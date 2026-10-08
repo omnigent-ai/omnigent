@@ -3389,10 +3389,6 @@ describe("undoArchiveConversations optimistic restore", () => {
       const sharedKey = ["conversations", "", false, null, "shared"];
       queryClient.setQueryData(mineKey, infinitePage([]));
       queryClient.setQueryData(sharedKey, infinitePage([]));
-      queryClient.setQueryData(["session", "conv_owned"], {
-        id: "conv_owned",
-        archived: true,
-      });
       fetchMock.mockResolvedValueOnce(
         mockResponse(conversation({ id: "conv_owned", archived: false })),
       );

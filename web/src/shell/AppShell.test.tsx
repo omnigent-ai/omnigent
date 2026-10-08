@@ -76,9 +76,9 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 // AppShell reads the GitHub info to gate the rail's GitHub tab; keep it
 // loading here (tab visible, matching the Files gate's no-flash default) so
 // no network-backed query fires. Tab visibility itself is covered in
-// AppShell.githubTabVisibility.test.tsx.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+// AppShell.pullRequestTabVisibility.test.tsx.
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -5052,11 +5052,11 @@ describe("AppShell design-mode submission", () => {
     restoreGetState();
   });
 
-  function submitInstruction(prompt = "Use a week picker.") {
+  function submitInstruction(prompt = "Use a week picker.", viewId = "conv_design") {
     act(() => {
-      select({ conversationId: "conv_design", screenshot: "data:image/png;base64,AQID" });
+      select({ conversationId: viewId, screenshot: "data:image/png;base64,AQID" });
       submit({
-        conversationId: "conv_design",
+        conversationId: viewId,
         id: 1,
         element: { tag: "input", id: "#period" },
         prompt,
@@ -5124,6 +5124,47 @@ describe("AppShell design-mode submission", () => {
       "First change",
       "Second change",
     ]);
+  });
+
+  // User-opened tabs submit with their `browser-tab:` view ID, not the session ID.
+  it("sends a submission from a user-opened tab in the current session", () => {
+    renderShell("/c/conv_design");
+    submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
+    expect(send).not.toHaveBeenCalled();
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+    const files = enqueueMessage.mock.calls[0][1] as File[];
+    expect(files).toHaveLength(1);
+    expect(signal).toHaveBeenCalledWith("browser-tab:conv_design:tab-two", {
+      id: 1,
+      ok: true,
+      message: "Queued for agent.",
+    });
+  });
+
+  it("queues a user-opened tab submission behind the session's existing backlog", () => {
+    localStorage.setItem("omnigent:always-steer", "true");
+    Object.assign(chat, {
+      queuedMessages: [
+        { queueId: "earlier", conversationId: "conv_design", text: "Earlier change" },
+      ],
+    });
+    renderShell("/c/conv_design");
+    submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
+    expect(send).not.toHaveBeenCalled();
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a user-opened tab submission after switching to another session", () => {
+    renderShell("/c/conv_design");
+    chat.conversationId = "conv_other";
+    submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
+    expect(enqueueMessage).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(signal).toHaveBeenCalledWith("browser-tab:conv_design:tab-two", {
+      id: 1,
+      ok: false,
+      message: "Return to this session before sending.",
+    });
   });
 
   it("rejects a late pointer submission after switching to another session", () => {

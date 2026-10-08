@@ -239,6 +239,22 @@ class CreatedSession:
 
 
 @dataclass(frozen=True)
+class ConversationUpdateResult:
+    """Result of updating a conversation and its requested model settings.
+
+    :param conversation: The conversation after the update has been persisted.
+    :param reasoning_effort_changed: Whether a requested reasoning-effort
+        value changed from the value on the locked AP row.
+    :param model_override_changed: Whether a requested model override changed
+        from the value on the locked AP row.
+    """
+
+    conversation: Conversation
+    reasoning_effort_changed: bool
+    model_override_changed: bool
+
+
+@dataclass(frozen=True)
 class SessionConnectivity:
     """
     The minimal session fields the sidebar's online-dot needs.
@@ -974,6 +990,35 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def update_conversation_with_changes(
+        self,
+        conversation_id: str,
+        title: str | None = None,
+        reasoning_effort: str | None = None,
+        _unset_reasoning_effort: bool = False,
+        model_override: str | None = None,
+        _unset_model_override: bool = False,
+        cost_control_mode_override: str | None = None,
+        _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
+        harness_override: str | None = None,
+        _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
+        terminal_launch_args: list[str] | None = None,
+        archived: bool | None = None,
+        reported_model: str | None = None,
+    ) -> ConversationUpdateResult | None:
+        """Update a conversation and report requested model-setting changes.
+
+        The returned change flags describe only the explicitly requested
+        ``reasoning_effort`` and ``model_override`` updates. A request that
+        writes the value already stored, including an explicit clear of an
+        already-``None`` value, reports ``False``.
         """
         ...
 

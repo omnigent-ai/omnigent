@@ -234,6 +234,14 @@ Cross-harness journeys:
   `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
   keeps a resumed effort whose config write failed for later updates.
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`chat-render`, Claude shell commands from the web composer:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
+  drives the built SPA at desktop and phone widths with controlled backend
+  events, including a following prompt and reload.
+  `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_web_shell_command_settles_before_the_next_prompt`
+  covers the real CLI and transcript forwarder through the repro environment.
+  It requires Claude Code and tmux; machine-managed Claude settings need an
+  isolated container for the scripted model endpoint.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
@@ -288,6 +296,14 @@ Cross-harness journeys:
   checks output recovery across a real server restart and injected stream-open
   failures. It supplies native-style events; it does not run a vendor CLI.
   Run with plain `uv run pytest` and the browser prerequisites in the skill.
+- **`disconnect`, completed Claude Task child (own environment):**
+  `tests/e2e_ui/sessions/test_claude_native_idle_handoff.py::test_completed_claude_child_survives_stale_status_handoff`
+  uses the real Claude CLI, native child forwarder, two server replicas, and a
+  runner tunnel cut. A completed child with stale saved `running` state must
+  not acquire a failure on the new replica, in its chat or the Agents panel,
+  including after reload. Run with plain `uv run pytest` and the browser
+  prerequisites in the skill. Requires Claude Code and tmux; machine-managed
+  Claude credentials need an isolated container for the scripted model endpoint.
 
 - **`plugin-inventory` (component and host tests):**
   `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real

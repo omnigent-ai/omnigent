@@ -903,15 +903,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
-    // textContent includes it but it's invisible; the labels are what matters.
-    const svgTitleText = (el: Element) =>
-      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
-    expect(
-      screen
-        .getAllByRole("menuitem")
-        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
-    ).toEqual([
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Export",
       "Rename",
@@ -919,7 +911,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Add to project",
       "Files",
       "Changes",
-      "GitHub",
+      "Pull Requests",
       "Agents1",
       "Archive",
       "Delete",

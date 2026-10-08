@@ -1111,6 +1111,7 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
+      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1370,6 +1371,7 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
+  hostId: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1544,6 +1546,7 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
+  hostId,
   status,
   isWorking,
   showsWorking,
@@ -1832,6 +1835,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <Transcript
+            hostId={hostId}
             setConversationEl={setConversationEl}
             containerEl={containerEl}
             scroller={scroller}
@@ -3692,6 +3696,7 @@ function ComposerImpl(
             state={composerGit.githubState}
             prCount={composerGit.prCount}
             prNumber={composerGit.prNumber}
+            prNumberPrefix={composerGit.prNumberPrefix}
             onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">

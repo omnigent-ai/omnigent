@@ -3667,6 +3667,7 @@ def create_runner_app(
         harness = _session_harness_name(conv_id)
         if harness not in ("claude-native", "codex-native", "opencode-native"):
             return
+        from omnigent.inner.databricks_executor import DatabricksAuthError
         from omnigent.native.native_cost_popup import launch_cost_popup, wait_for_tmux_client
 
         attached = await asyncio.to_thread(
@@ -3679,6 +3680,10 @@ def create_runner_app(
                 f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
             )
         except httpx.HTTPError:
+            return
+        except DatabricksAuthError as exc:
+            # Best-effort: the host credential service may be unable to sign the request.
+            _logger.warning("Skipping cost popup repopulation for %s: %s", conv_id, exc)
             return
         if resp.status_code != 200:
             return
@@ -6169,8 +6174,13 @@ def create_runner_app(
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's
             # thread, leaving the parent's turn and message buffer untouched.
+            from websockets.exceptions import WebSocketException
+
             from omnigent.harnesses.codex_native import side_chat
-            from omnigent.harnesses.codex_native.app_server import client_for_transport
+            from omnigent.harnesses.codex_native.app_server import (
+                CodexAppServerResponseError,
+                client_for_transport,
+            )
 
             _side_turn_id = body.get("codex_side_turn_id")
             _side_text = ""
@@ -6219,6 +6229,42 @@ def create_runner_app(
                     await side_chat.submit_side_turn(
                         _side_client, str(_side_thread_id), _side_text
                     )
+            except CodexAppServerResponseError as exc:
+                # Codex refused the turn (e.g. typing into a multi-agent-v2
+                # sub-agent, or a thread that no longer exists).
+                _rpc_message = exc.message or str(exc)
+                _missing = "thread not found" in _rpc_message.casefold()
+                _logger.warning(
+                    "Codex side-chat turn rejected: conv=%s thread=%s error=%s",
+                    conversation_id,
+                    _side_thread_id,
+                    exc,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=404 if _missing else 409,
+                    content={
+                        "error": "codex_side_chat_not_found"
+                        if _missing
+                        else "codex_side_chat_rejected",
+                        "detail": _rpc_message,
+                    },
+                )
+            except (ConnectionError, OSError, TimeoutError, WebSocketException) as exc:
+                _logger.warning(
+                    "Codex side-chat app-server unreachable: conv=%s thread=%s error=%r",
+                    conversation_id,
+                    _side_thread_id,
+                    exc,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_unavailable",
+                        "detail": "The Codex app-server connection was lost; try again.",
+                    },
+                )
             finally:
                 await _side_client.close()
             return Response(status_code=202)

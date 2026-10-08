@@ -24,6 +24,7 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -71,7 +72,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { openAgentBrowserTab } from "@/hooks/useBrowserTabs";
+import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   findAgentTerminal,
@@ -94,7 +95,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
@@ -116,7 +117,7 @@ import {
 } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -922,7 +923,7 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
+        // Pull Requests tab: shares the Files/workspace gate. Non-git workspaces and
         // other unavailable reasons are shown as empty states in the panel.
         github: showFilesPanel,
         // Browser soft tabs: available only when the shell hosts the embedded
@@ -1022,7 +1023,9 @@ export function AppShell() {
         const shot = designShotRef.current.get(cid);
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
         const chat = useChatStore.getState();
-        if (cid !== chat.conversationId) {
+        // `cid` is the browser view ID; user-opened tabs encode their owning session.
+        const ownerId = browserViewOwnerId(cid);
+        if (ownerId !== chat.conversationId) {
           designShotRef.current.delete(cid);
           signal(false, "Return to this session before sending.");
           return;
@@ -1030,7 +1033,7 @@ export function AppShell() {
         const files = file ? [file] : undefined;
         if (
           shouldQueueSend(
-            cid,
+            ownerId,
             chat.status,
             chat.sessionStatus,
             chat.queuedMessages,
@@ -2036,9 +2039,9 @@ export function AppShell() {
     setShellsPanelOpen(true);
   }
 
-  // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
-  // (matches the desktop rail's GitHub tab; the panel handles all states —
-  // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
+  // Mobile FAB → "Pull Requests" opens the pull request panel as a full-screen
+  // drawer (matches the desktop rail's Pull Requests tab; the panel handles all
+  // states — not-a-git-repo, no provider CLI, unauthenticated, no PR — itself).
   const openGithubPanel = useCallback(() => {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
@@ -2051,7 +2054,7 @@ export function AppShell() {
     setGithubPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
 
-  // Composer links open the mobile drawer or reveal the desktop GitHub tab.
+  // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
   const openGithubTab = useCallback(() => {
     if (isMobileViewport()) {
@@ -2649,11 +2652,11 @@ export function AppShell() {
               {conversationId && showFilesPanel && (
                 <MobilePanelDrawer
                   open={githubPanelOpen}
-                  title="GitHub"
+                  title="Pull Requests"
                   onClose={() => setGithubPanelOpen(false)}
                   testId="github-panel-drawer"
                 >
-                  <GithubPanel conversationId={conversationId} />
+                  <PullRequestPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
@@ -2749,6 +2752,8 @@ export function AppShell() {
           <KeyboardShortcutsDialog />
           {/* Opens the import modal once per newly connected host. */}
           {!isEmbedded && <ImportReviewGate />}
+          {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
+          {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
           {/* Dev-only `?import-preview` for the post-setup import modal. */}
           {ImportContextPreview && (
             <Suspense fallback={null}>

@@ -40,6 +40,7 @@ GITLAB_MR = "https://git.example.test/g/s/p/-/merge_requests/7"
 @pytest.fixture(autouse=True)
 def _isolated_registry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     """Start from the built-in providers, with no ambient GitHub host configuration."""
+    monkeypatch.setattr(registry, "PROVIDER_MODULES", ("omnigent.git_providers.github",))
     monkeypatch.setattr(registry.importlib.metadata, "entry_points", lambda **_: ())
     for name in ("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "GH_HOST"):
         monkeypatch.delenv(name, raising=False)

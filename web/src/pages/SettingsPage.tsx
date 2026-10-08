@@ -42,7 +42,6 @@ import {
   useRef,
   useState,
 } from "react";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
@@ -51,6 +50,7 @@ import {
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
+  GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
   LogOutIcon,
@@ -415,7 +415,7 @@ const workspaceTabCards: {
 }[] = [
   { value: "files", label: "Files", icon: FilesIcon },
   { value: "changes", label: "Changes", icon: FileDiffIcon },
-  { value: "github", label: "GitHub", icon: GithubMono },
+  { value: "github", label: "Pull Requests", icon: GitPullRequestIcon },
   { value: "subagents", label: "Agents", icon: BotIcon },
 ];
 

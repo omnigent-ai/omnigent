@@ -536,6 +536,12 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /**
+   * The server's pending-input id from the accepted POST. The bubble keeps
+   * `tempId` as its React key, so this is its only link to the entry a
+   * receipt names. Snapshot-replayed entries carry that id as `tempId`.
+   */
+  pendingId?: string;
 }
 
 /**
@@ -626,6 +632,16 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * Recent shell mirrors and the bubbles they settled. Retaining both client
+   * and server ids protects later inputs from duplicate or legacy receipts.
+   */
+  settledShellInputs: {
+    itemId: string;
+    tempId?: string;
+    pendingId?: string;
+    contentKey?: string;
+  }[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -1844,6 +1860,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  settledShellInputs: [],
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -2494,7 +2511,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, posted: true } : p,
+            p.tempId === tempId
+              ? {
+                  ...p,
+                  posted: true,
+                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                }
+              : p,
+          ),
+          settledShellInputs: s.settledShellInputs.map((entry) =>
+            entry.tempId === tempId && postResult.pendingId
+              ? { ...entry, pendingId: postResult.pendingId }
+              : entry,
           ),
         }));
       }
@@ -2502,9 +2530,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // optimistic bubble deliberately keeps its client temp id as its
       // stable React key — swapping it to the server id mid-send forces
       // a bubble remount (a visible flink). The eventual
-      // `session.input.consumed` clears this bubble by FIFO order (its
-      // `clearedPendingId` matches only snapshot-hydrated bubbles, which
-      // already carry the server id); see the consumed handler.
+      // `pendingId` links it to a later receipt without changing the React key.
       // Refresh the sidebar without waiting for the 4 s `useConversations`
       // poll — picks up server-side title auto-gen and any runner_id /
       // status transitions that happen during the turn.
@@ -6839,6 +6865,23 @@ function messageContentText(content: MessageContentBlock[]): string {
 }
 
 /**
+ * Match a sent `!cmd` using the server's whitespace normalization.
+ * Unsent drafts and empty commands cannot acknowledge a submission.
+ *
+ * @param bubble - A queued optimistic bubble.
+ * @param command - The mirrored command, without its leading `!`.
+ */
+function isShellCommandBubble(bubble: PendingUserMessage, command: string): boolean {
+  const wanted = command.replace(/\s+/g, " ").trim();
+  if (bubble.initialDraft || wanted === "") return false;
+  const text = messageContentText(bubble.content);
+  return text.startsWith("!") && text.slice(1).trimStart() === wanted;
+}
+
+/** Bound replay protection to the server's maximum pending queue size. */
+const MAX_SETTLED_SHELL_INPUTS = 64;
+
+/**
  * Normalized texts of the committed user-message blocks in `blocks`,
  * dropping empties (image-only messages). The dedup baseline for the
  * the snapshot replay in `bindStream`.
@@ -7497,6 +7540,19 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           eventContent !== null &&
           isClaudeAgentMessageContent(eventContent) &&
           (!pendingHead || contentKeyOf(pendingHead.content) !== contentKeyOf(eventContent));
+        // An older server's skip receipt names a `!cmd` bubble its shell input already
+        // cleared: it owns no bubble, and the FIFO head belongs to a later message.
+        const named = event.clearedPendingId;
+        const settledShell =
+          !!named &&
+          s.settledShellInputs.some(
+            (entry) =>
+              entry.pendingId === named ||
+              entry.tempId === named ||
+              (!entry.pendingId &&
+                eventContent !== null &&
+                entry.contentKey === contentKeyOf(eventContent)),
+          );
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -7505,7 +7561,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // Same precision order as below (named entry, then FIFO head), minus
           // the append.
           const cleared = event.clearedPendingId;
-          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
+          const at = cleared
+            ? s.pendingUserMessages.findIndex(
+                (p) => p.tempId === cleared || p.pendingId === cleared,
+              )
+            : -1;
           if (at >= 0) {
             return {
               pendingUserMessages: [
@@ -7514,6 +7574,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
+          if (settledShell) return {};
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,
@@ -7530,7 +7591,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;
         if (cleared) {
-          const idx = s.pendingUserMessages.findIndex((p) => p.tempId === cleared);
+          const idx = s.pendingUserMessages.findIndex(
+            (p) => p.tempId === cleared || p.pendingId === cleared,
+          );
           if (idx >= 0) {
             const matched = s.pendingUserMessages[idx]!;
             const content = committedContentFor(event, matched.content);
@@ -7565,6 +7628,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    drains it and names it via `clearedPendingId`, so it lands on
         //    branch 1 and never reaches this fallback.
         const head =
+          settledShell ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
@@ -7618,6 +7682,31 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return { pendingUserMessages: rest };
       });
       return;
+    case "terminal_command": {
+      // Shell inputs have no consumed receipt; remove only the matching sent bubble.
+      const command = event.kind === "input" ? event.input : null;
+      if (command === null) return;
+      applyToConversation((s) => {
+        if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
+        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
+        const popped = s.pendingUserMessages[at];
+        return {
+          pendingUserMessages: popped
+            ? [...s.pendingUserMessages.slice(0, at), ...s.pendingUserMessages.slice(at + 1)]
+            : s.pendingUserMessages,
+          settledShellInputs: [
+            ...s.settledShellInputs,
+            {
+              itemId: event.itemId,
+              tempId: popped?.tempId,
+              pendingId: popped?.pendingId,
+              contentKey: popped ? contentKeyOf(popped.content) : undefined,
+            },
+          ].slice(-MAX_SETTLED_SHELL_INPUTS),
+        };
+      });
+      return;
+    }
     case "session_interrupted":
       // Explicit user-cancel signal. Distinguishes "interrupted by
       // user action" from the generic `response.incomplete` that

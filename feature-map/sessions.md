@@ -235,6 +235,15 @@ plain `uv run pytest`, which starts a private server for the test.
   period. A completed legacy transcript without saved lifecycle state must
   remain readable without a disconnect error, including when the browser
   returns to the old server after its reads recover.
+- **`reconnect`, completed Claude Task child (own environment):**
+  `tests/e2e_ui/sessions/test_claude_native_idle_handoff.py::test_completed_claude_child_survives_stale_status_handoff`
+  drives a real Claude-native parent and its Agent tool through child completion,
+  then stages stale saved `running` state and moves the runner to a fresh server.
+  After a real tunnel loss and the production disconnect grace, the child's
+  result stays readable without a chat error or failed Agents-row status,
+  including after reload. Only model replies and stale persistence are staged.
+  Requires Claude Code and tmux; machine-managed Claude credentials need an
+  isolated container for the local model endpoint.
 - **`stop`, `archive`, active sub-agents (own environment):**
   `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
   drives real Claude and Codex parents, native children, a host daemon, and its
