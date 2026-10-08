@@ -43,3 +43,12 @@ def test_repro_recording_rules_match_the_shared_guide() -> None:
     assert "Text-only CLI output is not a reason to skip recording" in instructions
     assert "name the specific blocker in `recording_unavailable_reason`" in instructions
     assert "Do not block the verdict because footage is missing or rejected" in instructions
+
+
+def test_lane_captions_take_screen_arrangement_from_the_frame() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "the order of rows in a menu or picker, which row is first or checked" in lanes
+    assert "from the frame itself or from a driver assertion on the rendered elements" in lanes
+    assert "never from the design, the fix description, or the test's intent" in lanes
+    assert 'lists "Harness default" first and the gateway models below it' in lanes

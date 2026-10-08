@@ -329,3 +329,13 @@ For each recording, write a short **`caption`** in its handoff entry describing
 what the clip shows: e.g. `"start a session → open the model picker → select the
 catalog → picker shows raw IDs"`. This is what a reader sees under the video on
 the ticket, so make it read like a journey, not a restatement of the bug title.
+
+When the caption says what is on screen — the order of rows in a menu or picker,
+which row is first or checked, the exact text of a label — take those details
+from the frame itself or from a driver assertion on the rendered elements (for
+example the menu items' `all_inner_texts()` in order), never from the design,
+the fix description, or the test's intent. A picker whose final frame lists
+"Harness default" first and the gateway models below it is captioned in that
+order even if the fix meant to put the models first; a frame that disagrees
+with the intended layout is a finding to settle, not a detail to describe as
+intended.
