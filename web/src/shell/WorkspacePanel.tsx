@@ -4,6 +4,7 @@ import {
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
+  GitPullRequestIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
@@ -59,11 +60,10 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -649,7 +649,7 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
-  /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
+  /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
@@ -878,8 +878,8 @@ function WorkspacePanelImpl({
   // pending tab stays put and is rekeyed to the real child once it arrives (via
   // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
   // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side + launches a
-  // runner on the parent's host. Rejects so the composer re-enables and keeps
+  // kept prompt-cache-warm); every other harness forks server-side and reuses
+  // the parent's live runner. Rejects so the composer re-enables and keeps
   // the typed text for a retry.
   const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
     if (usesNativeSideChatFork(sideChatHarness)) {
@@ -940,7 +940,7 @@ function WorkspacePanelImpl({
         childId={selectedSideChat}
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
         // A Codex side chat restored after a restart is a dead ephemeral
-        // fork: show it read-only (and kill it) rather than let the user
+        // fork: show it read-only rather than let the user
         // send into a thread that no longer exists.
         readOnly={
           usesNativeSideChatFork(sideChatHarness) &&
@@ -949,10 +949,15 @@ function WorkspacePanelImpl({
         }
       />
     );
-  // Close a side-chat tab: stop the child's runner (real children only) so its
-  // compute is freed, then drop the browser-local tab.
-  const closeSideChat = (childId: string) => {
-    if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
+  const closeSideChat = async (childId: string) => {
+    if (!childId.startsWith("pending:")) {
+      try {
+        await stopSession(childId);
+      } catch {
+        toast.error("Couldn't close side chat. Try again.");
+        return;
+      }
+    }
     // The tab is gone, so its unsent text/attachments and any seeded question
     // that never got to send have nowhere to return to.
     useChatStore.getState().clearSideChatComposer(childId);
@@ -1087,17 +1092,17 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     github: (pending || showGithubTab) && (
-      <WorkspaceTabTooltip key="github" label="GitHub" shortcut={shortcutFor("github")}>
+      <WorkspaceTabTooltip key="github" label="Pull Requests" shortcut={shortcutFor("github")}>
         <TabsTrigger
           value="github"
-          aria-label="GitHub"
+          aria-label="Pull Requests"
           aria-keyshortcuts={shortcutFor("github")}
           data-workspace-tab="github"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
-          <GithubMono size={16} />
-          <span className="sr-only">GitHub</span>
+          <GitPullRequestIcon />
+          <span className="sr-only">Pull Requests</span>
         </TabsTrigger>
       </WorkspaceTabTooltip>
     ),
@@ -1246,7 +1251,7 @@ function WorkspacePanelImpl({
                 it hugs the last tab when they fit and stays pinned when they
                 don't. overflow-y-hidden stops overflow-x:auto from spawning a
                 vertical scrollbar that eats horizontal space. */}
-              <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              <div className="no-drag flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
                 <FileTabsStrip
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
@@ -1457,7 +1462,7 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : rightRailTab === "github" && showGithubTab ? (
-            <GithubPanel conversationId={conversationId} />
+            <PullRequestPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : (

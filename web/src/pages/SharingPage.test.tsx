@@ -94,6 +94,35 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SharingPage", () => {
+  it("uses titled outlined groups and mobile description tooltips", async () => {
+    setSharingState(state());
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
+
+    expect(screen.getByText(/Control whether users on this server can share sessions/)).toHaveClass(
+      "max-md:hidden",
+    );
+    for (const testId of ["settings-group-sharing-mode", "settings-group-public-sharing"]) {
+      expect(screen.getByTestId(testId).lastElementChild).toHaveClass(
+        "rounded-xl",
+        "border",
+        "border-border",
+        "bg-card",
+      );
+    }
+
+    expect(screen.getByText(/Allow sharing a session with anyone who has the link/)).toHaveClass(
+      "max-md:hidden",
+    );
+    const help = screen.getByRole("button", { name: "About Public access" });
+    expect(help).toHaveClass("md:hidden");
+    fireEvent.click(help);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      /Allow sharing a session with anyone who has the link/,
+    );
+  });
+
   it("shows all four tiers with the current one selected (admin)", async () => {
     setSharingState(state({ sharing_mode: "read_only" }));
 

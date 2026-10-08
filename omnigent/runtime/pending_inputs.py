@@ -62,8 +62,10 @@ flags every entry queued at that moment (:func:`mark_interrupted`): a later
 match that jumps over one drains it quietly like an uncertain entry, and it
 no longer counts as pending or replays in the snapshot. A mirror carrying its
 own text still drains it normally, since the agent did record it after all,
-unless a live entry has the same text (a resend after Stop): that one takes
-the mirror. The positional drain (:func:`resolve_oldest`) never picks one.
+unless a live resend has the same text and no other live input intervenes:
+that resend takes the mirror. With an intervening input, queue order wins so a
+delayed pre-Stop echo cannot falsely mark the intervening input lost. The
+positional drain (:func:`resolve_oldest`) never picks an interrupted entry.
 
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
@@ -584,7 +586,9 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
             _pending.pop(conversation_id, None)
 
 
-def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False) -> MatchedDrain:
+def resolve_matching_text(
+    conversation_id: str, text: str, *, hold: bool = False, shell_command: bool = False
+) -> MatchedDrain:
     """
     Drain through the first pending entry whose text matches ``text``.
 
@@ -597,11 +601,14 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
     undelivered web messages.
 
     Identical texts match in queue order, except that an entry the person
-    cancelled by interrupting yields to a later live one with the same text:
-    the resend after Stop is the one the agent recorded.
+    cancelled by interrupting yields to a later live one with the same text
+    when no other live input intervenes. Otherwise, a delayed pre-Stop echo
+    could incorrectly declare the intervening message lost.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param text: User-message text mirrored from the native transcript.
+    :param shell_command: Match a command without its ``!`` prefix and leave
+        all older inputs queued; shell mirrors cannot establish prompt loss.
     :param hold: Keep the matched and skipped entries in place, marked held,
         instead of removing them; the caller settles each with
         :func:`release` or :func:`restore`. Entries already held are skipped.
@@ -623,19 +630,24 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
         ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
-        texts = [_collapse_whitespace(_content_text(entry.content)) for _pid, entry in ordered]
-        interrupted = [entry.interrupted for _pid, entry in ordered]
+        texts = [
+            _shell_command_text(entry.content)
+            if shell_command
+            else _collapse_whitespace(_content_text(entry.content))
+            for _pid, entry in ordered
+        ]
         # Two passes. An exact (whitespace-collapsed) match first, so two
         # messages that differ only in a marker-like phrase the person typed
         # at the front stay distinct. Then, for entries carrying attachments:
         # the executor pastes one generated marker line per file block ahead
         # of the text, so drop exactly that many from the mirror and compare
         # with the entry's own text — typed marker-like text still counts.
+        interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         if match_index is None:
             marker_matches: list[int] = []
             for index, (_pid, entry) in enumerate(ordered):
-                attachments = _attachment_count(entry.content)
+                attachments = 0 if shell_command else _attachment_count(entry.content)
                 if attachments == 0 or not texts[index]:
                     continue
                 if (
@@ -650,7 +662,9 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an
         # unbounded append downstream. The matched entry itself always drains.
-        skipped_entries = ordered[:match_index][:_MAX_ENTRIES_PER_CONVERSATION]
+        skipped_entries = (
+            [] if shell_command else ordered[:match_index][:_MAX_ENTRIES_PER_CONVERSATION]
+        )
         matched_id, matched_entry = ordered[match_index]
         for pending_id, entry in [*skipped_entries, (matched_id, matched_entry)]:
             if hold:
@@ -785,24 +799,24 @@ def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int 
 
 def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
     """
-    Pick the first candidate the person did not cancel, else the first one.
+    Prefer a live resend only when it cannot skip another live input.
 
     A resend of the same text after Stop leaves a cancelled entry and a live
-    one that match the same mirror. The agent recorded the resend, so it takes
-    the mirror and the cancelled entry is jumped over. A cancelled entry with
-    no live twin still matches: the agent did record it. If another live input
-    intervenes, text alone cannot distinguish the cancelled copy from the
-    resend; preferring the live entry is inherently ambiguous but deliberately
-    optimizes for the common resend case.
+    one that match the same mirror. Prefer the resend unless another live
+    input intervenes: text alone cannot rule out a delayed original echo,
+    and choosing the resend would incorrectly mark that intervening input lost.
 
     :param candidates: Queue indices of the entries that match, oldest first.
     :param interrupted: Per entry, whether the person cancelled it by interrupting.
     :returns: The chosen index, or ``None`` when there are no candidates.
     """
+    if not candidates:
+        return None
+    first = candidates[0]
     for index in candidates:
         if not interrupted[index]:
-            return index
-    return candidates[0] if candidates else None
+            return first if any(not flag for flag in interrupted[first:index]) else index
+    return first
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -837,6 +851,29 @@ def _strip_generated_markers(text: str, count: int) -> str:
             break
         text = stripped
     return text
+
+
+def _shell_command_text(content: list[dict[str, Any]]) -> str:
+    """Normalize a web shell input by removing one shell-mode prefix."""
+    text = _collapse_whitespace(_content_text(content))
+    return text[1:].lstrip() if text.startswith("!") else ""
+
+
+def resolve_shell_command(
+    conversation_id: str, command: str, *, hold: bool = False
+) -> DrainedInput | None:
+    """Settle a web ``!command`` matching a shell input mirror.
+
+    Shell inputs can overtake queued prompts, so they provide no evidence that
+    older entries were lost. Output halves and unmatched terminal input must
+    not consume a pending prompt.
+
+    :param conversation_id: Session whose pending inputs are searched.
+    :param command: Mirrored command without the shell-mode ``!`` prefix.
+    :param hold: Keep the entry for rollback until persistence succeeds.
+    :returns: The matching entry, or ``None`` without changing the queue.
+    """
+    return resolve_matching_text(conversation_id, command, hold=hold, shell_command=True).matched
 
 
 def reset_for_tests() -> None:

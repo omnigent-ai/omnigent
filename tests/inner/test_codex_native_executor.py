@@ -105,6 +105,8 @@ class _FakeCodexNativeClient:
         :returns: Codex-shaped response payload.
         """
         type(self).requests.append((method, params))
+        if method == "model/list":
+            return {"result": {"data": [], "nextCursor": None}}
         if method == "turn/start":
             turn_id = f"turn_{type(self).next_turn}"
             type(self).next_turn += 1
@@ -1305,6 +1307,7 @@ def test_web_model_pick_applied_via_thread_settings_update(
     )
 
     assert _FakeCodexNativeClient.requests == [
+        ("model/list", {"includeHidden": True}),
         (
             "thread/settings/update",
             {
@@ -1354,6 +1357,137 @@ def test_model_settings_update_mirrors_model_into_config_toml(
     _run_turn_with_config(executor, "hello", ExecutorConfig(model="gpt-5.6-luna"))
 
     assert read_codex_config_model(tmp_path) == "gpt-5.6-luna"
+
+
+def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
+    """Return a fresh fake whose catalog lists ``gpt-5.6-sol`` with *supported* efforts."""
+
+    class CatalogClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+        created = []
+        next_turn = 1
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "model/list":
+                type(self).requests.append((method, params))
+                return {
+                    "result": {
+                        "data": [
+                            {
+                                "id": "gpt-5.6-sol",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": value} for value in supported
+                                ],
+                            }
+                        ],
+                        "nextCursor": None,
+                    }
+                }
+            return await super().request(method, params)
+
+    return CatalogClient
+
+
+@pytest.mark.parametrize(
+    ("requested", "inherited", "supported", "expected", "model_override"),
+    [
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "max", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "max", None),
+        ("ultra", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "ultra", None),
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", "databricks-gpt-5-6-sol"),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", "databricks-gpt-5-6-sol"),
+    ],
+)
+def test_dispatch_uses_model_supported_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested: str | None,
+    inherited: str,
+    supported: list[str],
+    expected: str,
+    model_override: str | None,
+) -> None:
+    """Explicit and inherited efforts are checked before starting the next turn."""
+    CatalogClient = _catalog_client(supported)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", CatalogClient
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        f'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "{inherited}"\n'
+    )
+
+    _run_turn_with_config(
+        CodexNativeExecutor(bridge_dir=tmp_path),
+        "hello",
+        ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
+    )
+
+    updates = [
+        params for method, params in CatalogClient.requests if method == "thread/settings/update"
+    ]
+    if requested is not None or inherited != expected:
+        assert len(updates) == 1
+        assert updates[0]["effort"] == expected
+    elif model_override is not None:
+        assert updates == [{"threadId": "thread_123", "model": model_override}]
+    else:
+        assert updates == []
+    assert CatalogClient.requests[-1][0] == "turn/start"
+    assert read_codex_config_effort(tmp_path) == expected
+
+    if requested == "minimal" and model_override is None:
+        _start_state(tmp_path)
+        _run_turn_with_config(
+            CodexNativeExecutor(bridge_dir=tmp_path),
+            "next turn",
+            ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
+        )
+        assert [
+            params["effort"]
+            for method, params in CatalogClient.requests
+            if method == "thread/settings/update"
+        ] == [expected, expected]
+    assert sum(method == "model/list" for method, _params in CatalogClient.requests) == 1
+    assert read_codex_config_model(tmp_path) == (model_override or "gpt-5.6-sol")
+
+
+def test_dispatch_validates_an_effort_whose_config_write_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Turn dispatch checks a recorded applied effort, not the stale config value."""
+    from omnigent.harnesses.codex_native.bridge import (
+        read_unmirrored_codex_settings,
+        write_unmirrored_codex_settings,
+    )
+
+    CatalogClient = _catalog_client(["low", "medium", "high", "xhigh"])
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", CatalogClient
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n')
+    # A live update applied max, but its config write failed.
+    write_unmirrored_codex_settings(tmp_path, {"effort": "max"})
+
+    _run_turn_with_config(
+        CodexNativeExecutor(bridge_dir=tmp_path), "hello", ExecutorConfig(model=None, extra={})
+    )
+
+    updates = [
+        params for method, params in CatalogClient.requests if method == "thread/settings/update"
+    ]
+    assert updates == [{"threadId": "thread_123", "effort": "xhigh"}]
+    assert read_codex_config_effort(tmp_path) == "xhigh"
+    assert read_unmirrored_codex_settings(tmp_path) == {}
 
 
 def test_effort_only_settings_update_leaves_config_toml_model(
@@ -1516,40 +1650,6 @@ def test_settings_update_drops_invalid_effort_keeps_model(
     assert method == "thread/settings/update"
     assert params["model"] == "gpt-5.3-codex"
     assert "effort" not in params
-
-
-@pytest.mark.parametrize("effort", ["ultra", "max"])
-def test_settings_update_forwards_codex_high_reasoning_levels(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    effort: str,
-) -> None:
-    """
-    Sol's ``max``/``ultra`` reach the wire instead of coercing to ``xhigh``.
-
-    Codex advertises these as per-model reasoning levels and honors a turn at
-    them (Sol's ``ultra`` runs subagents), so a web-picked level must ride
-    through on ``thread/settings/update`` unchanged rather than being clamped.
-    """
-    _FakeCodexNativeClient.requests = []
-    _FakeCodexNativeClient.created = []
-    _FakeCodexNativeClient.next_turn = 1
-    monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
-        _FakeCodexNativeClient,
-    )
-    _start_state(tmp_path)
-    executor = CodexNativeExecutor(bridge_dir=tmp_path)
-
-    _run_turn_with_config(
-        executor,
-        "hi",
-        ExecutorConfig(model="gpt-5.6-sol", extra={"reasoning_effort": effort}),
-    )
-
-    method, params = _FakeCodexNativeClient.requests[0]
-    assert method == "thread/settings/update"
-    assert params["effort"] == effort
 
 
 def test_run_turn_surfaces_recorded_startup_error(

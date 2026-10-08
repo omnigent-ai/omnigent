@@ -50,8 +50,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => ({ data: undefined }),
 }));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
@@ -69,6 +69,7 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
     githubState: "ready" as "loading" | "ready" | "unknown",
     prCount: 0,
     prNumber: null as number | null,
+    prNumberPrefix: "#",
     refresh: vi.fn(),
     refreshing: false,
   },
@@ -98,6 +99,7 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       githubState: "ready",
       prCount: 0,
       prNumber: null,
+      prNumberPrefix: "#",
       refreshing: false,
     },
     overrides,
@@ -632,6 +634,8 @@ describe("Composer send shortcut", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
+    [false, "{Alt>}{Enter}{/Alt}"],
+    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     const onSend = vi.fn();
@@ -1111,6 +1115,63 @@ describe("Composer slash-command submit routing", () => {
 
     expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
     // It's a slash_command event, NOT a plaintext message.
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("routes a skill whose name contains spaces, with and without args", () => {
+    // SKILL.md frontmatter names may carry spaces and parentheses; the
+    // catalog's full name must match, not just the first token.
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    // Menu completion leaves "/<name> " in the composer; Enter must submit it.
+    fireEvent.change(ta, { target: { value: `/${name} ` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "");
+
+    fireEvent.change(ta, { target: { value: `/${name} rewrite this paragraph` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenLastCalledWith(name, "rewrite this paragraph");
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(2);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("routes a known skill whose first word is not command-shaped", () => {
+    // The catalog match outranks the "/name" shape guard, so "Node.js" works.
+    const name = "Node.js Best Practices";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Idiomatic Node.js." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: `/${name} for this module` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "for this module");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("prefers a multi-word skill over a built-in matching only its first word", () => {
+    const name = "Help Desk";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Triage a support request." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: `/${name} summarize` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "summarize");
     expect(onSend).not.toHaveBeenCalled();
   });
 
@@ -2374,8 +2435,11 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-settings")).toBeNull();
     expect(trailing.firstElementChild).toContainElement(harnessPicker);
     expect(actions.children).toHaveLength(3);
-    expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
-    expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
+    expect(workspace).toHaveClass("mx-3", "h-7", "md:h-[37px]", "rounded-t-2xl");
+    expect(textarea().closest("form")).toHaveClass(
+      "px-6",
+      "pb-[max(20px,env(safe-area-inset-bottom))]",
+    );
     // A normal working directory has no empty worktree affordance.
     expect(within(workspace).queryByTestId("composer-git-branch")).toBeNull();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
@@ -2427,7 +2491,7 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
+    expect(screen.queryByTestId("composer-pr-loading")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
 
     setComposerGitStatus({ githubState: "unknown" });
@@ -2436,8 +2500,15 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
+    expect(screen.queryByTestId("composer-pr-unknown")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("marks the PR number with the prefix of the PR's provider", () => {
+    setComposerGitStatus({ prCount: 1, prNumber: 7, prNumberPrefix: "!" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("!7");
+    expect(screen.getByTestId("composer-pr-link")).toHaveAccessibleName("!7");
   });
 
   it("keeps the PR to the right of the confirmed worktree status", () => {
@@ -3294,6 +3365,29 @@ describe("Composer slash-command highlight overlay", () => {
     expect(screen.getByTestId("composer-highlight-overlay")).toHaveClass("text-ui");
   });
 
+  it("tints the full name of a skill with spaces, leaving args default", () => {
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: `/${name} rewrite this` } });
+    expect(tintedText()).toBe(`/${name}`);
+    expect(overlayText()).toBe(`/${name} rewrite this`);
+  });
+
+  it("tints a known skill whose first word is not command-shaped", () => {
+    const name = "Node.js Best Practices";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Idiomatic Node.js." }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: `/${name} here` } });
+    expect(tintedText()).toBe(`/${name}`);
+  });
+
   it("renders no overlay for plain prose", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "just a normal message" } });
@@ -3937,6 +4031,39 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("");
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
     expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("retracts delivery that arrives while the failed draft restore is rendering", () => {
+    const stableId = "8".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const unsubscribe = useChatStore.subscribe((state) => {
+      if (state.restoredSendDraft?.stableId !== stableId || state.restoredSendDraft.delivered)
+        return;
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+      });
+    });
+    try {
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "resend me",
+            files: [],
+            stableId,
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("");
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(getSessionDraft("conv_test")).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("keeps the user's edits when the delivered retraction lands", () => {
@@ -5553,7 +5680,7 @@ describe("Composer config gear", () => {
     expect(calls).toEqual(["model", "effort"]);
   });
 
-  it("shows a titled actionable tooltip when a session config update fails", async () => {
+  it("leaves no lingering error indicator when a session config update fails", async () => {
     const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
     const options = [
       { id: "opus", model: "opus", displayName: "Opus" },
@@ -5572,12 +5699,14 @@ describe("Composer config gear", () => {
 
     await openSessionModels();
     fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    const error = await screen.findByTestId("composer-config-error");
-    fireEvent.focus(error);
-    const tooltip = await screen.findByTestId("composer-config-error-tooltip");
-    expect(tooltip).toHaveTextContent("Couldn’t update configuration");
-    expect(tooltip).toHaveTextContent("Host stopped responding");
-    expect(tooltip).toHaveTextContent("Try again");
+    await waitFor(() =>
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+    );
+    expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
+    expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
   });
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {

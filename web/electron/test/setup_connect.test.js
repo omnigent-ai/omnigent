@@ -63,6 +63,22 @@ async function harness(
   };
 }
 
+it("provides a full-width 48px window drag region and a clickable settings gear", async (t) => {
+  const { document } = await harness(t);
+  const style = document.querySelector("style").textContent;
+  const dragMatch = style.match(/\.drag-strip\s*\{[^}]*\}/);
+  assert.ok(dragMatch, "expected a .drag-strip rule in the setup page styles");
+  const dragRule = dragMatch[0];
+  assert.match(dragRule, /height:\s*48px/);
+  assert.match(dragRule, /left:\s*0/);
+  assert.match(dragRule, /right:\s*0/);
+  assert.match(dragRule, /-webkit-app-region:\s*drag/);
+  const gearMatch = style.match(/\.gear-btn\s*\{[^}]*\}/);
+  assert.ok(gearMatch, "expected a .gear-btn rule in the setup page styles");
+  const gearRule = gearMatch[0];
+  assert.match(gearRule, /-webkit-app-region:\s*no-drag/);
+});
+
 it("shows a concise expiry message without repeating the prefilled server URL", async (t) => {
   const message = "Session expired. Connect to sign in again.";
   const params = new URLSearchParams({ error: message, url: SERVER });
@@ -166,25 +182,6 @@ it("does not pretend login stopped if cancellation itself fails", async (t) => {
   assert.equal(h.label.textContent, "Authenticating…");
   assert.equal(h.cancel.disabled, false);
   assert.match(h.error.textContent, /Could not cancel sign-in/);
-});
-
-it("offers a fresh browser sign-in for Databricks workspaces only", async (t) => {
-  const h = await harness(t);
-  const other = h.document.getElementById("other-account");
-  assert.equal(other.hidden, false);
-  other.click();
-  assert.equal(h.requests[0].url, SERVER);
-  assert.equal(h.requests[0].browserSignIn, true);
-  assert.equal(other.disabled, true);
-  h.requests[0].resolve({});
-  await tick();
-  h.connect.click();
-  assert.equal(h.requests[1].browserSignIn, undefined);
-  h.requests[1].resolve({});
-  await tick();
-  h.input.value = "http://localhost:6767";
-  h.input.dispatchEvent(new h.window.Event("input"));
-  assert.equal(other.hidden, true);
 });
 
 it("names recent servers that named themselves, keeping the host visible", async (t) => {

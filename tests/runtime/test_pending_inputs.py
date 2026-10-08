@@ -709,15 +709,42 @@ def test_resolve_matching_text_prefers_a_live_resend_over_an_interrupted_twin() 
     """
     cancelled = pending_inputs.record("conv_a", [_text_block("continue")])
     pending_inputs.mark_interrupted("conv_a", [cancelled])
-    other = pending_inputs.record("conv_a", [_text_block("something else")])
     resend = pending_inputs.record("conv_a", [_text_block("continue")])
 
     drained = pending_inputs.resolve_matching_text("conv_a", "continue")
 
     assert drained.matched is not None and drained.matched.pending_id == resend
-    # The cancelled twin drains quietly; a live message in between is still lost.
+    # The cancelled twin drains quietly without shadowing the live resend.
     assert [entry.pending_id for entry in drained.uncertain] == [cancelled]
-    assert [entry.pending_id for entry in drained.skipped] == [other]
+    assert drained.skipped == []
+    assert pending_inputs.pending_ids("conv_a") == []
+
+
+@pytest.mark.parametrize("with_attachment", [False, True])
+def test_delayed_interrupted_echo_does_not_skip_a_live_message_before_a_resend(
+    with_attachment: bool,
+) -> None:
+    content = [_text_block("continue")]
+    mirror = "continue"
+    if with_attachment:
+        content.insert(0, {"type": "input_image", "url": "img://1"})
+        mirror = "[Attached: /tmp/x.png]\n\ncontinue"
+    cancelled = pending_inputs.record("conv_a", content)
+    pending_inputs.mark_interrupted("conv_a", [cancelled])
+    other = pending_inputs.record("conv_a", [_text_block("something else")])
+    resend = pending_inputs.record("conv_a", content)
+
+    delayed = pending_inputs.resolve_matching_text("conv_a", mirror)
+
+    assert delayed.matched is not None and delayed.matched.pending_id == cancelled
+    assert delayed.skipped == [] and delayed.uncertain == []
+    assert pending_inputs.pending_ids("conv_a") == [other, resend]
+    intervening = pending_inputs.resolve_matching_text("conv_a", "something else")
+    assert intervening.matched is not None and intervening.matched.pending_id == other
+    assert intervening.skipped == []
+    latest = pending_inputs.resolve_matching_text("conv_a", mirror)
+    assert latest.matched is not None and latest.matched.pending_id == resend
+    assert latest.skipped == []
     assert pending_inputs.pending_ids("conv_a") == []
 
 

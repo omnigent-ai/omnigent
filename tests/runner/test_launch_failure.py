@@ -10,12 +10,23 @@ from omnigent.runner.launch_failure import (
     classify_native_turn_error,
     classify_terminal_failure,
     describe_failure_code,
+    diagnose_client_update_required,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
 # root — the exact scenario a root container hits.
 _ROOT_REFUSAL_OUTPUT = (
     "--dangerously-skip-permissions cannot be run with root privileges for security reasons"
+)
+
+# Claude Code's StopFailure text when the AI gateway cancels its upstream call.
+_GATEWAY_499_OUTPUT = 'API Error: 499 {"error_code":"CANCELLED","message":""}'
+
+# Claude Code's StopFailure text when its version predates the selected model.
+_CLIENT_UPDATE_OUTPUT = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
 )
 
 
@@ -190,6 +201,40 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
     assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
 
 
+_CONTENT_LENGTH_REJECTION = (
+    '{"error_code":"BAD_REQUEST","message":"Server received a request which '
+    "exceeds maximum allowed content length. RequestSize(bytes): 33967957, "
+    'Limit(bytes): 33554432"}'
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _CONTENT_LENGTH_REJECTION,
+        (
+            "Server received a request which exceeds maximum allowed content "
+            "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+        ),
+    ],
+)
+def test_classifies_content_length_cap_rejection_as_context_overflow(
+    code: str, message: str
+) -> None:
+    assert classify_native_turn_error(code, message) == "context_length_exceeded"
+
+
+def test_content_length_text_without_sizes_stays_generic() -> None:
+    message = "Server received a request which exceeds maximum allowed content length."
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing"])
+def test_content_length_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _CONTENT_LENGTH_REJECTION) == code
+
+
 @pytest.mark.parametrize(
     "code",
     # Budget detection runs before the early-return guard, so it applies to
@@ -249,10 +294,43 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "status_code: 504 Gateway Timeout",
         "API Error: 529",
         "The model is overloaded. Please retry your request.",
+        # The gateway's cancelled upstream call: Claude Code retries 503s, never 499.
+        _GATEWAY_499_OUTPUT,
+        "API Error: 499",
+        "API Error: Request rejected (499) · CANCELLED",
+        'unexpected status 499 Client Closed Request: {"error_code": "CANCELLED","message":""}',
+        '{"error_code":"CANCELLED","message":""}',
     ],
 )
 def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "transient_upstream_error"
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        # User interrupts and client-side aborts are not gateway failures.
+        "API Error: Request was aborted.",
+        "Request was aborted.",
+        "[Request interrupted by user]",
+        "[Request interrupted by user for tool use]",
+        "The operation was aborted",
+        "Turn cancelled by the user",
+        "Interrupted by user",
+        # Only a 3-digit 499 status or the CANCELLED envelope counts.
+        "Request rejected (4990)",
+        "API Error: 4991",
+        'API Error: 400 {"error_code":"INVALID_PARAMETER_VALUE","message":"query cancelled"}',
+    ],
+)
+def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == code
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
+def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _GATEWAY_499_OUTPUT) == code
 
 
 @pytest.mark.parametrize(
@@ -277,6 +355,68 @@ def test_429_still_classifies_as_rate_limit_not_transient() -> None:
     )
 
 
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _CLIENT_UPDATE_OUTPUT,
+        "inner executor error: " + _CLIENT_UPDATE_OUTPUT,
+        "Claude Code 2.1.263 does not support this model; version 2.1.280 or newer is required",
+        "does not support this model; version 3.0.0 or newer is required",
+    ],
+)
+def test_classifies_client_update_required(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "client_update_required"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: 400 INVALID_PARAMETER_VALUE: This model does not support image input.",
+        "Claude Code 2.1.217 does not support this feature; version 2.1.280 or newer is required",
+        "There's an issue with the selected model. It may not exist.",
+        "Node.js 22.13.0 or newer is required",
+    ],
+)
+def test_other_unsupported_model_errors_are_not_client_update(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+    assert diagnose_client_update_required(message) is None
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
+def test_client_update_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _CLIENT_UPDATE_OUTPUT) == code
+
+
+def test_client_update_diagnosis_names_both_versions_and_the_fix() -> None:
+    diagnosis = diagnose_client_update_required(_CLIENT_UPDATE_OUTPUT)
+
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code needs an update"
+    assert "2.1.217" in diagnosis.cause
+    assert "version 2.1.280 or newer" in diagnosis.cause
+    assert diagnosis.remediation is not None
+    assert "`claude update`" in diagnosis.remediation
+    assert "on the host" in diagnosis.remediation
+    assert diagnosis.category is ErrorCategory.CONFIG
+
+
+def test_client_update_diagnosis_without_installed_version_still_names_required() -> None:
+    diagnosis = diagnose_client_update_required(
+        "does not support this model; version 3.0.0 or newer is required"
+    )
+
+    assert diagnosis is not None
+    assert diagnosis.cause == (
+        "Claude Code on the host doesn't support this model; version 3.0.0 or newer is required."
+    )
+
+
+def test_client_update_diagnosis_ignores_unrelated_errors() -> None:
+    assert diagnose_client_update_required(_GATEWAY_499_OUTPUT) is None
+    assert diagnose_client_update_required("") is None
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
@@ -288,6 +428,7 @@ def test_429_still_classifies_as_rate_limit_not_transient() -> None:
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
         ("transient_upstream_error", "temporary error"),
+        ("client_update_required", "too old for the selected model"),
         ("budget_exhausted", "budget"),
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),

@@ -143,6 +143,48 @@ def _fail_pending_mcp_tools(conn: HostConnection) -> None:
             future.set_exception(ConnectionError("host disconnected"))
 
 
+def _fail_pending_inventory(pending: dict[str, asyncio.Future[Any]], host_id: str) -> None:
+    """Fail inventory waiters on their owner loops and clear the retired map."""
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    while True:
+        try:
+            _request_id, future = pending.popitem()
+        except KeyError:
+            break
+        if future.done():
+            continue
+        try:
+            owner_loop = future.get_loop()
+            if owner_loop.is_closed():
+                continue
+
+            def settle(future: asyncio.Future[Any] = future, host_id: str = host_id) -> None:
+                if not future.done():
+                    future.set_exception(ConnectionError(f"host '{host_id}' disconnected"))
+
+            if owner_loop is current_loop:
+                settle()
+            else:
+                owner_loop.call_soon_threadsafe(settle)
+        except RuntimeError:
+            # The owner loop can close between the check and scheduling. The
+            # pending map is already retired, so there is nothing to wake.
+            continue
+
+
+def _fail_pending_skills(conn: HostConnection) -> None:
+    """Fail skill-discovery requests as soon as their host disappears."""
+    _fail_pending_inventory(conn.pending_skills, conn.host_id)
+
+
+def _fail_pending_mcp_servers(conn: HostConnection) -> None:
+    """Fail MCP inventory requests as soon as their host disappears."""
+    _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+
+
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
 # come online (a 60s window today); 10 minutes covers slow retries with
@@ -527,6 +569,8 @@ class HostRegistry:
                 _fail_pending_plugins(old)
                 _fail_pending_skill_content(old)
                 _fail_pending_mcp_tools(old)
+                _fail_pending_skills(old)
+                _fail_pending_mcp_servers(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -573,6 +617,8 @@ class HostRegistry:
         _fail_pending_plugins(removed)
         _fail_pending_skill_content(removed)
         _fail_pending_mcp_tools(removed)
+        _fail_pending_skills(removed)
+        _fail_pending_mcp_servers(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

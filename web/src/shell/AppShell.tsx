@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
@@ -23,6 +24,7 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -70,7 +72,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { openAgentBrowserTab } from "@/hooks/useBrowserTabs";
+import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   findAgentTerminal,
@@ -93,7 +95,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
@@ -115,7 +117,7 @@ import {
 } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -496,6 +498,8 @@ export function AppShell() {
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
+  const [forkSourceSessionId, setForkSourceSessionId] = useState<string | null>(null);
+  const [forkHostSessionId, setForkHostSessionId] = useState<string | null>(null);
   // Truncation point for a "fork from here" opened from a message's
   // actions (ChatPage, via ForkDialogContext). `null` = full clone —
   // the mobile menu Clone entry's behavior. Cleared whenever the dialog
@@ -558,6 +562,23 @@ export function AppShell() {
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
   const { session: activeSession, isLoading: sessionLoading } = useSession(serverConversationId);
+  const { session: scopedForkSourceSession, error: scopedForkSourceError } =
+    useSession(forkSourceSessionId);
+  const { session: forkHostSession } = useSession(forkHostSessionId);
+  const forkSourceSession = forkSourceSessionId ? scopedForkSourceSession : activeSession;
+  const effectiveForkSourceSessionId = forkSourceSessionId ?? serverConversationId;
+  const forkSourceReady = !forkSourceSessionId || scopedForkSourceSession !== null;
+  useEffect(() => {
+    if (
+      !forkSourceSessionId ||
+      scopedForkSourceSession !== null ||
+      scopedForkSourceError === null ||
+      !forkOpen
+    )
+      return;
+    setForkOpen(false);
+    toast.error("Couldn't load the session to fork. Try again.");
+  }, [forkOpen, forkSourceSessionId, scopedForkSourceError, scopedForkSourceSession]);
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -617,6 +638,10 @@ export function AppShell() {
   const parentConv = useMemo(
     () => allConversations?.find((c) => c.id === activeSession?.parentSessionId) ?? null,
     [allConversations, activeSession?.parentSessionId],
+  );
+  const forkHostConv = useMemo(
+    () => allConversations?.find((c) => c.id === forkHostSessionId) ?? null,
+    [allConversations, forkHostSessionId],
   );
   // ── Header breadcrumb ─────────────────────────────────────────────────
   // The chat header shows the conversation's title, prefixed by a folder icon
@@ -896,7 +921,7 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
+        // Pull Requests tab: shares the Files/workspace gate. Non-git workspaces and
         // other unavailable reasons are shown as empty states in the panel.
         github: showFilesPanel,
         // Browser soft tabs: available only when the shell hosts the embedded
@@ -996,7 +1021,9 @@ export function AppShell() {
         const shot = designShotRef.current.get(cid);
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
         const chat = useChatStore.getState();
-        if (cid !== chat.conversationId) {
+        // `cid` is the browser view ID; user-opened tabs encode their owning session.
+        const ownerId = browserViewOwnerId(cid);
+        if (ownerId !== chat.conversationId) {
           designShotRef.current.delete(cid);
           signal(false, "Return to this session before sending.");
           return;
@@ -1004,7 +1031,7 @@ export function AppShell() {
         const files = file ? [file] : undefined;
         if (
           shouldQueueSend(
-            cid,
+            ownerId,
             chat.status,
             chat.sessionStatus,
             chat.queuedMessages,
@@ -2010,9 +2037,9 @@ export function AppShell() {
     setShellsPanelOpen(true);
   }
 
-  // Mobile FAB → "GitHub" opens the GitHub panel as a full-screen drawer
-  // (matches the desktop rail's GitHub tab; the panel handles all states —
-  // not-a-git-repo, no gh CLI, unauthenticated, no PR — itself).
+  // Mobile FAB → "Pull Requests" opens the pull request panel as a full-screen
+  // drawer (matches the desktop rail's Pull Requests tab; the panel handles all
+  // states — not-a-git-repo, no provider CLI, unauthenticated, no PR — itself).
   const openGithubPanel = useCallback(() => {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
@@ -2025,7 +2052,7 @@ export function AppShell() {
     setGithubPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
 
-  // Composer links open the mobile drawer or reveal the desktop GitHub tab.
+  // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
   const openGithubTab = useCallback(() => {
     if (isMobileViewport()) {
@@ -2237,12 +2264,21 @@ export function AppShell() {
   const forkDialogContextValue = useMemo<ForkDialogContextValue>(
     () => ({
       canFork: canClone,
-      openForkDialog: (opts?: { upToResponseId?: string }) => {
+      openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => {
+        const sourceSessionId = opts?.sourceSessionId ?? null;
+        const sourceState = sourceSessionId
+          ? queryClient.getQueryState(["session", sourceSessionId])
+          : undefined;
+        if (sourceSessionId && sourceState?.status === "error" && sourceState.data === undefined) {
+          void queryClient.resetQueries({ queryKey: ["session", sourceSessionId], exact: true });
+        }
+        setForkSourceSessionId(sourceSessionId);
+        setForkHostSessionId(sourceSessionId ? (serverConversationId ?? null) : null);
         setForkUpToResponseId(opts?.upToResponseId ?? null);
         setForkOpen(true);
       },
     }),
-    [canClone],
+    [canClone, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2386,6 +2422,7 @@ export function AppShell() {
                     // appeared. Left collapsed, the breadcrumb stays put beneath
                     // the floating card (and in the title-bar strip on mac).
                     sidebarOpen={sidebarOpen}
+                    settingsMode={inSettings}
                     onOpenSidebar={(peek?: boolean) => {
                       if (peek) {
                         setSidebarPeek(true);
@@ -2608,11 +2645,11 @@ export function AppShell() {
               {conversationId && showFilesPanel && (
                 <MobilePanelDrawer
                   open={githubPanelOpen}
-                  title="GitHub"
+                  title="Pull Requests"
                   onClose={() => setGithubPanelOpen(false)}
                   testId="github-panel-drawer"
                 >
-                  <GithubPanel conversationId={conversationId} />
+                  <PullRequestPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
@@ -2641,23 +2678,35 @@ export function AppShell() {
               onOpenChange={setShareOpen}
             />
           )}
-          {conversationId && (
+          {effectiveForkSourceSessionId && forkSourceReady && (
             <ForkSessionDialog
-              // Remount per session so the title prefill (captured at mount)
-              // re-derives when the user navigates between sessions.
-              key={`fork-session-dialog-${conversationId}`}
-              sourceSessionId={conversationId}
-              sourceTitle={activeSession?.title}
-              sourceWorkspace={activeSession?.workspace ?? parentConv?.workspace}
-              sourceHostId={activeSession?.hostId ?? parentConv?.host_id}
-              sourceGitBranch={activeSession?.gitBranch}
+              // Remount per source so source-derived form defaults reset when
+              // a side-chat bubble opens the app-wide dialog.
+              key={`fork-session-dialog-${effectiveForkSourceSessionId}`}
+              sourceSessionId={effectiveForkSourceSessionId}
+              sourceTitle={forkSourceSession?.title}
+              sourceWorkspace={
+                forkSourceSession?.workspace ??
+                (forkSourceSessionId
+                  ? (forkHostSession?.workspace ?? forkHostConv?.workspace)
+                  : parentConv?.workspace)
+              }
+              sourceHostId={
+                forkSourceSession?.hostId ??
+                (forkSourceSessionId
+                  ? (forkHostSession?.hostId ?? forkHostConv?.host_id)
+                  : parentConv?.host_id)
+              }
+              sourceGitBranch={forkSourceSession?.gitBranch}
               upToResponseId={forkUpToResponseId}
               open={forkOpen}
               onOpenChange={(open) => {
                 setForkOpen(open);
-                // Closing clears the truncation point so a later Clone (or
-                // reopened dialog) doesn't silently fork a partial history.
-                if (!open) setForkUpToResponseId(null);
+                // A later opener replaces the source; only truncation must
+                // clear immediately so Clone never forks partial history.
+                if (!open) {
+                  setForkUpToResponseId(null);
+                }
               }}
             />
           )}
@@ -2696,6 +2745,8 @@ export function AppShell() {
           <KeyboardShortcutsDialog />
           {/* Opens the import modal once per newly connected host. */}
           {!isEmbedded && <ImportReviewGate />}
+          {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
+          {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
           {/* Dev-only `?import-preview` for the post-setup import modal. */}
           {ImportContextPreview && (
             <Suspense fallback={null}>

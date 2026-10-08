@@ -329,7 +329,10 @@ def test_cli_exports_credits_and_compact_fallback(monkeypatch, tmp_path) -> None
     assert json.loads(credits.read_text()) == [
         {"pr": 1, "author": "alice", "author_url": "https://github.com/alice"}
     ]
-    assert "## Other contributions" in notes.read_text()
+    assert "## Other contributions" not in notes.read_text()
+    assert "### 💜 Thanks to our community" in notes.read_text()
+    assert "[@alice](https://github.com/alice)" in notes.read_text()
+    assert "/pull/" not in notes.read_text()
     assert "Fix typo" not in notes.read_text()
 
 
@@ -369,7 +372,7 @@ def test_pr_list_handles_missing_title() -> None:
     assert "#5: (no title)" in listing
 
 
-def test_all_contributions_have_linked_credits() -> None:
+def test_all_contributions_keep_changelog_credits_without_release_pr_list() -> None:
     results = [
         gen.harvest_pr(1, _body("Fix a crash"), "fix: crash", "alice"),
         gen.harvest_pr(2, _body(None).replace("Bug fix", "Docs"), "docs: typo", "bob"),
@@ -378,14 +381,15 @@ def test_all_contributions_have_linked_credits() -> None:
     ]
     notes = gen.render_draft_notes(results, _REPO)
     section = gen.render_section("v1.0.0", "2026-09-24", results, _REPO)
-    for text in (notes, section):
-        for result in results:
-            assert text.count(f"[#{result.pr}](https://github.com/{_REPO}/pull/{result.pr})") == 1
-            assert f"[@{result.author}](https://github.com/{result.author})" in text
+    for result in results:
+        assert section.count(f"[#{result.pr}](https://github.com/{_REPO}/pull/{result.pr})") == 1
+        assert f"[@{result.author}](https://github.com/{result.author})" in section
+        assert f"[@{result.author}](https://github.com/{result.author})" in notes
+    assert "/pull/" not in notes
     for description in ("docs: typo", "chore: update CI", "Legacy PR"):
         assert description in section
         assert description not in notes
-    assert "## Other contributions" in notes
+    assert "## Other contributions" not in notes
     assert "## Documentation updates" not in notes
     assert "(@bob)" in gen.render_pr_list(results)
 
