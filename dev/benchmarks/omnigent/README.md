@@ -100,7 +100,10 @@ run stays within the CI time budget. Caps only lower a count, never raise it.
 - `session_cold_start`, `session_cold_restart`: 1 warmup and up to 14 samples.
   Every op launches a fresh runner, so one warmup absorbs the first-launch
   costs; a run launches at most 15 runners.
-- `cli_startup`: no warmup, up to 6 samples.
+- `cli_startup`: no warmup, up to 6 samples. Times `omnigent polly --server` from
+  invocation until the REPL toolbar reports `ready`. The CLI gets its own data
+  and config dirs, and between samples only its own daemons are stopped, so the
+  journey is safe to run next to a local Omnigent server.
 
 | Journey | Operation timed |
 | --- | --- |
@@ -383,8 +386,12 @@ baseline's schema. Dispatch it with `baseline_ref` == `candidate_ref` for an A/A
 noise check.
 
 `compare.py` (used by the release and PR gates) flags a regression on run-median
-P50 or P95. Journeys with fewer than 20 samples per run (the capped full-turn and
-`cli_startup` journeys) gate on P50 only, since their P95 is the slowest sample.
+P50 or P95 (`--threshold`, and optionally a separate `--threshold-p95`). Journeys
+with fewer than 20 samples per run gate on P50 only, since their P95 is the slowest
+sample. A journey whose candidate ops all failed is `failed` and fails the gate.
+The release gate uses 30% on P50 and 50% on P95, about twice the worst
+per-journey noise seen in same-runner A/A runs; the PR benchmark's comparison
+against the nightly (a different VM) stays at 100%.
 
 Schema changes need no manual step: the seed always targets the current
 migrated schema (migrations run when the store is constructed), the reuse

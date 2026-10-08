@@ -3943,6 +3943,21 @@ describe("Mobile session menu", () => {
 });
 
 describe("AppShell clone/fork action", () => {
+  it("blocks direct current-session fork openers for an unsupported managed session", () => {
+    mockConversations([{ id: "conv_managed", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_managed",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_managed");
+    fireEvent.click(screen.getByTestId("fork-probe-open"));
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
+
   it("exposes canFork to a read-only collaborator on a top-level session", () => {
     // level 1 = read. A collaborator who can only view the shared session
     // must still be able to fork it into their own copy. The header/menu
@@ -5037,11 +5052,11 @@ describe("AppShell design-mode submission", () => {
     restoreGetState();
   });
 
-  function submitInstruction(prompt = "Use a week picker.") {
+  function submitInstruction(prompt = "Use a week picker.", viewId = "conv_design") {
     act(() => {
-      select({ conversationId: "conv_design", screenshot: "data:image/png;base64,AQID" });
+      select({ conversationId: viewId, screenshot: "data:image/png;base64,AQID" });
       submit({
-        conversationId: "conv_design",
+        conversationId: viewId,
         id: 1,
         element: { tag: "input", id: "#period" },
         prompt,
@@ -5109,6 +5124,47 @@ describe("AppShell design-mode submission", () => {
       "First change",
       "Second change",
     ]);
+  });
+
+  // User-opened tabs submit with their `browser-tab:` view ID, not the session ID.
+  it("sends a submission from a user-opened tab in the current session", () => {
+    renderShell("/c/conv_design");
+    submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
+    expect(send).not.toHaveBeenCalled();
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+    const files = enqueueMessage.mock.calls[0][1] as File[];
+    expect(files).toHaveLength(1);
+    expect(signal).toHaveBeenCalledWith("browser-tab:conv_design:tab-two", {
+      id: 1,
+      ok: true,
+      message: "Queued for agent.",
+    });
+  });
+
+  it("queues a user-opened tab submission behind the session's existing backlog", () => {
+    localStorage.setItem("omnigent:always-steer", "true");
+    Object.assign(chat, {
+      queuedMessages: [
+        { queueId: "earlier", conversationId: "conv_design", text: "Earlier change" },
+      ],
+    });
+    renderShell("/c/conv_design");
+    submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
+    expect(send).not.toHaveBeenCalled();
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a user-opened tab submission after switching to another session", () => {
+    renderShell("/c/conv_design");
+    chat.conversationId = "conv_other";
+    submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
+    expect(enqueueMessage).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(signal).toHaveBeenCalledWith("browser-tab:conv_design:tab-two", {
+      id: 1,
+      ok: false,
+      message: "Return to this session before sending.",
+    });
   });
 
   it("rejects a late pointer submission after switching to another session", () => {

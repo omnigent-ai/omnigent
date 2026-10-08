@@ -144,6 +144,44 @@ async def test_stale_continuation_without_model_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_end_freezes_gc_once_only_when_armed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After its first completed turn's stream ends, the subprocess collects then freezes, once."""
+    from omnigent.runtime.harnesses import _scaffold
+
+    gc_calls: list[str] = []
+    monkeypatch.setattr(_scaffold.gc, "collect", lambda: gc_calls.append("collect") or 0)
+    monkeypatch.setattr(_scaffold.gc, "freeze", lambda: gc_calls.append("freeze"))
+    monkeypatch.setattr(_scaffold, "_freeze_gc_after_first_turn", False)
+    outcomes: list[str] = []
+
+    class _App(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            outcome = outcomes.pop(0)
+            if outcome == "fail":
+                raise RuntimeError("turn failed")
+            if outcome == "cancel":  # observed the cancel and returned normally
+                ctx.cancelled.set()
+
+    app = _App()
+    request = CreateResponseRequest(model="test-agent", input="hi")
+
+    async def _turn(outcome: str, terminal: str = "response.completed") -> list[str]:
+        outcomes.append(outcome)
+        ctx = TurnContext(f"resp_{len(gc_calls)}", asyncio.Queue(), asyncio.Event())
+        frames = [frame async for frame in app._stream_turn(request, ctx, model="test-agent")]
+        assert f"event: {terminal}".encode() in frames[-1]
+        return gc_calls[:]
+
+    assert await _turn("ok") == []  # an embedding process never arms it
+
+    _scaffold.arm_gc_freeze_after_first_turn()
+    assert await _turn("fail", "response.failed") == []  # a failed turn keeps it armed
+    assert await _turn("cancel", "response.cancelled") == []  # so does a cancelled one
+    assert await _turn("ok") == ["collect", "freeze"]
+    assert await _turn("ok") == ["collect", "freeze"]  # one-shot
+
+
+@pytest.mark.asyncio
 async def test_build_terminal_event_waits_for_run_task_failure() -> None:
     """
     Terminal synthesis must wait for the run task to fully settle.

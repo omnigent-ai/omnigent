@@ -60,6 +60,7 @@ import type {
   SessionStatusEvent,
   SessionTerminalPendingEvent,
   StreamEvent,
+  TerminalCommandEvent,
 } from "@/lib/events";
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
@@ -512,6 +513,7 @@ beforeEach(() => {
     conversationId: null,
     blocks: [],
     pendingUserMessages: [],
+    settledShellInputs: [],
     queuedMessages: [],
     activeResponse: null,
     status: "idle",
@@ -8158,6 +8160,341 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent(event);
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+  });
+
+  describe("terminal_command (claude-native !cmd)", () => {
+    const shellEvent = (kind: "input" | "output", command = "ls"): TerminalCommandEvent => ({
+      type: "terminal_command",
+      kind,
+      input: kind === "input" ? command : null,
+      stdout: kind === "output" ? "a.txt" : null,
+      stderr: null,
+      itemId: `item_shell_${kind}`,
+      responseId: "resp_shell_1",
+    });
+    const bubble = (tempId: string, text: string) => ({
+      tempId,
+      content: [{ type: "input_text" as const, text }],
+    });
+    const receipt = (itemId: string, text: string, clearedPendingId: string): StreamEvent => ({
+      type: "session_input_consumed",
+      itemId,
+      itemType: "message",
+      clearedPendingId,
+      data: { role: "user", content: [{ type: "input_text", text }], user_authored: true },
+    });
+    // A sent bubble keeps its client key; the server's pending id rides along.
+    const sent = (n: number, text: string) => ({
+      ...bubble(`pend_${n}`, text),
+      posted: true,
+      pendingId: `pending_${n}`,
+    });
+
+    it("pops the queued bubble whose command was mirrored", () => {
+      // A `!cmd` runs as a shell command, so no `session.input.consumed`
+      // follows. The server settles the entry whose text is that command; the
+      // matching bubble must clear with it, or the next message's receipt would
+      // pop this one and strand its own.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "!ls"), bubble("pend_2", "next")],
+      });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([bubble("pend_2", "next")]);
+    });
+
+    it("pops only the `!ls` bubble when it is queued behind a plain message", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "fix the bug"), bubble("pend_2", "!ls")],
+      });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        bubble("pend_1", "fix the bug"),
+      ]);
+    });
+
+    it("pops nothing for a command typed in the terminal", () => {
+      // No web bubble is that command, so the queued messages are still queued.
+      const pending = [
+        bubble("pend_1", "fix the bug"),
+        bubble("pend_2", "!ls"),
+        bubble("pend_3", "next"),
+      ];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("input", "pwd"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it.each([
+      ["!  ls   -la", "ls -la"],
+      ["!ls -la", "ls   -la"],
+      ["! ls -la", "ls -la"],
+    ])("matches %j against the mirrored command %j across spacing", (queued, command) => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [bubble("pend_1", queued)] });
+
+      handleSessionEvent(shellEvent("input", command));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("pops the oldest of two identical commands", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [bubble("pend_1", "!ls"), bubble("pend_2", "! ls")],
+      });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([bubble("pend_2", "! ls")]);
+    });
+
+    it("does not take a plain message that repeats the command for the shell command", () => {
+      const pending = [bubble("pend_1", "ls")];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it("never pops an unsent draft", () => {
+      const draft = {
+        ...bubble("pend_draft", "!ls"),
+        initialDraft: { text: "!ls", files: [] },
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [draft] });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([draft]);
+    });
+
+    it("matches nothing for an empty command", () => {
+      const pending = [bubble("pend_1", "!")];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("input", "  "));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it("leaves pendingUserMessages alone on the output half", () => {
+      const pending = [bubble("pend_1", "!ls")];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+
+      handleSessionEvent(shellEvent("output"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+    });
+
+    it("is a no-op when pendingUserMessages is empty (observing client)", () => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("keeps the next message's bubble through an older server's skip receipt", () => {
+      // An older server never drains the `!cmd` entry: the next message's mirror
+      // persists it as skipped, with a receipt naming the bubble popped above.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [sent(1, "!echo hi"), sent(2, "thanks")],
+      });
+
+      handleSessionEvent(shellEvent("input", "echo hi"));
+      handleSessionEvent(receipt("item_skipped_user", "!echo hi", "pending_1"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(2, "thanks")]);
+
+      handleSessionEvent(receipt("item_thanks", "thanks", "pending_2"));
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks).toMatchObject([
+        {
+          type: "user_message",
+          ctx: { itemId: "item_skipped_user" },
+          content: [{ text: "!echo hi" }],
+        },
+        { type: "user_message", ctx: { itemId: "item_thanks" }, stableKey: "pend_2" },
+      ]);
+    });
+
+    it("keeps every later bubble queued through the skip receipt", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [sent(1, "!echo hi"), sent(2, "thanks"), sent(3, "more")],
+      });
+
+      handleSessionEvent(shellEvent("input", "echo hi"));
+      handleSessionEvent(receipt("item_skipped_user", "!echo hi", "pending_1"));
+      handleSessionEvent(receipt("item_thanks", "thanks", "pending_2"));
+
+      // "thanks" took its own bubble, so "more" stays visible until its mirror lands.
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(3, "more")]);
+
+      handleSessionEvent(receipt("item_more", "more", "pending_3"));
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks).toMatchObject([
+        { ctx: { itemId: "item_skipped_user" } },
+        { ctx: { itemId: "item_thanks" }, stableKey: "pend_2" },
+        { ctx: { itemId: "item_more" }, stableKey: "pend_3" },
+      ]);
+    });
+
+    it("keeps the next bubble when the skipped command's item already rendered", () => {
+      // The forwarder-mirrored item beat its receipt into `blocks`.
+      const rendered = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "",
+          itemId: "item_skipped",
+        },
+        content: [{ type: "input_text", text: "!echo hi" }],
+      } as unknown as AnyBlock;
+      useChatStore.setState({
+        blocks: [rendered],
+        pendingUserMessages: [sent(1, "!echo hi"), sent(2, "thanks")],
+      });
+
+      handleSessionEvent(shellEvent("input", "echo hi"));
+      handleSessionEvent(receipt("item_skipped", "!echo hi", "pending_1"));
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([sent(2, "thanks")]);
+      expect(state.blocks).toEqual([rendered]);
+    });
+
+    it("settles the head for a receipt naming an id no shell input cleared", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [sent(1, "!echo hi"), sent(2, "thanks")],
+      });
+
+      handleSessionEvent(shellEvent("input", "echo hi"));
+      handleSessionEvent(receipt("item_thanks", "thanks", "pending_unknown"));
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks).toMatchObject([{ ctx: { itemId: "item_thanks" }, stableKey: "pend_2" }]);
+    });
+
+    it("does not consume an identical later command on a replayed shell mirror", () => {
+      useChatStore.setState({ pendingUserMessages: [sent(1, "!ls"), sent(2, "!ls")] });
+
+      handleSessionEvent(shellEvent("input"));
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(2, "!ls")]);
+      handleSessionEvent({ ...shellEvent("input"), itemId: "item_shell_second" });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("does not consume a new send on a replay of an observed terminal command", () => {
+      handleSessionEvent(shellEvent("input"));
+      useChatStore.setState({ pendingUserMessages: [sent(1, "!ls")] });
+
+      handleSessionEvent(shellEvent("input"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(1, "!ls")]);
+    });
+
+    it("keeps the next bubble through repeated legacy skip receipts", () => {
+      useChatStore.setState({ pendingUserMessages: [sent(1, "!ls"), sent(2, "next")] });
+      handleSessionEvent(shellEvent("input"));
+
+      handleSessionEvent(receipt("item_skipped", "!ls", "pending_1"));
+      handleSessionEvent(receipt("item_skipped", "!ls", "pending_1"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(2, "next")]);
+      expect(useChatStore.getState().blocks).toHaveLength(1);
+    });
+
+    it("recognizes a legacy receipt that beats the shell POST acknowledgement", () => {
+      useChatStore.setState({
+        pendingUserMessages: [bubble("pend_unacked", "!ls"), sent(2, "next")],
+      });
+      handleSessionEvent(shellEvent("input"));
+
+      handleSessionEvent(receipt("item_skipped", "!ls", "pending_unacked"));
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(2, "next")]);
+    });
+
+    it("adopts the server id when the POST acknowledgement follows the shell mirror", async () => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      let resolvePost: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          return new Promise<Response>((resolve) => {
+            resolvePost = () =>
+              resolve(mockResponse({ queued: true, pending_id: "pending_shell" }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("!ls", "agent_xyz");
+      await vi.waitFor(() => expect(resolvePost).not.toBeNull());
+      handleSessionEvent(shellEvent("input"));
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+
+      resolvePost!();
+      await sending;
+      expect(useChatStore.getState().settledShellInputs).toMatchObject([
+        { pendingId: "pending_shell" },
+      ]);
+      useChatStore.setState({ pendingUserMessages: [sent(2, "next")] });
+      handleSessionEvent(receipt("item_skipped", "!ls", "pending_shell"));
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(2, "next")]);
+    });
+
+    it("records a sent `!cmd`'s server id so its skip receipt is recognised", async () => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      let posts = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          posts += 1;
+          return mockResponse({ queued: true, pending_id: `pending_${posts}` });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().send("!echo hi", "agent_xyz");
+      await useChatStore.getState().send("thanks", "agent_xyz");
+
+      handleSessionEvent(shellEvent("input", "echo hi"));
+      handleSessionEvent(receipt("item_skipped_user", "!echo hi", "pending_1"));
+
+      expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+        { content: [{ text: "thanks" }], pendingId: "pending_2" },
+      ]);
     });
   });
 

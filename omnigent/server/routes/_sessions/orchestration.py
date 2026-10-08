@@ -41,6 +41,7 @@ from omnigent.entities import (
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
+    TerminalCommandData,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -2743,19 +2744,31 @@ def _native_mirror_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _shell_command_input(item: NewConversationItem) -> str | None:
+    """Return a mirrored shell input's command, excluding its output half."""
+    if (
+        item.type == "terminal_command"
+        and isinstance(item.data, TerminalCommandData)
+        and item.data.kind == "input"
+    ):
+        return item.data.input or None
+    return None
+
+
 def _drains_pending_inputs(item: NewConversationItem) -> bool:
     """
     Whether a mirrored item settles a queued web message.
 
-    True for a web-composer user message echoed back by the transcript and for
-    a slash command (typed in the web composer as plain text, mirrored as a
-    ``slash_command`` item). Assistant and tool items never touch the queue.
+    User messages, slash commands, and shell-command inputs can settle web
+    submissions. Assistant messages, tool items, and shell outputs cannot.
 
     :param item: The parsed external item.
     :returns: ``True`` when persisting *item* drains a pending-input entry.
     """
     if item.type == "slash_command":
         return isinstance(item.data, SlashCommandData)
+    if item.type == "terminal_command":
+        return _shell_command_input(item) is not None
     return (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2981,6 +2994,10 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
         held_older = matched.skipped
+    elif (shell_command := _shell_command_input(item)) is not None:
+        drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
+        if drained is not None:
+            cleared_pending_id = drained.pending_id
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error) with stable

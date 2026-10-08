@@ -2778,8 +2778,8 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        updated = await asyncio.to_thread(
-            conversation_store.update_conversation,
+        update_result = await asyncio.to_thread(
+            conversation_store.update_conversation_with_changes,
             session_id,
             title=body.title,
             reasoning_effort=None if clear_effort else effort,
@@ -2798,8 +2798,10 @@ def register_core_routes(
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
-        if updated is None:
+        if update_result is None:
             raise _session_not_found()
+        updated = update_result.conversation
+        effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
             # An active live change orders this write against its own when refused.
@@ -2850,7 +2852,11 @@ def register_core_routes(
         negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
         combined_model_forward = False
         _model_forward = None
-        if live_forward and (effort is not None or clear_effort):
+        if (
+            live_forward
+            and (effort is not None or clear_effort)
+            and (effort_changed or (live_model_change and codex_native))
+        ):
             effort_event: dict[str, object] = {
                 "type": "effort_change",
                 "effort": updated.reasoning_effort,

@@ -283,9 +283,14 @@ jobs:
   cut:
     needs: [authorize, plan, benchmark, benchmark-approve]
     # benchmark-approve is skipped unless a regression is flagged, and the whole
-    # benchmark chain under skip_benchmark. `!cancelled` lets those skips through
-    # (it also lets a failed benchmark through — only a flagged regression gates).
-    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !cancelled() }}
+    # benchmark chain under skip_benchmark, so those two may be skipped. Anything
+    # else — a failed benchmark, a rejected approval, a failed plan — stops the
+    # cut; re-dispatch with skip_benchmark=true to cut without the benchmark.
+    if: >-
+      ${{ !cancelled() && !inputs.dry_run && needs.plan.outputs.already_done != 'true' &&
+      needs.authorize.result == 'success' && needs.plan.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.benchmark.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.benchmark-approve.result) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

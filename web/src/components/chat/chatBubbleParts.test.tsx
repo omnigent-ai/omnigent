@@ -101,6 +101,29 @@ describe("AssistantBubble fork source", () => {
     items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
   };
 
+  it("disables the message fork without hiding its explanation", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            canFork: true,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       name: "side chat",
@@ -489,6 +512,25 @@ describe("AssistantBubble sealed side-chat recovery", () => {
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended."),
     );
+  });
+});
+
+describe("UserBubble shell prompts", () => {
+  it("preserves shell syntax and attachment-like text literally", () => {
+    const command = "printf '%s\\n' '**hi**' '[Attached: /tmp/file]' '`pwd`'\necho done";
+    const bubble: Extract<Bubble, { kind: "user" }> = {
+      kind: "user",
+      itemId: "shell-input",
+      content: [{ type: "input_text", text: `!${command}` }],
+      shellCommand: command,
+    };
+    render(<BubbleView bubble={bubble} />);
+
+    const prompt = screen.getByTestId("message-bubble");
+    expect(prompt).toHaveAttribute("data-role", "user");
+    expect(prompt).toHaveAttribute("data-user-message-id", "shell-input");
+    expect(prompt.querySelector("pre")?.textContent).toBe(`!${command}`);
+    expect(screen.getByTestId("copy-message-link")).toBeEnabled();
   });
 });
 

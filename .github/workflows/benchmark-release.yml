@@ -194,13 +194,24 @@ jobs:
           done
           exit "$rc"
 
+      # Thresholds come from same-runner A/A runs: the worst per-journey noise
+      # was ~15% on run-median P50 and ~23% on gated P95, so gate at ~2x that.
       - name: Compare results
         id: compare
         if: steps.refs.outputs.baseline != ''
         working-directory: candidate
         env:
           REQUIRE_JOURNEYS: ${{ inputs.require_journeys }}
+          P50_THRESHOLD: "0.3"
+          P95_THRESHOLD: "0.5"
         run: |
+          # These thresholds assume the comparator that skips small-sample P95.
+          # An older candidate's compare.py predates it (and --threshold-p95), so
+          # it keeps the 100% it was tuned for.
+          thresholds=(--threshold 1.0)
+          if uv run --no-sync dev/benchmarks/omnigent/compare.py --help | grep -q -- '--threshold-p95'; then
+            thresholds=(--threshold "$P50_THRESHOLD" --threshold-p95 "$P95_THRESHOLD")
+          fi
           require=()
           if [ -n "$REQUIRE_JOURNEYS" ]; then
             require=(--require "$REQUIRE_JOURNEYS" --output-json ../comparison.json)
@@ -209,10 +220,16 @@ jobs:
           uv run --no-sync dev/benchmarks/omnigent/compare.py \
             --baseline ../baseline.json \
             --candidate ../candidate.json \
-            --threshold 1.0 \
+            "${thresholds[@]}" \
             --output-markdown ../comparison.md "${require[@]}"
           RC=$?
           set -e
+          # 1 with a report = regression, 3 = a required journey was not measured.
+          # Anything else means the comparison broke (an uncaught exception exits 1, no report).
+          if { [ "$RC" -ne 0 ] && [ "$RC" -ne 1 ] && [ "$RC" -ne 3 ]; } || { [ "$RC" -eq 1 ] && [ ! -s ../comparison.md ]; }; then
+            echo "::error::compare.py failed (exit ${RC})."
+            exit "$RC"
+          fi
           # Exit 1 (regression) can also have unmeasured journeys, so read them from the report.
           complete=true
           unmeasured=""
@@ -224,7 +241,6 @@ jobs:
             unmeasured="$(jq -r '.unmeasured | join(",")' ../comparison.json)"
             [ -z "$unmeasured" ] || complete=false
           fi
-          # 3 = no regression, but a required journey was not measured on both sides.
           [ "$RC" -ne 3 ] || RC=0
           {
             echo "regression=$([ $RC -ne 0 ] && echo 'true' || echo 'false')"
@@ -251,7 +267,7 @@ jobs:
             echo ""
             cat comparison.md 2>/dev/null || echo "_No comparison report generated._"
             echo ""
-            echo "_Candidate vs ${BASELINE_REF} · 100 iterations × 3 runs · SQLite · threshold 100% on P50/P95 · both run concurrently on one runner (${CPU_MODEL:-unknown CPU}, $(nproc) vCPU)_"
+            echo "_Candidate vs ${BASELINE_REF} · 100 iterations × 3 runs · SQLite · both run concurrently on one runner (${CPU_MODEL:-unknown CPU}, $(nproc) vCPU)_"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload comparison artifacts

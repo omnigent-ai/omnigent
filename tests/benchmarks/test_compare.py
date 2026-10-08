@@ -236,3 +236,138 @@ def test_cli_output_json_lists_rows(tmp_path: Path) -> None:
     assert rc == 1
     assert data["passed"] is False
     assert [(r["journey"], r["status"]) for r in data["rows"]] == [("interrupt", "regression")]
+
+
+def test_compare_applies_a_separate_p95_threshold() -> None:
+    # P50 +20% stays under a 30% P50 threshold; P95 +50% stays under a 60% P95 one.
+    baseline = {"journeys": {"list_sessions": _journey([10, 10, 10], [20, 20, 20], n=100)}}
+    candidate = {"journeys": {"list_sessions": _journey([12, 12, 12], [30, 30, 30], n=100)}}
+
+    passed, rows = compare_reports(
+        baseline, candidate, threshold=0.3, backend="sqlite", threshold_p95=0.6
+    )
+    assert passed
+    assert rows[0]["status"] == "ok"
+
+    # Without the separate threshold, the same +50% P95 trips the 30% gate.
+    passed, rows = compare_reports(baseline, candidate, threshold=0.3, backend="sqlite")
+    assert not passed
+    assert rows[0]["status"] == "regression"
+
+
+def test_compare_p95_threshold_does_not_loosen_p50() -> None:
+    baseline = {"journeys": {"list_sessions": _journey([10, 10, 10], [20, 20, 20], n=100)}}
+    candidate = {"journeys": {"list_sessions": _journey([14, 14, 14], [21, 21, 21], n=100)}}
+
+    passed, rows = compare_reports(
+        baseline, candidate, threshold=0.3, backend="sqlite", threshold_p95=0.6
+    )
+
+    assert not passed  # P50 +40% > 30%
+    assert rows[0]["status"] == "regression"
+
+
+def test_markdown_states_both_thresholds() -> None:
+    baseline = {"journeys": {"list_sessions": _journey([10, 10, 10], [20, 20, 20], n=100)}}
+    passed, rows = compare_reports(
+        baseline, baseline, threshold=0.3, backend="sqlite", threshold_p95=0.6
+    )
+
+    markdown = build_markdown(rows, threshold=0.3, passed=passed, threshold_p95=0.6)
+
+    assert "**30%** on run-median P50, **60%** on P95" in markdown
+    assert "**100%** on run-median P50 or P95" in build_markdown(
+        rows, threshold=1.0, passed=passed
+    )
+
+
+def _failed_journey(runs: int = 3) -> dict:
+    """A journey whose every op failed: runs exist, latencies are 0.0 placeholders."""
+    return {
+        "backend": "sqlite",
+        "runs": [
+            {"n_success": 0, "n_failures": 100, "p50_ms": 0.0, "p95_ms": 0.0} for _ in range(runs)
+        ],
+        "summary": {"runs_total": runs, "runs_ok": 0},
+    }
+
+
+def test_compare_fails_a_journey_whose_every_candidate_op_failed() -> None:
+    # Both sides failed every request (all HTTP 500s); 0.0 ms is not a measurement.
+    baseline = {"journeys": {"policy_evaluate": _failed_journey()}}
+    candidate = {"journeys": {"policy_evaluate": _failed_journey()}}
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert not passed
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["c_p50"] is None
+    assert rows[0]["delta_p50"] is None
+    markdown = build_markdown(rows, threshold=1.0, passed=passed)
+    assert "| policy_evaluate | ❌ failed |" in markdown
+    assert "**FAIL**" in markdown
+
+
+def test_compare_fails_when_only_the_candidate_failed() -> None:
+    baseline = {"journeys": {"policy_evaluate": _journey([10, 10, 10], [12, 12, 12], n=100)}}
+    candidate = {"journeys": {"policy_evaluate": _failed_journey()}}
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert not passed
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["b_p50"] == 10
+
+
+def test_compare_ignores_failed_runs_in_the_run_median() -> None:
+    # One run failed outright; its 0.0 placeholder must not drag the median down.
+    candidate_journey = _journey([10, 10], [12, 12], n=100)
+    candidate_journey["runs"].append({"n_success": 0, "p50_ms": 0.0, "p95_ms": 0.0})
+    baseline = {"journeys": {"list_sessions": _journey([10, 10, 10], [12, 12, 12], n=100)}}
+    candidate = {"journeys": {"list_sessions": candidate_journey}}
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert passed
+    assert rows[0]["status"] == "ok"
+    assert rows[0]["c_p50"] == 10
+
+
+def test_compare_treats_an_all_failed_baseline_as_new() -> None:
+    baseline = {"journeys": {"policy_evaluate": _failed_journey()}}
+    candidate = {"journeys": {"policy_evaluate": _journey([10, 10, 10], [12, 12, 12], n=100)}}
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert passed
+    assert rows[0]["status"] == "new"
+    assert rows[0]["delta_p50"] is None
+    assert rows[0]["c_p50"] == 10
+
+
+def test_compare_still_reports_an_errored_journey_as_skipped() -> None:
+    baseline = {"journeys": {"interrupt": _journey([10, 10, 10], [12, 12, 12], n=50)}}
+    candidate = {
+        "journeys": {
+            "interrupt": {"backend": "sqlite", "runs": [], "summary": {}, "skipped": True}
+        }
+    }
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert passed
+    assert rows[0]["status"] == "skipped"
+
+
+def test_a_failed_run_does_not_disable_p95_gating() -> None:
+    # Two 100-sample runs regress P95 by 100%+; a third run failed outright.
+    candidate_journey = _journey([10, 10], [30, 30], n=100)
+    candidate_journey["runs"].append({"n_success": 0, "p50_ms": 0.0, "p95_ms": 0.0})
+    baseline = {"journeys": {"list_sessions": _journey([10, 10, 10], [12, 12, 12], n=100)}}
+    candidate = {"journeys": {"list_sessions": candidate_journey}}
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert rows[0]["p95_gated"] is True
+    assert not passed
+    assert rows[0]["status"] == "regression"

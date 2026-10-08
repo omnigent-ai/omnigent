@@ -14,6 +14,8 @@ export interface ForkDialogContextValue {
    * Callers hide their fork affordance when false.
    */
   canFork: boolean;
+  /** Visible but unavailable: callers disable the action and explain why. */
+  disabledReason?: string;
   /**
    * Open the fork/clone dialog. With `upToResponseId` set, the dialog
    * submits a truncated fork ("fork from this response"); without it,
