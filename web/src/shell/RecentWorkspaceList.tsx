@@ -2,6 +2,7 @@ import { useQueries } from "@tanstack/react-query";
 import { FolderGit2Icon, FolderIcon, FolderOpenIcon } from "lucide-react";
 
 import { hostWorktreesQueryOptions } from "@/hooks/useHostWorktrees";
+import { MenuItem } from "@/components/ui/menu-item";
 
 export interface RecentWorkspaceListProps {
   hostId: string | null;
@@ -30,20 +31,20 @@ export function RecentWorkspaceList({
   });
 
   return (
-    <div className="flex flex-col gap-0" data-testid="recent-workspace-list">
+    <div className="flex flex-col gap-px" data-testid="recent-workspace-list">
       {paths.map((path, index) => {
         const isGit = (worktreeQueries[index]?.data?.length ?? 0) > 0;
         return (
-          <div
+          <MenuItem
             key={path}
-            className={`group/recent flex min-w-0 items-center rounded-md hover:bg-muted focus-within:bg-muted ${
-              path === selectedPath ? "bg-muted" : ""
-            }`}
+            active={path === selectedPath}
+            density="compact"
+            className="group/recent p-0"
             data-testid={`recent-workspace-row-${index}`}
           >
             <button
               type="button"
-              className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm"
+              className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-[3px] text-left text-ui leading-4"
               onClick={() => onSelect(path)}
               data-testid={`recent-workspace-select-${index}`}
             >
@@ -64,7 +65,7 @@ export function RecentWorkspaceList({
             </button>
             <button
               type="button"
-              className="mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 transition hover:bg-background hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 group-hover/recent:opacity-100 group-focus-within/recent:opacity-100"
+              className="mr-1 inline-flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition hover:bg-background hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 group-hover/recent:opacity-100 group-focus-within/recent:opacity-100"
               aria-label={`Browse ${path}`}
               title={`Browse ${path}`}
               onClick={() => onBrowse(path)}
@@ -72,7 +73,7 @@ export function RecentWorkspaceList({
             >
               <FolderOpenIcon className="size-4" aria-hidden />
             </button>
-          </div>
+          </MenuItem>
         );
       })}
     </div>

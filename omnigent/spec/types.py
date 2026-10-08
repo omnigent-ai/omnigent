@@ -432,7 +432,7 @@ class DatabricksAuth:
     ``~/.databrickscfg``.
 
     Use this to route LLM calls through Databricks model serving
-    (Unity AI Gateway or another Databricks-hosted endpoint) using
+    (Unity Gateway or another Databricks-hosted endpoint) using
     a named credential profile.
 
     Example YAML::
@@ -878,12 +878,13 @@ class SkillSpec:
     """
     A parsed skill from ``skills/<dir>/SKILL.md``.
 
-    The directory name is provenance only — it is recorded in
-    :attr:`skill_dir` and need not equal :attr:`name`.
+    Like Claude Code, the directory name is the invocation identifier
+    and the frontmatter ``name`` is only a human-facing label.
 
-    :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``. Taken from the
-        frontmatter, not from the directory name.
+    :param name: Invocation identifier, taken from the skill's
+        directory name, e.g. ``"asd-ste100"`` (typed as
+        ``/asd-ste100``). Bundled skills must match ``[a-z0-9-]+``.
+        Providers may namespace it, e.g. ``"plugin:asd-ste100"``.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -897,6 +898,10 @@ class SkillSpec:
         orchestration skills (frontmatter ``user-invocable: false``);
         such skills are excluded from the composer's ``/`` menu.
         Defaults to ``True`` (absent frontmatter field = invocable).
+    :param display_name: Human-facing label from the frontmatter
+        ``name``, e.g. ``"Simplified Technical English (ASD-STE100)"``.
+        May contain spaces. ``None`` when it equals :attr:`name` or the
+        source supplies no label (in-memory or CLI-listed skills).
     """
 
     name: str
@@ -904,6 +909,7 @@ class SkillSpec:
     content: str
     skill_dir: Path | None = None
     user_invocable: bool = True
+    display_name: str | None = None
 
 
 @dataclass
@@ -1144,12 +1150,16 @@ class Phase(str, Enum):
     (``Phase("tool_call")``) and preserves the string form in
     logs / JSON serialization.
 
-    Session-level phases (fire once per turn):
+    Session-level phases:
 
     - ``REQUEST``: after a new user message arrives, before
       the LLM turn.
-    - ``RESPONSE``: after the LLM's final assistant message,
-      before persistence.
+    - ``RESPONSE``: before assistant text is persisted. The runner relay
+      evaluates each nonempty segment, including text before tool calls.
+      ``EvaluationContext.turn_final`` identifies the final segment of a
+      successful turn; response policies should skip only explicit
+      ``False`` for completion actions, preserving callers that supply
+      ``None``. Content checks should evaluate every segment.
 
     Tool phases (fire per tool invocation):
 
@@ -1603,6 +1613,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
+    # Operator-approved model-signing authority. Separate from sandbox
+    # egress_rules so generic network access cannot authorize credentials.
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False

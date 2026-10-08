@@ -16,7 +16,9 @@ Use `read_skill_file` with this skill name and the relative filename, or read
 relative to the directory supplied by the native Skill tool. The agent bundle
 may live outside the target checkout; do not resolve these files against cwd.
 
-After preflight and, for reproduction-driven work, `resolve-repro-audit`, read
+After preflight, load `resolve-investigate` in every mode. Apply it before the
+repro audit or choosing a fix. After `resolve-repro-audit` for reproduction-driven
+work, read
 [existing-fix.md](existing-fix.md) before choosing author or review. Skip discovery
 in review-remediation mode. Load `resolve-impact-assessment` for every mode.
 
@@ -103,7 +105,7 @@ Do all of this before Step 1:
    it is not a resolution failure. When `public` is absent or false (the default),
    skip this — do not call `sys_session_share`.
 2. **Recover the handoff** (above): the verdict, `facets`, `journey`, `bug_url`,
-   and the e2e test's content at `test_path`. In ticket-only mode there is no
+   and the reproduction test's content at `test_path`. In ticket-only mode there is no
    handoff: read the ticket instead, as "Ticket-only mode" describes.
    - **If the input carried a `bug_url`, that is the bug — authoritative.** Use
      the run only to recover the test/verdict/facets/journey. Cross-check: the

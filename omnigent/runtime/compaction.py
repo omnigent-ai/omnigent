@@ -24,6 +24,8 @@ import tiktoken
 from omnigent.entities import (
     CompactionData,
     ConversationItem,
+    FunctionCallData,
+    FunctionCallOutputData,
     MessageData,
 )
 from omnigent.llms.adapters._content import redact_binary_payloads
@@ -191,8 +193,26 @@ def _find_recent_boundary(
         if is_assistant_msg or is_function_call:
             groups_seen += 1
             if groups_seen >= recent_window:
-                return i
+                return _tool_safe_history_boundary(history, i)
     return 0
+
+
+def _tool_safe_history_boundary(history: list[ConversationItem], boundary: int) -> int:
+    """Keep any tool exchange crossing the recent-history boundary intact."""
+    call_positions: dict[str, int] = {}
+    spans: list[tuple[int, int]] = []
+    for index, item in enumerate(history):
+        if isinstance(item.data, FunctionCallData):
+            call_positions[item.data.call_id] = index
+        elif isinstance(item.data, FunctionCallOutputData):
+            start = call_positions.pop(item.data.call_id, None)
+            if start is not None:
+                spans.append((start, index))
+    # Descending starts also preserve overlapping parallel-tool exchanges.
+    for start, end in sorted(spans, reverse=True):
+        if start < boundary <= end:
+            boundary = start
+    return boundary
 
 
 def _clear_tool_results(

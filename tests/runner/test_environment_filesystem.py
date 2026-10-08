@@ -15,9 +15,14 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound
+from omnigent.entities.environment_filesystem import (
+    FilesystemPathNotFound,
+    InvalidPath,
+    PathUnreachable,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -172,6 +177,59 @@ async def test_read_file_content(
     assert body["content"] == "hello world"
     assert body["encoding"] == "utf-8"
     assert body["bytes"] == 11
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("absolute_path", [False, True], ids=["workspace", "host"])
+async def test_read_file_content_has_no_agent_line_cap(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    absolute_path: bool,
+) -> None:
+    """The file viewer receives every line of a file below the byte cap."""
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
+    file_path = (workspace.parent if absolute_path else workspace) / "large.py"
+    file_path.write_text(content, encoding="utf-8")
+    request_path = str(file_path) if absolute_path else file_path.name
+
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{request_path}"
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["truncated"] is False
+    assert body["encoding"] == "utf-8"
+    assert body["content"] == content
+    assert body["bytes"] == len(content.encode("utf-8"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("absolute_path", [False, True], ids=["workspace", "host"])
+async def test_read_file_content_retains_byte_cap(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    absolute_path: bool,
+) -> None:
+    """Viewer reads still flag oversized text and preserve UTF-8 boundaries."""
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 4)
+    file_path = (workspace.parent if absolute_path else workspace) / "large.txt"
+    file_path.write_text("abcé\nlast line\n", encoding="utf-8")
+    request_path = str(file_path) if absolute_path else file_path.name
+
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{request_path}"
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["truncated"] is True
+    assert body["encoding"] == "utf-8"
+    assert body["content"] == "abc"
+    assert body["bytes"] == 3
 
 
 @pytest.mark.asyncio
@@ -2387,3 +2445,73 @@ async def test_scoped_search_reaches_snapshot_files_past_the_budget(
 
     assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
     assert body["truncated"] is True
+
+
+def _confined_fs(
+    ws: Path, *, read_roots: list[Path] | None = None, follow_outward_links: bool = True
+) -> CallerProcessFilesystem:
+    """A filesystem view over *ws* under an active (confined) policy.
+
+    Only path resolution is exercised, so no helper is spawned.
+    """
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=read_roots,
+        write_roots=[],
+        write_files=[],
+        allow_network=False,
+    )
+    os_env = SimpleNamespace(cwd=str(ws), sandbox=policy)
+    return CallerProcessFilesystem(os_env, follow_outward_links=follow_outward_links)  # type: ignore[arg-type]
+
+
+def test_outward_symlink_under_a_confined_policy_needs_a_grant(tmp_path: Path) -> None:
+    """A link out of the workspace is authorized like the absolute path it points
+    at: a confined environment admits it only when a grant covers the target, and
+    nothing is admitted unless outward links were asked for."""
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PathUnreachable):
+        _confined_fs(ws)._resolve("linked")
+    with pytest.raises(InvalidPath):
+        _confined_fs(ws, read_roots=[outside], follow_outward_links=False)._resolve("linked")
+
+    assert _confined_fs(ws, read_roots=[outside])._resolve("linked") == outside
+
+
+@pytest.mark.asyncio
+async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: Path) -> None:
+    """Callers that never ask for outward links (the file-diff route, the write
+    baseline capture) read through a workspace symlink into a declared read grant
+    via the helper, as they always did; a link to an ungranted directory still
+    fails there instead of being resolved up front."""
+    granted = (tmp_path / "granted").resolve()
+    granted.mkdir()
+    (granted / "note.txt").write_text("granted content\n")
+    ungranted = (tmp_path / "ungranted").resolve()
+    ungranted.mkdir()
+    (ungranted / "note.txt").write_text("secret\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "linked").symlink_to(granted, target_is_directory=True)
+    (ws / "escape").symlink_to(ungranted, target_is_directory=True)
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=[str(granted)]),
+        )
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        assert (await fs.read("linked/note.txt")).data == b"granted content\n"
+        with pytest.raises(FilesystemPathNotFound):
+            await fs.read("escape/note.txt")
+    finally:
+        os_env.close()

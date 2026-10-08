@@ -1,13 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
-import { BubbleView } from "./chatBubbleParts";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
+import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
-const continuation = "Please continue from where you left off before the rate limit error.";
+const continuation = "Please continue from where you left off.";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -54,6 +56,82 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+});
+
+describe("Mermaid diagram width", () => {
+  it("uses the full chat column for a Mermaid fence", () => {
+    const items = [
+      { kind: "text" as const, itemId: "diagram", text: "```mermaid\nA-->B\n```", final: true },
+    ];
+    expect(containsMermaidDiagram(items)).toBe(true);
+    const bubble: Extract<Bubble, { kind: "assistant" }> = {
+      kind: "assistant",
+      responseId: "resp_diagram",
+      stableId: "diagram",
+      lifecycle: "completed",
+      error: null,
+      items,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={bubble} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("max-w-full");
+    expect(screen.getByTestId("message-bubble").firstElementChild).toHaveClass("w-full");
+  });
+
+  it("ignores Mermaid mentioned outside a fence", () => {
+    expect(
+      containsMermaidDiagram([
+        { kind: "text", itemId: "prose", text: "A Mermaid diagram would help.", final: true },
+      ]),
+    ).toBe(false);
+  });
+});
+
+describe("AssistantBubble fork source", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_side_reply",
+    stableId: "side_reply",
+    lifecycle: "completed",
+    error: null,
+    items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
+  };
+
+  it.each([
+    {
+      name: "side chat",
+      scope: "conv_side_child",
+      expected: {
+        sourceSessionId: "conv_side_child",
+        upToResponseId: "resp_side_reply",
+      },
+    },
+    {
+      name: "main chat",
+      scope: null,
+      expected: { sourceSessionId: undefined, upToResponseId: "resp_side_reply" },
+    },
+  ])("opens from the $name session", ({ scope, expected }) => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={bubble} isLastAssistant={false} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("fork-from-response"));
+
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(openForkDialog).toHaveBeenCalledWith(expected);
+  });
 });
 
 describe("message navigation highlight", () => {
@@ -200,6 +278,36 @@ describe("AssistantBubble error retry", () => {
     expect(useChatStore.getState().failedSendDraft).toBe(draft);
   });
 
+  it("continues a transient upstream failure in place instead of resuming the runner", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    render(<BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+    });
+  });
+
+  it("continues a dropped harness stream in place instead of resuming the runner", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    render(<BubbleView bubble={errorBubble("connection_error")} isLastAssistant />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+    });
+  });
+
   it("coalesces retry clicks from separate rate-limit cards in the same turn", async () => {
     let finishRetry: ((response: Response) => void) | undefined;
     fetchMock.mockImplementationOnce(
@@ -327,6 +435,60 @@ describe("AssistantBubble error retry", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_retry/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
+  });
+});
+
+describe("AssistantBubble sealed side-chat recovery", () => {
+  it("removes recovery actions when the side chat is sealed but keeps the error", () => {
+    const view = render(
+      <BubbleView bubble={errorBubble("required_terminal_exited")} recoveryDisabled />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(screen.getByTestId("error-pill")).toHaveTextContent("The agent's terminal exited");
+
+    view.rerender(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
+
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeInTheDocument();
+  });
+
+  it.each([null, "conv_child"])(
+    "refreshes the resumed session's labels (scope=%s)",
+    async (scope) => {
+      const client = new QueryClient();
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ error: { code: "conflict", message: "This side chat has ended." } }, 409),
+      );
+      render(
+        <QueryClientProvider client={client}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={errorBubble("required_terminal_exited")} />
+          </ConversationScopeContext.Provider>
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+      await waitFor(() =>
+        expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", scope ?? "conv_retry"] }),
+      );
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(`/v1/sessions/${scope ?? "conv_retry"}/events`);
+      expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended.");
+    },
+  );
+
+  it("preserves the error when rendered without a query provider", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ error: { code: "conflict", message: "This side chat has ended." } }, 409),
+    );
+    render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended."),
+    );
   });
 });
 

@@ -18,6 +18,7 @@ def _resolve_procedures() -> str:
         [
             build_instructions(spec, None, []),
             skills["resolve-inputs"],
+            skills["resolve-investigate"],
             resource("resolve-inputs", "review-remediation.md"),
             resource("resolve-inputs", "ticket-only.md"),
             resource("resolve-inputs", "reproduction.md"),
@@ -236,16 +237,22 @@ def test_output_outcomes_include_repro_audit_blockers() -> None:
         "`needs_more_info`",
         "reliable reproduction",
         "evidence is unsafe",
-        "intended behavior is ambiguous",
+        "required inputs/authorization are missing",
         "setup/environment blocks verification",
     ):
         assert requirement in outcomes
+
+    assert "unresolved design choice is `partially_fixed`" in outcomes
+    assert "choice in `remaining_work`" in outcomes
 
 
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:
     instructions = _normalized_resolve_instructions()
     assert "Skip reproduction handoff recovery, fail-before proof" in instructions
-    assert "your **targeted test written in 2B.4 is the fail→pass proof**" in instructions
+    assert (
+        "the **selected regression check from 2B.4 supplies the fail→pass proof** "
+        "for a behavioral bug" in instructions
+    )
 
 
 def test_resolve_description_does_not_endorse_unaudited_tests() -> None:
@@ -254,6 +261,17 @@ def test_resolve_description_does_not_endorse_unaudited_tests() -> None:
     assert "Before both authoring and reviewing" in description
     assert "repairs or rejects unreliable tests" in description
     assert "a test that PASSES there means main has since fixed the bug" not in description
+
+
+def test_resolve_publish_requests_inline_eli5_without_placeholder_sections() -> None:
+    skills = {skill.name: skill.content for skill in load(_RESOLVE_AGENT).skills}
+    summary = (
+        skills["resolve-publish"].split("- In **Summary**", 1)[1].split("- In **Test Plan**", 1)[0]
+    )
+
+    assert "start non-trivial changes with a 1–2 sentence ELI5" in summary
+    assert "inline rather than in a separate section" in summary
+    assert "placeholder diagrams or empty sections" in summary
 
 
 def test_written_evidence_is_limited_to_results_without_visible_interaction() -> None:
@@ -284,3 +302,26 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "name the specific blocker in `recording_unavailable_reason`" in normalized
     assert "Text-only CLI output is not a reason to skip recording" in normalized
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
+
+
+def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
+    instructions = _normalized_resolve_instructions()
+    review = instructions.split("### 4.3", 1)[1].split("### 4.4", 1)[0]
+    for requirement in (
+        "Polly AI Review (`/review`)",
+        "Open Code Review (`/ocr`)",
+        "After **every push**",
+        "non-blocking note as if it were blocking",
+        "no fixed review-round cap",
+        "review_cycle.py check",
+        "actual execution deadline",
+        "`partially_fixed`",
+    ):
+        assert requirement in review
+    assert "approximately six" not in instructions
+    final = instructions.split("### 4.5", 1)[1].split("## Output", 1)[0]
+    assert "review_cycle.py check" in final
+    output = _resolve_procedures().split("## Output —", 1)[1]
+    handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
+    assert handoff["ocr_review"]
+    assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}

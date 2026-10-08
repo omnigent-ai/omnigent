@@ -8,9 +8,16 @@
 // No stream available (older shell / browser preview) → a single phase line.
 
 import { useEffect, useRef, useState } from "react";
+import { RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
+import { ConnectStatus } from "@/pages/onboarding/primitives";
 
 type Phase = "installing" | "running" | "ready" | "failed";
+
+// Empty-terminal beat before the first install commands stream in, so the
+// install step doesn't flash straight from empty into output.
+export const WARMUP_MS = 600;
 
 export function SetupTerminalStep({
   onInstallCli,
@@ -18,7 +25,11 @@ export function SetupTerminalStep({
   onRun,
   onSetupLog,
   onBack,
+  onConnectAnyway,
   runningLabel = "Starting Omnigent",
+  runningHint = "Starting the local server…",
+  connection = null,
+  onCancelConnect,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
@@ -29,8 +40,15 @@ export function SetupTerminalStep({
   /** Subscribe to the run action's log lines (server boot); returns unsubscribe. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
   onBack: () => void;
+  /** Open an existing server after setup fails, without installing or starting a runner. */
+  onConnectAnyway?: () => void;
   /** Heading + verb for the run phase ("Starting Omnigent" / "Connecting…"). */
   runningLabel?: string;
+  /** Placeholder log line for the run phase until its first line streams. */
+  runningHint?: string;
+  /** Progress of the run phase's server connect (null when not connecting). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
@@ -71,8 +89,10 @@ export function SetupTerminalStep({
   // effect and launch a SECOND install. The sequence runs once per attempt.
   const onInstallCliRef = useRef(onInstallCli);
   const onRunRef = useRef(onRun);
+  const onInstallLogRef = useRef(onInstallLog);
   onInstallCliRef.current = onInstallCli;
   onRunRef.current = onRun;
+  onInstallLogRef.current = onInstallLog;
 
   // Install (if needed) → run, once per attempt (retry bumps `attempt`).
   useEffect(() => {
@@ -83,6 +103,14 @@ export function SetupTerminalStep({
       const install = onInstallCliRef.current;
       if (install) {
         setPhase("installing");
+        // Hold the empty loader + terminal for a beat before the first install
+        // commands stream in — only when there's a stream to show it against.
+        if (onInstallLogRef.current) {
+          await new Promise((resolve) => {
+            setTimeout(resolve, WARMUP_MS);
+          });
+          if (canceled || !alive.current) return;
+        }
         const res = await install();
         if (canceled || !alive.current) return;
         if (!res.ok) {
@@ -127,7 +155,18 @@ export function SetupTerminalStep({
           ? "Installing the Omnigent CLI"
           : runningLabel;
   const phaseLabel = inProgress ? `${baseLabel}${".".repeat(dots)}` : baseLabel;
-  const pendingHint = phase === "installing" ? "Installing the CLI…" : "Starting the local server…";
+  const pendingHint = phase === "installing" ? "Installing the CLI…" : runningHint;
+  // Coarse progress over real milestones: warmup → install output → server
+  // starting → done; without an install, the run's first output and the server
+  // open fill those steps. Holds within a step (streaming log + pulse show liveness).
+  const progress =
+    phase === "ready" || phase === "failed"
+      ? 100
+      : phase === "running" && (onInstallCli || connection !== null)
+        ? 70
+        : streamed
+          ? 35
+          : 10;
 
   return (
     <div className="flex h-full flex-col px-2 pb-1 pt-4">
@@ -136,8 +175,8 @@ export function SetupTerminalStep({
         <div
           className={`h-full rounded-full transition-all duration-300 ease-linear ${
             phase === "failed" ? "bg-destructive/60" : "bg-foreground/25"
-          } ${phase === "installing" || phase === "running" ? "animate-pulse" : ""}`}
-          style={{ width: phase === "ready" || phase === "failed" ? "100%" : "60%" }}
+          } ${inProgress ? "animate-pulse" : ""}`}
+          style={{ width: `${progress}%` }}
         />
       </div>
 
@@ -167,14 +206,24 @@ export function SetupTerminalStep({
         )}
       </div>
 
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
       {phase === "failed" && (
-        <div className="mt-3 flex gap-2">
-          <Button variant="outline" className="flex-1" onClick={onBack}>
+        <div className="mt-3 flex justify-between gap-2">
+          <Button variant="outline" onClick={onBack}>
             Back
           </Button>
-          <Button className="flex-1" onClick={() => setAttempt((n) => n + 1)}>
-            Retry
-          </Button>
+          <div className="flex gap-2">
+            {onConnectAnyway && (
+              <Button variant="outline" onClick={onConnectAnyway}>
+                Continue anyway
+              </Button>
+            )}
+            <Button onClick={() => setAttempt((n) => n + 1)}>
+              <RotateCw className="size-4" aria-hidden />
+              Retry
+            </Button>
+          </div>
         </div>
       )}
     </div>
