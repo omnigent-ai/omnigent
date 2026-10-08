@@ -73,6 +73,7 @@ from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
+from omnigent.util.threaded_auth import ThreadedAuth
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
@@ -727,10 +728,10 @@ def _remote_headers(
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
     elif server_url:
-        from omnigent.cli_auth import load_token
+        from omnigent.cli_auth import load_or_refresh_token
 
-        # 2. Stored OIDC session token from `omnigent login`.
-        oidc_token = load_token(server_url)
+        # 2. Stored OIDC session token from `omnigent login`, renewed if lapsed.
+        oidc_token = load_or_refresh_token(server_url)
         if oidc_token:
             headers["Authorization"] = f"Bearer {oidc_token}"
         else:
@@ -786,7 +787,7 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     return source.current_token()
 
 
-class _DatabricksTokenAuth(httpx.Auth):
+class _DatabricksTokenAuth(ThreadedAuth):
     """
     httpx Auth that authenticates via the Databricks SDK, refreshing
     OAuth tokens transparently.
@@ -884,13 +885,17 @@ class _DatabricksTokenAuth(httpx.Auth):
             # Check stored OIDC token from `omnigent login`, then fall back to
             # the reused Databricks SDK auth.
             oidc_token = None
+            login_refused = False
             if self._server_url:
-                from omnigent.cli_auth import load_token
+                from omnigent.cli_auth import has_refreshable_login, load_or_refresh_token
 
-                oidc_token = load_token(self._server_url)
+                oidc_token = load_or_refresh_token(self._server_url)
+                # A login whose renewal was just refused must not borrow
+                # unrelated Databricks credentials.
+                login_refused = oidc_token is None and has_refreshable_login(self._server_url)
             if oidc_token:
                 request.headers["Authorization"] = f"Bearer {oidc_token}"
-            else:
+            elif not login_refused:
                 token = self._sdk_token()
                 if token:
                     request.headers["Authorization"] = f"Bearer {token}"
@@ -951,9 +956,9 @@ def _server_auth(
     # Check stored `omnigent login` records: a session JWT or a
     # Databricks Apps pointer record.
     if server_url:
-        from omnigent.cli_auth import load_databricks_workspace_host, load_token
+        from omnigent.cli_auth import has_refreshable_login, load_databricks_workspace_host
 
-        if load_token(server_url) or load_databricks_workspace_host(server_url):
+        if has_refreshable_login(server_url) or load_databricks_workspace_host(server_url):
             return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
     creds = _read_databrickscfg(None)
     if creds is not None and creds.token:
