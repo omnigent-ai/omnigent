@@ -31,6 +31,8 @@ class OmnigentBridgeListener(
     private val onOpenServerSetup: () -> Unit = {},
     /** Present only for a natively authenticated workspace bridge. */
     private val onSignOut: (() -> Unit)? = null,
+    /** Web asked to sign the server out; the shell answers whether it took over. */
+    private val onSignOutOfServer: () -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -118,6 +120,10 @@ class OmnigentBridgeListener(
 
             "signOut" -> {
                 onSignOut?.invoke()
+            }
+
+            "signOutOfServer" -> {
+                onSignOutOfServer()
             }
         }
     }

@@ -22,6 +22,7 @@ class OidcSessionControllerTest {
     private var now = 100_000L
     private var manifest = nativeManifest("ap_session")
     private val direct = Executor { it.run() }
+    private val timers = FakeScheduler()
     private val credentials =
         OidcCredentials(
             store = store,
@@ -36,9 +37,7 @@ class OidcSessionControllerTest {
             now = { now },
         )
     private val controller =
-        OidcSessionController(host, credentials, jar, io = direct, main = direct, now = {
-            now
-        }) { manifest }
+        OidcSessionController(host, credentials, jar, direct, direct, timers, { now }) { manifest }
 
     init {
         host.credentials = credentials
@@ -257,12 +256,13 @@ class OidcSessionControllerTest {
     }
 
     @Test
-    fun `only the login route of the connected server is taken over`() {
+    fun `only the connected server's auth routes are taken over`() {
         assertFalse(controller.handlesNavigation("$SERVER/auth/login"))
+        assertFalse(controller.handlesNavigation("$SERVER/auth/logout"))
         connectWithCookie()
 
-        assertFalse(controller.handlesNavigation("$SERVER/auth/logout"))
         assertFalse(controller.handlesNavigation("$SERVER/c/1"))
+        assertFalse(controller.handlesNavigation("$SERVER/auth/callback"))
         assertFalse(controller.handlesNavigation("https://other.example/omnigent/auth/login"))
     }
 
@@ -270,9 +270,15 @@ class OidcSessionControllerTest {
     fun `results for a replaced connection are dropped`() {
         val queued = QueuedExecutor()
         val replaced =
-            OidcSessionController(host, credentials, jar, io = queued, main = direct, now = {
-                now
-            }) { manifest }
+            OidcSessionController(
+                host,
+                credentials,
+                jar,
+                queued,
+                direct,
+                timers,
+                { now },
+            ) { manifest }
         jar.values["ap_session"] = "still-good"
         server.accepted += "still-good"
 
@@ -303,6 +309,311 @@ class OidcSessionControllerTest {
         assertFalse(controller.resumeHandedOffSignIn())
     }
 
+    @Test
+    fun `the cookie is renewed a little before it expires`() {
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        server.refresh = 200 to """{"access_token":"first","expires_in":3600}"""
+        server.accepted += setOf("first", "second")
+        controller.connect(SERVER, interactive = false)
+        assertEquals(listOf(3_540_000L), timers.delays)
+
+        server.refresh = 200 to """{"access_token":"second","expires_in":3600}"""
+        now += 3_540_000L
+        timers.fire()
+
+        assertEquals("second", jar.values["ap_session"])
+        assertEquals(3_540_000L, timers.delays.last())
+        assertEquals("load:$SERVER", host.events.last())
+    }
+
+    @Test
+    fun `the web view's own expiry times the renewal of a reused cookie`() {
+        jar.values["ap_session"] = "still-good"
+        jar.expiries["ap_session"] = now + 100_000L
+        server.accepted += "still-good"
+
+        controller.connect(SERVER, interactive = false)
+
+        assertEquals(listOf(80_000L), timers.delays)
+    }
+
+    @Test
+    fun `a reused cookie of unknown expiry waits for the page to ask`() {
+        connectWithCookie()
+
+        assertTrue(timers.delays.isEmpty())
+    }
+
+    @Test
+    fun `returning to the foreground renews a missing cookie at once`() {
+        connectWithCookie()
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        server.refresh = 200 to """{"access_token":"renewed"}"""
+        server.accepted += "renewed"
+        controller.onBackground()
+        jar.values.clear()
+
+        controller.onForeground()
+        assertEquals(listOf(0L), timers.delays)
+        timers.fire()
+
+        assertEquals("renewed", jar.values["ap_session"])
+    }
+
+    @Test
+    fun `returning from the browser mid sign-in leaves the session to the sign-in`() {
+        connectWithCookie()
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        server.refresh = 400 to """{"error":"invalid_grant"}"""
+        jar.values.clear()
+        controller.onSignInRequested()
+        controller.signIn()
+        server.exchange =
+            200 to """{"token":"signed-in","expires_in":28800,"refresh_token":"grant-2"}"""
+        server.accepted += "signed-in"
+        val refreshes = server.requests.count { it.endsWith("/oauth/token") }
+
+        controller.onForeground()
+        assertTrue(timers.pending.isEmpty())
+        controller.onBrowserCallback(host.callback("code=c"))
+
+        assertEquals("load:$SERVER", host.events.last())
+        assertEquals(refreshes, server.requests.count { it.endsWith("/oauth/token") })
+        assertEquals(listOf(28_740_000L), timers.delays)
+    }
+
+    @Test
+    fun `no renewal runs in the background`() {
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        server.refresh = 200 to """{"access_token":"first","expires_in":3600}"""
+        server.accepted += "first"
+        controller.connect(SERVER, interactive = false)
+
+        controller.onBackground()
+
+        assertTrue(timers.pending.isEmpty())
+    }
+
+    @Test
+    fun `a renewal that fails after the app left the foreground schedules no retry`() {
+        jar.values["ap_session"] = "still-good"
+        jar.expiries["ap_session"] = now + 100_000L
+        server.accepted += "still-good"
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        controller.connect(SERVER, interactive = false)
+        server.unreachable = true
+        server.onRequest = { request ->
+            // The app goes to the background while the renewal is on the wire.
+            if (request.uri.path.endsWith("/oauth/token")) controller.onBackground()
+        }
+
+        timers.fire()
+
+        assertTrue(timers.pending.isEmpty())
+        server.onRequest = {}
+        server.unreachable = false
+        server.refresh = 200 to """{"access_token":"renewed"}"""
+        server.accepted += "renewed"
+        jar.values.remove("ap_session")
+        controller.onForeground()
+        timers.fire()
+        assertEquals("renewed", jar.values["ap_session"])
+    }
+
+    @Test
+    fun `a background renewal retries an unreachable server after 30 s`() {
+        jar.values["ap_session"] = "still-good"
+        jar.expiries["ap_session"] = now + 100_000L
+        server.accepted += "still-good"
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        controller.connect(SERVER, interactive = false)
+        server.unreachable = true
+
+        timers.fire()
+
+        assertEquals(30_000L, timers.delays.last())
+        assertEquals("load:$SERVER", host.events.last())
+        server.unreachable = false
+        server.refresh = 200 to """{"access_token":"renewed"}"""
+        server.accepted += "renewed"
+        timers.fire()
+        assertEquals("renewed", jar.values["ap_session"])
+    }
+
+    @Test
+    fun `a background renewal that lost the grant explains the next prompt`() {
+        jar.values["ap_session"] = "still-good"
+        jar.expiries["ap_session"] = now + 100_000L
+        server.accepted += "still-good"
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        controller.connect(SERVER, interactive = false)
+        server.refresh = 400 to """{"error":"invalid_grant"}"""
+        timers.fire()
+        assertNull(store.grants[ORIGIN])
+
+        controller.onSignInRequested()
+
+        assertEquals(
+            "ask:omni.example ended your session. Sign in again to continue.",
+            host.events.last(),
+        )
+    }
+
+    @Test
+    fun `sign-out forgets the grant, clears the cookie and revokes the grant`() {
+        connectWithCookie()
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+
+        assertTrue(controller.signOut())
+
+        assertEquals("signedOut:You're signed out of omni.example.", host.events.last())
+        assertNull(store.grants[ORIGIN])
+        assertNull(jar.values["ap_session"])
+        assertEquals("POST /omnigent/oauth/revoke", server.requests.last())
+        assertFalse(controller.canSignOut)
+        assertFalse(controller.signOut())
+    }
+
+    @Test
+    fun `signing out during a renewal the page asked for returns to setup once`() {
+        // The refresh runs on its own thread, as in the app, so its failure reaches the view
+        // while the sign-out is still under way.
+        val queued = QueuedExecutor()
+        val threaded =
+            OidcCredentials(
+                store = store,
+                pending =
+                    OidcPendingSignInStore(
+                        context,
+                        EncryptedRecordStore(
+                            context,
+                            "test-oidc-${UUID.randomUUID()}",
+                            PlainCipher,
+                        ),
+                    ) { now },
+                transport = server,
+                verifyTransport = server,
+                executor = queued,
+                now = { now },
+            )
+        val view =
+            OidcSessionController(host, threaded, jar, direct, direct, timers, { now }) { manifest }
+        jar.values["ap_session"] = "still-good"
+        server.accepted += "still-good"
+        view.connect(SERVER, interactive = false)
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        server.refresh = 200 to """{"access_token":"renewed"}"""
+        server.onRequest = { request ->
+            if (request.uri.path.endsWith("/oauth/token")) view.signOut()
+        }
+        val before = host.events.size
+
+        view.onSignInRequested()
+        queued.runAll()
+
+        assertEquals(
+            listOf("signedOut:You're signed out of omni.example."),
+            host.events.drop(before),
+        )
+        assertNull(jar.values["ap_session"])
+    }
+
+    @Test
+    fun `a browser sign-in completing during a renewal leaves renewals working`() {
+        val queued = QueuedExecutor()
+        val threaded =
+            OidcCredentials(
+                store = store,
+                pending =
+                    OidcPendingSignInStore(
+                        context,
+                        EncryptedRecordStore(
+                            context,
+                            "test-oidc-${UUID.randomUUID()}",
+                            PlainCipher,
+                        ),
+                    ) { now },
+                transport = server,
+                verifyTransport = server,
+                executor = queued,
+                now = { now },
+            )
+        val view =
+            OidcSessionController(host, threaded, jar, direct, direct, timers, { now }) { manifest }
+        jar.values["ap_session"] = "still-good"
+        jar.expiries["ap_session"] = now + 100_000L
+        server.accepted += "still-good"
+        store.grants[ORIGIN] = OidcRefreshGrant("grant-1", null)
+        // An older browser sign-in is still pending when the app reconnects with its cookie.
+        val state = queryItems(threaded.beginSignIn(SERVER, "ap_session")).toMap()["native_state"]
+        view.connect(SERVER, interactive = false)
+        timers.fire()
+
+        // The automatic renewal is out when the browser delivers the older sign-in.
+        server.exchange =
+            200 to """{"token":"signed-in","expires_in":3600,"refresh_token":"grant-2"}"""
+        server.accepted += setOf("signed-in", "stale")
+        server.refresh = 200 to """{"access_token":"stale"}"""
+        view.onBrowserCallback(URI("ai.omnigent.android:/oauth/callback?state=$state&code=c"))
+        queued.runAll()
+
+        // The superseded renewal's session is never installed.
+        assertEquals("signed-in", jar.values["ap_session"])
+        assertEquals(3_540_000L, timers.delays.last())
+        server.refresh = 200 to """{"access_token":"renewed"}"""
+        server.accepted += "renewed"
+        view.onSignInRequested()
+        queued.runAll()
+        assertEquals("renewed", jar.values["ap_session"])
+    }
+
+    @Test
+    fun `a sign-in handed off before sign-out finished installs nothing`() {
+        connectWithCookie()
+        server.exchange = 200 to """{"token":"late"}"""
+        server.accepted += "late"
+        val authorization = credentials.beginSignIn(SERVER, "ap_session")
+        val state = queryItems(authorization).toMap()["native_state"]
+        credentials.completeHandedOffSignIn(
+            URI("ai.omnigent.android:/oauth/callback?state=$state&code=c"),
+        )
+        jar.holdNext = true
+        val before = host.events.size
+
+        controller.signOut()
+        // The receiver's intent arrives while the web view is still deleting the cookie.
+        controller.onCallbackHandedOff(null)
+        jar.held!!.invoke()
+
+        assertNull(jar.values["ap_session"])
+        assertEquals(
+            listOf("signedOut:You're signed out of omni.example."),
+            host.events.drop(before),
+        )
+    }
+
+    @Test
+    fun `the page's logout route signs out natively`() {
+        connectWithCookie()
+
+        assertTrue(controller.handlesNavigation("$SERVER/auth/logout"))
+
+        assertEquals("signedOut:You're signed out of omni.example.", host.events.last())
+    }
+
+    @Test
+    fun `a sign-out that leaves something behind says so`() {
+        connectWithCookie()
+        jar.refuse = true
+
+        controller.signOut()
+
+        assertEquals(
+            "signedOut:" + OidcWebSession.signedOutMessage("omni.example", complete = false),
+            host.events.last(),
+        )
+    }
+
     private fun connectWithCookie() {
         jar.values["ap_session"] = "still-good"
         server.accepted += "still-good"
@@ -317,6 +628,7 @@ class OidcSessionControllerTest {
 
     private class FakeServer : OAuthTransport {
         val requests = mutableListOf<String>()
+        var onRequest: (OAuthHttpRequest) -> Unit = {}
         val accepted = mutableSetOf<String>()
         var refresh = 400 to """{"error":"invalid_grant"}"""
         var exchange = 200 to """{"token":"signed-in"}"""
@@ -324,6 +636,7 @@ class OidcSessionControllerTest {
 
         override fun execute(request: OAuthHttpRequest): OAuthHttpResponse {
             requests += "${request.method} ${request.uri.path}"
+            onRequest(request)
             if (unreachable) throw OAuthNetworkException()
             val path = request.uri.path
             val (status, body) =
@@ -355,8 +668,13 @@ class OidcSessionControllerTest {
 
     private class FakeJar : OidcCookieJar {
         val values = mutableMapOf<String, String>()
+        val expiries = mutableMapOf<String, Long>()
         val writes = mutableListOf<Pair<String, String>>()
         var refuse = false
+
+        /** Holds back the web view's answer to the next cookie write until the test releases it. */
+        var held: (() -> Unit)? = null
+        var holdNext = false
 
         override fun get(url: String): String? =
             values.entries.joinToString("; ") { "${it.key}=${it.value}" }.ifEmpty { null }
@@ -373,10 +691,42 @@ class OidcSessionControllerTest {
             }
             val (name, value) = setCookie.substringBefore(';').split('=', limit = 2)
             if (setCookie.contains("Max-Age=0")) values.remove(name) else values[name] = value
+            // A new cookie replaces the old one's expiry; the shell then times it itself.
+            expiries.remove(name)
+            if (holdNext) {
+                holdNext = false
+                held = { callback(true) }
+                return
+            }
             callback(true)
         }
 
         override fun flush() = Unit
+
+        override fun expiry(
+            url: String,
+            name: String,
+        ): Long? = expiries[name]
+    }
+
+    /** Timers that fire only when the test says so. */
+    private class FakeScheduler : OidcScheduler {
+        val delays = mutableListOf<Long>()
+        val pending = mutableListOf<() -> Unit>()
+
+        override fun schedule(
+            delayMillis: Long,
+            task: () -> Unit,
+        ): () -> Unit {
+            delays += delayMillis
+            pending += task
+            return { pending.remove(task) }
+        }
+
+        fun fire() {
+            val task = pending.removeFirst()
+            task()
+        }
     }
 
     private class FakeHost : OidcSessionController.Host {
@@ -405,6 +755,10 @@ class OidcSessionControllerTest {
 
         override fun returnToSetup(message: String?) {
             events += "setup:$message"
+        }
+
+        override fun signedOut(message: String) {
+            events += "signedOut:$message"
         }
 
         override fun launchSignIn(

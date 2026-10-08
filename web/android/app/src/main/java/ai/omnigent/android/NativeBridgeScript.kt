@@ -118,9 +118,21 @@ object NativeBridgeScript {
                 currentOrigin: payload.currentOrigin,
                 managedServers: cleanList(payload.managedServers),
                 recentServers: cleanList(payload.recentServers),
+                canSignOut: payload.canSignOut === true,
               };
               for (const resolve of serverPickerWaiters) { try { resolve(info); } catch (_) {} }
               serverPickerWaiters.clear();
+            },
+          });
+
+          // signOutOfServer waiters: native answers true once it has taken over the
+          // sign-out, false when this connection can't be signed out natively.
+          const signOutWaiters = new Set();
+          Object.defineProperty(window, "__omnigentNativeEmitSignOutResult", {
+            configurable: false, enumerable: false, writable: false,
+            value(handled) {
+              for (const resolve of signOutWaiters) { try { resolve(handled === true); } catch (_) {} }
+              signOutWaiters.clear();
             },
           });
 
@@ -281,6 +293,11 @@ object NativeBridgeScript {
             switchServer(url) {
               if (typeof url === "string") post({ method: "switchServer", url });
               return Promise.resolve();
+            },
+            signOutOfServer() {
+              const pending = new Promise((resolve) => { signOutWaiters.add(resolve); });
+              post({ method: "signOutOfServer" });
+              return pending;
             },
             openServerSetup() {
               post({ method: "openServerSetup" });

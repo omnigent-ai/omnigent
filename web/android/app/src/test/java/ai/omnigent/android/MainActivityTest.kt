@@ -225,6 +225,22 @@ class MainActivityTest {
         val script = shadowOf(webView).lastEvaluatedJavascript.orEmpty()
         assertTrue(script.contains("__omnigentNativeEmitServerPicker"))
         assertTrue(script.contains("currentOrigin") && script.contains("example.com"))
+        // Only a server whose sign-in the shell owns offers "Sign out of <server>".
+        assertTrue(script.contains("\"canSignOut\":false"))
+    }
+
+    @Test
+    fun `sign-out the shell can't perform answers the page false`() {
+        val activity = launch()
+        val webView = activity.webView()
+
+        activity.invoke("onSignOutOfServerRequested")
+
+        assertEquals(
+            "window.__omnigentNativeEmitSignOutResult && window.__omnigentNativeEmitSignOutResult(false);",
+            shadowOf(webView).lastEvaluatedJavascript,
+        )
+        assertFalse(activity.isFinishing)
     }
 
     @Test
