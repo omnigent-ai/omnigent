@@ -854,6 +854,102 @@ def test_parse_kubernetes_home_size_limit_null_is_unbounded(
     assert fake.home_size_limit is None
 
 
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+def test_parse_kubernetes_agents_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """`sandbox.kubernetes.agents.<name>.image` reaches the launcher as a name → image map."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": provider,
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "image": "registry.example.com/host-base:v1",
+                "agents": {"researcher": {"image": " registry.example.com/host-research:v1 "}},
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    if provider == "agent_sandbox":
+        import omnigent.onboarding.sandboxes.agent_sandbox_warm_pool as warm_mod
+
+        captured: dict[str, object] = {}
+
+        def _warm_ctor(**kwargs: object) -> FakeSandboxLauncher:
+            captured.update(kwargs)
+            return fake
+
+        monkeypatch.setattr(warm_mod, "AgentSandboxWarmPoolLauncher", _warm_ctor)
+        cfg.default.launcher_factory()
+        assert captured["agent_images"] == {"researcher": "registry.example.com/host-research:v1"}
+        assert captured["image"] == "registry.example.com/host-base:v1"
+        return
+    assert cfg.default.launcher_factory() is fake
+    assert fake.image == "registry.example.com/host-base:v1"
+    assert fake.agent_images == {"researcher": "registry.example.com/host-research:v1"}
+
+
+def test_parse_kubernetes_agents_kept_on_config() -> None:
+    """The parsed map rides the config so startup can check it against built-ins."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "agent_sandbox",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"agents": {"researcher": {"image": "x:1"}}},
+        }
+    )
+    assert cfg is not None
+    assert cfg.default.agent_images == {"researcher": "x:1"}
+
+
+def test_warn_unknown_agent_images(caplog: pytest.LogCaptureFixture) -> None:
+    """Only names with no seeded built-in agent are warned about."""
+    from types import SimpleNamespace
+
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.server.managed_hosts import warn_unknown_agent_images
+
+    cfg = parse_sandbox_config(
+        {
+            "provider": "agent_sandbox",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "agents": {
+                    "researcher": {"image": "x:1"},
+                    "typo": {"image": "x:1"},
+                    "uploaded": {"image": "x:1"},
+                }
+            },
+        }
+    )
+    assert cfg is not None
+    agents = {
+        builtin_agent_id("researcher"): SimpleNamespace(session_id=None),
+        builtin_agent_id("uploaded"): SimpleNamespace(session_id="conv-1"),
+    }
+    store = SimpleNamespace(get=agents.get)
+    with caplog.at_level("WARNING", logger="omnigent.server.managed_hosts"):
+        warn_unknown_agent_images(cfg, store)  # type: ignore[arg-type]
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "agents.typo matches no built-in agent" in warned
+    assert "agents.uploaded matches no built-in agent" in warned
+    assert "researcher" not in warned
+
+
+def test_parse_kubernetes_without_agents_passes_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No `agents` block → every runner keeps the fleet image."""
+    cfg = parse_sandbox_config(
+        {"provider": "kubernetes", "server_url": "http://s.svc.cluster.local"}
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    cfg.default.launcher_factory()
+    assert fake.agent_images is None
+
+
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -995,6 +1091,21 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"home_size_limit": 8}, "quantity string"),
         ({"home_size_limit": ""}, "quantity string"),
         ({"home_size_limit": "lots"}, "valid Kubernetes quantity"),
+        # Per-agent images: operator typos must stop startup, and keys other
+        # than `image` stay rejected until per-agent secrets/env are supported.
+        ({"agents": ["researcher"]}, r"sandbox\.kubernetes\.agents' must be a mapping"),
+        ({"agents": {"": {"image": "x:1"}}}, "valid Kubernetes label values"),
+        ({"agents": {" researcher": {"image": "x:1"}}}, "valid Kubernetes label values"),
+        ({"agents": {"my agent": {"image": "x:1"}}}, "valid Kubernetes label values"),
+        ({"agents": {"a" * 64: {"image": "x:1"}}}, "valid Kubernetes label values"),
+        ({"agents": {"researcher": "x:1"}}, r"agents\.researcher' must be a mapping"),
+        ({"agents": {"researcher": {}}}, r"agents\.researcher\.image"),
+        ({"agents": {"researcher": {"image": "  "}}}, r"agents\.researcher\.image"),
+        ({"agents": {"researcher": {"image": 3}}}, r"agents\.researcher\.image"),
+        (
+            {"agents": {"researcher": {"image": "x:1", "secret_name": "s"}}},
+            "unknown key",
+        ),
         # A misspelled section key would silently no-op (e.g. no PVCs mounted)
         # without the allowlist check.
         ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
