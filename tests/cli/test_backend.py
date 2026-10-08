@@ -18,7 +18,6 @@ import subprocess
 import sys
 import textwrap
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -2905,16 +2904,14 @@ def test_ensure_backend_remote_authenticates_before_daemon_on_calling_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Auth (which may prompt for a login) finishes on the calling thread before the daemon."""
+    caller = threading.current_thread()
     events: list[str] = []
-    auth_done = threading.Event()
 
     def _auth(server: str, *, non_interactive: bool = False) -> None:
-        events.append(f"auth main_thread={threading.current_thread() is threading.main_thread()}")
-        time.sleep(0.2)
-        auth_done.set()
+        events.append(f"auth on_caller={threading.current_thread() is caller}")
 
     def _daemon(server: str | None) -> bool:
-        events.append(f"daemon after_auth={auth_done.is_set()}")
+        events.append("daemon")
         return False
 
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
@@ -2923,7 +2920,7 @@ def test_ensure_backend_remote_authenticates_before_daemon_on_calling_thread(
 
     _ensure_backend("https://myapp-1234.aws.databricksapps.com")
 
-    assert events == ["auth main_thread=True", "daemon after_auth=True"]
+    assert events == ["auth on_caller=True", "daemon"]
 
 
 def test_databricks_preflight_silent_sdk_refresh_skips_login(

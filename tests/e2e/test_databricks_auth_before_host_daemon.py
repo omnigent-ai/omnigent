@@ -11,11 +11,10 @@ included. A real ``omnigent run`` subprocess drives the whole journey. It is lau
 module (the one the installed ``omnigent`` console script runs) executes; ``-m
 omnigent.cli`` would re-execute the file under ``__main__`` and the child-side stub
 below would not reach it. Only one collaborator is substituted, in the child via
-``sitecustomize``: ``_databricks_workspace_auth_info`` returns ``None``, which is
-exactly the result a credential-less user gets. That keeps the Databricks SDK's
-credential resolution from making a nondeterministic network attempt against the
-loopback stub while the real ``_ensure_backend`` ordering, daemon-spawn gating, and
-registry/log/tunnel observation still run.
+``sitecustomize`` (see ``credential_stub``): ``_databricks_workspace_auth_info``
+returns ``None``, exactly the result a credential-less user gets, so the real
+``_ensure_backend`` ordering, daemon-spawn gating, and registry/log/tunnel
+observation still run.
 """
 
 from __future__ import annotations
@@ -209,13 +208,14 @@ def credential_stub(tmp_path_factory: pytest.TempPathFactory) -> Path:
     the loopback stub.
     """
     stub = tmp_path_factory.mktemp("credential-stub")
-    # Fail loudly if a cli.py rename drops the patch target: site runs sitecustomize
-    # for effect, so the assert aborts before the marker is written.
+    # Fail loudly if a cli.py rename drops the patch target: site swallows plain
+    # exceptions from sitecustomize, so raise SystemExit to actually abort the child.
     (stub / "sitecustomize.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
         "from omnigent import cli\n"
-        "assert hasattr(cli, '_databricks_workspace_auth_info'), 'stub target missing'\n"
+        "if not hasattr(cli, '_databricks_workspace_auth_info'):\n"
+        "    raise SystemExit('stub target missing')\n"
         "cli._databricks_workspace_auth_info = lambda _host: None\n"
         "_marker = os.environ.get('OMNIGENT_TEST_STUB_MARKER')\n"
         "if _marker:\n"
@@ -318,7 +318,6 @@ def failed_launch(
     while not records and time.monotonic() < deadline:
         time.sleep(0.2)
         records = _records()
-    host_logs = sorted(p.name for p in (data_dir / "logs" / "host").glob("*.log"))
 
     # Only a spawned daemon dials the tunnel; with no record there is nothing to wait for.
     deadline = time.monotonic() + (_TUNNEL_DIAL_WINDOW_S if records else 0.0)
@@ -327,6 +326,11 @@ def failed_launch(
         if tunnel_requests or time.monotonic() >= deadline:
             break
         time.sleep(0.2)
+
+    # Sample the host log after the full observation window so a daemon that writes
+    # it slightly after its record or tunnel dial is still caught, keeping all three
+    # orphan signals consistent.
+    host_logs = sorted(p.name for p in (data_dir / "logs" / "host").glob("*.log"))
 
     return _FailedLaunch(
         output=output,
