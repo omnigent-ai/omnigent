@@ -301,7 +301,7 @@ def test_project_actions_are_keyboard_accessible_on_desktop(
     expect(kebab).to_be_focused()
     page.keyboard.press("Enter")
     expect(page.get_by_test_id("project-new-session-menu")).to_be_hidden()
-    expect(page.get_by_test_id("rename-project")).to_be_focused()
+    expect(page.get_by_test_id("project-settings")).to_be_focused()
     page.keyboard.press("Escape")
     expect(kebab).to_be_focused()
     page.keyboard.press("Shift+Tab")

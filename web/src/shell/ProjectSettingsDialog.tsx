@@ -126,6 +126,7 @@ export function ProjectSettingsDialog({
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
   const [name, setName] = useState(projectName);
+  const nameInputRef = useRef<HTMLInputElement>(null);
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
   // Worktree default for the project. The toggle seeds from the project's
@@ -184,6 +185,12 @@ export function ProjectSettingsDialog({
     if (!open) return;
     setName(projectName);
   }, [open, projectName]);
+
+  useEffect(() => {
+    if (!open) return;
+    nameInputRef.current?.focus();
+    nameInputRef.current?.select();
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -337,6 +344,7 @@ export function ProjectSettingsDialog({
         <form onSubmit={onSubmit} className="flex flex-col gap-4">
           <Field label="Name" htmlFor="project-settings-name">
             <input
+              ref={nameInputRef}
               id="project-settings-name"
               data-testid="project-settings-name"
               className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"

@@ -102,19 +102,9 @@ def test_right_click_opens_project_folder_menu(project_page: tuple[Page, str]) -
 
     header.click(button="right")
 
-    expect(page.get_by_test_id("rename-project")).to_be_visible()
     expect(page.get_by_test_id("project-settings")).to_be_visible()
     expect(page.get_by_test_id("delete-project")).to_be_visible()
     expect(header).to_have_attribute("aria-expanded", before)
-
-    page.get_by_test_id("rename-project").click()
-    expect(page.get_by_test_id("rename-project-confirm")).to_be_visible()
-    name_input = page.get_by_role("dialog").locator("input")
-    expect(name_input).to_be_focused()
-    assert name_input.evaluate("input => [input.selectionStart, input.selectionEnd]") == [
-        0,
-        len(project),
-    ]
 
 
 def test_click_dismissing_menu_does_not_toggle_then_next_click_toggles(
@@ -125,7 +115,7 @@ def test_click_dismissing_menu_does_not_toggle_then_next_click_toggles(
     header = _folder_header(page, project)
 
     header.click(button="right")
-    expect(page.get_by_test_id("rename-project")).to_be_visible()
+    expect(page.get_by_test_id("project-settings")).to_be_visible()
     before = _expanded(header)
     flipped = "false" if before == "true" else "true"
     bounds = header.bounding_box()
@@ -135,7 +125,7 @@ def test_click_dismissing_menu_does_not_toggle_then_next_click_toggles(
         bounds["x"] + bounds["width"] / 2,
         bounds["y"] + bounds["height"] / 2,
     )
-    expect(page.get_by_test_id("rename-project")).not_to_be_visible()
+    expect(page.get_by_test_id("project-settings")).not_to_be_visible()
     expect(header).to_have_attribute("aria-expanded", before)
 
     header.click()
@@ -165,7 +155,7 @@ def test_keyboard_opens_project_folder_menu(project_page: tuple[Page, str]) -> N
     header.focus()
     header.press("ContextMenu")
 
-    expect(page.get_by_test_id("rename-project")).to_be_visible()
+    expect(page.get_by_test_id("project-settings")).to_be_visible()
     expect(header).to_have_attribute("aria-expanded", before)
 
 
@@ -183,7 +173,7 @@ def test_touch_long_press_opens_project_folder_menu(
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
     try:
         page.wait_for_timeout(750)
-        expect(page.get_by_test_id("rename-project")).to_be_visible()
+        expect(page.get_by_test_id("project-settings")).to_be_visible()
     finally:
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
@@ -218,7 +208,7 @@ def test_moving_touch_hold_does_not_open_project_folder_menu(
             {"type": "touchMove", "touchPoints": [_touch_point(header, x_offset=20)]},
         )
         page.wait_for_timeout(700)
-        expect(page.get_by_test_id("rename-project")).not_to_be_visible()
+        expect(page.get_by_test_id("project-settings")).not_to_be_visible()
     finally:
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
