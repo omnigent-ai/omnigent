@@ -4831,7 +4831,6 @@ export function NewChatLandingScreen() {
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
   const canSubmit =
-    (message.trim().length > 0 || files.length > 0) &&
     !pickerLoading &&
     !workspaceLoading &&
     !pendingSkillCompletion &&
@@ -4841,10 +4840,8 @@ export function NewChatLandingScreen() {
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating;
 
-  // Why submit is disabled, surfaced as the button's tooltip. Checked in the
-  // order a user fills the form — location first, then message — so the
-  // tooltip always names the next missing input. Null when nothing is
-  // actionable (submitting, or mid-create).
+  // The tooltip follows configuration order and names the next missing input.
+  // An empty prompt is valid once the required launch configuration is ready.
   const submitDisabledReason = canSubmit
     ? null
     : pendingSkillCompletion
@@ -4865,9 +4862,7 @@ export function NewChatLandingScreen() {
                   ? "Please choose a host and working directory"
                   : configuredAgentUnavailable && selectedAgent == null
                     ? "This project's configured agent is unavailable — pick an agent to continue"
-                    : message.trim().length === 0 && files.length === 0
-                      ? "Enter a message to get started"
-                      : null;
+                    : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5174,9 +5169,8 @@ export function NewChatLandingScreen() {
   }
 
   async function handleCreate() {
-    // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
-    // and form-submit paths that call this directly can't create a session with
-    // a blank message, host, agent, or workspace.
+    // Mirror the button gate so Enter and form submit require launch config.
+    // An empty prompt intentionally opens a session ready for its first message.
     if (!canSubmit) return;
     // A create is actually happening: report it for pointer clicks (via the
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
@@ -5668,6 +5662,7 @@ export function NewChatLandingScreen() {
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
+      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
       // SDK invocations resolve on the runner after create; native CLIs receive plain text.
       const skill = isNativeTerminalAgent
         ? null
@@ -5705,7 +5700,9 @@ export function NewChatLandingScreen() {
         // Label the row, stash the first message for ChatPage to send, navigate.
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
-        setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        if (initialPrompt || files.length > 0) {
+          setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        }
         if (onScreenRef.current && window.location.href === createLocation) {
           navigate(`/c/${data.id}`);
         }

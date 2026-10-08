@@ -3229,6 +3229,38 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(posts).toHaveLength(1);
   });
 
+  it("keeps an empty launch idle without posting an empty message", async () => {
+    seedSession("conv_real");
+    const begun = beginLocalConversation("", undefined);
+    expect(begun).not.toBeNull();
+
+    const { tempConvId, pendingMsgTempId } = begun!;
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
+    expect(useChatStore.getState().status).toBe("idle");
+
+    hydrateLocalConversation(
+      tempConvId,
+      "conv_real",
+      "agent_xyz",
+      "",
+      undefined,
+      pendingMsgTempId,
+      null,
+      noopNavigate,
+    );
+    await settle();
+
+    const state = conversationRegistry.peek("conv_real")!.getState();
+    expect(state.pendingUserMessages).toHaveLength(0);
+    expect(state.status).toBe("idle");
+    const posts = fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        String(url) === "/v1/sessions/conv_real/events" &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posts).toHaveLength(0);
+  });
+
   it("B1: a failed first message settles to idle (not stuck streaming)", async () => {
     seedSession("conv_real");
     fetchMock.mockImplementation((input, init) => {
