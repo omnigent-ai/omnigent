@@ -1398,11 +1398,10 @@ def create_runner_app(
     _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
-    # Wake-notice turns tracked from start to end: False until the turn
-    # surfaces output (a text delta or tool call), True after. A wake turn
-    # that ends still-False with an undrained inbox gets one bounded
-    # recovery wake (see _rewake_parent_if_inbox_stranded).
-    _wake_turn_saw_output: dict[str, bool] = {}
+    # Wake-notice turn outcome: "armed" at dispatch, "output" after a text delta
+    # or tool call, "empty" only on an observed response.completed with nothing
+    # surfaced. Only "empty" earns a recovery wake (see _rewake_parent_if_inbox_stranded).
+    _wake_turn_outcome: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
     # still held a sub-agent result (typically: the server was down when the
     # child finished). The catch-up scan re-attempts these on tunnel reconnect.
@@ -3415,7 +3414,7 @@ def create_runner_app(
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
-        _wake_turn_saw_output.pop(session_id, None)
+        _wake_turn_outcome.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
@@ -4411,7 +4410,7 @@ def create_runner_app(
         _background_tasks.add(_wake_task)
 
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
-        wake_turn_output = _wake_turn_saw_output.pop(parent_session_id, None)
+        wake_turn_outcome = _wake_turn_outcome.pop(parent_session_id, None)
         inbox = _session_inboxes.get(parent_session_id)
         drained = inbox is None or inbox.empty()
         if drained:
@@ -4423,16 +4422,13 @@ def create_runner_app(
             # Keep the wake-pending flag consistent with a drained inbox.
             _subagent_wake_pending.discard(parent_session_id)
             return
-        # Recover the undrained inbox only when its delivery is known broken:
-        # the wake never started a turn (pending flag still set), the wake
-        # POST exhausted its retries (stranded), or the delivered wake turn
-        # ended without surfacing any output — _run_turn_bg discards the
-        # pending flag at turn start, so the empty-completion case leaves no
-        # flag behind. A wake turn that produced output already answered the
-        # notice; re-waking it would spend model turns on an inbox the parent
-        # chose not to drain.
+        # Recover the undrained inbox only when delivery is known broken: the
+        # wake never started a turn (pending), its POST exhausted retries
+        # (stranded), or the delivered turn reported an empty response.completed.
+        # A turn that surfaced output answered the notice; one that ended with no
+        # completion signal (native injection, interrupt) never confirmed empty.
         if (
-            wake_turn_output is not False
+            wake_turn_outcome != "empty"
             and parent_session_id not in _subagent_wake_pending
             and parent_session_id not in _stranded_wake_parents
         ):
@@ -4802,11 +4798,12 @@ def create_runner_app(
     ) -> None:
         if conv in _subagent_wake_pending:
             _subagent_wake_pending.discard(conv)
-            # This turn delivers a sub-agent wake notice; track whether it
-            # surfaces any output so an empty completion can be recovered.
-            _wake_turn_saw_output[conv] = False
+            # This turn delivers a sub-agent wake notice; track its outcome so
+            # only an observed empty completion (not a native/interrupt end)
+            # earns recovery.
+            _wake_turn_outcome[conv] = "armed"
         else:
-            _wake_turn_saw_output.pop(conv, None)
+            _wake_turn_outcome.pop(conv, None)
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
@@ -5800,10 +5797,15 @@ def create_runner_app(
                                     delta = event.get("delta")
                                     if delta is not None:
                                         _text_acc.append(delta)
-                                    if delta and conv_id in _wake_turn_saw_output:
-                                        _wake_turn_saw_output[conv_id] = True
+                                    if delta and conv_id in _wake_turn_outcome:
+                                        _wake_turn_outcome[conv_id] = "output"
                                 elif _evt_type == "response.completed":
                                     _stream_failed_error = None
+                                    # An observed completion with nothing
+                                    # surfaced is the only state that earns a
+                                    # recovery wake.
+                                    if _wake_turn_outcome.get(conv_id) == "armed":
+                                        _wake_turn_outcome[conv_id] = "empty"
                                     if _text_acc:
                                         _session_histories.setdefault(conv_id, []).append(
                                             {
@@ -5832,9 +5834,9 @@ def create_runner_app(
                                     if isinstance(_item, dict):
                                         _it = _item.get("type")
                                         if _it in ("function_call", "function_call_output") and (
-                                            conv_id in _wake_turn_saw_output
+                                            conv_id in _wake_turn_outcome
                                         ):
-                                            _wake_turn_saw_output[conv_id] = True
+                                            _wake_turn_outcome[conv_id] = "output"
                                         if _it == "function_call":
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
