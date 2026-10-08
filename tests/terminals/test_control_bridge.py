@@ -1053,6 +1053,71 @@ async def test_control_bridge_read_only_drops_input() -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+async def test_control_bridge_read_only_viewer_does_not_block_harness_send_keys() -> None:
+    """A read-only viewer must not stop the harness from typing into the pane.
+
+    tmux >= 3.7 rejects ``send-keys`` with "client is read-only" when the
+    implicit target client (the most recently active one) was attached with
+    ``-r``. Harnesses run plain ``send-keys -t <pane>``, so a viewer attached
+    with ``-r`` broke chat delivery for the owner.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    sock, target = await _new_private_tmux("cat")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=True
+        )
+    )
+    try:
+        flags = ""
+        for _ in range(50):
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                str(sock),
+                "list-clients",
+                "-F",
+                "#{client_flags}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            flags = out.decode().strip()
+            if flags:
+                break
+            await asyncio.sleep(0.1)
+        client_flags = flags.split(",")
+        # Checked directly because tmux < 3.7 accepts the send-keys below
+        # even from behind a ``-r`` viewer.
+        assert "read-only" not in client_flags, flags
+        assert "ignore-size" in client_flags, flags
+
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "send-keys",
+            "-t",
+            target,
+            "-l",
+            "typed-by-harness",
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        assert proc.returncode == 0, err.decode()
+        for _ in range(50):
+            if b"typed-by-harness" in b"".join(ws.sent):
+                break
+            await asyncio.sleep(0.1)
+        assert b"typed-by-harness" in b"".join(ws.sent)
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_control_attach_pins_client_term_over_inherited_dumb(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

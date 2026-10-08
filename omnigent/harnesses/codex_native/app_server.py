@@ -35,7 +35,17 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
+from omnigent.harnesses.codex_native.bridge import (
+    clear_certificate_failure,
+    mirror_applied_codex_settings,
+    read_codex_config_model,
+    read_codex_home_config_effort,
+    read_codex_home_config_model,
+    read_unmirrored_codex_settings,
+    record_certificate_failure,
+    write_policy_hook_config,
+)
 from omnigent.harnesses.codex_native.launch_args import (
     _merge_tables,
     _write_private_config,
@@ -95,7 +105,11 @@ from omnigent.process_logging import (
     log_once,
     redact_log_text,
 )
-from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
+from omnigent.util.reasoning_effort import (
+    CODEX_NATIVE_EFFORTS,
+    EFFORT_ORDER,
+    clamp_effort_for_model,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -106,6 +120,11 @@ CodexParams: TypeAlias = _JsonObject
 CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
+_EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
+_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
+_EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
+_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
+_EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -719,6 +738,113 @@ def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
     return None
 
 
+def clamp_codex_effort_for_model(
+    effort: str | None, model: str | None, catalog: object
+) -> str | None:
+    """Apply gateway caps, then choose the nearest advertised effort, with ties downward.
+
+    Codex's catalog cannot lift a deployment's backend restrictions. Accept
+    both ``model/list`` and ``codex debug models`` catalogs; missing or unusable
+    capabilities retain the gateway-capped effort, never another model's ladder.
+    """
+    effort = clamp_effort_for_model(effort, model)
+    if effort is None or model is None:
+        return effort
+    entry = _codex_model_catalog_entry(catalog, model)
+    if entry is None:
+        return effort
+    levels = entry.get("supportedReasoningEfforts", entry.get("supported_reasoning_levels"))
+    if not isinstance(levels, list):
+        return effort
+    advertised = [
+        level.get("reasoningEffort", level.get("effort"))
+        for level in levels
+        if isinstance(level, dict)
+    ]
+    supported = [
+        value
+        for value in EFFORT_ORDER
+        if value in advertised and clamp_effort_for_model(value, model) == value
+    ]
+    if not supported or effort in supported or effort not in EFFORT_ORDER:
+        return effort
+    target = EFFORT_ORDER.index(effort)
+    resolved = min(supported, key=lambda value: abs(EFFORT_ORDER.index(value) - target))
+    log_once(
+        _logger,
+        logging.INFO,
+        "Adjusted Codex reasoning effort for model %s: %s -> %s",
+        model,
+        effort,
+        resolved,
+    )
+    return resolved
+
+
+_effort_catalog_cache: TTLCache[str, list[_JsonObject]] = TTLCache(maxsize=128, ttl=60.0)
+# Models a fresh catalog lacked, so an unlisted model does not refetch on every turn.
+_effort_catalog_misses: TTLCache[str, set[str]] = TTLCache(maxsize=128, ttl=60.0)
+
+
+async def resolve_codex_effort_for_model(
+    client: CodexAppServerClient,
+    effort: str | None,
+    model: str | None,
+    *,
+    transport: str | None = None,
+) -> str:
+    """Resolve against live capabilities, reusing successful discovery for one minute.
+
+    A transport key lets successive turn clients share the catalog for their
+    app-server. New server transports and expired entries fetch fresh rows;
+    discovery failures are never cached. Explicit levels retain the gateway
+    fallback; resets raise without a discoverable model default because Codex
+    treats a null effort in ``thread/settings/update`` as unchanged.
+    """
+    catalog = _effort_catalog_cache.get(transport) if transport is not None else None
+    if (
+        catalog is not None
+        and transport is not None
+        and model
+        and _codex_model_catalog_entry(catalog, model) is None
+        and model not in _effort_catalog_misses.get(transport, ())
+    ):
+        catalog = None  # The cached rows may predate this model, so refetch them.
+    if model and catalog is None:
+        try:
+            catalog = await asyncio.wait_for(
+                list_codex_model_options(client, include_hidden=True),
+                timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS,
+            )
+            # Empty startup catalogs can recover; retry instead of hiding later metadata.
+            if transport is not None and catalog:
+                _effort_catalog_cache[transport] = catalog
+                if _codex_model_catalog_entry(catalog, model) is None:
+                    _effort_catalog_misses.setdefault(transport, set()).add(model)
+        except Exception:  # noqa: BLE001 — discovery must not prevent a turn
+            log_once(
+                _logger,
+                logging.WARNING,
+                "Could not read Codex model capabilities for effort validation (transport=%s)",
+                transport,
+                exc_info=True,
+            )
+    if effort is None:
+        entry = _codex_model_catalog_entry(catalog, model) if model else None
+        if entry is None:
+            # Name the cause, since an unreachable server and an unlisted model differ.
+            raise ValueError(
+                "Could not read the Codex model catalog to resolve the default effort"
+                if model and catalog is None
+                else f"Codex model capabilities unavailable for {model!r}"
+            )
+        default = entry.get("defaultReasoningEffort", entry.get("default_reasoning_level"))
+        if not isinstance(default, str) or not default:
+            raise ValueError("Codex model catalog did not provide a default reasoning effort")
+        effort = default
+    return clamp_codex_effort_for_model(effort, model, catalog) or effort
+
+
 def _codex_model_upgrade_metadata_is_malformed(entry: dict[str, object]) -> bool:
     """Return whether declared migration metadata lacks a usable target."""
     upgrade_info = entry.get("upgradeInfo")
@@ -818,6 +944,12 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+#: Codex ``-32600`` messages for a thread with no active turn at all. The
+#: superseded-turn rejection (``expected active turn id ... but found ...``) is
+#: separate because a newer turn is still live there.
+_NO_ACTIVE_TURN_MESSAGES = frozenset({"no active turn to steer", "no active turn to interrupt"})
+
+
 def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex rejected a turn id that ended or was replaced.
 
@@ -830,9 +962,25 @@ def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
     if error.code != -32600 or error.message is None:
         return False
     message = error.message.strip().casefold()
-    return message in {"no active turn to steer", "no active turn to interrupt"} or (
+    return message in _NO_ACTIVE_TURN_MESSAGES or (
         "expected active turn id" in message and "but found" in message
     )
+
+
+def is_no_active_turn_error(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex rejected because the thread has no active turn at all.
+
+    This is the subset of :func:`is_stale_active_turn_error` where the turn
+    genuinely ended. It excludes the superseded-turn rejection (``expected
+    active turn id ... but found ...``), where a newer turn is still live.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``True`` only when no turn is currently active.
+    """
+    if error.code != -32600 or error.message is None:
+        return False
+    message = error.message.strip().casefold()
+    return message in _NO_ACTIVE_TURN_MESSAGES
 
 
 #: JSON-RPC internal-error code codex returns when its thread-store fails.
@@ -1115,10 +1263,13 @@ def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -
     )
 
 
-async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
-    """Read every visible model from an initialized Codex app-server client.
+async def list_codex_model_options(
+    client: CodexAppServerClient, *, include_hidden: bool = False
+) -> list[_JsonObject]:
+    """Read models from an initialized Codex app-server client.
 
     :param client: Connected Codex app-server client.
+    :param include_hidden: Include models omitted from the picker but still runnable.
     :returns: Raw ``model/list`` rows in Codex preference order.
     :raises ValueError: When Codex returns a malformed response.
     """
@@ -1126,7 +1277,7 @@ async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonOb
     cursor: str | None = None
     include_hidden_supported = True
     while True:
-        params: CodexParams = {"includeHidden": False} if include_hidden_supported else {}
+        params: CodexParams = {"includeHidden": include_hidden} if include_hidden_supported else {}
         if cursor is not None:
             params["cursor"] = cursor
         try:
@@ -1138,6 +1289,13 @@ async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonOb
                 raise
             # Older servers list visible models by default but reject this field.
             include_hidden_supported = False
+            if include_hidden:
+                log_once(
+                    _logger,
+                    logging.INFO,
+                    "Codex model/list rejected includeHidden; hidden model capabilities "
+                    "are unavailable from this server",
+                )
             continue
         result = response.get("result")
         if not isinstance(result, dict):
@@ -1828,6 +1986,9 @@ class CodexNativeAppServer:
     config_profile: str | None = None
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
+    # First TLS certificate failure the launcher printed; mirrored into the
+    # bridge so the forwarder can fail a stuck turn with the cause.
+    certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
     async def start(self) -> None:
@@ -1844,6 +2005,8 @@ class CodexNativeAppServer:
             )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
+        # A previous launch's certificate record must not fail this launch's turns.
+        clear_certificate_failure(self.bridge_dir)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()
@@ -1887,8 +2050,8 @@ class CodexNativeAppServer:
             minimal_config=minimal_config,
         )
         model_migration_target: str | None = None
+        catalog: object = self.model_catalog_rows
         if self.trust_project and self.pinned_model:
-            catalog: object = self.model_catalog_rows
             catalog_entry = _codex_model_catalog_entry(catalog, self.pinned_model)
             # ``model/list`` excludes hidden rows. A selected legacy model may
             # therefore be absent even from a fresh snapshot. A present row
@@ -1941,8 +2104,11 @@ class CodexNativeAppServer:
                     self.pinned_model,
                     model_migration_target,
                 )
-        if self.pinned_effort:
-            _pin_codex_config_effort(self.codex_home, self.pinned_effort, self.pinned_model)
+        effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
+        requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
+        effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
+        if effective_effort and (self.pinned_effort or effective_effort != requested_effort):
+            _pin_codex_config_effort(self.codex_home, effective_effort, effective_model)
         _sync_codex_developer_instructions(
             self.codex_home,
             self.developer_instructions,
@@ -1987,6 +2153,9 @@ class CodexNativeAppServer:
         if self.reconcile_process_registry:
             reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
+        effort_catalog_transport = self.listen_url or str(self.socket_path)
+        _effort_catalog_cache.pop(effort_catalog_transport, None)
+        _effort_catalog_misses.pop(effort_catalog_transport, None)
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
@@ -2045,6 +2214,49 @@ class CodexNativeAppServer:
         try:
             startup_client = await self._wait_until_ready()
             try:
+                # Standalone CLI launches may have no shared catalog snapshot.
+                # Correct their copied defaults before a TUI creates its thread.
+                if (
+                    effective_model
+                    and effective_effort
+                    and _codex_model_catalog_entry(catalog, effective_model) is None
+                ):
+                    resolved_effort = effective_effort
+                    try:
+                        resolved_effort = await resolve_codex_effort_for_model(
+                            startup_client,
+                            effective_effort,
+                            effective_model,
+                            transport=effort_catalog_transport,
+                        )
+                        if resolved_effort != effective_effort:
+                            await asyncio.wait_for(
+                                startup_client.request(
+                                    "config/batchWrite",
+                                    {
+                                        "filePath": str(self.codex_home / "config.toml"),
+                                        "edits": [
+                                            {
+                                                "keyPath": "model_reasoning_effort",
+                                                "value": resolved_effort,
+                                                "mergeStrategy": "replace",
+                                            }
+                                        ],
+                                    },
+                                ),
+                                timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
+                            )
+                    except Exception:  # noqa: BLE001 - the local write below still repairs it
+                        _logger.warning(
+                            "Could not persist supported Codex reasoning effort at startup",
+                            exc_info=True,
+                        )
+                        if resolved_effort != effective_effort:
+                            # The app-server and TUI read this file when the thread is created.
+                            # If it cannot be written either, stop rather than launch the pair.
+                            _pin_codex_config_effort(
+                                self.codex_home, resolved_effort, effective_model
+                            )
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)
@@ -2325,6 +2537,11 @@ class CodexNativeAppServer:
                 self.recent_stderr.append(text)
                 if len(self.recent_stderr) > 20:
                     self.recent_stderr.pop(0)
+            if self.certificate_failure is None:
+                failure = detect_certificate_failure(text)
+                if failure is not None:
+                    self.certificate_failure = failure
+                    record_certificate_failure(self.bridge_dir, failure)
             if diagnostics is not None:
                 diagnostics.submit(
                     bytes(pending) + (b"\n" if newline else b""), bytes_omitted=omitted_bytes
@@ -2893,7 +3110,7 @@ class _DatabricksLaunchMaterialization:
     app-server build and the model-options probe so the two cannot drift.
 
     :param config_overrides: ``-c`` overrides routing Codex through the
-        profile's AI Gateway (provider block + auth command + model pin).
+        profile's Unity Gateway (provider block + auth command + model pin).
     :param model: The model the overrides pin, e.g. ``"databricks-gpt-5-4"``
         — the explicit *model* when given, else the catalog default.
     :param host: The profile's workspace origin for ``DATABRICKS_HOST``.
@@ -3851,7 +4068,7 @@ def resolve_native_codex_launch(
             )
             log_info_once(
                 _logger,
-                "native-codex routing: managed connect host — Databricks AI gateway "
+                "native-codex routing: managed connect host — Databricks Unity Gateway "
                 "via the credential broker (host-only [omnigent] profile + sidecar).",
             )
             return NativeCodexLaunch(
@@ -3864,7 +4081,7 @@ def resolve_native_codex_launch(
                 ),
                 model=resolved_model,
                 profile=None,
-                summary="Databricks AI gateway (managed connect host, broker-minted)",
+                summary="Databricks Unity Gateway (managed connect host, broker-minted)",
             )
 
     if entry is None:
@@ -4269,6 +4486,7 @@ async def apply_codex_thread_effort(
     effort: str,
     *,
     model: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Set a loaded thread's reasoning effort via ``thread/settings/update``.
@@ -4285,19 +4503,43 @@ async def apply_codex_thread_effort(
     :param effort: Session-persisted effort, e.g. ``"ultra"``.
     :param model: Model the thread runs, or ``None``; the effort is clamped to
         a level that model accepts.
+    :param bridge_dir: Session bridge directory for reading the current model
+        and mirroring the applied effort back to the terminal config.
     :raises Exception: If the app-server rejects the update.
     """
-    from omnigent.util.reasoning_effort import clamp_effort_for_model
-
     client = client_for_transport(transport, client_name="omnigent-codex-native-effort")
-    await client.connect()
     try:
-        await client.request(
-            "thread/settings/update",
-            {"threadId": thread_id, "effort": clamp_effort_for_model(effort, model)},
+        await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
+        if model is None and bridge_dir is not None:
+            pending = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
+            model = pending.get("model") or await asyncio.to_thread(
+                read_codex_config_model, bridge_dir
+            )
+        applied_effort = await resolve_codex_effort_for_model(
+            client, effort, model, transport=transport
         )
+        await asyncio.wait_for(
+            client.request(
+                "thread/settings/update",
+                {"threadId": thread_id, "effort": applied_effort},
+            ),
+            timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
+        )
+        # The mirror takes a cross-process file lock, so keep it off the event loop.
+        if bridge_dir is not None and await asyncio.to_thread(
+            mirror_applied_codex_settings, bridge_dir, {"effort": applied_effort}
+        ):
+            _logger.warning(
+                "Failed to mirror resumed Codex reasoning effort %s into config.toml "
+                "(thread=%s, bridge=%s)",
+                applied_effort,
+                thread_id,
+                bridge_dir,
+            )
     finally:
-        await client.close()
+        # A wedged server can stall the closing handshake; it must not mask the result.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.close(), timeout=_EFFORT_CLOSE_TIMEOUT_SECONDS)
 
 
 def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:

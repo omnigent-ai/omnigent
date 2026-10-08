@@ -103,6 +103,12 @@ async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
     # Tells the shell where server-driven chrome lives, so it need not infer
     # placement from the version number.
     assert body["ui"]["server_picker"] == "sidebar"
+    # This fixture runs without an auth provider, so there is nothing to sign in to,
+    # and no native app redirect is advertised outside OIDC.
+    assert body["auth"] == {"mode": "none", "session_cookie": None, "native_redirect_uris": None}
+    # Present-but-null when the operator names nothing.
+    assert "server_name" in body
+    assert body["server_name"] is None
 
 
 @pytest.mark.asyncio
@@ -620,6 +626,36 @@ async def test_branding_snapshot_performs_no_request_time_io_or_decode(
         if response.request.url.path.startswith("/v1/branding/logo/")
     )
     assert (config_loads, logo_reads, validations, pillow_opens) == startup_counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("branding", "expected"),
+    [
+        ({"server_name": "  Acme Engineering  "}, "Acme Engineering"),
+        ({"server_name": "   "}, None),
+        # No fallback: the product name doesn't identify one deployment.
+        ({"app_name": "Acme Agent"}, None),
+    ],
+)
+async def test_well_known_manifest_server_name(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    branding: dict[str, object],
+    expected: str | None,
+) -> None:
+    app = _build_branding_app(
+        db_uri, tmp_path, "server-name", server_config={"branding": branding}
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        manifest = (await client.get("/.well-known/omnigent.json")).json()
+        info_branding = (await client.get("/v1/info")).json()["branding"]
+
+    assert manifest["server_name"] == expected
+    # The /v1/info branding block is unchanged; the name lives in the manifest.
+    assert "server_name" not in info_branding
 
 
 @pytest.mark.asyncio

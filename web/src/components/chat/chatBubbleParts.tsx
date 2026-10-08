@@ -64,7 +64,8 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { continueFailedTurn, retrySession } from "@/lib/sessionsApi";
+import { QueryClientContext } from "@tanstack/react-query";
+import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -73,10 +74,10 @@ import {
   useScopedConversationId,
 } from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
-import { UserMessageNav } from "@/components/UserMessageNav";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
@@ -554,11 +555,14 @@ export const BubbleView = memo(
     isLastAssistant = false,
     showsWorking = false,
     actionsPersistent = false,
+    recoveryDisabled = false,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
     actionsPersistent?: boolean;
+    /** Hide retry/recovery controls when the surrounding session is sealed. */
+    recoveryDisabled?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
@@ -585,6 +589,7 @@ export const BubbleView = memo(
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
         actionsPersistent={actionsPersistent}
+        recoveryDisabled={recoveryDisabled}
       />
     );
   },
@@ -592,6 +597,7 @@ export const BubbleView = memo(
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
+    (prev.recoveryDisabled ?? false) === (next.recoveryDisabled ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -706,14 +712,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const text = extractUserText(bubble.content);
+  const isShellCommand = bubble.shellCommand !== undefined;
+  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
   // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
   // markers (no input_file block), so surface them as chips.
-  const mentionedChips = extractAttachedPaths(bubble.content);
+  const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
@@ -725,6 +732,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // a large DOM for text the user hasn't asked to read yet.
   const isLong = text.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
+  const visibleText = isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -860,13 +868,19 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && (
               <>
                 <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
-                  <FilePathAwareMessageResponse
-                    breaks
-                    mode="static"
-                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                  >
-                    {isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text}
-                  </FilePathAwareMessageResponse>
+                  {isShellCommand ? (
+                    <pre className="whitespace-pre-wrap break-words font-mono text-sm">
+                      <code>{visibleText}</code>
+                    </pre>
+                  ) : (
+                    <FilePathAwareMessageResponse
+                      breaks
+                      mode="static"
+                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                    >
+                      {visibleText}
+                    </FilePathAwareMessageResponse>
+                  )}
                   {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
                   {isCollapsed && isLong && (
@@ -930,11 +944,13 @@ function AssistantBubble({
   isLastAssistant = false,
   showsWorking = false,
   actionsPersistent = false,
+  recoveryDisabled = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
   actionsPersistent?: boolean;
+  recoveryDisabled?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
@@ -964,6 +980,7 @@ function AssistantBubble({
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
@@ -993,12 +1010,20 @@ function AssistantBubble({
         await continueFailedTurn(conversationId);
         return;
       }
-      const result = await retrySession(conversationId);
-      if (!result.recovered) {
-        throw new Error("The session is already connected; no recovery was performed");
+      try {
+        const result = await retrySession(conversationId);
+        if (!result.recovered) {
+          throw new Error("The session is already connected; no recovery was performed");
+        }
+      } catch (error) {
+        // Resume can seal a lost side chat; refresh its read-only state immediately.
+        if (error instanceof ApiError && error.code === "conflict") {
+          void queryClient?.invalidateQueries({ queryKey: ["session", conversationId] });
+        }
+        throw error;
       }
     },
-    [conversationId, scopedConversationId, isLastAssistant],
+    [conversationId, scopedConversationId, isLastAssistant, queryClient],
   );
 
   if (bubble.items.length === 0) return null;
@@ -1064,7 +1089,7 @@ function AssistantBubble({
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
             defaultExpanded={bubble.defaultExpanded}
-            onRetryError={handleRetryError}
+            onRetryError={recoveryDisabled ? undefined : handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -1101,15 +1126,24 @@ function AssistantBubble({
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
               {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <MessageAction
-                  tooltip="Fork from here"
-                  size="icon-xxs"
-                  data-testid="fork-from-response"
-                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-                  componentId="chat.message.fork"
-                >
-                  <SplitIcon size={14} />
-                </MessageAction>
+                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                  <MessageAction
+                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                    label="Fork from here"
+                    disabled={!!forkDialog.disabledReason}
+                    size="icon-xxs"
+                    data-testid="fork-from-response"
+                    onClick={() =>
+                      forkDialog.openForkDialog({
+                        sourceSessionId: scopedConversationId ?? undefined,
+                        upToResponseId: bubble.responseId,
+                      })
+                    }
+                    componentId="chat.message.fork"
+                  >
+                    <SplitIcon size={14} />
+                  </MessageAction>
+                </DisabledActionTooltip>
               )}
               <MessageAction
                 tooltip={isLinkCopied ? "Copied!" : "Copy link"}
@@ -1144,18 +1178,6 @@ function AssistantBubble({
 // ---------------------------------------------------------------------------
 // Scroll helpers — rendered inside <Conversation> / as its siblings.
 // ---------------------------------------------------------------------------
-
-export function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
-  const { isAtBottom } = useStickToBottomContext();
-  return (
-    <UserMessageNav
-      {...props}
-      // Mobile-only: the TurnRail replaces these buttons on desktop. Hidden at
-      // the bottom on mobile too. Keyboard ⌘⌥↑↓ still works on all sizes.
-      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
-    />
-  );
-}
 
 /**
  * Forces the conversation back to the bottom when this client submits a new
@@ -2015,7 +2037,7 @@ export function JumpToTopButton({
       // the safe-area inset, so add --omnigent-inset-top (0px off-shell).
       style={{ top: "calc(50px + var(--omnigent-inset-top))" }}
       className={cn(
-        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150",
+        "pointer-events-none absolute inset-x-0 z-40 flex justify-center transition-opacity duration-150 max-md:hidden",
         visible ? "opacity-100" : "opacity-0",
       )}
     >

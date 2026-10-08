@@ -114,14 +114,14 @@ def _is_host_tool(tool_name: str) -> bool:
 
 class InnerExecutorError(RuntimeError):
     """
-    An executor-reported failure that names its own semantic error code.
+    An executor-reported failure with a code or explicit delivery evidence.
 
     Raised by :class:`ExecutorAdapter` when an :class:`ExecutorError` event
-    carries a ``code``, so the terminal ``response.failed`` reports that code,
-    headline and next step instead of the exception class name.
+    carries a ``code`` or ``undelivered`` flag. Uncoded failures retain their
+    RuntimeError classification while carrying delivery evidence to the relay.
 
     :param message: Human-readable failure text shown to the user.
-    :param code: Semantic failure code, e.g. ``"databricks_sign_in_pending"``.
+    :param code: Semantic failure code, or ``None`` for the generic classifier.
     :param title: Short headline for the error card, or ``None``.
     :param remediation: Concrete next step for the user, or ``None``.
     :param undelivered: ``True`` when the harness never received the message.
@@ -131,7 +131,7 @@ class InnerExecutorError(RuntimeError):
         self,
         message: str,
         *,
-        code: str,
+        code: str | None,
         title: str | None = None,
         remediation: str | None = None,
         undelivered: bool = False,
@@ -366,12 +366,11 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
-                        if event.code:
-                            # The executor named the failure: keep its code, headline
-                            # and next step so the card reads as that failure rather
-                            # than as a bare exception class.
+                        if event.code or event.undelivered:
+                            # Delivery evidence must survive even when the executor
+                            # leaves classification to the generic error path.
                             raise InnerExecutorError(
-                                detail,
+                                detail if event.code else f"inner executor error: {detail}",
                                 code=event.code,
                                 title=event.title,
                                 remediation=event.remediation,
@@ -989,11 +988,13 @@ class ExecutorAdapter(HarnessApp):
     def _build_error_detail(self, exception: BaseException) -> Any:
         """Map an exception to a semantic code the Omnigent retry allowlist recognizes.
 
-        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``.
-        Unknown types fall back to base class (``type(exception).__name__``).
+        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``,
+        then a text check for a CLI too old for the model. Unknown types fall back to base
+        class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
+        from omnigent.runner.launch_failure import diagnose_client_update_required
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, ProviderAuthRequired):
@@ -1005,6 +1006,11 @@ class ExecutorAdapter(HarnessApp):
                 remediation=exception.remediation,
             )
         if isinstance(exception, InnerExecutorError):
+            if not exception.code:
+                detail = self._build_error_detail(RuntimeError(str(exception)))
+                return detail.model_copy(
+                    update={"undelivered": True if exception.undelivered else None}
+                )
             return ErrorDetail(
                 code=exception.code,
                 message=str(exception),
@@ -1018,6 +1024,18 @@ class ExecutorAdapter(HarnessApp):
         code = classify_inner_exception(exception)
         if code is not None:
             return ErrorDetail(code=code, message=str(exception))
+
+        # An old-CLI model refusal reaches here as a bare RuntimeError; its text names the fix.
+        message = str(exception)
+        diagnosis = diagnose_client_update_required(message)
+        if diagnosis is not None:
+            return ErrorDetail(
+                code="client_update_required",
+                message=message,
+                title=diagnosis.title,
+                cause=diagnosis.cause,
+                remediation=diagnosis.remediation,
+            )
 
         return super()._build_error_detail(exception)
 
