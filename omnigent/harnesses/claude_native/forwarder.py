@@ -884,6 +884,9 @@ class _ForwardDedupeState:
     # partial answer.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
+    # Session already logged as moved off this runner, so the notice is not
+    # repeated for every item dropped afterwards.
+    session_not_bound_logged_for: str | None = None
 
 
 @dataclass(frozen=True)
@@ -4778,13 +4781,20 @@ async def _forward_available_items(
                     delivered_ambiguous=False,
                     http_status=_http_status_for_log(exc),
                 )
-                await _post_forwarder_failed_status(
-                    client,
-                    session_id=session_id,
-                    reason=f"transcript item {item.source_id} rejected",
-                    source_id=retry_key,
-                    response_id=current_response_id,
-                )
+                if _is_session_not_bound(exc):
+                    # The session now lives on another runner; a failed status
+                    # from this one would fail it there.
+                    _log_session_not_bound_once(
+                        dedupe, session_id=session_id, source_id=item.source_id
+                    )
+                else:
+                    await _post_forwarder_failed_status(
+                        client,
+                        session_id=session_id,
+                        reason=f"transcript item {item.source_id} rejected",
+                        source_id=retry_key,
+                        response_id=current_response_id,
+                    )
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
                 updated = TranscriptForwardState(
@@ -6280,6 +6290,37 @@ async def _post_forwarder_failed_status(
         )
 
 
+def _log_session_not_bound_once(
+    dedupe: _ForwardDedupeState,
+    *,
+    session_id: str,
+    source_id: str,
+) -> None:
+    """
+    Log that a session left this runner, once per session.
+
+    :param dedupe: Forwarder state remembering the session already logged.
+    :param session_id: Omnigent session/conversation id.
+    :param source_id: Source id of the dropped transcript item, e.g.
+        ``"item-1:0:message"``; never the item content.
+    :returns: None.
+    """
+    if dedupe.session_not_bound_logged_for == session_id:
+        return
+    dedupe.session_not_bound_logged_for = session_id
+    _logger.info(
+        "Claude transcript item dropped: session is no longer bound to this runner; "
+        "session=%s source_id=%s",
+        session_id,
+        source_id,
+        extra=debug_event(
+            "claude_forwarder_session_not_bound",
+            session_id=session_id,
+            source_id=source_id,
+        ),
+    )
+
+
 async def _post_external_session_todos(
     client: httpx.AsyncClient,
     *,
@@ -6316,6 +6357,19 @@ def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
         return False
     status_code = exc.response.status_code
     return 400 <= status_code < 500 and status_code not in _HTTP_TRANSIENT_STATUS_CODES
+
+
+def _is_session_not_bound(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` means the session no longer belongs to this runner.
+
+    The runner event tunnel answers 403 for a session that was moved to another
+    runner while this runner's Claude pane and forwarder stayed alive.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` for a 403 status response, otherwise ``False``.
+    """
+    return _http_status_for_log(exc) == 403
 
 
 def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:

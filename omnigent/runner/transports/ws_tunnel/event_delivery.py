@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 from websockets.exceptions import ConnectionClosed
 
+from omnigent.errors import ErrorCode
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
@@ -275,8 +276,15 @@ class TunnelEventClient(httpx.AsyncClient):
             return await self._synthetic_response(503, request=request)
         if ack.applied == len(events):
             return await self._synthetic_response(202, request=request, json={"queued": False})
+        if ack.retryable:
+            status = 503
+        elif ack.error == ErrorCode.FORBIDDEN:
+            # Wrong-runner refusal (session moved to another host), not a malformed event.
+            status = 403
+        else:
+            status = 422
         return await self._synthetic_response(
-            503 if ack.retryable else 422,
+            status,
             json={"detail": ack.error or "event batch was not accepted"},
             request=request,
         )
