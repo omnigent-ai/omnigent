@@ -9,9 +9,10 @@ const MAX_GENERATED_BYTES = 128;
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
 export const MAX_CONFIG_BYTES = 1024 * 1024;
-export const MAX_XML_MARKUP = 2_600_000;
+export const MAX_XML_MARKUP = 1_975_000;
 export const MAX_CONFIG_XML_MARKUP = 32_000;
-export const MAX_EMITTED_ELEMENTS = MAX_XML_MARKUP;
+// Shared meshes can emit more elements than a single parsed source.
+export const MAX_EMITTED_ELEMENTS = 2_600_000;
 export const MAX_EMITTED_ELEMENT_OVERHEAD = 1024;
 const XML_MARKUP_START = "<".charCodeAt(0);
 export const INFLATE_CHUNK_BYTES = 16 * 1024;
@@ -336,6 +337,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const palette: unknown = JSON.parse(
       strFromU8(configs["Metadata/project_settings.config"]),
     ).filament_colour;
+    delete configs["Metadata/project_settings.config"];
     if (!Array.isArray(palette)) return buffer;
     const color = (index: number | null): string | null => {
       const value: unknown = index === null ? null : palette[index - 1];
@@ -364,6 +366,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       }
     }
     const settings = xml(configs["Metadata/model_settings.config"]);
+    delete configs["Metadata/model_settings.config"];
     const slots = new Map<Element, number | null>();
     const cachedSlot = (element: Element | undefined, inherited: number | null) => {
       if (!element) return inherited;
@@ -396,6 +399,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     ).find((relationship) => relationship.getAttribute("Type") === MODEL_RELATIONSHIP);
     if (!rootRelationship) return buffer;
     const rootPath = zipPath(rootRelationship.getAttribute("Target") ?? "");
+    entries.delete("_rels/.rels");
     const models = new Map<string, Document>();
     const objects = new Map<string, Element>();
     const meshes = new WeakSet<Element>();
@@ -404,12 +408,14 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const namespaces = new Map<string, string>();
     let objectCount = 0;
     let componentCount = 0;
-    for (const [path, data] of entries) {
+    for (const path of entries.keys()) {
       if (!path.endsWith(".model")) continue;
-      const document = xml(data);
-      if (document.documentElement.getAttribute("xmlns") !== CORE) return buffer;
+      const document = xml(entries.get(path)!);
       entries.delete(path);
-      for (const element of document.querySelectorAll("*")) {
+      if (document.documentElement.getAttribute("xmlns") !== CORE) return buffer;
+      const elements = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
+      do {
+        const element = elements.currentNode as Element;
         if (!MODEL_NAMESPACES.has(element.namespaceURI ?? "")) return buffer;
         if (utf8Length(element.prefix ?? "") > MAX_NAMESPACE_PREFIX_BYTES) return buffer;
         for (const name of element.getAttributeNames()) {
@@ -439,7 +445,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         )
           return buffer;
         if (element.localName === "component" && ++componentCount > MAX_COMPONENTS) return buffer;
-      }
+      } while (elements.nextNode());
       const resources = children(document.documentElement, "resources")[0];
       if (!resources) return buffer;
       const normalizedPath = zipPath(path);
@@ -586,6 +592,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     };
     const sourceBuild = children(root.documentElement, "build")[0];
     if (!sourceBuild) return buffer;
+    for (const model of models.values()) model.documentElement.replaceChildren();
+    models.clear();
     reserve(sourceBuild, "build");
     const build = output.adoptNode(sourceBuild);
     const contexts = new Map<
@@ -625,9 +633,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       bases.append(base);
     }
     outputModel.append(build);
-    for (const model of models.values()) model.documentElement.replaceChildren();
     entries.clear();
-    models.clear();
     objects.clear();
     links.clear();
     objectConfigs.clear();
