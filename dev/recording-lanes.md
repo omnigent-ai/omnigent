@@ -346,16 +346,17 @@ When the reported symptom is an absence — no card, no notice, a turn that
 will also pass on a session that failed for an unrelated reason, and the clip
 then shows that failure instead: a red "Something went wrong" pill in an
 otherwise empty transcript, an error badge on the session row. Alongside the
-missing-element assertion, assert that no generic error notice is on screen. In
-the web lane that means no transcript error pill
+missing-element assertion, first wait for the stall context the caption
+describes to be visible — the user message, the pending tool call, or the
+running-turn indicator — and only then assert that no generic error notice is
+on screen; a zero-count assertion passes vacuously while the page is still
+loading. In the web lane that means no transcript error pill
 (`expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)`;
 the same pill with `data-level="info"` is an informational notice, not a
 failure) and no error badge on the session's sidebar row
 (`expect(row.locator('[data-testid="session-state-badge"][data-state="error"]')).to_have_count(0)`;
-the badge reflects session state and outlives a dismissed pill). Also assert
-that the stall context the caption describes is visible — the user message, the
-pending tool call, or the running-turn indicator. If an error notice does
-appear, find what raised it (the seeded
+the badge reflects session state and outlives a dismissed pill). If an error
+notice does appear, find what raised it (the seeded
 session's own turn or the injected event) and fix the setup before filming; a
 clip of an error notice demonstrates that error, not a silent stall.
 

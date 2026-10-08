@@ -58,7 +58,9 @@ def test_before_clip_of_an_absence_must_rule_out_a_different_failure() -> None:
         'row.locator(\'[data-testid="session-state-badge"][data-state="error"]\')).to_have_count(0)'
         in lanes
     )
-    assert "the stall context the caption describes is visible" in lanes
+    assert "first wait for the stall context the caption describes to be visible" in lanes
+    assert "only then assert that no generic error notice is on screen" in lanes
+    assert "a zero-count assertion passes vacuously while the page is still loading" in lanes
     assert "demonstrates that error, not a silent stall" in lanes
 
 
