@@ -884,12 +884,15 @@ def restart_live_runner_process(live_server: str, live_runner_id: str) -> None:
     # replacement connection; observe the disconnect before starting it.
     disconnect_deadline = time.monotonic() + HEALTH_TIMEOUT_S
     while time.monotonic() < disconnect_deadline:
-        response = httpx.get(
-            f"{live_server}/v1/runners/{live_runner_id}/status",
-            timeout=2,
-        )
-        if response.status_code == 200 and response.json().get("online") is False:
-            break
+        try:
+            response = httpx.get(
+                f"{live_server}/v1/runners/{live_runner_id}/status",
+                timeout=2,
+            )
+            if response.status_code == 200 and response.json().get("online") is False:
+                break
+        except httpx.HTTPError:
+            pass
         time.sleep(POLL_INTERVAL_S)
     else:
         raise AssertionError("killed runner tunnel remained online before restart")

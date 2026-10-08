@@ -1741,3 +1741,55 @@ async def test_rekey_codex_native_session_cancels_incumbent_under_new_id() -> No
         for key in (old_id, new_id):
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(key, None)
         await _drain_forwarder_runs([rotated_run, incumbent_run])
+
+
+@pytest.mark.asyncio
+async def test_codex_forwarder_completion_after_rotation_releases_new_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A forwarder that rotated and then returns normally pops and closes its app-server
+    under the replacement id, leaving neither id registered."""
+    old_id = "1111aaaa1111aaaa1111aaaa1111aaaa"
+    new_id = "2222bbbb2222bbbb2222bbbb2222bbbb"
+    closed = False
+
+    class _FakeAppServer:
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    async def _rotate_then_return(**kwargs: Any) -> None:
+        kwargs["on_session_rotated"](old_id, new_id)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.forwarder.supervise_forwarder", _rotate_then_return
+    )
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda *a, **k: None)
+    app_server = _FakeAppServer()
+    try:
+        runner_app_mod._AUTO_CODEX_APP_SERVERS[old_id] = app_server
+        task = asyncio.create_task(
+            native_orchestration._codex_forward_known_thread(
+                session_id=old_id,
+                bridge_dir=tmp_path,
+                codex_ws_url="ws://127.0.0.1:9",
+                thread_id="thread_old",
+                app_server=app_server,  # type: ignore[arg-type]
+            )
+        )
+        runner_app_mod._register_auto_forwarder_task(old_id, task)
+        await asyncio.wait_for(task, timeout=10)
+        await asyncio.sleep(0)
+
+        assert closed is True, "normal completion must close the forwarder's own app-server"
+        for key in (old_id, new_id):
+            assert key not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            assert key not in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert codex_native_bridge.read_bridge_startup_error(tmp_path) is not None, (
+            "a returned forwarder must mark the pane so the next ensure replaces it"
+        )
+    finally:
+        for key in (old_id, new_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(key, None)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(key, None)

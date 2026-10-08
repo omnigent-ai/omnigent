@@ -293,7 +293,13 @@ class _Journey:
             lambda: read_bridge_state(self.bridge_dir), "Codex thread creation", timeout=120
         )
         app_pid = _app_server_pid(state.socket_path)
-        self.app = (app_pid, psutil.Process(app_pid).create_time())
+        try:
+            self.app = (app_pid, psutil.Process(app_pid).create_time())
+        except psutil.Error as error:
+            raise AssertionError(
+                f"codex app-server pid {app_pid} for session {session_id} "
+                f"(thread {state.thread_id}) vanished before the census started: {error!r}"
+            ) from None
         self.ws_url = state.socket_path
         _wait_for(
             lambda: len(_stubs(self.app)) >= len(_STUB_SERVERS),
@@ -367,6 +373,7 @@ class _Journey:
     def clear(self) -> CodexNativeBridgeState:
         before = self.state
         known = _stubs(self.app)
+        self.wait_tui_interactive(timeout=_TUI_READY_TIMEOUT_S)
         _tmux(self.socket, "send-keys", "-t", self.target, "/clear")
         time.sleep(0.5)
         _tmux(self.socket, "send-keys", "-t", self.target, "Enter")
@@ -447,11 +454,11 @@ class _Journey:
         for session_id in self.session_ids:
             with contextlib.suppress(Exception):
                 self.client.delete(f"/v1/sessions/{session_id}", timeout=30)
-        leftovers = {(row["pid"], row["created"]) for row in _mcp_children(self.app)}
+        # Children first: killing the app-server would reparent them out of the census.
+        for row in _mcp_children(self.app):
+            _kill((row["pid"], row["created"]))
         if self.app is not None:
-            leftovers.add(self.app)
-        for identity in sorted(leftovers, reverse=True):
-            _kill(identity)
+            _kill(self.app)
 
 
 @pytest.fixture
