@@ -273,6 +273,25 @@ def test_generated_provider_config_disables_runner_idle_shutdown(monkeypatch, tm
     assert _load_runner_idle_timeout_s_from_config() == 0
 
 
+def test_generated_codex_provider_prices_sessions_like_the_e2e_fixture(monkeypatch, tmp_path):
+    from dev.repro_env.runtime import write_model_config
+    from omnigent.llms.context_window import fetch_model_pricing_with_provider
+    from omnigent.onboarding.provider_config import load_config
+    from tests.helpers.ui_configuration import _CODEX_MOCK_PRICING_PER_MILLION
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+    write_model_config(tmp_path, "http://127.0.0.1:12345", "mock-claude", "mock-codex")
+
+    pricing = fetch_model_pricing_with_provider("mock-codex", load_config(), "codex")
+
+    assert pricing is not None, "prepared codex provider must price codex-native sessions"
+    input_rate, output_rate, cache_read_rate = _CODEX_MOCK_PRICING_PER_MILLION
+    assert pricing.input_per_token == pytest.approx(input_rate / 1_000_000)
+    assert pricing.output_per_token == pytest.approx(output_rate / 1_000_000)
+    assert pricing.cache_read_per_token == pytest.approx(cache_read_rate / 1_000_000)
+
+
 def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monkeypatch):
     import time
 

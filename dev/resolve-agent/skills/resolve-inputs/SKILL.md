@@ -16,7 +16,9 @@ Use `read_skill_file` with this skill name and the relative filename, or read
 relative to the directory supplied by the native Skill tool. The agent bundle
 may live outside the target checkout; do not resolve these files against cwd.
 
-After preflight and, for reproduction-driven work, `resolve-repro-audit`, read
+After preflight, load `resolve-investigate` in every mode. Apply it before the
+repro audit or choosing a fix. After `resolve-repro-audit` for reproduction-driven
+work, read
 [existing-fix.md](existing-fix.md) before choosing author or review. Skip discovery
 in review-remediation mode. Load `resolve-impact-assessment` for every mode.
 

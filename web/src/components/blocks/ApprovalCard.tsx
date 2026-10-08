@@ -56,6 +56,7 @@ import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/native
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import type { CodexPersistMode, RememberScope } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
@@ -188,6 +189,8 @@ interface ApprovalCardProps {
    * sessions other than the chat store's active one.
    */
   onSubmit?: SubmitApprovalFn;
+  /** Extra classes for the card container, e.g. to drop its border when embedded. */
+  className?: string;
 }
 
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
@@ -210,6 +213,7 @@ export function ApprovalCard({
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
+  className,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
@@ -570,7 +574,7 @@ export function ApprovalCard({
       <Alert
         data-testid="approval-card"
         data-state="responded"
-        className="flex flex-col gap-1 border-muted"
+        className={cn("flex flex-col gap-1 border-muted", className)}
       >
         <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
@@ -630,7 +634,7 @@ export function ApprovalCard({
     <Alert
       data-testid="approval-card"
       data-state="pending"
-      className="flex flex-col gap-2 py-3 px-4"
+      className={cn("flex flex-col gap-2 py-3 px-4", className)}
     >
       <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval ? (

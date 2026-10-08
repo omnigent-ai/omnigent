@@ -91,6 +91,56 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
 
 
 @pytest.mark.asyncio
+async def test_prepare_codex_terminal_forwards_profile_to_launch_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The CLI pass-through ``--profile`` reaches launch resolution and the app-server build."""
+    from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-bridge"
+    )
+
+    async def _fake_create_session(_client: object, _bundle: bytes, *, bridge_id: str) -> str:
+        del _client, _bundle, bridge_id
+        return "conv_fresh_profile"
+
+    resolved: dict[str, Any] = {}
+    captured: dict[str, Any] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    def _fake_resolve_launch(**kwargs: Any) -> NativeCodexLaunch:
+        resolved.update(kwargs)
+        return NativeCodexLaunch([], None, None)
+
+    def _fake_build_codex_native_server(**kwargs: object) -> object:
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _fake_resolve_launch)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
+
+    with pytest.raises(_Sentinel):
+        await codex_native._prepare_codex_terminal(
+            base_url="http://test",
+            headers={},
+            session_id=None,
+            runner_id=None,
+            session_bundle=b"fake-bundle",
+            codex_args=("--profile", "openai"),
+            command="codex",
+            model=None,
+        )
+
+    assert resolved["terminal_launch_args"] == ("--profile", "openai")
+    assert captured["terminal_launch_args"] == ("--profile", "openai")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_failure", [None, "terminal", "client"])
 @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
 async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupted(

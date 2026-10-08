@@ -56,7 +56,9 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    compatibility, and performance? Does it miss facets or obvious adjacent edge
    cases, or introduce a regression in the surrounding code? Complete the shared
    impact assessment and run its checks for the whole PR. Record why the selected
-   approach is preferable in the review.
+   approach is preferable in the review. Apply `resolve-investigate` to the
+   reported configuration, competing causes, and historical design rationale;
+   explicitly identify policy changes even when the repro test passes.
    "Best" means the strongest maintainable fit for this codebase and bug, not a
    license to replace a sound, idiomatic contribution with a theoretically purer
    rewrite or a personal style preference.
@@ -65,8 +67,10 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    Establish one concrete reported failure or requested outcome and its
    acceptance criteria from `bug_url` and the PR's linked issue. Different
    layers or root causes can contribute to that outcome. If the issue bundles
-   independent problems, ask the author to split them or track them separately;
-   stop with `needs_more_info` if the intended scope is unclear.
+   independent problems, identify separable follow-ups in the review. Propose the
+   best-supported scope and keep working on clear requirements. Only a concrete
+   missing input or authorization conflict blocks that work; unresolved design
+   choices remain explicit for PR review under `resolve-investigate`.
 
    For each change, ask whether removing it would leave the intended fix
    incomplete, incorrect, unsafe, or inadequately tested or documented.
