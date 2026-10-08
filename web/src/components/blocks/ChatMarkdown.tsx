@@ -218,7 +218,7 @@ function githubPullRequest(href: string | undefined): string | null {
   try {
     const url = new URL(href);
     if (url.protocol !== "https:" || url.hostname !== "github.com") return null;
-    const match = /^\/[^/]+\/([^/]+)\/pull\/(\d+)\/?$/.exec(url.pathname);
+    const match = url.pathname.match(/^\/[^/]+\/([^/]+)\/pull\/(\d+)\/?$/);
     return match ? `${match[1]}#${match[2]}` : null;
   } catch {
     return null;
