@@ -26,6 +26,7 @@ from omnigent.runner.github_resource import (
     github_info,
     github_pr_diff,
 )
+from omnigent.runner.session_prs import PullRequestRef
 
 
 def _stub_gh(
@@ -154,16 +155,22 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     assert info["pr"]["head_ref"] == "alice/feature"
     assert info["pr"]["is_draft"] is True
     assert info["base_ref"] == "main"
-    assert any(c[:2] == ("pr", "view") for c in calls)
+    assert info["pr"]["checks_supported"] is True
+    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
     assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
 def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty)."""
+    """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty).
+
+    gh's "no pull requests" failure names no refused field, so it is not retried.
+    """
+    calls: list[tuple[str, ...]] = []
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
         head = tuple(argv[:2])
         if head == ("auth", "status"):
             return (0, "", "")
@@ -179,6 +186,7 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     info = github_info(str(repo))
     assert info["pr"] is None
     assert info["base_ref"] is None
+    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
 
 
 def test_github_info_pr_via_commit_fork_fallback(
@@ -1114,3 +1122,130 @@ def test_gh_applies_account_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(env, dict)
     assert env["GH_TOKEN"] == "chosen-tok"
     assert "GITHUB_TOKEN" not in env
+
+
+_CHECKS_FORBIDDEN = (
+    "GraphQL: Resource not accessible by personal access token "
+    "(repository.pullRequests.nodes.0.statusCheckRollup.nodes.0.commit.statusCheckRollup)"
+)
+
+_PR_WITHOUT_CHECKS = {
+    "number": 42,
+    "title": "Add thing",
+    "state": "OPEN",
+    "url": "https://github.com/acme/repo/pull/42",
+    "isDraft": False,
+    "author": {"login": "contributor"},
+    "baseRefName": "main",
+    "headRefName": "feature",
+    "headRefOid": "a" * 40,
+    "baseRefOid": "b" * 40,
+    "body": "Description",
+    "comments": [],
+}
+
+
+def _gh_without_checks_permission(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Stub ``gh`` signed in with a fine-grained PAT.
+
+    GitHub refuses ``statusCheckRollup`` to such a token, so only a ``pr view``
+    that asks for it fails; every other read succeeds.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if list(argv[:2]) == ["auth", "status"]:
+            me = {"login": "contributor", "active": True, "state": "success"}
+            return (0, json.dumps({"hosts": {"github.com": [me]}}), "")
+        if list(argv[:2]) == ["repo", "view"]:
+            return (0, json.dumps({"nameWithOwner": "acme/repo"}), "")
+        if list(argv[:3]) == ["repo", "set-default", "--view"]:
+            return (0, "acme/repo\n", "")
+        if list(argv[:2]) == ["pr", "view"]:
+            fields = argv[argv.index("--json") + 1].split(",")
+            if "statusCheckRollup" in fields:
+                return (1, "", _CHECKS_FORBIDDEN)
+            data = {
+                name: _PR_WITHOUT_CHECKS[name] for name in fields if name in _PR_WITHOUT_CHECKS
+            }
+            return (0, json.dumps(data), "")
+        if argv[0] == "api" and "/commits/" in argv[1] and argv[1].endswith("/pulls"):
+            row = {"number": 42, "state": "open", "base": {"repo": {"full_name": "acme/repo"}}}
+            return (0, json.dumps([row]), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    return calls
+
+
+def test_github_info_resolves_pr_when_checks_field_is_forbidden(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The branch's PR still resolves when only its check runs are unreadable."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    calls = _gh_without_checks_permission(monkeypatch)
+
+    info = github_info(str(repo))
+    assert info["authenticated"] is True
+    assert info["pr"] is not None, calls
+    assert info["pr"]["number"] == 42
+    assert info["pr"]["title"] == "Add thing"
+    assert info["base_ref"] == "main"
+    assert not (info["pr"].get("checks") or {}).get("total")
+    assert info["pr"]["checks_supported"] is False
+    # The refused call is retried once without the field; no commit fallback runs.
+    assert [c[-1] for c in calls if c[:2] == ("pr", "view")] == [
+        github_resource._PR_VIEW_FIELDS,
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+    ]
+    assert not any(c[0] == "api" for c in calls)
+
+
+def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A linked PR whose checks are unreadable renders instead of reporting a sign-in problem."""
+    monkeypatch.setattr(github_resource._config, "github_account_preference", lambda _key: None)
+    calls = _gh_without_checks_permission(monkeypatch)
+    reference = PullRequestRef.from_url("https://github.com/acme/repo/pull/42")
+
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["authenticated"] is True
+    assert info["pr"] is not None, calls
+    assert info["pr"]["title"] == "Add thing"
+    assert info["pr"]["head_sha"] == "a" * 40
+    assert not (info["pr"].get("checks") or {}).get("total")
+    assert info["pr"]["checks_supported"] is False
+    assert info["pr"]["body"] == "Description"
+
+
+def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit ``-R`` fetch after a commit lookup gets the same retry."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    calls = _gh_without_checks_permission(monkeypatch)
+    gh = github_resource._gh
+
+    def branch_lookup_misses(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if list(argv[:3]) == ["pr", "view", "--json"]:
+            calls.append(tuple(argv))
+            return (1, "", 'no pull requests found for branch "feature"')
+        return gh(argv, cwd=cwd, token=token)
+
+    monkeypatch.setattr(github_resource, "_gh", branch_lookup_misses)
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 42
+    assert info["pr"]["checks_supported"] is False
+    assert [c[-1] for c in calls if c[:3] == ("pr", "view", "42")] == [
+        github_resource._PR_VIEW_FIELDS,
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+    ]
