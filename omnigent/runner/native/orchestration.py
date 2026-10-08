@@ -2828,10 +2828,9 @@ async def _post_pi_native_effort_notice(
 
 
 _CODEX_THREAD_RESET_NOTICE = (
-    "Codex reported an internal error while loading this session's saved transcript, "
-    "so Omnigent started a fresh Codex thread instead of failing the turn. The chat "
-    "history here is intact, but Codex's own memory of the earlier turns is not "
-    "restored."
+    "Codex could not load this session's saved transcript, so Omnigent started a fresh "
+    "Codex thread instead of failing the turn. The chat history here is intact, but "
+    "Codex's own memory of the earlier turns is not restored."
 )
 
 
