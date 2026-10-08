@@ -154,12 +154,12 @@ def _recorded_daemons(data_dir: Path) -> list[tuple[int, float | None]]:
 def _is_recorded_daemon(proc: psutil.Process, started_at: float | None) -> bool:
     """Confirm the recorded PID is still our daemon before killing it.
 
-    A daemon can exit and the OS can hand its PID to an unrelated process on the
-    shared CI host; match the recorded start time and an omnigent command line so
-    teardown never signals a stranger.
+    A daemon can exit and the OS reuse its PID; a stranger would have started
+    after the record, so require creation at or before the recorded claim (small
+    slack) and an omnigent command line.
     """
     try:
-        if started_at is not None and abs(proc.create_time() - started_at) > 120:
+        if started_at is not None and proc.create_time() > started_at + 5:
             return False
         return any("omnigent" in part.lower() for part in proc.cmdline())
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -209,10 +209,8 @@ def credential_stub(tmp_path_factory: pytest.TempPathFactory) -> Path:
     the loopback stub.
     """
     stub = tmp_path_factory.mktemp("credential-stub")
-    # Assert the patch target exists before assigning: a rename in cli.py would
-    # otherwise create a dangling attribute and let the real SDK reach the network
-    # nondeterministically. site runs sitecustomize for effect, so a failed assert
-    # aborts it before the marker is written.
+    # Fail loudly if a cli.py rename drops the patch target: site runs sitecustomize
+    # for effect, so the assert aborts before the marker is written.
     (stub / "sitecustomize.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
