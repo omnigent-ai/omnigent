@@ -158,8 +158,8 @@ def test_program_broken_two_row_terminal_url_opens_full_destination(
     _print_url_folded_at_pane_width(page, _WRAPPED_URL)
     # The shell opened last, so its attach socket is the newest one.
     pane_cols, pane_rows = panes[-1][-1] if panes and panes[-1] else (0, 0)
-    assert pane_cols and pane_cols < len(_WRAPPED_URL), (
-        f"the URL must be longer than the pane to wrap: pane size {pane_cols}x{pane_rows}"
+    assert pane_cols and pane_rows and pane_cols < len(_WRAPPED_URL) <= 2 * pane_cols, (
+        f"the URL must span exactly two rows of the pane: pane size {pane_cols}x{pane_rows}"
     )
 
     for row in (1, 2):

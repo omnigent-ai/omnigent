@@ -54,8 +54,10 @@ function computeLinks(term: Terminal, lineIndex: number, activate: TerminalLinkA
 
 /**
  * Rows forming the logical line around ``lineIndex`` and the index of its first row.
- * Expansion stops at whitespace, which ends any URL, or at the length cap. Rows are
- * right-trimmed so a URL wrapped early before a wide char still matches; see bufferPosition.
+ * Expansion stops at whitespace, which ends any URL (a row that trims to nothing
+ * counts, so erased wrapped rows never send the scan across the whole scrollback),
+ * or at the length cap. Rows are right-trimmed so a URL wrapped early before a wide
+ * char still matches; see bufferPosition.
  */
 function logicalLine(term: Terminal, lineIndex: number): [string[], number] {
   const buffer = term.buffer.active;
@@ -67,9 +69,9 @@ function logicalLine(term: Terminal, lineIndex: number): [string[], number] {
   let length = 0;
   if (currentText[0] !== " ") {
     while (length < MAX_JOINED_LENGTH && continuesRowAbove(term, topIndex)) {
-      const above = buffer.getLine(--topIndex);
-      if (!above) break;
-      const text = above.translateToString(true);
+      const text = buffer.getLine(topIndex - 1)?.translateToString(true);
+      if (!text) break;
+      topIndex--;
       length += text.length;
       lines.unshift(text);
       if (text.includes(" ")) break;
@@ -78,9 +80,9 @@ function logicalLine(term: Terminal, lineIndex: number): [string[], number] {
   let bottomIndex = lineIndex;
   length = 0;
   while (length < MAX_JOINED_LENGTH && continuesRowAbove(term, bottomIndex + 1)) {
-    const below = buffer.getLine(++bottomIndex);
-    if (!below) break;
-    const text = below.translateToString(true);
+    const text = buffer.getLine(bottomIndex + 1)?.translateToString(true);
+    if (!text) break;
+    bottomIndex++;
     length += text.length;
     lines.push(text);
     if (text.includes(" ")) break;
