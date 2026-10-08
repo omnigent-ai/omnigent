@@ -246,6 +246,7 @@ describe("ForkSessionDialog", () => {
 
     const submit = screen.getByTestId("fork-session-submit");
     expect(submit).toBeDisabled();
+    expect(screen.getByRole("group", { name: "Clone session" })).toBe(submit.parentElement);
     expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
       "Forking this sandbox session is not supported yet.",
     );
@@ -258,6 +259,9 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByRole("tooltip")).toHaveTextContent(
         "Forking this sandbox session is not supported yet.",
       ),
+    );
+    expect(submit.parentElement).toHaveAccessibleDescription(
+      "Forking this sandbox session is not supported yet.",
     );
     expect(forkSessionMock).not.toHaveBeenCalled();
     expect(launchRunnerMock).not.toHaveBeenCalled();

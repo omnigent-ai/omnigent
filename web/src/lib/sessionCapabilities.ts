@@ -4,6 +4,8 @@ export const SANDBOX_FORK_UNSUPPORTED = "Forking this sandbox session is not sup
 export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
   "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
+export const SESSION_ACTIONS_UNAVAILABLE =
+  "Unable to check session capabilities. Reload to try again.";
 
 /** Sandbox providers whose managed integration rejects forking. */
 const UNSUPPORTED_FORK_PROVIDERS = new Set(["arclet", "lakebox"]);

@@ -1,4 +1,4 @@
-import type { ComponentType, ReactNode } from "react";
+import { useId, type ComponentType, type ReactNode } from "react";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { DisabledActionTooltip } from "./DisabledActionTooltip";
 import { cn } from "@/lib/utils";
@@ -8,7 +8,7 @@ interface ItemProps {
   className?: string;
   onSelect?: (event: Event) => void;
   "aria-disabled"?: boolean;
-  "aria-description"?: string;
+  "aria-describedby"?: string;
   "data-testid"?: string;
 }
 
@@ -23,18 +23,27 @@ export function SessionActionMenuItem({
   disabledReason?: string;
   Item?: ComponentType<ItemProps>;
 }) {
+  const descriptionId = useId();
   return (
     <DisabledActionTooltip reason={disabledReason}>
       <Item
         {...props}
         aria-disabled={disabledReason ? true : undefined}
-        aria-description={disabledReason}
+        aria-describedby={
+          [props["aria-describedby"], disabledReason && descriptionId].filter(Boolean).join(" ") ||
+          undefined
+        }
         className={cn(className, disabledReason && "cursor-not-allowed opacity-50")}
         onSelect={(event) => {
           if (disabledReason) event.preventDefault();
           else onSelect?.(event);
         }}
       />
+      {disabledReason && (
+        <span id={descriptionId} className="sr-only">
+          {disabledReason}
+        </span>
+      )}
     </DisabledActionTooltip>
   );
 }

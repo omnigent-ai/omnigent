@@ -97,6 +97,8 @@ sidebar menus, and message actions. The composer's host menu shows a disabled
 **Switch host…** item. Hover or focus either action to read why it is unsupported.
 The reconnect dialog also disables Clone and Switch host; directory selection
 cannot enable either action.
+While support is being checked, actions stay disabled. If that check fails,
+the explanation asks you to reload.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
 choose Stop session while a side chat or sub-agent is working. On mobile, open
@@ -202,6 +204,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/shell/SwitchHostDialog.test.tsx`, and
   `web/src/shell/ReconnectSessionDialog.test.tsx`. Header fallbacks, including
   mobile, are covered by `web/src/shell/ChatHeader.test.tsx`.
+  Failed lookups, recovery, and shared sessions with unlisted hosts are covered
+  by `web/src/hooks/useSessionActionRestrictions.test.tsx`.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.

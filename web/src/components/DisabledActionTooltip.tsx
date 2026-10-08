@@ -21,6 +21,7 @@ export function DisabledActionTooltip({
       <Tooltip>
         <TooltipTrigger asChild>
           <span
+            role={label ? "group" : undefined}
             tabIndex={label ? 0 : undefined}
             aria-label={label}
             aria-disabled={label ? true : undefined}
