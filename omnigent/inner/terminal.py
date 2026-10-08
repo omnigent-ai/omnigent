@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -49,10 +51,17 @@ from .sandbox import (
     create_exec_launcher,
     create_private_tmpdir,
     resolve_sandbox,
+    with_additional_read_roots,
     with_additional_write_roots,
     with_denied_unix_sockets,
 )
 from .terminal_clipboard import TerminalClipboardBridge
+from .terminal_lifecycle import (
+    TERMINAL_INSTANCE_ID_ENV,
+    TERMINAL_LAUNCH_ID_ENV,
+    TERMINAL_LAUNCH_SESSION_ID_ENV,
+    TerminalLifecycleTrace,
+)
 
 # Heterogeneous JSON-shaped result returned by :meth:`TerminalInstance.send`
 # and :meth:`TerminalInstance.read`. In practice the dicts carry a mix of
@@ -959,6 +968,8 @@ def build_terminal_os_env_spec(
                 "enforcement while egress_rules remain as inert "
                 "decoration on the policy."
             )
+        if any(p.copy_on_write for p in sandbox.write_path_specs):
+            raise ValueError("sandbox_override is not allowed with copy_on_write paths")
         sandbox.type = sandbox_override
         effective_os_env_spec.sandbox = sandbox
 
@@ -1070,11 +1081,13 @@ class TerminalInstance:
         repr=False,
     )
     diagnostic_id: str = field(default_factory=lambda: uuid.uuid4().hex, init=False, repr=False)
-    # Exit status of the pane's inner process, captured from tmux
-    # ``#{pane_dead_status}`` the first time a dead pane is observed (only
-    # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
-    # until the process exits or when tmux reports no numeric status.
+    lifecycle_trace: TerminalLifecycleTrace = field(
+        default_factory=TerminalLifecycleTrace, init=False, repr=False
+    )
+    # Launched-command status (possibly a wrapper), captured from tmux
+    # ``#{pane_dead_status}``; see ``last_exit_status`` for ``None`` semantics.
     _last_exit_status: int | None = field(default=None, repr=False)
+    _last_exit_signal: str | None = field(default=None, repr=False)
     # Diagnostics for the "tmux unavailable" exit path: the stderr of the last
     # failed capture-pane probe, and of the has-session probe that then
     # confirmed the session gone. The has-session stderr is what separates a
@@ -1109,6 +1122,20 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+
+    def client_interaction_within(self, window_s: float) -> bool:
+        """
+        Whether a web client interacted with this terminal in the last *window_s* seconds.
+
+        Read by the native pane reaper as its "a human is here" signal for
+        browser viewers: tmux cannot see control-mode input, so the bridge's
+        own stamp (:meth:`note_client_interaction`) stands in for it.
+
+        :param window_s: Recency window in seconds, e.g. ``120.0``.
+        :returns: ``True`` when the last interaction is younger than *window_s*;
+            ``False`` when none was ever observed.
+        """
+        return time.monotonic() - self._last_client_interaction_at < window_s
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -1206,7 +1233,9 @@ class TerminalInstance:
         """Correlate probe failures with lifecycle events without recording pane contents."""
         extra = debug_event(
             event_name,
+            session_id=self.lifecycle_trace.session_id,
             terminal_instance_id=self.diagnostic_id,
+            terminal_launch_id=self.lifecycle_trace.launch_id,
             terminal_name=self.name,
             terminal_key=self.session_key,
             consecutive_probe_failures=consecutive_failures,
@@ -1344,14 +1373,19 @@ class TerminalInstance:
         return "; ".join(parts)
 
     def last_exit_status(self) -> int | None:
-        """Return the inner process's exit code, if the pane has died.
+        """Return the launched command's exit code, if the pane has died.
 
         Captured from tmux ``#{pane_dead_status}`` when a dead pane is first
         observed (see :meth:`_pane_is_dead` / :meth:`_pane_is_dead_async`).
         Only meaningful for terminals launched with ``keep_alive_after_exit``
         (``remain-on-exit``); ``None`` otherwise or before exit.
+        A configured wrapper's status does not necessarily describe its child.
         """
         return self._last_exit_status
+
+    def last_exit_signal(self) -> str | None:
+        """Return tmux's observed signal, without attributing who sent it."""
+        return self._last_exit_signal
 
     def _remember_exit_status(self, fields: str) -> None:
         """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.
@@ -1374,9 +1408,19 @@ class TerminalInstance:
         parts = fields.strip().split("|")
         if len(parts) != 3:
             return False
-        dead, status, signal = parts
+        dead, status, raw_signal = parts
         self._remember_exit_status(f"{dead} {status}")
-        return dead == "1" and not status and not signal
+        if dead == "1" and raw_signal:
+            self._last_exit_signal = raw_signal[:64]
+            with contextlib.suppress(ValueError, KeyError):
+                self._last_exit_signal = (
+                    signal.Signals(int(raw_signal)).name
+                    if raw_signal.isdigit()
+                    else signal.Signals[
+                        raw_signal if raw_signal.startswith("SIG") else "SIG" + raw_signal
+                    ].name
+                )
+        return dead == "1" and not status and not raw_signal
 
     async def _refresh_exit_status(self) -> None:
         """Allow a short grace period for tmux to reap a confirmed-dead pane."""
@@ -1471,6 +1515,7 @@ class TerminalInstance:
             return
         self._last_exit_snapshot = None
         self._last_exit_status = None
+        self._last_exit_signal = None
         effective_cwd = str(cwd or self.private_dir)
 
         # Do NOT advertise the tmux control socket path to the
@@ -1489,6 +1534,17 @@ class TerminalInstance:
         # Apply exclusions last so overrides cannot leak credentials to MCP servers.
         for key in self.env_unset:
             env.pop(key, None)
+        # Never reuse a parent's launch identity if diagnostic initialization fails.
+        for key in (
+            TERMINAL_INSTANCE_ID_ENV,
+            TERMINAL_LAUNCH_ID_ENV,
+            TERMINAL_LAUNCH_SESSION_ID_ENV,
+        ):
+            env.pop(key, None)
+        try:
+            env.update(self.lifecycle_trace.launch_environment(self.diagnostic_id))
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent launch.
+            logger.debug("Terminal lifecycle correlation unavailable (%s)", type(exc).__name__)
         # Strip the runner-auth secret: native agents run their shell in
         # this tmux pane, so the binding token must never reach it.
         # After ``env.update`` so ``self.env`` can't re-admit it.
@@ -1519,17 +1575,24 @@ class TerminalInstance:
         # relay daemon during ``activate_sandbox``; the shell
         # spawned beyond the launcher inherits HTTP_PROXY / CA
         # env vars so its outbound traffic is filtered.
+        host_cwd = effective_cwd
         sandbox_for_launcher: SandboxPolicy | None = self.sandbox_policy
         if sandbox_for_launcher is not None and sandbox_for_launcher.active:
             env = strip_desktop_session_env(env)
             if self.egress_rules:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
-            launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+            if sandbox_for_launcher.copy_on_write_namespace:
+                host_cwd = "/"
+                launcher_path = create_exec_launcher(
+                    cli_path, sandbox_for_launcher, cwd=effective_cwd
+                )
+            else:
+                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
-        inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
+        inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 
@@ -1583,7 +1646,7 @@ class TerminalInstance:
                         "-y",
                         "24",
                         "-c",
-                        effective_cwd,
+                        host_cwd,
                         inner_str,
                     ],
                     *pane_died_hook,
@@ -1668,12 +1731,20 @@ class TerminalInstance:
 
         return {"status": "sent"}
 
-    async def read(self, scrollback: int = 0) -> TerminalResult:
-        """Capture the terminal screen."""
+    async def read(self, scrollback: int = 0, *, join_wrapped: bool = False) -> TerminalResult:
+        """Capture the terminal screen.
+
+        :param scrollback: Scrollback lines to include above the visible pane.
+        :param join_wrapped: Join lines the pane wrapped at its width back into
+            one line (``capture-pane -J``), so a long token such as a sign-in
+            address printed into an 80-column pane reads back whole.
+        """
         if not self.running:
             return {"error": "Terminal is not running"}
 
         args = ["capture-pane", "-t", self.tmux_target, "-p"]
+        if join_wrapped:
+            args.append("-J")
         if scrollback > 0:
             args.extend(["-S", f"-{scrollback}"])
 
@@ -1763,6 +1834,21 @@ class TerminalInstance:
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
+        try:
+            if self.lifecycle_trace.note_cleanup():
+                logger.info(
+                    "Terminal cleanup started",
+                    extra=debug_event(
+                        "terminal_cleanup_started",
+                        session_id=self.lifecycle_trace.session_id,
+                        terminal_instance_id=self.diagnostic_id,
+                        terminal_name=self.name,
+                        terminal_key=self.session_key,
+                        **self.lifecycle_trace.log_attributes(),
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
+            logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
         # Cancel both idle-watcher variants first so they don't race
         # the socket teardown. Order doesn't matter — they're
         # independent.
@@ -2531,16 +2617,6 @@ class TerminalInstance:
         return proc.stdout.decode()
 
 
-def _shell_quote(s: str) -> str:
-    """Quote a string for shell use."""
-    if not s:
-        return "''"
-    # Simple quoting for common cases.
-    if re.match(r"^[a-zA-Z0-9_./:@=-]+$", s):
-        return s
-    return "'" + s.replace("'", "'\\''") + "'"
-
-
 @dataclass(frozen=True)
 class TerminalCreateResult:
     """
@@ -2565,6 +2641,7 @@ def create_terminal_instance(
     spec: TerminalEnvSpec,
     *,
     parent_os_env_spec: OSEnvSpec | None = None,
+    parent_environment: OSEnvironment | None = None,
     cwd_override: str | None = None,
     sandbox_override: str | None = None,
     conversation_link: str | None = None,
@@ -2641,7 +2718,19 @@ def create_terminal_instance(
         os_env = create_os_environment(forked_spec)
     else:
         cwd = Path(effective_os_env_spec.cwd or os.getcwd()).resolve()
-        os_env = create_os_environment(effective_os_env_spec)
+        inherited_policy = None
+        if parent_environment is not None and (spec.os_env is None or spec.os_env == "inherit"):
+            inherited_policy = getattr(parent_environment, "sandbox", None)
+            parent_cwd = getattr(parent_environment, "cwd", None)
+            if inherited_policy is not None and parent_cwd is not None:
+                inherited_policy = with_additional_read_roots(inherited_policy, [parent_cwd])
+        os_env = create_os_environment(
+            effective_os_env_spec,
+            sandbox_policy=inherited_policy,
+            copy_on_write_environment=(
+                parent_environment.copy_on_write_environment if parent_environment else None
+            ),
+        )
 
     # Resolve sandbox policy for the terminal process.
     sandbox: SandboxPolicy | None = None
@@ -2650,8 +2739,12 @@ def create_terminal_instance(
     if effective_os_env_spec.sandbox is not None:
         sandbox_spec = effective_os_env_spec.sandbox
         if sandbox_spec.type != "none":
-            sandbox = resolve_sandbox(effective_os_env_spec, cwd)
+            sandbox = getattr(os_env, "sandbox", None) or resolve_sandbox(
+                effective_os_env_spec, cwd
+            )
             if sandbox.active:
+                if os_env is not None:
+                    os_env.prepare_sandbox(sandbox)
                 # Add the private dir to write roots so a forked working
                 # tree (``private_dir/root``) and the instance dir stay
                 # writable inside the pane.

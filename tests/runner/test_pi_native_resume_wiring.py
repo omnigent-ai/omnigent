@@ -6,6 +6,8 @@ Covers reading the fork labels into ``_PiNativeLaunchConfig`` and the
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +132,39 @@ async def test_resolve_no_client_returns_captured_id(tmp_path: Path) -> None:
         server_client=None,
     )
     assert out == _EXTERNAL_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fork", [False, True])
+async def test_resume_provider_lookup_keeps_runner_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fork: bool
+) -> None:
+    from omnigent.harnesses.pi_native import credentials
+
+    loop = asyncio.get_running_loop()
+    provider_waits: list[bool] = []
+
+    def _slow_provider() -> None:
+        serviced = threading.Event()
+        loop.call_soon_threadsafe(serviced.set)
+        provider_waits.append(serviced.wait(timeout=2))
+
+    monkeypatch.setattr(credentials, "resolve_pi_native_provider", _slow_provider)
+    config = _config(
+        workspace=tmp_path,
+        external_session_id=None if fork else _EXTERNAL_ID,
+        fork_carry_history=fork,
+    )
+    async with _items_only_client([_user_item("hello")]) as client:
+        out = await _resolve_pi_resume_session(
+            session_id="conv_1",
+            launch_config=config,
+            session_dir=tmp_path,
+            workspace=tmp_path,
+            server_client=client,
+        )
+    assert out is not None
+    assert provider_waits == [True], "Resume discovery must not block runner heartbeats"
 
 
 @pytest.mark.asyncio

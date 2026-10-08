@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Collection
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -30,6 +32,7 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,
+    parse_write_paths,
 )
 from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
@@ -59,6 +62,7 @@ from omnigent.spec.types import (
     SkillSpec,
     ToolsConfig,
 )
+from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
 
 _log = logging.getLogger(__name__)
 
@@ -97,9 +101,10 @@ class _ConfigYamlLoader(yaml.SafeLoader):
 _BOOL_TAG = "tag:yaml.org,2002:bool"
 _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
-# ``executor.config`` keys kept as their nested YAML structure instead of
-# string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+# ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"context_files", "system_prompt_mode"}
+)
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip
@@ -275,6 +280,10 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(os_env, executor.harness_kind)
+    model_egress = _parse_model_egress(raw.get("model_egress"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
@@ -315,7 +324,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if raw_instructions is None:
         raw_instructions = raw.get("prompt")
     instructions = _resolve_instructions(root, raw_instructions)
-    skills = _discover_skills(root / "skills")
+    skills = _with_legacy_skill_names(_discover_skills(root / "skills"))
     skills_filter = _parse_skills_filter(raw.get("skills"))
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
     mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
@@ -341,6 +350,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         sub_agents=sub_agents,
         async_enabled=async_enabled,
         os_env=os_env,
+        model_egress=model_egress,
         terminals=terminals,
         timers=timers,
         spawn=spawn,
@@ -1000,6 +1010,16 @@ def _parse_os_env_sandbox(
                 code=ErrorCode.INVALID_INPUT,
             )
         sandbox_type = _resolve_sandbox_type(raw_type)
+    try:
+        parsed_write_paths = parse_write_paths(write_paths_raw)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise OmnigentError(
+            "copy_on_write requires sandbox.type=linux_bwrap", code=ErrorCode.INVALID_INPUT
+        )
     if egress_rules and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise OmnigentError(
             "os_env.sandbox.egress_rules requires sandbox.type=linux_bwrap "
@@ -1041,7 +1061,7 @@ def _parse_os_env_sandbox(
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=[str(p) for p in read_paths_raw] if read_paths_raw is not None else None,
-        write_paths=[str(p) for p in write_paths_raw] if write_paths_raw is not None else None,
+        write_paths=parsed_write_paths,
         write_files=[str(p) for p in write_files_raw] if write_files_raw is not None else None,
         allow_network=bool(raw.get("allow_network", True)),
         cwd_allow_hidden=cwd_allow_hidden,
@@ -1341,6 +1361,35 @@ def _parse_egress_rules(raw: object) -> list[str] | None:
         except ValueError as exc:
             raise OmnigentError(
                 f"os_env.sandbox.egress_rules[{i}] is invalid: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        validated.append(entry)
+    return validated
+
+
+def _parse_model_egress(raw: object) -> list[str] | None:
+    """Parse the explicit model-signing grant independently of generic egress."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise OmnigentError(
+            "model_egress must be a non-empty list of HTTP egress rules",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    from omnigent.inner.egress.rules import parse_rule
+
+    validated: list[str] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, str):
+            raise OmnigentError(
+                f"model_egress[{index}] must be a string",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            parse_rule(entry)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"model_egress[{index}] is invalid: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         validated.append(entry)
@@ -2306,7 +2355,7 @@ def discover_host_skills(
         for spec in _discover_skills(d, skipped=skipped):
             if spec.name in seen_names:
                 continue
-            if filter_names is not None and spec.name not in filter_names:
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             seen_names.add(spec.name)
             skills.append(spec)
@@ -2511,12 +2560,56 @@ def _quote_description_with_colon(frontmatter_str: str) -> str:
     return "\n".join(out)
 
 
+def skill_matches_names(spec: SkillSpec, names: Collection[str]) -> bool:
+    """
+    Whether a configured ``skills:`` name list selects *spec*.
+
+    Lists written before skills were invoked by directory may name a skill
+    by its frontmatter ``name``, so that label is accepted as an alias.
+
+    :param spec: Parsed skill, e.g. directory ``review`` labelled ``code-review``.
+    :param names: Configured names, e.g. ``["code-review"]``.
+    :returns: ``True`` when the list names the skill's command or its label.
+    """
+    return spec.name in names or (spec.display_name is not None and spec.display_name in names)
+
+
+def _is_valid_bundled_skill_name(name: str) -> bool:
+    """Whether *name* passes the bundled-skill name validation."""
+    return bool(_SKILL_NAME_PATTERN.match(name)) and len(name) <= _SKILL_NAME_MAX_LEN
+
+
+def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
+    """
+    Keep the frontmatter name of bundled skills whose directory is not a valid name.
+
+    Bundles were validated on the frontmatter ``name`` before skills were
+    invoked by directory, so ``skills/Code_Review/`` named ``code-review``
+    still loads, as ``code-review``.
+
+    :param skills: Bundled skills as parsed from ``<bundle>/skills/``.
+    :returns: The same skills, with the frontmatter name as the command
+        where only it is valid.
+    """
+    return [
+        replace(skill, name=skill.display_name, display_name=None)
+        if skill.display_name is not None
+        and not _is_valid_bundled_skill_name(skill.name)
+        and _is_valid_bundled_skill_name(skill.display_name)
+        else skill
+        for skill in skills
+    ]
+
+
 def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
 
     The file must begin with YAML frontmatter delimited by ``---``
     lines, containing at least ``name`` and ``description`` keys.
+    The skill's directory name becomes :attr:`SkillSpec.name` (the
+    invocation identifier); a frontmatter ``name`` that differs from it
+    becomes :attr:`SkillSpec.display_name`.
 
     :param skill_md: Path to the ``SKILL.md`` file, e.g.
         ``skills/code-review/SKILL.md``.
@@ -2535,7 +2628,8 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         # scanner in _discover_skills and the per-skill guards in the menu
         # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
-            f"SKILL.md could not be read: {skill_md}: {exc}",
+            f"SKILL.md could not be read: {skill_md} "
+            f"({type(exc).__name__}, errno={getattr(exc, 'errno', None)})",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
     match = _FRONTMATTER_RE.match(text)
@@ -2548,14 +2642,12 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     try:
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
-        # Retry with colon-bearing prose quoted before giving up, and report
-        # the ORIGINAL error if that still fails so the message names the real
-        # complaint rather than the rewrite's.
+        # Retry prose containing colons; diagnostics must not include file contents.
         try:
             frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
         except yaml.YAMLError:
             raise OmnigentError(
-                f"SKILL.md has invalid YAML frontmatter: {skill_md}: {exc}",
+                f"SKILL.md has invalid YAML frontmatter: {skill_md} ({type(exc).__name__})",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
     if not isinstance(frontmatter, dict):
@@ -2578,12 +2670,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     # ``user-invocable: false`` marks an internal orchestration skill that
     # the user should not invoke directly; absent/true ⇒ invocable.
     user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
+    label = str(name)
     return SkillSpec(
-        name=str(name),
+        name=skill_md.parent.name,
         description=str(description),
         content=content.strip(),
         skill_dir=skill_md.parent,
         user_invocable=user_invocable,
+        display_name=label if label != skill_md.parent.name else None,
     )
 
 

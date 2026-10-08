@@ -295,7 +295,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
 
 def _run_configure_databricks() -> None:
     """
-    Configure coding harnesses to use Databricks Unity AI Gateway.
+    Configure coding harnesses to use Databricks Unity Gateway.
 
     Shells out to ``ucode configure`` to authenticate workspaces and set
     up harnesses (Claude SDK, Codex, OpenAI Agents, Pi). After setup,
@@ -638,7 +638,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # harness, the menu is scoped to that harness's surface.
     options = add_menu_options_for_family(family) if family is not None else add_menu_options()
     # A custom provider defined by the user's own ~/.codex/config.toml
-    # (e.g. isaac's Databricks AI Gateway) that is not currently configured
+    # (e.g. isaac's Databricks Unity Gateway) that is not currently configured
     # gets its own add option. This is the only way back after Remove —
     # removal dismisses the detection so it stops auto-adopting, and there
     # is nothing to type/paste here (the credential lives in that file).
@@ -998,7 +998,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         _routed = f"{family_label(family)}'s" if family is not None else "your harnesses'"
         console.print(
             f"  [dim]Routes {_routed} model calls through this workspace's "
-            "Databricks Unity AI Gateway (via ucode), so usage is governed and "
+            "Databricks Unity Gateway (via ucode), so usage is governed and "
             "billed there. This signs you into the workspace and runs "
             "`ucode configure` for it.[/dim]"
         )
@@ -1184,7 +1184,7 @@ def _claude_managed_gateway_label() -> str | None:
     When Claude Code's own settings deliver a gateway credential (enterprise
     ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``), the Claude "subscription" the
     machine really carries is that gateway, so setup names it as such (e.g.
-    ``"Databricks AI Gateway"``) instead of the generic ``"Subscription"``.
+    ``"Databricks Unity Gateway"``) instead of the generic ``"Subscription"``.
     Purely a display derivation from live managed settings — nothing persisted.
 
     :returns: The gateway label, or ``None`` when no managed credential is present.
@@ -1225,7 +1225,7 @@ def _compact_credential_label(det: DetectedProvider) -> str:
         brand = _CLI_LOGIN_BRAND.get(det.name, det.name)
         return f"{brand} Subscription"
     # A cli-config detection carries the provider's own display name
-    # ("Databricks AI Gateway"); other kinds ignore the keyword.
+    # ("Databricks Unity Gateway"); other kinds ignore the keyword.
     return credential_label(det.kind, det.name, display_name=det.display_name)
 
 
@@ -1339,7 +1339,7 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
     # A Claude subscription whose real backing is Claude Code's managed-settings
-    # gateway reads as that gateway (e.g. "Databricks AI Gateway") rather than
+    # gateway reads as that gateway (e.g. "Databricks Unity Gateway") rather than
     # the generic "Subscription", so the credential the user recognizes is named
     # — the Claude analogue of the "Codex-Databricks" row. Display only; the
     # persisted entry stays a plain subscription (no new shape on disk).

@@ -2,7 +2,7 @@
 
 Companion to ``test_build_routing_client.py``, which covers the individual
 builders. Here the question is the PAIR: a Databricks deployment with an ``llm:``
-block gets the AI Gateway *and* the built-in judge, so an off-gateway harness
+block gets the Unity Gateway *and* the built-in judge, so an off-gateway harness
 still routes, and ``routing_client`` stays the pair's primary.
 """
 

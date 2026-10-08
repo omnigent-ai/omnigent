@@ -47,7 +47,7 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationStore, DailyCostState
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -58,6 +58,12 @@ _logger = logging.getLogger(__name__)
 # are skipped entirely, so sessions/deployments that don't use it pay
 # nothing extra per evaluation.
 _USER_DAILY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_daily_cost_budget"
+
+# Dotted path of the per-user monthly cost-budget factory. The engine is
+# seeded with the session owner's monthly-cost rollup ONLY when a policy
+# set includes this handler.
+# Dotted path of the generic per-user period cost-budget factory.
+_USER_PERIOD_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_period_cost_budget"
 
 # Dotted path of the per-subagent cost-budget factory. The engine is
 # seeded with the subtree-scoped usage ONLY when a policy set includes
@@ -108,24 +114,66 @@ _SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = Works
 )
 
 
-def _needs_user_daily_cost(specs: list[PolicySpec]) -> bool:
+def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
     """
-    Return whether any policy in *specs* is the per-user daily cost-budget.
+    Find the oldest period across all cost-budget policies.
 
-    Drives the conditional injection: only when this returns ``True``
-    does :func:`build_policy_engine` resolve the owner and read the
-    daily-cost rollup.
+    Scans for daily and period cost-budget policies, determines the start
+    date for each period, and returns the period string for the oldest one.
+    This allows fetching all daily cost records needed by all policies in
+    a single query.
 
     :param specs: The merged policy specs for the engine.
-    :returns: ``True`` when a :class:`FunctionPolicySpec` references the
-        ``user_daily_cost_budget`` factory.
+    :returns: The period string ("day", "week", "month", "quarter", "year")
+        for the oldest period, or None if no cost-budget policies are present.
     """
-    return any(
-        isinstance(s, FunctionPolicySpec)
-        and s.function is not None
-        and s.function.path == _USER_DAILY_COST_POLICY_PATH
-        for s in specs
-    )
+    from datetime import datetime, timedelta, timezone
+
+    from omnigent.db.utils import now_epoch
+
+    # Collect all periods from cost-budget policies
+    periods: list[str] = []
+
+    for s in specs:
+        if not isinstance(s, FunctionPolicySpec) or s.function is None:
+            continue
+        # Legacy daily cost budget policy
+        if s.function.path == _USER_DAILY_COST_POLICY_PATH:
+            periods.append("day")
+        # Generic period policy
+        elif s.function.path == _USER_PERIOD_COST_POLICY_PATH:
+            args = s.function.arguments or {}
+            period = args.get("period")
+            if period:
+                periods.append(period)
+
+    if not periods:
+        return None
+
+    # Calculate start date for each period and find the oldest
+    now = now_epoch()
+    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+
+    def period_start_date(period: str) -> datetime:
+        if period == "day":
+            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+        if period == "week":
+            # ISO week starts on Monday
+            start = dt.date() - timedelta(days=dt.weekday())
+            return datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
+        if period == "month":
+            return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+        if period == "quarter":
+            quarter = (dt.month - 1) // 3 + 1
+            start_month = (quarter - 1) * 3 + 1
+            return datetime(dt.year, start_month, 1, tzinfo=timezone.utc)
+        if period == "year":
+            return datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+        # Unknown period, treat as day
+        return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+
+    # Find the period with the oldest start date
+    return min(periods, key=period_start_date)
 
 
 def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
@@ -190,32 +238,146 @@ def _resolve_session_owner_cached(
 def _load_user_daily_cost(
     conversation_id: str,
     conversation_store: ConversationStore,
-) -> dict[str, float | str]:
+) -> list[DailyCostState]:
     """
     Read the session owner's per-UTC-day cost rollup as the engine seed.
 
-    Resolves the owner (cached) and reads ``{cost_usd, ask_approved_usd}``
-    for today (UTC), tagged with the owner's ``user_id`` so the budget
-    policy can name whose spend tripped the gate. When the session has no
-    owner grant (single-user mode), returns zeros (and no ``user_id``) so
-    the per-user daily budget never trips — consistent with the write
-    path, which also no-ops without an owner.
+    Returns a single-element list containing today's cost state, formatted
+    consistently with period cost loading so both daily and period policies
+    can consume the same ``user_daily_cost`` context field.
 
     :param conversation_id: The session, e.g. ``"conv_abc123"``.
     :param conversation_store: Store for the owner + daily-cost lookups.
-    :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>,
-        "user_id": <owner>}``; ``user_id`` omitted in single-user mode.
+    :returns: Single-element list with today's cost state, or empty list
+        in single-user mode.
     """
     from omnigent.db.utils import now_epoch, utc_day
 
     owner = _resolve_session_owner_cached(conversation_id, conversation_store)
     if owner is None:
-        return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
-    state: dict[str, float | str] = dict(
-        conversation_store.get_daily_cost_state(owner, utc_day(now_epoch()))
-    )
-    state["user_id"] = owner
-    return state
+        return []
+
+    today = utc_day(now_epoch())
+    # Use list_daily_cost_states to get today's record in the same format
+    # as period budgets, so both can consume the same context field
+    return conversation_store.list_daily_cost_states(owner, today)
+
+
+def _utc_day(epoch: int) -> str:
+    """Return the UTC calendar day for an epoch timestamp as ``"YYYY-MM-DD"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC day string, e.g. ``"2026-08-21"``.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _utc_week(epoch: int) -> str:
+    """Return the UTC ISO week for an epoch timestamp as ``"YYYY-Www"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC ISO week string, e.g. ``"2026-W34"``.
+    """
+    from datetime import datetime, timezone
+
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _utc_month(epoch: int) -> str:
+    """Return the UTC calendar month for an epoch timestamp as ``"YYYY-MM"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC month string, e.g. ``"2026-08"``.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m")
+
+
+def _utc_quarter(epoch: int) -> str:
+    """Return the UTC calendar quarter for an epoch timestamp as ``"YYYY-Qq"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC quarter string, e.g. ``"2026-Q3"``.
+    """
+    from datetime import datetime, timezone
+
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    quarter = (dt.month - 1) // 3 + 1
+    return f"{dt.year}-Q{quarter}"
+
+
+def _utc_year(epoch: int) -> str:
+    """Return the UTC calendar year for an epoch timestamp as ``"YYYY"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC year string, e.g. ``"2026"``.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y")
+
+
+def _load_user_period_cost(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    period: str,
+) -> list[DailyCostState]:
+    """
+    Read the session owner's daily cost records for the current period.
+
+    Resolves the owner (cached) and queries all daily cost records for the
+    current period's date range. Returns a list of daily cost dicts, each
+    containing ``{cost_usd, ask_approved_usd, user_id, day_utc}``.
+    The policy function aggregates these to compute the period total.
+
+    When the session has no owner grant (single-user mode), returns an
+    empty list so the per-user period budget never trips.
+
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store for the owner + daily-cost lookups.
+    :param period: Time period granularity: ``"day"``, ``"week"``,
+        ``"month"``, ``"quarter"``, or ``"year"``.
+    :returns: List of daily cost dicts, one per day in the period. Empty
+        in single-user mode.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from omnigent.db.utils import now_epoch
+
+    owner = _resolve_session_owner_cached(conversation_id, conversation_store)
+    if owner is None:
+        return []
+
+    # Calculate date range for the period
+    now = now_epoch()
+    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+
+    if period == "day":
+        start = dt.date()
+    elif period == "week":
+        # ISO week starts on Monday
+        start = dt.date() - timedelta(days=dt.weekday())
+    elif period == "month":
+        start = dt.date().replace(day=1)
+    elif period == "quarter":
+        quarter = (dt.month - 1) // 3 + 1
+        start_month = (quarter - 1) * 3 + 1
+        start = dt.date().replace(month=start_month, day=1)
+    elif period == "year":
+        start = dt.date().replace(month=1, day=1)
+    else:
+        # Fallback: treat as single day
+        start = dt.date()
+
+    start_date = start.isoformat()
+
+    # Query daily cost records for the period
+    return conversation_store.list_daily_cost_states(owner, start_date)
 
 
 def any_policies_apply(
@@ -378,9 +540,8 @@ def build_policy_engine(
         that rebuild an engine specifically to observe concurrent writes
         (the native ASK gate's post-lock re-evaluation) pass ``None``.
     :param expected_agent_id: The ``agent_id`` the caller resolved *spec*
-        from. ``agent_id`` is mutable (switch-agent) but selects the spec,
-        so it must be read before the engine exists and cannot be
-        re-derived here. Passing it lets the builder confirm it against
+        from. ``agent_id`` selects the spec, so it must be read before the
+        engine exists and cannot be re-derived here. Passing it lets the builder confirm it against
         the fresh row and fail closed on a mismatch, instead of
         authorizing an evaluation under the previous agent's guardrails.
         ``None`` skips the check (callers with no spec/agent coupling).
@@ -500,12 +661,9 @@ def build_policy_engine(
                 code=ErrorCode.CONFLICT,
             )
         conv = fresh_self
-    # Agent/spec confirmation — deliberately AFTER the refresh above, and
-    # nowhere else. Comparing against the earlier row (as a previous revision
-    # did) validated the very snapshot whose staleness is the hazard, so a
-    # switch-agent in the window was accepted. Exact equality: a fresh row
-    # whose binding is ``None``, or no fresh row at all, is a mismatch too —
-    # not a reason to skip the check.
+    # Must run AFTER the refresh: comparing the earlier (stale) row would accept
+    # a rebind in the window. Exact equality: a fresh row bound to ``None``, or no
+    # fresh row at all, is a mismatch too.
     if expected_agent_id is not None:
         fresh_agent_id = conv.agent_id if conv is not None else None
         if fresh_agent_id != expected_agent_id:
@@ -631,13 +789,16 @@ def build_policy_engine(
             if conv is not None
             else {}
         )
-    # Conditional injection (#1): only pay the owner + daily-cost lookups
-    # when a per-user daily cost-budget policy is actually present.
-    initial_user_daily_cost = (
-        _load_user_daily_cost(conversation_id, conversation_store)
-        if _needs_user_daily_cost(all_policy_specs)
-        else None
-    )
+    # Conditional injection: only load daily cost records when cost-budget
+    # policies are present. Find the oldest period across all policies and
+    # load daily records from that date forward, so all policies can filter
+    # to their own period ranges from a single seed.
+    initial_user_daily_cost = None
+    oldest_period = _get_cost_policy_oldest_period(all_policy_specs)
+    if oldest_period:
+        initial_user_daily_cost = _load_user_period_cost(
+            conversation_id, conversation_store, period=oldest_period
+        )
     # Session model: the conversation's model_override (set when a user
     # picks a model mid-session) wins over the spec's llm.model; None when
     # neither is available and cost policies treat it as undeterminable.

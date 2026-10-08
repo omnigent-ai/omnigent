@@ -24,6 +24,7 @@ import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
 import { isNativeShell } from "@/lib/nativeBridge";
+import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
@@ -219,17 +220,24 @@ const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-primary underline"
  * popup blocker) a bare `_blank` click is silently swallowed — nothing opens
  * and nothing navigates — so a click must fall back to navigating in place.
  * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
- * open-in-new-tab / menu semantics. Native shells are left on the default
- * path: their window-open policy routes the link externally and reports
- * `null` regardless, so the fallback would navigate twice.
+ * open-in-new-tab / menu semantics. In a native shell the default path is the
+ * shell's window-open policy (external browser / system handlers) — except
+ * when the user opted in to the in-app browser, where a plain click on a web
+ * link routes to the conversation's embedded browser pane instead. The web
+ * popup fallback never runs natively: the shell's policy reports `null` from
+ * window.open regardless, so it would navigate twice.
  */
 function followLinkWithPopupFallback(
   event: React.MouseEvent<HTMLAnchorElement>,
   href: string,
+  conversationId: string | undefined,
 ): void {
   if (event.defaultPrevented || event.button !== 0) return;
   if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  if (isNativeShell()) return;
+  if (isNativeShell()) {
+    if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
+    return;
+  }
   if (!/^(?:https?:)?\/\//i.test(href)) return;
   event.preventDefault();
   const popup = window.open("about:blank", "_blank");
@@ -264,6 +272,8 @@ function WorkspaceFileLink({
   const marked = (props as Record<string, unknown>)[WORKSPACE_FILE_LINK_ATTR];
   const path = typeof marked === "string" ? marked : "";
   const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path);
+  // Scopes the desktop in-app browser route to this conversation's view.
+  const conversationId = useFileViewerConversationId();
 
   if (!path) {
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
@@ -286,7 +296,7 @@ function WorkspaceFileLink({
             ? props.onClick
             : (event) => {
                 props.onClick?.(event);
-                followLinkWithPopupFallback(event, blankHref);
+                followLinkWithPopupFallback(event, blankHref, conversationId);
               }
         }
       >
