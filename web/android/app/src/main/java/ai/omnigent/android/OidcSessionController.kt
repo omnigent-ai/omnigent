@@ -175,6 +175,32 @@ internal class OidcSessionController(
         return true
     }
 
+    /** Debug fault injection: deletes the session cookie; [done] says whether one was removed. */
+    fun clearSessionCookie(done: (Boolean) -> Unit) {
+        val connected = connection ?: return done(false)
+        val url = meUrl(connected)
+        if (OidcWebSession.cookieValue(cookies.get(url), connected.cookieName) ==
+            null
+        ) {
+            return done(false)
+        }
+        cookies.set(
+            connected.origin,
+            OidcWebSession.deletionCookie(connected.cookieName, connected.serverUrl),
+        ) {
+            main.execute {
+                cookies.flush()
+                done(OidcWebSession.cookieValue(cookies.get(url), connected.cookieName) == null)
+            }
+        }
+    }
+
+    /** Debug fault injection: forgets the stored grant without revoking it. */
+    fun forgetGrant(): Boolean {
+        val connected = connection ?: return false
+        return credentials.forgetStoredGrant(connected.serverUrl)
+    }
+
     /** The app came to the foreground: renew now if the cookie is missing or due. */
     fun onForeground() {
         foreground = true

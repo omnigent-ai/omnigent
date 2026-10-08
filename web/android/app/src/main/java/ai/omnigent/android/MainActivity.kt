@@ -774,8 +774,12 @@ class MainActivity : AppCompatActivity() {
     private fun onServerPickerRequested() {
         switchButton.removeCallbacks(revealSwitcherFallback)
         // Workspace recovery and local sign-out stay natively reachable even
-        // when the current SPA also renders its sidebar server picker.
-        switchButton.visibility = if (workspaceSession != null) View.VISIBLE else View.GONE
+        // when the current SPA also renders its sidebar server picker, as do the
+        // OIDC debug faults in debug builds.
+        val nativeMenu =
+            workspaceSession != null ||
+                (OidcAuthDebugMenu.IS_AVAILABLE && oidcSession?.canSignOut == true)
+        switchButton.visibility = if (nativeMenu) View.VISIBLE else View.GONE
         emitServerPicker()
     }
 
@@ -1420,7 +1424,7 @@ class MainActivity : AppCompatActivity() {
             add(0, 0, 0, hostLabelOf(currentUrl)).isEnabled = false
             // Group 1: the other servers on offer (divider before this group).
             otherServers.forEachIndexed { i, url ->
-                add(1, 100 + i, 0, hostLabelOf(url))
+                add(1, SERVER_ITEM_BASE + i, 0, hostLabelOf(url))
             }
             // Group 2: actions (divider before this group).
             add(2, 3, 0, getString(R.string.menu_reload))
@@ -1430,6 +1434,7 @@ class MainActivity : AppCompatActivity() {
                 DatabricksAuthDebugMenu.addItems(this)
             } else if (oidcSession?.canSignOut == true) {
                 add(2, 6, 0, getString(R.string.menu_sign_out))
+                OidcAuthDebugMenu.addItems(this)
             }
         }
         popup.setOnMenuItemClickListener { item ->
@@ -1454,15 +1459,20 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
 
-                in 100..Int.MAX_VALUE -> {
-                    val url = otherServers[item.itemId - 100]
-                    switchToServer(url)
+                in SERVER_ITEM_BASE until SERVER_ITEM_BASE + otherServers.size -> {
+                    switchToServer(otherServers[item.itemId - SERVER_ITEM_BASE])
                     true
                 }
 
                 else -> {
+                    val session = oidcSession
                     if (DatabricksAuthDebugMenu.handles(item.itemId)) {
                         runAuthenticationDebugFault(item.itemId)
+                        true
+                    } else if (OidcAuthDebugMenu.handles(item.itemId) && session != null) {
+                        OidcAuthDebugMenu.run(item.itemId, session) { message ->
+                            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                        }
                         true
                     } else {
                         false
@@ -1708,6 +1718,9 @@ class MainActivity : AppCompatActivity() {
 
         /** Replaces a page the shell covers while it signs in, so it stops running. */
         private const val BLANK_PAGE = "about:blank"
+
+        /** Server-menu ids of the other servers on offer; the debug submenus sit far above. */
+        private const val SERVER_ITEM_BASE = 100
 
         /** A [UserConnectRequests] token: the user asked for this connect. */
         const val EXTRA_CONNECT_REQUEST = "ai.omnigent.android.CONNECT_REQUEST"

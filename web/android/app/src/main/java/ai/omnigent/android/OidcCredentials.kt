@@ -324,6 +324,13 @@ internal class OidcCredentials(
     @Synchronized
     private fun signOutGeneration(origin: String): Int = signOutGenerations[origin] ?: 0
 
+    /** Debug fault injection: forgets the stored grant without revoking it. */
+    fun forgetStoredGrant(serverUrl: String): Boolean {
+        if (!hasStoredGrant(serverUrl)) return false
+        val origin = originOf(serverUrl) ?: return false
+        return runCatching { store.delete(origin) }.isSuccess
+    }
+
     /** Whether a readable refresh grant is stored for the server's origin. */
     fun hasStoredGrant(serverUrl: String): Boolean {
         val origin = originOf(serverUrl) ?: return false

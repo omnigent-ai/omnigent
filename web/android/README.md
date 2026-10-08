@@ -156,7 +156,40 @@ and `auth.session_cookie` is set:
 
 The refresh grant is stored per server origin, and the sign-in in progress is
 stored so it survives Android stopping the app while the browser is open. Both
-are encrypted with an Android Keystore key and never leave the device.
+are encrypted with an Android Keystore key and never leave the device. Debug
+builds add **Debug Authentication** to the native server menu on these
+connections, with **Clear Session Cookie** and **Clear Refresh Token**.
+
+### Manual verification
+
+Run an OIDC server whose manifest lists the app's redirect, for example a local
+server with `OMNIGENT_AUTH_PROVIDER=oidc` against the e2e fake identity provider
+(`tests/e2e_ui/auth/_fake_idp.py`). On an emulator, `adb reverse` the server's
+and the identity provider's ports so Chrome and the server agree on
+`http://localhost:<port>` (debug builds allow cleartext to localhost). Then
+`just run-android`. Check steps 1 and 5 on a Chrome with Auth Tab and on one
+that falls back to a Custom Tab.
+
+1. Connect: the browser shows the identity provider, closes after sign-in, and
+   the app is signed in. The identity provider never appears in the WebView.
+2. Select **Cancel** during **Signing in…**, or close the browser: the connect
+   screen returns with the URL, and retrying works.
+3. Sign in with a disallowed account: the connect screen shows the server's
+   reason.
+4. Relaunch: signed in without the browser. The server logs one `GET /v1/me` and
+   no `POST /oauth/token`.
+5. Start a sign-in, run `adb shell am kill ai.omnigent.android` while the browser
+   is in front, then finish signing in: the app reopens signed in.
+6. **Debug Authentication → Clear Session Cookie**: the session renews silently
+   as soon as the page next calls the server. Clear it again and leave the app
+   at once: reopening it renews silently too.
+7. **Debug Authentication → Clear Refresh Token**, then **Clear Session Cookie**,
+   then reload: "Sign in to <host> to continue." with **Sign In**.
+8. Sign out from the web app's settings, the sidebar picker, and the native
+   menu: "You're signed out of <host>.", and a relaunch stays on the connect
+   screen.
+9. An accounts-mode server, a header-mode server, an older OIDC server (ticket
+   sign-in), a Databricks workspace, and a Databricks App behave as before.
 
 ## Managed configuration (org-preset servers)
 
