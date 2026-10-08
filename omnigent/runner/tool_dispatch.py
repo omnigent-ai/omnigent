@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -54,6 +55,8 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.inner.async_utils import run_sync_cleanup
+from omnigent.inner.executor import ToolCallStatus, classify_tool_result
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -62,6 +65,7 @@ from omnigent.models.model_override import (
 )
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -338,6 +342,11 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # passthrough and never reach this path.) Without this entry the call fell
 # through to the spec-callable branch and errored "tool unavailable".
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
+
+# web_read — the bot-resistant single-URL fetch builtin. Runner-local (like
+# web_search) so a wrapped harness's web_read call resolves to the spec's
+# configured backend (nimble / firecrawl / jina) via WebReadTool.invoke.
+_WEB_READ_TOOLS = frozenset({"web_read"})
 
 # nimble_research — Nimble Agent API v2 research runs (start → poll → result).
 # Runner-local so a non-OpenAI model's nimble_research call resolves to
@@ -857,6 +866,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _WEB_READ_TOOLS
     | _NIMBLE_RESEARCH_TOOLS
     | _NIMBLE_EXTRACT_TOOLS
     | _HINDSIGHT_TOOLS
@@ -1494,10 +1504,10 @@ async def _record_subagent_receipt(
     :param work_id: Dispatch id, e.g. ``"subagent_a1b2c3d4e5f6"``.
     :returns: None.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     error = await _patch_subagent_label(
-        server_client, child_session_id, _runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY, work_id
+        server_client, child_session_id, _subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY, work_id
     )
     if error is not None:
         _logger.warning(
@@ -1613,7 +1623,7 @@ async def _send_to_in_flight_child(
     :param created_by: Human actor that sent the nudge, if known.
     :returns: A JSON handle on success; a descriptive error string otherwise.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     # Post first — before any register/stamp — so a failure leaves the live
     # turn's tracking untouched (nothing to roll back, never a teardown).
@@ -1635,8 +1645,8 @@ async def _send_to_in_flight_child(
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
-    async with _runner_app.in_flight_send_lock(child_session_id):
-        entry = _runner_app.get_subagent_work(child_session_id)
+    async with _subagent_work.in_flight_send_lock(child_session_id):
+        entry = _subagent_work.get_subagent_work(child_session_id)
         if entry is not None and entry.status in ("running", "waiting"):
             # The tracked turn is still active, so the post was buffered into it.
             # Reuse the one entry so its single completion delivers under it;
@@ -1647,15 +1657,15 @@ async def _send_to_in_flight_child(
             # or the in-flight turn was untracked locally (post-restart). Track
             # it freshly so the completion is delivered, directly as "running"
             # (never "launching") to stay clear of the launch-timeout reaper.
-            work_id = _runner_app.new_subagent_work_id()
-            _runner_app.register_child_session(
+            work_id = _subagent_work.new_subagent_work_id()
+            _subagent_work.register_child_session(
                 child_session_id,
                 parent_session_id=conversation_id,
                 title=child_display_title,
                 tool=agent,
                 session_name=title,
             )
-            fresh = _runner_app.register_subagent_work(
+            fresh = _subagent_work.register_subagent_work(
                 parent_session_id=conversation_id,
                 child_session_id=child_session_id,
                 agent=agent,
@@ -1671,7 +1681,7 @@ async def _send_to_in_flight_child(
             stamp_error = await _patch_subagent_label(
                 server_client,
                 child_session_id,
-                _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY,
+                _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
                 work_id,
             )
             if stamp_error is not None:
@@ -1923,11 +1933,11 @@ async def _teardown_failed_child(
     :returns: ``None`` when no server cleanup was needed or cleanup
         succeeded, otherwise a parent-visible warning string.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
-    entry = _runner_app.get_subagent_work(child_session_id)
-    _runner_app.unregister_child_session(child_session_id)
-    _runner_app.unregister_subagent_work(child_session_id)
+    entry = _subagent_work.get_subagent_work(child_session_id)
+    _subagent_work.unregister_child_session(child_session_id)
+    _subagent_work.unregister_subagent_work(child_session_id)
     if not created_child:
         if entry is not None:
             await _record_subagent_receipt(server_client, child_session_id, entry.work_id)
@@ -2467,6 +2477,7 @@ async def _execute_subagent_tool(
     """
     # Lazy import to avoid circular dependency at module load.
     from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     message = _subagent_message_from_args(args)
     if message is None or not message.strip():
@@ -2476,8 +2487,8 @@ async def _execute_subagent_tool(
     if conversation_id is None:
         return "Error: sys_session_send requires conversation_id"
     if session_inbox is not None:
-        _runner_app._session_inboxes_ref.setdefault(conversation_id, session_inbox)
-    elif conversation_id not in _runner_app._session_inboxes_ref:
+        _subagent_work._session_inboxes_ref.setdefault(conversation_id, session_inbox)
+    elif conversation_id not in _subagent_work._session_inboxes_ref:
         return "Error: sys_session_send requires parent session inbox"
 
     try:
@@ -2619,7 +2630,7 @@ async def _execute_subagent_tool(
     assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
-    work_id = _runner_app.new_subagent_work_id()
+    work_id = _subagent_work.new_subagent_work_id()
     if existing is not None:
         child_session_id = existing.get("id")
         if not isinstance(child_session_id, str) or not child_session_id:
@@ -2662,7 +2673,7 @@ async def _execute_subagent_tool(
                 "fresh session with the requested budget."
             )
         child_wrapper_label = _session_wrapper_label(existing)
-        existing_work = _runner_app.get_subagent_work(child_session_id)
+        existing_work = _subagent_work.get_subagent_work(child_session_id)
         if existing_work is not None and existing_work.status == "launching":
             # The child's turn hasn't started streaming yet, so there is no
             # active turn to inject into and a send now could race a parallel
@@ -2715,12 +2726,12 @@ async def _execute_subagent_tool(
                     f"{sub_agent_name!r}: failed to list existing "
                     f"children — {_all_children}"
                 )
-            _runner_app.recover_subagent_ordinals(
+            _subagent_work.recover_subagent_ordinals(
                 conversation_id,
                 str(sub_agent_name),
                 _all_children,
             )
-            ordinal = _runner_app.next_subagent_ordinal(
+            ordinal = _subagent_work.next_subagent_ordinal(
                 conversation_id,
                 str(sub_agent_name),
             )
@@ -2799,7 +2810,7 @@ async def _execute_subagent_tool(
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
-            "labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
+            "labels": {_subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
@@ -2888,7 +2899,7 @@ async def _execute_subagent_tool(
                     and _auto_ordinal
                     and _ordinal_attempt < _max_ordinal_retries
                 ):
-                    ordinal = _runner_app.next_subagent_ordinal(
+                    ordinal = _subagent_work.next_subagent_ordinal(
                         conversation_id,
                         str(sub_agent_name),
                     )
@@ -3019,18 +3030,18 @@ async def _execute_subagent_tool(
         # child keeps its session, so the id is written first. A missing
         # stamp would let the previous turn's receipt mask this turn's result.
         stamp_error = await _patch_subagent_label(
-            server_client, child_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+            server_client, child_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
         )
         if stamp_error is not None:
             return f"Error: failed to record sub-agent dispatch: {stamp_error}"
-    _runner_app.register_child_session(
+    _subagent_work.register_child_session(
         child_session_id,
         parent_session_id=conversation_id,
         title=f"{sub_agent_name}:{session_name}",
         tool=sub_agent_name,
         session_name=session_name,
     )
-    _runner_app.register_subagent_work(
+    _subagent_work.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=child_session_id,
         agent=str(sub_agent_name),
@@ -3158,7 +3169,7 @@ async def _send_to_existing_session(
         parent of the target.
     :returns: JSON handle on success; a JSON/text error otherwise.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
     try:
         snap = await server_client.get(f"/v1/sessions/{target_session_id}", timeout=30.0)
@@ -3202,7 +3213,7 @@ async def _send_to_existing_session(
         or "agent"
     )
     instance_title = parsed.title if parsed.title is not None else (display_title or "")
-    existing_work = _runner_app.get_subagent_work(target_session_id)
+    existing_work = _subagent_work.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status == "launching":
         # No active turn to inject into yet; a send now could race a parallel
         # start. Ask the caller to retry once it is running.
@@ -3230,20 +3241,20 @@ async def _send_to_existing_session(
             wrapper_label=_session_wrapper_label(snap_data),
             created_by=created_by,
         )
-    work_id = _runner_app.new_subagent_work_id()
+    work_id = _subagent_work.new_subagent_work_id()
     stamp_error = await _patch_subagent_label(
-        server_client, target_session_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        server_client, target_session_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
     )
     if stamp_error is not None:
         return f"Error: failed to record sub-agent dispatch: {stamp_error}"
-    _runner_app.register_child_session(
+    _subagent_work.register_child_session(
         target_session_id,
         parent_session_id=conversation_id,
         title=display_title or "",
         tool=agent_label,
         session_name=instance_title,
     )
-    _runner_app.register_subagent_work(
+    _subagent_work.register_subagent_work(
         parent_session_id=conversation_id,
         child_session_id=target_session_id,
         agent=agent_label,
@@ -3373,7 +3384,7 @@ def _finalize_created_session(
     :returns: JSON handle ``{conversation_id, kind, agent_id,
         agent_name, title, status}``.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
     from omnigent.server.schemas import SessionCreatedEvent
 
     child_id = data.get("id")
@@ -3382,7 +3393,7 @@ def _finalize_created_session(
     agent_name = data.get("agent_name")
     agent_label = agent_name if isinstance(agent_name, str) and agent_name else "agent"
     label = title if isinstance(title, str) else ""
-    _runner_app.register_child_session(
+    _subagent_work.register_child_session(
         child_id,
         parent_session_id=conversation_id,
         title=label,
@@ -3907,6 +3918,64 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _web_read_config_from_spec(agent_spec: AgentSpec | None) -> dict[str, str]:
+    """
+    Return the ``web_read`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_web_search_config_from_spec`: scans ``spec.tools.builtins``
+    for the entry named ``"web_read"`` and returns its ``config``
+    (read_provider + credentials + optional driver). Empty dict when the
+    builtin is a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The web_read config dict, e.g.
+        ``{"read_provider": "nimble", "api_key": "..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "web_read":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_web_read_tool(
+    args: _JsonObject,
+    *,
+    agent_spec: AgentSpec | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``web_read`` tool call to the spec's configured backend.
+
+    Builds ``WebReadTool`` from the spec's ``web_read`` builtin config and
+    runs its synchronous ``invoke`` off the event loop (the backend makes a
+    blocking HTTP call), mirroring :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``url`` (required).
+    :param agent_spec: Parent agent's spec; carries the web_read config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The extracted page content, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.web_read import WebReadTool
+
+    config = _web_read_config_from_spec(agent_spec)
+    tool = WebReadTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "web_read",
+        agent_id=agent_id or "web_read",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _nimble_research_config_from_spec(agent_spec: AgentSpec | None) -> dict[str, str]:
     """
     Return the ``nimble_research`` builtin's config dict from the parent spec.
@@ -4350,7 +4419,8 @@ async def _execute_browser_tool(
     embedded browser: POST ``/v1/sessions/{conversation_id}/browser/
     action_request`` with ``{action, args}`` (where ``action`` is the
     tool name minus the ``browser_`` prefix) and return the server's JSON
-    response verbatim as the tool output. The server parks a Future,
+    response as the tool output, preserving screenshots as native images.
+    The server parks a Future,
     publishes ``browser.action_request`` on the session stream, and
     resolves the Future when the winning renderer POSTs the action
     result — so this POST stays open until the action completes or the
@@ -4393,7 +4463,41 @@ async def _execute_browser_tool(
         return json.dumps({"error": f"{tool_name} failed: {type(exc).__name__}: {exc}"})
     if resp.status_code >= 400:
         return json.dumps({"error": f"{tool_name} returned {resp.status_code}: {resp.text[:200]}"})
+    if tool_name == "browser_screenshot":
+        return _browser_screenshot_output(resp.text)
     return resp.text
+
+
+def _browser_screenshot_output(output: str) -> str:
+    """Carry a successful browser data URL through the shared image transport."""
+    try:
+        result = json.loads(output)
+    except ValueError:
+        return output
+    if (
+        not isinstance(result, dict)
+        or result.get("ok") is not True
+        or classify_tool_result(result).status != ToolCallStatus.SUCCESS
+    ):
+        return output
+    data_url = result.get("data_url")
+    if not isinstance(data_url, str):
+        return output
+    match = re.fullmatch(r"data:(image/[a-zA-Z0-9.+-]+);base64,([\s\S]+)", data_url)
+    if match is None:
+        return output
+    media_type, data = match.groups()
+    canonical = native_image_payload(data, media_type)
+    if canonical is None:
+        return output
+    metadata = {key: value for key, value in result.items() if key != "data_url"}
+    return encode_mcp_image_result(
+        [
+            {"type": "text", "text": json.dumps(metadata)},
+            {"type": "image", "mimeType": media_type, "data": canonical},
+        ],
+        is_error=False,
+    )
 
 
 async def _execute_policy_tool(
@@ -5366,6 +5470,7 @@ async def _agent_list_fetch(
     *,
     after: str | None,
     limit: int,
+    exhausted: bool = False,
 ) -> _DiscoveryPage:
     """
     Fetch one cursor page of a paginated list endpoint.
@@ -5379,8 +5484,11 @@ async def _agent_list_fetch(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param exhausted: Skip a source whose cursor has reached its end.
     :returns: Rows and server continuation metadata.
     """
+    if exhausted:
+        return _DiscoveryPage([], False)
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
         if path == "/v1/sessions":
@@ -5552,6 +5660,46 @@ def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_J
     return kept
 
 
+_AGENT_READINESS_TIMEOUT_S = 5.0
+_AGENT_READINESS_MAX_DEPTH = 16
+
+
+async def _agent_list_host_readiness(
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> _JsonObject | None:
+    """Use the runner's host identity, with a bounded legacy session fallback."""
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    try:
+        async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
+            host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+            if host_id:
+                return await _host_harnesses_or_none(host_id, server_client)
+            seen: set[str] = set()
+            while conversation_id and conversation_id not in seen:
+                if len(seen) >= _AGENT_READINESS_MAX_DEPTH:
+                    return None
+                seen.add(conversation_id)
+                response = await server_client.get(
+                    f"/v1/sessions/{conversation_id}",
+                    params={"include_items": "false", "include_liveness": "false"},
+                    timeout=_AGENT_READINESS_TIMEOUT_S,
+                )
+                if response.status_code != 200:
+                    return None
+                snapshot = _string_object_dict(response.json())
+                if snapshot is None:
+                    return None
+                host_id = _optional_string(snapshot.get("host_id"))
+                if host_id:
+                    return await _host_harnesses_or_none(host_id, server_client)
+                conversation_id = _optional_string(snapshot.get("parent_session_id"))
+    except (TimeoutError, httpx.HTTPError, ValueError):
+        return None
+    return None
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -5563,7 +5711,7 @@ async def _agent_list_via_rest(
     continued: bool,
 ) -> str:
     """
-    List launchable agents across built-ins, session-bound, and local.
+    List agents across built-ins, session-bound, and local, with host readiness.
 
     Fans out three independent reads — each degrades to an empty section
     on failure rather than failing the whole call:
@@ -5597,30 +5745,29 @@ async def _agent_list_via_rest(
         bounded page with continuation metadata.
     """
     source_limit = limit or _AGENT_LIST_PAGE_LIMIT
-    builtins_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["builtins"][0] == _DISCOVERY_END
-        else await _agent_list_fetch(
+
+    spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert spec.cwd is not None
+    configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
+    builtins_page, sessions_page, local_configs, readiness, family = await asyncio.gather(
+        _agent_list_fetch(
             "/v1/agents",
             server_client,
             after=cursor_state["builtins"][1],
             limit=source_limit,
-        )
-    )
-    sessions_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["session_agents"][0] == _DISCOVERY_END
-        else await _agent_list_fetch(
+            exhausted=cursor_state["builtins"][0] == _DISCOVERY_END,
+        ),
+        _agent_list_fetch(
             "/v1/sessions",
             server_client,
             after=cursor_state["session_agents"][1],
             limit=source_limit,
-        )
+            exhausted=cursor_state["session_agents"][0] == _DISCOVERY_END,
+        ),
+        asyncio.to_thread(_scan_local_agent_configs, configs_dir),
+        _agent_list_host_readiness(server_client, conversation_id),
+        _spawn_family(server_client, conversation_id),
     )
-    spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
-    assert spec.cwd is not None
-    configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
-    local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
     local_state, local_after = cursor_state["local_configs"]
     if local_state == _DISCOVERY_END:
         remaining_configs = []
@@ -5635,9 +5782,15 @@ async def _agent_list_via_rest(
         sessions_page.rows,
         remaining_configs[:source_limit],
     )
-    listing["builtins"] = _in_spawn_family(
-        listing["builtins"], await _spawn_family(server_client, conversation_id)
-    )
+    listing["builtins"] = _in_spawn_family(listing["builtins"], family)
+    from omnigent.harness_availability import harness_launch_availability
+
+    for row in listing["builtins"]:
+        available, reason = harness_launch_availability(
+            _optional_string(row.get("harness")), readiness
+        )
+        row["available_on_host"] = available
+        row["unavailable_reason"] = reason
     return _bounded_discovery_result(
         listing,
         limit=limit,
@@ -6557,6 +6710,14 @@ async def execute_tool(
                 task_id=task_id,
                 agent_id=agent_id,
             )
+        elif tool_name in _WEB_READ_TOOLS:
+            output = await _execute_web_read_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
         elif tool_name in _NIMBLE_RESEARCH_TOOLS:
             output = await _execute_nimble_research_tool(
                 args,
@@ -7051,7 +7212,14 @@ async def _execute_os_env_tool(
             )
             owns_environment = False
         else:
-            os_env = create_os_environment(effective_spec)
+            additional_read_roots = (
+                [resource_registry.codex_skills_dir(conversation_id)]
+                if resource_registry is not None and conversation_id is not None
+                else []
+            )
+            os_env = create_os_environment(
+                effective_spec, additional_read_roots=additional_read_roots
+            )
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 
@@ -7108,12 +7276,16 @@ async def _execute_os_env_tool(
             tool_name,
             extra={"session_id": conversation_id},
         )
-        return json.dumps({"error": str(exc)})
+        return json_dumps_transport_safe({"error": str(exc)})
     finally:
         if os_env is not None and owns_environment:
-            os_env.close()
+            await run_sync_cleanup(
+                os_env.close,
+                component="runner_os_env_tool",
+                session_id=conversation_id,
+            )
 
-    return json.dumps(result)
+    return json_dumps_transport_safe(result)
 
 
 # ── REST-backed tools (Phase 1) ──────────────────────────
@@ -7806,7 +7978,15 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         if status == "failed":
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":
-            return f"[System: sub-agent task {handle_id} cancelled — {target}]"
+            if not has_output:
+                return f"[System: sub-agent task {handle_id} cancelled — {target}]"
+            # A cancelled turn may still have produced real output (the agent
+            # kept working after the interrupt); surface it instead of
+            # silently dropping the result.
+            return (
+                f"[System: sub-agent task {handle_id} cancelled — {target}; "
+                f"output before cancellation: {output}]"
+            )
         return f"[System: sub-agent task {handle_id} {status} — {target}: {output}]"
     if status == "completed":
         if not has_output:
@@ -8021,6 +8201,11 @@ async def _cleanup_drained_subagent_work(
     a lost receipt costs one duplicate delivery after a restart, whereas a
     lost result would never reach the parent.
 
+    A drained ``failed`` that is only the launch reaper's guess is not final:
+    the dispatch stays registered and un-receipted so the child's own terminal
+    edge can still replace it and reach the parent. Draining that genuine
+    result (or session teardown) performs the cleanup instead.
+
     :param payload: Drained inbox payload.
     :param server_client: HTTP client pointed at the Omnigent server, or
         ``None`` when the drain runs without server access.
@@ -8036,9 +8221,12 @@ async def _cleanup_drained_subagent_work(
     work_id = payload.get("work_id")
     if not isinstance(work_id, str) or not work_id:
         return
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
 
-    _runner_app.unregister_subagent_work(
+    entry = _subagent_work.get_subagent_work(child_id)
+    if entry is not None and entry.work_id == work_id and entry.launch_timed_out:
+        return
+    _subagent_work.unregister_subagent_work(
         child_id,
         work_id=work_id,
         remember_drained_delivery=True,
@@ -8638,7 +8826,7 @@ async def _cancel_subagent_task(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON cancellation result.
     """
-    from omnigent.runner import app as _runner_app
+    from omnigent.runner import subagent_work as _subagent_work
     from omnigent.runner.native.interrupt import native_cancel_capability
 
     task_id = args.get("task_id") or args.get("handle_id")
@@ -8646,7 +8834,7 @@ async def _cancel_subagent_task(
         return 'Error: sys_cancel_task requires "task_id"'
     if conversation_id is None:
         return "Error: sys_cancel_task requires conversation_id"
-    entry = _runner_app.get_subagent_work(str(task_id))
+    entry = _subagent_work.get_subagent_work(str(task_id))
     if entry is None:
         return await _cancel_evicted_native_subagent(
             str(task_id),
@@ -8689,7 +8877,7 @@ async def _cancel_subagent_task(
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
         )
 
-    updated = _runner_app.get_subagent_work(str(task_id)) or entry
+    updated = _subagent_work.get_subagent_work(str(task_id)) or entry
     if updated.status == "cancelled":
         return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
     if capability == "best_effort":

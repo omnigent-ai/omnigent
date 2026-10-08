@@ -97,6 +97,11 @@ class _RecordingStore:
             self.get_calls.append(session_id)
         return self._conv
 
+    def get_item(self, session_id: str, item_id: str) -> ConversationItem | None:
+        """This double models dedup at append time only; nothing is ever found."""
+        del session_id, item_id
+        return None
+
     def append(
         self,
         session_id: str,

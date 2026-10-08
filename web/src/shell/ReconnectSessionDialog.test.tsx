@@ -387,4 +387,34 @@ describe("<ReconnectSessionDialog />", () => {
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute("aria-busy", "true");
   });
+
+  it("offers an explicit Arca reconnect for the remembered remote host", () => {
+    const onReconnect = vi.fn();
+    renderDialog({
+      arcaReconnect: { reconnecting: false, error: null, onReconnect },
+    });
+
+    expect(screen.getByTestId("reconnect-session-description")).toHaveTextContent(
+      "Arca host is offline",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect Arca" }));
+    expect(onReconnect).toHaveBeenCalledOnce();
+  });
+
+  it("shows Arca reconnect progress and failures in the current session dialog", () => {
+    renderDialog({
+      arcaReconnect: {
+        reconnecting: true,
+        error: "Couldn't reach Arca.",
+        onReconnect: vi.fn(),
+      },
+    });
+
+    const button = screen.getByRole("button", { name: "Reconnecting Arca…" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByTestId("reconnect-session-arca-error")).toHaveTextContent(
+      "Couldn't reach Arca.",
+    );
+  });
 });

@@ -2,10 +2,80 @@ import { describe, expect, it } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import {
   claudeTaskNotificationMarker,
+  taskNotificationMarkerContent,
+  isClaudeAgentMessageContent,
   isSystemUserContent,
   parseSystemMessage,
-  taskNotificationMarkerContent,
 } from "./systemMessage";
+
+describe("isClaudeAgentMessageContent", () => {
+  const message =
+    '<teammate-message teammate_id="researcher" color="blue">Report</teammate-message>';
+  const handback = '<agent-message from="researcher">Report</agent-message>';
+  const text = (s: string): MessageContentBlock[] => [{ type: "input_text", text: s }];
+  const result =
+    "<task-notification><task-id>agent-1</task-id><result>Report</result></task-notification>";
+
+  it.each([
+    message,
+    handback,
+    result,
+    ` \n${message}\n${message}\n`,
+    `${message}\n${handback}`,
+    `<teammate-message teammate_id="researcher">{"type":"idle_notification"}</teammate-message>`,
+    `Another Claude session sent a message:\n${message}`,
+    `Another Claude session sent a message:\n${handback}`,
+    `Another Claude session sent a message while you were working:\n${message}`,
+    `A peer session sent a message while you were working:\n${message}`,
+    `Another Claude session sent a message:\n${message}\n\nThis came from another Claude session — not typed by your user, but very likely working on their behalf.`,
+    `Another Claude session sent a message:\n${message}\n\nThat "other Claude session" is an agent working inside this same session — a subagent or teammate spawned on your user's behalf.`,
+    "<task-notification><task-id>task-1</task-id><summary>Agent reviewer finished</summary></task-notification>",
+  ])("recognizes native task/team context: %s", (value) => {
+    expect(isClaudeAgentMessageContent(text(value))).toBe(true);
+  });
+
+  it.each([
+    "hello",
+    `Can you explain ${message}?`,
+    `\`\`\`xml\n${message}\n\`\`\``,
+    `> ${message}`,
+    `${message}\nWhat does this message mean?`,
+    `${handback}\nWhat does this message mean?`,
+    `\`\`\`xml\n${handback}\n\`\`\``,
+    `Another Claude session sent a message:\n${message}\nWhat does this message mean?`,
+    '<teammate-message teammate_id="researcher">incomplete',
+    "<teammate-message>missing sender</teammate-message>",
+    "<agent-message>missing sender</agent-message>",
+    '<agent-message from="researcher">incomplete',
+    "<task-notification>missing task id</task-notification>",
+    "<task-notification><task-id>task-1</task-id><summary>Background command completed</summary></task-notification>",
+    "<task-notification><task-id>task-1</task-id><summary>Monitor event</summary></task-notification>",
+    `${result}\nWhat does this mean?`,
+    `\`\`\`xml\n${result}\n\`\`\``,
+  ])("keeps human discussion and incomplete envelopes visible: %s", (value) => {
+    expect(isClaudeAgentMessageContent(text(value))).toBe(false);
+  });
+
+  it("does not hide a message containing real user text or attachments", () => {
+    expect(isClaudeAgentMessageContent([...text(message), ...text("Please explain this.")])).toBe(
+      false,
+    );
+    expect(
+      isClaudeAgentMessageContent([...text(message), { type: "input_image", file_id: "f1" }]),
+    ).toBe(false);
+    expect(isClaudeAgentMessageContent([...text(result), ...text("Please explain this.")])).toBe(
+      false,
+    );
+    expect(
+      taskNotificationMarkerContent([...text(result), ...text("Please explain this.")]),
+    ).toBeNull();
+    expect(
+      taskNotificationMarkerContent([...text(result), { type: "input_image", file_id: "f1" }]),
+    ).toBeNull();
+    expect(taskNotificationMarkerContent(text(result))).toBeNull();
+    expect(isClaudeAgentMessageContent([])).toBe(false);
+  });
+});
 
 describe("parseSystemMessage", () => {
   it("returns null for plain user text", () => {

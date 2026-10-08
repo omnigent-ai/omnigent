@@ -85,6 +85,9 @@ _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 # under a live child and assert the crash-recovery path. Never set in prod.
 _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
 
+# Upper bound on draining a forked child's debug-log sink before os._exit.
+_CHILD_TELEMETRY_FLUSH_TIMEOUT_S = 2.0
+
 
 @dataclass(frozen=True)
 class _SourceFileStamp:
@@ -198,6 +201,43 @@ def _import_runner_graph() -> None:
     from omnigent.runtime.harnesses import _runner as _harness_runner  # noqa: F401
 
 
+def _import_deferred_graph() -> None:
+    """Import what only some runner boots need, once the zygote is serving.
+
+    A runner whose server declines to mint its token (no auth provider,
+    header/proxy mode) falls through to Databricks credential discovery, which
+    imports the SDK (~0.45s) on every launch. Loading it once the zygote is
+    serving, after any request already waiting (a cold host's first fork),
+    keeps it out of each later fork. ``databricks-sdk`` is an optional
+    dependency.
+    """
+    try:
+        import databricks.sdk.config  # noqa: F401
+
+        from omnigent.inner import databricks_executor  # noqa: F401
+    except ImportError:
+        pass  # SDK not installed: runners never pay for it either.
+    except Exception as exc:  # noqa: BLE001 — an optional preload must not kill the forkserver
+        # The SDK can raise OSError probing credentials at import; forks then
+        # import it themselves.
+        sys.stderr.write(f"zygote: deferred Databricks SDK preload failed: {exc!r}\n")
+        sys.stderr.flush()
+
+
+def _exit_unless_single_threaded() -> None:
+    """Exit with status 2 if an import started a thread (fork-safety invariant)."""
+    if threading.active_count() != 1:  # pragma: no cover — defense in depth
+        # Forking from a multithreaded process risks child deadlocks. The graph
+        # is audited to start no import-time threads; if that ever regresses,
+        # fail loud here rather than ship silent deadlocks.
+        names = [t.name for t in threading.enumerate()]
+        print(
+            f"error: runner zygote must be single-threaded before forking; saw {names}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def _wire_child_stdio(log_path: str | None) -> None:
     """Point the forked child's stdio at the session log, stdin at /dev/null.
 
@@ -288,6 +328,23 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     from omnigent.runner._entry import main
 
     main()
+
+
+def _flush_child_telemetry() -> None:
+    """Drain the child's debug-log sink and stdio before ``os._exit``.
+
+    ``os._exit`` skips ``atexit``, where the sink would otherwise send its last
+    batch. Bounded so a slow upload cannot keep a dying child alive.
+    """
+    # BaseException too: this runs in a dying child, where nothing may stop the
+    # caller's os._exit (e.g. a KeyboardInterrupt during the drain join).
+    with contextlib.suppress(BaseException):
+        from omnigent.debug_logging import close_debug_log_sink
+
+        close_debug_log_sink(timeout=_CHILD_TELEMETRY_FLUSH_TIMEOUT_S)
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(BaseException):
+            stream.flush()
 
 
 def _maybe_run_test_seam() -> None:
@@ -418,6 +475,7 @@ class _ZygoteServer:
         # close (the daemon socket + all runner sockets).
         self._control_socks: set[socket.socket] = {control_sock}
         self._buffers: dict[int, bytearray] = {}
+        self._deferred_imported = False
         self._sel.register(control_sock, selectors.EVENT_READ, "daemon")
         self._buffers[control_sock.fileno()] = bytearray()
 
@@ -427,13 +485,26 @@ class _ZygoteServer:
             while True:
                 self._reap()
                 # Timeout so idle periods still reap exited children promptly.
-                for key, _mask in self._sel.select(timeout=1.0):
+                # Until the deferred graph is loaded, only peek: pending requests
+                # are served first, and the import runs once nothing is waiting.
+                events = self._sel.select(timeout=1.0 if self._deferred_imported else 0)
+                if not events and not self._deferred_imported:
+                    self._import_deferred()
+                    continue
+                for key, _mask in events:
                     # Only sockets are ever registered, so key.fileobj (typed
                     # HasFileno | int by selectors) is always a socket here.
                     if not self._on_readable(cast("socket.socket", key.fileobj), key.data):
                         return
         finally:
             self._sel.close()
+
+    def _import_deferred(self) -> None:
+        """Load :func:`_import_deferred_graph` once, when no request is pending."""
+        self._deferred_imported = True
+        _import_deferred_graph()
+        gc.freeze()
+        _exit_unless_single_threaded()
 
     def _reap(self) -> None:
         """Non-blocking reap of any exited children into ``exit_codes``.
@@ -675,19 +746,26 @@ class _ZygoteServer:
 
         :param body: Zero-arg callable running the child's real work.
         """
+        exit_code = 0
         try:
             body()
         except SystemExit as exc:
             # Preserve the exec'd entrypoint's exit code (main() raises
             # SystemExit) rather than flattening it to a traceback + code 1.
             code = exc.code
-            os._exit(code if isinstance(code, int) else (0 if code is None else 1))
-        except BaseException:  # noqa: BLE001 — last-resort child guard
-            import traceback
-
-            traceback.print_exc()
-            os._exit(1)
-        os._exit(0)
+            exit_code = code if isinstance(code, int) else (0 if code is None else 1)
+        except BaseException as exc:  # noqa: BLE001 — last-resort child guard
+            # Route through sys.excepthook so the runner's crash hook (installed
+            # by its main()) records the cause; it chains to the default print.
+            with contextlib.suppress(BaseException):
+                sys.excepthook(type(exc), exc, exc.__traceback__)
+            exit_code = 1
+        # The child must never fall back into the zygote's serve loop, even if
+        # the flush is interrupted.
+        try:
+            _flush_child_telemetry()
+        finally:
+            os._exit(exit_code)
 
     def _drop_runner(self, conn: socket.socket) -> None:
         """Forget a runner whose control socket closed (the runner exited).
@@ -774,16 +852,7 @@ def main() -> None:
     # registered handlers; adding another that blindly releases the lock raises
     # "cannot release un-acquired lock" in the child.
 
-    if threading.active_count() != 1:  # pragma: no cover — defense in depth
-        # Forking from a multithreaded process risks child deadlocks. The graph
-        # is audited to start no import-time threads; if that ever regresses,
-        # fail loud here rather than ship silent deadlocks.
-        names = [t.name for t in threading.enumerate()]
-        print(
-            f"error: runner zygote must be single-threaded before forking; saw {names}",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+    _exit_unless_single_threaded()
 
     # Ctrl+C is a normal operator-driven shutdown; exit quietly without a traceback.
     with contextlib.suppress(KeyboardInterrupt):

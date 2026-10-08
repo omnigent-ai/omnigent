@@ -89,11 +89,9 @@ def load_agent_def(
     resolution. See :func:`_resolve_instructions` for the rules.
 
     :param path_or_dict: A YAML file path or already-parsed dict.
-    :param enforce_handler_allowlist: When ``True``, reject any
-        ``type: function`` policy whose ``handler:`` / ``callable:``
-        dotted path is not a registered policy handler, *before*
-        ``_parse_agent_def`` resolves and (for factory policies)
-        **calls** it. This is the guard for the untrusted
+    :param enforce_handler_allowlist: When ``True``, reject dynamic tool
+        targets (including nested agent tools) and unregistered function
+        policy handlers before importing or calling them. This guards the untrusted
         agent-bundle upload path: ``omnigent.spec.load`` routes a
         single-file omnigent YAML bundle here during
         ``validate_agent_bundle``, and the loader executes policy
@@ -101,7 +99,7 @@ def load_agent_def(
         ``handler: subprocess.Popen`` would otherwise run during
         validation. Defaults to ``False`` so trusted callers (local
         ``omnigent run``, operator specs, the CLI) keep working with
-        custom handlers — the operator already has code execution, so
+        custom handlers and tools — the operator already has code execution, so
         the restriction would add no security there.
     """
     path: Path | None = None
@@ -126,14 +124,18 @@ def load_agent_def(
         )
     if enforce_handler_allowlist:
         _reject_unregistered_policy_handlers(data)
-    return _parse_agent_def(data, instructions_root=instructions_root)
+    return _parse_agent_def(
+        data,
+        instructions_root=instructions_root,
+        allow_dynamic_tools=not enforce_handler_allowlist,
+    )
 
 
 def _reject_unregistered_policy_handlers(data: YamlData) -> None:
     """Reject unregistered handlers before parsing an uploaded policy.
 
     Check legacy handler/callable fields and native function paths, including
-    wrapped handlers. Tool callable paths are validated separately.
+    wrapped handlers. Tool targets are guarded separately by the recursive tool parser.
     """
     from omnigent.policies.registry import (
         function_policy_handler_allowed,
@@ -251,6 +253,7 @@ def _resolve_instructions(
 def _parse_agent_def(
     data: YamlData,
     *,
+    allow_dynamic_tools: bool,
     instructions_root: Path | None = None,
 ) -> AgentDef:
     agent = AgentDef()
@@ -314,7 +317,7 @@ def _parse_agent_def(
 
     # Tools
     for tname, tdata in data.get("tools", {}).items():
-        agent.tools[tname] = _parse_tool(tname, tdata)
+        agent.tools[tname] = _parse_tool(tname, tdata, allow_dynamic_tools=allow_dynamic_tools)
 
     # Policies
     for pname, pdata in data.get("policies", {}).items():
@@ -390,7 +393,7 @@ def _parse_agent_def(
 # ---------------------------------------------------------------------------
 
 
-def _parse_tool(name: str, data: str | YamlData) -> Tool:
+def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -> Tool:
     if isinstance(data, str):
         if data == "inherit":
             return InheritedTool(name=name)
@@ -406,6 +409,17 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
         return FunctionTool(name=name, description=str(data))
 
     tool_type = data.get("type", "function")
+
+    # Guard imports in the recursive parser so nested tools cannot bypass
+    # the upload restriction. Module initialization is already a side effect.
+    if not allow_dynamic_tools and (
+        (tool_type == "function" and isinstance(data.get("callable"), str))
+        or (tool_type == "cancellable_function" and isinstance(data.get("runner"), str))
+    ):
+        raise ValueError(
+            f"Tool {name!r}: uploaded agent bundles may not declare a "
+            "server-side Python callable tool."
+        )
 
     if tool_type == "function":
         # Reject typos like ``runtime: clinet`` at load time.
@@ -503,7 +517,7 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
 
         sub_tools: dict[str, Tool] = {}
         for sname, sdata in data.get("tools", {}).items():
-            sub_tools[sname] = _parse_tool(sname, sdata)
+            sub_tools[sname] = _parse_tool(sname, sdata, allow_dynamic_tools=allow_dynamic_tools)
         raw_max_sessions = data.get("max_sessions")
         max_sessions: int | None = None
         if raw_max_sessions is not None:

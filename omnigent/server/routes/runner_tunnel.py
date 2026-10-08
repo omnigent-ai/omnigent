@@ -16,18 +16,26 @@ which the :class:`WSTunnelTransport` uses to route requests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
-from typing import TypedDict
+from typing import cast
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnosticAttrs
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
     HelloFrame,
     PingFrame,
     PongFrame,
@@ -48,7 +56,7 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
-_ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
+_RUNNER_RECOVERY_SLOW_SEC = 30.0
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -57,7 +65,7 @@ _ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
 _MANAGED_RUNNER_TOKEN_TTL_S = 1800
 
 
-class _TunnelConnectionAttrs(TypedDict):
+class _TunnelConnectionAttrs(TunnelDiagnosticAttrs):
     """Debug-log attributes joining a tunnel row to one runner connection.
 
     :param runner_id: Runner the tunnel belongs to.
@@ -177,8 +185,8 @@ def create_runner_tunnel_router(
     registry: TunnelRegistry,
     *,
     allowed_tunnel_tokens: frozenset[str] | None = None,
-    on_runner_disconnect: Callable[[str], Awaitable[None]] | None = None,
-    on_runner_connect: Callable[[str], Awaitable[None]] | None = None,
+    on_runner_disconnect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
+    on_runner_connect: Callable[[str, RunnerSession], Awaitable[None]] | None = None,
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
@@ -197,10 +205,10 @@ def create_runner_tunnel_router(
         shared remote-server behavior by accepting any token-bound
         runner id.
     :param on_runner_disconnect: Optional async callback fired when
-        a runner's tunnel closes. Receives the ``runner_id``. Used
+        a runner's tunnel closes. Receives the ``runner_id`` and connection. Used
         by the sessions module to mark sessions ``runner_offline``.
     :param on_runner_connect: Optional async callback fired when a
-        runner tunnel is established. Receives the ``runner_id``.
+        runner tunnel is established. Receives the ``runner_id`` and connection.
         Used to re-assign sessions on runner reconnect.
     :param auth_provider: Optional auth provider for user identity
         extraction. When set, runner listing is scoped to the
@@ -469,10 +477,11 @@ def create_runner_tunnel_router(
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
+        owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
             now = time.time()
-            return {
+            attrs: _TunnelConnectionAttrs = {
                 "runner_id": runner_id,
                 "ended_by": ended_by,
                 "connection_id": session.hello.connection_id if session is not None else None,
@@ -483,6 +492,16 @@ def create_runner_tunnel_router(
                     round(now - session.last_frame_at, 3) if session is not None else None
                 ),
             }
+            if session is not None:
+                return {**attrs, **session.diagnostics.snapshot()}
+            return attrs
+
+        def _report_diagnostics() -> None:
+            _logger.warning(
+                "Runner %s tunnel scheduling or send delay",
+                runner_id,
+                extra=debug_event("runner_tunnel_health", **_connection_attrs()),
+            )
 
         try:
             # 3. Receive hello frame.
@@ -510,6 +529,13 @@ def create_runner_tunnel_router(
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            session.diagnostics.settings.update(
+                tunnel_side="server",
+                app_ping_interval_s=PING_INTERVAL_S,
+                app_silence_timeout_s=PING_INTERVAL_S * PING_MISS_THRESHOLD,
+                protocol_keepalive_source="unavailable_from_asgi",
+            )
+            session.diagnostics.frame_received()
             _logger.info(
                 "Runner %s connected (version=%s, harnesses=%s)",
                 runner_id,
@@ -521,56 +547,52 @@ def create_runner_tunnel_router(
                     runner_id=runner_id,
                     version=frame.runner_version,
                     connection_id=frame.connection_id,
+                    **session.diagnostics.snapshot(),
                 ),
             )
 
-            # 6. Start tunnel helper tasks. The sender task is the
-            # only code path that writes to the Starlette WebSocket;
-            # request-side callers enqueue frames through the registry.
-            # These start BEFORE ``on_runner_connect`` fires so the
-            # hook can perform real tunnel I/O — without the sender
-            # loop running, any ``WSTunnelTransport``-backed request
-            # the hook makes would deadlock on its response future.
-            sender_task = asyncio.create_task(
-                _sender_loop(ws, session),
-                name=f"tunnel-sender:{runner_id}",
-            )
-            ping_task = asyncio.create_task(
-                _ping_loop(ws, session, runner_id, registry),
-                name=f"tunnel-ping:{runner_id}",
-            )
-            keepalive_task = asyncio.create_task(
-                _keepalive_loop(runner_id),
-                name=f"tunnel-keepalive:{runner_id}",
-            )
-            receive_task = asyncio.create_task(
-                _receive_loop(ws, session, runner_id, registry),
-                name=f"tunnel-receive:{runner_id}",
-            )
+            async with session.diagnostics.monitoring(
+                _report_diagnostics, connection_id=frame.connection_id
+            ):
+                # 6. Start tunnel helper tasks. The sender task is the
+                # only code path that writes to the Starlette WebSocket;
+                # request-side callers enqueue frames through the registry.
+                # These start BEFORE ``on_runner_connect`` fires so the
+                # hook can perform real tunnel I/O — without the sender
+                # loop running, any ``WSTunnelTransport``-backed request
+                # the hook makes would deadlock on its response future.
+                sender_task = asyncio.create_task(
+                    _sender_loop(ws, session),
+                    name=f"tunnel-sender:{runner_id}",
+                )
+                ping_task = asyncio.create_task(
+                    _ping_loop(ws, session, runner_id, registry),
+                    name=f"tunnel-ping:{runner_id}",
+                )
+                keepalive_task = asyncio.create_task(
+                    _keepalive_loop(runner_id),
+                    name=f"tunnel-keepalive:{runner_id}",
+                )
+                receive_task = asyncio.create_task(
+                    _receive_loop(ws, session, runner_id, registry),
+                    name=f"tunnel-receive:{runner_id}",
+                )
 
-            if on_runner_connect is not None:
-                # Bounded so a slow / hung hook can't stall WS
-                # shutdown: helper tasks are already running, but
-                # we still await the hook before entering the
-                # tunnel's main wait loop.
-                try:
-                    await asyncio.wait_for(
-                        on_runner_connect(runner_id),
-                        timeout=_ON_RUNNER_CONNECT_TIMEOUT_SEC,
-                    )
-                except asyncio.TimeoutError:
-                    _logger.warning(
-                        "on_runner_connect callback timed out for %s after %ss",
-                        runner_id,
-                        _ON_RUNNER_CONNECT_TIMEOUT_SEC,
-                    )
-                except Exception:
-                    _logger.exception(
-                        "on_runner_connect callback failed for %s",
-                        runner_id,
+                owned.extend((sender_task, ping_task, keepalive_task, receive_task))
+
+                if EVENT_INGEST_CAPABILITY in frame.capabilities and callable(
+                    getattr(ws.app.state, "runner_event_ingest", None)
+                ):
+                    await registry.send_text(session, encode_frame(EventReadyFrame()))
+
+                if on_runner_connect is not None:
+                    owned.append(
+                        asyncio.create_task(
+                            _run_connect_hook(on_runner_connect, session),
+                            name=f"tunnel-recovery:{runner_id}",
+                        )
                     )
 
-            try:
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -617,34 +639,22 @@ def create_runner_tunnel_router(
                             ),
                         )
                     raise task_error
-                # Every finished helper ended cleanly: a server-side close (ping
-                # timeout, replaced generation) with no peer close yet, so no
-                # ``disconnected`` row follows. Record it.
+                # Server-initiated closes may end a helper without a peer reply.
+                # Emit the same event shape as the WebSocketDisconnect path.
                 _logger.info(
-                    "Runner %s tunnel closed (%s ended)",
+                    "Runner %s tunnel closed (%s ended; code=%s, reason=%r)",
                     runner_id,
                     ended_by,
-                    extra=debug_event("runner_tunnel", phase="closed", **_connection_attrs()),
+                    session.close_code,
+                    session.close_reason,
+                    extra=debug_event(
+                        "runner_tunnel",
+                        phase="disconnected",
+                        code=session.close_code,
+                        reason=session.close_reason,
+                        **_connection_attrs(),
+                    ),
                 )
-            finally:
-                for task in (sender_task, ping_task, receive_task, keepalive_task):
-                    task.cancel()
-                await asyncio.gather(
-                    sender_task,
-                    ping_task,
-                    receive_task,
-                    keepalive_task,
-                    return_exceptions=True,
-                )
-                registry.deregister(runner_id, session)
-                if on_runner_disconnect is not None:
-                    try:
-                        await on_runner_disconnect(runner_id)
-                    except Exception:
-                        _logger.exception(
-                            "on_runner_disconnect callback failed for %s",
-                            runner_id,
-                        )
 
         except WebSocketDisconnect as exc:
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
@@ -661,34 +671,64 @@ def create_runner_tunnel_router(
                     **_connection_attrs(),
                 ),
             )
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
         except Exception:
             _logger.exception(
                 "Tunnel error for runner %s",
                 runner_id,
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
+        finally:
+            for task in owned:
+                task.cancel()
+            await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
                 registry.deregister(runner_id, session)
-            else:
-                registry.deregister(runner_id)
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
+                if on_runner_disconnect is not None:
+                    try:
+                        await on_runner_disconnect(runner_id, session)
+                    except Exception:
+                        _logger.exception("on_runner_disconnect callback failed for %s", runner_id)
 
     return router
+
+
+async def _run_connect_hook(
+    hook: Callable[[str, RunnerSession], Awaitable[None]], session: RunnerSession
+) -> None:
+    """Recover for the connection's lifetime, warning without cancelling slow work."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    runner_id = session.runner_id
+    attrs = {"runner_id": runner_id, "connection_id": session.hello.connection_id}
+    slow = loop.call_later(
+        _RUNNER_RECOVERY_SLOW_SEC,
+        lambda: _logger.warning(
+            "Runner recovery still running for %s after %ss",
+            runner_id,
+            _RUNNER_RECOVERY_SLOW_SEC,
+            extra=debug_event("runner_recovery", outcome="slow", **attrs),
+        ),
+    )
+    outcome = "completed"
+    try:
+        await hook(runner_id, session)
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    except Exception:
+        outcome = "failed"
+        _logger.exception("on_runner_connect callback failed for %s", runner_id)
+    finally:
+        slow.cancel()
+        _logger.info(
+            "Runner recovery %s for %s after %.1fs",
+            outcome,
+            runner_id,
+            loop.time() - started,
+            extra=debug_event(
+                "runner_recovery", outcome=outcome, duration_s=loop.time() - started, **attrs
+            ),
+        )
 
 
 async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
@@ -697,13 +737,24 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
     :param ws: Accepted Starlette WebSocket.
     :param session: Current runner session whose queue this task
         drains.
-    :returns: None when the session is retired.
+    :returns: None when the session is retired, or when the socket was
+        closed by another task (ping timeout, retire) while a send
+        raced it.
     """
     while True:
-        data = await session.outbound_queue.get()
-        if data is None:
+        frame = await session.outbound_queue.get()
+        if frame is None:
             return
-        await ws.send_text(data)
+        session.diagnostics.dequeued(frame)
+        try:
+            await session.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
+        except RuntimeError:
+            if ws.application_state is WebSocketState.DISCONNECTED:
+                # The ping loop or registry retirement closed the socket
+                # concurrently; the disconnect is already logged there.
+                _logger.debug("Runner %s send raced a concurrent close", session.runner_id)
+                return
+            raise
 
 
 async def _receive_tunnel_text(ws: WebSocket, runner_id: str) -> str | None:
@@ -747,36 +798,127 @@ async def _receive_loop(
     :returns: None when the WebSocket disconnects or the session is
         no longer current.
     """
-    while True:
-        raw = await _receive_tunnel_text(ws, runner_id)
-        if not registry.mark_frame_seen(session):
-            return
-        if raw is None:
-            continue
+    ingest = cast(
+        "Callable[..., Awaitable[EventAckFrame]] | None",
+        getattr(ws.app.state, "runner_event_ingest", None),
+    )
+    slots = getattr(ws.app.state, "runner_event_ingest_slots", None)
+    if slots is None:
+        slots = asyncio.Semaphore(16)
+        ws.app.state.runner_event_ingest_slots = slots
+    runner_active = getattr(ws.app.state, "runner_event_ingest_active_counts", None)
+    if runner_active is None:
+        runner_active = {}
+        ws.app.state.runner_event_ingest_active_counts = runner_active
+    session_locks = getattr(ws.app.state, "runner_event_ingest_locks", None)
+    if session_locks is None:
+        session_locks = weakref.WeakValueDictionary()
+        ws.app.state.runner_event_ingest_locks = session_locks
+    active: set[asyncio.Task[None]] = set()
+
+    def finished(task: asyncio.Task[None]) -> None:
+        # Capacity belongs to the admitted task, even if it was cancelled
+        # before its coroutine began. Keep counts across tunnel generations.
+        slots.release()
+        count = runner_active[runner_id] - 1
+        if count:
+            runner_active[runner_id] = count
+        else:
+            runner_active.pop(runner_id)
+        active.discard(task)
+
+    async def process(batch: EventBatchFrame) -> None:
         try:
-            resp_frame = decode_frame(raw)
-        except ValueError as exc:
-            _logger.warning(
-                "Runner %s sent malformed tunnel frame; dropping: %s",
+            if registry.get(runner_id) is not session or not callable(ingest):
+                return
+            # A malicious/buggy runner may send multiple frames for the same
+            # session despite the client-side FIFO. Preserve apply order here.
+            async with session_locks.setdefault(batch.session_id, asyncio.Lock()):
+                if registry.get(runner_id) is not session:
+                    return
+                ack = await ingest(
+                    app=ws.app,
+                    headers=ws.headers,
+                    owner=session.owner,
+                    runner_id=runner_id,
+                    batch=batch,
+                )
+        except Exception as exc:
+            _logger.exception(
+                "Runner %s event ingestion failed",
                 runner_id,
-                exc,
+                extra=debug_event(
+                    "runner_event_ingest_failed",
+                    session_id=batch.session_id,
+                    runner_id=runner_id,
+                    connection_id=session.hello.connection_id,
+                    batch_id=batch.id,
+                    batch_size=len(batch.events),
+                    failure_stage="dispatch",
+                    error_type=type(exc).__name__,
+                    retryable=True,
+                ),
             )
-            continue
-        if isinstance(resp_frame, PongFrame):
-            # Tunnel keepalive round-trip. DEBUG because pings are frequent —
-            # opt in via log level. ``ts`` is epoch-ms stamped when the server
-            # pinged, so now - ts is the runner round-trip latency.
+            ack = EventAckFrame(batch.id, 0, "ingest failed", retryable=True)
+        if registry.get(runner_id) is session:
+            # A replacement tunnel can register between the check and enqueue.
+            with contextlib.suppress(ConnectionError):
+                await registry.send_text(session, encode_frame(ack))
+
+    try:
+        while True:
+            raw = await _receive_tunnel_text(ws, runner_id)
+            if not registry.mark_frame_seen(session):
+                return
+            session.diagnostics.frame_received()
+            if raw is None:
+                continue
+            try:
+                resp_frame = decode_frame(raw)
+            except ValueError as exc:
+                _logger.warning(
+                    "Runner %s sent malformed tunnel frame; dropping: %s",
+                    runner_id,
+                    exc,
+                )
+                continue
+            if isinstance(resp_frame, EventBatchFrame):
+                if EVENT_INGEST_CAPABILITY not in session.hello.capabilities or not callable(
+                    ingest
+                ):
+                    continue
+                if slots.locked() or runner_active.get(runner_id, 0) >= 2:
+                    await registry.send_text(
+                        session,
+                        encode_frame(EventAckFrame(resp_frame.id, 0, "busy", retryable=True)),
+                    )
+                    continue
+                await slots.acquire()
+                runner_active[runner_id] = runner_active.get(runner_id, 0) + 1
+                task = asyncio.create_task(process(resp_frame))
+                active.add(task)
+                task.add_done_callback(finished)
+                continue
+            if isinstance(resp_frame, PongFrame):
+                session.diagnostics.app_pong_received(resp_frame.ts)
+                # Any frame (including pong) renews the tunnel's liveness.
+                _logger.debug(
+                    "runner %s tunnel keepalive: pong rtt=%dms",
+                    runner_id,
+                    int(time.time() * 1000) - resp_frame.ts,
+                )
+                continue
+            if isinstance(resp_frame, (WSFrame, WSCloseFrame)):
+                registry.route_ws_inbound(runner_id, resp_frame, session=session)
+                continue
+            # Route response.* frames to the reassembly queue.
+            registry.route_response_frame(runner_id, resp_frame, session=session)
+    finally:
+        # Cancelling a to_thread await cannot stop its DB call.
+        if active:
             _logger.debug(
-                "runner %s tunnel keepalive: pong rtt=%dms",
-                runner_id,
-                int(time.time() * 1000) - resp_frame.ts,
+                "Runner %s disconnected with %d accepted event batches", runner_id, len(active)
             )
-            continue
-        if isinstance(resp_frame, (WSFrame, WSCloseFrame)):
-            registry.route_ws_inbound(runner_id, resp_frame, session=session)
-            continue
-        # Route response.* frames to the reassembly queue.
-        registry.route_response_frame(runner_id, resp_frame, session=session)
 
 
 async def _keepalive_loop(runner_id: str) -> None:
@@ -855,8 +997,10 @@ async def _ping_loop(
                     error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.UNKNOWN.value,
+                    **session.diagnostics.snapshot(),
                 ),
             )
+            registry.record_close(session, code=4003, reason="ping timeout")
             try:
                 await ws.close(code=4003, reason="ping timeout")
             except RuntimeError:
@@ -868,9 +1012,11 @@ async def _ping_loop(
         # inherits this handler's workspace scope via copy_context.
         session_live_state.touch_runner_liveness([runner_id])
         try:
+            ping_ts = int(time.time() * 1000)
             await registry.send_text(
                 session,
-                encode_frame(PingFrame(ts=int(time.time() * 1000))),
+                encode_frame(PingFrame(ts=ping_ts)),
+                app_ping_ts=ping_ts,
             )
         except Exception:  # noqa: BLE001 -- any send failure ends the ping loop cleanly.
             return

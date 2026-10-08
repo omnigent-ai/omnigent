@@ -45,10 +45,9 @@ import {
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import {
-  applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
-  readUiFontSizePx,
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -172,7 +171,9 @@ function OmnigentProviders({
     initChatStore(hostQueryClient);
     // Resolve a session's routing host on demand (a hostless sub-agent child
     // walks up to its host-bound ancestor) before host-scoped requests key.
-    setSessionHostResolver((sessionId) => prefetchSessionHostChain(hostQueryClient, sessionId));
+    setSessionHostResolver((sessionId, options) =>
+      prefetchSessionHostChain(hostQueryClient, sessionId, options),
+    );
     void resolveIdentity();
     return null;
   });
@@ -194,7 +195,7 @@ function OmnigentProviders({
   const scopeRootRef = useCallback((el: HTMLDivElement | null) => {
     setEmbedScopeRoot(el);
     if (el) {
-      applyDesktopUiFontSize(readUiFontSizePx());
+      applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());

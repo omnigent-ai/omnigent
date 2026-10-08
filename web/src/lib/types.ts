@@ -379,7 +379,7 @@ export interface Session {
   subagentRoutingOverride?: "on" | "off" | null;
   /**
    * Whether the owner opted into letting people with *view* (read-only)
-   * access browse this session's workspace files (the Files/Changes/GitHub
+   * access browse this session's workspace files (the Files/Changes/Pull Requests
    * surfaces and the file contents behind them). `false` by default — a
    * read grant shares the conversation, not the raw filesystem. Owner-set
    * from the share dialog; the rail reads it to decide whether to mount the
@@ -423,6 +423,8 @@ export interface Session {
     title?: string;
     cause?: string;
     remediation?: string;
+    /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
+    item_id?: string;
   } | null;
   /**
    * Outstanding `response.elicitation_request` event payloads on
@@ -551,10 +553,12 @@ export interface SandboxStatus {
 
 /** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */
 export interface SkillSummary {
-  /** Lowercase kebab-case identifier, e.g. ``"triage-issues"``. */
+  /** Invocation identifier (the skill's directory name), e.g. ``"triage-issues"``. */
   name: string;
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
+  /** Frontmatter ``name`` label, e.g. ``"Triage Issues"``; absent from older servers. */
+  display_name?: string | null;
 }
 
 export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";

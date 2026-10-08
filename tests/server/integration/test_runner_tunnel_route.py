@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -19,14 +21,20 @@ from starlette.requests import HTTPConnection
 from omnigent.errors import OmnigentError
 from omnigent.runner import create_runner_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
     HelloFrame,
     PingFrame,
+    PongFrame,
     RequestFrame,
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -341,13 +349,16 @@ async def test_ws_tunnel_status_reports_registration(
         offline = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
 
         communicator = await _connect_route(app, _TUNNEL_PATH)
-        await _send_hello(communicator, registry, connection_id="conn-status-1")
         try:
+            await _send_hello(communicator, registry, connection_id="conn-status-1")
             online = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
+            await communicator.send_input(
+                {"type": "websocket.disconnect", "code": 1000, "reason": "runner shutdown"}
+            )
+            await asyncio.wait_for(communicator.future, timeout=budget(1.0))
         finally:
-            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-            with contextlib.suppress(asyncio.TimeoutError):
-                await communicator.wait(timeout=budget(1.0))
+            communicator.stop(exceptions=False)
+            await asyncio.gather(communicator.future, return_exceptions=True)
 
     assert offline.json() == {"runner_id": _RUNNER_ID, "online": False}
     assert online.json() == {"runner_id": _RUNNER_ID, "online": True}
@@ -359,11 +370,330 @@ async def test_ws_tunnel_status_reports_registration(
         if getattr(r, "event_name", None) == "runner_tunnel"
     }
     assert rows["connected"]["connection_id"] == "conn-status-1"
-    disconnected = rows["disconnected"]
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 1
+    disconnected = ends[0]
+    assert disconnected["phase"] == "disconnected"
     assert disconnected["connection_id"] == "conn-status-1"
     assert disconnected["code"] == 1000
+    assert disconnected["reason"] == "runner shutdown"
     assert disconnected["ended_by"] == "tunnel-receive"
     assert disconnected["connection_age_s"] >= 0
+    assert disconnected["tunnel_side"] == "server"
+    assert disconnected["protocol_keepalive_source"] == "unavailable_from_asgi"
+    assert "protocol_ping_timeout_s" not in disconnected
+    assert disconnected["app_ping_interval_s"] == 30.0
+    assert disconnected["app_silence_timeout_s"] == 90.0
+    assert disconnected["last_received_frame_age_s"] >= 0
+    assert registry.get(_RUNNER_ID) is None
+
+
+def _tunnel_end_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    """Return structured tunnel end events, including unexpected errors."""
+    return [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel"
+        and record.attributes["phase"] != "connected"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("from_thread", "delay_retirement"),
+    [(False, False), (True, False), (True, True)],
+    ids=["route-loop", "other-thread", "delayed-other-thread"],
+)
+async def test_server_retirement_logs_one_structured_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    from_thread: bool,
+    delay_retirement: bool,
+) -> None:
+    """Retiring a runner records the close even without a peer close reply."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-retired")
+        callbacks: list[Callable[[], None]] = []
+        if delay_retirement:
+
+            def defer_retirement(_session: RunnerSession, callback: Callable[[], None]) -> None:
+                callbacks.append(callback)
+
+            monkeypatch.setattr(
+                "omnigent.runner.transports.ws_tunnel.registry._call_session_soon_threadsafe",
+                defer_retirement,
+            )
+        if from_thread:
+            await asyncio.to_thread(route_app.registry.deregister, _RUNNER_ID)
+        else:
+            route_app.registry.deregister(_RUNNER_ID)
+
+        if delay_retirement:
+            # Let the receive helper observe the stale generation before the
+            # owner-loop retirement callback can stop the sender.
+            await communicator.send_input(
+                {"type": "websocket.receive", "text": encode_frame(PingFrame(ts=0))}
+            )
+            await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+            assert len(callbacks) == 1
+            callbacks[0]()
+
+        close = await communicator.receive_output(timeout=budget(1.0))
+        assert close == {
+            "type": "websocket.close",
+            "code": 1001,
+            "reason": "tunnel retired by server; reconnect",
+        }
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 1
+    assert ends[0]["phase"] == "disconnected"
+    assert ends[0]["runner_id"] == _RUNNER_ID
+    assert ends[0]["connection_id"] == "conn-retired"
+    assert ends[0]["code"] == close["code"]
+    assert ends[0]["reason"] == close["reason"]
+    assert ends[0]["ended_by"] == ("tunnel-receive" if delay_retirement else "tunnel-sender")
+    assert route_app.registry.get(_RUNNER_ID) is None
+
+
+async def test_abnormal_peer_disconnect_preserves_code_during_registry_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cleanup must not emit an extra retirement code for a peer disconnect."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-peer")
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006, "reason": ""})
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 1
+    assert ends[0]["phase"] == "disconnected"
+    assert ends[0]["connection_id"] == "conn-peer"
+    assert ends[0]["code"] == 1006
+    assert ends[0]["reason"] == ""
+    assert route_app.registry.get(_RUNNER_ID) is None
+
+
+async def test_simultaneous_retirement_and_peer_disconnect_logs_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A completed receive error wins over a normally completed sender."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    registry = TunnelRegistry()
+    resume_handler = asyncio.Event()
+
+    async def on_connect(_runner_id: str, _connection: RunnerSession) -> None:
+        await resume_handler.wait()
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_connect=on_connect),
+        prefix="/v1",
+    )
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, registry, connection_id="conn-race")
+        # Let both helper tasks finish before the handler checks their results.
+        registry.deregister(_RUNNER_ID)
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        resume_handler.set()
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 1
+    assert ends[0]["phase"] == "disconnected"
+    assert ends[0]["connection_id"] == "conn-race"
+    assert ends[0]["code"] == 1006
+    assert ends[0]["ended_by"] == "tunnel-receive,tunnel-sender"
+
+
+@pytest.mark.parametrize("fail_recovery", [False, True])
+async def test_slow_recovery_continues_without_closing_healthy_tunnel(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fail_recovery: bool
+) -> None:
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(runner_tunnel, "_RUNNER_RECOVERY_SLOW_SEC", 0.01)
+    caplog.set_level(logging.INFO, logger=runner_tunnel.__name__)
+    registry = TunnelRegistry()
+    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def recover(_rid: str, _connection: RunnerSession) -> None:
+        entered.set()
+        await release.wait()
+        finished.set()
+        if fail_recovery:
+            raise RuntimeError("session initialization failed")
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_connect=recover), prefix="/v1"
+    )
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, registry, connection_id="conn-recovery")
+        await asyncio.wait_for(entered.wait(), budget(1))
+
+        async def warned() -> None:
+            while not any(
+                getattr(r, "attributes", {}).get("outcome") == "slow" for r in caplog.records
+            ):
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(warned(), budget(1))
+        assert not finished.is_set()
+        release.set()
+        await asyncio.wait_for(finished.wait(), budget(1))
+        assert registry.get(_RUNNER_ID) is not None
+        assert not communicator.future.done()
+        events = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_recovery"
+        ]
+        assert [event["outcome"] for event in events] == [
+            "slow",
+            "failed" if fail_recovery else "completed",
+        ]
+        assert all(event["runner_id"] == _RUNNER_ID for event in events)
+        assert all(event["connection_id"] == "conn-recovery" for event in events)
+        terminal = events[-1]
+        assert isinstance(terminal["duration_s"], (int, float)) and terminal["duration_s"] >= 0
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(1))
+
+
+@pytest.mark.parametrize("end", ["peer", "replacement", "shutdown"])
+async def test_tunnel_end_cancels_and_joins_only_its_recovery(
+    end: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    registry = TunnelRegistry()
+    entered, replacement_entered = asyncio.Event(), asyncio.Event()
+    cancelled: list[RunnerSession] = []
+    disconnected: list[RunnerSession] = []
+
+    async def recover(_rid: str, connection: RunnerSession) -> None:
+        (replacement_entered if entered.is_set() else entered).set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(connection)
+
+    async def disconnect(_rid: str, connection: RunnerSession) -> None:
+        assert connection in cancelled, "disconnect hook ran before recovery cleanup"
+        disconnected.append(connection)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(
+            registry, on_runner_connect=recover, on_runner_disconnect=disconnect
+        ),
+        prefix="/v1",
+    )
+    first = await _connect_route(app, _TUNNEL_PATH)
+    second = None
+    try:
+        await _send_hello(first, registry, connection_id="conn-original")
+        await asyncio.wait_for(entered.wait(), budget(1))
+        old = registry.get(_RUNNER_ID)
+        assert old is not None
+        if end == "replacement":
+            second = await _connect_route(app, _TUNNEL_PATH)
+            await _send_hello(second, registry, connection_id="conn-replacement")
+            await asyncio.wait_for(replacement_entered.wait(), budget(1))
+        elif end == "shutdown":
+            first.future.cancel()
+        else:
+            await first.send_input({"type": "websocket.disconnect", "code": 1006})
+        await asyncio.wait_for(asyncio.gather(first.future, return_exceptions=True), budget(1))
+        assert cancelled == disconnected == [old]
+        if second is not None:
+            assert registry.get(_RUNNER_ID) is not old
+            assert registry.get(_RUNNER_ID) is not None
+            assert not second.future.done()
+        else:
+            assert registry.get(_RUNNER_ID) is None
+    finally:
+        for communicator in (first, second):
+            if communicator is not None and not communicator.future.done():
+                await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+                await communicator.wait(timeout=budget(1))
+    assert not any(
+        task.get_name().startswith("tunnel-") and task.get_name().endswith(f":{_RUNNER_ID}")
+        for task in asyncio.all_tasks()
+    )
+    events = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_recovery"
+    ]
+    expected_connections = ["conn-original"]
+    if end == "replacement":
+        expected_connections.append("conn-replacement")
+    assert [(event["connection_id"], event["outcome"]) for event in events] == [
+        (connection_id, "cancelled") for connection_id in expected_connections
+    ]
+    assert all(event["runner_id"] == _RUNNER_ID for event in events)
+    assert all(
+        isinstance(event["duration_s"], (int, float)) and event["duration_s"] >= 0
+        for event in events
+    )
+
+
+async def test_replacement_logs_close_for_only_the_retired_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A replacement's close belongs to the old generation, not the new one."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+    first = await _connect_route(route_app.app, _TUNNEL_PATH)
+    second = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(first, route_app.registry, connection_id="conn-old")
+        await _send_hello(second, route_app.registry, connection_id="conn-new")
+        close = await first.receive_output(timeout=budget(1.0))
+        assert close == {
+            "type": "websocket.close",
+            "code": 4000,
+            "reason": "tunnel replaced",
+        }
+        await asyncio.wait_for(first.future, timeout=budget(1.0))
+        current = route_app.registry.get(_RUNNER_ID)
+        assert current is not None
+        assert current.hello.connection_id == "conn-new"
+
+        await second.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(second.future, timeout=budget(1.0))
+    finally:
+        first.stop(exceptions=False)
+        second.stop(exceptions=False)
+        await asyncio.gather(first.future, second.future, return_exceptions=True)
+
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 2
+    assert all(event["phase"] == "disconnected" for event in ends)
+    assert [(event["connection_id"], event["code"]) for event in ends] == [
+        ("conn-old", 4000),
+        ("conn-new", 1000),
+    ]
+    assert ends[0]["reason"] == "tunnel replaced"
 
 
 async def test_ws_tunnel_list_runners_reports_online_harnesses(app: FastAPI) -> None:
@@ -779,6 +1109,49 @@ async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
         await communicator.wait(timeout=budget(1.0))
 
 
+@pytest.mark.parametrize("end", ["disconnect", "non_hello"])
+async def test_second_connection_ending_before_hello_preserves_healthy_tunnel(end: str) -> None:
+    registry = TunnelRegistry()
+    disconnected: list[RunnerSession] = []
+
+    async def on_disconnect(_rid: str, connection: RunnerSession) -> None:
+        disconnected.append(connection)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_disconnect=on_disconnect), prefix="/v1"
+    )
+    first = await _connect_route(app, _TUNNEL_PATH)
+    second = None
+    try:
+        await _send_hello(first, registry, connection_id="healthy-connection")
+        original = registry.get(_RUNNER_ID)
+        assert original is not None
+        second = await _connect_route(app, _TUNNEL_PATH)
+        if end == "disconnect":
+            await second.send_input({"type": "websocket.disconnect", "code": 1006})
+        else:
+            await second.send_input(
+                {"type": "websocket.receive", "text": encode_frame(PingFrame(ts=1))}
+            )
+            close = await second.receive_output(timeout=budget(1))
+            assert close["type"] == "websocket.close"
+            assert close["code"] == 4001
+        await asyncio.wait_for(second.future, budget(1))
+        assert registry.get(_RUNNER_ID) is original
+        assert not first.future.done()
+        assert disconnected == []
+
+        await first.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(first.future, budget(1))
+        assert disconnected == [original]
+    finally:
+        for communicator in (first, second):
+            if communicator is not None:
+                communicator.stop(exceptions=False)
+                await asyncio.gather(communicator.future, return_exceptions=True)
+
+
 async def test_ws_tunnel_route_is_not_double_prefixed(app: FastAPI) -> None:
     """The tunnel route is accepted at one ``/v1`` prefix, not two.
 
@@ -1026,6 +1399,479 @@ async def test_ws_tunnel_loopback_unauthenticated_registers_as_local() -> None:
             await communicator.wait(timeout=budget(1.0))
 
 
+async def test_event_ingest_does_not_block_tunnel_receive_loop() -> None:
+    route = _tunnel_route_app()
+    started = asyncio.Event()
+    unblock = asyncio.Event()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        started.set()
+        await unblock.wait()
+        return EventAckFrame(batch.id, len(batch.events))
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        ready = await comm.receive_output(timeout=budget(1.0))
+        assert isinstance(decode_frame(ready["text"]), EventReadyFrame)
+        for i in range(3):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=f"batch-{i}",
+                            session_id="s",
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(started.wait(), timeout=budget(1.0))
+        # Two workers are in flight; the read loop remains free to reject
+        # the third request rather than waiting for a DB slot.
+        busy = await comm.receive_output(timeout=budget(1.0))
+        ack = decode_frame(busy["text"])
+        assert isinstance(ack, EventAckFrame)
+        assert ack.id == "batch-2"
+        assert ack.retryable and ack.applied == 0
+        unblock.set()
+        replies = [
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+            for _ in range(2)
+        ]
+        assert {reply.id for reply in replies if isinstance(reply, EventAckFrame)} == {
+            "batch-0",
+            "batch-1",
+        }
+    finally:
+        unblock.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+
+
+async def test_event_ingest_failure_logs_session_and_retries_without_closing_tunnel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    route = _tunnel_route_app()
+    calls = 0
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        nonlocal calls
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary ingestion failure")
+        return EventAckFrame(batch.id, len(batch.events))
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                        connection_id="connection-test",
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        for batch_id in ("first", "retry"):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=batch_id,
+                            session_id="session-test",
+                            events=[
+                                {
+                                    "type": "external_output_text_delta",
+                                    "data": {"delta": "private-event-content"},
+                                }
+                            ],
+                        )
+                    ),
+                }
+            )
+            ack = decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+            assert isinstance(ack, EventAckFrame)
+            assert ack.id == batch_id
+            if batch_id == "first":
+                assert ack.applied == 0 and ack.retryable
+            else:
+                assert ack.applied == 1 and not ack.retryable
+        (failure,) = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_event_ingest_failed"
+        ]
+        assert failure.session_id == "session-test"
+        assert failure.attributes == {
+            "runner_id": _RUNNER_ID,
+            "connection_id": "connection-test",
+            "batch_id": "first",
+            "batch_size": 1,
+            "failure_stage": "dispatch",
+            "error_type": "RuntimeError",
+            "retryable": True,
+        }
+        assert "private-event-content" not in caplog.text
+        assert route.registry.get(_RUNNER_ID) is not None
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(1.0))
+
+
+async def test_event_ingest_disconnect_before_worker_start_releases_slot() -> None:
+    route = _tunnel_route_app()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_frame(
+                HelloFrame(
+                    runner_version="test",
+                    frame_protocol_version=1,
+                    capabilities=[EVENT_INGEST_CAPABILITY],
+                )
+            ),
+        }
+    )
+    assert isinstance(
+        decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+        EventReadyFrame,
+    )
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_frame(
+                EventBatchFrame(
+                    id="before-disconnect",
+                    session_id="s",
+                    events=[{"type": "external_output_text_delta", "data": {}}],
+                )
+            ),
+        }
+    )
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    with contextlib.suppress(asyncio.TimeoutError):
+        await comm.wait(timeout=budget(1.0))
+
+    async def capacity_restored() -> None:
+        while route.app.state.runner_event_ingest_slots._value != 16:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(capacity_restored(), timeout=budget(1.0))
+    assert route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0) == 0
+
+
+async def test_event_ingest_disconnect_keeps_running_db_work_charged() -> None:
+    route = _tunnel_route_app()
+    started = threading.Event()
+    release = threading.Event()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+
+        def blocking_db_work() -> None:
+            started.set()
+            release.wait(timeout=budget(10.0))
+
+        await asyncio.to_thread(blocking_db_work)
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    EventBatchFrame(
+                        id="running-db",
+                        session_id="s",
+                        events=[{"type": "external_output_text_delta", "data": {}}],
+                    )
+                ),
+            }
+        )
+        assert await asyncio.to_thread(started.wait, budget(1.0))
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+        assert route.app.state.runner_event_ingest_slots._value == 15
+        assert route.app.state.runner_event_ingest_active_counts[_RUNNER_ID] == 1
+    finally:
+        release.set()
+
+    async def capacity_restored() -> None:
+        while route.app.state.runner_event_ingest_slots._value != 16:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(capacity_restored(), timeout=budget(1.0))
+    assert route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0) == 0
+
+
+async def test_event_ingest_preserves_order_per_session() -> None:
+    route = _tunnel_route_app()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    entered: list[str] = []
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        entered.append(batch.id)
+        if batch.id == "first":
+            first_started.set()
+            await release_first.wait()
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        hello = HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[EVENT_INGEST_CAPABILITY],
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_frame(hello)})
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        for batch_id in ("first", "second"):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=batch_id,
+                            session_id="same-session",
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(first_started.wait(), timeout=budget(1.0))
+        await asyncio.sleep(0)
+        assert entered == ["first"]
+        release_first.set()
+        acks = [
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+            for _ in range(2)
+        ]
+        assert [ack.id for ack in acks if isinstance(ack, EventAckFrame)] == ["first", "second"]
+    finally:
+        release_first.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+
+
+async def test_event_ingest_other_session_progresses_while_one_is_blocked() -> None:
+    route = _tunnel_route_app()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        if batch.session_id == "a":
+            first_started.set()
+            await release_first.wait()
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        for session_id in ("a", "b"):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=session_id,
+                            session_id=session_id,
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(first_started.wait(), timeout=budget(1.0))
+        ack = decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+        assert isinstance(ack, EventAckFrame) and ack.id == "b"
+        release_first.set()
+        ack = decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+        assert isinstance(ack, EventAckFrame) and ack.id == "a"
+    finally:
+        release_first.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+
+
+async def test_disconnected_batch_waiting_on_lock_cannot_apply_after_reconnect() -> None:
+    route = _tunnel_route_app()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    entered: list[str] = []
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        entered.append(batch.id)
+        if batch.id == "first":
+            first_started.set()
+            await release_first.wait()
+        return EventAckFrame(batch.id, 1)
+
+    async def connect() -> ApplicationCommunicator:
+        comm = await _connect_route(route.app, _TUNNEL_PATH)
+        hello = HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[EVENT_INGEST_CAPABILITY],
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_frame(hello)})
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        return comm
+
+    route.app.state.runner_event_ingest = ingest
+    old = await connect()
+    old_closed = False
+    new: ApplicationCommunicator | None = None
+    try:
+        for batch_id in ("first", "stale-second"):
+            await old.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=batch_id,
+                            session_id="same-session",
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(first_started.wait(), timeout=budget(1.0))
+
+        async def both_admitted() -> None:
+            while route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0) < 2:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(both_admitted(), timeout=budget(1.0))
+        await old.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await old.wait(timeout=budget(1.0))
+        old_closed = True
+        new = await connect()
+        release_first.set()
+
+        async def old_work_finished() -> None:
+            while route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(old_work_finished(), timeout=budget(1.0))
+        assert entered == ["first"]
+        await new.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    EventBatchFrame(
+                        id="new",
+                        session_id="same-session",
+                        events=[{"type": "external_output_text_delta", "data": {}}],
+                    )
+                ),
+            }
+        )
+        ack = decode_frame((await new.receive_output(timeout=budget(1.0)))["text"])
+        assert isinstance(ack, EventAckFrame) and ack.id == "new"
+        assert entered == ["first", "new"]
+    finally:
+        release_first.set()
+        try:
+            if new is not None:
+                await new.send_input({"type": "websocket.disconnect", "code": 1000})
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await new.wait(timeout=budget(1.0))
+        finally:
+            if not old_closed:
+                await old.send_input({"type": "websocket.disconnect", "code": 1000})
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await old.wait(timeout=budget(1.0))
+
+
 # ── Managed-runner token mint endpoint (POST /v1/runners/{id}/token) ──
 
 
@@ -1259,9 +2105,11 @@ async def test_ping_loop_restamps_runner_liveness(
         session_live_state.configure(None)
 
 
+@pytest.mark.parametrize("retire_during_timeout", [False, True], ids=["timeout", "retire-race"])
 async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    retire_during_timeout: bool,
 ) -> None:
     """A silent runner is closed by the server and both rows name the socket.
 
@@ -1269,12 +2117,11 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     the runner dead and closes the tunnel. The ``runner_ping_timeout`` row and
     the tunnel's end row must carry the hello's connection id, the
     connection's age and the silence, and name the ping task among what ended
-    the tunnel. Whether the peer's close reply has arrived by the time the
-    handler observes the end is timing dependent, so the end row is either
-    ``closed`` (ping task alone) or ``disconnected`` (peer close seen too).
+    the tunnel. The close code is recorded without waiting for a peer reply.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log capture fixture.
+    :param retire_during_timeout: Retire after the ping loop observes a timeout.
     :returns: None.
     """
     import omnigent.server.routes.runner_tunnel as tunnel_mod
@@ -1283,6 +2130,28 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 1)
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()
+    if retire_during_timeout:
+        seconds_since_last_frame = route_app.registry.seconds_since_last_frame
+
+        def retire_after_timeout_check(session: RunnerSession) -> float | None:
+            elapsed = seconds_since_last_frame(session)
+            if elapsed is not None and elapsed > (
+                tunnel_mod.PING_INTERVAL_S * tunnel_mod.PING_MISS_THRESHOLD
+            ):
+                # Retire between the liveness check and the timeout close,
+                # while the owner loop cannot run the retirement callback.
+                thread = threading.Thread(
+                    target=route_app.registry.deregister,
+                    args=(_RUNNER_ID, session),
+                )
+                thread.start()
+                thread.join(timeout=budget(1.0))
+                assert not thread.is_alive(), "concurrent retirement did not finish"
+            return elapsed
+
+        monkeypatch.setattr(
+            route_app.registry, "seconds_since_last_frame", retire_after_timeout_check
+        )
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
     try:
         await _send_hello(communicator, route_app.registry, connection_id="conn-silent-1")
@@ -1295,10 +2164,10 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
                 break
             assert asyncio.get_event_loop().time() < deadline, "ping timeout never closed"
         assert message["code"] == 4003
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
     finally:
-        await communicator.send_input({"type": "websocket.disconnect", "code": 4003})
-        with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=budget(1.0))
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
 
     timeouts = [
         r.attributes
@@ -1310,18 +2179,115 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert timeouts[0]["connection_id"] == "conn-silent-1"
     assert timeouts[0]["connection_age_s"] >= 0
     assert timeouts[0]["silent_s"] > 0
-    ends = [
-        r.attributes
-        for r in caplog.records
-        if getattr(r, "event_name", None) == "runner_tunnel"
-        and r.attributes["phase"] in {"closed", "disconnected"}
-    ]
+    assert timeouts[0]["app_silence_timeout_s"] == 0.02
+    assert timeouts[0]["last_received_frame_age_s"] >= 0
+    assert timeouts[0]["last_app_pong_received_age_s"] is None
+    ends = _tunnel_end_events(caplog)
     assert len(ends) == 1
+    assert ends[0]["phase"] == "disconnected"
     assert ends[0]["connection_id"] == "conn-silent-1"
     assert "tunnel-ping" in ends[0]["ended_by"].split(",")
     assert ends[0]["connection_age_s"] >= 0
-    if ends[0]["phase"] == "disconnected":
-        assert ends[0]["code"] == 4003
+    assert ends[0]["code"] == (1001 if retire_during_timeout else 4003)
+    assert ends[0]["reason"] == (
+        "tunnel retired by server; reconnect" if retire_during_timeout else "ping timeout"
+    )
+
+
+async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 1000)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-heartbeat")
+        ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
+        assert isinstance(ping, PingFrame)
+        await communicator.send_input(
+            {"type": "websocket.receive", "text": encode_frame(PongFrame(ts=ping.ts))}
+        )
+        session = route_app.registry.get(_RUNNER_ID)
+        assert session is not None
+        async with asyncio.timeout(budget(1)):
+            while session.diagnostics.snapshot()["last_app_pong_received_age_s"] is None:
+                await asyncio.sleep(0.001)
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(communicator.future, timeout=budget(1))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    row = _tunnel_end_events(caplog)[0]
+    assert row["connection_id"] == "conn-heartbeat"
+    assert row["app_ping_rtt_s"] >= 0
+    assert row["last_app_ping_sent_age_s"] >= 0
+    assert row["last_app_pong_received_age_s"] >= 0
+    assert row["outbound_queue_high_water"] >= 1
+    assert row["send_errors"] == 0
+
+
+async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The timeout still fires when the sender is stuck, and cleanup preserves proof."""
+    from omnigent.runner.transports.ws_tunnel import diagnostics as diagnostics_module
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(diagnostics_module, "_SAMPLE_INTERVAL_S", 0.005)
+    monkeypatch.setattr(diagnostics_module, "_SLOW_OPERATION_S", 0.01)
+    monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.05)
+    monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 3)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+
+    async def blocked_sender_app(scope, receive, send):
+        async def delayed_send(message):
+            if message["type"] == "websocket.send":
+                await asyncio.Future()
+            await send(message)
+
+        await route_app.app(scope, receive, delayed_send)
+
+    communicator = ApplicationCommunicator(blocked_sender_app, _websocket_scope(_TUNNEL_PATH))
+    try:
+        await communicator.send_input({"type": "websocket.connect"})
+        assert (await communicator.receive_output(timeout=budget(1)))["type"] == "websocket.accept"
+        await _send_hello(communicator, route_app.registry, connection_id="conn-blocked-send")
+        message = await communicator.receive_output(timeout=budget(2))
+        assert message["type"] == "websocket.close"
+        assert message["code"] == 4003
+        await asyncio.wait_for(communicator.future, timeout=budget(1))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    timeout = next(
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_ping_timeout"
+    )
+    closed = _tunnel_end_events(caplog)[0]
+    health = next(
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel_health"
+    )
+    assert health["connection_id"] == "conn-blocked-send"
+    assert health["tunnel_side"] == "server"
+    for row in (timeout, closed):
+        assert row["connection_id"] == "conn-blocked-send"
+        assert row["sends_in_flight"] == 1
+        assert row["oldest_tracked_send_age_s"] > 0
+        assert row["outbound_queue_depth"] >= 1
+        assert row["app_pings_queued"] >= 1
+        assert row["last_app_ping_sent_age_s"] is None
+        assert row["last_app_pong_received_age_s"] is None
+    assert route_app.registry.get(_RUNNER_ID) is None
 
 
 async def test_keepalive_loop_fires_faster_than_the_ping_interval(
@@ -1343,3 +2309,131 @@ async def test_keepalive_loop_fires_faster_than_the_ping_interval(
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert len(calls) >= 3 and set(calls) == {"r1"}
+
+
+class _FakeSenderWebSocket:
+    """Minimal ``send_text`` stand-in for ``_sender_loop`` unit tests.
+
+    :param raises: Exception ``send_text`` raises, or ``None`` to
+        record the frame instead.
+    :param application_state: Post-raise state, mimicking Starlette's
+        synchronous state flip when a concurrent close wins the race.
+    """
+
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        application_state: object = None,
+    ) -> None:
+        from starlette.websockets import WebSocketState
+
+        self._raises = raises
+        self.application_state = (
+            application_state if application_state is not None else WebSocketState.CONNECTED
+        )
+        self.sent: list[str] = []
+
+    async def send_text(self, data: str) -> None:
+        if self._raises is not None:
+            raise self._raises
+        self.sent.append(data)
+
+
+async def test_sender_diagnostics_exclude_retirement_sentinel_from_queue_depth() -> None:
+    from omnigent.server.routes import runner_tunnel
+
+    registry = TunnelRegistry()
+    ws = _FakeSenderWebSocket()
+    session = registry.register(
+        _RUNNER_ID,
+        ws,
+        HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[]),
+    )
+    await registry.send_text(session, "first")
+    await registry.send_text(session, "second")
+    registry.deregister(_RUNNER_ID, session)
+    await runner_tunnel._sender_loop(ws, session)
+    assert ws.sent == ["first", "second"]
+    assert session.diagnostics.snapshot()["outbound_queue_depth"] == 0
+    assert session.diagnostics.snapshot()["outbound_queue_high_water"] == 2
+
+
+async def test_sender_loop_swallows_send_after_close_race() -> None:
+    """A send racing a concurrent close (socket already DISCONNECTED)
+    ends the sender loop quietly instead of raising into the route."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import runner_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.DISCONNECTED,
+    )
+    session = SimpleNamespace(
+        runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
+    await runner_tunnel._sender_loop(ws, session)  # returns without raising
+
+
+async def test_sender_loop_reraises_send_failure_while_connected() -> None:
+    """The same RuntimeError while the socket is still CONNECTED is a
+    real error and must propagate to the route's error-logging path."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import runner_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.CONNECTED,
+    )
+    session = SimpleNamespace(
+        runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
+    with pytest.raises(RuntimeError):
+        await runner_tunnel._sender_loop(ws, session)
+
+
+async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
+    """A real Starlette socket closed while a frame is still in the transport
+    reports DISCONNECTED, so the transport's send-after-close error is benign."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocket
+
+    from omnigent.server.routes import runner_tunnel
+
+    close_sent = asyncio.Event()
+    frame_in_transport = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "websocket.send":
+            frame_in_transport.set()
+            await close_sent.wait()
+            # What uvicorn raises for a frame that lost the race to a close.
+            raise RuntimeError(
+                "Unexpected ASGI message 'websocket.send', after sending "
+                "'websocket.close' or response already completed."
+            )
+        if message["type"] == "websocket.close":
+            close_sent.set()
+
+    ws = WebSocket({"type": "websocket", "path": "/", "headers": []}, receive, send)
+    await ws.accept()
+    session = SimpleNamespace(
+        runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
+    sender = asyncio.create_task(runner_tunnel._sender_loop(ws, session))
+    await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
+    await ws.close(code=4000)
+    await asyncio.wait_for(sender, timeout=5)  # returns instead of raising

@@ -48,9 +48,20 @@ _WORKSPACE_WHEEL_LIMIT_BYTES = _WORKSPACE_FILE_LIMIT_BYTES
 _WEB_UI_DIR_NAME = "web-ui"
 _WEB_UI_ARCHIVE_NAME = "web-ui.tar.gz"
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
-# Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
-# proxy instead (see run_uv_lock).
+# Public PyPI by default; UV_INDEX_URL selects a deployment-accessible mirror.
 _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
+
+# Select UV_INDEX_URL explicitly before clearing uv's environment overrides.
+# --no-config only ignores files; extra indexes can still outrank --default-index.
+_UV_INDEX_ENV_VARS = (
+    "UV_CONFIG_FILE",
+    "UV_DEFAULT_INDEX",
+    "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+    "UV_INDEX",
+    "UV_INDEX_URL",
+    "UV_NO_CONFIG",
+)
 
 # Leaving these in the env when we hand off to the CLI/SDK can
 # silently route us to the wrong workspace, or upload code under the
@@ -587,24 +598,37 @@ def build_uv_pyproject(
 def run_uv_lock(src: Path) -> None:
     """Generate ``uv.lock`` for the Databricks Apps source directory.
 
+    Use public PyPI unless ``UV_INDEX_URL`` selects another deployment index.
+    Ignore machine-level uv configuration and competing index variables so
+    they cannot replace the selected index with a machine-only mirror.
+
     :param src: App source directory containing ``pyproject.toml``,
         e.g. ``deploy/databricks/src``.
     """
-    # Honor a caller-supplied UV_INDEX_URL (e.g. a private mirror or proxy);
-    # otherwise default to public PyPI. UV_INDEX / UV_DEFAULT_INDEX are dropped
-    # so a stray value in the shell can't shadow the index we lock against.
     index_url = os.environ.get("UV_INDEX_URL") or _UV_DEFAULT_INDEX_URL
     env = os.environ.copy()
-    env.pop("UV_INDEX", None)
-    env.pop("UV_DEFAULT_INDEX", None)
-    env["UV_INDEX_URL"] = index_url
-    _log(f"uv lock --python 3.12 --index-url {index_url}")
-    subprocess.run(
-        ["uv", "lock", "--python", "3.12", "--index-url", index_url],
-        cwd=src,
-        env=env,
-        check=True,
-    )
+    for var in _UV_INDEX_ENV_VARS:
+        env.pop(var, None)
+    _log(f"uv lock --python 3.12 --no-config --default-index {_redact_url(index_url)}")
+    cmd = ["uv", "lock", "--python", "3.12", "--no-config", "--default-index", index_url]
+    try:
+        subprocess.run(cmd, cwd=src, env=env, check=True)
+    except subprocess.CalledProcessError as exc:
+        # Keep credentialed index URLs out of failure tracebacks.
+        raise subprocess.CalledProcessError(
+            exc.returncode,
+            [*cmd[:-1], _redact_url(index_url)],
+            output=exc.output,
+            stderr=exc.stderr,
+        ) from None
+
+
+def _redact_url(url: str) -> str:
+    """Strip userinfo, query, and fragment from a URL before it reaches a log."""
+    # [^/]+ (not [^/@]+) so a literal `@` inside a password redacts fully.
+    url = re.sub(r"^(\w+://)[^/]+@", r"\1***@", url)
+    # Query strings and fragments can carry tokens (e.g. ?token=...).
+    return url.split("?", 1)[0].split("#", 1)[0]
 
 
 def write_uv_dependency_files(

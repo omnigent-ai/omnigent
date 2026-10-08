@@ -33,6 +33,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Same liveness-race flake mitigation as test_hosts_filesystem: the
 # mock-WS host can be deregistered under parallel CI load, yielding a
@@ -44,26 +45,6 @@ pytestmark = [
 
 _HOST_ID = "7f6bda8f5e302e51cee65f7094f3d49e"
 _HOST_NAME = "wt-test-laptop"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope.
-
-    :param path: WebSocket path, e.g. ``"/v1/hosts/X/tunnel"``.
-    :returns: ASGI scope dict.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _hello_text(name: str = _HOST_NAME) -> str:

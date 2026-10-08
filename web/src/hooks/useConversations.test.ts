@@ -33,6 +33,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
   useTogglePinnedConversation,
+  useReorderPinnedConversations,
   fetchPinnedConversations,
   clearSessionTombstones,
   markRecentlyCreated,
@@ -41,7 +42,7 @@ import {
   type Conversation,
   type PinnedConversationsResult,
 } from "./useConversations";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 
@@ -1590,6 +1591,294 @@ describe("useTogglePinnedConversation cache patching", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
   });
+});
+
+describe("useReorderPinnedConversations failure reconcile", () => {
+  const pinnedRow = (id: string, value: string) =>
+    conversation({ id, updated_at: 150, labels: { [PINNED_LABEL_KEY]: value } });
+
+  // The sidebar prefers the list cache's copy of a row over the pinned cache's,
+  // so both must carry the reconciled value.
+  function seed() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const rows = [pinnedRow("conv_a", "1000"), pinnedRow("conv_b", "2000")];
+    queryClient.setQueryData(["conversations", "", false], infinitePage(rows));
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: rows,
+      filterHonored: true,
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useReorderPinnedConversations(), { wrapper });
+    const values = (id: string) => [
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+        ?.pages.flatMap((p) => p.data)
+        .find((c) => c.id === id)?.labels?.[PINNED_LABEL_KEY],
+      queryClient
+        .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+        ?.conversations.find((c) => c.id === id)?.labels?.[PINNED_LABEL_KEY],
+    ];
+    return { queryClient, rendered, values };
+  }
+
+  it("restores the previous value in every cache when the PATCH fails", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const { rendered, values } = seed();
+
+    act(() => rendered.result.current.mutate([{ id: "conv_b", pinnedAt: 999 }]));
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(values("conv_b")).toEqual(["2000", "2000"]);
+  });
+
+  it("removes the optimistic key when a legacy-only pin PATCH fails", async () => {
+    // conv_l is pinned only in localStorage, so it has no server-side label yet.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_a",
+          object: "conversation",
+          labels: { [PINNED_LABEL_KEY]: "1500" },
+        }),
+      );
+    const { queryClient, rendered, values } = seed();
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        pinnedRow("conv_a", "1000"),
+        pinnedRow("conv_b", "2000"),
+        conversation({ id: "conv_l", updated_at: 150 }),
+      ]),
+    );
+
+    act(() =>
+      rendered.result.current.mutate([
+        { id: "conv_l", pinnedAt: 999 },
+        { id: "conv_a", pinnedAt: 1500 },
+      ]),
+    );
+    expect(values("conv_l")).toEqual(["999", "999"]);
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(values("conv_l")).toEqual([undefined, undefined]);
+    expect(values("conv_a")).toEqual(["1500", "1500"]);
+  });
+
+  it("keeps landed writes and restores failed ones in a partly failed batch", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_a",
+          object: "conversation",
+          labels: { [PINNED_LABEL_KEY]: "3000" },
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const { rendered, values } = seed();
+
+    act(() =>
+      rendered.result.current.mutate([
+        { id: "conv_a", pinnedAt: 3000 },
+        { id: "conv_b", pinnedAt: 4000 },
+      ]),
+    );
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(values("conv_a")).toEqual(["3000", "3000"]);
+    expect(values("conv_b")).toEqual(["2000", "2000"]);
+  });
+});
+
+describe("overlapping pin writes", () => {
+  // Pin, unpin, and reorder writes don't overlap: a new one is refused while
+  // another is saving, so each rollback and reconcile sees only its own change.
+  function setup(pinValue: string | undefined) {
+    const resolvers: ((r: Response) => void)[] = [];
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const row = conversation({
+      id: "conv_c",
+      labels: pinValue === undefined ? {} : { [PINNED_LABEL_KEY]: pinValue },
+    });
+    queryClient.setQueryData(["conversations", "", false], infinitePage([row]));
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: pinValue === undefined ? [] : [row],
+      filterHonored: true,
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => ({ toggle: useTogglePinnedConversation(), reorder: useReorderPinnedConversations() }),
+      { wrapper },
+    );
+    const state = () => ({
+      list: queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+        ?.pages.flatMap((p) => p.data)
+        .find((c) => c.id === "conv_c")?.labels?.[PINNED_LABEL_KEY],
+      pinned: queryClient
+        .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+        ?.conversations.find((c) => c.id === "conv_c")?.labels?.[PINNED_LABEL_KEY],
+    });
+    const respond = async (index: number, value: string | null) => {
+      await waitFor(() => expect(resolvers.length).toBeGreaterThan(index));
+      resolvers[index](
+        value === null
+          ? mockResponse({}, { ok: false, status: 500 })
+          : mockResponse({
+              id: "conv_c",
+              object: "conversation",
+              labels: { [PINNED_LABEL_KEY]: value },
+            }),
+      );
+    };
+    return { queryClient, result, state, respond };
+  }
+
+  it("refuses a second drag while the first is saving", async () => {
+    const { queryClient, result, state, respond } = setup("3000");
+
+    act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 1500 }]));
+    act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 999 }]));
+    expect(state()).toEqual({ list: "1500", pinned: "1500" });
+
+    await respond(0, "1500");
+    await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(state()).toEqual({ list: "1500", pinned: "1500" });
+  });
+
+  it.each([
+    ["resolves", "999", "999"],
+    ["rejects", null, "3000"],
+  ] as const)(
+    "refuses an unpin while a reorder is saving, then the reorder %s",
+    async (_outcome, response, expected) => {
+      const { result, state, respond } = setup("3000");
+      const toasts: string[] = [];
+      const onToast = (e: Event) => {
+        toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+      };
+      window.addEventListener("omnigent:toast", onToast);
+
+      act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 999 }]));
+      act(() => result.current.toggle.mutate({ id: "conv_c", pinned: false }));
+      expect(state()).toEqual({ list: "999", pinned: "999" });
+
+      await respond(0, response);
+      await waitFor(() => expect(result.current.reorder.isSuccess).toBe(true));
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(state()).toEqual({ list: expected, pinned: expected });
+      // The refusal explains itself once; it isn't also reported as a failed unpin.
+      expect(toasts).toContain("Still saving your pins. Try again in a moment.");
+      expect(toasts).not.toContain("Couldn't unpin the session.");
+      window.removeEventListener("omnigent:toast", onToast);
+    },
+  );
+
+  it.each([
+    ["lands", "5000", { list: "5000", pinned: "5000" }],
+    ["fails", null, { list: undefined, pinned: undefined }],
+  ] as const)(
+    "refuses a drag while a pin is saving, then the pin %s",
+    async (_outcome, response, expected) => {
+      const { result, state, respond } = setup(undefined);
+
+      act(() => result.current.toggle.mutate({ id: "conv_c", pinned: true, pinnedAt: 5000 }));
+      act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 999 }]));
+      expect(state()).toEqual({ list: "5000", pinned: "5000" });
+
+      await respond(0, response);
+      await waitFor(() =>
+        expect(result.current.toggle.isSuccess || result.current.toggle.isError).toBe(true),
+      );
+      expect(fetchMock).toHaveBeenCalledOnce();
+      // A failed pin leaves no ghost: it's out of the pinned section and labels.
+      expect(state()).toEqual(expected);
+    },
+  );
+});
+
+describe("useTogglePinnedConversation failure rollback", () => {
+  it.each([
+    ["unpin", "3000", false, "Couldn't unpin the session."],
+    ["pin", undefined, true, "Couldn't pin the session."],
+  ] as const)(
+    "a failed %s rolls back only the pin key, keeping labels changed meanwhile",
+    async (_action, pinValue, pinned, message) => {
+      const toasts: string[] = [];
+      const onToast = (e: Event) => {
+        toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+      };
+      window.addEventListener("omnigent:toast", onToast);
+      let rejectPatch!: (r: Response) => void;
+      fetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            rejectPatch = resolve;
+          }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const labels = (project: string) => ({
+        [PROJECT_LABEL_KEY]: project,
+        ...(pinValue === undefined ? {} : { [PINNED_LABEL_KEY]: pinValue }),
+      });
+      const row = conversation({ id: "conv_x", updated_at: 150, labels: labels("A") });
+      queryClient.setQueryData(["conversations", "", false], infinitePage([row]));
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+        conversations: pinValue === undefined ? [] : [row],
+        filterHonored: true,
+      });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useTogglePinnedConversation(), { wrapper });
+      const listLabels = () =>
+        queryClient
+          .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+          ?.pages.flatMap((p) => p.data)
+          .find((c) => c.id === "conv_x")?.labels;
+
+      act(() => result.current.mutate({ id: "conv_x", pinned }));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      // A project move lands while the pin PATCH is pending.
+      queryClient.setQueryData<ConversationsInfiniteData>(["conversations", "", false], (old) =>
+        old
+          ? {
+              ...old,
+              pages: old.pages.map((page) => ({
+                ...page,
+                data: page.data.map((c) =>
+                  c.id === "conv_x"
+                    ? { ...c, labels: { ...c.labels, [PROJECT_LABEL_KEY]: "B" } }
+                    : c,
+                ),
+              })),
+            }
+          : old,
+      );
+
+      rejectPatch(mockResponse({}, { ok: false, status: 500 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+
+      // The move's label survives; only the pin key is rolled back.
+      expect(listLabels()).toEqual(labels("B"));
+      const pinnedIds =
+        queryClient
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.map((c) => c.id) ?? [];
+      expect(pinnedIds).toEqual(pinValue === undefined ? [] : ["conv_x"]);
+      // The row snapped back, so the user is told the write didn't save.
+      expect(toasts).toEqual([message]);
+      window.removeEventListener("omnigent:toast", onToast);
+    },
+  );
 });
 
 describe("useTogglePinnedConversation old-server fallback", () => {

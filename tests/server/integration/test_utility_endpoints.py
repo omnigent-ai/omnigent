@@ -87,7 +87,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert isinstance(data["managed_sandboxes_enabled"], bool)
     assert data["features"] == {
         "usage_page": False,
-        "customize": False,
+        "harness_settings_ui": True,
         "harness_install": False,
         "canvas": False,
     }
@@ -97,6 +97,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # while the feature is off so the UI never offers an install the disabled
     # route would reject.
     assert data["installable_harnesses"] == []
+    # Gates the web's archive worktree prompt; older servers omit it.
+    assert data["archive_worktree_cleanup"] is True
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
@@ -232,7 +234,7 @@ def _sources_caps(*, external: bool, local: bool, factory: bool) -> object:
             _sources_caps(external=False, local=False, factory=False),
             {"external": False, "oss": False},
         ),
-        # The workspace AI Gateway alone: no fallback for an ungatewayed harness.
+        # The workspace Unity Gateway alone: no fallback for an ungatewayed harness.
         (
             _sources_caps(external=True, local=False, factory=False),
             {"external": True, "oss": False},

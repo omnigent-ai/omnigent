@@ -6,7 +6,8 @@
 
 /** The selectable tabs in the right workspace rail, in display order.
  *  "browser" and "sidechat" are dynamic-tab modes (a browser tab / a side-chat
- *  tab is selected), not fixed nav tabs — the nav strip renders the first four. */
+ *  tab is selected), not fixed nav tabs — the nav strip renders the first four.
+ *  "github" is a stable stored id for the Pull Requests tab; renaming it drops saved choices. */
 export type RightRailTab = "files" | "changes" | "github" | "subagents" | "browser" | "sidechat";
 
 /**
