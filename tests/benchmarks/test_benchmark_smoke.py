@@ -1331,15 +1331,27 @@ class _CliStubEnv:
         return {"PATH": os.environ.get("PATH", ""), "TMPDIR": str(self._tmp)}
 
 
-def _fake_cli(tmp_path: Path, calls: Path) -> Path:
-    """A stand-in `omnigent`: logs each call, and prints a slow REPL for `polly`."""
+# What the REPL paints once ready: the toolbar, or the prompt where it's suppressed.
+_TOOLBAR_READY = " polly \\302\\267  ready \\n"
+_PROMPT_READY = "\\342\\235\\257 "
+
+
+def _fake_cli(
+    tmp_path: Path, calls: Path, *, drain: str = "exit 0", ready: str = _TOOLBAR_READY
+) -> Path:
+    """A stand-in `omnigent`: logs each call, and prints a slow REPL for `polly`.
+
+    :param drain: Shell run for a draining `host stop --all` (no `--daemon-only`).
+    :param ready: What `polly` prints once its REPL is ready.
+    """
     fake = tmp_path / "omnigent"
     fake.write_text(
         "#!/bin/sh\n"
         f'echo "$* | $OMNIGENT_DATA_DIR | $OMNIGENT_CONFIG_HOME" >> {calls}\n'
+        f'if [ "$*" = "host stop --all" ]; then {drain}; fi\n'
         'if [ "$1" = polly ]; then\n'
         "  printf 'Launching your agent\\n'; sleep 0.5\n"
-        "  printf ' polly \\302\\267  ready \\n'; sleep 30\n"
+        f"  printf '{ready}'; sleep 30\n"
         "fi\n"
     )
     fake.chmod(0o755)
@@ -1348,12 +1360,25 @@ def _fake_cli(tmp_path: Path, calls: Path) -> Path:
 
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="fake CLI is a POSIX shell script")
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drain", "falls_back"),
+    [
+        pytest.param("exit 0", False, id="drained"),
+        pytest.param("exit 1", True, id="drain-failed"),
+        pytest.param("exec sleep 5", True, id="drain-timed-out"),
+    ],
+)
 async def test_cli_startup_stops_only_its_own_daemons(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain: str, falls_back: bool
 ) -> None:
-    """cli_startup must never run `omnigent stop`, which kills any local server."""
+    """cli_startup must never run `omnigent stop`, which kills any local server.
+
+    Teardown drains the last session first; if that fails or hangs, it still
+    stops the journey's daemons.
+    """
     calls = tmp_path / "calls.txt"
-    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls)))
+    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls, drain=drain)))
+    monkeypatch.setattr(bench_journeys, "_CLI_DRAIN_TIMEOUT_S", 0.5)
     env = cast(BenchEnvironment, _CliStubEnv(tmp_path))
     journey = ALL_JOURNEYS["cli_startup"]
 
@@ -1366,6 +1391,7 @@ async def test_cli_startup_stops_only_its_own_daemons(
     assert calls.read_text().splitlines() == [
         f"host stop --all --daemon-only | {scoped}",  # prepare: daemons only, fast
         f"host stop --all | {scoped}",  # teardown: drain the last session first
+        *([f"host stop --all --daemon-only | {scoped}"] if falls_back else []),
     ]
     assert Path(cli_env["OMNIGENT_DATA_DIR"]).is_relative_to(tmp_path)
     # Pre-set theme, so the first-run picker doesn't stand in for the REPL.
@@ -1374,12 +1400,15 @@ async def test_cli_startup_stops_only_its_own_daemons(
 
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="fake CLI is a POSIX shell script")
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ready", [pytest.param(_TOOLBAR_READY, id="toolbar"), pytest.param(_PROMPT_READY, id="prompt")]
+)
 async def test_cli_startup_times_until_the_repl_is_ready(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready: str
 ) -> None:
     """The spinner line is not readiness; the timed CLI runs in the scoped dirs."""
     calls = tmp_path / "calls.txt"
-    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls)))
+    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls, ready=ready)))
     env = cast(BenchEnvironment, _CliStubEnv(tmp_path))
     journey = ALL_JOURNEYS["cli_startup"]
 

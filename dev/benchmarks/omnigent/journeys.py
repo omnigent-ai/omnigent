@@ -863,6 +863,8 @@ _CLI_STARTUP_READY_SIGNALS = [r"·\s*ready", r"❯ "]
 
 # Per-attempt timeout: daemon start + session + runner launch, ~4-7s on CI.
 _CLI_STARTUP_TIMEOUT_S = 60
+# Budget for teardown's `host stop --all` to drain the last session.
+_CLI_DRAIN_TIMEOUT_S = 60.0
 
 # Pre-set theme for the journey's fresh config home, so the first-run theme
 # picker doesn't stand in for the REPL.
@@ -891,20 +893,31 @@ async def _stop_cli_daemons(ctx: JourneyContext, *, drain_sessions: bool) -> Non
     """Run ``omnigent host stop --all`` within the journey's own data dir.
 
     :param drain_sessions: Stop each daemon's sessions first, so their runners
-        close their REPL terminals themselves before the daemon goes.
+        close their REPL terminals themselves before the daemon goes. If that
+        fails or times out, the daemons are still stopped without draining.
     """
     omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
     if omnigent_bin is None:
         return
     args = [omnigent_bin, "host", "stop", "--all"]
-    if not drain_sessions:
-        args.append("--daemon-only")
+    if drain_sessions:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            drained = await asyncio.to_thread(
+                subprocess.run,
+                args,
+                env=_cli_env(ctx),
+                capture_output=True,
+                timeout=_CLI_DRAIN_TIMEOUT_S,
+                check=False,
+            )
+            if drained.returncode == 0:
+                return
     await asyncio.to_thread(
         subprocess.run,
-        args,
+        [*args, "--daemon-only"],
         env=_cli_env(ctx),
         capture_output=True,
-        timeout=60 if drain_sessions else 15,
+        timeout=15,
         check=False,
     )
 
