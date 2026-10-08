@@ -8,7 +8,7 @@ import {
   readCustomTheme,
   writeCustomTheme,
 } from "./customTheme";
-import { PALETTES } from "./themePalette";
+import { PALETTE_TOKEN_CSS_NAMES, PALETTES } from "./themePalette";
 import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
@@ -345,6 +345,20 @@ describe("customTheme", () => {
     expect(style.getPropertyValue("--custom-dark-sidebar")).not.toContain("var(");
     // Concrete values pass through untouched.
     expect(style.getPropertyValue("--custom-dark-background")).toBe("#282a36");
+  });
+
+  it.each(PALETTES)("leaves no raw palette-token reference in applied $label values", (palette) => {
+    applyCustomTheme(createCustomThemeFromPalette(palette));
+
+    const style = document.documentElement.style;
+    const rawReference = new RegExp(
+      `var\\(\\s*--(${Object.values(PALETTE_TOKEN_CSS_NAMES).join("|")})\\b`,
+    );
+    const applied = Array.from(style).filter((property) => property.startsWith("--custom-"));
+    expect(applied.length).toBeGreaterThan(0);
+    for (const property of applied) {
+      expect(style.getPropertyValue(property)).not.toMatch(rawReference);
+    }
   });
 
   it("pins Omnigent's shell-background reference and keeps its concrete gradient", () => {

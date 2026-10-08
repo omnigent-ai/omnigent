@@ -17,6 +17,8 @@ route interception. The standalone SPA, whose style root and dark root are both
 
 from __future__ import annotations
 
+import math
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -104,6 +106,36 @@ export default {
 # sidebar is near-white (~0.88). Anything above this reads as a light panel.
 _DARK_LUMINANCE_MAX = 0.35
 
+# Dracula's dark sidebar is rgba(..., 0.8) and translucency lowers it to 0.72. A
+# transparent fallback (alpha 0) is dark by luminance, so alpha is checked too.
+_OPAQUE_ALPHA = 0.8
+_TRANSLUCENT_ALPHA = 0.72
+
+# Written after a complete build so sibling xdist workers of the same run reuse
+# it instead of wiping ``dist-embed/`` while another worker is still serving it.
+_BUILD_STAMP = _HOST_DIR / ".built-by-run"
+
+
+def _build_embed_host() -> None:
+    if not _VITE.is_file():
+        raise RuntimeError(f"{_VITE} is missing; run `pnpm install --filter web` first")
+    subprocess.run(
+        [str(_VITE), "build", "--config", "vite.embed.config.ts"],
+        cwd=_WEB_DIR,
+        check=True,
+        stdin=subprocess.DEVNULL,
+    )
+    _HOST_DIR.mkdir(parents=True, exist_ok=True)
+    (_HOST_DIR / "index.html").write_text(_HOST_INDEX_HTML)
+    (_HOST_DIR / "entry.js").write_text(_HOST_ENTRY_JS)
+    (_HOST_DIR / "vite.config.mjs").write_text(_HOST_VITE_CONFIG)
+    subprocess.run(
+        [str(_VITE), "build", "--config", str(_HOST_DIR / "vite.config.mjs"), str(_HOST_DIR)],
+        cwd=_WEB_DIR,
+        check=True,
+        stdin=subprocess.DEVNULL,
+    )
+
 
 @pytest.fixture(scope="session")
 def embed_host_dist(request: pytest.FixtureRequest) -> Path:
@@ -114,25 +146,12 @@ def embed_host_dist(request: pytest.FixtureRequest) -> Path:
     """
     if request.config.getoption("--ui-skip-build") and (_HOST_DIST / "index.html").is_file():
         return _HOST_DIST
+    run_id = os.environ.get("PYTEST_XDIST_TESTRUNUID", "")
     with filelock.FileLock(str(_WEB_DIR / ".build-embed.lock"), timeout=900):
-        if not _VITE.is_file():
-            raise RuntimeError(f"{_VITE} is missing; run `pnpm install --filter web` first")
-        subprocess.run(
-            [str(_VITE), "build", "--config", "vite.embed.config.ts"],
-            cwd=_WEB_DIR,
-            check=True,
-            stdin=subprocess.DEVNULL,
-        )
-        _HOST_DIR.mkdir(parents=True, exist_ok=True)
-        (_HOST_DIR / "index.html").write_text(_HOST_INDEX_HTML)
-        (_HOST_DIR / "entry.js").write_text(_HOST_ENTRY_JS)
-        (_HOST_DIR / "vite.config.mjs").write_text(_HOST_VITE_CONFIG)
-        subprocess.run(
-            [str(_VITE), "build", "--config", str(_HOST_DIR / "vite.config.mjs"), str(_HOST_DIR)],
-            cwd=_WEB_DIR,
-            check=True,
-            stdin=subprocess.DEVNULL,
-        )
+        if not (run_id and _BUILD_STAMP.is_file() and _BUILD_STAMP.read_text() == run_id):
+            _build_embed_host()
+            if run_id:
+                _BUILD_STAMP.write_text(run_id)
     assert (_HOST_DIST / "index.html").is_file(), "host page build produced no index.html"
     return _HOST_DIST
 
@@ -187,6 +206,10 @@ def luminance(value: str) -> float:
 
     red, green, blue, _alpha = parse_css_color(value)
     return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+
+
+def alpha(value: str) -> float:
+    return parse_css_color(value)[3]
 
 
 def background_color(element: Locator) -> str:
@@ -249,6 +272,17 @@ def assert_sidebar_stays_dark(backgrounds: dict[str, str], pane_background: str)
             f"with Translucent sidebars off ({state}) the custom sidebar uses the light "
             f"palette in dark mode: {value} (luminance {luminance(value):.3f}) while the "
             f"translucent state is dark ({translucent}) and the pane is {pane_background}"
+        )
+    expected_alpha = {
+        "opaque": _OPAQUE_ALPHA,
+        "translucent": _TRANSLUCENT_ALPHA,
+        "opaque_again": _OPAQUE_ALPHA,
+    }
+    for state, expected in expected_alpha.items():
+        value = backgrounds[state]
+        assert math.isclose(alpha(value), expected, abs_tol=0.01), (
+            f"{state} custom sidebar is {value}, expected alpha {expected}: a transparent or "
+            f"unresolved background is not the dark palette"
         )
 
 
