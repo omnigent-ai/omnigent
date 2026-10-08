@@ -872,17 +872,9 @@ def live_server(
 
 
 def restart_live_runner_process(live_server: str, live_runner_id: str) -> None:
-    """
-    Kill and replace the live runner subprocess, then wait for it to reconnect.
-
-    The replacement uses the same runner id, tunnel binding, and server, and the
-    environment currently recorded in ``_live_runner_state["env"]``, so a test
-    can adjust that environment before calling this.
-
-    :param live_server: Base URL of the live server kept across the restart.
-    :param live_runner_id: Stable runner identity reused by the replacement.
-    :returns: None. Returns once the replacement tunnel is online.
-    """
+    """Kill and replace the live runner subprocess, then wait for it to reconnect.
+    The replacement reuses ``_live_runner_state["env"]``, so a test can adjust that
+    environment before calling this."""
     old_proc = cast(subprocess.Popen[bytes], _live_runner_state["process"])
     old_proc.kill()
     old_proc.wait(timeout=10)

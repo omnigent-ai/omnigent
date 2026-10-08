@@ -1612,13 +1612,9 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
 
 @pytest.mark.asyncio
 async def test_rekey_codex_native_session_moves_entries_and_evicts_under_new_key() -> None:
-    """
-    A native ``/clear`` rotation moves both registry entries onto the new session id.
-
-    The forwarder task and app-server stay the same objects, so the moved
-    forwarder's exit must still evict its entry even though it was registered
-    under the pre-rotation id.
-    """
+    """A native ``/clear`` rotation moves both registry entries onto the new session id,
+    and the moved forwarder's exit still evicts its entry even though it was registered
+    under the pre-rotation id."""
     old_id = "aaaa1111aaaa1111aaaa1111aaaa1111"
     new_id = "bbbb2222bbbb2222bbbb2222bbbb2222"
     run = _ForwarderRun()
@@ -1665,12 +1661,8 @@ async def test_rekey_codex_native_session_moves_entries_and_evicts_under_new_key
 
 @pytest.mark.asyncio
 async def test_teardown_after_rekey_closes_codex_app_server_under_new_session_id() -> None:
-    """
-    After rotation, teardown reaches the app-server through the new session id only.
-
-    ``DELETE /v1/sessions`` and the idle reaper key teardown by the session that
-    now owns the terminal; the retired id must no longer stop the live server.
-    """
+    """After rotation, teardown reaches the app-server through the new session id only;
+    the retired id must no longer stop the live server."""
     old_id = "cccc3333cccc3333cccc3333cccc3333"
     new_id = "dddd4444dddd4444dddd4444dddd4444"
     run = _ForwarderRun()

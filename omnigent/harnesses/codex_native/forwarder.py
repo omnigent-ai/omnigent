@@ -2071,18 +2071,9 @@ async def _unsubscribe_retired_thread(
     *,
     thread_id: str,
 ) -> None:
-    """
-    Drop this connection's subscription to a thread retired by a native ``/clear``.
-
-    Codex keeps a thread and its stdio MCP servers loaded while any connection
-    stays subscribed, so the forwarder's own ``thread/resume`` would otherwise
-    pin the retired thread for the app-server's lifetime. Best effort: failures
-    are logged, not raised.
-
-    :param client: The forwarder's long-lived app-server client.
-    :param thread_id: Retired Codex thread id, e.g. ``"thread_old"``.
-    :returns: None.
-    """
+    """Drop this connection's subscription to a thread retired by a native ``/clear``.
+    Codex keeps a thread's stdio MCP servers loaded while any connection stays
+    subscribed, so the forwarder's own ``thread/resume`` would pin them (best effort)."""
     try:
         await asyncio.wait_for(
             client.request("thread/unsubscribe", {"threadId": thread_id}),
@@ -2133,11 +2124,9 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
-    :param on_session_rotated: Optional callback invoked as
-        ``on_session_rotated(old_session_id, new_session_id)`` after a native
-        ``/clear`` rotates Omnigent ownership onto a fresh session. The runner
-        uses it to move its app-server/forwarder teardown bookkeeping onto the
-        session that now owns the terminal.
+    :param on_session_rotated: Optional ``(old_session_id, new_session_id)`` callback
+        fired after a native ``/clear`` rotates ownership onto a fresh session, so the
+        runner can move its app-server/forwarder bookkeeping onto that session.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """

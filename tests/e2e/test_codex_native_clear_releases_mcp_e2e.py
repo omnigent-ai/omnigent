@@ -88,11 +88,8 @@ def stub_mcp_log(
     live_server: str, live_runner_id: str, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[Path]:
     """Run the live runner with a ``CODEX_HOME`` that launches the stub MCP servers.
-
-    The runner copies the host ``CODEX_HOME`` config into each session, so it is
-    restarted with the stub config and restarted again with its previous
-    environment afterwards, keeping the override out of other e2e modules.
-    """
+    The runner copies the host ``CODEX_HOME`` config into each session, so it is restarted
+    with the stub config and restored afterwards to keep the override out of other modules."""
     codex_home = tmp_path_factory.mktemp("codex-home")
     log = _write_stub_mcp_config(codex_home)
     runner_env = e2e_conftest._live_runner_state["env"]

@@ -344,17 +344,9 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
 
 
 def _rekey_codex_native_session(old_session_id: str, new_session_id: str) -> None:
-    """
-    Move a codex-native session's registry entries onto its ``/clear`` replacement.
-
-    The replacement session owns the terminal while the same app-server and
-    forwarder run on; teardown keyed by that session (``DELETE /v1/sessions``,
-    the idle pane reaper, required-terminal exit) must find them.
-
-    :param old_session_id: Session rotated away from, e.g. ``"conv_old"``.
-    :param new_session_id: Replacement session, e.g. ``"conv_new"``.
-    :returns: None.
-    """
+    """Move a codex-native session's registry entries onto its ``/clear`` replacement.
+    The replacement owns the terminal while the same app-server and forwarder run on,
+    so teardown keyed by that session (DELETE, idle reaper, terminal exit) must find them."""
     if old_session_id == new_session_id:
         return
     app_server = _AUTO_CODEX_APP_SERVERS.pop(old_session_id, None)
