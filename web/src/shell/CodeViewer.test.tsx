@@ -128,6 +128,15 @@ function renderViewer(
   );
 }
 
+describe("video previews", () => {
+  it("opens a recording player rather than a source editor or binary notice", () => {
+    renderViewer("", true, "demo.webm");
+    expect(screen.getByRole("button", { name: "Play video: demo.webm" })).toBeVisible();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+  });
+});
+
 /**
  * Dispatches a `copy` event to `document` with a mock clipboardData.
  * Returns the `setData` spy so the caller can assert on what was written.

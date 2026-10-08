@@ -81,6 +81,8 @@ import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
+import { VideoPlayer } from "@/components/VideoPlayer";
+import { isVideoFile } from "@/lib/video";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
 // actually viewed, so the initial bundle and markdown/preview paths don't pay
@@ -774,6 +776,17 @@ export function CodeViewer({
     };
   }, [content]);
 
+  if (isVideoFile(path, fileQuery.data?.content_type)) {
+    return (
+      <div className="flex h-full items-center justify-center overflow-auto p-4">
+        <VideoPlayer
+          conversationId={conversationId}
+          path={path}
+          title={path.split("/").pop() ?? path}
+        />
+      </div>
+    );
+  }
   if (fileQuery.isLoading) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">

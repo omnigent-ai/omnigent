@@ -59,6 +59,22 @@ function workspaceFileUrl(
   );
 }
 
+/** Read complete media bytes through the host's authenticated transport, with cancellation. */
+export async function fetchWorkspaceFileBlob(
+  conversationId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const res = await authenticatedFetch(
+    workspaceFileUrl(conversationId, path, { download: "true" }),
+    {
+      signal,
+    },
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.blob();
+}
+
 export async function fetchFileContent(
   conversationId: string,
   path: string,

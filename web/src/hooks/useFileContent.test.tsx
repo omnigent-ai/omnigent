@@ -28,6 +28,7 @@ import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
+  fetchWorkspaceFileBlob,
   fileContentToBlob,
   triggerBrowserDownload,
   useFileContent,
@@ -242,6 +243,17 @@ const DOWNLOAD_URL =
   "/v1/sessions/sess_123/resources/environments/default/filesystem/src/main.py?download=true";
 
 describe("downloadWorkspaceFile", () => {
+  it("fetches complete video bytes with cancellation and encoded host paths", async () => {
+    const file = new Blob(["complete recording"], { type: "video/webm" });
+    fetchMock.mockResolvedValueOnce(blobResponse(file));
+    const signal = new AbortController().signal;
+    expect(await fetchWorkspaceFileBlob("sess_123", "/Users/me/demo clip.webm", signal)).toBe(file);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_123/resources/environments/default/filesystem/Users/me/demo%20clip.webm?download=true&base=host",
+      expect.objectContaining({ signal, cache: "no-store" }),
+    );
+  });
+
   it("clicks a link to the raw download URL so the browser streams it to disk", async () => {
     // A same-origin navigation shows in the browser's download UI at once and
     // never buffers the file in the page, unlike a fetch-then-Blob.
