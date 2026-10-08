@@ -1085,6 +1085,19 @@ def test_combined_operations_keep_prs_without_misattributing_creation(
     assert was_created is created
 
 
+def test_gitlab_identity_jq_compound_output_remains_unattributed() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {
+            "command": "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .web_url; gh pr create"
+        },
+        "https://gitlab.com/example/one/-/merge_requests/7\n" + A,
+    )
+    assert refs == []
+    assert created
+
+
 @pytest.mark.parametrize(
     "content_command,target,created",
     [
