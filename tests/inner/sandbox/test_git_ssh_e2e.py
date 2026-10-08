@@ -68,11 +68,13 @@ def test_git_ssh_clone_inside_sandboxed_terminal(
     workspace = tmp_path / "terminal-workspace"
     workspace.mkdir()
     marker = workspace / "result"
+    detail = workspace / "git-output"
     command = (
-        f"test ! -r {shlex.quote(binding.identity_file)} && "
+        f"( set -x; test ! -r {shlex.quote(binding.identity_file)} && "
         f"git clone --branch main {shlex.quote(url)} cloned && "
         f"! git ls-remote {shlex.quote(url.replace('repo.git', 'other.git'))} >/dev/null 2>&1 && "
         f"! git -C cloned push {shlex.quote(url)} HEAD:denied >/dev/null 2>&1 "
+        f") > {shlex.quote(str(detail))} 2>&1 "
         f"&& printf success > {shlex.quote(str(marker))} "
         f"|| printf failure > {shlex.quote(str(marker))}"
     )
@@ -92,7 +94,9 @@ def test_git_ssh_clone_inside_sandboxed_terminal(
         while not marker.exists() and time.monotonic() < deadline:
             time.sleep(0.1)
         assert marker.exists(), run_async(instance.read()).get("screen")
-        assert marker.read_text() == "success", run_async(instance.read()).get("screen")
+        assert marker.read_text() == "success", (
+            detail.read_text() if detail.exists() else run_async(instance.read()).get("screen")
+        )
         assert (workspace / "cloned" / "README.md").read_text() == "Git SSH fixture\n"
     finally:
         run_async(instance.close())
