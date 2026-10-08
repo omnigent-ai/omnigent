@@ -1557,6 +1557,7 @@ def _resolve_session_provider_entry(
         providers = load_providers(effective_config_with_detected(load_config()))
         return providers.get(auth.name)
     except Exception:  # noqa: BLE001 — broken spec must never break cost accounting
+        _logger.debug("named-provider lookup failed for pricing", exc_info=True)
         return None
 
 
