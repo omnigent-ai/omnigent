@@ -2839,6 +2839,8 @@ def _patch_auth_preflight(
     monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(probe_status))
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
+    # No cached workspace grant: keep the Databricks SDK/CLI credential chain offline.
+    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace_host: None)
     login_calls: list[str] = []
 
     def _capture_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
@@ -2872,16 +2874,18 @@ def test_ensure_backend_databricks_preflight_runs_login_on_tty(
 def test_ensure_backend_databricks_preflight_hints_headless(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Headless invocations get the exact login command, not a browser."""
+    """Headless invocations get the exact login command, not a browser or a daemon."""
     login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=False)
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: False)
+    daemon_calls: list[str | None] = []
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: daemon_calls.append(server))
 
     with pytest.raises(click.ClickException) as exc:
         _ensure_backend("https://myapp-1234.aws.databricksapps.com")
 
     assert "omnigent login https://myapp-1234.aws.databricksapps.com" in str(exc.value)
-    # No browser flow attempted off-TTY.
+    # No browser flow attempted off-TTY, and the failed sign-in spawns no daemon.
     assert login_calls == []
+    assert daemon_calls == []
 
 
 def test_ensure_backend_databricks_preflight_skips_when_authenticated(
@@ -2920,25 +2924,6 @@ def test_ensure_backend_remote_authenticates_before_daemon_on_calling_thread(
     _ensure_backend("https://myapp-1234.aws.databricksapps.com")
 
     assert events == ["auth main_thread=True", "daemon after_auth=True"]
-
-
-def test_ensure_backend_remote_auth_failure_never_starts_daemon(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A launch that fails sign-in must not leave a host daemon behind."""
-    daemon_calls: list[str | None] = []
-
-    def _auth(server: str, *, non_interactive: bool = False) -> None:
-        raise click.ClickException("Not signed in")
-
-    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
-    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", _auth)
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: daemon_calls.append(server))
-
-    with pytest.raises(click.ClickException):
-        _ensure_backend("https://myapp-1234.aws.databricksapps.com")
-
-    assert daemon_calls == []
 
 
 def test_databricks_preflight_silent_sdk_refresh_skips_login(
