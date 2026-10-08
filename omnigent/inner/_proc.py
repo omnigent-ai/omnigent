@@ -409,6 +409,14 @@ def kill_tree(process: _ProcessLike | None) -> None:
             process.kill()
 
 
+def _kill_surviving_leader(process: subprocess.Popen[Any]) -> None:
+    # If the leader outlived group teardown (a denied killpg, or a kill still
+    # pending), end it directly so Popen.__exit__'s unbounded wait() can't hang.
+    if process.poll() is None:
+        with suppress(Exception):
+            process.kill()
+
+
 def run_isolated(
     args: Sequence[str],
     *,
@@ -456,11 +464,13 @@ def run_isolated(
             with suppress(Exception):
                 reaped: tuple[Any, Any] = process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
                 exc.stdout, exc.stderr = reaped
+            _kill_surviving_leader(process)
             raise
         except BaseException:
             kill_tree(process)
             with suppress(Exception):
                 process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
+            _kill_surviving_leader(process)
             raise
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
