@@ -38,8 +38,9 @@ function computeLinks(term: Terminal, lineIndex: number, activate: TerminalLinkA
     const uri = match[0];
     if (!isUrl(uri)) continue;
     const [startY, startX] = bufferPosition(term, startLineIndex, 0, match.index);
+    if (startY === -1 || startX === -1) continue;
     const [endY, endX] = bufferPosition(term, startY, startX, uri.length);
-    if (startY === -1 || startX === -1 || endY === -1 || endX === -1) continue;
+    if (endY === -1 || endX === -1) continue;
     // Ranges are 1-based with an inclusive end, so only endX keeps its
     // 0-based exclusive value.
     links.push({

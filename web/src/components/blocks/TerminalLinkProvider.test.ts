@@ -116,6 +116,17 @@ describe("TerminalLinkProvider", () => {
     expect(link.range).toEqual({ start: { x: 1, y: 1 }, end: { x: 0, y: 2 } });
   });
 
+  it("joins a lone full-width token to the non-blank row below it", async () => {
+    // Accepted ambiguity: the buffer cannot tell this from a longer URL that a
+    // program broke at the pane width, so the next row's first word is joined.
+    const exact = `https://ab.example.io/${"x".repeat(COLS - 22)}`;
+    const term = await terminalShowing(`${exact}\r\nnext paragraph\r\n`);
+
+    const [link] = linksOnRow(term, 1);
+    expect(link.text).toBe(`${exact}next`);
+    expect(link.range).toEqual({ start: { x: 1, y: 1 }, end: { x: 4, y: 2 } });
+  });
+
   it("maps a URL that wraps early in front of a wide character", async () => {
     // 21 narrow cells, then ten 2-cell characters: the tenth does not fit in
     // the last cell, so xterm leaves it empty and wraps the character.

@@ -101,10 +101,9 @@ describe("openTerminalLink", () => {
 
     openTerminalLink(event, "https://example.com/foo");
 
-    // Without preventDefault the click's default navigation would unload
-    // the SPA (and kill the WebSocket-attached terminal) before
-    // window.open's tab is usable. A failure here means that suppression
-    // was dropped.
+    // Without preventDefault the click's default navigation would unload the
+    // SPA (and kill the WebSocket-attached terminal) before window.open's
+    // tab is usable.
     expect(preventSpy).toHaveBeenCalledOnce();
   });
 

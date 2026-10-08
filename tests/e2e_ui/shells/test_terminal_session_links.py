@@ -61,36 +61,36 @@ def _print_url_folded_at_pane_width(page: Page, url: str) -> None:
     _run_at_terminal_origin(page, f"printf '%s\\n' '{url}' | fold -w \"$(tput cols)\"")
 
 
-def _first_terminal_row_point(page: Page) -> tuple[float, float]:
-    """Return a point near the start of row 1 in the active xterm screen."""
+def _terminal_row_point(page: Page, row: int = 1, rows: int = 1) -> tuple[float, float]:
+    """Return a point near the start of 1-based *row* in the active xterm screen of *rows* rows."""
     terminal_view = page.get_by_test_id("terminal-view").last
     screen = terminal_view.locator(".xterm-screen").first
     expect(screen).to_be_visible(timeout=20_000)
     box = screen.bounding_box()
     assert box is not None, "xterm screen should have a clickable bounding box"
-    return box["x"] + 16, box["y"] + 10
+    return box["x"] + 16, box["y"] + (row - 1) * box["height"] / rows + 10
 
 
 def _click_first_terminal_row(page: Page) -> None:
     """Click near the start of row 1 in the active xterm screen."""
-    page.mouse.click(*_first_terminal_row_point(page))
+    page.mouse.click(*_terminal_row_point(page))
 
 
-def _record_pane_cols(page: Page) -> list[list[int]]:
-    """Collect the resize column counts sent on each attach socket, newest socket last."""
-    panes: list[list[int]] = []
+def _record_pane_sizes(page: Page) -> list[list[tuple[int, int]]]:
+    """Collect the (cols, rows) of each resize sent on each attach socket, newest socket last."""
+    panes: list[list[tuple[int, int]]] = []
 
     def _on_ws(ws: object) -> None:
         if "/attach" not in ws.url:  # type: ignore[attr-defined]
             return
-        cols: list[int] = []
-        panes.append(cols)
+        sizes: list[tuple[int, int]] = []
+        panes.append(sizes)
 
         def _on_frame(payload: str | bytes) -> None:
             if isinstance(payload, str) and payload.startswith("{"):
                 message = json.loads(payload)
                 if message.get("type") == "resize":
-                    cols.append(int(message["cols"]))
+                    sizes.append((int(message["cols"]), int(message["rows"])))
 
         ws.on("framesent", _on_frame)  # type: ignore[attr-defined]
 
@@ -143,7 +143,7 @@ def test_same_origin_terminal_session_link_navigates_in_app(
 def test_program_broken_two_row_terminal_url_opens_full_destination(
     request: pytest.FixtureRequest, terminal_session: tuple[str, str]
 ) -> None:
-    """Clicking the first row of a URL the program broke at the pane width opens the whole URL.
+    """Clicking either row of a URL the program broke at the pane width opens the whole URL.
 
     A width-aware CLI ends the first row with its own line break, so the pane
     holds two hard rows that look exactly like a terminal soft wrap.
@@ -151,28 +151,31 @@ def test_program_broken_two_row_terminal_url_opens_full_destination(
     base_url, session_id = terminal_session
     page: Page = request.getfixturevalue("page")
     page.context.route(f"https://{_WRAPPED_URL_HOST}/**", _echo_destination)
-    panes = _record_pane_cols(page)
+    panes = _record_pane_sizes(page)
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_new_shell(page)
     _print_url_folded_at_pane_width(page, _WRAPPED_URL)
     # The shell opened last, so its attach socket is the newest one.
-    pane_cols = panes[-1] if panes else []
-    assert pane_cols and pane_cols[-1] < len(_WRAPPED_URL), (
-        f"the URL must be longer than the pane to wrap: pane cols {pane_cols}"
+    pane_cols, pane_rows = panes[-1][-1] if panes and panes[-1] else (0, 0)
+    assert pane_cols and pane_cols < len(_WRAPPED_URL), (
+        f"the URL must be longer than the pane to wrap: pane size {pane_cols}x{pane_rows}"
     )
 
-    # Hover first so the detected link's underline is visible before the click.
-    point = _first_terminal_row_point(page)
-    page.mouse.move(*point)
-    page.wait_for_timeout(1_000)
-    with page.expect_popup(timeout=5_000) as popup_info:
-        page.mouse.click(*point)
-    popup = popup_info.value
-    popup.wait_for_load_state()
-    page.wait_for_timeout(1_000)
+    for row in (1, 2):
+        # Hover first so the detected link's underline is visible before the click.
+        point = _terminal_row_point(page, row, pane_rows)
+        page.mouse.move(*point)
+        page.wait_for_timeout(1_000)
+        with page.expect_popup(timeout=5_000) as popup_info:
+            page.mouse.click(*point)
+        popup = popup_info.value
+        expect(
+            popup.get_by_role("heading", name="Destination opened from the terminal")
+        ).to_be_visible()
+        popup.wait_for_timeout(1_000)
 
-    assert popup.url == _WRAPPED_URL, (
-        f"clicking the first row of the two-row URL opened {popup.url!r} "
-        f"instead of the complete URL {_WRAPPED_URL!r} (pane is {pane_cols[-1]} columns wide)"
-    )
+        assert popup.url == _WRAPPED_URL, (
+            f"clicking row {row} of the two-row URL opened {popup.url!r} "
+            f"instead of the complete URL {_WRAPPED_URL!r} (pane is {pane_cols} columns wide)"
+        )
