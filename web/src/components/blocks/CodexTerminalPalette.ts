@@ -1,25 +1,27 @@
 import type { ITheme } from "@xterm/xterm";
+import { mix } from "@/lib/customTheme";
+import type { TerminalColors } from "@/lib/terminalPalettes";
 
 export const CODEX_INPUT_BACKGROUND_INDEX = 255;
+// Each shade blends the canvas toward the text color, so the bands keep their
+// step above the canvas under every palette. The weights reproduce the
+// original shades on the default palette.
 const BACKGROUND_TONES = {
   subtle: {
     index: 253,
-    light: "#fafafa",
-    dark: "#1f2123",
+    weight: { light: 0.022, dark: 0.057 },
     rgb: ["14;14;14", "31;33;35"],
     indexed: [233, 234],
   },
   input: {
     index: CODEX_INPUT_BACKGROUND_INDEX,
-    light: "#f4f4f4",
-    dark: "#2f3132",
+    weight: { light: 0.048, dark: 0.133 },
     rgb: ["30;30;30", "47;49;50", "244;244;244"],
     indexed: [8, 236, 255],
   },
   emphasis: {
     index: 254,
-    light: "#e0e0e0",
-    dark: "#464849",
+    weight: { light: 0.134, dark: 0.244 },
     rgb: ["224;224;224"],
     indexed: [254],
   },
@@ -62,10 +64,14 @@ const MAX_CONTROL_SEQUENCE_LENGTH = 128;
 const MAX_XTERM_PARAMETER = 0x7fffffff;
 const encoder = new TextEncoder();
 
-export function codexTerminalTheme(theme: ITheme, isDark: boolean): ITheme {
+export function codexTerminalTheme(theme: TerminalColors, isDark: boolean): ITheme {
   const extendedAnsi = new Array<string>(EXTENDED_ANSI_COLOR_COUNT);
   for (const tone of Object.values(BACKGROUND_TONES)) {
-    extendedAnsi[tone.index - STANDARD_ANSI_COLOR_COUNT] = isDark ? tone.dark : tone.light;
+    extendedAnsi[tone.index - STANDARD_ANSI_COLOR_COUNT] = mix(
+      theme.background,
+      theme.foreground,
+      isDark ? tone.weight.dark : tone.weight.light,
+    );
   }
   return { ...theme, extendedAnsi };
 }

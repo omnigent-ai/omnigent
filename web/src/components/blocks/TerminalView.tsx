@@ -9,7 +9,7 @@
 // guard against a missing `ref.current`.
 
 import { Loader2Icon } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -26,6 +26,9 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import { readCustomTheme, subscribeCustomTheme } from "@/lib/customTheme";
+import { resolveTerminalPalette } from "@/lib/terminalPalettes";
+import { readThemePalette, subscribeThemePalette } from "@/lib/themePalette";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import {
@@ -267,12 +270,24 @@ export function TerminalView({
   );
   useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
   const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
-  const terminalBackground = terminalTheme(isDark).background;
-  // Stable ref so the theme-update effect can reach the live session
-  // without adding isDark to the attachSession deps (which would
+  // The terminal's colors follow the app's color theme; the mode setting above
+  // only picks that theme's light or dark variant.
+  const [themeSelection, setThemeSelection] = useState(() => readThemePalette());
+  useEffect(() => subscribeThemePalette(setThemeSelection), []);
+  const [customTheme, setCustomTheme] = useState(() => readCustomTheme());
+  useEffect(() => subscribeCustomTheme(setCustomTheme), []);
+  const terminalPalette = useMemo(
+    () => resolveTerminalPalette(themeSelection, customTheme),
+    [themeSelection, customTheme],
+  );
+  const terminalBackground = terminalTheme(isDark, terminalPalette).background;
+  // Stable refs so the theme-update effect can reach the live session
+  // without adding the theme to the attachSession deps (which would
   // reconnect the WebSocket on every theme change).
   const isDarkRef = useRef(isDark);
   isDarkRef.current = isDark;
+  const terminalPaletteRef = useRef(terminalPalette);
+  terminalPaletteRef.current = terminalPalette;
   const sessionRef = useRef<TerminalSession | null>(null);
   // Stable refs so callback prop changes never recreate the WS session.
   const onStateChangeRef = useRef(onStateChange);
@@ -571,6 +586,7 @@ export function TerminalView({
           focusOnConnectRef.current,
           terminalId === "terminal_codex_main",
           notifyFileLink,
+          terminalPaletteRef.current,
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -610,8 +626,8 @@ export function TerminalView({
 
   // Push theme changes into the live session without remounting.
   useEffect(() => {
-    sessionRef.current?.setTheme(isDark);
-  }, [isDark]);
+    sessionRef.current?.setTheme(isDark, terminalPalette);
+  }, [isDark, terminalPalette]);
 
   useEffect(() => {
     sessionRef.current?.setClipboardEnabled(!readOnly && active);

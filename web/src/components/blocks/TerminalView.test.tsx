@@ -19,6 +19,9 @@ import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
+import { applyCustomTheme, createCustomThemeFromPalette } from "@/lib/customTheme";
+import { TERMINAL_PALETTES, type TerminalPalette } from "@/lib/terminalPalettes";
+import { applyThemePalette, PALETTES } from "@/lib/themePalette";
 import type { ConnectionState } from "./TerminalSession";
 import {
   TerminalView,
@@ -64,6 +67,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     adaptCodexPalette: boolean;
     onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void;
     onFileLink?: (uri: string) => boolean;
+    terminalPalette?: TerminalPalette;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
@@ -94,6 +98,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _focusOnConnect = true,
       adaptCodexPalette = false,
       onFileLink?: (uri: string) => boolean,
+      terminalPalette?: TerminalPalette,
     ) {
       terminalSessionMock.instances.push({
         url,
@@ -102,6 +107,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         adaptCodexPalette,
         onClipboardRequest,
         onFileLink,
+        terminalPalette,
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
@@ -215,6 +221,48 @@ describe("control-mode terminal", () => {
       terminalSessionMock.instances[0].onFileLink?.("file:///home/u/ws/src/app.ts#L42-L50"),
     ).toBe(true);
     expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42 });
+  });
+});
+
+describe("terminal color theme", () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute("data-theme");
+  });
+
+  it("opens with the stored color theme's palette", async () => {
+    localStorage.setItem("omnigent:ui-theme-palette", JSON.stringify("nord"));
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(terminalSessionMock.instances[0].terminalPalette).toBe(TERMINAL_PALETTES.nord);
+  });
+
+  it("re-themes the live terminal when the color theme changes", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const session = terminalSessionMock.instances[0];
+
+    act(() => applyThemePalette("gruvbox"));
+
+    expect(session.setTheme).toHaveBeenLastCalledWith(false, TERMINAL_PALETTES.gruvbox);
+    expect(session.container.parentElement?.style.backgroundColor).toBe("rgb(251, 241, 199)");
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(session.dispose).not.toHaveBeenCalled();
+  });
+
+  it("re-themes the live terminal when the custom theme changes", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const session = terminalSessionMock.instances[0];
+    const custom = { ...createCustomThemeFromPalette(PALETTES[0]), tint: "#e0f0ff" };
+
+    act(() => {
+      applyCustomTheme(custom);
+      applyThemePalette("custom");
+    });
+
+    const [, palette] = session.setTheme.mock.lastCall as [boolean, TerminalPalette];
+    expect(palette.light.background).not.toBe(TERMINAL_PALETTES.omni.light.background);
+    expect(palette.light.red).toBe(TERMINAL_PALETTES.omni.light.red);
   });
 });
 

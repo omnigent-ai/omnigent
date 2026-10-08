@@ -1,6 +1,8 @@
 import { Terminal } from "@xterm/xterm";
 import { describe, expect, it } from "vitest";
+import { TERMINAL_PALETTES } from "@/lib/terminalPalettes";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
+import { terminalTheme } from "./TerminalSession";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -312,18 +314,49 @@ describe("xterm compatibility", () => {
 
 describe("terminal theme", () => {
   it("changes only the three reserved background slots, without mutating the base theme", () => {
-    const original = { foreground: "#123456", background: "#abcdef", red: "#ff0044" };
     for (const isDark of [false, true]) {
+      const original = terminalTheme(isDark);
       const theme = codexTerminalTheme(original, isDark);
       expect(theme).toMatchObject(original);
       expect(theme.extendedAnsi?.[253 - 16]).toBe(isDark ? "#1f2123" : "#fafafa");
-      expect(theme.extendedAnsi?.[254 - 16]).toBe(isDark ? "#464849" : "#e0e0e0");
-      expect(theme.extendedAnsi?.[255 - 16]).toBe(isDark ? "#2f3132" : "#f4f4f4");
+      expect(theme.extendedAnsi?.[254 - 16]).toBe(isDark ? "#46484a" : "#e0e0e0");
+      expect(theme.extendedAnsi?.[255 - 16]).toBe(isDark ? "#2f3133" : "#f4f4f4");
       expect(theme.extendedAnsi?.filter(Boolean)).toHaveLength(3);
       expect(theme.extendedAnsi?.slice(0, 253 - 16).every((color) => color === undefined)).toBe(
         true,
       );
+      expect(original).not.toHaveProperty("extendedAnsi");
     }
-    expect(original).not.toHaveProperty("extendedAnsi");
   });
+
+  it.each(["solarized", "gruvbox", "catppuccin"] as const)(
+    "derives the band shades from the %s canvas",
+    (palette) => {
+      // Fixed gray bands would clash on tinted canvases, so each shade must
+      // step from the palette's own background toward its text color.
+      const channels = (hex: string) => [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16));
+      for (const isDark of [false, true]) {
+        const base = terminalTheme(isDark, TERMINAL_PALETTES[palette]);
+        const background = channels(base.background);
+        const foreground = channels(base.foreground);
+        const theme = codexTerminalTheme(base, isDark);
+        const distances = [253, 255, 254].map((index) => {
+          const shade = channels(theme.extendedAnsi?.[index - 16] ?? "");
+          shade.forEach((value, channel) => {
+            expect(value).toBeGreaterThanOrEqual(
+              Math.min(background[channel], foreground[channel]),
+            );
+            expect(value).toBeLessThanOrEqual(Math.max(background[channel], foreground[channel]));
+          });
+          return shade.reduce(
+            (sum, value, channel) => sum + Math.abs(value - background[channel]),
+            0,
+          );
+        });
+        expect(distances[0]).toBeGreaterThan(0);
+        expect(distances[1]).toBeGreaterThan(distances[0]);
+        expect(distances[2]).toBeGreaterThan(distances[1]);
+      }
+    },
+  );
 });
