@@ -3551,10 +3551,12 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout. An idle
-        top-level session is included for exactly that reason; an idle
-        sub-agent is not, since its work finished on a runner that was
-        already live.
+        instead of spinning on "starting" until a timeout. Only a runner
+        that never connected fails an idle top-level session for that
+        reason: when the host dies after the runner ran, an idle session
+        lost no work and stays idle (offline via liveness). An idle
+        sub-agent is not failed either way, since its work finished on a
+        runner that was already live.
 
         :param host_id: The reporting host's id.
         :param runner_id: The crashed runner's id.
@@ -3569,6 +3571,9 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
+        # A runner this replica saw connect already ran, so its idle sessions lost
+        # no work; a replica that never saw it has no stamp and keeps failing them.
+        runner_ran = session_live_state.last_liveness_stamp(runner_id) is not None
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -3585,7 +3590,7 @@ def create_app(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),
             conversation_store,
-            fail_idle_top_level=True,
+            fail_idle_top_level=not runner_ran,
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
