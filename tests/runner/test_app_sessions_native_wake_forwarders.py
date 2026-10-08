@@ -1703,3 +1703,41 @@ async def test_teardown_after_rekey_closes_codex_app_server_under_new_session_id
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(key, None)
             runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(key, None)
         await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_rekey_codex_native_session_cancels_incumbent_under_new_id() -> None:
+    """A forwarder that raced in under the rotated id is cancelled, not silently dropped."""
+    old_id = "eeee5555eeee5555eeee5555eeee5555"
+    new_id = "ffff6666ffff6666ffff6666ffff6666"
+    rotated_run = _ForwarderRun()
+    incumbent_run = _ForwarderRun()
+
+    def _parked_for(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    try:
+        rotated_task = asyncio.create_task(_parked_for(rotated_run)())
+        incumbent_task = asyncio.create_task(_parked_for(incumbent_run)())
+        runner_app_mod._register_auto_forwarder_task(old_id, rotated_task)
+        runner_app_mod._register_auto_forwarder_task(new_id, incumbent_task)
+        await asyncio.sleep(0)
+
+        native_orchestration._rekey_codex_native_session(old_id, new_id)
+        await asyncio.sleep(0)
+
+        assert runner_app_mod._AUTO_FORWARDER_TASKS[new_id] is rotated_task
+        assert incumbent_run.cancelled is True
+        assert not rotated_task.done()
+    finally:
+        for key in (old_id, new_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(key, None)
+        await _drain_forwarder_runs([rotated_run, incumbent_run])

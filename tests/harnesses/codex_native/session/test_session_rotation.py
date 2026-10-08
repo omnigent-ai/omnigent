@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -380,6 +382,75 @@ class _CapturedSessionEvent:
     body: dict[str, Any]
 
 
+def _rotation_ap_handler(
+    *,
+    session_events: list[_CapturedSessionEvent] | None = None,
+    hook_posts: list[dict[str, Any]] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Serve the Omnigent calls a supervise loop makes while rotating conv_old onto conv_new."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_codex",
+                    "runner_id": "runner_123",
+                    "labels": {},
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "PATCH" and request.url.path in {
+            "/v1/sessions/conv_new",
+            "/v1/sessions/conv_old",
+        }:
+            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
+        if request.method == "POST" and request.url.path == (
+            "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer"
+        ):
+            return httpx.Response(200, json={"id": "terminal_codex_main"})
+        if request.url.path.endswith("/hooks/codex-elicitation-request"):
+            assert isinstance(body, dict)
+            if hook_posts is not None:
+                hook_posts.append(body)
+            return httpx.Response(200, json={"decision": "accept"})
+        if request.url.path.endswith("/events"):
+            assert isinstance(body, dict)
+            if session_events is not None:
+                session_id = request.url.path.split("/")[3]
+                session_events.append(_CapturedSessionEvent(session_id=session_id, body=body))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(
+            500,
+            json={"error": f"unexpected {request.method} {request.url.path}"},
+        )
+
+    return handler
+
+
+class _RotationFakeClient(_FakeCodexAppServerClient):
+    """Fake app-server client whose ``thread/unsubscribe`` succeeds, fails or stalls."""
+
+    def __init__(self, events: list[dict[str, Any]], *, unsubscribe: str = "ok") -> None:
+        super().__init__(events=events)
+        self.unsubscribe = unsubscribe
+        self.order: list[str] = []
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method != "thread/unsubscribe":
+            return await super().request(method, params)
+        self.order.append("unsubscribe")
+        self.requests.append((method, params))
+        if self.unsubscribe == "error":
+            raise RuntimeError("thread/unsubscribe rejected")
+        if self.unsubscribe == "stall":
+            await asyncio.Event().wait()
+        return {"result": {"status": "unsubscribed"}}
+
+
 def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     tmp_path: Path,
 ) -> None:
@@ -426,49 +497,6 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     session_events: list[_CapturedSessionEvent] = []
     hook_posts: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Serve AP calls made while the supervise loop rotates sessions.
-
-        :param request: HTTP request from the forwarder.
-        :returns: Fake AP response.
-        """
-        body = json.loads(request.content) if request.content else None
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
-            return httpx.Response(
-                200,
-                json={
-                    "id": "conv_old",
-                    "agent_id": "ag_codex",
-                    "runner_id": "runner_123",
-                    "labels": {},
-                },
-            )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            return httpx.Response(200, json={"id": "conv_new"})
-        if request.method == "PATCH" and request.url.path in {
-            "/v1/sessions/conv_new",
-            "/v1/sessions/conv_old",
-        }:
-            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
-        if request.method == "POST" and request.url.path == (
-            "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer"
-        ):
-            return httpx.Response(200, json={"id": "terminal_codex_main"})
-        if request.url.path.endswith("/hooks/codex-elicitation-request"):
-            assert isinstance(body, dict)
-            hook_posts.append(body)
-            return httpx.Response(200, json={"decision": "accept"})
-        if request.url.path.endswith("/events"):
-            assert isinstance(body, dict)
-            session_id = request.url.path.split("/")[3]
-            session_events.append(_CapturedSessionEvent(session_id=session_id, body=body))
-            return httpx.Response(202, json={"queued": False})
-        return httpx.Response(
-            500,
-            json={"error": f"unexpected {request.method} {request.url.path}"},
-        )
-
     async def run() -> None:
         """
         Run the supervise loop over rotation and stale child events.
@@ -483,7 +511,9 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
             app_server_url="ws://127.0.0.1:9876",
             thread_id="thread_old",
             client=fake_client,  # type: ignore[arg-type]
-            ap_transport=httpx.MockTransport(handler),
+            ap_transport=httpx.MockTransport(
+                _rotation_ap_handler(session_events=session_events, hook_posts=hook_posts)
+            ),
         )
 
     asyncio.run(run())
@@ -499,45 +529,20 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
 
 
 def test_supervise_forwarder_unsubscribes_retired_thread_after_rotation(tmp_path: Path) -> None:
-    """A /clear rotation releases the forwarder's subscription to the retired
-    thread; Codex keeps a thread's stdio MCP servers loaded while subscribed, so the
-    forwarder's own thread/resume must not pin it for the app server's lifetime."""
+    """A /clear rotation hands ownership to the runner first, then releases only the
+    retired thread; Codex keeps a thread's stdio MCP servers loaded while subscribed, so
+    the forwarder's own thread/resume must not pin it for the app server's lifetime."""
     _write_forwarder_bridge(
         tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
-    fake_client = _FakeCodexAppServerClient(
+    fake_client = _RotationFakeClient(
         events=[_thread_started_event("thread_new"), _started_event("turn_new")]
     )
+    rotations: list[tuple[str, str]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """Serve AP calls made while the supervise loop rotates sessions."""
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
-            return httpx.Response(
-                200,
-                json={
-                    "id": "conv_old",
-                    "agent_id": "ag_codex",
-                    "runner_id": "runner_123",
-                    "labels": {},
-                },
-            )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            return httpx.Response(200, json={"id": "conv_new"})
-        if request.method == "PATCH" and request.url.path in {
-            "/v1/sessions/conv_new",
-            "/v1/sessions/conv_old",
-        }:
-            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
-        if request.method == "POST" and request.url.path == (
-            "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer"
-        ):
-            return httpx.Response(200, json={"id": "terminal_codex_main"})
-        if request.url.path.endswith("/events"):
-            return httpx.Response(202, json={"queued": False})
-        return httpx.Response(
-            500,
-            json={"error": f"unexpected {request.method} {request.url.path}"},
-        )
+    def on_session_rotated(old_session_id: str, new_session_id: str) -> None:
+        fake_client.order.append("rotated")
+        rotations.append((old_session_id, new_session_id))
 
     async def run() -> None:
         """Run the supervise loop through a native thread switch."""
@@ -549,7 +554,8 @@ def test_supervise_forwarder_unsubscribes_retired_thread_after_rotation(tmp_path
             app_server_url="ws://127.0.0.1:9876",
             thread_id="thread_old",
             client=fake_client,  # type: ignore[arg-type]
-            ap_transport=httpx.MockTransport(handler),
+            ap_transport=httpx.MockTransport(_rotation_ap_handler()),
+            on_session_rotated=on_session_rotated,
         )
 
     asyncio.run(run())
@@ -560,3 +566,63 @@ def test_supervise_forwarder_unsubscribes_retired_thread_after_rotation(tmp_path
     assert resumed[:1] == ["thread_old"]
     assert ("thread/unsubscribe", {"threadId": "thread_old"}) in fake_client.requests
     assert ("thread/unsubscribe", {"threadId": "thread_new"}) not in fake_client.requests
+    assert rotations == [("conv_old", "conv_new")]
+    # Ownership moves before the unsubscribe is awaited, so teardown by the retired id
+    # cannot reach the live session while the request is in flight.
+    assert fake_client.order == ["rotated", "unsubscribe"]
+
+
+@pytest.mark.parametrize("unsubscribe", ["error", "stall"])
+def test_supervise_forwarder_rotation_survives_unsubscribe_failure(
+    unsubscribe: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected or stalled thread/unsubscribe is logged and never blocks the rotation,
+    the ownership hand-off, or event mirroring onto the replacement thread."""
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
+    )
+    monkeypatch.setattr(codex_native_forwarder, "_UNSUBSCRIBE_TIMEOUT_SECONDS", 0.05)
+    fake_client = _RotationFakeClient(
+        events=[_thread_started_event("thread_new"), _started_event("turn_new")],
+        unsubscribe=unsubscribe,
+    )
+    rotations: list[tuple[str, str]] = []
+    session_events: list[_CapturedSessionEvent] = []
+
+    def on_session_rotated(old_session_id: str, new_session_id: str) -> None:
+        fake_client.order.append("rotated")
+        rotations.append((old_session_id, new_session_id))
+
+    async def run() -> None:
+        """Run the supervise loop through a native thread switch."""
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=tmp_path,
+            app_server_url="ws://127.0.0.1:9876",
+            thread_id="thread_old",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_rotation_ap_handler(session_events=session_events)),
+            on_session_rotated=on_session_rotated,
+        )
+
+    with caplog.at_level(logging.WARNING, logger=codex_native_forwarder.__name__):
+        asyncio.run(run())
+
+    assert fake_client.order == ["rotated", "unsubscribe"]
+    assert rotations == [("conv_old", "conv_new")]
+    # The replacement thread's turn/started still reaches the new session.
+    assert [
+        event.body["data"]["status"]
+        for event in session_events
+        if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
+    ] == ["running"]
+    assert any(
+        "could not unsubscribe retired thread thread_old" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )

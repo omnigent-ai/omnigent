@@ -12,7 +12,7 @@ import shutil
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,24 @@ _STUB_SERVERS = ("stub_a", "stub_b")
 # Codex unloads an idle, unsubscribed thread about 60s after its last subscriber leaves.
 _RELEASE_WINDOW_S = 120.0
 _TEARDOWN_WINDOW_S = 30.0
+_TUI_READY_TIMEOUT_S = 120.0
+# Codex renders a randomised placeholder, so readiness is the composer prompt itself.
+_COMPOSER_PROMPTS = ("›", "»")
+_COMPOSER_DISABLED = {"Input disabled.", "Shutting down...", "Answer the questions to continue."}
+
+# A process identity: pid plus creation time, so a reused pid is never mistaken
+# for the process that held it.
+_ProcessId = tuple[int, float]
+
+
+def _system_codex_config_in_use() -> bool:
+    try:
+        return bool(_SYSTEM_CODEX_CONFIG.read_text().strip())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
 
 pytestmark = [
     pytest.mark.skipif(
@@ -62,7 +80,7 @@ pytestmark = [
         reason="requires real Codex and tmux binaries",
     ),
     pytest.mark.skipif(
-        _SYSTEM_CODEX_CONFIG.exists() and bool(_SYSTEM_CODEX_CONFIG.read_text().strip()),
+        _system_codex_config_in_use(),
         reason="requires isolated Codex system config to keep model requests local",
     ),
 ]
@@ -94,9 +112,9 @@ def stub_mcp_log(
     log = _write_stub_mcp_config(codex_home)
     runner_env = e2e_conftest._live_runner_state["env"]
     previous = runner_env.get("CODEX_HOME")
-    runner_env["CODEX_HOME"] = str(codex_home)
-    restart_live_runner_process(live_server, live_runner_id)
     try:
+        runner_env["CODEX_HOME"] = str(codex_home)
+        restart_live_runner_process(live_server, live_runner_id)
         yield log
     finally:
         if previous is None:
@@ -106,18 +124,20 @@ def stub_mcp_log(
         restart_live_runner_process(live_server, live_runner_id)
 
 
-def _alive(pid: int) -> bool:
+def _alive(identity: _ProcessId) -> bool:
+    pid, created = identity
     with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        proc = psutil.Process(pid)
+        return proc.create_time() == created and proc.status() != psutil.STATUS_ZOMBIE
     return False
 
 
-def _mcp_children(app_pid: int) -> list[dict[str, Any]]:
+def _mcp_children(app: _ProcessId | None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    if not _alive(app_pid):
+    if app is None or not _alive(app):
         return rows
-    for child in psutil.Process(app_pid).children(recursive=True):
-        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+    for child in psutil.Process(app[0]).children(recursive=True):
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             cmdline = " ".join(child.cmdline())
             if _STUB_NAME in cmdline:
                 kind = "stub"
@@ -136,8 +156,8 @@ def _mcp_children(app_pid: int) -> list[dict[str, Any]]:
     return rows
 
 
-def _stub_pids(app_pid: int) -> set[int]:
-    return {row["pid"] for row in _mcp_children(app_pid) if row["kind"] == "stub"}
+def _stubs(app: _ProcessId | None) -> set[_ProcessId]:
+    return {(row["pid"], row["created"]) for row in _mcp_children(app) if row["kind"] == "stub"}
 
 
 def _loaded_threads(ws_url: str) -> list[str]:
@@ -179,37 +199,30 @@ class _Journey:
         self.model = f"mock-codex-clear-{uuid.uuid4().hex[:8]}"
         self.session_ids: list[str] = []
         self.evidence: dict[str, Any] = {"model": self.model, "steps": []}
-        self.app_pid = 0
+        self.app: _ProcessId | None = None
+        self.bridge_dir: Path | None = None
+        self.ws_url = ""
         self.socket = ""
         self.target = ""
 
-    @classmethod
-    def start(
-        cls,
-        client: httpx.Client,
-        runner_id: str,
-        mock_url: str,
-        workspace: Path,
-        stub_log: Path,
-    ) -> _Journey:
-        journey = cls(client, mock_url, workspace, stub_log)
+    def start(self, runner_id: str) -> None:
         spec = yaml.safe_load(
-            _materialize_codex_agent_spec(workspace, model=journey.model).read_text()
+            _materialize_codex_agent_spec(self.workspace, model=self.model).read_text()
         )
         spec["name"] = f"codex-clear-{uuid.uuid4().hex[:8]}"
         spec["executor"]["auth"] = {
             "type": "api_key",
             "api_key": "mock-key",
-            "base_url": f"{mock_url}/v1",
+            "base_url": f"{self.mock_url}/v1",
         }
         spec["spawn"] = False
-        spec["os_env"]["cwd"] = str(workspace)
+        spec["os_env"]["cwd"] = str(self.workspace)
         create = post_session_bundle(
-            client.post,
+            self.client.post,
             "/v1/sessions",
             bundle_files({"codex-native-ui.yaml": yaml.safe_dump(spec).encode()}),
             metadata={
-                "workspace": str(workspace),
+                "workspace": str(self.workspace),
                 "labels": {
                     WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
                     UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
@@ -218,55 +231,80 @@ class _Journey:
         )
         assert create.is_success, create.text
         session_id = create.json()["session_id"]
-        journey.session_ids.append(session_id)
-        journey.bridge_dir = bridge_dir_for_bridge_id(session_id)
-        binding = client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
+        self.session_ids.append(session_id)
+        self.bridge_dir = bridge_dir_for_bridge_id(session_id)
+        binding = self.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
         assert binding.is_success, binding.text
-        terminal = client.post(
+        terminal = self.client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
             timeout=120,
         )
         assert terminal.status_code == 200, terminal.text[:1000]
         metadata = terminal.json()["metadata"]
-        journey.socket, journey.target = metadata["tmux_socket"], metadata["tmux_target"]
+        self.socket, self.target = metadata["tmux_socket"], metadata["tmux_target"]
         state = _wait_for(
-            lambda: read_bridge_state(journey.bridge_dir), "Codex thread creation", timeout=120
+            lambda: read_bridge_state(self.bridge_dir), "Codex thread creation", timeout=120
         )
-        journey.app_pid = _app_server_pid(state.socket_path)
-        journey.ws_url = state.socket_path
+        app_pid = _app_server_pid(state.socket_path)
+        self.app = (app_pid, psutil.Process(app_pid).create_time())
+        self.ws_url = state.socket_path
         _wait_for(
-            lambda: len(_stub_pids(journey.app_pid)) >= len(_STUB_SERVERS),
+            lambda: len(_stubs(self.app)) >= len(_STUB_SERVERS),
             "stub MCP wrappers",
             timeout=60,
         )
-        journey.wait_pane_text("Ask Codex")
-        set_fallback_mock_llm(mock_url, journey.model, "MOCK_FALLBACK")
-        journey.record(
+        self.wait_tui_interactive(timeout=_TUI_READY_TIMEOUT_S)
+        set_fallback_mock_llm(self.mock_url, self.model, "MOCK_FALLBACK")
+        self.record(
             "start",
             session_id=session_id,
             thread_id=state.thread_id,
-            app_server_pid=journey.app_pid,
+            app_server_pid=app_pid,
         )
-        return journey
 
     @property
     def state(self) -> CodexNativeBridgeState:
+        assert self.bridge_dir is not None, "journey not started"
         state = read_bridge_state(self.bridge_dir)
         assert state is not None
         return state
 
     def record(self, step: str, **fields: Any) -> None:
-        fields["mcp_children"] = _mcp_children(self.app_pid)
-        with contextlib.suppress(Exception):
-            fields["loaded_threads"] = _loaded_threads(self.ws_url)
+        fields["mcp_children"] = _mcp_children(self.app)
+        if self.ws_url:
+            with contextlib.suppress(Exception):
+                fields["loaded_threads"] = _loaded_threads(self.ws_url)
         self.evidence["steps"].append({"step": step, "t": time.time(), **fields})
 
     def pane(self) -> str:
         return _tmux(self.socket, "capture-pane", "-p", "-t", self.target, "-S", "-80")
 
     def wait_pane_text(self, text: str, timeout: float = 60.0) -> None:
-        _wait_for(lambda: text in self.pane(), f"TUI to display {text!r}", timeout=timeout)
+        self._wait_pane(lambda pane: text in pane, f"display {text!r}", timeout)
+
+    def wait_tui_interactive(self, timeout: float) -> None:
+        def accepting_input(pane: str) -> bool:
+            composers = [
+                line.lstrip()[1:].strip()
+                for line in pane.splitlines()
+                if line.lstrip().startswith(_COMPOSER_PROMPTS)
+            ]
+            return bool(composers) and composers[-1] not in _COMPOSER_DISABLED
+
+        self._wait_pane(accepting_input, "show an enabled composer", timeout)
+
+    def _wait_pane(self, check: Callable[[str], bool], what: str, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        pane = ""
+        while time.monotonic() < deadline:
+            pane = self.pane()
+            if check(pane):
+                return
+            time.sleep(0.2)
+        raise AssertionError(
+            f"Timed out waiting for the TUI to {what} after {timeout:.0f}s; pane:\n{pane[-1500:]}"
+        )
 
     def run_turn(self) -> str:
         marker = f"READY_{uuid.uuid4().hex[:8]}"
@@ -283,7 +321,7 @@ class _Journey:
 
     def clear(self) -> CodexNativeBridgeState:
         before = self.state
-        known = _stub_pids(self.app_pid)
+        known = _stubs(self.app)
         _tmux(self.socket, "send-keys", "-t", self.target, "/clear")
         time.sleep(0.5)
         _tmux(self.socket, "send-keys", "-t", self.target, "Enter")
@@ -296,7 +334,7 @@ class _Journey:
         if after.session_id not in self.session_ids:
             self.session_ids.append(after.session_id)
         _wait_for(
-            lambda: len(_stub_pids(self.app_pid) - known) >= len(_STUB_SERVERS),
+            lambda: len(_stubs(self.app) - known) >= len(_STUB_SERVERS),
             "the new thread's stub MCP wrappers",
             timeout=60,
         )
@@ -308,12 +346,12 @@ class _Journey:
         )
         return after
 
-    def wait_stubs_gone(self, pids: set[int], timeout: float) -> set[int]:
+    def wait_stubs_gone(self, stubs: set[_ProcessId], timeout: float) -> set[_ProcessId]:
         deadline = time.monotonic() + timeout
-        remaining = {pid for pid in pids if _alive(pid)}
+        remaining = {stub for stub in stubs if _alive(stub)}
         while remaining and time.monotonic() < deadline:
             time.sleep(1.0)
-            remaining = {pid for pid in pids if _alive(pid)}
+            remaining = {stub for stub in stubs if _alive(stub)}
         self.record(
             "release_window",
             waited_s=round(timeout - max(0.0, deadline - time.monotonic()), 1),
@@ -322,11 +360,12 @@ class _Journey:
         return remaining
 
     def wait_app_server_gone(self, timeout: float) -> bool:
+        assert self.app is not None, "journey not started"
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and _alive(self.app_pid):
+        while time.monotonic() < deadline and _alive(self.app):
             time.sleep(0.5)
-        self.record("teardown_window", app_server_alive=_alive(self.app_pid))
-        return not _alive(self.app_pid)
+        self.record("teardown_window", app_server_alive=_alive(self.app))
+        return not _alive(self.app)
 
     def finish(self) -> None:
         pane_text = ""
@@ -357,11 +396,13 @@ class _Journey:
         for session_id in self.session_ids:
             with contextlib.suppress(Exception):
                 self.client.delete(f"/v1/sessions/{session_id}", timeout=30)
-        for pid in sorted(
-            {self.app_pid, *(row["pid"] for row in _mcp_children(self.app_pid))}, reverse=True
-        ):
-            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                psutil.Process(pid).kill()
+        leftovers = {(row["pid"], row["created"]) for row in _mcp_children(self.app)}
+        if self.app is not None:
+            leftovers.add(self.app)
+        for identity in sorted(leftovers, reverse=True):
+            if _alive(identity):
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    psutil.Process(identity[0]).kill()
 
 
 @pytest.fixture
@@ -374,9 +415,14 @@ def journey(
 ) -> Iterator[_Journey]:
     if mock_llm_server_url is None:
         pytest.skip("requires the local mock model endpoint")
-    started = _Journey.start(
-        http_client, live_runner_id, mock_llm_server_url, tmp_path, stub_mcp_log
-    )
+    started = _Journey(http_client, mock_llm_server_url, tmp_path, stub_mcp_log)
+    try:
+        started.start(live_runner_id)
+    except BaseException:
+        # A partial start still owns a session, pane and app-server on the shared runner.
+        with contextlib.suppress(Exception):
+            started.finish()
+        raise
     yield started
     started.finish()
 
@@ -384,17 +430,17 @@ def journey(
 def test_clear_releases_previous_thread_mcp_processes(journey: _Journey) -> None:
     """Both retired threads' stub MCP wrappers exit after two ``/clear`` rotations."""
     journey.run_turn()
-    generations = [_stub_pids(journey.app_pid)]
+    generations = [_stubs(journey.app)]
     for _ in range(2):
         journey.clear()
-        generations.append(_stub_pids(journey.app_pid) - set().union(*generations))
+        generations.append(_stubs(journey.app) - set().union(*generations))
     retired = set().union(*generations[:-1])
     remaining = journey.wait_stubs_gone(retired, timeout=_RELEASE_WINDOW_S)
     assert not remaining, (
         f"{len(remaining)} stub MCP wrapper(s) from the two retired Codex "
         f"threads are still running {_RELEASE_WINDOW_S:.0f}s after /clear "
-        f"(pids {sorted(remaining)}; "
-        f"generations {[sorted(g) for g in generations]}; "
+        f"(pids {sorted(pid for pid, _ in remaining)}; "
+        f"generations {[sorted(pid for pid, _ in g) for g in generations]}; "
         f"threads still loaded in the app server: {_loaded_threads(journey.ws_url)})"
     )
 
@@ -406,17 +452,18 @@ def test_deleting_rotated_session_closes_app_server(journey: _Journey) -> None:
     delete = journey.client.delete(f"/v1/sessions/{rotated.session_id}", timeout=60)
     assert delete.status_code == 200, delete.text[:500]
     assert journey.wait_app_server_gone(_TEARDOWN_WINDOW_S), (
-        f"codex app-server pid {journey.app_pid} is still running "
+        f"codex app-server {journey.app} is still running "
         f"{_TEARDOWN_WINDOW_S:.0f}s after deleting the rotated session "
-        f"{rotated.session_id}; MCP wrappers alive: {_mcp_children(journey.app_pid)}"
+        f"{rotated.session_id}; MCP wrappers alive: {_mcp_children(journey.app)}"
     )
 
 
 def test_clear_before_first_turn_releases_mcp_processes(journey: _Journey) -> None:
     """Without a prior turn the forwarder never subscribed, so Codex retires the old thread."""
-    first_generation = _stub_pids(journey.app_pid)
+    first_generation = _stubs(journey.app)
     journey.clear()
     remaining = journey.wait_stubs_gone(first_generation, timeout=_RELEASE_WINDOW_S)
     assert not remaining, (
-        f"stub MCP wrappers {sorted(remaining)} survived a /clear issued before any turn"
+        f"stub MCP wrappers {sorted(pid for pid, _ in remaining)} survived a /clear "
+        "issued before any turn"
     )

@@ -354,6 +354,11 @@ def _rekey_codex_native_session(old_session_id: str, new_session_id: str) -> Non
         _AUTO_CODEX_APP_SERVERS[new_session_id] = app_server
     forwarder_task = _AUTO_FORWARDER_TASKS.pop(old_session_id, None)
     if forwarder_task is not None:
+        # A forwarder that raced in under the new id would otherwise lose its
+        # reference and leak its app-server; cancelling it closes that server.
+        incumbent = _AUTO_FORWARDER_TASKS.get(new_session_id)
+        if incumbent is not None and incumbent is not forwarder_task:
+            incumbent.cancel()
         _AUTO_FORWARDER_TASKS[new_session_id] = forwarder_task
 
 
@@ -5889,7 +5894,6 @@ async def _codex_discover_thread_and_forward(
     registry_key = session_id
 
     def _on_forwarder_rotation(old_session_id: str, new_session_id: str) -> None:
-        """Track the rotated session so this task's teardown stays accurate."""
         nonlocal registry_key
         _rekey_codex_native_session(old_session_id, new_session_id)
         registry_key = new_session_id
@@ -6240,7 +6244,6 @@ async def _codex_forward_known_thread(
     registry_key = session_id
 
     def _on_forwarder_rotation(old_session_id: str, new_session_id: str) -> None:
-        """Track the rotated session so this task's teardown stays accurate."""
         nonlocal registry_key
         _rekey_codex_native_session(old_session_id, new_session_id)
         registry_key = new_session_id

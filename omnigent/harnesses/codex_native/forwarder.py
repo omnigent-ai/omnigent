@@ -2206,13 +2206,14 @@ async def supervise_forwarder(
                     )
                     if rotated:
                         forwarder_state.note_parent_rotation(target.session_id)
+                        # Re-key the runner's teardown bookkeeping before any await, so
+                        # teardown by the retired id cannot reach the live rotated session.
+                        if on_session_rotated is not None:
+                            on_session_rotated(retiring_session_id, target.session_id)
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await subscribe_task
                         await _unsubscribe_retired_thread(client, thread_id=retiring_thread_id)
-                        # Let the runner move its teardown bookkeeping onto the rotated session.
-                        if on_session_rotated is not None:
-                            on_session_rotated(retiring_session_id, target.session_id)
                         # Fresh thread after a /clear rotation — start its
                         # own active signal so the new subscription parks
                         # until the rotated thread's first turn.
