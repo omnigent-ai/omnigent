@@ -42,6 +42,10 @@ internal class OmnigentWebViewClient(
     private val onWorkspaceSessionInvalid: (status: Int?) -> Unit = {},
     private val onWorkspaceSignOut: () -> Unit = {},
     private val bridgeScript: () -> String = { NativeBridgeScript.source },
+    /** True when the shell took over a pinned-origin page load (a native OIDC auth route). */
+    private val handlesNavigation: (url: String?) -> Boolean = { false },
+    /** Every main-frame URL the page reaches, including in-page `pushState` navigations. */
+    private val onHistoryUpdated: (url: String?) -> Unit = {},
 ) : WebViewClient() {
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
@@ -73,6 +77,13 @@ internal class OmnigentWebViewClient(
                 onWorkspaceSessionInvalid(null)
                 return
             }
+        }
+
+        // A native OIDC session handles its own auth routes; loads the shell starts
+        // itself skip shouldOverrideUrlLoading, so they are caught here too.
+        if (isHttpScheme(scheme) && origin == pinned && handlesNavigation(url)) {
+            view.stopLoading()
+            return
         }
 
         // A real http(s) navigation to a foreign origin means the server bounced
@@ -132,6 +143,7 @@ internal class OmnigentWebViewClient(
             onWorkspaceSignOut()
             return
         }
+        onHistoryUpdated(url)
         if (originOf(url) != pinnedOrigin()) return
         val target = workspaceRootTarget(url) ?: return
         bounce(view, target)
@@ -203,6 +215,7 @@ internal class OmnigentWebViewClient(
         val origin = originOf(url.toString())
         val pinned = pinnedOrigin()
         if (origin == pinned) {
+            if (handlesNavigation(url.toString())) return true
             val target = workspaceRootTarget(url.toString()) ?: return false
             bounce(view, target)
             return true

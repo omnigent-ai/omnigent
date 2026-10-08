@@ -30,6 +30,8 @@
     <string name="oauth_recovery_exhausted">The workspace session could not be restored. Reconnect to try again.</string>
     <string name="oauth_signing_out">Signing out of this workspace…</string>
     <string name="oauth_sign_out_incomplete">Sign-out could not finish. Reconnect to retry cleanup before signing in.</string>
+    <string name="oidc_connecting">Connecting…</string>
+    <string name="oidc_signing_in">Signing in…</string>
     <string name="menu_reload">Reload</string>
     <string name="menu_connect_new">Connect to New Server</string>
     <string name="menu_sign_out_workspace">Sign Out of Workspace</string>

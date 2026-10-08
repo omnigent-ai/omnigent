@@ -29,6 +29,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.VisibleForTesting
 import androidx.appcompat.app.AppCompatActivity
 import androidx.browser.auth.AuthTabIntent
 import androidx.core.content.ContextCompat
@@ -46,6 +47,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
 /**
@@ -60,7 +62,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
+
+    // Legacy ticket sign-in for OIDC servers whose manifest lacks this app's native redirect.
+    // Deprecated: removal targeted for Android 0.3.0.
     private val oidcLoginManager = OidcLoginManager()
+    private val oidcAuthLauncher =
+        AuthTabIntent.registerActivityResultLauncher(this, ::handleOidcAuthResult)
+    private val oidcExecutor = Executors.newCachedThreadPool()
+    private var oidcSession: OidcSessionController? = null
     private var databricksLoginManager: DatabricksLoginManager? = null
     private val callbackHandoff by lazy {
         OAuthCallbackHandoff(applicationContext)
@@ -232,10 +241,9 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
-        if (workspaceContext != null) {
-            connectionOverlay = buildConnectionOverlay()
-            container.addView(connectionOverlay)
-        }
+        connectionOverlay = buildConnectionOverlay()
+        if (workspaceContext == null) connectionOverlay.visibility = View.GONE
+        container.addView(connectionOverlay)
         container.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
             if (right - left != oldRight - oldLeft) updateServerSwitcherWidth(right - left)
         }
@@ -295,11 +303,135 @@ class MainActivity : AppCompatActivity() {
             )
         val context = workspaceContext
         val profile = workspaceProfile
+        val callback = intent.getBooleanExtra(OAuthCallbackActivity.EXTRA_OAUTH_CALLBACK, false)
         if (context != null && profile != null) {
             beginWorkspaceConnection(context, profile, allowInteractive = userInitiated)
-        } else {
-            webView.loadUrl(serverUrl)
+        } else if (!(callback && resumesOidcSignIn(serverUrl))) {
+            connectServer(serverUrl, interactive = userInitiated)
         }
+    }
+
+    /** Picks up a sign-in the callback receiver finished while no shell was running. */
+    private fun resumesOidcSignIn(serverUrl: String): Boolean =
+        serverAuthentication(originOf(serverUrl)) == ServerAuthentication.OIDC &&
+            oidcController().resumeHandedOffSignIn()
+
+    /**
+     * Loads a server that isn't a Databricks workspace. Servers that offer this app native OIDC
+     * sign-in in their manifest are signed in before the page loads; the rest load as before.
+     */
+    private fun connectServer(
+        serverUrl: String,
+        interactive: Boolean,
+    ) {
+        if (serverAuthentication(originOf(serverUrl)) != ServerAuthentication.OIDC) {
+            oidcSession?.stop()
+            connectionOverlay.visibility = View.GONE
+            webView.loadUrl(serverUrl)
+            return
+        }
+        // A page left running under the cover keeps calling its server and could start a
+        // sign-in of its own; the session's page loads fresh once it is ready.
+        if (webView.url != null) webView.loadUrl(BLANK_PAGE)
+        oidcController().connect(serverUrl, interactive)
+    }
+
+    private fun oidcController(): OidcSessionController =
+        oidcSession ?: OidcSessionController(
+            host = OidcHost(),
+            credentials = OidcCredentials.shared(applicationContext),
+            cookies = DefaultProfileCookieJar,
+            io = oidcWorker ?: oidcExecutor,
+            main = { task -> runOnUiThread(task) },
+            fetchManifest = manifestReader,
+        ).also { oidcSession = it }
+
+    private fun handleOidcAuthResult(result: AuthTabIntent.AuthResult) {
+        val session = oidcSession ?: return
+        when (result.resultCode) {
+            AuthTabIntent.RESULT_OK -> {
+                val callback =
+                    result.resultUri?.toString()?.let {
+                        runCatching {
+                            URI(
+                                it,
+                            )
+                        }.getOrNull()
+                    }
+                if (callback ==
+                    null
+                ) {
+                    session.onBrowserFailed()
+                } else {
+                    session.onBrowserCallback(callback)
+                }
+            }
+
+            AuthTabIntent.RESULT_CANCELED -> {
+                if (ignoreNextAuthTabCancellation || callbackHandoff.isInProgress()) {
+                    ignoreNextAuthTabCancellation = false
+                    return
+                }
+                session.onBrowserClosed()
+            }
+
+            else -> {
+                session.onBrowserFailed()
+            }
+        }
+    }
+
+    /** Presents the native OIDC session's progress and outcomes in the connection overlay. */
+    private inner class OidcHost : OidcSessionController.Host {
+        override fun showProgress(progress: OidcSessionController.Progress) {
+            connectionOverlay.visibility = View.VISIBLE
+            connectionMessage.text =
+                getString(
+                    when (progress) {
+                        OidcSessionController.Progress.CONNECTING -> R.string.oidc_connecting
+                        OidcSessionController.Progress.SIGNING_IN -> R.string.oidc_signing_in
+                        OidcSessionController.Progress.COMPLETING -> R.string.oidc_completing
+                    },
+                )
+            connectionAction.visibility = View.GONE
+            connectionCancel.visibility = View.VISIBLE
+        }
+
+        override fun showSignInRequired(message: String) {
+            // The signed-out page under the prompt would keep asking to sign in.
+            webView.loadUrl(BLANK_PAGE)
+            connectionOverlay.visibility = View.VISIBLE
+            connectionMessage.text = message
+            connectionAction.apply {
+                text = getString(R.string.oauth_sign_in)
+                visibility = View.VISIBLE
+                setOnClickListener { oidcSession?.signIn() }
+            }
+            connectionCancel.visibility = View.VISIBLE
+        }
+
+        override fun loadWithoutNativeSignIn(url: String) = loadPage(url)
+
+        override fun loadPage(url: String) {
+            connectionOverlay.visibility = View.GONE
+            // Back must not walk into the blank or signed-out pages before this one.
+            historyCleared = false
+            webView.loadUrl(url)
+        }
+
+        override fun returnToSetup(message: String?) {
+            this@MainActivity.returnToSetup(
+                ServerStore(this@MainActivity).currentServerUrl(),
+                message,
+            )
+        }
+
+        override fun launchSignIn(
+            serverUrl: String,
+            cookieName: String,
+        ): Boolean =
+            OidcSignInLauncher(OidcCredentials.shared(applicationContext), callbackHandoff)
+                .start(oidcAuthLauncher, serverUrl, cookieName)
     }
 
     private fun handleDatabricksAuthResult(result: AuthTabIntent.AuthResult) {
@@ -413,7 +545,7 @@ class MainActivity : AppCompatActivity() {
             connectionCancel =
                 Button(this@MainActivity).apply {
                     text = getString(R.string.oauth_cancel)
-                    setOnClickListener { cancelWorkspaceConnection() }
+                    setOnClickListener { cancelConnection() }
                 }
             addView(connectionCancel)
         }
@@ -501,6 +633,17 @@ class MainActivity : AppCompatActivity() {
                     returnToSetup(context.pageUri.toString(), failure.message)
                 }
             }
+        }
+    }
+
+    private fun cancelConnection() {
+        val session = oidcSession
+        if (workspaceContext == null &&
+            session != null
+        ) {
+            session.cancel()
+        } else {
+            cancelWorkspaceConnection()
         }
     }
 
@@ -675,7 +818,7 @@ class MainActivity : AppCompatActivity() {
             )
             recreate()
         } else {
-            reloadWithNewServer(target, origin)
+            reloadWithNewServer(target, origin, interactive = true)
         }
     }
 
@@ -702,6 +845,8 @@ class MainActivity : AppCompatActivity() {
                     onPageReady = ::onPageReady,
                     onNavigationStarted = ::armServerSwitcherWatchdog,
                     onLoginRequired = ::startLogin,
+                    handlesNavigation = { url -> oidcSession?.handlesNavigation(url) == true },
+                    onHistoryUpdated = { url -> oidcSession?.onPageVisited(url) },
                     onRendererGone = ::recoverFromRendererDeath,
                     workspaceSession = { workspaceSession },
                     onWorkspaceSessionInvalid = ::handleWorkspaceSessionInvalid,
@@ -952,6 +1097,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Run the legacy ticket login flow for OIDC servers without native sign-in. Deprecated:
+     * removal targeted for Android 0.3.0.
+     *
      * Run the RFC 8252 login flow: authenticate in the system browser
      * (Google/passkey work there, not in a WebView), then [onSessionToken]
      * injects the session. Triggered by [OmnigentWebViewClient] when the server
@@ -965,6 +1113,11 @@ class MainActivity : AppCompatActivity() {
      */
     private fun startLogin() {
         val origin = pinnedOrigin ?: return
+        // A native OIDC session renews itself; the identity provider never loads in the page.
+        oidcSession?.takeIf { it.connection != null }?.let { session ->
+            session.onSignInRequested()
+            return
+        }
         if (loginAttempts >= MAX_LOGIN_ATTEMPTS) {
             authLog("login attempts exhausted ($loginAttempts) — not retrying")
             return
@@ -1096,6 +1249,8 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest?.deny()
         pendingMicRequest = null
         oidcLoginManager.shutdown()
+        oidcSession?.stop()
+        oidcExecutor.shutdownNow()
         databricksAuthExecutor.shutdownNow()
         workspaceFuture?.cancel(true)
         workspaceCoordinator?.shutdown()
@@ -1115,6 +1270,11 @@ class MainActivity : AppCompatActivity() {
             callbackHandoff.clear()
             ignoreNextAuthTabCancellation = true
             val error = intent.getStringExtra(OAuthCallbackActivity.EXTRA_OAUTH_ERROR)
+            val session = oidcSession
+            if (workspaceContext == null && session != null) {
+                session.onCallbackHandedOff(error)
+                return
+            }
             if (error != null) {
                 returnToSetup(workspaceContext?.pageUri?.toString(), error)
                 return
@@ -1144,7 +1304,11 @@ class MainActivity : AppCompatActivity() {
                 recreate()
                 return
             }
-            reloadWithNewServer(newServerUrl, newOrigin)
+            val userInitiated =
+                UserConnectRequests.consume(
+                    intent.getStringExtra(EXTRA_CONNECT_REQUEST),
+                )
+            reloadWithNewServer(newServerUrl, newOrigin, userInitiated)
         }
 
         val path = navigatePathOf(intent) ?: return
@@ -1162,6 +1326,7 @@ class MainActivity : AppCompatActivity() {
     private fun reloadWithNewServer(
         serverUrl: String,
         newOrigin: String,
+        interactive: Boolean,
     ) {
         // Cancel any in-flight login before pinning the new origin: the poll runs
         // against the old server and its token must never land on the new origin's
@@ -1175,7 +1340,8 @@ class MainActivity : AppCompatActivity() {
         loginAttempts = 0
         switchButton.text = hostLabelOf(serverUrl)
         installBridge()
-        webView.loadUrl(serverUrl)
+        // An OIDC server's page stays covered while its manifest is read.
+        connectServer(serverUrl, interactive)
     }
 
     private fun updateServerSwitcherWidth(containerWidthPx: Int) {
@@ -1319,6 +1485,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
+        oidcSession?.onPageVisited(url)
         // Does NOT reset the crash budget: a load-then-crash loop fires onPageReady
         // every cycle, so resetting here would defeat withinCrashBudget()'s guard.
         flushPendingActivation()
@@ -1489,6 +1656,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        /** Reads a server's manifest before it loads; replaced in tests. */
+        @VisibleForTesting
+        internal var manifestReader: (String) -> ServerManifest = { ServerManifest.fetch(it) }
+
+        /** Runs native sign-in network work; null uses the activity's own pool. Tests only. */
+        @VisibleForTesting
+        internal var oidcWorker: Executor? = null
+
+        /** Replaces a page the shell covers while it signs in, so it stops running. */
+        private const val BLANK_PAGE = "about:blank"
+
         /** A [UserConnectRequests] token: the user asked for this connect. */
         const val EXTRA_CONNECT_REQUEST = "ai.omnigent.android.CONNECT_REQUEST"
         private const val MAX_LOGIN_ATTEMPTS = 3
