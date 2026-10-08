@@ -84,9 +84,11 @@ the temporary directory where it retains recordings when that variable is unset.
 
 Playwright writes one raw
 `page@<hash>.webm` per page context — the main shell window, plus any OAuth
-popup or in-window IdP view, which record separately. Call
-`saveRecording(recordDir, "<name>")` after `electronApp.close()` (as the
-reference test does) to rename **all** of them to stable names: the largest
+popup or in-window IdP view, which record separately. After
+`electronApp.close()`, `await stopDisplayCapture()` (it finalizes the composited
+capture and releases a harness-owned Xvfb; the harness also runs it when the app
+exits) and then call `saveRecording(recordDir, "<name>")` (as the reference
+test does) to rename **all** of them to stable names: the largest
 becomes `<name>.webm` and any others `<name>-2.webm`, `<name>-3.webm`, … It
 returns the list of saved paths. For a popup / IdP bug the subject is the popup
 clip (often the smaller one), so when there is more than one, inspect each and
@@ -136,8 +138,9 @@ instruction to chat. No instruction bar should appear below the browser URL.
 3. Drive the real window to the failing state and assert on it. For a
    `reproduced` facet the assertion FAILS on the running build — the failing
    run's video is the before-fix footage.
-4. Close the app AND call `saveRecording` in the `finally` block (as the
-   reference test does), so the clip is named on the failing path too — a
+4. Close the app, `await stopDisplayCapture()`, AND call `saveRecording` in the
+   `finally` block (as the reference test does), so the clip is named on the
+   failing path too — a
    `reproduced` facet's run throws, and if you name the clip after the
    `try/finally` it never runs on the very path that produces the before-fix
    footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or

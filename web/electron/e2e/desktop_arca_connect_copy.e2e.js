@@ -41,6 +41,20 @@ function sleep(ms) {
   });
 }
 
+/** Poll `probe` every 100ms until it returns a truthy value or `timeoutMs` passes. */
+async function pollUntil(probe, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let value = await probe();
+  // Each probe must follow the previous one and the pause between them.
+  /* oxlint-disable no-await-in-loop */
+  while (!value && Date.now() < deadline) {
+    await sleep(100);
+    value = await probe();
+  }
+  /* oxlint-enable no-await-in-loop */
+  return value;
+}
+
 describe(
   "desktop shell — copying from the Arca connect console",
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}` },
@@ -53,6 +67,12 @@ describe(
     const seen = {};
 
     const readClipboard = () => app.electronApp.evaluate(({ clipboard }) => clipboard.readText());
+    /** The clipboard once a copy landed, or the sentinel when nothing arrived in time. */
+    const clipboardAfterCopy = async () =>
+      (await pollUntil(async () => {
+        const text = await readClipboard();
+        return text === SENTINEL ? "" : text;
+      }, 3_000)) || SENTINEL;
     const resetClipboard = () =>
       app.electronApp.evaluate(({ clipboard }, text) => clipboard.writeText(text), SENTINEL);
     const selectionText = (page) => page.evaluate(() => window.getSelection().toString());
@@ -61,9 +81,11 @@ describe(
         globalThis.recordedContextMenus = [];
       });
     const contextMenus = () => app.electronApp.evaluate(() => globalThis.recordedContextMenus);
+    const contextMenusClosed = () => app.electronApp.evaluate(() => !globalThis.openContextMenus);
 
     async function dragAcross(page, locator) {
       const box = await locator.boundingBox();
+      assert.ok(box, `element has no bounding box: ${locator}`);
       await page.mouse.move(box.x + 2, box.y + box.height / 2);
       await page.mouse.down();
       await page.mouse.move(box.x + box.width - 4, box.y + box.height / 2, { steps: 12 });
@@ -72,10 +94,16 @@ describe(
 
     async function rightClickAt(page, locator) {
       const box = await locator.boundingBox();
+      assert.ok(box, `element has no bounding box: ${locator}`);
       await resetContextMenus();
       await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: "right" });
-      await sleep(1500);
-      return contextMenus();
+      const menus = await pollUntil(async () => {
+        const recorded = await contextMenus();
+        return recorded.length > 0 ? recorded : null;
+      }, 3_000);
+      // Let the auto-closed popup go away before the next pointer action.
+      await pollUntil(contextMenusClosed, 3_000);
+      return menus ?? [];
     }
 
     before(async () => {
@@ -96,12 +124,18 @@ describe(
         .getByText("What should we build?")
         .waitFor({ state: "visible", timeout: 40_000 });
       // Native menus never reach the page, so observe them where they are built.
+      // This patches the suite's own app process, which ends with electronApp.close().
       await electronApp.evaluate(({ Menu }) => {
         const popup = Menu.prototype.popup;
         globalThis.recordedContextMenus = [];
+        globalThis.openContextMenus = 0;
         Menu.prototype.popup = function (options) {
           globalThis.recordedContextMenus.push(this.items.map((item) => item.role ?? item.label));
-          setTimeout(() => this.closePopup(), 1200);
+          globalThis.openContextMenus += 1;
+          setTimeout(() => {
+            this.closePopup();
+            globalThis.openContextMenus -= 1;
+          }, 1200);
           return popup.call(this, options);
         };
       });
@@ -123,8 +157,7 @@ describe(
       await command.click({ clickCount: 3 });
       seen.commandSelection = await selectionText(consolePage);
       await consolePage.keyboard.press(COPY_SHORTCUT);
-      await sleep(500);
-      seen.commandClipboard = await readClipboard();
+      seen.commandClipboard = await clipboardAfterCopy();
       seen.commandContextMenus = await rightClickAt(consolePage, command);
 
       await resetClipboard();
@@ -149,8 +182,7 @@ describe(
       await dragAcross(consolePage, status);
       seen.statusDragSelection = await selectionText(consolePage);
       await consolePage.keyboard.press(COPY_SHORTCUT);
-      await sleep(500);
-      seen.statusClipboard = await readClipboard();
+      seen.statusClipboard = await clipboardAfterCopy();
       seen.statusContextMenus = await rightClickAt(consolePage, status);
 
       await resetClipboard();
@@ -158,27 +190,30 @@ describe(
         .locator(".xterm-rows > div", { hasText: "OMNIGENT_AUTH_REQUIRED" })
         .first();
       await dragAcross(consolePage, errorRow);
-      await sleep(300);
-      seen.terminalSelected = await consolePage.evaluate(
-        () => document.querySelectorAll(".xterm-selection div").length > 0,
+      seen.terminalSelected = await pollUntil(
+        () =>
+          consolePage.evaluate(() => document.querySelectorAll(".xterm-selection div").length > 0),
+        3_000,
       );
       await consolePage.keyboard.press(COPY_SHORTCUT);
-      await sleep(500);
-      seen.terminalClipboard = await readClipboard();
+      seen.terminalClipboard = await clipboardAfterCopy();
       seen.terminalContextMenus = await rightClickAt(consolePage, errorRow);
       await sleep(1000);
     });
 
     after(async () => {
-      if (app) {
-        await app.electronApp.close();
-        await app.stopDisplayCapture();
-        saved = saveRecording(RECORD_DIR, "arca-console-copy");
-        fs.rmSync(app.userDataDir, { recursive: true, force: true });
+      try {
+        if (app) {
+          await app.electronApp.close().catch(() => {});
+          await app.stopDisplayCapture();
+          saved = saveRecording(RECORD_DIR, "arca-console-copy");
+          fs.rmSync(app.userDataDir, { recursive: true, force: true });
+        }
+      } finally {
+        if (server) await server.close();
+        if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
       }
-      if (server) await server.close();
-      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
-      assert.ok(saved && saved.length > 0, "no desktop recording was produced");
+      if (app) assert.ok(saved && saved.length > 0, "no desktop recording was produced");
     });
 
     it("copies the command line with mouse selection and the copy shortcut", () => {

@@ -108,6 +108,7 @@ it("keeps the failure text selectable and lets the copy shortcut copy terminal o
   assert.equal(term.keyHandler(key("keydown", { key: "c", metaKey: true })), false);
   assert.equal(term.keyHandler(key("keyup", { key: "c", ctrlKey: true })), false);
   assert.equal(term.keyHandler(key("keydown", { key: "c", ctrlKey: true, altKey: true })), true);
+  assert.equal(term.keyHandler(key("keydown", { key: "C", ctrlKey: true, shiftKey: true })), true);
   assert.equal(term.keyHandler(key("keydown", { key: "v", ctrlKey: true })), true);
   assert.equal(term.keyHandler(key("keydown", { key: "c" })), true);
   term.selected = false;

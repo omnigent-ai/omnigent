@@ -12,7 +12,30 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { saveRecording, startPrivateDisplay } = require("../e2e/desktopHarness");
+const {
+  desktopDepsAvailable,
+  launchDesktop,
+  saveRecording,
+  startPrivateDisplay,
+} = require("../e2e/desktopHarness");
+
+const xvfbAvailable =
+  process.platform === "linux" &&
+  spawnSync("Xvfb", ["-help"], { stdio: "ignore" }).error === undefined;
+
+/** Poll `predicate` every 50ms until it holds or `timeoutMs` passes. */
+async function waitFor(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  // Each probe must follow the previous one and the pause between them.
+  /* oxlint-disable no-await-in-loop */
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  }
+  /* oxlint-enable no-await-in-loop */
+  return predicate();
+}
 
 describe("saveRecording", () => {
   let dir;
@@ -63,9 +86,6 @@ describe("saveRecording", () => {
 });
 
 describe("startPrivateDisplay", () => {
-  const xvfbAvailable =
-    process.platform === "linux" &&
-    spawnSync("Xvfb", ["-help"], { stdio: "ignore" }).error === undefined;
   let savedDisplay;
 
   beforeEach(() => {
@@ -95,7 +115,48 @@ describe("startPrivateDisplay", () => {
       } finally {
         await owned.stop();
       }
-      assert.equal(fs.existsSync(socket), false);
+      // Xvfb unlinks its socket on SIGTERM shortly after exiting.
+      assert.ok(await waitFor(() => !fs.existsSync(socket), 3_000), `X socket left at ${socket}`);
+    },
+  );
+});
+
+describe("launchDesktop display lifecycle", () => {
+  const deps = desktopDepsAvailable();
+  const canRun = xvfbAvailable && deps.ok;
+  let savedDisplay;
+  let recordDir;
+
+  beforeEach(() => {
+    savedDisplay = process.env.DISPLAY;
+    recordDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-launch-display-"));
+  });
+
+  afterEach(() => {
+    if (savedDisplay === undefined) delete process.env.DISPLAY;
+    else process.env.DISPLAY = savedDisplay;
+    fs.rmSync(recordDir, { recursive: true, force: true });
+  });
+
+  it(
+    "releases the owned Xvfb when the app closes without stopDisplayCapture",
+    { skip: canRun ? false : "needs Linux with Xvfb, electron and playwright installed" },
+    async () => {
+      delete process.env.DISPLAY;
+      // No server URL: the shell boots to its bundled setup page.
+      const app = await launchDesktop({ recordDir });
+      const socket = `/tmp/.X11-unix/X${app.display.slice(1)}`;
+      try {
+        assert.ok(fs.existsSync(socket), `no X socket at ${socket}`);
+        await app.electronApp.close();
+        assert.ok(
+          await waitFor(() => !fs.existsSync(socket), 10_000),
+          `X socket left at ${socket}`,
+        );
+      } finally {
+        await app.stopDisplayCapture();
+        fs.rmSync(app.userDataDir, { recursive: true, force: true });
+      }
     },
   );
 });

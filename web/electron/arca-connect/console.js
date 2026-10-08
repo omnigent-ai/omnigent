@@ -51,7 +51,12 @@ let fitAddon = null;
 
 /** Ctrl+C / Cmd+C, on any of the keydown/keypress/keyup events xterm forwards. */
 function isCopyShortcut(event) {
-  return (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "c";
+  return (
+    (event.ctrlKey || event.metaKey) &&
+    !event.altKey &&
+    !event.shiftKey &&
+    event.key.toLowerCase() === "c"
+  );
 }
 
 function ensureTerminal() {

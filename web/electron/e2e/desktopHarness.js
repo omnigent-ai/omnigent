@@ -349,6 +349,12 @@ function startDisplayCapture(recordDir, display) {
   return { stop };
 }
 
+/** Wrap an async `fn` so every call shares the first invocation's promise. */
+function once(fn) {
+  let result = null;
+  return () => (result ??= fn());
+}
+
 /** SIGTERM a child and wait for it to exit (SIGKILL after 5s). */
 function stopProcess(proc) {
   return new Promise((resolve) => {
@@ -391,21 +397,31 @@ function startPrivateDisplay() {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      proc.kill("SIGKILL");
       reject(new Error(`${message}\n${stderr}`.trim()));
     };
-    timer = setTimeout(() => {
-      proc.kill("SIGKILL");
-      fail("Xvfb did not report a display within 15s");
-    }, 15_000);
+    timer = setTimeout(() => fail("Xvfb did not report a display within 15s"), 15_000);
     proc.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
-    proc.stdio[3].on("data", (chunk) => {
+    proc.stdio[3]?.on("data", (chunk) => {
       number += chunk;
       if (settled || !number.includes("\n")) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ display: `:${number.trim()}`, stop: () => stopProcess(proc) });
+      // The display must neither keep Node alive nor outlive it.
+      proc.unref();
+      proc.stderr.unref();
+      proc.stdio[3].unref();
+      const killOnExit = () => proc.kill("SIGTERM");
+      process.once("exit", killOnExit);
+      resolve({
+        display: `:${number.trim()}`,
+        stop: async () => {
+          process.off("exit", killOnExit);
+          await stopProcess(proc);
+        },
+      });
     });
     proc.on("error", (err) => {
       fail(
@@ -437,9 +453,12 @@ function startPrivateDisplay() {
  *   `main.js`, e.g. a stand-in system browser that must exist from launch.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
  *   window: import("playwright").Page, userDataDir: string,
- *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
- *   awaited before `saveRecording` (it finalizes the composited capture and
- *   shuts down a harness-owned Xvfb; a no-op when neither ran).
+ *   display: string | undefined,
+ *   stopDisplayCapture: () => Promise<void> }>} `display` is the X display the
+ *   app runs on. `stopDisplayCapture` finalizes the composited capture and
+ *   shuts down a harness-owned Xvfb; await it before `saveRecording`. It also
+ *   runs when the app closes, so a lane that never calls it releases its
+ *   display anyway, and repeated calls share one teardown.
  */
 async function launchDesktop(opts) {
   const { _electron: electron } = require("playwright");
@@ -487,10 +506,13 @@ async function launchDesktop(opts) {
   // saveRecording; the per-page clips remain as context.
   const displayCapture = startDisplayCapture(opts.recordDir, display);
 
-  const stopDisplayCapture = async () => {
-    if (displayCapture) await displayCapture.stop();
-    if (privateDisplay) await privateDisplay.stop();
-  };
+  const stopDisplayCapture = once(async () => {
+    try {
+      if (displayCapture) await displayCapture.stop();
+    } finally {
+      if (privateDisplay) await privateDisplay.stop();
+    }
+  });
 
   let electronApp;
   try {
@@ -510,6 +532,11 @@ async function launchDesktop(opts) {
     await stopDisplayCapture();
     throw err;
   }
+  // A lane that only closes Electron must not leave the capture running or an
+  // owned display behind.
+  electronApp.on("close", () => {
+    void stopDisplayCapture();
+  });
   // If locating the shell fails after launch succeeds, close the app so the
   // Electron process isn't orphaned (the caller never got a handle to close).
   let window;
@@ -539,7 +566,7 @@ async function launchDesktop(opts) {
     await stopDisplayCapture();
     throw err;
   }
-  return { electronApp, window, userDataDir, stopDisplayCapture };
+  return { electronApp, window, userDataDir, display, stopDisplayCapture };
 }
 
 /**
