@@ -50,5 +50,5 @@ def test_lane_captions_take_screen_arrangement_from_the_frame() -> None:
 
     assert "the order of rows in a menu or picker, which row is first or checked" in lanes
     assert "from the frame itself or from a driver assertion on the rendered elements" in lanes
+    assert "which row is first or checked, the exact text of a label" in lanes
     assert "never from the design, the fix description, or the test's intent" in lanes
-    assert 'lists "Harness default" first and the gateway models below it' in lanes
