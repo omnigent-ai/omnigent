@@ -130,6 +130,7 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(f"unexpected subprocess during readiness tests: {argv!r}")
 
     monkeypatch.setattr(hi.subprocess, "run", _stub_run)
+    monkeypatch.setattr(hi, "_run_cli_probe", _stub_run)
     # Auth-aware native harnesses (now including Cursor native) check login state
     # in the picker map. Treat them as logged in when the test just needs
     # "binary present".
