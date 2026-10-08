@@ -781,8 +781,7 @@ def _parse_harness_cli_version(text: str) -> str | None:
 # The readiness cap matches goose's status-probe budget (``_INFO_TIMEOUT_S``):
 # enough for a healthy ``auth status`` keychain read / token refresh, short
 # enough that a wedged CLI fails fast. Probes run through ``run_isolated`` so a
-# timeout also stops whatever the CLI spawned (an updater's ``git fetch``)
-# instead of leaking it to the host daemon on every readiness refresh.
+# timeout tears down the CLI's descendants instead of leaking them to the daemon.
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 

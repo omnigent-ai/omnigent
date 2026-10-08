@@ -417,8 +417,8 @@ def run_isolated(
     **popen_kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
     """
-    Run ``args`` to completion like :func:`subprocess.run`, killing the whole
-    process tree on timeout.
+    Run ``args`` to completion like :func:`subprocess.run`, tearing down its
+    process group and discoverable descendants on timeout.
 
     ``subprocess.run(timeout=...)`` kills only its direct child, so anything that
     child spawned (an updater, a ``git fetch``) survives the timeout and is
@@ -436,16 +436,24 @@ def run_isolated(
     :raises OSError: When the child cannot be started.
     """
     if capture_output:
+        if popen_kwargs.get("stdout") is not None or popen_kwargs.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not be used with capture_output.")
         popen_kwargs["stdout"] = subprocess.PIPE
         popen_kwargs["stderr"] = subprocess.PIPE
     with subprocess.Popen(args, **popen_kwargs, **spawn_kwargs()) as process:
         remember_process_group(process)
         try:
             stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            kill_tree(process)
+            # Reap the leader without blocking on a surviving descendant that
+            # still holds the pipes; keep the probe's output like subprocess.run.
+            with suppress(Exception):
+                reaped: tuple[Any, Any] = process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
+                exc.stdout, exc.stderr = reaped
+            raise
         except BaseException:
             kill_tree(process)
-            # Reap the leader without waiting forever on a descendant that
-            # survived and still holds the pipes open.
             with suppress(Exception):
                 process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
             raise

@@ -413,8 +413,51 @@ def test_run_isolated_timeout_kills_the_whole_tree(tmp_path: Path) -> None:
     script = f"sleep 300 & echo $! > '{child_pid_path}'; exec sleep 300"
     child_pid: int | None = None
     try:
+        # A 2s timeout keeps the grandchild's pid write ahead of the kill even
+        # on a loaded machine, so this does not race the process teardown.
         with pytest.raises(subprocess.TimeoutExpired):
-            _proc.run_isolated(["sh", "-c", script], timeout=0.5, capture_output=True, text=True)
+            _proc.run_isolated(["sh", "-c", script], timeout=2, capture_output=True, text=True)
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(child_pid)
+    finally:
+        if child_pid is not None and _proc.process_alive(child_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(child_pid).kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX shell")
+def test_run_isolated_kills_the_tree_on_non_timeout_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A non-timeout failure from communicate() must still tear down the tree and
+    # propagate the original exception, not just the timeout path.
+    child_pid_path = tmp_path / "child.pid"
+    script = f"sleep 300 & echo $! > '{child_pid_path}'; exec sleep 300"
+
+    real_communicate = subprocess.Popen.communicate
+    state = {"raised": False}
+
+    def flaky_communicate(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not state["raised"]:
+            # Let the grandchild come up so there is a real tree to tear down.
+            deadline = time.monotonic() + 5
+            while not child_pid_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            state["raised"] = True
+            raise RuntimeError("boom")
+        return real_communicate(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", flaky_communicate)
+
+    child_pid: int | None = None
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            _proc.run_isolated(["sh", "-c", script], timeout=30, capture_output=True, text=True)
+        assert child_pid_path.exists()
         child_pid = int(child_pid_path.read_text())
         deadline = time.monotonic() + 5
         while _proc.process_alive(child_pid) and time.monotonic() < deadline:
