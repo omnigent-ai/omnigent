@@ -516,7 +516,7 @@ async def test_rejected_change_restores_an_effort_the_terminal_reported_before_s
     """A report that precedes the refused write confirms the old effort, so it is restored."""
     session = native_session
     session.codex.failure = "update_refused"
-    real_update = SqlAlchemyConversationStore.update_conversation
+    real_update = SqlAlchemyConversationStore.update_conversation_with_changes
     saving = threading.Event()
     resume = threading.Event()
 
@@ -526,7 +526,9 @@ async def test_rejected_change_restores_an_effort_the_terminal_reported_before_s
             resume.wait(timeout=5.0)
         return real_update(store, *args, **kwargs)
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, "update_conversation", pause_before_saving)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "update_conversation_with_changes", pause_before_saving
+    )
     url = f"/v1/sessions/{session.session_id}"
     pending = asyncio.create_task(client.patch(url, json={"reasoning_effort": "high"}))
     try:
