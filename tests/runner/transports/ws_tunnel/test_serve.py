@@ -414,7 +414,7 @@ async def _serve_until_http_auth_rejection(
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
     # The hint is quoted for POSIX shells; pin that so the assertions hold on Windows.
-    monkeypatch.setattr(cli_invocation_module, "IS_WINDOWS", False, raising=False)
+    monkeypatch.setattr(cli_invocation_module, "IS_WINDOWS", False)
 
     with pytest.raises(RuntimeError, match="HTTP 401") as exc_info:
         await serve_tunnel(
@@ -458,13 +458,11 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
         monkeypatch, server_url="https://example.databricks.com/api/2.0/omnigent?o=123"
     )
 
-    command = _login_hint_command(message)
-    assert command.startswith("isaac omni login "), command
-    assert "https://example.databricks.com/omnigent?o=123" in command
-    # Every glob metacharacter must sit inside quotes (or be escaped) so the
-    # command pastes into a nomatch shell such as zsh unchanged.
-    unquoted = re.sub(r"\\.|'[^']*'|\"[^\"]*\"", "", command)
-    assert not any(ch in unquoted for ch in "?*["), command
+    # Wrapper spelled, and the `?o=` URL quoted so a nomatch shell such as zsh
+    # pastes it unchanged.
+    assert _login_hint_command(message) == (
+        "isaac omni login 'https://example.databricks.com/omnigent?o=123'"
+    )
 
 
 @pytest.mark.skipif(
@@ -502,7 +500,7 @@ async def test_http_auth_rejection_hint_pastes_into_nomatch_shell(
     assert bash is not None
     pasted = subprocess.run(
         [bash, "-O", "failglob", "-c", command],
-        env={"PATH": f"{shims}{os.pathsep}/usr/bin:/bin"},
+        env={"PATH": f"{shims}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}"},
         cwd=str(tmp_path),
         capture_output=True,
         text=True,
@@ -633,7 +631,7 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
     # Pin jitter to 0 so sleep delays are the unjittered backoff curve.
     monkeypatch.setattr(serve_module.random, "uniform", lambda *_args, **_kw: 0.0)
     monkeypatch.delenv(WRAPPER_COMMAND_ENV, raising=False)
-    monkeypatch.setattr(cli_invocation_module, "IS_WINDOWS", False, raising=False)
+    monkeypatch.setattr(cli_invocation_module, "IS_WINDOWS", False)
 
     with pytest.raises(RuntimeError) as exc_info:
         await serve_tunnel(
