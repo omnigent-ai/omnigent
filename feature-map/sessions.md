@@ -100,10 +100,13 @@ to read why it is unsupported.
 The reconnect dialog also disables Clone and Switch host; directory selection
 cannot enable either action.
 While support is being checked, actions stay disabled. If that check fails,
-the explanation asks you to reload. Direct dialogs show a loading status without
+the explanation asks you to reload. A missing source-host record keeps switching
+disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
 an action button until the check finishes; supported forms then receive keyboard focus.
 If the reconnect dialog is already on Clone when an unsupported result arrives,
 it selects Reconnect and explains the restriction.
+An open switch dialog closes when switching becomes unavailable and stays closed
+if support returns; choose Switch host again to reopen it.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
 choose Stop session while a side chat or sub-agent is working. On mobile, open

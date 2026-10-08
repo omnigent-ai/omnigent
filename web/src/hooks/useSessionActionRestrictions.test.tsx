@@ -29,6 +29,10 @@ const getSessionMock = vi.mocked(getSessionSlim);
 const fetchMock = vi.mocked(authenticatedFetch);
 const clients = new Set<QueryClient>();
 const unrestricted = { forkDisabledReason: undefined, switchHostDisabledReason: undefined };
+const unlistedHost = {
+  forkDisabledReason: undefined,
+  switchHostDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
+};
 const unsupported = {
   forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
   switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
@@ -145,9 +149,20 @@ describe("useSessionActionRestrictions", () => {
       await waitFor(() =>
         expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("success"),
       );
-      expect(result.current).toEqual(managed ? unsupported : unrestricted);
+      expect(result.current).toEqual(managed ? unsupported : unlistedHost);
     },
   );
+
+  it("enables switching after an unlisted source host becomes available", async () => {
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ hosts: [] })));
+    const { client, result } = renderRestrictions();
+    await waitFor(() => expect(result.current).toEqual(unlistedHost));
+    fetchMock.mockImplementation(async () => hostsResponse());
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["hosts"] });
+    });
+    await waitFor(() => expect(result.current).toEqual(unrestricted));
+  });
 
   it.each([false, true])(
     "preserves hostless session capabilities without requesting hosts (managed=%s)",
@@ -181,7 +196,8 @@ describe("useSessionActionRestrictions", () => {
         fetchMock.mockImplementation(async () => new Response(JSON.stringify({ hosts: [] })));
       }
       const { client, result, rerender } = renderRestrictions();
-      await waitFor(() => expect(result.current).toEqual(unrestricted));
+      const expected = hostListed ? unrestricted : unlistedHost;
+      await waitFor(() => expect(result.current).toEqual(expected));
       getSessionMock.mockRejectedValue(new Error("Session unavailable"));
       fetchMock.mockRejectedValue(new Error("Hosts unavailable"));
       await act(async () => {
@@ -191,7 +207,7 @@ describe("useSessionActionRestrictions", () => {
       expect(client.getQueryState(["session", "session-1"])?.status).toBe("error");
       expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("error");
       rerender();
-      expect(result.current).toEqual(unrestricted);
+      expect(result.current).toEqual(expected);
     },
   );
 });

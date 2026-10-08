@@ -76,9 +76,7 @@ export function SwitchHostDialog(props: Parameters<typeof SupportedSwitchHostDia
         <DialogContent data-testid="switch-host-dialog" className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Switch host</DialogTitle>
-            <DialogDescription role={loading ? "status" : undefined}>
-              {switchHostDisabledReason}
-            </DialogDescription>
+            <DialogDescription role="status">{switchHostDisabledReason}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="ghost" onClick={() => props.onOpenChange(false)}>

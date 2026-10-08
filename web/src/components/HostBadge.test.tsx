@@ -145,9 +145,7 @@ describe("HostBadge", () => {
       expect(item).toHaveAttribute("aria-disabled", "true");
       fireEvent.focus(item);
       await waitFor(() =>
-        expect(screen.getByRole("tooltip")).toHaveTextContent(
-          "Switching hosts is not supported for this sandbox session yet.",
-        ),
+        expect(screen.getByRole("tooltip")).toHaveTextContent(SANDBOX_SWITCH_HOST_UNSUPPORTED),
       );
       fireEvent.click(item);
       fireEvent.keyDown(item, { key: "Enter" });
@@ -235,6 +233,40 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
   });
 
+  it("keeps focus and an explanation when the host lookup omits the current host", async () => {
+    useHostsMock.mockReturnValue({ data: undefined, isLoading: true });
+    const user = userEvent.setup();
+    const { rerender } = render(<HostBadge sessionId="conv_1" />);
+    await user.tab();
+    useHostsMock.mockReturnValue({ data: [], isLoading: false });
+    rerender(<HostBadge sessionId="conv_1" />);
+    const target = screen.getByRole("group", { name: "Switch host" });
+    expect(target).toHaveFocus();
+    await waitFor(() => expect(target).toHaveAccessibleDescription(SESSION_ACTIONS_UNAVAILABLE));
+    await user.keyboard("{Enter} ");
+    expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+  });
+
+  it.each(["status", "composer"] as const)(
+    "does not reopen the %s switch dialog after a restriction clears",
+    (appearance) => {
+      const { rerender } = render(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      if (appearance === "composer") {
+        fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Switch host…" }));
+      } else {
+        fireEvent.click(screen.getByTestId("host-badge"));
+      }
+      expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
+      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
+      rerender(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+      useHostsMock.mockReturnValue({ data: [host()] });
+      rerender(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+    },
+  );
+
   it.each(["ordinary", "arclet", "lakebox", "loading", "failed"])(
     "hides switch host in read-only %s sessions",
     (state) => {
@@ -254,12 +286,14 @@ describe("HostBadge", () => {
     },
   );
 
-  it("does not offer host switching for a shared host omitted from the host list", () => {
+  it("explains unavailable switching for a shared host omitted from the host list", () => {
     useHostsMock.mockReturnValue({ data: [] });
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
     fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
     expect(screen.getByText("host_a1b2")).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
+    const item = screen.getByRole("menuitem", { name: "Switch host…" });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    expect(item).toHaveAccessibleDescription(SESSION_ACTIONS_UNAVAILABLE);
   });
 
   it("renders the host name with an online status when reachable", () => {

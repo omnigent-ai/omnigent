@@ -233,7 +233,6 @@ describe("<ReconnectSessionDialog />", () => {
     expect(screen.getByTestId("reconnect-session-tab-clone")).toBeDisabled();
     const switchHost = screen.getByTestId("reconnect-session-switch-host");
     expect(switchHost).toBeDisabled();
-    fireEvent.click(switchHost);
     const user = userEvent.setup();
     const target = screen.getByRole("group", { name });
     expect(target).toHaveAttribute("tabindex", "0");
@@ -242,6 +241,7 @@ describe("<ReconnectSessionDialog />", () => {
     await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent(reason));
     expect(target).toHaveAccessibleDescription(reason);
     await user.keyboard("{Enter} ");
+    await user.click(target);
     expect(clonePanelState()).toBe("inactive");
     expect(screen.queryByTestId("switch-host-dialog-stub")).not.toBeInTheDocument();
   });

@@ -24,14 +24,18 @@ export function useSessionActionRestrictions(
   const host = hosts?.find((candidate) => candidate.host_id === hostId);
   const restrictions = sessionActionRestrictions(session ?? fallback, host);
   const loading = Boolean(sessionId && isLoading) || Boolean(hostId && hostsLoading);
-  // Successful host lists can omit shared hosts; their snapshot carries the managed label.
+  // Cached lists can omit shared hosts without making supported forks unavailable.
   const lookupFailed =
     Boolean(sessionId && !session && error) || Boolean(hostId && !hosts && hostsError);
   let lookupReason: string | undefined;
   if (lookupFailed) lookupReason = SESSION_ACTIONS_UNAVAILABLE;
   else if (loading) lookupReason = SESSION_ACTIONS_LOADING;
+  const hostMissing = Boolean(hostId && hosts && !host);
   return {
     forkDisabledReason: restrictions.forkDisabledReason ?? lookupReason,
-    switchHostDisabledReason: restrictions.switchHostDisabledReason ?? lookupReason,
+    switchHostDisabledReason:
+      restrictions.switchHostDisabledReason ??
+      lookupReason ??
+      (hostMissing ? SESSION_ACTIONS_UNAVAILABLE : undefined),
   };
 }

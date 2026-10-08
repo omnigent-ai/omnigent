@@ -160,6 +160,17 @@ describe("SwitchHostDialog", () => {
     expect(updateSessionMock).not.toHaveBeenCalled();
     expect(launchRunnerMock).not.toHaveBeenCalled();
 
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: false,
+      error: new Error("Session unavailable"),
+    });
+    rerender(content());
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Unable to check session capabilities. Reload to try again.",
+    );
+    expect(screen.getByTestId("switch-host-button")).toBeDisabled();
+
     vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
     rerender(content());
     await waitFor(() => expect(screen.getByTestId("mock-host-select")).toHaveFocus());

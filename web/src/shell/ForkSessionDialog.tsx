@@ -692,7 +692,7 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
     return (
       <>
         <p
-          role={loading ? "status" : undefined}
+          role="status"
           className="text-sm text-muted-foreground"
           data-testid="fork-session-unavailable"
         >

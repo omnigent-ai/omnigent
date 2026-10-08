@@ -284,6 +284,17 @@ describe("ForkSessionDialog", () => {
     const { refresh } = renderDialog();
     expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
 
+    useSessionMock.mockReturnValue({
+      session: null,
+      isLoading: false,
+      error: new Error("Session unavailable"),
+    });
+    refresh();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Unable to check session capabilities. Reload to try again.",
+    );
+    expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+
     useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
     refresh();
     expect(screen.getByTestId("fork-session-agent-select")).toHaveFocus();

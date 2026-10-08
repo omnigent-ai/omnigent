@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
@@ -132,9 +132,12 @@ export function HostBadge({
 
   const badge = resolveHostBadge({ hostId, host, online });
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
+  const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
+  useEffect(() => {
+    if (!canSwitch) setSwitchOpen(false);
+  }, [canSwitch]);
   if (appearance === "composer") {
     const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
-    const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
     const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
     return (
       <>
@@ -234,8 +237,6 @@ export function HostBadge({
     );
   }
 
-  // Only a resolved, supported host can offer a manual switch.
-  const canSwitch = host !== undefined && !switchHostDisabledReason;
   return (
     <>
       <DisabledActionTooltip

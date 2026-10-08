@@ -8,8 +8,8 @@ export const SESSION_ACTIONS_UNAVAILABLE =
   "Unable to check session capabilities. Reload to try again.";
 
 /**
- * Fallback when the embedded marker is absent; keep IDs aligned with
- * capabilities.ts's provider labels. Other core sandbox providers support forking.
+ * Fallback wire IDs for snapshots missing the deployment's managed marker.
+ * Other sandbox providers remain forkable in the core server.
  */
 const UNSUPPORTED_FORK_PROVIDERS = new Set(["arclet", "lakebox"]);
 

@@ -188,9 +188,8 @@ export function ReconnectSessionDialog({
     conversationId,
     { hostId: sourceHostId },
   );
-  // Only a settled restriction drives the default tab, the Clone trigger, and
-  // the copy: a disabled trigger would hand the dialog's initial focus to
-  // Reconnect and activate it, so the loading placeholder never disables Clone.
+  // Loading never disables Clone: a disabled trigger would hand initial focus
+  // to Reconnect and activate it before the capability check finishes.
   const forkRestriction =
     forkDisabledReason === SESSION_ACTIONS_LOADING ? undefined : forkDisabledReason;
   useEffect(() => {
@@ -208,6 +207,8 @@ export function ReconnectSessionDialog({
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
   const showCommand = isOwner || !isHostReconnect;
+  const defaultTab = showCommand ? "reconnect" : "clone";
+  const resolvedTab = forkRestriction ? "reconnect" : (selectedTab ?? defaultTab);
   const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, harness, state });
   // Titles mirror the unreachable banner's wording ("Host is offline —
   // click to reconnect" / "Agent disconnected — click to reconnect").
@@ -237,9 +238,7 @@ export function ReconnectSessionDialog({
           {/* Restrictions can arrive after opening Clone; preserve the form
             while moving the user to Reconnect. Closing resets the selection. */}
           <Tabs
-            value={
-              forkRestriction ? "reconnect" : (selectedTab ?? (showCommand ? "reconnect" : "clone"))
-            }
+            value={resolvedTab}
             onValueChange={setSelectedTab}
             className="flex min-h-0 flex-1 flex-col gap-4"
             componentId="reconnect.tabs"
