@@ -30,6 +30,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native.main import _claude_background_session_holds_id
 from omnigent.runner.app import _build_claude_native_base_args
 
 _CLAUDE_BINARY = os.environ.get("OMNIGENT_E2E_CLAUDE_RESUME_BIN") or shutil.which("claude")
@@ -92,10 +93,10 @@ def test_resume_of_still_live_session_is_not_refused(
 ) -> None:
     """The runner's resume launch must succeed against a still-live session.
 
-    Launches a background session that stays alive, then runs the exact argv the
-    runner builds for a resume. Today the Claude CLI refuses with its
-    background-session guard and a non-zero exit; the fix must let the resume
-    proceed.
+    Launches a background session that stays alive, confirms the production
+    holder probe recognises it, then runs the exact argv the runner builds for
+    a resume and asserts the CLI does not refuse with its background-session
+    guard.
     """
     mock = isolated_mock_llm_server_url
     # Fallback response lets the resume turn complete; the parked background
@@ -112,6 +113,16 @@ def test_resume_of_still_live_session_is_not_refused(
     try:
         _claude(env, "--bg", "say hello", timeout=60, check=True)
         external_session_id = _await_live_background_session(env)
+
+        # The runner only branches a copy if the production probe recognises
+        # this live holder against the real ``claude agents --json`` schema; a
+        # schema mismatch here would silently reintroduce the refusal.
+        assert _claude_background_session_holds_id(
+            external_session_id,
+            claude_binary=_CLAUDE_BINARY,
+            cwd=str(tmp_path),
+            env=env,
+        ), "production holder probe did not detect the live background session"
 
         resume_args = _build_claude_native_base_args(
             reasoning_effort=None,

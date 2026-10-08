@@ -8372,51 +8372,93 @@ async def _auto_create_claude_terminal(
     # transcript that doesn't exist. See
     # designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
     resume_external_session_id: str | None = None
-    # Byte length of the synthesized resume transcript, measured before Claude
-    # starts; the forwarder seeds its cursor from this measured prefix rather
-    # than a racy live end-offset that can skip the freshly-injected prompt.
+    # Byte length of the resume transcript, measured before Claude starts; the
+    # forwarder seeds its cursor from this measured prefix rather than a racy
+    # live end-offset that can skip the freshly-injected prompt.
     resume_prefix_bytes: int | None = None
-    # Fork (``--fork-session``) instead of reattaching only when a separate
-    # live process still holds this id; a bare ``--resume`` is then refused
-    # by Claude's background-session guard.
+    # Fork (``--fork-session``) instead of resuming only as a fallback: a live
+    # process holding this id refuses a bare ``--resume``, and we fork only
+    # when we could not clone the holder's transcript to a fresh id.
     resume_fork = False
     if server_client is not None and session_external_id is not None:
         from omnigent.harnesses.claude_native.main import (
             _claude_background_session_holds_id,
+            _clone_claude_transcript,
             _ensure_local_claude_resume_transcript,
         )
 
+        _workspace_resolved = Path(workspace).resolve()
+        # Resolve holder status first: a live process holding this id refuses a
+        # bare ``--resume`` and its live transcript must not be overwritten.
         try:
-            _transcript = await _ensure_local_claude_resume_transcript(
-                server_client,
-                session_id=session_id,
-                external_session_id=session_external_id,
-                workspace=Path(workspace).resolve(),
-                bridge_dir=bridge_dir,
+            _held = await asyncio.to_thread(
+                _claude_background_session_holds_id,
+                session_external_id,
+                cwd=str(_workspace_resolved),
             )
+        except Exception:  # noqa: BLE001 — best-effort probe; assume no holder
+            _held = False
+        if _held:
+            # Clone the holder's live transcript under a fresh id and resume
+            # that copy, leaving the held file untouched. The measured prefix
+            # bounds the cursor past the copied history.
+            _our_uuid = str(uuid.uuid4())
+            try:
+                _cloned = _clone_claude_transcript(
+                    source_external_session_id=session_external_id,
+                    target_external_session_id=_our_uuid,
+                    clone_workspace=_workspace_resolved,
+                )
+            except Exception:  # noqa: BLE001 — best-effort; fork or launch fresh
+                _cloned = None
+                _logger.warning(
+                    "Could not clone live-holder transcript for %s; forking instead",
+                    session_id,
+                    exc_info=True,
+                )
+            if _cloned is not None:
+                resume_external_session_id = _our_uuid
+                resume_prefix_bytes = _measured_prefix_bytes(_cloned)
+                try:
+                    await server_client.patch(
+                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                        json={"external_session_id": _our_uuid},
+                        params={"include_usage": "false"},
+                        timeout=10.0,
+                    )
+                except httpx.HTTPError:
+                    _logger.warning(
+                        "Could not pre-set external_session_id for live-holder "
+                        "resume clone %s; relying on hook capture",
+                        session_id,
+                        exc_info=True,
+                    )
+        if resume_external_session_id is None:
+            # No holder, or the clone failed: synthesize the local transcript
+            # ``--resume`` reads. A still-live holder refuses the bare resume,
+            # so fork; otherwise reattach in place at the measured end.
+            try:
+                _transcript = await _ensure_local_claude_resume_transcript(
+                    server_client,
+                    session_id=session_id,
+                    external_session_id=session_external_id,
+                    workspace=_workspace_resolved,
+                    bridge_dir=bridge_dir,
+                )
+            except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+                _transcript = None
+                _logger.warning(
+                    "Could not synthesize Claude resume transcript for %s; "
+                    "launching without --resume",
+                    session_id,
+                    exc_info=True,
+                )
             if _transcript is not None:
                 resume_external_session_id = session_external_id
-                resume_prefix_bytes = _measured_prefix_bytes(_transcript)
-                try:
-                    _held = await asyncio.to_thread(
-                        _claude_background_session_holds_id,
-                        session_external_id,
-                        cwd=str(Path(workspace).resolve()),
-                    )
-                except Exception:  # noqa: BLE001 — best-effort probe; keep in-place resume
-                    _held = False
                 if _held:
-                    # A live process holds this id, so a bare ``--resume`` is
-                    # refused: fork a copy. The fork tails the live session,
-                    # not our synthesized file, so drop the synthesized prefix.
                     resume_fork = True
-                    resume_prefix_bytes = None
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _logger.warning(
-                "Could not synthesize Claude resume transcript for %s; launching without --resume",
-                session_id,
-                exc_info=True,
-            )
+                else:
+                    resume_prefix_bytes = _measured_prefix_bytes(_transcript)
     elif session_external_id is None and fork_source_external_id is not None:
         # Forked clone with no native session yet: clone the SOURCE's
         # local Claude transcript into the clone's OWN project dir under a

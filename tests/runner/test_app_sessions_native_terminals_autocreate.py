@@ -2178,22 +2178,23 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_forks_when_a_live_process_holds_the_session(
+async def test_auto_create_claude_terminal_clones_when_a_live_process_holds_the_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Resume branches a copy when a live process still holds the session id.
+    Resume branches off a measured clone when a live process holds the id.
 
     When the user resumes a session whose Claude id is still held alive by a
     separate process (e.g. the local terminal that created it is still
     attached), a bare ``claude --resume <id>`` is refused by Claude's
-    background-session guard -- the reported failure. The runner must detect
-    the live holder and launch ``claude --resume <id> --fork-session`` so the
-    resume branches a copy instead of erroring. Because the fork starts from
-    the live session rather than the synthesized transcript, the forwarder must
-    also drop the synthesized prefix (``start_at_offset=None``) while still
-    seeking to the tail (``start_at_end=True``) so it does not re-post history.
+    background-session guard -- the reported failure. The runner detects the
+    live holder, clones its transcript under a fresh id without overwriting the
+    held file, re-keys the Omnigent session to that id, and resumes the copy
+    with a plain ``--resume <our_uuid>`` (no ``--fork-session``). The forwarder
+    seeds from the clone's measured prefix (``start_at_offset``), so a prompt
+    injected during boot lands past that boundary and is forwarded once while
+    the copied history is not replayed -- the loss a live end-offset seed risks.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -2215,21 +2216,16 @@ async def test_auto_create_claude_terminal_forks_when_a_live_process_holds_the_s
         _capture_forwarder,
     )
 
-    async def _fake_synth(
-        client: Any,
-        *,
-        session_id: str,
-        external_session_id: str,
-        workspace: Path,
-        bridge_dir: Path,
-    ) -> Path:
-        """Return a transcript path so the resume branch sets ``--resume``."""
-        del client, session_id, workspace, bridge_dir
-        return tmp_path / f"{external_session_id}.jsonl"
+    # Synthesis would overwrite the live holder's transcript, so the held path
+    # must clone instead of calling it.
+    async def _fail_synth(*args: Any, **kwargs: Any) -> Path:
+        """Fail if the held resume synthesizes over the holder's transcript."""
+        del args, kwargs
+        raise AssertionError("held resume must clone, not synthesize in place")
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
-        _fake_synth,
+        _fail_synth,
     )
 
     holds_calls: list[str] = []
@@ -2245,8 +2241,41 @@ async def test_auto_create_claude_terminal_forks_when_a_live_process_holds_the_s
         _fake_holds,
     )
 
+    clone_calls: list[dict[str, Any]] = []
+    # Stand-in for the holder's copied history; its byte length is the prefix
+    # the forwarder must seed past.
+    clone_body = "".join(
+        json.dumps({"type": "user", "uuid": f"copied{n}", "message": {"role": "user"}}) + "\n"
+        for n in range(3)
+    )
+
+    def _fake_clone(
+        *,
+        source_external_session_id: str,
+        target_external_session_id: str,
+        clone_workspace: Path,
+    ) -> Path:
+        """Write the clone file under the assigned id and record the call."""
+        clone_calls.append(
+            {
+                "source": source_external_session_id,
+                "target": target_external_session_id,
+                "workspace": clone_workspace,
+            }
+        )
+        clone_path = tmp_path / f"{target_external_session_id}.jsonl"
+        clone_path.write_text(clone_body, encoding="utf-8")
+        return clone_path
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._clone_claude_transcript",
+        _fake_clone,
+    )
+
+    patched: list[dict[str, Any]] = []
+
     class _SnapshotServerClient(NullServerClient):
-        """Server client whose session snapshot carries the resume id."""
+        """Server client carrying the resume id and capturing the id re-key."""
 
         async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
             """Return the session snapshot, or empty labels for the bridge check."""
@@ -2272,6 +2301,11 @@ async def test_auto_create_claude_terminal_forks_when_a_live_process_holds_the_s
                     return {"external_session_id": resume_id}
 
             return _SnapResponse()
+
+        async def patch(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            """Record the external_session_id re-key to the clone's id."""
+            patched.append({"url": url, "json": kwargs.get("json")})
+            return self._Response()
 
     launched_args: list[str] = []
 
@@ -2310,23 +2344,33 @@ async def test_auto_create_claude_terminal_forks_when_a_live_process_holds_the_s
 
     await asyncio.sleep(0)
 
-    # The live holder was probed with the resumed id.
+    # The live holder was probed with the resumed id, then its transcript was
+    # cloned under a fresh id in the launch workspace -- never overwritten.
     assert holds_calls == [resume_id]
+    assert len(clone_calls) == 1
+    assert clone_calls[0]["source"] == resume_id
+    our_uuid = clone_calls[0]["target"]
+    assert our_uuid != resume_id
+    assert clone_calls[0]["workspace"] == (tmp_path / "workspace").resolve()
 
-    # Launch forks the live session: ``--fork-session`` sits immediately after
-    # ``--resume <id>`` so Claude branches a copy instead of being refused.
-    assert "--fork-session" in launched_args, launched_args
+    # Launch resumes the CLONE in place (plain ``--resume <our_uuid>``), not the
+    # held id, and never passes ``--fork-session``.
+    assert "--fork-session" not in launched_args, launched_args
     resume_index = launched_args.index("--resume")
-    assert launched_args[resume_index : resume_index + 3] == [
-        "--resume",
-        resume_id,
-        "--fork-session",
-    ], launched_args
+    assert launched_args[resume_index + 1] == our_uuid, launched_args
+    assert resume_id not in launched_args, launched_args
 
-    # The fork starts from the live session, not the synthesized transcript, so
-    # the forwarder seeks to the tail with no synthesized prefix to skip past.
+    # Omnigent is re-keyed to the clone's id so a later relaunch resumes it.
+    assert {
+        "url": "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2",
+        "json": {"external_session_id": our_uuid},
+    } in patched
+
+    # The forwarder seeds from the clone's measured prefix, not a live
+    # end-offset: a boot-window prompt lands past this boundary and is
+    # forwarded once while the copied history is not replayed.
     assert forwarder_kwargs.get("start_at_end") is True
-    assert forwarder_kwargs.get("start_at_offset") is None
+    assert forwarder_kwargs.get("start_at_offset") == len(clone_body.encode())
 
 
 @pytest.mark.asyncio
