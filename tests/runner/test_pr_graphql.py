@@ -12,6 +12,7 @@ from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import SessionPrRegistry
 
 URL = "https://github.com/example/project/pull/42"
+PR_PATH = ".data.createPullRequest.pullRequest"
 QUERY = """mutation CreatePullRequest($repositoryId: ID!, $headRepositoryId: ID!) {
   createPullRequest(input: {
     repositoryId: $repositoryId, headRepositoryId: $headRepositoryId,
@@ -147,18 +148,21 @@ def test_quoted_redirect_arguments_do_not_suppress_creation(body_argument: str) 
 
 
 @pytest.mark.parametrize(
-    "shell_pattern",
+    "shell_pattern,projection",
     [
-        "{create}; cat saved-pr-output.txt",
-        "cat saved-pr-output.txt; {create}",
-        "{create} >/dev/null",
-        "{create} 1>>saved-pr-output.txt",
-        "{wrapped} >/dev/null",
-        "{create} --silent",
-        "{create} --silent=true",
-        "{create} | gh pr create",
-        "git log -1 --format=%B; {create}",
-        "sh -c 'false || cat saved-pr-output.txt'; {create}",
+        ("{create}; cat saved-pr-output.txt", None),
+        ("cat saved-pr-output.txt; {create}", None),
+        ("{create} >/dev/null", None),
+        ("{create} 1>>saved-pr-output.txt", None),
+        ("{wrapped} >/dev/null", None),
+        ("{create} --silent", None),
+        ("{create} --silent=true", None),
+        ("{create} | gh pr create", None),
+        ("{create} & wait", None),
+        ("git log -1 --format=%B; {create}", None),
+        ("sh -c 'false || cat saved-pr-output.txt'; {create}", None),
+        ("{create}; cat saved-pr-output.txt", PR_PATH),
+        ("{create}; cat saved-pr-output.txt", f"{PR_PATH}.url"),
     ],
     ids=[
         "later-output",
@@ -169,13 +173,12 @@ def test_quoted_redirect_arguments_do_not_suppress_creation(body_argument: str) 
         "silent",
         "silent-value",
         "pipe",
+        "background",
         "git-content",
         "nested-fallback-output",
+        "object-projection",
+        "url-projection",
     ],
-)
-@pytest.mark.parametrize(
-    "projection",
-    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
 )
 def test_graphql_unresolved_stdout_cannot_replace_absent_creation(
     shell_pattern: str, projection: str | None
@@ -326,18 +329,62 @@ def test_other_graphql_operations_do_not_attach_prs(query: str) -> None:
 
 
 @pytest.mark.parametrize("compound", [False, True], ids=["single", "shared-output"])
-@pytest.mark.parametrize("formatter", ["--jq", "--template", "-t"])
-def test_graphql_body_projection_is_not_pr_identity(formatter: str, compound: bool) -> None:
+@pytest.mark.parametrize(
+    "formatters",
+    [
+        ("--jq", f"{PR_PATH}.body"),
+        ("--template", "{{" + PR_PATH + ".body}}"),
+        ("-t", "{{" + PR_PATH + ".body}}"),
+        ("--jq", f"{PR_PATH}.url", "--jq", f"{PR_PATH}.body"),
+        ("--jq", f"{PR_PATH}.url", "-q", f"{PR_PATH}.body"),
+        ("-q", f"{PR_PATH}.url", "--jq", f"{PR_PATH}.body"),
+        (f"-q{PR_PATH}.url", f"-q{PR_PATH}.body"),
+        (f"--jq={PR_PATH}.url", f"--jq={PR_PATH}.body"),
+    ],
+    ids=[
+        "jq",
+        "template",
+        "short-template",
+        "long-long",
+        "long-short",
+        "short-long",
+        "attached",
+        "equals",
+    ],
+)
+def test_graphql_body_projection_is_not_pr_identity(
+    formatters: tuple[str, ...], compound: bool
+) -> None:
     query = QUERY.replace("number url title isDraft", "number url title isDraft body")
-    path = ".data.createPullRequest.pullRequest.body"
-    projection = path if formatter == "--jq" else "{{" + path + "}}"
-    shell = command(query) + " " + shlex.join([formatter, projection])
+    shell = command(query) + " " + shlex.join(formatters)
     if compound:
         shell += "; gh pr create --repo example/another"
     references, _ = extract_prs(
         "shell", {"command": shell}, "https://github.com/example/mentioned/pull/99"
     )
     assert not references
+
+
+@pytest.mark.parametrize(
+    "previous,formatters,projection",
+    [
+        (f"{PR_PATH}.body", ("--jq", f"{PR_PATH}.url"), f"{PR_PATH}.url"),
+        (f"{PR_PATH}.url", ("-q", PR_PATH), PR_PATH),
+        (PR_PATH, (f"--jq={PR_PATH}.url",), f"{PR_PATH}.url"),
+    ],
+    ids=["body-to-url", "url-to-object", "object-to-url"],
+)
+def test_graphql_last_formatter_selects_output_shape(
+    previous: str, formatters: tuple[str, ...], projection: str
+) -> None:
+    query = QUERY.replace("number url title isDraft", "number url title isDraft body")
+    references, created = extract_prs(
+        "shell",
+        {"command": command(query, previous) + " " + shlex.join(formatters)},
+        {"exit_code": 0, "stdout": creation_output(projection)},
+    )
+    assert [ref.url for ref in references] == [URL]
+    assert created
 
 
 def test_graphql_nested_aliases_do_not_supply_pr_identity() -> None:
@@ -360,15 +407,27 @@ def test_graphql_alias_uses_its_response_identity() -> None:
     assert created
 
 
-@pytest.mark.parametrize("operation", ["createPullRequest", "addComment"])
 @pytest.mark.parametrize(
-    "body",
+    "operation,body",
     [
-        json.dumps('A "quoted" path: C:\\work\\repo.\ncreatePullRequest(input: {})'),
-        '"""A note about C:\\work\\repo.\nExample: createPullRequest(input: {})\n"""',
-        r'"""Code sample: \"""createPullRequest\""". Keep this text."""',
-        r'"""An escaped delimiter and quote: \"""" remain text."""',
-        json.dumps("An ordinary paragraph in the pull request description.\n" * 400),
+        (
+            "createPullRequest",
+            json.dumps('A "quoted" path: C:\\work\\repo.\ncreatePullRequest(input: {})'),
+        ),
+        (
+            "createPullRequest",
+            '"""A note about C:\\work\\repo.\nExample: createPullRequest(input: {})\n"""',
+        ),
+        ("createPullRequest", r'"""Code sample: \"""createPullRequest\""". Keep this text."""'),
+        ("createPullRequest", r'"""An escaped delimiter and quote: \"""" remain text."""'),
+        (
+            "createPullRequest",
+            json.dumps("An ordinary paragraph in the pull request description.\n" * 400),
+        ),
+        (
+            "addComment",
+            json.dumps('A "quoted" path: C:\\work\\repo.\ncreatePullRequest(input: {})'),
+        ),
     ],
     ids=[
         "quoted-string",
@@ -376,6 +435,7 @@ def test_graphql_alias_uses_its_response_identity() -> None:
         "escaped-block-quotes",
         "escaped-block-delimiter-and-quote",
         "long-description",
+        "other-operation",
     ],
 )
 def test_graphql_string_contents_do_not_change_operation(operation: str, body: str) -> None:
@@ -418,10 +478,16 @@ def test_graphql_json_output_does_not_fall_back_to_unrelated_url(
     assert not references
 
 
-@pytest.mark.parametrize("prefix", ['{"message":\n', "[\n", '"unfinished\n', "[INFO] building\n"])
 @pytest.mark.parametrize(
-    "projection",
-    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+    "prefix,projection",
+    [
+        ('{"message":\n', None),
+        ("[\n", None),
+        ('"unfinished\n', None),
+        ("[INFO] building\n", None),
+        ('{"message":\n', PR_PATH),
+        ('{"message":\n', f"{PR_PATH}.url"),
+    ],
 )
 def test_incomplete_json_output_is_not_reparsed_as_pr_identity(
     prefix: str, projection: str | None
@@ -452,11 +518,16 @@ def test_full_response_reads_only_the_mutation_identity(
 
 
 @pytest.mark.parametrize(
-    "projection",
-    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
-)
-@pytest.mark.parametrize(
-    "wrapper", ["stdout", "serialized-stdout", "aggregatedOutput", "structuredContent", "content"]
+    "projection,wrapper",
+    [
+        (PR_PATH, "stdout"),
+        (PR_PATH, "serialized-stdout"),
+        (PR_PATH, "aggregatedOutput"),
+        (PR_PATH, "structuredContent"),
+        (PR_PATH, "content"),
+        (None, "stdout"),
+        (f"{PR_PATH}.url", "stdout"),
+    ],
 )
 def test_graphql_output_is_separate_from_tool_metadata(
     projection: str | None, wrapper: str

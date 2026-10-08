@@ -53,8 +53,11 @@ _WRITE_API_OPERATIONS = {
 }
 
 
-def _flag(tokens: list[str], *names: str) -> str | None:
-    for index, token in enumerate(tokens):
+def _flag(tokens: list[str], *names: str, last: bool = False) -> str | None:
+    # Scalar formatter flags use the final occurrence, including mixed aliases.
+    indices = range(len(tokens) - 1, -1, -1) if last else range(len(tokens))
+    for index in indices:
+        token = tokens[index]
         for name in names:
             if token == name and index + 1 < len(tokens):
                 return tokens[index + 1]
@@ -365,7 +368,7 @@ def _content_only(tokens: list[str]) -> bool:
         # A template prints any selected field, so its output has no identity provenance.
         if _flag(tokens, "--template", "-t") is not None:
             return True
-        projection = _flag(tokens, "--jq", "-q")
+        projection = _flag(tokens, "--jq", "-q", last=True)
         path = f".data.{field}.pullRequest"
         if projection is not None:
             return projection.strip() not in {path, f"{path}.url"}
@@ -373,7 +376,7 @@ def _content_only(tokens: list[str]) -> bool:
     fields = _flag(tokens, "--json")
     return (
         tokens[:2] == ["pr", "diff"]
-        or _flag(tokens, "--jq", "-q") in {".body", ".[].body"}
+        or _flag(tokens, "--jq", "-q", last=True) in {".body", ".[].body"}
         or (
             tokens[0] == "pr"
             and fields is not None
@@ -580,7 +583,7 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         if not tokens or tokens[0] not in {"pr", "api"}:
             continue
         field = _graphql_create_field(tokens)
-        projection = (_flag(tokens, "--jq", "-q") or "").strip()
+        projection = (_flag(tokens, "--jq", "-q", last=True) or "").strip()
         commands.append((tokens, field, projection))
     output_eligible = not any(field for _, field, _ in commands) or _graphql_output_eligible(
         segments

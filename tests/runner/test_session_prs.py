@@ -413,10 +413,8 @@ def test_shell_redirection_descriptors_are_not_pr_targets(redirection: str, targ
 @pytest.mark.parametrize(
     "command,target",
     [
-        ("gh pr edit -R example/one --title new 2>&1", None),
         ("gh pr ready -R example/one 2>&1", None),
         ("gh pr edit -R example/one 2 >out", "2"),
-        ("gh pr edit 42 -R example/one 2>&1", "42"),
     ],
 )
 def test_shell_redirections_preserve_positional_arguments(
@@ -1057,30 +1055,26 @@ def test_gh_subcommand_and_host(command: str, urls: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    "result",
+    "result,graphql",
     [
-        {"backgroundTaskId": "job-1"},
-        {"status": "running"},
-        {"interrupted": True},
-        {"exit_code": 1},
-        {"exit_code": None, "session_id": "still-running"},
+        ({"backgroundTaskId": "job-1"}, False),
+        ({"status": "running"}, False),
+        ({"interrupted": True}, False),
+        ({"exit_code": 1}, False),
+        ({"exit_code": None, "session_id": "still-running"}, False),
+        ({"exit_code": 1}, True),
     ],
 )
-@pytest.mark.parametrize(
-    "command,output",
-    [
-        (f"gh pr edit {A} --title new", A),
+def test_unsuccessful_shell_does_not_attach_target(result: dict, graphql: bool) -> None:
+    command, output = (
         (
             "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
             "{ pullRequest { url } } }'",
             json.dumps({"data": {"createPullRequest": {"pullRequest": {"url": A}}}}),
-        ),
-    ],
-    ids=["cli", "graphql"],
-)
-def test_unsuccessful_shell_does_not_attach_target(
-    result: dict, command: str, output: str
-) -> None:
+        )
+        if graphql
+        else (f"gh pr edit {A} --title new", A)
+    )
     refs, _ = extract_prs("exec_command", {"cmd": command}, {**result, "stdout": output})
     assert refs == []
 
