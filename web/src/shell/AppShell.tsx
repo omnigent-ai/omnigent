@@ -70,7 +70,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { openAgentBrowserTab } from "@/hooks/useBrowserTabs";
+import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   findAgentTerminal,
@@ -996,7 +996,9 @@ export function AppShell() {
         const shot = designShotRef.current.get(cid);
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
         const chat = useChatStore.getState();
-        if (cid !== chat.conversationId) {
+        // `cid` is the browser view ID; user-opened tabs encode their owning session.
+        const ownerId = browserViewOwnerId(cid);
+        if (ownerId !== chat.conversationId) {
           designShotRef.current.delete(cid);
           signal(false, "Return to this session before sending.");
           return;
@@ -1004,7 +1006,7 @@ export function AppShell() {
         const files = file ? [file] : undefined;
         if (
           shouldQueueSend(
-            cid,
+            ownerId,
             chat.status,
             chat.sessionStatus,
             chat.queuedMessages,
