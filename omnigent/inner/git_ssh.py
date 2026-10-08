@@ -311,11 +311,11 @@ class _GitSshHandler(socketserver.BaseRequestHandler):
             broker.run_ssh(
                 sock, write_lock, binding, pinned_ip, command, "version=2" if protocol else None
             )
-        except (GitSshDenied, ValueError, json.JSONDecodeError) as exc:
+        except (GitSshDenied, ValueError) as exc:
             logger.info("Git SSH denied: %s", exc)
             with contextlib.suppress(OSError):
                 _write_frame(sock, b"D", str(exc).encode(), write_lock)
-        except (OSError, ConnectionError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError):
             logger.exception("Git SSH broker connection failed")
             with contextlib.suppress(OSError):
                 _write_frame(sock, b"D", b"Git SSH broker connection failed", write_lock)
@@ -401,7 +401,7 @@ class GitSshBroker:
                             raise GitSshDenied("Git SSH transfer limit exceeded")
                     process.stdin.write(frame[1])
                     process.stdin.flush()
-            except (OSError, ConnectionError, BrokenPipeError, GitSshDenied):
+            except (OSError, ValueError, GitSshDenied):
                 _signal_ssh_group(process, signal.SIGTERM)
             finally:
                 with contextlib.suppress(OSError):
@@ -431,7 +431,9 @@ class GitSshBroker:
                 code = process.wait(timeout=_SESSION_TIMEOUT)
             except subprocess.TimeoutExpired:
                 _stop_ssh_group(process)
-                code = process.returncode or 128
+                code = process.returncode
+            if code is None or code < 0:
+                code = 128
             for thread in threads[1:]:
                 thread.join()
             with contextlib.suppress(OSError):
@@ -459,10 +461,12 @@ class GitSshBroker:
             _stop_ssh_group(process)
         self._server.shutdown()
         self._server.server_close()
+        with contextlib.suppress(OSError):
+            self.socket_path.unlink(missing_ok=True)
         self._thread.join(timeout=3)
         with self._condition:
             if not self._condition.wait_for(lambda: not self._connections, timeout=5):
-                raise RuntimeError("Git SSH broker handlers did not stop")
+                logger.error("Git SSH broker handlers did not stop")
 
 
 def start_git_ssh_broker(bindings: Sequence[GitSshBinding], tmpdir: Path) -> GitSshBroker:

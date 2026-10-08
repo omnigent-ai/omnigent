@@ -2555,27 +2555,13 @@ def _build_copilot_spawn_env(
 
 
 def _serialize_os_env(value: OSEnvSpec | None) -> str | None:
-    """
-    Encode an :class:`OSEnvSpec` for the wrap's env-var input.
-
-    JSON-encodes :func:`dataclasses.asdict` of the OSEnvSpec so
-    the wrap can :func:`json.loads` it back on the harness side
-    (per the per-spawn env-var pattern from §Step 5a). When
-    *value* is ``None`` (no os_env declared on the spec), this
-    returns ``None`` and ``_build_claude_sdk_spawn_env`` omits
-    the env var entirely — the wrap then falls back to its
-    enable-natives-by-default rule.
-
-    :param value: ``spec.os_env`` — an :class:`OSEnvSpec`
-        instance or ``None``.
-    :returns: JSON string encoding the OSEnvSpec, or ``None``
-        when *value* is ``None``.
-    """
-    import dataclasses
+    """Encode an OS environment for harness subprocesses."""
 
     if value is None:
         return None
-    return json.dumps(dataclasses.asdict(value))
+    from omnigent.inner.os_env_serialization import encode_os_env_spec
+
+    return json.dumps(encode_os_env_spec(value))
 
 
 def _serialize_retry_policy(value: RetryPolicy | None) -> str | None:

@@ -907,6 +907,15 @@ def with_additional_write_roots(
     )
 
 
+def _restore_broker_socket_roots(policy: SandboxPolicy) -> SandboxPolicy:
+    roots = [
+        Path(path).parent
+        for path in (policy.egress_socket_path, policy.git_ssh_socket_path)
+        if path is not None
+    ]
+    return with_additional_write_roots(policy, roots) if roots else policy
+
+
 def with_additional_read_roots(
     policy: SandboxPolicy,
     extra_roots: Sequence[Path],
@@ -1091,7 +1100,9 @@ def run_launcher(
     decoded = _decode_json_arg(encoded_sandbox)
     if not isinstance(decoded, dict):
         raise ValueError("Invalid launcher sandbox payload")
-    sandbox = SandboxPolicy.from_jsonable(decoded)
+    # The JSON policy omits parent-owned mask exemptions; recover the
+    # broker dirs before bwrap scans dotfiles and hides their sockets.
+    sandbox = _restore_broker_socket_roots(SandboxPolicy.from_jsonable(decoded))
 
     # Before any wrap / exec so neither the re-exec'd launcher nor the
     # target can see env vars the spawner didn't deliberately pass.

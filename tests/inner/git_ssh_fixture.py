@@ -21,11 +21,28 @@ def _run(
     return subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, check=True)
 
 
+def _nonloopback_ip() -> str | None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.connect(("192.0.2.1", 80))
+        except OSError:
+            return None
+        address = probe.getsockname()[0]
+    return address if not address.startswith("127.") else None
+
+
 @pytest.fixture
-def ssh_git_server(tmp_path: Path) -> Iterator[tuple[GitSshBinding, str, Path]]:
+def ssh_git_server(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[tuple[GitSshBinding, str, Path]]:
     sshd = shutil.which("sshd") or ("/usr/sbin/sshd" if Path("/usr/sbin/sshd").exists() else None)
     if sshd is None:
         pytest.skip("OpenSSH server is unavailable")
+    listen_ip = None
+    if getattr(request, "param", None) == "nonloopback":
+        listen_ip = _nonloopback_ip()
+        if listen_ip is None:
+            pytest.skip("no non-loopback local address is available")
     port_socket = socket.socket()
     port_socket.bind(("127.0.0.1", 0))
     port = port_socket.getsockname()[1]
@@ -39,9 +56,12 @@ def ssh_git_server(tmp_path: Path) -> Iterator[tuple[GitSshBinding, str, Path]]:
     known_hosts = tmp_path / "known_hosts"
     known_hosts.write_text(f"127.0.0.1 {(tmp_path / 'host_key.pub').read_text()}")
     server_config = tmp_path / "sshd_config"
+    listen_addresses = "ListenAddress 127.0.0.1\n"
+    if listen_ip:
+        listen_addresses += f"ListenAddress {listen_ip}\n"
     server_config.write_text(
         f"Port {port}\n"
-        "ListenAddress 0.0.0.0\n"
+        f"{listen_addresses}"
         f"HostKey {host_key}\n"
         f"AuthorizedKeysFile {authorized_keys}\n"
         f"PidFile {tmp_path / 'sshd.pid'}\n"
@@ -50,7 +70,11 @@ def ssh_git_server(tmp_path: Path) -> Iterator[tuple[GitSshBinding, str, Path]]:
     )
     _run(sshd, "-t", "-f", str(server_config))
     server_log = (tmp_path / "sshd.log").open("wb")
-    server = subprocess.Popen([sshd, "-D", "-e", "-f", str(server_config)], stderr=server_log)
+    try:
+        server = subprocess.Popen([sshd, "-D", "-e", "-f", str(server_config)], stderr=server_log)
+    except Exception:
+        server_log.close()
+        raise
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -95,5 +119,10 @@ def ssh_git_server(tmp_path: Path) -> Iterator[tuple[GitSshBinding, str, Path]]:
         yield binding, url, work
     finally:
         server.terminate()
-        server.wait(timeout=5)
-        server_log.close()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)
+        finally:
+            server_log.close()

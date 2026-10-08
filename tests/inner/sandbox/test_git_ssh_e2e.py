@@ -18,6 +18,18 @@ from omnigent.inner.terminal import create_terminal_instance
 from tests.inner.sandbox.conftest import run_async
 
 
+def _startup_binding(tmp_path: Path) -> GitSshBinding:
+    return GitSshBinding(
+        host="git.example.test",
+        port=22,
+        username="git",
+        repository="org/repo.git",
+        operations=frozenset({"fetch"}),
+        identity_file=str(tmp_path / "identity"),
+        known_hosts_file=str(tmp_path / "known_hosts"),
+    )
+
+
 def test_git_ssh_clone_inside_real_sandbox(
     ssh_git_server: tuple[GitSshBinding, str, Path],
     tmp_path: Path,
@@ -103,12 +115,11 @@ def test_git_ssh_clone_inside_sandboxed_terminal(
 
 
 def test_git_ssh_helper_start_failure_closes_broker(
-    ssh_git_server: tuple[GitSshBinding, str, Path],
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    binding, _, _ = ssh_git_server
+    binding = _startup_binding(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     sandbox = active_sandbox_spec_factory(git_ssh=[binding])
@@ -141,12 +152,11 @@ def test_git_ssh_helper_start_failure_closes_broker(
 
 
 def test_git_ssh_terminal_start_failure_closes_broker(
-    ssh_git_server: tuple[GitSshBinding, str, Path],
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    binding, _, _ = ssh_git_server
+    binding = _startup_binding(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     spec = TerminalEnvSpec(

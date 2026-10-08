@@ -1857,7 +1857,12 @@ class TerminalInstance:
 
     def _stop_git_ssh(self) -> None:
         if self._git_ssh_broker is not None:
-            self._git_ssh_broker.stop()
+            try:
+                self._git_ssh_broker.stop()
+            except Exception:
+                logger.exception(
+                    "Git SSH broker stop failed for terminal %s:%s", self.name, self.session_key
+                )
             self._git_ssh_broker = None
         if self._git_ssh_tmpdir is not None:
             cleanup_private_tmpdir(self._git_ssh_tmpdir)

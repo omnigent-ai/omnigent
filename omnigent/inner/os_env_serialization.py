@@ -4,9 +4,15 @@ from typing import Any, cast
 
 from pydantic import TypeAdapter
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
 _SANDBOX_ADAPTER = TypeAdapter(OSEnvSandboxSpec)
+_OS_ENV_ADAPTER = TypeAdapter(OSEnvSpec)
+
+
+def encode_os_env_spec(value: OSEnvSpec) -> dict[str, Any]:
+    """Encode an OS environment, including nested bindings, for JSON transport."""
+    return cast(dict[str, Any], _OS_ENV_ADAPTER.dump_python(value, mode="json"))
 
 
 def encode_sandbox_spec(value: OSEnvSandboxSpec) -> dict[str, Any]:

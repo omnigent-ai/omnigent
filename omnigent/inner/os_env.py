@@ -7,6 +7,7 @@ import base64
 import codecs
 import contextlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -75,6 +76,8 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # opaque JSON object at this boundary with runtime validation in
 # ``_handle_helper_request``.
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+logger = logging.getLogger(__name__)
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
 EditEntry: TypeAlias = dict[str, str]
@@ -723,7 +726,10 @@ class _HelperProcessClient:
                 self._sandbox_handle = None
             self._stop_egress_proxy_locked()
             if self._git_ssh_broker is not None:
-                self._git_ssh_broker.stop()
+                try:
+                    self._git_ssh_broker.stop()
+                except Exception:
+                    logger.exception("Git SSH broker stop failed")
                 self._git_ssh_broker = None
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
