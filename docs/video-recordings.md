@@ -51,6 +51,11 @@ Seeking an already loaded video preserves its paused or playing state.
 The highlighted action follows playback and native seeking. Actions beyond a
 known recording duration are disabled.
 
+Hide the panel using the arrow beside **Recording actions**. The video fills
+the card while the panel is hidden. Use **Actions** in the player footer to
+reopen it. Both controls work with the keyboard; toggling preserves playback
+and the selected action.
+
 With no companion file, the player shows its ordinary controls and no action
 panel. Invalid, empty, oversized, or truncated files also leave ordinary video
 playback available. After the agent finishes a turn, an open preview refreshes
