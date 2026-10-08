@@ -10,12 +10,20 @@ the header menu), and each place is a separate entry point.
 ## Sub-features
 
 - `pin`: pinned sessions move to their own section and back.
+- `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
+  old Pinned slot. Dragging a pinned row into a folder unpins it without one.
+- `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
+  order, which persists across reloads; dropping an unpinned row onto a pinned
+  row pins it into that slot.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
-- `stop`: Stop session ends a host-launched parent and the sub-agents on its
-  runner without reporting their expected disconnect as a task failure.
+- `stop`: Stop session on a hosted parent ends its runner, including side chats
+  and sub-agents sharing that runner. Conversation histories are kept.
+- `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
+  closing one stops only that chat. Starting one from a stopped generic hosted
+  parent relaunches the parent first, then shares its replacement runner.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -27,10 +35,14 @@ the header menu), and each place is a separate entry point.
   fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
+- `unsupported-sandbox-actions`: Databricks Sandbox and Arclet fork and
+  host-switch controls stay visible but disabled, with hover and keyboard
+  explanations. Their forms cannot submit.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app can reconnect a local host
-  itself. States: reconnecting (spinner), reconnect failed (retry), host offline.
+  itself or explicitly reconnect a remembered Arca host. States: reconnecting
+  (spinner), reconnect failed (retry), host offline.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
   initialize before delivery; SDK sub-agents reuse their loaded session state.
@@ -45,6 +57,10 @@ the header menu), and each place is a separate entry point.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, rename, archive or unarchive, and delete.
+
+**Pinned section drag:** drag a pinned row onto another pinned row to reorder
+the Pinned section, or drop an unpinned row onto a pinned row to pin it into
+that slot.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (archive, unarchive, delete).
@@ -65,7 +81,9 @@ you remove them.
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
-when a local session is stranded). In the desktop app, reconnect acts directly.
+when a local session is stranded). In the desktop app, reconnect acts directly
+for this machine; an Arca-hosted session offers an explicit **Reconnect Arca**
+action in the same dialog.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -74,9 +92,35 @@ and send a follow-up after its parent runner is replaced.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Stop session:** open the native parent's sidebar menu and choose Stop session
-while a sub-agent is working. This ends the runner; the current-turn interrupt
-control is a separate action that leaves the session connected.
+**Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
+sidebar menus, and message actions. The composer's host menu shows a disabled
+**Switch host…** item when you have write access. Read-only viewers retain the
+existing host menu without switching controls. Hover or focus a disabled action
+to read why it is unsupported.
+The reconnect dialog also disables Clone and Switch host; directory selection
+cannot enable either action.
+While support is being checked, actions stay disabled. If that check fails,
+the explanation asks you to reload. A missing source-host record keeps switching
+disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
+an action button until the check finishes; supported forms then receive keyboard focus.
+If the reconnect dialog is already on Clone when an unsupported result arrives,
+it selects Reconnect and explains the restriction.
+An open switch dialog closes when switching becomes unavailable and stays closed
+if support returns; choose Switch host again to reopen it.
+
+**Stop session:** open the parent's sidebar row menu or right-click the row and
+choose Stop session while a side chat or sub-agent is working. On mobile, open
+the sidebar drawer and long-press the row. The current-turn interrupt control is
+a separate action that leaves the session connected.
+
+**Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
+parent composer, or choose **Start a new side chat** from the composer's add
+tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
+side chats open in a drawer. A generic hosted parent can start a new side chat
+after stopping; this relaunches the parent and both use one runner. Close a side
+chat with its tab's close button; the parent and sibling chats keep running. A
+chat-only side chat can also send messages from its direct `/c/<child_id>` URL
+without choosing a workspace.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -103,6 +147,14 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
+- **`pin-undo`, sidebar row:**
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_undo_unpin_restores_pinned_slot`.
+  The row menu (mobile) and header menu Unpin have web unit coverage only:
+  unpin a pinned session, click Undo on the toast, and expect it back in the
+  same Pinned position.
+- **`pin-reorder`:**
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
+  Dropping an unpinned row onto a pinned row has web unit coverage only.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`
@@ -115,6 +167,10 @@ plain `uv run pytest`, which starts a private server for the test.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
   session, open the archived view, choose Unarchive on the row, and expect the
   session back in the main list.
+- **`unarchive`, Undo toast:**
+  `tests/e2e_ui/sessions/test_sidebar_lifecycle.py::test_sidebar_session_organization_round_trip`
+  archives two sessions and restores both to Mine through Undo, including after
+  a reload.
 - **`delete`:**
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
@@ -149,8 +205,37 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
+- **`unsupported-sandbox-actions`:**
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_fork_and_switch_host_disabled`
+  covers the header, sidebar context menu, message action, and composer host menu
+  at desktop and phone widths, plus the desktop sidebar dropdown. It checks
+  hover, keyboard focus, and ignored activation.
+  The server and transcript are real; Databricks Sandbox and Arclet metadata is
+  patched at the browser boundary, and no live sandbox is provisioned. Direct form
+  and reconnect guards have component coverage in `web/src/shell/ForkSessionDialog.test.tsx`,
+  `web/src/shell/SwitchHostDialog.test.tsx`, and
+  `web/src/shell/ReconnectSessionDialog.test.tsx`. Header fallbacks, including
+  mobile, are covered by `web/src/shell/ChatHeader.test.tsx`.
+  Failed lookups, recovery, hostless sessions, and shared sessions with unlisted
+  hosts are covered by `web/src/hooks/useSessionActionRestrictions.test.tsx`.
+  Host-menu loading/error explanations and the default status badge's disabled
+  action have component coverage in `web/src/components/HostBadge.test.tsx`.
+  Loading-to-enabled keyboard focus is covered there and in
+  `web/src/components/DisabledActionTooltip.test.tsx`. The fork and switch-host
+  dialog suites also cover loading-to-form focus; the tooltip suite checks that a
+  cleared explanation does not reopen without interaction.
+  Supported host-switch UI coverage:
+  `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
+  checks the release/launch requests with stubbed host APIs.
 - **`reconnect`, spinner:**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
+- **`reconnect`, offline-host cause (own environment):**
+  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_preserves_failed_turn_and_retry`
+  creates Claude/Codex native-wrapper sessions on a real disposable host, stops
+  the host and its runners, and checks the API failure and browser details.
+  It covers missing and stale runner bindings, reload persistence, and retry
+  without duplicate transcript input. Repeat with `--device='iPhone 13'` for
+  the mobile entry point; keep browser evidence outside the checkout.
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
 - **`reconnect`, idle replica handoff (own environment):**
@@ -160,6 +245,15 @@ plain `uv run pytest`, which starts a private server for the test.
   period. A completed legacy transcript without saved lifecycle state must
   remain readable without a disconnect error, including when the browser
   returns to the old server after its reads recover.
+- **`reconnect`, completed Claude Task child (own environment):**
+  `tests/e2e_ui/sessions/test_claude_native_idle_handoff.py::test_completed_claude_child_survives_stale_status_handoff`
+  drives a real Claude-native parent and its Agent tool through child completion,
+  then stages stale saved `running` state and moves the runner to a fresh server.
+  After a real tunnel loss and the production disconnect grace, the child's
+  result stays readable without a chat error or failed Agents-row status,
+  including after reload. Only model replies and stale persistence are staged.
+  Requires Claude Code and tmux; machine-managed Claude credentials need an
+  isolated container for the local model endpoint.
 - **`stop`, `archive`, active sub-agents (own environment):**
   `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
   drives real Claude and Codex parents, native children, a host daemon, and its
@@ -168,6 +262,29 @@ plain `uv run pytest`, which starts a private server for the test.
   real runner crash that must still report a failure. Requires both native
   CLIs and tmux; Claude's machine-managed credentials require an isolated
   container for the local model endpoint.
+- **`stop`, `side-chat-lifecycle`, hosted side chats (own environment):**
+  `tests/e2e_ui/sessions/test_stop_side_chats.py::test_stop_session_stops_hosted_side_chats`
+  drives both desktop sidebar menus and the mobile long-press menu with a real
+  host. Side chats share their parent's runner. Closing one leaves its parent
+  and sibling working; stopping the parent stops that shared runner and keeps
+  all histories. An unrelated session stays online, and a new side chat
+  relaunches its parent before both share the replacement runner.
+  Only model replies are scripted.
+- **`side-chat-lifecycle`, creation entry points:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py` covers `/side`, the Workspace
+  menu, the composer add tray, selected text's Ask in side chat action, and the
+  mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
+  runner and verify parent recovery before binding; the hosted lifecycle test
+  above proves live-parent reuse with actual runner processes.
+- **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
+  `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
+  opens a runnerless child directly and sends a message without a directory
+  picker. Session metadata and message dispatch are mocked.
+- **`side-chat-lifecycle`, native Codex:**
+  `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
+  drives a real Codex CLI and app-server with scripted model replies. It checks
+  inherited context in the model request, isolated follow-ups, and a parent
+  that stays usable after closing its side chat.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
@@ -207,6 +324,10 @@ plain `uv run pytest`, which starts a private server for the test.
 
 ## Gotchas
 
+- Existing side chats on separate runners must still be closed individually.
+  Hostless CLI Stop keeps its existing per-conversation behavior.
+- Starting a side chat after its parent stopped relaunches the parent. The new
+  chat shares that replacement runner and stops with the parent again.
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header
@@ -217,6 +338,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
+- Databricks Sandbox and Arclet restrictions apply to managed sources, including
+  shared sessions. Other sandbox providers support forking. Verify the supported
+  path with
+  `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
 - A custom agent outlives its sessions: forks of your own sessions share it,
   and forking someone else's session gives you your own copy. Appearing in the
   picker does not prove the fork API accepts it; check the bound agent after

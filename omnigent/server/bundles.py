@@ -354,5 +354,9 @@ def uploaded_agent_for(
             and agent.name == name
             and agent.bundle_location == location
         ):
+            # The blob can vanish while the row survives (pruned artifacts, a DB
+            # restored without its store); this upload holds the same files.
+            if not artifact_store.exists(location):
+                artifact_store.put(location, bundle_bytes)
             return agent
     return None

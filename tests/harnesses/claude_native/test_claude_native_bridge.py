@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import itertools
 import json
 import os
 import queue
@@ -26,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any, TextIO
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
@@ -11028,6 +11030,109 @@ def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
     )
 
 
+# What the pane shows behind a launch wrapper before Claude Code draws its
+# input box (captured from ``isaac -- --resume <id>``).
+_LAUNCHER_OUTPUT_PANE = """\
+Generating claude-code MCP client config...
+No changes made to /home/user/.claude.json.
+"""
+
+
+def test_inject_user_message_sends_no_escape_into_launcher_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Launcher output shown before the input box is drawn draws no Escape.
+
+    The screen has no composer, but it is not a surface an Escape can clear,
+    and Escapes spent on it reach Claude Code once its input box mounts —
+    where two in a row open the rewind dialog.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captures = {"n": 0}
+    tui = {"pane": _LAUNCHER_OUTPUT_PANE}
+    sent: list[str] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Show launcher output for a few polls, then the mounted input box.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            captures["n"] += 1
+            if captures["n"] > 20 and tui["pane"] == _LAUNCHER_OUTPUT_PANE:
+                tui["pane"] = _composer_pane()
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("hello")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        sent.append(cmd[-1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="hello")
+
+    assert "Escape" not in sent, f"Escape typed into launcher output: {sent}"
+    assert sent[-1] == "Enter"
+
+
+def test_occupied_input_retries_stay_outside_the_double_escape_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Repeated dismissal Escapes are spaced wider than a double-Escape.
+
+    Two Escapes 0.77s apart on Claude Code's composer open the rewind
+    dialog; 1.0s apart they do not. A retry that lands after the first
+    Escape already cleared the surface must not form that pair. Runs on
+    :class:`_VirtualClock`, so the spacing under test is the production
+    constant rather than wall-clock scheduling.
+    """
+    clock = _VirtualClock()
+    escape_times: list[float] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Keep a surface that ignores Escape on screen.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_MODEL_PICKER_PANE, stderr="")
+        if cmd[-1] == "Escape":
+            escape_times.append(clock.monotonic())
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    claude_native_bridge._restore_occupied_input("/tmp/example/tmux.sock", "claude:0.0")
+
+    gaps = [later - earlier for earlier, later in itertools.pairwise(escape_times)]
+    assert len(escape_times) >= 2, f"Expected a retried Escape, got {len(escape_times)}"
+    assert min(gaps) >= 1.0, f"Escapes {gaps} apart can open Claude Code's rewind dialog"
+
+
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11056,6 +11161,103 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+
+
+def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A composer-less dialog with no Escape hint gets no keystrokes at all.
+
+    The restore leaves such a surface alone (an Escape would not clear it,
+    and one spent on launcher output reaches the composer later), and a
+    slash command has no readiness gate behind it: nothing would draft, so
+    the blind submit Enter would accept the dialog's highlighted option
+    instead of running the command, while the call reported success. The
+    ``/effort`` confirmation shows the shape — the pending-user-prompt
+    guard does not recognize it as a decision prompt either.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_EFFORT_DIALOG_PANE])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert sends == [], f"Nothing may be typed into the dialog; got {sends}."
+
+
+def test_inject_slash_command_fails_loud_when_dismissal_is_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A surface that outlives the dismissal retries gets no command either.
+
+    The picker advertises Escape and takes each one, yet never leaves; the
+    restore gives up at :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` and hands
+    the surface back. Only the dismissal Escapes may reach the pane — not
+    the ``C-u``, the command text, or the Enter that used to follow blind.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    tails = [args[-1] for args in sends]
+    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+
+
+def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One hint-less frame right after a dismissible surface is not a refusal.
+
+    A repaint caught mid-redraw can show neither the composer nor the
+    surface's footer. Giving the pane up on that single frame would fail the
+    slash command loud at a surface that was about to clear; the hint-less
+    read must be seen twice in a row before it counts.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _MODEL_PICKER_PANE,
+            "● Working on it",
+            _IDLE_PANE,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+
+
+def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Footer casing is not reliable (see ``_DIALOG_FOOTER_RE``): ``esc to`` counts.
+
+    A dismissible surface read as unclearable would be refused instead of
+    cleared, so the hint check must not depend on the capital E.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _MODEL_PICKER_PANE.replace("Esc to cancel", "esc to cancel")
+    sends = _fake_tmux(
+        monkeypatch,
+        [pane, pane, _IDLE_PANE, _composer_pane("/compact"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert [args[-1] for args in sends] == ["Escape", "C-u", "/compact", "Enter"]
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
@@ -11234,37 +11436,62 @@ _PRE_TOOL_USE_PAYLOAD: dict[str, object] = {
 }
 
 
-class _ScriptedPolicyClient:
-    """Fake runner policy client with a scripted body or failure.
+_USER_PROMPT_SUBMIT_PAYLOAD: dict[str, object] = {
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "hello",
+}
 
-    :param body: JSON body for every response, or ``None`` to raise.
+
+class _ScriptedPolicyClient:
+    """Fake runner policy client replaying one scripted step per POST.
+
+    :param steps: Replayed in order, the last one repeating: a dict body
+        answers 200, an int answers that status with an empty body, an
+        exception is raised, and ``None`` raises a connection failure.
     """
 
-    def __init__(self, body: dict[str, object] | None) -> None:
-        """Store the script.
-
-        :param body: Response payload; ``None`` makes every call raise.
-        """
-        self.body = body
+    def __init__(self, *steps: dict[str, object] | int | BaseException | None) -> None:
+        self.steps = list(steps)
         self.calls = 0
+        self.bodies: list[dict[str, object] | None] = []
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
-        """Return the scripted verdict or raise a transport error.
+        """Replay the next step as a minimal httpx-Response-shaped namespace.
 
         :param url: Evaluate path (ignored).
-        :param json: Forwarded EvaluationRequest (ignored).
-        :returns: Minimal httpx-Response-shaped namespace.
+        :param json: Forwarded EvaluationRequest; recorded for identity checks.
+        :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
-        del url, json
+        del url
+        self.bodies.append(json)
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
-        if self.body is None:
+        if step is None:
             raise ConnectionError("scripted transport failure")
-        raw = _json.dumps(self.body).encode("utf-8")
+        if isinstance(step, BaseException):
+            raise step
+        if isinstance(step, int):
+            return SimpleNamespace(status_code=step, content=b"", headers={})
+        raw = _json.dumps(step).encode("utf-8")
         return SimpleNamespace(
             status_code=200, content=raw, headers={"Content-Type": "application/json"}
         )
+
+
+@pytest.fixture
+def _policy_retry_clock(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Advance relay retry time without changing asyncio's real clock."""
+    clock = Mock(wraps=time)
+    clock.monotonic.return_value = 0.0
+
+    def advance(seconds: float) -> None:
+        clock.monotonic.return_value += seconds
+
+    clock.sleep.side_effect = advance
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    return clock
 
 
 def _hook_relay(tmp_path, monkeypatch, client):
@@ -11381,6 +11608,106 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known"),
+        httpx.ConnectTimeout("connect timed out"),
+    ],
+)
+async def test_hook_evaluate_endpoint_retries_connect_failures_within_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, error: Exception
+) -> None:
+    """A prompt survives a connection failure lasting beyond three attempts."""
+    client = _ScriptedPolicyClient(error, error, error, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert body == "", f"recovered lookup must let the prompt through, got {body!r}"
+        assert client.calls == 4
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [1, 2, 4]
+        assert len({body["_omnigent_elicitation_id"] for body in client.bodies if body}) == 1
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PreToolUse", "PostToolUse"])
+async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, hook_event: str
+) -> None:
+    """A sustained resolver failure retains each event's enforcement behavior."""
+    client = _ScriptedPolicyClient(
+        httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+    )
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            {
+                **_PRE_TOOL_USE_PAYLOAD,
+                **_USER_PROMPT_SUBMIT_PAYLOAD,
+                "hook_event_name": hook_event,
+                "tool_response": "done",
+            },
+        )
+        if hook_event == "UserPromptSubmit":
+            output = json.loads(body)
+            assert output["decision"] == "block"
+            assert "failing closed for this request" in output["reason"]
+        elif hook_event == "PreToolUse":
+            assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
+        else:
+            assert body == "", "PostToolUse must still fail open"
+        assert client.calls == 6
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
+            1,
+            2,
+            4,
+            8,
+            10,
+        ]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [401, 504, httpx.RequestError("no auth token"), httpx.ReadError("torn poll")],
+)
+async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _policy_retry_clock: Mock,
+    failure: int | Exception,
+) -> None:
+    """HTTP, auth, and held-poll failures retain the existing three attempts."""
+    client = _ScriptedPolicyClient(failure)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert client.calls == 3
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
     finally:
         relay.close()
 

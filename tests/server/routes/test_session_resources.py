@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
@@ -755,6 +756,10 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
+    forwarded = fake_runner.post_json_calls[1][1]
+    assert re.fullmatch(r"[0-9a-f]{32}", forwarded["delivery_attempt_id"])
+    assert isinstance(forwarded["input_enqueued_at_ms"], int)
+    assert forwarded["input_enqueued_at_ms"] > 0
     assert fake_runner.post_json_calls == [
         (
             "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals",
@@ -776,6 +781,9 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 # Forwarded so the runner resolves the harness spec on the
                 # first message (before POST /v1/sessions caches it).
                 "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
+                "pending_id": body["pending_id"],
+                "delivery_attempt_id": forwarded["delivery_attempt_id"],
+                "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
             },
         ),
     ]
@@ -4737,7 +4745,9 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
 
 
 @pytest.mark.asyncio
-async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
+async def test_kiro_native_dispatch_forwards_without_persisting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Kiro web-chat input is mirrored by Kiro's session forwarder."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
@@ -4749,8 +4759,13 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
     client = _FakeRunnerClient()
     body = SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "stable_id": "a" * 32,
+        },
     )
+    caplog.set_level("INFO")
 
     try:
         result = await _dispatch_session_event_to_runner(
@@ -4779,12 +4794,98 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
         forwarded = client.post_json_calls[1][1]
         assert forwarded["agent_id"] == "2c515637c67d0717ad0bebc2747b71bc"
         assert forwarded["model"] == "kiro-native-ui"
+        assert forwarded["input_stable_id"] == "a" * 32
+        assert forwarded["pending_id"] == result.pending_id
+        assert len(forwarded["delivery_attempt_id"]) == 32
+        assert forwarded["input_enqueued_at_ms"] > 0
+        repeated = await _dispatch_session_event_to_runner(
+            conv.id,
+            conv,
+            body,
+            store,
+            client,  # type: ignore[arg-type]
+            agent_name="kiro-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+        assert repeated.pending_id == result.pending_id
+        assert len([call for call in client.post_json_calls if call[0].endswith("/events")]) == 1
+        events = {getattr(r, "event_name", None): r for r in caplog.records}
+        for event_name in (
+            "native_input_enqueued",
+            "turn_dispatched",
+            "native_input_retry_deduplicated",
+        ):
+            attrs = events[event_name].attributes
+            assert attrs["input_stable_id"] == "a" * 32
+            assert attrs["pending_id"] == result.pending_id
+            assert attrs["delivery_attempt_id"] == forwarded["delivery_attempt_id"]
+            assert "hello" not in repr(attrs)
     finally:
         pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
-async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> None:
+async def test_codex_side_dispatch_forwards_without_pending_input_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A side-chat command bypasses the parent's pending-input queue."""
+    from omnigent.native.input_diagnostics import INPUT_FIELDS, input_delivery_scope
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    client = _FakeRunnerClient()
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "/side explain this function"}],
+            "stable_id": "a" * 32,
+        },
+    )
+    caplog.set_level("INFO")
+
+    try:
+        with input_delivery_scope({"input_stable_id": "b" * 32}):
+            result = await _dispatch_session_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                store,
+                client,  # type: ignore[arg-type]
+                agent_name="codex-native-ui",
+                file_store=None,
+                artifact_store=None,
+            )
+
+        assert result.item_id is None
+        assert result.pending_id is None
+        assert pending_inputs.snapshot_for(conv.id) == []
+        assert store.appended_items == []
+        [forwarded] = [
+            payload for path, payload in client.post_json_calls if path.endswith("/events")
+        ]
+        assert forwarded["content"] == body.data["content"]
+        assert not INPUT_FIELDS.intersection(forwarded)
+        assert not any(
+            str(getattr(record, "event_name", "")).startswith("native_input_")
+            for record in caplog.records
+        )
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
+    cancelled: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     """A failed Kiro tmux injection must not leave a ghost pending input."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
@@ -4793,18 +4894,30 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
     store = _ConversationStore()
     conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
     assert conv is not None
-    client = _FakeRunnerClient(
+
+    class _FailingForwardClient(_FakeRunnerClient):
+        def _make_response(self, method: str, url: str) -> httpx.Response:
+            if cancelled and url.endswith("/events"):
+                raise asyncio.CancelledError()
+            return super()._make_response(method, url)
+
+    client = _FailingForwardClient(
         responses={
             "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/events": (500, {"error": "tmux failed"})
         }
     )
     body = SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "private prompt"}],
+            "stable_id": "a" * 32,
+        },
     )
+    caplog.set_level("INFO")
 
     try:
-        with pytest.raises(HTTPException):
+        with pytest.raises(asyncio.CancelledError if cancelled else HTTPException):
             await _dispatch_session_event_to_runner(
                 "823dbd1aab969b5a813fac59bb977a77",
                 conv,
@@ -4823,6 +4936,18 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
         ]
         assert store.appended_items == []
         assert pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77") == []
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "native_input_forward_finished"
+        ]
+        forwarded = client.post_json_calls[1][1]
+        attrs = record.attributes
+        assert attrs["outcome"] == ("cancelled" if cancelled else "error")
+        assert attrs["input_stable_id"] == "a" * 32
+        for key in ("pending_id", "delivery_attempt_id", "input_enqueued_at_ms"):
+            assert attrs[key] == forwarded[key]
+        assert "private prompt" not in repr(attrs)
     finally:
         pending_inputs.reset_for_tests()
 
@@ -5109,6 +5234,65 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry()
         assert store.appended_items[0].created_by == "a@example.com"
         assert pending_inputs.snapshot_for(sid) == []
         assert pending_id  # the drained entry was the reformatted message itself
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_without_text_match_never_takes_an_interrupted_entry() -> None:
+    """A message typed in the TUI after a cancelled web message is not the cancelled one.
+
+    With no text match the mirror falls back to the oldest entry. A cancelled
+    entry is never that guess: the TUI message would inherit its attachment,
+    author and client id, and the entry would be reported as settled.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cancelled = pending_inputs.record(
+        sid,
+        [
+            {"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"},
+            {"type": "input_text", "text": "the cancelled web message"},
+        ],
+        created_by="alice@example.com",
+        stable_id="ab" * 16,
+    )
+    pending_inputs.mark_interrupted(sid, [cancelled])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "typed in the terminal"}],
+            },
+            "response_id": "resp_typed",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            created_by="bob@example.com",
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        typed = store.appended_items[0]
+        assert typed.data.content == [{"type": "input_text", "text": "typed in the terminal"}]
+        assert typed.created_by == "bob@example.com"
+        assert store.persisted_by_stable_id == {}
+        # The cancelled entry is untouched: hidden, and left to a later match or the TTL.
+        assert pending_inputs.pending_ids(sid) == [cancelled]
+        assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()
 
@@ -6967,8 +7151,11 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_append", [False, True])
 async def test_relay_settles_queued_native_message_on_failed_turn(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fail_first_append: bool,
 ) -> None:
     """A failed native turn commits the queued web message ahead of its error item.
 
@@ -6980,11 +7167,14 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
     nothing queued for a later mirrored message to drain by mistake.
     """
     from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _settle_undelivered_native_input,
+    )
     from omnigent.server.routes.sessions import _relay_runner_stream
 
     pending_inputs.reset_for_tests()
     sid = "64a784c3aa907d1774f44313546947c6"
-    store = _ConversationStore()
+    store = _FailOnceStore() if fail_first_append else _ConversationStore()
     content = [{"type": "input_text", "text": "set up the worktree"}]
     pending_id = pending_inputs.record(
         sid,
@@ -6992,6 +7182,8 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         created_by="alice@example.com",
         stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
     )
+    original = pending_inputs.delivery_attributes_for(sid, pending_id)
+    caplog.set_level(logging.INFO)
     # A second message the runner is still holding for the next turn.
     queued_next = pending_inputs.record(
         sid,
@@ -7045,6 +7237,26 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
     )
 
     try:
+        if fail_first_append:
+            await _settle_undelivered_native_input(
+                store,  # type: ignore[arg-type]
+                sid,
+                "resp_fail",
+                "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+            )
+            assert store.appended_items == []
+            assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+                pending_id,
+                queued_next,
+            ]
+            restored = pending_inputs.delivery_attributes_for(sid, pending_id)
+            assert restored["delivery_attempt_id"] == original["delivery_attempt_id"]
+            assert restored["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
+            assert not any(
+                getattr(record, "event_name", None) == "native_input_settled"
+                for record in caplog.records
+            )
+            assert not any(e.get("type") == "session.input.consumed" for e in published)
         await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
 
         types = [i.type for i in store.appended_items]
@@ -7072,7 +7284,128 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         assert len(consumed) == 1
         assert consumed[0]["data"]["cleared_pending_id"] == pending_id
         assert consumed[0]["data"]["created_by"] == "alice@example.com"
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "native_input_settled"
+        ]
+        attrs = record.attributes
+        assert attrs["outcome"] == "reported_undelivered"
+        assert attrs["pending_id"] == pending_id
+        assert attrs["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        assert attrs["delivery_attempt_id"] == original["delivery_attempt_id"]
+        assert attrs["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
+        assert attrs["item_id"] == consumed[0]["data"]["item_id"]
+        assert attrs["response_id"] == message.response_id == "resp_fail"
+        assert attrs["match_method"] == "input_stable_id"
     finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("undelivered", [True, False])
+async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
+    undelivered: bool,
+) -> None:
+    """Preserve one real error without a second missing-transcript error on the next turn."""
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_content = [{"type": "input_text", "text": "set up the worktree"}]
+    next_content = [{"type": "input_text", "text": "then run the tests"}]
+    first_pending = pending_inputs.record(
+        sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
+    )
+    next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    # Script only the executor boundary; the real adapter must transport its evidence.
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="test-agent", input=first_content), ctx
+            )
+        error = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        client = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_not_ready", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_not_ready",
+                            "model": "claude",
+                            "error": error,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        if not undelivered:
+            assert [item.type for item in store.appended_items] == ["error"]
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+                first_pending,
+                next_pending,
+            ]
+            return
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        first, failure = store.appended_items
+        assert first.data.content == first_content
+        assert first.created_by == "alice@example.com"
+        assert first.response_id == failure.response_id == "resp_not_ready"
+        assert failure.data.code == "RuntimeError"
+        assert failure.data.message == "inner executor error: Terminal is not ready"
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            next_pending
+        ]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": next_content},
+                    "response_id": "resp_next",
+                    "source_id": "claude:next-input:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[-1].data.content == next_content
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        await adapter.on_shutdown()
         pending_inputs.reset_for_tests()
 
 

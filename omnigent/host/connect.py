@@ -538,6 +538,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Discovery and invocation must read the same harness config directories.
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
+        # Forge CLI config selectors must agree across CLI, daemon, and runner.
+        # Forward paths only; bearer-token environment variables remain excluded.
+        "GLAB_CONFIG_DIR",
+        "GH_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]
@@ -3603,9 +3609,11 @@ class HostProcess:
         """Serve a workspace-mutating op from the host (runner-offline fallback).
 
         Mirrors :meth:`_handle_fs_request` but for the small set of writes the
-        host can serve — currently the GitHub account/base preference, which
-        touches the host's ``~/.omnigent/config.yaml`` and runs ``gh``/``git`` in
-        the workspace. Called inside a worker thread by the dispatcher.
+        host can serve — currently the pull request panel's account/base
+        preference and PR attach/remove, which touch the host's
+        ``~/.omnigent/config.yaml`` and the session's PR registry and run the git
+        provider's CLI and ``git`` in the workspace. Called inside a worker
+        thread by the dispatcher.
 
         :param frame: The write frame (op + workspace + params).
         :returns: A result frame with the refreshed payload, or an error frame.
@@ -3657,17 +3665,17 @@ class HostProcess:
         op: str,
         params: dict[str, object],
     ) -> dict[str, object]:
-        """Route a write op to its handler. Writes call ``github_resource``
+        """Route a write op to its handler. Writes call ``pr_resource``
         directly (not the read-only ``WorkspaceReader``).
 
         :raises ValueError: On an unknown op.
         """
         from typing import cast
 
-        from omnigent.runner import github_resource
+        from omnigent.runner import pr_resource
 
         if op == "github_set_preference":
-            return github_resource.set_github_preference(
+            return pr_resource.set_pr_preference(
                 workspace,
                 account=cast("str | None", params.get("account")),
                 remote=cast("str | None", params.get("remote")),
@@ -3675,7 +3683,7 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
             )
         if op == "github_prs_update":
-            return github_resource.update_session_pr(
+            return pr_resource.update_session_pr(
                 workspace,
                 str(params["session_id"]),
                 str(params["url"]),
@@ -5134,7 +5142,7 @@ def _serve_host_until_exit(
 
     # Executor-agnostic Databricks setup: when the owner has linked a workspace,
     # materialize their per-user token as a ``~/.databrickscfg`` profile so the
-    # agent's model serving + MCP route through their Databricks AI Gateway.
+    # agent's model serving + MCP route through their Databricks Unity Gateway.
     # Best-effort; a no-op when Databricks isn't connected/configured.
     from omnigent.host.databricks_credential import configure_host_databricks
 

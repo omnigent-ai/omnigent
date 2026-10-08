@@ -40,6 +40,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
@@ -2078,7 +2079,11 @@ class SessionResourceRegistry:
 
         if primary is not None:
             try:
-                primary.close()
+                await run_sync_cleanup(
+                    primary.close,
+                    component="runner_primary_os_env",
+                    session_id=session_id,
+                )
             except Exception:
                 _logger.exception(
                     "Error closing primary env for session=%s",

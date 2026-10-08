@@ -59,7 +59,9 @@ initChatStore(queryClient);
 // Let a host-scoped request resolve its session's routing host on demand,
 // walking a hostless sub-agent child up to its host-bound ancestor (a cold
 // /c/<child> open) before the request is keyed.
-setSessionHostResolver((sessionId) => prefetchSessionHostChain(queryClient, sessionId));
+setSessionHostResolver((sessionId, options) =>
+  prefetchSessionHostChain(queryClient, sessionId, options),
+);
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session

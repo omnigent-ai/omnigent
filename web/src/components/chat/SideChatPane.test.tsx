@@ -312,6 +312,7 @@ describe("side-chat interrupt", () => {
 
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+    expect(sessionsApi.stopSession).not.toHaveBeenCalled();
   });
 });
 
@@ -433,6 +434,7 @@ describe("side chat sealed by the server", () => {
       screen.getByText("This side chat has ended and can’t be continued."),
     ).toBeInTheDocument();
     expect(screen.queryByTestId("side-chat-input")).toBeNull();
+    expect(sessionsApi.stopSession).not.toHaveBeenCalled();
   });
 
   it("re-reads the child's labels after the opening /side send settles", async () => {

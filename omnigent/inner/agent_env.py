@@ -72,6 +72,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # The user's URL-opener command, so an agent's CLI logins open URLs the
         # way the user configured (e.g. forwarded to a laptop from a remote box).
         "BROWSER",
+        # Config locations, not bearer tokens: agent tools use the host's CLI login.
+        "GH_CONFIG_DIR",
+        "GLAB_CONFIG_DIR",
         OMNIGENT_SESSION_ENV_VAR,
         # Windows system / profile constants (SYSTEMROOT is mandatory for
         # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX

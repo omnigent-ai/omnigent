@@ -484,7 +484,7 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
 # Maps harnesses that gate the vendor-neutral gateway transport on a
 # ``HARNESS_*_GATEWAY`` truthy flag to that env var name. The flag enables
 # the executor's gateway path (base URL + token command + model) regardless
-# of which producer fed it — generic providers or the Databricks AI gateway.
+# of which producer fed it — generic providers or the Databricks Unity Gateway.
 # ``openai-agents-sdk`` is absent: its executor takes the API key / base URL
 # directly with no such gate (see :func:`_apply_provider_to_openai_agents`).
 _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
@@ -665,7 +665,7 @@ def configure_agent_harness_with_provider(
         if harness_type == "codex":
             # The codex executor symlinks the user's ~/.codex/config.toml
             # into the per-session CODEX_HOME, so a custom default
-            # ``model_provider`` there (e.g. isaac's Databricks AI Gateway)
+            # ``model_provider`` there (e.g. isaac's Databricks Unity Gateway)
             # would silently hijack a Subscription selection. Pin codex's
             # built-in ``openai`` provider so "Subscription" always means
             # the ChatGPT login — a no-op when the user's config sets no
@@ -675,7 +675,7 @@ def configure_agent_harness_with_provider(
 
     if entry.kind == CLI_CONFIG_KIND:
         # The pi harness consumes both families and can route a cli-config
-        # Databricks AI Gateway (the gateway's Anthropic Messages surface is one
+        # Databricks Unity Gateway (the gateway's Anthropic Messages surface is one
         # Pi speaks natively) — the same provider pi-native routes via
         # ``_cli_config_pi_provider``. Translate it into the pi gateway
         # transport rather than failing loud; a non-Databricks cli-config is
@@ -708,7 +708,7 @@ def configure_agent_harness_with_provider(
         # profile name drives model + base URL + auth-command lookup from
         # ~/.databrickscfg + ucode state. This mirrors the legacy
         # DatabricksAuth branch: enable the neutral gateway transport (the
-        # Databricks AI gateway is one producer of that transport), record
+        # Databricks Unity Gateway is one producer of that transport), record
         # the Databricks profile (Databricks-specific, used by the executor
         # for token refresh), then delegate gateway enrichment to ucode.
         profile = entry.profile
@@ -983,12 +983,12 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
 
 
 def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
-    """Apply a cli-config Databricks AI Gateway to the pi (gateway-harness) path.
+    """Apply a cli-config Databricks Unity Gateway to the pi (gateway-harness) path.
 
     The gateway-harness pi launch (``omnigent run`` / agents) and pi-native
     (the terminal) both resolve the same default provider
     (:func:`default_provider_for_harness`), so when that default is a
-    ``cli-config`` Databricks AI Gateway, this path must route it rather than
+    ``cli-config`` Databricks Unity Gateway, this path must route it rather than
     fail loud. We reuse the pi-native translation
     (:func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`) — which
     reads the codex ``[model_providers.X]`` transport, rewrites the base URL to
@@ -1003,7 +1003,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
         reaches here).
     :raises OmnigentError: If the cli-config entry cannot be translated into a
         Pi gateway provider (its codex table can't be resolved or it is not a
-        recognized Databricks AI Gateway) — selection should prevent this, so a
+        recognized Databricks Unity Gateway) — selection should prevent this, so a
         failure here is a real misconfiguration worth surfacing.
     """
     # Imported lazily: pi_native_credentials is on the runner's session-create
@@ -1018,7 +1018,7 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
         raise OmnigentError(
             f"provider {entry.name!r} (kind 'cli-config') was selected for the 'pi' "
             "harness but its codex [model_providers] table could not be resolved as a "
-            "Databricks AI Gateway. Check the [model_providers] base_url + auth in "
+            "Databricks Unity Gateway. Check the [model_providers] base_url + auth in "
             "~/.codex/config.toml, or configure a key/gateway provider for pi in "
             "~/.omnigent/config.yaml.",
             code=ErrorCode.INVALID_INPUT,
@@ -2183,7 +2183,7 @@ def _build_cursor_spawn_env(
     builders (claude-sdk / codex / pi / openai-agents), there is NO gateway or
     Databricks-profile resolution: the Cursor SDK talks only to Cursor's own
     backend (``CURSOR_API_KEY``) and has no custom API base-URL override, so it
-    never routes through the Databricks AI gateway. That is also why cursor is
+    never routes through the Databricks Unity Gateway. That is also why cursor is
     intentionally absent from :data:`AgentHarnessType` and the gateway/ucode
     dicts above.
 
@@ -2479,7 +2479,7 @@ def _build_copilot_spawn_env(
     builders there is NO gateway or Databricks-profile resolution: the GitHub
     Copilot SDK talks only to GitHub's Copilot backend (a GitHub token) and has
     no custom API base-URL override, so it never routes through the Databricks
-    AI gateway. That is also why copilot is intentionally absent from
+    Unity Gateway. That is also why copilot is intentionally absent from
     :data:`AgentHarnessType` and the gateway/ucode dicts above.
 
     Auth: an explicit ``executor.auth: {type: api_key, api_key: ...}`` carries

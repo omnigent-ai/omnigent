@@ -103,8 +103,9 @@ async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
     # Tells the shell where server-driven chrome lives, so it need not infer
     # placement from the version number.
     assert body["ui"]["server_picker"] == "sidebar"
-    # This fixture runs without an auth provider, so there is nothing to sign in to.
-    assert body["auth"] == {"mode": "none", "session_cookie": None}
+    # This fixture runs without an auth provider, so there is nothing to sign in to,
+    # and no native app redirect is advertised outside OIDC.
+    assert body["auth"] == {"mode": "none", "session_cookie": None, "native_redirect_uris": None}
     # Present-but-null when the operator names nothing.
     assert "server_name" in body
     assert body["server_name"] is None

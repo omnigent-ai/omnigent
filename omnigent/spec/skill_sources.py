@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import Literal, cast
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
+from omnigent.spec.parser import (
+    _discover_skills,
+    _parse_skill,
+    discover_host_skills,
+    skill_matches_names,
+)
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -223,7 +228,7 @@ def _claude_code_skills(
                     "Skipping portable skill with invalid command name: %s", spec.skill_dir
                 )
                 continue
-            if filter_names is not None and spec.name not in filter_names:
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             out.append(spec)
         # Surface dropped skills so a missing command is diagnosable.
@@ -463,7 +468,7 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
         for spec in _discover_skills(install_path / "skills", skipped=skipped):
-            if filter_names is not None and spec.name not in filter_names:
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             out.append(replace(spec, name=f"{plugin}:{spec.name}"))
         # Surface dropped skills with the plugin key so a missing command is
@@ -505,7 +510,8 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         standalone = [
             skill
             for skill in native
-            if not isinstance(ctx.skills_filter, list) or skill.name in ctx.skills_filter
+            if not isinstance(ctx.skills_filter, list)
+            or skill_matches_names(skill, ctx.skills_filter)
         ] + select_claude_portable_skills(_claude_code_skills(ctx, ".agents"), native)
     else:
         standalone = _generic_host_skills(ctx)
@@ -710,10 +716,12 @@ def antigravity_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
                 spec = _parse_skill(child / "SKILL.md")
             except (OmnigentError, OSError):  # best-effort discovery
                 continue
-            name = spec.name if namespace is None else f"{namespace}:{spec.name}"
+            # agy is not confirmed to invoke by directory, so keep its frontmatter-name keying.
+            base = spec.display_name or spec.name
+            name = base if namespace is None else f"{namespace}:{base}"
             if filter_names is not None and name not in filter_names:
                 continue
-            out.append(spec if namespace is None else replace(spec, name=name))
+            out.append(replace(spec, name=name, display_name=None))
     return out
 
 
