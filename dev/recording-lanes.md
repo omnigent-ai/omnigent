@@ -301,11 +301,11 @@ tape and note that rendering was skipped.
   calling the helper and keep it set for the tape, so the seeded trust never lands
   in your real `~/.claude.json`. The prepared repro environment seeds this only
   for its own server and runner processes (in `.omnigent/repro-env/claude-config`);
-  `python -m dev.repro_env exec` passes your shell's environment through
-  unchanged, so a tape run that way still needs the export and the helper call.
-  `claude agents` then opens an interactive view that stays open: `Wait` for the
-  listed session, leave the view (Claude Code asks for Ctrl-C twice), and `Wait`
-  for the shell prompt before typing the next command.
+  `python -m dev.repro_env exec` does not replace your shell's `CLAUDE_CONFIG_DIR`
+  with that directory, so a tape run that way still needs the export and the
+  helper call. `claude agents` then opens an interactive view that stays open:
+  `Wait` for the listed session, leave the view (Claude Code asks for Ctrl-C
+  twice), and `Wait` for the shell prompt before typing the next command.
 - **A clip of the reproduction TEST running is NOT the journey.** If the tape
   won't render (server boot times out, `ttyd` missing, VHS unavailable), do
   **not** substitute a recording of `pytest … FAILS` / an `AssertionError`. That
