@@ -362,14 +362,15 @@ describe("customTheme", () => {
   });
 
   it("pins Omnigent's shell-background reference and keeps its concrete gradient", () => {
-    applyCustomTheme({ ...createCustomThemeFromPalette(PALETTES[0]), contrast: 60 });
+    const omni = PALETTES.find((palette) => palette.id === "omni")!;
+    applyCustomTheme({ ...createCustomThemeFromPalette(omni), contrast: 60 });
 
     const style = document.documentElement.style;
     expect(style.getPropertyValue("--custom-light-shell-background")).toBe(
       "var(--custom-light-background)",
     );
     expect(style.getPropertyValue("--custom-dark-shell-background")).toBe(
-      PALETTES[0].tokens.dark.shellBackground,
+      omni.tokens.dark.shellBackground,
     );
   });
 });

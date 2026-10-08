@@ -8,11 +8,8 @@ custom color theme in dark mode and **Translucent sidebars** off, the
 conversations sidebar paints near-white while the main pane stays dark; turning
 the toggle on makes it dark, turning it off brings the light panel back.
 
-The real embed island is built (``vite build --config vite.embed.config.ts``),
-wrapped in a minimal dark host page (host-owned React + react-router, like the
-workspace monolith's bundle), and served same-origin over the live server via
-route interception. The standalone SPA, whose style root and dark root are both
-``<html>``, runs the same journey as a control. No LLM turn is involved.
+Exercises the real embed island, with the standalone SPA (style root and dark root
+both ``<html>``) as a control. No LLM turn is involved.
 """
 
 from __future__ import annotations
@@ -30,7 +27,8 @@ from playwright.sync_api import Locator, Page, Route, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WEB_DIR = _REPO_ROOT / "web"
-_DIST_EMBED = _WEB_DIR / "dist-embed"
+# Own gitignored output so this build and `pnpm build:embed` never wipe each other.
+_DIST_EMBED = _WEB_DIR / "dist-embed-e2e"
 _HOST_DIR = _DIST_EMBED / "e2e-host"
 _HOST_DIST = _HOST_DIR / "dist"
 _VITE = _WEB_DIR / "node_modules" / ".bin" / "vite"
@@ -112,7 +110,7 @@ _OPAQUE_ALPHA = 0.8
 _TRANSLUCENT_ALPHA = 0.72
 
 # Written after a complete build so sibling xdist workers of the same run reuse
-# it instead of wiping ``dist-embed/`` while another worker is still serving it.
+# it instead of wiping the output while another worker is still serving it.
 _BUILD_STAMP = _HOST_DIR / ".built-by-run"
 
 
@@ -120,7 +118,7 @@ def _build_embed_host() -> None:
     if not _VITE.is_file():
         raise RuntimeError(f"{_VITE} is missing; run `pnpm install --filter web` first")
     subprocess.run(
-        [str(_VITE), "build", "--config", "vite.embed.config.ts"],
+        [str(_VITE), "build", "--config", "vite.embed.config.ts", "--outDir", str(_DIST_EMBED)],
         cwd=_WEB_DIR,
         check=True,
         stdin=subprocess.DEVNULL,
@@ -142,7 +140,7 @@ def embed_host_dist(request: pytest.FixtureRequest) -> Path:
     """Build the embed island and the host page bundle; return the host dist dir.
 
     ``--ui-skip-build`` reuses an existing host build, mirroring the SPA option.
-    The embed build runs first because its ``emptyOutDir`` wipes ``dist-embed/``.
+    The embed build runs first because its ``emptyOutDir`` wipes the output dir.
     """
     if request.config.getoption("--ui-skip-build") and (_HOST_DIST / "index.html").is_file():
         return _HOST_DIST
