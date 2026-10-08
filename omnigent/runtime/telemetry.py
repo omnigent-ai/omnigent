@@ -348,18 +348,6 @@ def _make_session_id_processor() -> Any:
     return make_span_attribute_processor("session.id", _session_id_var.get)
 
 
-def _make_user_id_processor() -> Any:
-    """
-    Span processor stamping ``user.id``, the authenticated Omnigent user.
-
-    Uses :func:`omnigent.debug_logging.current_user_id`: the request's user on
-    the server, ``OMNIGENT_USER_ID`` (the host owner) on hosts and runners.
-    """
-    from omnigent.debug_logging import current_user_id
-
-    return make_span_attribute_processor("user.id", current_user_id)
-
-
 def _make_active_skill_processor() -> Any:
     """Span processor stamping ``omnigent.skill.active`` from :data:`_active_skill_var`."""
     return make_span_attribute_processor("omnigent.skill.active", _active_skill_var.get)
@@ -1085,8 +1073,6 @@ def _init_otel_traces(endpoint: str) -> None:
             # Enrich every span with session.id from the active context (set via
             # session_scope at the request hook / executor turn / forwarder).
             provider.add_span_processor(_make_session_id_processor())
-            # Enrich every span with the authenticated user.id.
-            provider.add_span_processor(_make_user_id_processor())
             # Tag every span with the skill active in the turn, if any.
             provider.add_span_processor(_make_active_skill_processor())
             provider.add_span_processor(BatchSpanProcessor(_create_otlp_span_exporter()))

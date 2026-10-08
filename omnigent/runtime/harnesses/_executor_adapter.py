@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -112,17 +113,25 @@ def _strip_mcp_tool_prefix(name: str) -> str:
 # "Skill" and Omnigent's builtin "load_skill". Coverage gaps: designs/OBSERVABILITY.md §13.
 _SKILL_TOOL_NAMES = frozenset({"Skill", "load_skill"})
 
-# Arg keys that may hold the skill name. Native ``Skill`` input is CLI-owned and
-# unpinned (commonly ``command``); ``load_skill`` uses ``name``.
-_SKILL_NAME_KEYS = ("command", "name", "skill", "skill_name")
+# Arg keys that carry the skill name, per tool. Native ``Skill`` uses ``skill``
+# (``command`` in older Claude Code); ``load_skill`` uses ``name``.
+_SKILL_NAME_ARG_KEYS: dict[str, tuple[str, ...]] = {
+    "Skill": ("skill", "command"),
+    "load_skill": ("name",),
+}
+
+# A skill name, optionally plugin-qualified (``plugin:skill``). Values that don't
+# match are treated as content and never exported.
+_SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][\w.-]{0,63}(?::[A-Za-z0-9][\w.-]{0,63})?", re.ASCII)
 
 
-def _extract_skill_name(args: dict[str, Any]) -> str | None:
-    """Skill name from a skill tool call's args: a known key, else the first string value."""
+def _extract_skill_name(tool_name: str, args: dict[str, Any]) -> str | None:
+    """Validated skill name from a skill tool call's name field, else ``None``."""
     if not isinstance(args, dict):
         return None
-    for value in (*(args.get(key) for key in _SKILL_NAME_KEYS), *args.values()):
-        if isinstance(value, str) and value.strip():
+    for key in _SKILL_NAME_ARG_KEYS.get(tool_name, ()):
+        value = args.get(key)
+        if isinstance(value, str) and _SKILL_NAME_RE.fullmatch(value.strip()):
             return value.strip()
     return None
 
@@ -295,11 +304,10 @@ class ExecutorAdapter(HarnessApp):
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
         _active_tool_span = None
         _active_tool_parent = None
-        # Skill telemetry, turn-scoped. The first token restores the pre-turn
-        # active skill; _turn_skills[-1] is the most recent skill.
+        # Skill telemetry, turn-scoped: one (name, start) per skill call, the most
+        # recent last. The first token restores the pre-turn active skill.
         _active_skill_token: Any = None
-        _turn_skills: list[str] = []
-        _last_skill_start: float | None = None
+        _skill_calls: list[tuple[str, float]] = []
         _turn_outcome: str | None = None
 
         user_message = _extract_last_user_message(request.input)
@@ -371,17 +379,18 @@ class ExecutorAdapter(HarnessApp):
                                 event.args or {},
                             )
                             if _bare_tool_name in _SKILL_TOOL_NAMES:
-                                _skill_name = _extract_skill_name(event.args or {})
+                                _skill_name = _extract_skill_name(
+                                    _bare_tool_name, event.args or {}
+                                )
                                 if _skill_name:
                                     tctx.set_skill_name(_active_tool_span, _skill_name)
                                     _token = set_active_skill(_skill_name)
                                     if _active_skill_token is None:
                                         _active_skill_token = _token
-                                    _turn_skills.append(_skill_name)
-                                    _last_skill_start = time.monotonic()
-                            elif _turn_skills:
+                                    _skill_calls.append((_skill_name, time.monotonic()))
+                            elif _skill_calls:
                                 skill_metrics.record_skill_tool_call(
-                                    _turn_skills[-1], _bare_tool_name
+                                    _skill_calls[-1][0], _bare_tool_name
                                 )
                         elif isinstance(event, ToolCallComplete):
                             if _active_tool_span is not None:
@@ -528,17 +537,14 @@ class ExecutorAdapter(HarnessApp):
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await injection_watcher
-            # Record skill metrics once per turn, then clear the active skill so it
-            # can't leak into the next turn.
-            if _turn_skills:
-                _outcome = _turn_outcome or "unknown"
-                for _skill in dict.fromkeys(_turn_skills):
-                    skill_metrics.record_skill_invocation(_skill, _outcome)
-                if _last_skill_start is not None:
-                    skill_metrics.record_skill_execution_duration(
-                        _turn_skills[-1],
-                        (time.monotonic() - _last_skill_start) * 1000.0,
-                    )
+            # Record each skill call (count + call-to-turn-end duration), then clear
+            # the active skill so it can't leak into the next turn.
+            _turn_end = time.monotonic()
+            for _skill, _start in _skill_calls:
+                skill_metrics.record_skill_invocation(_skill, _turn_outcome or "unknown")
+                skill_metrics.record_skill_execution_duration(
+                    _skill, (_turn_end - _start) * 1000.0
+                )
             if _active_skill_token is not None:
                 with contextlib.suppress(Exception):
                     reset_active_skill(_active_skill_token)

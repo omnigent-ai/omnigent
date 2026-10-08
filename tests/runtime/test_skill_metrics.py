@@ -88,11 +88,22 @@ def test_module_recorders_no_op_when_disabled(monkeypatch: pytest.MonkeyPatch) -
     """The ``@telemetry_guarded`` module functions do nothing (and never raise)
     when telemetry is disabled."""
     monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "false")
-    skill_metrics._default_metrics.cache_clear()
+    meter = _Meter()
+    instrument_lookups: list[None] = []
+
+    def _metrics() -> SkillMetrics:
+        instrument_lookups.append(None)
+        return SkillMetrics(meter=meter)
+
+    monkeypatch.setattr(skill_metrics, "_default_metrics", _metrics)
 
     skill_metrics.record_skill_invocation("x", "success")
     skill_metrics.record_skill_execution_duration("x", 1.0)
     skill_metrics.record_skill_tool_call("x", "Bash")
+
+    assert instrument_lookups == []
+    assert meter.counters == {}
+    assert meter.histograms == {}
 
 
 def test_module_recorders_emit_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:

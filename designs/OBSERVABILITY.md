@@ -468,7 +468,7 @@ low-cardinality labels — never content, never ids like `session.id`.
 | Need | Seam | Reference |
 |---|---|---|
 | Structured, per-turn, tree-nested span (agent/tool/skill-like) | New `start_X_span`/`end_X_span` on `TracingContext` + an `elif isinstance(event, …)` branch in the executor-adapter event loop | `omnigent/inner/tracing.py`, `omnigent/runtime/harnesses/_executor_adapter.py` |
-| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `user.id`, `omnigent.skill.active`) |
+| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `omnigent.skill.active`) |
 | Aggregatable counts / latency (dashboards, alerting) | A metric module copied from `omnigent/db/metrics.py`, with module-level `record_*` wrapped in `@telemetry_guarded` | `omnigent/runtime/skill_metrics.py`, `omnigent/db/metrics.py` |
 | Ad-hoc span around a code block | `telemetry.span()` (+ `record_message_payload` for a gated body) | `telemetry.py`, `omnigent/runtime/policies/engine.py` |
 
@@ -478,23 +478,31 @@ Two shared helpers keep the common cases one-liners:
   and never raises; wraps the `telemetry_enabled()` guard + debug-log-never-raise
   boilerplate every `record_*` needs.
 - **`telemetry.make_span_attribute_processor(attribute_key, get_value)`** —
-  builds the "stamp `attribute_key` on every span" processor. `session.id`,
-  `user.id` and `omnigent.skill.active` use it.
+  builds the "stamp `attribute_key` on every span" processor. `session.id` and
+  `omnigent.skill.active` use it.
 
 **Worked example — skill-execution telemetry (turn-scoped).** The executor
 adapter observes the `Skill` / `load_skill` tool call, stamps the ungated
 `omnigent.skill.name` on that tool span (`TracingContext.set_skill_name`), and
 `set_active_skill(name)` so `omnigent.skill.active` lands on every later span in
 the turn — that is how "which tools ran during skill X" is derivable with no
-per-tool code. Every span also carries `user.id`, the authenticated Omnigent
-user from `debug_logging.current_user_id()` (request-scoped on the server,
-`OMNIGENT_USER_ID` on hosts/runners), so skill usage is attributable per user.
-`user.id` is a span attribute only, never a metric label (unbounded cardinality). At turn end the adapter records `omnigent.skill.invocations`
-(by outcome), `omnigent.skill.execution.duration`, and `omnigent.skill.tool_calls`
-(`omnigent/runtime/skill_metrics.py`) and releases the active-skill binding.
-Boundaries are turn-scoped and therefore approximate: there is no native
-"skill finished" signal, so a skill's window is the Skill call → end of that
+per-tool code. At turn end the adapter records, per skill call,
+`omnigent.skill.invocations` (by outcome) and `omnigent.skill.execution.duration`;
+`omnigent.skill.tool_calls` counts each later tool call against the most recent
+skill (`omnigent/runtime/skill_metrics.py`). It then releases the active-skill
+binding. Boundaries are turn-scoped and therefore approximate: there is no native
+"skill finished" signal, so each call's window is the Skill call → end of that
 agent turn.
+
+The skill name is read only from the tool's name field (`skill` / `command` for
+`Skill`, `name` for `load_skill`) and must look like a skill name (optionally
+`plugin:skill`). Anything else is treated as content: nothing is exported, so a
+malformed call can't leak argument text past content capture.
+
+Ambient attributes (`session.id`, `omnigent.skill.active`) come from span
+processors that `_init_otel_traces` registers on the provider it creates. If the
+process uses an externally installed `TracerProvider` instead, `omnigent.skill.name`
+is still stamped on the skill tool span but `omnigent.skill.active` is not.
 
 **Harness coverage & known gaps.** Detection fires only on a `ToolCallRequest`
 whose name (after `_strip_mcp_tool_prefix`) is in `_SKILL_TOOL_NAMES`
