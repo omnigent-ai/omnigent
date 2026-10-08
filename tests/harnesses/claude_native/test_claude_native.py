@@ -6043,10 +6043,22 @@ class _FakeAgentsProc:
         # An entry without a ``kind`` field fails closed: an unrecognized schema
         # is not treated as a live holder.
         ('[{"sessionId": "sid-live"}]', False),
+        # Malformed, non-JSON daemon output fails closed instead of raising.
+        ("not json at all", False),
+        # A JSON object rather than the expected list fails closed.
+        ('{"sessionId": "sid-live", "kind": "background"}', False),
         # No sessions at all.
         ("[]", False),
     ],
-    ids=["held-background", "held-interactive", "other-session", "no-kind", "none"],
+    ids=[
+        "held-background",
+        "held-interactive",
+        "other-session",
+        "no-kind",
+        "malformed-json",
+        "non-list",
+        "none",
+    ],
 )
 def test_claude_background_session_holds_id_matches_live_non_interactive(
     monkeypatch: pytest.MonkeyPatch,

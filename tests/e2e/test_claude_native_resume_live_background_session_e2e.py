@@ -1,11 +1,10 @@
 """Resuming a still-live Claude session must not fail with the CLI's guard.
 
-Reproduces OMNI-12131: a user resumes a conversation from the Omnigent client
-while the same Claude session is still held alive by a separate live process (a
-local terminal / Isaac). The runner's resume launch runs
-``claude --resume <external_session_id>`` (built by
-:func:`_build_claude_native_base_args`) with no ``--fork-session`` and no
-``claude stop``/``attach`` handling, so the real Claude CLI refuses::
+A user resumes a conversation from the Omnigent client while the same Claude
+session is still held alive by a separate live process (a local terminal). The
+runner's resume launch runs ``claude --resume <external_session_id>`` (built by
+:func:`_build_claude_native_base_args`); when that launch omits ``--fork-session``
+the real Claude CLI refuses with its background-session guard::
 
     Error: Session <id> is running as a background session (<id>). Run
     `claude attach <id>` to open it, or `claude stop <id>` first to resume it
@@ -14,10 +13,9 @@ local terminal / Isaac). The runner's resume launch runs
 and exits non-zero, which the client surfaces as "Couldn't resume session".
 
 This drives the real ``claude`` binary against the deterministic mock Messages
-API (no interactive login), so it runs in CI. A background session stands in for
-the live local-terminal holder; the resume refusal is Claude-CLI behaviour that
-does not depend on that wrapper. The assertion encodes the fixed behaviour, so
-it is red today and green once resume handles the live-session case.
+API (no interactive login), so it runs in CI. A background session stands in
+for the live local-terminal holder; the resume refusal is Claude-CLI behaviour
+that does not depend on that wrapper.
 """
 
 from __future__ import annotations

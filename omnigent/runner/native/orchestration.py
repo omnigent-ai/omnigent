@@ -8372,11 +8372,9 @@ async def _auto_create_claude_terminal(
     # transcript that doesn't exist. See
     # designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
     resume_external_session_id: str | None = None
-    # Byte length of the resume transcript this launch synthesized, measured
-    # BEFORE Claude starts. The forwarder seeds its cursor from this rather than
-    # from a live end-offset: resolving the transcript path needs Claude's first
-    # hook, and the executor's prompt inject waits on the same boot, so a
-    # ``stat`` taken later routinely skips the freshly-injected message.
+    # Byte length of the synthesized resume transcript, measured before Claude
+    # starts; the forwarder seeds its cursor from this measured prefix rather
+    # than a racy live end-offset that can skip the freshly-injected prompt.
     resume_prefix_bytes: int | None = None
     # Fork (``--fork-session``) instead of reattaching only when a separate
     # live process still holds this id; a bare ``--resume`` is then refused

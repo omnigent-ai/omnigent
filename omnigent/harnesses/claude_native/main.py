@@ -5252,18 +5252,12 @@ def _claude_background_session_holds_id(
     """
     Return whether a separate live Claude process still holds this id.
 
-    Claude's CLI refuses ``claude --resume <id>`` with its background-session
-    guard whenever a non-interactive process (e.g. a local terminal left
-    running) still holds ``<id>`` alive. This queries the same per-user session
-    daemon that guard consults -- ``claude agents --json`` -- so a resume can
-    branch a copy with ``--fork-session`` instead of launching a command the
-    CLI will reject. The daemon is scoped by the ambient ``HOME`` /
-    ``CLAUDE_CONFIG_DIR``, so querying with the launch's env/cwd sees exactly
-    the sessions the guard will.
+    Queries the same per-user session daemon Claude's background-session guard
+    consults (``claude agents --json``), scoped by the launch's ``HOME`` /
+    ``CLAUDE_CONFIG_DIR`` so it sees exactly the sessions the guard will.
 
-    Best-effort and fail-closed: a missing binary, an unreachable daemon or
-    malformed output returns ``False`` so resume falls back to the unchanged
-    in-place path.
+    Best-effort and fail-closed: a missing binary, a non-zero exit, an
+    unreachable daemon or malformed output returns ``False``.
 
     :param external_session_id: Claude-native session id being resumed.
     :param claude_binary: Resolved ``claude`` executable; defaults to the same
