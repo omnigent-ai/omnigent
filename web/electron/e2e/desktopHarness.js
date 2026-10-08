@@ -92,6 +92,33 @@ function sleep(ms) {
   });
 }
 
+/** Poll `probe` every 100ms until it returns a truthy value or `timeoutMs` passes. */
+async function pollUntil(probe, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let value = await probe();
+  // Each probe must follow the previous one and the pause between them.
+  /* oxlint-disable no-await-in-loop */
+  while (!value && Date.now() < deadline) {
+    await sleep(100);
+    value = await probe();
+  }
+  /* oxlint-enable no-await-in-loop */
+  return value;
+}
+
+/** Unix socket an X display such as ":99" listens on. */
+function displaySocketPath(display) {
+  return `/tmp/.X11-unix/X${display.slice(1)}`;
+}
+
+/** Whether a private display can be started here: Linux with the Xvfb binary. */
+function xvfbAvailable() {
+  return (
+    process.platform === "linux" &&
+    spawnSync("Xvfb", ["-help"], { stdio: "ignore" }).error === undefined
+  );
+}
+
 /** Resolve a free TCP port by binding to :0 and reading it back. */
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -352,7 +379,13 @@ function startDisplayCapture(recordDir, display) {
 /** Wrap an async `fn` so every call shares the first invocation's promise. */
 function once(fn) {
   let result = null;
-  return () => (result ??= fn());
+  return () => {
+    result ??= fn().catch((err) => {
+      result = null;
+      throw err;
+    });
+    return result;
+  };
 }
 
 /** SIGTERM a child and wait for it to exit (SIGKILL after 5s). */
@@ -418,8 +451,11 @@ function startPrivateDisplay() {
       resolve({
         display: `:${number.trim()}`,
         stop: async () => {
-          process.off("exit", killOnExit);
-          await stopProcess(proc);
+          try {
+            await stopProcess(proc);
+          } finally {
+            process.off("exit", killOnExit);
+          }
         },
       });
     });
@@ -455,10 +491,11 @@ function startPrivateDisplay() {
  *   window: import("playwright").Page, userDataDir: string,
  *   display: string | undefined,
  *   stopDisplayCapture: () => Promise<void> }>} `display` is the X display the
- *   app runs on. `stopDisplayCapture` finalizes the composited capture and
- *   shuts down a harness-owned Xvfb; await it before `saveRecording`. It also
- *   runs when the app closes, so a lane that never calls it releases its
- *   display anyway, and repeated calls share one teardown.
+ *   app runs on. Await `stopDisplayCapture` after `electronApp.close()` and
+ *   before `saveRecording`: it finalizes the composited capture and shuts
+ *   down a harness-owned Xvfb. The app's close event also triggers it, which
+ *   only guarantees those resources are released, not that the capture file
+ *   is final. Repeated calls share one teardown.
  */
 async function launchDesktop(opts) {
   const { _electron: electron } = require("playwright");
@@ -467,47 +504,7 @@ async function launchDesktop(opts) {
   // it before creating anything on disk so a failure leaves nothing behind.
   const privateDisplay = await startPrivateDisplay();
   const display = privateDisplay ? privateDisplay.display : process.env.DISPLAY;
-  const userDataDir = opts.userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-"));
-  fs.mkdirSync(userDataDir, { recursive: true });
-  if (opts.serverUrl) {
-    // Seed both profile locations, matching main.js's development userData path.
-    for (const profile of [userDataDir, path.join(userDataDir, "Omnigent Dev")]) {
-      fs.mkdirSync(profile, { recursive: true });
-      fs.writeFileSync(
-        path.join(profile, "settings.json"),
-        JSON.stringify({ server_url: opts.serverUrl }, null, 2),
-      );
-    }
-  }
-  fs.mkdirSync(opts.recordDir, { recursive: true });
-
-  // Development builds derive userData from appData, overriding --user-data-dir.
-  // Redirect both before main.js loads so tests cannot touch a developer profile.
-  const profileBootstrap = path.join(userDataDir, "isolate-profile.cjs");
-  fs.writeFileSync(
-    profileBootstrap,
-    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
-  );
-  const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
-  const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
-  // Headless-Linux / CI container compatibility, gated on the same env var the
-  // Python e2e_ui suite uses (conftest.browser_type_launch_args). Under xvfb —
-  // and especially as root or in a container — Electron's Chromium refuses to
-  // start without --no-sandbox, and --disable-dev-shm-usage avoids the tiny
-  // /dev/shm a container gives it. Off by default so local (macOS/dev) runs are
-  // unchanged.
-  if (process.env.OMNIGENT_PW_NO_SANDBOX || privateDisplay) {
-    args.push("--no-sandbox", "--disable-dev-shm-usage");
-  }
-
-  // Film the composited display (window + embedded WebContentsViews) alongside
-  // Playwright's per-page clips: the per-page screencast of the shell window
-  // omits any WebContentsView composited over it, so on its own the "desktop
-  // recording" would silently drop the very content a journey renders inside
-  // an embedded browser view. The display capture becomes the primary clip in
-  // saveRecording; the per-page clips remain as context.
-  const displayCapture = startDisplayCapture(opts.recordDir, display);
-
+  let displayCapture = null;
   const stopDisplayCapture = once(async () => {
     try {
       if (displayCapture) await displayCapture.stop();
@@ -515,9 +512,46 @@ async function launchDesktop(opts) {
       if (privateDisplay) await privateDisplay.stop();
     }
   });
-
   let electronApp;
   try {
+    const userDataDir = opts.userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-"));
+    fs.mkdirSync(userDataDir, { recursive: true });
+    if (opts.serverUrl) {
+      // Seed both profile locations, matching main.js's development userData path.
+      for (const profile of [userDataDir, path.join(userDataDir, "Omnigent Dev")]) {
+        fs.mkdirSync(profile, { recursive: true });
+        fs.writeFileSync(
+          path.join(profile, "settings.json"),
+          JSON.stringify({ server_url: opts.serverUrl }, null, 2),
+        );
+      }
+    }
+    fs.mkdirSync(opts.recordDir, { recursive: true });
+
+    // Development builds derive userData from appData, overriding --user-data-dir.
+    // Redirect both before main.js loads so tests cannot touch a developer profile.
+    const profileBootstrap = path.join(userDataDir, "isolate-profile.cjs");
+    fs.writeFileSync(
+      profileBootstrap,
+      `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
+    );
+    const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
+    const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
+    // Under xvfb/containers Electron's Chromium needs --no-sandbox, and
+    // --disable-dev-shm-usage avoids a tiny container /dev/shm. Same env var as
+    // the Python e2e_ui suite; off by default so local runs are unchanged.
+    if (process.env.OMNIGENT_PW_NO_SANDBOX || privateDisplay) {
+      args.push("--no-sandbox", "--disable-dev-shm-usage");
+    }
+
+    // Film the composited display (window + embedded WebContentsViews) alongside
+    // Playwright's per-page clips: the per-page screencast of the shell window
+    // omits any WebContentsView composited over it, so on its own the "desktop
+    // recording" would silently drop the very content a journey renders inside
+    // an embedded browser view. The display capture becomes the primary clip in
+    // saveRecording; the per-page clips remain as context.
+    displayCapture = startDisplayCapture(opts.recordDir, display);
+
     electronApp = await electron.launch({
       args,
       recordVideo: { dir: opts.recordDir },
@@ -530,22 +564,15 @@ async function launchDesktop(opts) {
         ...opts.env,
       },
     });
-  } catch (err) {
-    await stopDisplayCapture();
-    throw err;
-  }
-  // A lane that only closes Electron must not leave the capture running or an
-  // owned display behind.
-  electronApp.on("close", () => {
-    void stopDisplayCapture().catch(() => {});
-  });
-  // If locating the shell fails after launch succeeds, close the app so the
-  // Electron process isn't orphaned (the caller never got a handle to close).
-  let window;
-  try {
+    // A lane that only closes Electron must not leave the capture running or an
+    // owned display behind.
+    electronApp.on("close", () => {
+      void stopDisplayCapture().catch(() => {});
+    });
     // Native overlays can appear before the shell. Wait for its loaded page
     // instead of treating the first WebContents as the application window.
     const deadline = Date.now() + 20_000;
+    let window;
     for (;;) {
       window = electronApp.windows().find((page) => {
         const url = page.url();
@@ -563,12 +590,14 @@ async function launchDesktop(opts) {
       // oxlint-disable-next-line no-await-in-loop -- Wait for the shell's navigation.
       await sleep(50);
     }
+    return { electronApp, window, userDataDir, display, stopDisplayCapture };
   } catch (err) {
-    await electronApp.close().catch(() => {});
+    // Nothing must outlive a failed launch: not an Electron the caller never got
+    // a handle to, not the capture, not an owned display.
+    if (electronApp) await electronApp.close().catch(() => {});
     await stopDisplayCapture();
     throw err;
   }
-  return { electronApp, window, userDataDir, display, stopDisplayCapture };
 }
 
 /**
@@ -632,4 +661,7 @@ module.exports = {
   launchDesktop,
   saveRecording,
   startPrivateDisplay,
+  pollUntil,
+  displaySocketPath,
+  xvfbAvailable,
 };

@@ -24,6 +24,7 @@ const {
   spawnServer,
   launchDesktop,
   saveRecording,
+  pollUntil,
 } = require("./desktopHarness");
 
 const deps = desktopDepsAvailable();
@@ -39,20 +40,6 @@ function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-/** Poll `probe` every 100ms until it returns a truthy value or `timeoutMs` passes. */
-async function pollUntil(probe, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let value = await probe();
-  // Each probe must follow the previous one and the pause between them.
-  /* oxlint-disable no-await-in-loop */
-  while (!value && Date.now() < deadline) {
-    await sleep(100);
-    value = await probe();
-  }
-  /* oxlint-enable no-await-in-loop */
-  return value;
 }
 
 describe(
@@ -92,18 +79,20 @@ describe(
       await page.mouse.up();
     }
 
+    /** Right-click `locator`; the patched popup activates Copy and then closes. */
     async function rightClickAt(page, locator) {
       const box = await locator.boundingBox();
       assert.ok(box, `element has no bounding box: ${locator}`);
       await resetContextMenus();
+      await resetClipboard();
       await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: "right" });
       const menus = await pollUntil(async () => {
         const recorded = await contextMenus();
         return recorded.length > 0 ? recorded : null;
       }, 3_000);
-      // Let the auto-closed popup go away before the next pointer action.
-      await pollUntil(contextMenusClosed, 3_000);
-      return menus ?? [];
+      // The popup must be gone before the next pointer action.
+      assert.ok(await pollUntil(contextMenusClosed, 3_000), "context menu did not close");
+      return { menus: menus ?? [], clipboard: await clipboardAfterCopy() };
     }
 
     before(async () => {
@@ -132,10 +121,13 @@ describe(
         Menu.prototype.popup = function (options) {
           globalThis.recordedContextMenus.push(this.items.map((item) => item.role ?? item.label));
           globalThis.openContextMenus += 1;
+          const copy = this.items.find((item) => item.role === "copy");
           setTimeout(() => {
+            // Activate Copy as a user would, then dismiss the menu.
+            copy?.click(undefined, options?.window, options?.window?.webContents);
             this.closePopup();
             globalThis.openContextMenus -= 1;
-          }, 1200);
+          }, 800);
           return popup.call(this, options);
         };
       });
@@ -160,7 +152,8 @@ describe(
       seen.commandSelection = await selectionText(consolePage);
       await consolePage.keyboard.press(COPY_SHORTCUT);
       seen.commandClipboard = await clipboardAfterCopy();
-      seen.commandContextMenus = await rightClickAt(consolePage, command);
+      ({ menus: seen.commandContextMenus, clipboard: seen.commandMenuClipboard } =
+        await rightClickAt(consolePage, command));
 
       await resetClipboard();
       await consolePage.locator("#confirm").click();
@@ -186,7 +179,10 @@ describe(
       seen.statusSelection = await selectionText(consolePage);
       await consolePage.keyboard.press(COPY_SHORTCUT);
       seen.statusClipboard = await clipboardAfterCopy();
-      seen.statusContextMenus = await rightClickAt(consolePage, status);
+      ({ menus: seen.statusContextMenus, clipboard: seen.statusMenuClipboard } = await rightClickAt(
+        consolePage,
+        status,
+      ));
 
       await resetClipboard();
       const errorRow = consolePage
@@ -200,7 +196,8 @@ describe(
       );
       await consolePage.keyboard.press(COPY_SHORTCUT);
       seen.terminalClipboard = await clipboardAfterCopy();
-      seen.terminalContextMenus = await rightClickAt(consolePage, errorRow);
+      ({ menus: seen.terminalContextMenus, clipboard: seen.terminalMenuClipboard } =
+        await rightClickAt(consolePage, errorRow));
       await sleep(1000); // recording pacing
     });
 
@@ -233,6 +230,15 @@ describe(
       );
       assert.ok(hasCopy(seen.statusContextMenus), "no context menu over the status text");
       assert.ok(hasCopy(seen.terminalContextMenus), "no context menu over the terminal output");
+    });
+
+    it("copies the selection when the menu's Copy item is activated", () => {
+      assert.equal(seen.commandMenuClipboard, seen.command);
+      assert.ok(
+        seen.statusMenuClipboard.includes(seen.status),
+        `clipboard after Copy over the status: ${JSON.stringify(seen.statusMenuClipboard)}`,
+      );
+      assert.match(seen.terminalMenuClipboard, /OMNIGENT_AUTH_REQUIRED/);
     });
 
     it("lets the sign-in/failure status text be selected and copied", () => {

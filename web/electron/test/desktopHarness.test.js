@@ -7,30 +7,21 @@
 
 const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
-const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { saveRecording, startPrivateDisplay } = require("../e2e/desktopHarness");
+const {
+  desktopDepsAvailable,
+  launchDesktop,
+  saveRecording,
+  startPrivateDisplay,
+  pollUntil,
+  displaySocketPath,
+  xvfbAvailable,
+} = require("../e2e/desktopHarness");
 
-const xvfbAvailable =
-  process.platform === "linux" &&
-  spawnSync("Xvfb", ["-help"], { stdio: "ignore" }).error === undefined;
-
-/** Poll `predicate` every 50ms until it holds or `timeoutMs` passes. */
-async function waitFor(predicate, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  // Each probe must follow the previous one and the pause between them.
-  /* oxlint-disable no-await-in-loop */
-  while (!predicate() && Date.now() < deadline) {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
-    });
-  }
-  /* oxlint-enable no-await-in-loop */
-  return predicate();
-}
+const hasXvfb = xvfbAvailable();
 
 describe("saveRecording", () => {
   let dir;
@@ -99,11 +90,11 @@ describe("startPrivateDisplay", () => {
 
   it(
     "starts its own Xvfb when Linux has no display and stops it on request",
-    { skip: xvfbAvailable ? false : "needs Linux with Xvfb installed" },
+    { skip: hasXvfb ? false : "needs Linux with Xvfb installed" },
     async () => {
       delete process.env.DISPLAY;
       const owned = await startPrivateDisplay();
-      const socket = `/tmp/.X11-unix/X${owned.display.slice(1)}`;
+      const socket = displaySocketPath(owned.display);
       try {
         assert.match(owned.display, /^:\d+$/);
         assert.ok(fs.existsSync(socket), `no X socket at ${socket}`);
@@ -111,7 +102,46 @@ describe("startPrivateDisplay", () => {
         await owned.stop();
       }
       // Xvfb unlinks its socket on SIGTERM shortly after exiting.
-      assert.ok(await waitFor(() => !fs.existsSync(socket), 3_000), `X socket left at ${socket}`);
+      assert.ok(await pollUntil(() => !fs.existsSync(socket), 3_000), `X socket left at ${socket}`);
+    },
+  );
+});
+
+describe("launchDesktop setup failure", () => {
+  const deps = desktopDepsAvailable();
+  let savedDisplay;
+  let dir;
+
+  beforeEach(() => {
+    savedDisplay = process.env.DISPLAY;
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-launch-failure-"));
+  });
+
+  afterEach(() => {
+    if (savedDisplay === undefined) delete process.env.DISPLAY;
+    else process.env.DISPLAY = savedDisplay;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it(
+    "releases the owned Xvfb when setup fails before Electron launches",
+    {
+      skip: hasXvfb && deps.ok ? false : "needs Linux with Xvfb, electron and playwright installed",
+    },
+    async () => {
+      delete process.env.DISPLAY;
+      const sockets = () =>
+        fs.existsSync("/tmp/.X11-unix") ? fs.readdirSync("/tmp/.X11-unix") : [];
+      const before = new Set(sockets());
+      // A regular file where the record dir must go makes mkdirSync throw.
+      const blocker = path.join(dir, "not-a-directory");
+      fs.writeFileSync(blocker, "");
+      await assert.rejects(launchDesktop({ recordDir: path.join(blocker, "recordings") }));
+      const leftover = () => sockets().filter((name) => !before.has(name));
+      assert.ok(
+        await pollUntil(() => leftover().length === 0, 3_000),
+        `X sockets left: ${leftover()}`,
+      );
     },
   );
 });

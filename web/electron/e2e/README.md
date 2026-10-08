@@ -55,10 +55,11 @@ pnpm --filter web run build          # build the SPA the server serves
 cd web/electron && pnpm install      # brings in electron + playwright
 ```
 
-On a headless Linux box with no `DISPLAY`, the harness starts a private `Xvfb`
-(the `Xvfb` executable must be installed) and passes Chromium `--no-sandbox` /
-`--disable-dev-shm-usage`, so a plain `node --test` run works; wrapping it in
-`xvfb-run -a` still works too.
+On a headless Linux box with no `DISPLAY`, `launchDesktop` starts a private
+`Xvfb` (the `Xvfb` executable must be installed) and passes Chromium
+`--no-sandbox` / `--disable-dev-shm-usage`, so a plain `node --test` run of the
+lanes built on it works; wrapping it in `xvfb-run -a` still works too. Lanes
+that launch Electron themselves (the design-prompt harness) still need a display.
 The harness still skips cleanly (not fails) when `electron` or `playwright`
 are absent (e.g. a `--filter web`-only checkout), so those runs stay green.
 

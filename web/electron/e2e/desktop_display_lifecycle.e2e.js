@@ -8,32 +8,21 @@
 
 const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { desktopDepsAvailable, launchDesktop } = require("./desktopHarness");
+const {
+  desktopDepsAvailable,
+  launchDesktop,
+  pollUntil,
+  displaySocketPath,
+  xvfbAvailable,
+} = require("./desktopHarness");
 
 const deps = desktopDepsAvailable();
-const xvfbAvailable =
-  process.platform === "linux" &&
-  spawnSync("Xvfb", ["-help"], { stdio: "ignore" }).error === undefined;
-const missing = [...deps.missing, ...(xvfbAvailable ? [] : ["Xvfb on Linux"])];
-
-/** Poll `predicate` every 50ms until it holds or `timeoutMs` passes. */
-async function waitFor(predicate, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  // Each probe must follow the previous one and the pause between them.
-  /* oxlint-disable no-await-in-loop */
-  while (!predicate() && Date.now() < deadline) {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
-    });
-  }
-  /* oxlint-enable no-await-in-loop */
-  return predicate();
-}
+const hasXvfb = xvfbAvailable();
+const missing = [...deps.missing, ...(hasXvfb ? [] : ["Xvfb on Linux"])];
 
 describe(
   "desktop shell — harness-owned display lifecycle",
@@ -58,12 +47,13 @@ describe(
     it("releases the owned Xvfb when the app closes without stopDisplayCapture", async () => {
       // No server URL: the shell boots to its bundled setup page.
       const app = await launchDesktop({ recordDir });
-      const socket = `/tmp/.X11-unix/X${app.display.slice(1)}`;
+      assert.match(app.display ?? "", /^:\d+$/, "harness did not provide an owned display");
+      const socket = displaySocketPath(app.display);
       try {
         assert.ok(fs.existsSync(socket), `no X socket at ${socket}`);
         await app.electronApp.close();
         assert.ok(
-          await waitFor(() => !fs.existsSync(socket), 15_000),
+          await pollUntil(() => !fs.existsSync(socket), 15_000),
           `X socket left at ${socket}`,
         );
       } finally {
