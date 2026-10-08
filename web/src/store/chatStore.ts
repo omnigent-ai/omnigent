@@ -346,13 +346,18 @@ export function beginLocalConversation(
     ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
   ];
   const selfAuthor = getCurrentAuthorId();
-  const bubble: PendingUserMessage = {
-    tempId: pendingMsgTempId,
-    content,
-    initialDraft: { text, files: files ?? [] },
-    createdAtS: Math.floor(Date.now() / 1000),
-    ...(selfAuthor !== null ? { author: selfAuthor } : {}),
-  };
+  const pendingUserMessages: PendingUserMessage[] =
+    content.length > 0
+      ? [
+          {
+            tempId: pendingMsgTempId,
+            content,
+            initialDraft: { text, files: files ?? [] },
+            createdAtS: Math.floor(Date.now() / 1000),
+            ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+          },
+        ]
+      : [];
 
   // Seed the model/agent identity so the optimistic composer shows the selected
   // model (with the caller's pending spinner) instead of the previous session's
@@ -383,9 +388,9 @@ export function beginLocalConversation(
   const entry = conversationRegistry.acquire(tempConvId);
   entry.setState({
     ...modelSeed,
-    pendingUserMessages: [bubble],
+    pendingUserMessages,
     loadingConversation: false,
-    status: "streaming",
+    status: pendingUserMessages.length > 0 ? "streaming" : "idle",
   });
   useChatStore.setState({ conversationId: tempConvId });
   conversationRegistry.setActive(tempConvId);
