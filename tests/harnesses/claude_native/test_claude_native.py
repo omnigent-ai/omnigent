@@ -6034,19 +6034,19 @@ class _FakeAgentsProc:
     ("entries_json", "expected"),
     [
         # A live, non-interactive holder of this id → the guard would refuse a
-        # bare --resume, so the probe reports a holder and the caller forks.
+        # bare --resume, so the probe reports a holder and the caller clones.
         ('[{"sessionId": "sid-live", "kind": "background"}]', True),
         # A parked interactive session is not a live holder for the guard.
         ('[{"sessionId": "sid-live", "kind": "interactive"}]', False),
         # A different session is held, not ours.
         ('[{"sessionId": "sid-other", "kind": "background"}]', False),
-        # An entry without a ``kind`` field fails closed: an unrecognized schema
-        # is not treated as a live holder.
-        ('[{"sessionId": "sid-live"}]', False),
-        # Malformed, non-JSON daemon output fails closed instead of raising.
-        ("not json at all", False),
-        # A JSON object rather than the expected list fails closed.
-        ('{"sessionId": "sid-live", "kind": "background"}', False),
+        # A live entry for our id with no ``kind`` is unknown, not a confirmed
+        # non-holder, so the probe reports ``None`` and the caller clones.
+        ('[{"sessionId": "sid-live"}]', None),
+        # Malformed, non-JSON daemon output is unknown rather than raising.
+        ("not json at all", None),
+        # A JSON object rather than the expected list is unknown.
+        ('{"sessionId": "sid-live", "kind": "background"}', None),
         # No sessions at all.
         ("[]", False),
     ],
@@ -6063,7 +6063,7 @@ class _FakeAgentsProc:
 def test_claude_background_session_holds_id_matches_live_non_interactive(
     monkeypatch: pytest.MonkeyPatch,
     entries_json: str,
-    expected: bool,
+    expected: bool | None,
 ) -> None:
     """
     The probe reports a holder only for a live, non-interactive match.
@@ -6071,7 +6071,7 @@ def test_claude_background_session_holds_id_matches_live_non_interactive(
     ``claude --resume`` is refused while a separate non-interactive process
     (e.g. a still-attached terminal) holds the id. The probe reads the same
     daemon via ``claude agents --json``: a non-interactive entry carrying our
-    id is a holder (fork needed), while a parked interactive entry or a
+    id is a holder (clone needed), while a parked interactive entry or a
     different id is not.
     """
     captured: dict[str, object] = {}
@@ -6091,10 +6091,10 @@ def test_claude_background_session_holds_id_matches_live_non_interactive(
     assert captured["cmd"] == ["/fake/claude", "agents", "--json"]
 
 
-def test_claude_background_session_holds_id_fails_closed_on_subprocess_error(
+def test_claude_background_session_holds_id_unknown_on_subprocess_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed daemon query returns False so resume falls back to in-place."""
+    """A failed daemon query returns None so the caller clones, not resumes."""
 
     def _boom(cmd: object, **kwargs: object) -> None:
         """Simulate the ``claude`` process failing to run."""
@@ -6104,14 +6104,14 @@ def test_claude_background_session_holds_id_fails_closed_on_subprocess_error(
 
     assert (
         claude_native._claude_background_session_holds_id("sid-live", claude_binary="/fake/claude")
-        is False
+        is None
     )
 
 
-def test_claude_background_session_holds_id_false_without_binary(
+def test_claude_background_session_holds_id_unknown_without_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No resolvable ``claude`` binary → False, and no subprocess is spawned."""
+    """No resolvable ``claude`` binary → None, and no subprocess is spawned."""
     monkeypatch.setattr(
         "omnigent._platform.resolve_cli_binary",
         lambda *args, **kwargs: "",
@@ -6124,11 +6124,11 @@ def test_claude_background_session_holds_id_false_without_binary(
 
     monkeypatch.setattr(claude_native.subprocess, "run", _record)
 
-    assert claude_native._claude_background_session_holds_id("sid-live") is False
+    assert claude_native._claude_background_session_holds_id("sid-live") is None
     assert calls == []
 
 
-def test_claude_background_session_holds_id_fails_closed_on_nonzero_exit(
+def test_claude_background_session_holds_id_unknown_on_nonzero_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A non-zero ``claude agents`` exit is not trusted, even with JSON stdout."""
@@ -6142,7 +6142,7 @@ def test_claude_background_session_holds_id_fails_closed_on_nonzero_exit(
 
     assert (
         claude_native._claude_background_session_holds_id("sid-live", claude_binary="/fake/claude")
-        is False
+        is None
     )
 
 

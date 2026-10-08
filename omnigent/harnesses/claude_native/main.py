@@ -5248,7 +5248,7 @@ def _claude_background_session_holds_id(
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
     timeout: float = 10.0,
-) -> bool:
+) -> bool | None:
     """
     Return whether a separate live Claude process still holds this id.
 
@@ -5256,8 +5256,11 @@ def _claude_background_session_holds_id(
     consults (``claude agents --json``), scoped by the launch's ``HOME`` /
     ``CLAUDE_CONFIG_DIR`` so it sees exactly the sessions the guard will.
 
-    Best-effort and fail-closed: a missing binary, a non-zero exit, an
-    unreachable daemon or malformed output returns ``False``.
+    Best-effort and conservative about writes: ``True`` means a live
+    non-interactive holder is confirmed; ``False`` means the daemon answered
+    and no such holder exists; ``None`` means liveness could not be determined
+    (missing binary, non-zero exit, unreachable daemon, or malformed output).
+    The caller must not resume the id in place unless the result is ``False``.
 
     :param external_session_id: Claude-native session id being resumed.
     :param claude_binary: Resolved ``claude`` executable; defaults to the same
@@ -5265,8 +5268,9 @@ def _claude_background_session_holds_id(
     :param cwd: Working directory for the query, normally the resume workspace.
     :param env: Environment for the query; defaults to the process env.
     :param timeout: Seconds to wait for the daemon query before giving up.
-    :returns: ``True`` only when a live, non-interactive session reports this
-        exact ``sessionId``.
+    :returns: ``True`` for a confirmed live, non-interactive holder of this
+        exact ``sessionId``, ``False`` when the daemon confirms none, and
+        ``None`` when liveness is unknown.
     """
     if not external_session_id:
         return False
@@ -5275,7 +5279,7 @@ def _claude_background_session_holds_id(
 
         claude_binary = resolve_cli_binary("claude", env_var="OMNIGENT_CLAUDE_PATH")
     if not claude_binary:
-        return False
+        return None
     try:
         proc = subprocess.run(
             [claude_binary, "agents", "--json"],
@@ -5287,22 +5291,27 @@ def _claude_background_session_holds_id(
             stdin=subprocess.DEVNULL,
         )
         if proc.returncode != 0:
-            return False
+            return None
         entries = json.loads(proc.stdout or "[]")
     except (OSError, subprocess.SubprocessError, ValueError):
-        return False
+        return None
     if not isinstance(entries, list):
-        return False
+        return None
     # The guard refuses the resume for any live holder that is not a parked
-    # interactive session, e.g. a background job. Require ``kind`` to be present
-    # so an unrecognized schema fails closed rather than over-forking.
-    return any(
-        isinstance(entry, dict)
-        and entry.get("sessionId") == external_session_id
-        and entry.get("kind") is not None
-        and entry.get("kind") != "interactive"
-        for entry in entries
-    )
+    # interactive session (e.g. a background job). A live entry for our id whose
+    # kind we cannot classify is reported as unknown rather than a confirmed
+    # non-holder, so the caller clones instead of resuming in place over a
+    # possibly-live transcript.
+    uncertain = False
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("sessionId") != external_session_id:
+            continue
+        kind = entry.get("kind")
+        if kind is None:
+            uncertain = True
+        elif kind != "interactive":
+            return True
+    return None if uncertain else False
 
 
 async def _resolve_cold_resume_args(

@@ -91,12 +91,14 @@ def test_resume_of_still_live_session_is_not_refused(
     isolated_mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """The runner's resume launch must succeed against a still-live session.
+    """A ``--fork-session`` resume must not hit the live-session guard.
 
     Launches a background session that stays alive, confirms the production
-    holder probe recognises it, then runs the exact argv the runner builds for
-    a resume and asserts the CLI does not refuse with its background-session
-    guard.
+    holder probe recognises it, then resumes via the builder's default
+    ``--fork-session`` seam and asserts the real CLI does not refuse with its
+    background-session guard. The runner's host resume path copies the
+    transcript under a fresh id and resumes that copy instead of the held id;
+    that clone behaviour is covered by the orchestration unit tests.
     """
     mock = isolated_mock_llm_server_url
     # Fallback response lets the resume turn complete; the parked background
@@ -111,7 +113,10 @@ def test_resume_of_still_live_session_is_not_refused(
     env = _claude_env(tmp_path, mock)
     external_session_id = ""
     try:
-        _claude(env, "--bg", "say hello", timeout=60, check=True)
+        bg = _claude(env, "--bg", "say hello", timeout=60)
+        assert bg.returncode == 0, (
+            f"background launch exited {bg.returncode}: {(bg.stdout + bg.stderr)!r}"
+        )
         external_session_id = _await_live_background_session(env)
 
         # The runner only branches a copy if the production probe recognises
