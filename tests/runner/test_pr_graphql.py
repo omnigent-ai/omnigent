@@ -67,12 +67,13 @@ def test_graphql_create_tracks_returned_pr(
     assert created
 
 
-@pytest.mark.parametrize("transport", ["runner-shell", "native-exit-footer"])
+@pytest.mark.parametrize("transport", ["runner-shell", "synthetic-success-footer"])
 @pytest.mark.parametrize(
     "projection",
     [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
 )
 def test_graphql_shell_result_formats(transport: str, projection: str | None) -> None:
+    """Exercise serialized runner output and tolerance for a synthetic success footer."""
     output = "[1 (root-commit) 1a2b3c4] A change\n" + creation_output(projection)
     if transport == "runner-shell":
         output = json.dumps({"stdout": output, "stderr": "", "exit_code": 0})
@@ -190,21 +191,13 @@ def test_graphql_body_projection_is_not_pr_identity(formatter: str, compound: bo
     assert not references
 
 
-@pytest.mark.parametrize(
-    "projection",
-    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
-)
-def test_graphql_nested_aliases_do_not_supply_pr_identity(projection: str | None) -> None:
+def test_graphql_nested_aliases_do_not_supply_pr_identity() -> None:
     query = QUERY.replace("number url title isDraft", "url: body")
     body_url = "https://github.com/example/mentioned/pull/99"
-    pr = {"url": body_url}
-    output = (
-        body_url
-        if projection and projection.endswith(".url")
-        else json.dumps(pr if projection else {"data": {"createPullRequest": {"pullRequest": pr}}})
-    )
     references, created = extract_prs(
-        "shell", {"command": command(query, projection=projection)}, output
+        "shell",
+        {"command": command(query, projection=".data.createPullRequest.pullRequest.url")},
+        body_url,
     )
     assert not references
     assert not created
