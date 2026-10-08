@@ -26,7 +26,7 @@ export function useSessionActionRestrictions(
   const loading = Boolean(sessionId && isLoading) || Boolean(hostId && hostsLoading);
   // Successful host lists can omit shared hosts; their snapshot carries the managed label.
   const lookupFailed =
-    Boolean(sessionId && !session && error) || Boolean(hostId && !host && hostsError);
+    Boolean(sessionId && !session && error) || Boolean(hostId && !hosts && hostsError);
   const lookupReason = lookupFailed
     ? SESSION_ACTIONS_UNAVAILABLE
     : loading

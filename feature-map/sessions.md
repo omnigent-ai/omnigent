@@ -159,6 +159,10 @@ plain `uv run pytest`, which starts a private server for the test.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
   session, open the archived view, choose Unarchive on the row, and expect the
   session back in the main list.
+- **`unarchive`, Undo toast:**
+  `tests/e2e_ui/sessions/test_sidebar_lifecycle.py::test_sidebar_session_organization_round_trip`
+  archives two sessions and restores both to Mine through Undo, including after
+  a reload.
 - **`delete`:**
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
@@ -204,8 +208,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/shell/SwitchHostDialog.test.tsx`, and
   `web/src/shell/ReconnectSessionDialog.test.tsx`. Header fallbacks, including
   mobile, are covered by `web/src/shell/ChatHeader.test.tsx`.
-  Failed lookups, recovery, and shared sessions with unlisted hosts are covered
-  by `web/src/hooks/useSessionActionRestrictions.test.tsx`.
+  Failed lookups, recovery, hostless sessions, and shared sessions with unlisted
+  hosts are covered by `web/src/hooks/useSessionActionRestrictions.test.tsx`.
+  Host-menu loading/error explanations and the default status badge's disabled
+  action have component coverage in `web/src/components/HostBadge.test.tsx`.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.

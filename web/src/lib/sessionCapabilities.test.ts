@@ -32,6 +32,18 @@ describe("session action restrictions", () => {
     expect(result.switchHostDisabledReason).toBe(SANDBOX_SWITCH_HOST_UNSUPPORTED);
   });
 
+  it("honors the embedded restriction even for a normally forkable provider", () => {
+    expect(
+      sessionActionRestrictions(
+        { labels: { "omnigent.host_type": "managed" } },
+        { sandbox_provider: "modal" },
+      ),
+    ).toEqual({
+      forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
+      switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+    });
+  });
+
   it("keeps both actions available for ordinary hosts", () => {
     expect(sessionActionRestrictions({ labels: {} }, { sandbox_provider: null })).toEqual({
       forkDisabledReason: undefined,

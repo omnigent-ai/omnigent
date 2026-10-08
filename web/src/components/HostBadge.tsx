@@ -3,9 +3,9 @@ import { useRef, useState } from "react";
 import { useHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
-import { sessionActionRestrictions } from "@/lib/sessionCapabilities";
 import { DisabledActionTooltip } from "./DisabledActionTooltip";
 import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
@@ -131,7 +131,7 @@ export function HostBadge({
       : liveOnline;
 
   const badge = resolveHostBadge({ hostId, host, online });
-  const { switchHostDisabledReason } = sessionActionRestrictions(session, host);
+  const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
   if (appearance === "composer") {
     const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
     const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
@@ -204,6 +204,7 @@ export function HostBadge({
   // reconnect dialog hands out) is the wrong instruction for it.
   const reconnectable = badge.status === "offline" && !session?.hostResumable && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
+  const title = `Host ${badge.label}, ${statusWord}`;
   // The dot is decorative (aria-hidden), so the status would otherwise be
   // conveyed by color alone. Restate it in sr-only text — read together with
   // the visible label, a screen reader announces "<host>, <status>". `title`
@@ -214,11 +215,12 @@ export function HostBadge({
         aria-hidden
         className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[badge.status])}
       />
-      <span className="truncate">{badge.label}</span>
+      <span className="truncate" title={switchHostDisabledReason ? title : undefined}>
+        {badge.label}
+      </span>
       <span className="sr-only">, {statusWord}</span>
     </>
   );
-  const title = `Host ${badge.label}, ${statusWord}`;
 
   if (reconnectable) {
     return (
@@ -246,7 +248,7 @@ export function HostBadge({
       <div
         data-testid="host-badge"
         className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
-        title={title}
+        title={switchHostDisabledReason ? undefined : title}
       >
         {content}
         {switchHostDisabledReason && (

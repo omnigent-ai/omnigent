@@ -148,17 +148,40 @@ describe("useSessionActionRestrictions", () => {
     },
   );
 
-  it("keeps supported actions available when a background refetch fails with usable cached data", async () => {
-    const { client, result } = renderRestrictions();
-    await waitFor(() => expect(result.current).toEqual(unrestricted));
-    getSessionMock.mockRejectedValue(new Error("Session unavailable"));
-    fetchMock.mockRejectedValue(new Error("Hosts unavailable"));
-    await act(async () => {
-      await client.invalidateQueries({ queryKey: ["session", "session-1"] });
-      await client.invalidateQueries({ queryKey: ["hosts"] });
-    });
-    expect(client.getQueryState(["session", "session-1"])?.status).toBe("error");
-    expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("error");
-    expect(result.current).toEqual(unrestricted);
-  });
+  it.each([false, true])(
+    "preserves hostless session capabilities without requesting hosts (managed=%s)",
+    async (managed) => {
+      getSessionMock.mockResolvedValue({
+        ...session(managed ? { "omnigent.host_type": "managed" } : {}),
+        hostId: undefined,
+      });
+      const { client, result } = renderRestrictions();
+      await waitFor(() =>
+        expect(client.getQueryState(["session", "session-1"])?.status).toBe("success"),
+      );
+      expect(result.current).toEqual(managed ? unsupported : unrestricted);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "keeps supported actions available after failed background refetches (host listed=%s)",
+    async (hostListed) => {
+      if (!hostListed) {
+        fetchMock.mockImplementation(async () => new Response(JSON.stringify({ hosts: [] })));
+      }
+      const { client, result, rerender } = renderRestrictions();
+      await waitFor(() => expect(result.current).toEqual(unrestricted));
+      getSessionMock.mockRejectedValue(new Error("Session unavailable"));
+      fetchMock.mockRejectedValue(new Error("Hosts unavailable"));
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: ["session", "session-1"] });
+        await client.invalidateQueries({ queryKey: ["hosts"] });
+      });
+      expect(client.getQueryState(["session", "session-1"])?.status).toBe("error");
+      expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("error");
+      rerender();
+      expect(result.current).toEqual(unrestricted);
+    },
+  );
 });

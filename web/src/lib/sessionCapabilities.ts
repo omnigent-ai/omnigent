@@ -20,8 +20,8 @@ export function sessionActionRestrictions(
   session: SessionActionSource | null | undefined,
   host?: { sandbox_provider?: string | null },
 ): { forkDisabledReason?: string; switchHostDisabledReason?: string } {
-  // Embedded deployments derive this label even when the viewer cannot list
-  // the source's host. A repository label alone does not imply a restriction.
+  // The embedded deployment derives this marker alongside its managed-fork ban,
+  // regardless of provider. It is distinct from core `host_type: managed` launches.
   const unsupportedSource =
     session?.labels?.["omnigent.host_type"] === "managed" ||
     (host?.sandbox_provider != null && UNSUPPORTED_FORK_PROVIDERS.has(host.sandbox_provider));

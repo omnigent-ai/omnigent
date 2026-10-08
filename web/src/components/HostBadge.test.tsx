@@ -1,8 +1,14 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HostBadge, resolveHostBadge } from "./HostBadge";
 import type { Host } from "@/hooks/useHosts";
+import {
+  SANDBOX_SWITCH_HOST_UNSUPPORTED,
+  SESSION_ACTIONS_LOADING,
+  SESSION_ACTIONS_UNAVAILABLE,
+} from "@/lib/sessionCapabilities";
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -148,6 +154,50 @@ describe("HostBadge", () => {
       fireEvent.keyDown(item, { key: " " });
       expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
       expect(item).toBeInTheDocument();
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["loading", SESSION_ACTIONS_LOADING],
+    ["failed", SESSION_ACTIONS_UNAVAILABLE],
+  ])("explains a %s host lookup in the composer menu", async (state, reason) => {
+    useHostsMock.mockReturnValue({
+      data: undefined,
+      isLoading: state === "loading",
+      error: state === "failed" ? new Error("Hosts unavailable") : null,
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    const item = screen.getByRole("menuitem", { name: "Switch host…" });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    expect(item).toHaveAccessibleDescription(reason);
+    fireEvent.focus(item);
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent(reason));
+    fireEvent.click(item);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+  });
+
+  it.each(["arclet", "lakebox"])(
+    "explains disabled switching on the default %s badge with a keyboard-focusable target",
+    async (provider) => {
+      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: provider })] });
+      const user = userEvent.setup();
+      render(<HostBadge sessionId="conv_1" />);
+      const button = screen.getByRole("button", { name: "Switch host…" });
+      const target = screen.getByRole("group", { name: "Switch host" });
+      expect(button).toBeDisabled();
+      expect(target).toHaveAttribute("tabindex", "0");
+      expect(screen.getByTestId("host-badge")).not.toHaveAttribute("title");
+      await user.tab();
+      expect(target).toHaveFocus();
+      await waitFor(() =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(SANDBOX_SWITCH_HOST_UNSUPPORTED),
+      );
+      expect(target).toHaveAccessibleDescription(SANDBOX_SWITCH_HOST_UNSUPPORTED);
+      await user.keyboard("{Enter} ");
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
     },
   );
 

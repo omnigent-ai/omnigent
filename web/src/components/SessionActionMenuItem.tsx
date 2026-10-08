@@ -21,6 +21,7 @@ export function SessionActionMenuItem({
   ...props
 }: ItemProps & {
   disabledReason?: string;
+  /** A Radix-compatible menu item that activates exclusively through onSelect. */
   Item?: ComponentType<ItemProps>;
 }) {
   const descriptionId = useId();
