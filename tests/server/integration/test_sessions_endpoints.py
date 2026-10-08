@@ -10689,24 +10689,21 @@ async def test_cancelled_message_the_agent_did_record_drains_as_matched(
         assert pending_inputs.pending_ids(session_id) == []
 
 
-async def test_btw_settles_its_own_entry_rather_than_a_cancelled_one(
+async def test_btw_sidechat_event_leaves_an_unrelated_queued_web_message_in_place(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A ``/btw`` typed after a cancelled message settles its own bubble.
+    A relayed ``/btw`` overlay settles nothing: a web message queued meanwhile keeps its entry.
 
-    The overlay never round-trips through the transcript, so the server drops the
-    oldest pending entry when it arrives. That must be the ``/btw`` entry, not the
-    cancelled one: otherwise the session list shows "running" and the ``/btw``
-    bubble comes back on every reload until the TTL.
+    A web ``/btw`` is never queued, so no entry belongs to the overlay. Settling the
+    oldest one would drop the other message's entry, and its own mirror would then
+    find nothing to settle.
     """
     from omnigent.runtime import pending_inputs
 
-    async with _codex_native_session(client, monkeypatch) as (session_id, _published):
-        cancelled = _queue_web_message(session_id, "cancel me")
-        await _press_stop(client, session_id)
-        _queue_web_message(session_id, "/btw what is this?")
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        queued = _queue_web_message(session_id, "go on")
 
         response = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -10717,10 +10714,17 @@ async def test_btw_settles_its_own_entry_rather_than_a_cancelled_one(
         )
 
         assert response.status_code == 202, response.text
-        assert pending_inputs.snapshot_for(session_id) == []
-        assert pending_inputs.has_pending(session_id) is False
-        # The cancelled entry is hidden and left to the TTL.
-        assert pending_inputs.pending_ids(session_id) == [cancelled]
+        overlays = [
+            event for _sid, event in published if event.get("type") == "session.btw_sidechat"
+        ]
+        assert [(o["question"], o["answer"]) for o in overlays] == [("what is this?", "A test.")]
+        snapshot = pending_inputs.snapshot_for(session_id)
+        assert [entry["pending_id"] for entry in snapshot] == [queued]
+
+        await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
+
+        assert _consumed_pending_ids(published) == [queued]
+        assert pending_inputs.pending_ids(session_id) == []
 
 
 @dataclass

@@ -2985,11 +2985,15 @@ async def _persist_external_conversation_item_unlocked(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
     elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
-        # A command typed in the web composer was queued as plain text but comes
-        # back as a slash_command item. Drain its own entry so it is not later
-        # mistaken for a lost message; older entries stay in place.
-        command_line = f"/{item.data.name} {item.data.arguments}".strip()
-        matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        # A command typed in the web composer was queued as plain text but comes back
+        # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
+        # ``/<plugin>:simplify``. Drain its own entry so it is not mistaken for a lost message.
+        spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
+        for spelling in spellings:
+            command_line = f"/{spelling} {item.data.arguments}".strip()
+            matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+            if matched.matched is not None:
+                break
         drained = matched.matched
         if drained is not None:
             cleared_pending_id = drained.pending_id
@@ -7266,7 +7270,20 @@ async def _dispatch_session_event_to_runner_impl(
                 "omnigent on the host (>= 0.15.0) and reconnect it, then try again.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        queues_message = isinstance(content, list) and bool(content) and not opens_side_chat
+        # A Claude /btw answers in a TUI overlay that never enters the transcript, so nothing
+        # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
+        # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
+        is_btw = (
+            _native_pane_harness(conv) == "claude-native"
+            and isinstance(content, list)
+            and all(
+                isinstance(block, dict) and block.get("type") == "input_text" for block in content
+            )
+            and bool(re.match(r"\s*/btw(\s|$)", _extract_user_text_for_routing(body)))
+        )
+        queues_message = (
+            isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
+        )
         if queues_message and web_stable_id is not None:
             repeated_pending_id = pending_inputs.pending_id_for_stable_id(
                 session_id, web_stable_id

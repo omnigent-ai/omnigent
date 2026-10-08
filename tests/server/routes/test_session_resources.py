@@ -8688,3 +8688,226 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("typed", "kind", "recorded_name", "arguments"),
+    [
+        # A skill typed /simplify is recorded under its plugin-qualified name.
+        ("/simplify the parser", "skill", "dev-productivity:simplify", "the parser"),
+        (
+            "/dev-productivity:simplify the parser",
+            "skill",
+            "dev-productivity:simplify",
+            "the parser",
+        ),
+        ("/compact", "command", "compact", ""),
+    ],
+    ids=["plugin-short-name", "plugin-qualified-name", "builtin"],
+)
+async def test_claude_native_slash_command_drains_its_queued_entry_under_either_name(
+    typed: str,
+    kind: str,
+    recorded_name: str,
+    arguments: str,
+) -> None:
+    """A web-typed command drains its entry whether Claude records it plugin-qualified or bare.
+
+    The older entry still waits for its own mirror.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": typed}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": kind,
+                "name": recorded_name,
+                "arguments": arguments,
+            },
+            "response_id": "resp_command",
+            "source_id": "claude:command:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", ["/simplify the lexer", "/review the parser"])
+async def test_claude_native_plugin_slash_command_leaves_a_different_queued_command(
+    typed: str,
+) -> None:
+    """Trying the bare name never settles an entry with other arguments or another command."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    other = pending_inputs.record(sid, [{"type": "input_text", "text": typed}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "skill",
+                "name": "dev-productivity:simplify",
+                "arguments": "the parser",
+            },
+            "response_id": "resp_simplify",
+            "source_id": "claude:simplify:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [other]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_override", "text"),
+    [
+        (None, "/btw what is a monad"),
+        (None, "/btw"),
+        # A forced-auto pane has not routed yet, but its terminal is already Claude.
+        ("auto", "/btw what is a monad"),
+    ],
+    ids=["question", "bare", "forced-auto-pane"],
+)
+async def test_claude_native_btw_message_is_forwarded_without_a_queued_entry(
+    harness_override: str | None,
+    text: str,
+) -> None:
+    """A /btw never reaches the transcript, so it must not leave a skippable entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.harness_override = harness_override
+    client = _FakeRunnerClient()
+    content = [{"type": "input_text", "text": text}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+
+        assert result.pending_id is None
+        assert pending_inputs.snapshot_for(sid) == []
+        # The text still reaches Claude's terminal, which answers it in its own overlay.
+        url, forwarded = client.post_json_calls[-1]
+        assert url == f"/v1/sessions/{sid}/events"
+        assert forwarded["content"] == content
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper", "agent_name", "text", "attachments"),
+    [
+        ("claude-code-native-ui", "claude-native-ui", "/btwx foo", []),
+        ("claude-code-native-ui", "claude-native-ui", "does /btw answer in an overlay?", []),
+        ("codex-native-ui", "codex-native-ui", "/btw what is a monad", []),
+        # An attachment is pasted ahead of the text, so Claude sees an ordinary prompt.
+        (
+            "claude-code-native-ui",
+            "claude-native-ui",
+            "/btw what is this?",
+            [{"type": "input_image", "file_id": "file_x", "filename": "a.png"}],
+        ),
+    ],
+    ids=["longer-command-name", "mentioned-mid-sentence", "codex-pane", "with-attachment"],
+)
+async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
+    wrapper: str,
+    agent_name: str,
+    text: str,
+    attachments: list[dict[str, str]],
+) -> None:
+    """Only a text-only /btw on a Claude pane skips the queue; anything else keeps its entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": wrapper},
+    )
+    client = _FakeRunnerClient()
+    content = [*attachments, {"type": "input_text", "text": text}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name=agent_name,
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+
+        assert result.pending_id is not None
+        assert [entry["content"] for entry in pending_inputs.snapshot_for(sid)] == [content]
+        assert client.post_json_calls[-1][0] == f"/v1/sessions/{sid}/events"
+    finally:
+        pending_inputs.reset_for_tests()
