@@ -33,3 +33,24 @@ it("moves focus to the enabled button when its restriction clears", async () => 
   await user.keyboard("{Enter}");
   expect(onClick).toHaveBeenCalledOnce();
 });
+
+it("does not reopen a cleared tooltip when the restriction returns", async () => {
+  const user = userEvent.setup();
+  const content = (reason?: string) => (
+    <>
+      <DisabledActionTooltip reason={reason}>
+        <button type="button">Fork</button>
+      </DisabledActionTooltip>
+      <button type="button">Another action</button>
+    </>
+  );
+  const { rerender } = render(content("Checking session capabilities…"));
+  await user.tab();
+  await waitFor(() => expect(screen.getByRole("tooltip")).toBeVisible());
+
+  rerender(content());
+  await user.tab();
+  expect(screen.getByRole("button", { name: "Another action" })).toHaveFocus();
+  rerender(content("Checking session capabilities…"));
+  expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+});

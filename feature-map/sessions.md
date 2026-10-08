@@ -98,7 +98,8 @@ sidebar menus, and message actions. The composer's host menu shows a disabled
 The reconnect dialog also disables Clone and Switch host; directory selection
 cannot enable either action.
 While support is being checked, actions stay disabled. If that check fails,
-the explanation asks you to reload.
+the explanation asks you to reload. Direct dialogs show a loading status without
+an action button until the check finishes; supported forms then receive keyboard focus.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
 choose Stop session while a side chat or sub-agent is working. On mobile, open
@@ -213,7 +214,9 @@ plain `uv run pytest`, which starts a private server for the test.
   Host-menu loading/error explanations and the default status badge's disabled
   action have component coverage in `web/src/components/HostBadge.test.tsx`.
   Loading-to-enabled keyboard focus is covered there and in
-  `web/src/components/DisabledActionTooltip.test.tsx`.
+  `web/src/components/DisabledActionTooltip.test.tsx`. The fork and switch-host
+  dialog suites also cover loading-to-form focus; the tooltip suite checks that a
+  cleared explanation does not reopen without interaction.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.

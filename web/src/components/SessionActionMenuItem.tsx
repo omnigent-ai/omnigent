@@ -19,7 +19,7 @@ export function SessionActionMenuItem({
   onSelect,
   className,
   ...props
-}: ItemProps & {
+}: Omit<ItemProps, "aria-disabled"> & {
   disabledReason?: string;
   /** A Radix-compatible menu item that activates exclusively through onSelect. */
   Item?: ComponentType<ItemProps>;

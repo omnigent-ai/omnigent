@@ -192,6 +192,7 @@ export function ReconnectSessionDialog({
   // Reconnect and activate it, so the loading placeholder never disables Clone.
   const forkRestriction =
     forkDisabledReason === SESSION_ACTIONS_LOADING ? undefined : forkDisabledReason;
+  // Loading stays out of the guidance, but the disabled action's tooltip explains the wait.
   const switchHostRestriction =
     switchHostDisabledReason === SESSION_ACTIONS_LOADING ? undefined : switchHostDisabledReason;
   const isHostReconnect = state === "host_offline";

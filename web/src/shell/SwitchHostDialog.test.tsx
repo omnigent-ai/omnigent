@@ -139,6 +139,33 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("SwitchHostDialog", () => {
+  it("shows a loading status before exposing a supported host-switch form", async () => {
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: true, error: null });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const content = () => (
+      <QueryClientProvider client={client}>
+        <SwitchHostDialog
+          open
+          onOpenChange={() => {}}
+          sessionId="conv_1"
+          currentHostId="host_old"
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(content());
+    expect(screen.getByRole("status")).toHaveTextContent("Checking session capabilities…");
+    expect(screen.queryByTestId("switch-host-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("mock-workspace-input")).not.toBeInTheDocument();
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
+    rerender(content());
+    await waitFor(() => expect(screen.getByTestId("mock-host-select")).toHaveFocus());
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByTestId("switch-host-button")).toBeEnabled();
+  });
+
   it.each([
     ["managed snapshot", null],
     ["Arclet host", "arclet"],

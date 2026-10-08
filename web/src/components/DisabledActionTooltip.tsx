@@ -21,6 +21,7 @@ export function DisabledActionTooltip({
   const triggerRef = useRef<HTMLSpanElement>(null);
   const [open, setOpen] = useState(false);
   useLayoutEffect(() => {
+    if (!reason) setOpen(false);
     if (!reason && label && document.activeElement === triggerRef.current) {
       triggerRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
     }

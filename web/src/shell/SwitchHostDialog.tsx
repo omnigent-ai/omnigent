@@ -12,6 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import {
   Select,
   SelectContent,
@@ -69,22 +70,27 @@ export function SwitchHostDialog(props: Parameters<typeof SupportedSwitchHostDia
     hostId: props.currentHostId,
   });
   if (switchHostDisabledReason) {
+    const loading = switchHostDisabledReason === SESSION_ACTIONS_LOADING;
     return (
       <Dialog open={props.open} onOpenChange={props.onOpenChange}>
         <DialogContent data-testid="switch-host-dialog" className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Switch host</DialogTitle>
-            <DialogDescription>{switchHostDisabledReason}</DialogDescription>
+            <DialogDescription role={loading ? "status" : undefined}>
+              {switchHostDisabledReason}
+            </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="ghost" onClick={() => props.onOpenChange(false)}>
               Cancel
             </Button>
-            <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
-              <Button data-testid="switch-host-button" disabled>
-                Switch host
-              </Button>
-            </DisabledActionTooltip>
+            {!loading && (
+              <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
+                <Button data-testid="switch-host-button" disabled>
+                  Switch host
+                </Button>
+              </DisabledActionTooltip>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

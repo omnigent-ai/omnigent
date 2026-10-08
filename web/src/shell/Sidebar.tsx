@@ -3341,7 +3341,7 @@ interface MenuItemProps {
   className?: string;
   disabled?: boolean;
   "aria-disabled"?: boolean;
-  "aria-description"?: string;
+  "aria-describedby"?: string;
   textValue?: string;
   variant?: "default" | "destructive";
   // Radix's menu `onSelect` receives a native Event in both families.
