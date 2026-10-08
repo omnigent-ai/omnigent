@@ -574,10 +574,10 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       item.removeAttributeNS(PRODUCTION, "path");
     }
     if (colors.length < 2) return buffer;
-    for (const color of colors) {
+    for (const displayColor of colors) {
       const base = output.createElementNS(CORE, "base");
-      base.setAttribute("name", color);
-      base.setAttribute("displaycolor", color);
+      base.setAttribute("name", displayColor);
+      base.setAttribute("displaycolor", displayColor);
       bases.append(base);
     }
     outputModel.append(build);
