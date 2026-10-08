@@ -27,6 +27,15 @@ def command(query: str = QUERY, projection: str | None = None) -> str:
     return shlex.join(args)
 
 
+def creation_output(projection: str | None, url: str | None = URL) -> str:
+    pr = {"url": url, "number": int(url.rsplit("/", 1)[1])} if url else None
+    if projection and projection.endswith(".url"):
+        return url if url else "null"
+    return json.dumps(
+        pr if projection else {"data": {"createPullRequest": {"pullRequest": pr}}}, indent=2
+    )
+
+
 @pytest.mark.parametrize("wrapped", [False, True], ids=["shell", "login-shell"])
 @pytest.mark.parametrize(
     "projection",
@@ -51,17 +60,65 @@ def test_graphql_create_tracks_returned_pr(wrapped: bool, projection: str | None
     assert created
 
 
+@pytest.mark.parametrize("transport", ["runner-shell", "native-exit-footer"])
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_graphql_shell_result_formats(transport: str, projection: str | None) -> None:
+    output = creation_output(projection)
+    if transport == "runner-shell":
+        output = json.dumps({"stdout": output, "stderr": "", "exit_code": 0})
+    else:
+        output += "\n[exit code: 0]"
+    references, created = extract_prs(
+        "sys_os_shell" if transport == "runner-shell" else "shell",
+        {"command": command(projection=projection)},
+        output,
+    )
+    assert [ref.url for ref in references] == [URL]
+    assert created
+
+
 @pytest.mark.parametrize("reverse", [False, True])
-def test_graphql_and_cli_creations_preserve_both_identities(reverse: bool) -> None:
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_graphql_and_cli_creations_preserve_both_identities(
+    reverse: bool, projection: str | None
+) -> None:
     other = "https://github.com/example/another/pull/7"
     commands = [
-        command(projection=".data.createPullRequest.pullRequest.url"),
+        command(projection=projection),
         "gh pr create -R example/another",
     ]
+    outputs = [creation_output(projection), other]
     references, created = extract_prs(
         "shell",
         {"command": "; ".join(reversed(commands) if reverse else commands)},
-        URL + "\n" + other,
+        "\n".join(reversed(outputs) if reverse else outputs),
+    )
+    assert {ref.url for ref in references} == {URL, other}
+    assert created
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_multiple_graphql_creations_preserve_returned_identities(
+    projection: str | None,
+) -> None:
+    other = "https://github.com/example/project/pull/43"
+    commands = [
+        command(projection=projection),
+        command(QUERY.replace('"contributor/topic"', '"contributor/another"'), projection),
+    ]
+    references, created = extract_prs(
+        "shell",
+        {"command": "; ".join(commands)},
+        "\n".join(creation_output(projection, url) for url in (URL, other)),
     )
     assert {ref.url for ref in references} == {URL, other}
     assert created
@@ -113,7 +170,7 @@ def test_other_graphql_operations_do_not_attach_prs(query: str) -> None:
 
 @pytest.mark.parametrize("exit_code", [1, None])
 def test_unsuccessful_graphql_create_does_not_attach_pr(exit_code: int | None) -> None:
-    result = {"exit_code": exit_code, "stdout": URL}
+    result = {"exit_code": exit_code, "stdout": creation_output(None)}
     if exit_code is None:
         result["session_id"] = "still-running"
     references, _ = extract_prs("exec_command", {"cmd": command()}, result)
@@ -217,6 +274,103 @@ def test_graphql_json_output_does_not_fall_back_to_unrelated_url(
     projection: str | None,
 ) -> None:
     output = json.dumps({"data": {"createPullRequest": None}}) + "\n" + URL
+    references, _ = extract_prs("shell", {"command": command(projection=projection)}, output)
+    assert not references
+
+
+@pytest.mark.parametrize("created", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_full_response_reads_only_the_mutation_identity(created: bool, reverse: bool) -> None:
+    unrelated = json.dumps({"url": "https://github.com/example/another/pull/7"})
+    outputs = [creation_output(None, URL if created else None), unrelated]
+    references, _ = extract_prs(
+        "shell",
+        {"command": command()},
+        {"stdout": "\n".join(reversed(outputs) if reverse else outputs)},
+    )
+    assert [ref.url for ref in references] == ([URL] if created else [])
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+@pytest.mark.parametrize(
+    "wrapper", ["stdout", "serialized-stdout", "aggregatedOutput", "structuredContent", "content"]
+)
+def test_graphql_output_is_separate_from_tool_metadata(
+    projection: str | None, wrapper: str
+) -> None:
+    unrelated = {"url": "https://github.com/example/another/pull/7"}
+    output = creation_output(projection)
+    value = [{"type": "text", "text": output}] if wrapper == "content" else output
+    result: object = {
+        "url": unrelated["url"],
+        "metadata": unrelated,
+        "stdout" if wrapper == "serialized-stdout" else wrapper: value,
+    }
+    if wrapper != "content":
+        result["content"] = unrelated
+    if wrapper == "serialized-stdout":
+        result = json.dumps({**result, "exit_code": 0})
+    references, created = extract_prs(
+        "sys_os_shell" if wrapper == "serialized-stdout" else "shell",
+        {"command": command(projection=projection)},
+        result,
+    )
+    assert [ref.url for ref in references] == [URL]
+    assert created
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_empty_graphql_output_does_not_read_other_tool_fields(projection: str | None) -> None:
+    unrelated = {"url": URL}
+    result = {
+        "stdout": creation_output(projection, None),
+        "content": unrelated,
+        "structuredContent": unrelated,
+        "metadata": unrelated,
+        "stderr": json.dumps(unrelated),
+    }
+    references, _ = extract_prs("shell", {"command": command(projection=projection)}, result)
+    assert not references
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+@pytest.mark.parametrize("tool", ["sys_os_shell", "shell", "exec_command"])
+def test_graphql_emitted_documents_are_not_tool_envelopes(
+    projection: str | None, tool: str
+) -> None:
+    document = json.dumps({"stdout": creation_output(projection), "exit_code": 0})
+    result = (
+        json.dumps({"stdout": document, "stderr": "", "exit_code": 0})
+        if tool == "sys_os_shell"
+        else document
+    )
+    references, _ = extract_prs(tool, {"command": command(projection=projection)}, result)
+    assert not references
+
+
+@pytest.mark.parametrize("field", ["content", "metadata", "stderr"])
+def test_graphql_projection_does_not_read_metadata_without_output(field: str) -> None:
+    result = {field: {"url": URL}}
+    references, _ = extract_prs(
+        "shell", {"command": command(projection=".data.createPullRequest.pullRequest")}, result
+    )
+    assert not references
+
+
+@pytest.mark.parametrize("created", [False, True])
+def test_ambiguous_projected_objects_are_not_attributed(created: bool) -> None:
+    projection = ".data.createPullRequest.pullRequest"
+    output = creation_output(projection, URL if created else None)
+    output += "\n" + json.dumps({"url": "https://github.com/example/another/pull/7"})
     references, _ = extract_prs("shell", {"command": command(projection=projection)}, output)
     assert not references
 

@@ -6,6 +6,7 @@ request facet recognizes its own shell commands, output objects, and MCP tools.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shlex
@@ -218,6 +219,15 @@ def extract_prs(
     tool_name: str, arguments: dict[str, object], result: object
 ) -> tuple[list[PullRequestRef], bool]:
     """Return positively identified PRs and whether the operation created them."""
+    if tool_name == "sys_os_shell" and isinstance(result, str):
+        # This tool serializes its result envelope; native shell strings are stdout.
+        try:
+            envelope = json.loads(result)
+        except ValueError:
+            pass
+        else:
+            if isinstance(envelope, dict) and "stdout" in envelope and "exit_code" in envelope:
+                result = envelope
     if _failed(result):
         return [], False
     facets = _facets()

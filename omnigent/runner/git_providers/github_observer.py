@@ -8,6 +8,7 @@ rules to their answers.
 from __future__ import annotations
 
 import functools
+import json
 import re
 from collections.abc import Sequence
 from pathlib import PurePath
@@ -380,20 +381,97 @@ def _content_only(tokens: list[str]) -> bool:
     )
 
 
-def _graphql_prs(result: object, *, field: str, allow_bare_url: bool) -> list[PullRequestRef]:
-    """Read the validated mutation's response or an identity-only projection."""
+def _graphql_output_values(result: object, depth: int = 0) -> list[object]:
+    """Unwrap the command output, preserving each emitted JSON document intact."""
+    if depth > 6:
+        return []
+    if isinstance(result, dict):
+        for key in ("stdout", "output", "aggregatedOutput", "structuredContent", "result", "text"):
+            if key in result:
+                return _graphql_output_values(result[key], depth + 1)
+        if "content" in result:
+            content = result["content"]
+            return (
+                _graphql_output_values(content, depth + 1)
+                if isinstance(content, (str, list))
+                else []
+            )
+        if any(key in result for key in ("metadata", "stderr", "exit_code", "exitCode")):
+            return []
+        return [result]
+    if isinstance(result, list):
+        return [
+            value
+            for block in result[:100]
+            if isinstance(block, dict) and block.get("type") == "text"
+            for value in _graphql_output_values(block.get("text"), depth + 1)
+        ]
+    if not isinstance(result, str):
+        return [result]
+    values: list[object] = []
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(result):
+        if result[index].isspace():
+            index += 1
+            continue
+        end = result.find("\n", index)
+        if end == -1:
+            end = len(result)
+        line = result[index:end].strip()
+        if line == "[exit code: 0]":
+            index = end
+            continue
+        if result[index] in '{["' or line == "null":
+            try:
+                value, position = decoder.raw_decode(result, index)
+            except ValueError:
+                return []
+            end = result.find("\n", position)
+            if end == -1:
+                end = len(result)
+            if result[position:end].strip():
+                return []
+            values.append(value)
+        else:
+            values.append(line)
+        index = end
+    return values
+
+
+def _graphql_prs(
+    result: object, *, field: str, projection: str, object_count: int
+) -> list[PullRequestRef]:
+    """Read only the response shape requested by the validated creation command."""
+    values = _graphql_output_values(result)
+    path = f".data.{field}.pullRequest"
+    if projection == f"{path}.url":
+        if any(value is None for value in values):
+            return []
+        return [
+            ref
+            for value in values
+            if isinstance(value, str) and len(value.split()) == 1 and (ref := pr_reference(value))
+        ]
     references: list[PullRequestRef] = []
-    for obj in result_objects(result):
-        if ref := pr_reference(obj.get("url")):
-            references.append(ref)
-        mutation = obj.get(field)
-        pr = mutation.get("pullRequest") if isinstance(mutation, dict) else None
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        if projection == path:
+            pr = value
+        elif not projection:
+            data = value.get("data")
+            mutation = data.get(field) if isinstance(data, dict) else None
+            pr = mutation.get("pullRequest") if isinstance(mutation, dict) else None
+        else:
+            continue
         if isinstance(pr, dict) and (ref := pr_reference(pr.get("url"))):
             references.append(ref)
-    if not references and allow_bare_url:
-        for line in output_text(result).splitlines():
-            if len(line.split()) == 1 and (ref := pr_reference(line.strip())):
-                references.append(ref)
+    # Extra projected objects or a null result leave their command attribution ambiguous.
+    if projection == path and (
+        any(value is None for value in values) or len(references) > object_count
+    ):
+        return []
     return references
 
 
@@ -427,13 +505,20 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
     Other ``gh`` commands, such as ``gh auth`` and ``gh config``, are setup that
     neither identifies a PR nor hides one, so they produce no op.
     """
-    ops: list[ShellPrOp] = []
+    commands: list[tuple[list[str], str | None, str]] = []
     for segment in segments:
         tokens = _gh_arguments(segment)
         if not tokens or tokens[0] not in {"pr", "api"}:
             continue
         field = _graphql_create_field(tokens)
         projection = (_flag(tokens, "--jq", "-q") or "").strip()
+        commands.append((tokens, field, projection))
+    object_count = sum(
+        field is not None and projection == f".data.{field}.pullRequest"
+        for _, field, projection in commands
+    )
+    ops: list[ShellPrOp] = []
+    for tokens, field, projection in commands:
         ops.append(
             ShellPrOp(
                 tracks=_tracks_pr(tokens),
@@ -444,7 +529,8 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
                     functools.partial(
                         _graphql_prs,
                         field=field,
-                        allow_bare_url=projection == f".data.{field}.pullRequest.url",
+                        projection=projection,
+                        object_count=object_count,
                     )
                     if field
                     else None
