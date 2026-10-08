@@ -1164,7 +1164,7 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
     }
   });
 
-  it("recolours model output above 32 MiB without multiplying its mesh payload", () => {
+  it("recolours output above 32 MiB and bounds absolute shared-mesh expansion", () => {
     const payloadBytes = 33 * 1024 * 1024;
     const input = archive(
       {
@@ -1195,7 +1195,31 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       [1, 2, 3],
       [12, 2, 3],
     ]);
-  }, 30_000); // Real large-output normalization and loader parsing need headroom on slower CI runners.
+    const copiedPayloadBytes = Math.floor(MAX_EMITTED_BYTES / 3) + 4096;
+    const oversized = archive(
+      {
+        "3D/root.model": model(
+          mesh(1).replace(
+            "<mesh>",
+            `<metadata name="payload">${"x".repeat(copiedPayloadBytes)}</metadata><mesh>`,
+          ) + [100, 101, 102].map((id, index) => composite(id, component(1, index * 10))).join(""),
+          [100, 101, 102].map((id) => `<item objectid="${id}"/>`).join(""),
+        ),
+        "Metadata/model_settings.config": `<config>${[100, 101, 102].map((id, index) => config(part(1, index + 1), undefined, id)).join("")}</config>`,
+      },
+      false,
+      0,
+    );
+    expect(copiedPayloadBytes * 3).toBeGreaterThan(MAX_EMITTED_BYTES);
+    expect(oversized.byteLength).toBeLessThan(MAX_SELECTED_BYTES);
+    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    try {
+      expect(applyThreeMfColors(oversized) === oversized).toBe(true);
+      expect(serializer).not.toHaveBeenCalled();
+    } finally {
+      serializer.mockRestore();
+    }
+  }, 30_000); // Real large-output and absolute-ceiling probes need headroom on slower CI runners.
 
   it("memoizes repeated leaf instances before deep import", () => {
     const count = 80;
