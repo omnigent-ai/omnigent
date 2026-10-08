@@ -46,6 +46,30 @@ function HostPreviewFrame({ htmlContent, iframeRef, onLoad }: HtmlPreviewFramePr
 }
 
 describe("HtmlCommentViewer", () => {
+  it("warns when a host frame loads without exposing its iframe ref", () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    function HostPreviewWithoutRef({ htmlContent, onLoad }: HtmlPreviewFrameProps) {
+      return (
+        <iframe
+          title="Host preview without ref"
+          srcDoc={htmlContent}
+          onLoad={onLoad}
+          sandbox="allow-scripts"
+        />
+      );
+    }
+    setOmnigentHostConfig({ htmlPreviewFrame: HostPreviewWithoutRef });
+    renderViewer("<p>Host artifact</p>", false, true);
+
+    fireEvent.load(screen.getByTitle("Host preview without ref"));
+
+    expect(warn).toHaveBeenCalledWith(
+      "HTML comment bridge cannot connect: preview frame did not expose its content window.",
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("passes prepared HTML and connects the bridge through the host-supplied frame", () => {
     setOmnigentHostConfig({ htmlPreviewFrame: HostPreviewFrame });
     const { rerender } = renderViewer(

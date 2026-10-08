@@ -218,16 +218,20 @@ export function HtmlCommentViewer({
   // race and makes the timeout measure the bridge startup, not document parsing.
   const onLoad = () => {
     const win = iframeRef.current?.contentWindow;
-    if (!win) return;
+    if (!win) {
+      console.warn(
+        "HTML comment bridge cannot connect: preview frame did not expose its content window.",
+      );
+      return;
+    }
     channelRef.current?.port1.close();
     const channel = new MessageChannel();
     channelRef.current = channel;
     // The port pins this closure, so mutable values in handleInbound must come from refs.
     channel.port1.onmessage = (ev) => handleInbound(ev.data);
     portRef.current = channel.port1;
-    // targetOrigin "*" supports the default frame and strict host fallbacks,
-    // which have an opaque ("null") origin. The transferred port + the
-    // nonce are the trust mechanism, not the origin.
+    // "*" is required for opaque frames; hosts may also use a separate origin.
+    // The renderer enforces isolation; the port + nonce bind bridge messages.
     win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [channel.port2]);
     clearReadyTimer();
     readyTimerRef.current = setTimeout(() => {

@@ -94,7 +94,11 @@ export type OmnigentAnalyticsEvent =
       durationMs?: number;
     };
 
-/** Hosts isolate the prepared HTML, expose its content iframe, and forward every load. */
+/**
+ * Trusted host renderer for untrusted HTML. Before executing any supplied HTML,
+ * enforce sandboxing and an opaque or separate, unprivileged origin that prevents
+ * access to the host app. Expose the content iframe before forwarding every load.
+ */
 export interface HtmlPreviewFrameProps {
   htmlContent: string;
   iframeRef: Ref<HTMLIFrameElement>;
@@ -102,7 +106,10 @@ export interface HtmlPreviewFrameProps {
 }
 
 export interface OmnigentHostConfig {
-  /** Optional isolation component. Older hosts retain the sandboxed srcdoc preview. */
+  /**
+   * Install before the app mounts and keep the component identity stable for that
+   * mount. Omitted by older hosts, which retain the sandboxed srcdoc preview.
+   */
   htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
   /** Stable server/workspace identity used to scope browser-local extension storage. */
   serverIdentity?: string;
