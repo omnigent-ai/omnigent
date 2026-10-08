@@ -19,7 +19,6 @@ import contextlib
 import logging
 import os
 import random
-import shlex
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -35,7 +34,7 @@ from websockets.exceptions import (
     WebSocketException,
 )
 
-from omnigent.cli_invocation import cli_invocation
+from omnigent.cli_invocation import cli_invocation, quote_hint_argument
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -522,7 +521,7 @@ async def serve_tunnel(
                         f"persisted across {login_redirect_streak} attempts); "
                         "the server likely requires auth — "
                         f"run `{cli_invocation()} login "
-                        f"{shlex.quote(display_server_url(server_url))}` or "
+                        f"{quote_hint_argument(display_server_url(server_url))}` or "
                         f"`{cli_invocation()} setup` to configure credentials"
                     ) from exc
                 retry_reason = (
@@ -540,12 +539,12 @@ async def serve_tunnel(
                         if server_url:
                             # `omnigent login` infers the fronting workspace itself,
                             # unlike `databricks auth login --host`, which needs the
-                            # workspace host. Quoted so `?o=` survives shell globbing.
+                            # workspace host. Quoted where the shell would glob `?o=`.
                             from omnigent.util.server_url import display_server_url
 
                             login_hint = (
                                 f"run `{cli_invocation()} login "
-                                f"{shlex.quote(display_server_url(server_url))}` "
+                                f"{quote_hint_argument(display_server_url(server_url))}` "
                                 "to re-authenticate"
                             )
                         else:

@@ -28,6 +28,7 @@ from websockets.exceptions import (
 from websockets.frames import Close
 from websockets.http11 import Response
 
+import omnigent.cli_invocation as cli_invocation_module
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -412,6 +413,8 @@ async def _serve_until_http_auth_rejection(
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    # The hint is quoted for POSIX shells; pin that so the assertions hold on Windows.
+    monkeypatch.setattr(cli_invocation_module, "IS_WINDOWS", False, raising=False)
 
     with pytest.raises(RuntimeError, match="HTTP 401") as exc_info:
         await serve_tunnel(
@@ -629,6 +632,7 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
     # Pin jitter to 0 so sleep delays are the unjittered backoff curve.
     monkeypatch.setattr(serve_module.random, "uniform", lambda *_args, **_kw: 0.0)
     monkeypatch.delenv(WRAPPER_COMMAND_ENV, raising=False)
+    monkeypatch.setattr(cli_invocation_module, "IS_WINDOWS", False, raising=False)
 
     with pytest.raises(RuntimeError) as exc_info:
         await serve_tunnel(
