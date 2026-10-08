@@ -2072,7 +2072,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     )
 
     # No live holder: keep this test on the in-place reattach path without
-    # spawning ``claude``; the fork path is covered separately.
+    # spawning ``claude``; the live-holder clone path is covered separately.
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._claude_background_session_holds_id",
         lambda *args, **kwargs: False,

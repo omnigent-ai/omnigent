@@ -8376,10 +8376,6 @@ async def _auto_create_claude_terminal(
     # forwarder seeds its cursor from this measured prefix rather than a racy
     # live end-offset that can skip the freshly-injected prompt.
     resume_prefix_bytes: int | None = None
-    # Fork (``--fork-session``) instead of resuming only as a fallback: a live
-    # process holding this id refuses a bare ``--resume``, and we fork only
-    # when we could not clone the holder's transcript to a fresh id.
-    resume_fork = False
     if server_client is not None and session_external_id is not None:
         from omnigent.harnesses.claude_native.main import (
             _claude_background_session_holds_id,
@@ -8400,8 +8396,8 @@ async def _auto_create_claude_terminal(
             _held = False
         if _held:
             # Clone the holder's live transcript under a fresh id and resume
-            # that copy, leaving the held file untouched. The measured prefix
-            # bounds the cursor past the copied history.
+            # that copy with a plain ``--resume``, leaving the held file
+            # untouched; the measured prefix bounds the cursor past the copy.
             _our_uuid = str(uuid.uuid4())
             try:
                 _cloned = _clone_claude_transcript(
@@ -8409,10 +8405,10 @@ async def _auto_create_claude_terminal(
                     target_external_session_id=_our_uuid,
                     clone_workspace=_workspace_resolved,
                 )
-            except Exception:  # noqa: BLE001 — best-effort; fork or launch fresh
+            except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
                 _cloned = None
                 _logger.warning(
-                    "Could not clone live-holder transcript for %s; forking instead",
+                    "Could not clone live-holder transcript for %s; launching without --resume",
                     session_id,
                     exc_info=True,
                 )
@@ -8433,10 +8429,9 @@ async def _auto_create_claude_terminal(
                         session_id,
                         exc_info=True,
                     )
-        if resume_external_session_id is None:
-            # No holder, or the clone failed: synthesize the local transcript
-            # ``--resume`` reads. A still-live holder refuses the bare resume,
-            # so fork; otherwise reattach in place at the measured end.
+        else:
+            # No live holder: synthesize the local transcript ``--resume``
+            # reads and reattach in place at its measured end.
             try:
                 _transcript = await _ensure_local_claude_resume_transcript(
                     server_client,
@@ -8455,10 +8450,7 @@ async def _auto_create_claude_terminal(
                 )
             if _transcript is not None:
                 resume_external_session_id = session_external_id
-                if _held:
-                    resume_fork = True
-                else:
-                    resume_prefix_bytes = _measured_prefix_bytes(_transcript)
+                resume_prefix_bytes = _measured_prefix_bytes(_transcript)
     elif session_external_id is None and fork_source_external_id is not None:
         # Forked clone with no native session yet: clone the SOURCE's
         # local Claude transcript into the clone's OWN project dir under a
@@ -8857,7 +8849,9 @@ async def _auto_create_claude_terminal(
         model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
-        resume_fork=resume_fork,
+        # This host-launch path never forks: a held id is resumed via a
+        # fresh-id clone instead, so a bare ``--resume`` is never refused.
+        resume_fork=False,
     )
 
     # Pass ``ap_server_url`` so ``build_hook_settings`` registers the
