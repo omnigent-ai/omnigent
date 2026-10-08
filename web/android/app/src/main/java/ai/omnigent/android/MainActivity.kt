@@ -289,14 +289,14 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
+        val userInitiated =
+            UserConnectRequests.consume(
+                intent.getStringExtra(EXTRA_CONNECT_REQUEST),
+            )
         val context = workspaceContext
         val profile = workspaceProfile
         if (context != null && profile != null) {
-            beginWorkspaceConnection(
-                context,
-                profile,
-                allowInteractive = intent.getBooleanExtra(EXTRA_USER_INITIATED_CONNECT, false),
-            )
+            beginWorkspaceConnection(context, profile, allowInteractive = userInitiated)
         } else {
             webView.loadUrl(serverUrl)
         }
@@ -670,7 +670,8 @@ class MainActivity : AppCompatActivity() {
             serverAuthentication(origin) == ServerAuthentication.DATABRICKS_WORKSPACE
         ) {
             setIntent(
-                Intent(this, MainActivity::class.java).putExtra(EXTRA_USER_INITIATED_CONNECT, true),
+                Intent(this, MainActivity::class.java)
+                    .putExtra(EXTRA_CONNECT_REQUEST, UserConnectRequests.issue()),
             )
             recreate()
         } else {
@@ -1488,7 +1489,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        const val EXTRA_USER_INITIATED_CONNECT = "ai.omnigent.android.USER_INITIATED_CONNECT"
+        /** A [UserConnectRequests] token: the user asked for this connect. */
+        const val EXTRA_CONNECT_REQUEST = "ai.omnigent.android.CONNECT_REQUEST"
         private const val MAX_LOGIN_ATTEMPTS = 3
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
