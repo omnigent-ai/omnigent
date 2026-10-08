@@ -12,7 +12,7 @@ import re
 import shlex
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from omnigent.git_providers import load_facet, providers
 from omnigent.policies.builtins._shell import (
@@ -89,17 +89,22 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     if depth > MAX_SHELL_NESTING:
         return []
     found: list[ShellSegment] = []
-    lexer = shlex.shlex(_join_shell_lines(command), posix=True, punctuation_chars=";&|\n")
+    lexer = shlex.shlex(_join_shell_lines(command), posix=True, punctuation_chars=";&|\n<>")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     segments: list[list[str]] = [[]]
+    output_eligible = True
     try:
         for token in lexer:
             if token == "||":
                 return []
             if token and all(char in ";&|\n" for char in token):
+                if token.strip(";\n") not in {"", "&&"}:
+                    output_eligible = False
                 segments.append([])
             else:
+                if token and all(char in "<>&|" for char in token):
+                    output_eligible = False
                 segments[-1].append(token)
     except ValueError:
         return []
@@ -109,10 +114,13 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
-            found.extend(_shell_segments(inner, depth + 1))
+            nested = _shell_segments(inner, depth + 1)
+            if not nested:
+                output_eligible = False
+            found.extend(nested)
         else:
             found.append(ShellSegment(raw_tokens=tuple(segment), invocation_tokens=tuple(tokens)))
-    return found
+    return found if output_eligible else [replace(item, output_eligible=False) for item in found]
 
 
 def _log_provider_failure(provider_id: str, step: str) -> None:

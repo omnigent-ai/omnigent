@@ -136,10 +136,13 @@ class ShellSegment:
     :ivar invocation_tokens: The real command and its arguments, after
         ``real_invocation_tokens`` from ``omnigent.policies.builtins._shell``
         drops those prefixes. Never empty.
+    :ivar output_eligible: False when redirection, piping, or background execution
+        prevents assigning the shared output to this invocation.
     """
 
     raw_tokens: tuple[str, ...]
     invocation_tokens: tuple[str, ...]
+    output_eligible: bool = True
 
 
 @dataclass(frozen=True)

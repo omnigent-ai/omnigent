@@ -111,6 +111,116 @@ def test_graphql_and_cli_creations_preserve_both_identities(
     assert created
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_graphql_creation_with_targeted_edit_keeps_both_prs(
+    reverse: bool, projection: str | None
+) -> None:
+    other = "https://github.com/example/other/pull/7"
+    commands = [command(projection=projection), "gh pr edit 7 -R example/other --add-label ready"]
+    outputs = [creation_output(projection), other]
+    references, created = extract_prs(
+        "shell",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        "\n".join(reversed(outputs) if reverse else outputs),
+    )
+    assert {ref.url for ref in references} == {URL, other}
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "shell_pattern",
+    [
+        "{create}; cat saved-pr-output.txt",
+        "cat saved-pr-output.txt; {create}",
+        "{create} >/dev/null",
+        "{create} 1>>saved-pr-output.txt",
+        "{wrapped} >/dev/null",
+        "{create} --silent",
+        "{create} --silent=true",
+        "{create} | gh pr create",
+        "git log -1 --format=%B; {create}",
+        "sh -c 'false || cat saved-pr-output.txt'; {create}",
+    ],
+    ids=[
+        "later-output",
+        "earlier-output",
+        "redirect",
+        "append",
+        "outer-redirect",
+        "silent",
+        "silent-value",
+        "pipe",
+        "git-content",
+        "nested-fallback-output",
+    ],
+)
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_graphql_unresolved_stdout_cannot_replace_absent_creation(
+    shell_pattern: str, projection: str | None
+) -> None:
+    create = command(projection=projection)
+    shell = shell_pattern.format(create=create, wrapped=shlex.join(["sh", "-c", create]))
+    references, _ = extract_prs(
+        "shell",
+        {"command": shell},
+        {
+            "exit_code": 0,
+            "stdout": creation_output(projection, "https://github.com/example/unrelated/pull/9"),
+        },
+    )
+    assert not references
+
+
+def test_graphql_unresolved_stdout_preserves_explicit_targets() -> None:
+    references, created = extract_prs(
+        "shell",
+        {
+            "command": command()
+            + " >/dev/null; cat saved-pr-output.txt; gh pr edit 7 -R example/other -t updated"
+        },
+        {"exit_code": 0, "stdout": creation_output(None)},
+    )
+    assert [ref.url for ref in references] == ["https://github.com/example/other/pull/7"]
+    assert not created
+
+
+def test_graphql_assignment_prefix_does_not_hide_an_output_command() -> None:
+    unrelated = "https://github.com/example/unrelated/pull/9"
+    edited = "https://github.com/example/other/pull/7"
+    references, _ = extract_prs(
+        "shell",
+        {
+            "command": "repo_id=$(printf '(') "
+            + shlex.join(["printf", "%s\n", unrelated, ")"])
+            + "; "
+            + command(projection=".data.createPullRequest.pullRequest.url")
+            + "; gh pr edit 7 -R example/other -t updated"
+        },
+        {"exit_code": 0, "stdout": unrelated + "\n)\n" + edited},
+    )
+    assert [ref.url for ref in references] == [edited]
+
+
+def test_graphql_checkout_preparation_keeps_creation_identity() -> None:
+    references, created = extract_prs(
+        "shell",
+        {
+            "command": "set -euo pipefail; cd /repo; git -C /repo add . && "
+            "git -C /repo commit -m 'A change' && git -C /repo push && " + command()
+        },
+        {"exit_code": 0, "stdout": creation_output(None)},
+    )
+    assert [ref.url for ref in references] == [URL]
+    assert created
+
+
 @pytest.mark.parametrize(
     "projection",
     [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
@@ -307,11 +417,10 @@ def test_full_response_reads_only_the_mutation_identity(
 ) -> None:
     other = "https://github.com/example/another/pull/7"
     unrelated = creation_output(None, other) if response_shaped else json.dumps({"url": other})
-    commands = [command(), "cat saved-response.json"]
     outputs = [creation_output(None, URL if created else None), unrelated]
     references, _ = extract_prs(
         "shell",
-        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        {"command": command()},
         {"stdout": "\n".join(reversed(outputs) if reverse else outputs)},
     )
     assert [ref.url for ref in references] == ([URL] if created and not response_shaped else [])
@@ -402,11 +511,10 @@ def test_ambiguous_projected_results_are_not_attributed(
     created: bool, reverse: bool, projection: str
 ) -> None:
     unrelated = creation_output(projection, "https://github.com/example/another/pull/7")
-    commands = [command(projection=projection), shlex.join(["printf", "%s\n", unrelated])]
     outputs = [creation_output(projection, URL if created else None), unrelated]
     references, _ = extract_prs(
         "shell",
-        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        {"command": command(projection=projection)},
         "\n".join(reversed(outputs) if reverse else outputs),
     )
     assert not references

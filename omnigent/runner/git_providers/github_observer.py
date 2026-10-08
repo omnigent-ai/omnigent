@@ -448,7 +448,12 @@ def _graphql_output_values(result: object, depth: int = 0) -> list[object]:
 
 
 def _graphql_prs(
-    result: object, *, field: str, projection: str, expected_count: int
+    result: object,
+    *,
+    field: str,
+    projection: str,
+    expected_count: int,
+    explicit_targets: frozenset[str],
 ) -> list[PullRequestRef]:
     """Read only the response shape requested by the validated creation command."""
     values = _graphql_output_values(result)
@@ -459,7 +464,10 @@ def _graphql_prs(
         references = [
             ref
             for value in values
-            if isinstance(value, str) and len(value.split()) == 1 and (ref := pr_reference(value))
+            if isinstance(value, str)
+            and len(value.split()) == 1
+            and (ref := pr_reference(value))
+            and ref.url not in explicit_targets
         ]
         return references if len(references) <= expected_count else []
     references: list[PullRequestRef] = []
@@ -478,7 +486,11 @@ def _graphql_prs(
             pr = mutation.get("pullRequest") if isinstance(mutation, dict) else None
         else:
             continue
-        if isinstance(pr, dict) and (ref := pr_reference(pr.get("url"))):
+        if (
+            isinstance(pr, dict)
+            and (ref := pr_reference(pr.get("url")))
+            and ref.url not in explicit_targets
+        ):
             references.append(ref)
     if not projection and response_count > expected_count:
         return []
@@ -514,11 +526,53 @@ def _gh_arguments(segment: ShellSegment) -> list[str] | None:
     return [*args, *prefix]
 
 
+def _graphql_setup(segment: ShellSegment) -> bool:
+    """Recognize supported checkout preparation before PR-producing commands."""
+    raw = " ".join(segment.raw_tokens)
+    if re.fullmatch(r"[A-Za-z_]\w*=\$\(gh api repos/[\w.-]+/[\w.-]+ (?:--jq|-q) \.node_id\)", raw):
+        return True
+    tokens = list(segment.invocation_tokens)
+    if tokens[0] == "cd":
+        return len(tokens) == 2
+    if tokens[0] == "set":
+        return tokens[1:] in (["-e"], ["-eu"], ["-euo", "pipefail"])
+    if PurePath(tokens[0]).name != "git":
+        return False
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-c", "-C", "--git-dir", "--work-tree"}:
+            index += 2
+        elif token == "--no-pager" or token.startswith(("-c", "-C", "--git-dir=", "--work-tree=")):
+            index += 1
+        else:
+            return token in {"add", "commit", "push"}
+    return False
+
+
+def _graphql_output_eligible(segments: Sequence[ShellSegment]) -> bool:
+    """Require known output producers and preserve checkout setup before PR operations."""
+    seen_pr = False
+    for segment in segments:
+        if not segment.output_eligible:
+            return False
+        tokens = _gh_arguments(segment)
+        if tokens:
+            if any(
+                token == "--silent" or token.startswith("--silent=") for token in tokens
+            ) or not (_creates_pr(tokens) or _command_target(tokens)):
+                return False
+            seen_pr = True
+        elif seen_pr or not _graphql_setup(segment):
+            return False
+    return True
+
+
 def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
     """Return one op per ``gh pr`` or ``gh api`` segment, in order.
 
-    Other ``gh`` commands, such as ``gh auth`` and ``gh config``, are setup that
-    neither identifies a PR nor hides one, so they produce no op.
+    Other ``gh`` commands produce no op. GraphQL output additionally requires
+    known stdout producers and a stream without redirects or pipes.
     """
     commands: list[tuple[list[str], str | None, str]] = []
     for segment in segments:
@@ -528,6 +582,12 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         field = _graphql_create_field(tokens)
         projection = (_flag(tokens, "--jq", "-q") or "").strip()
         commands.append((tokens, field, projection))
+    output_eligible = not any(field for _, field, _ in commands) or _graphql_output_eligible(
+        segments
+    )
+    explicit_targets = frozenset(
+        target.url for tokens, _, _ in commands if (target := _command_target(tokens))
+    )
     object_count = sum(
         field is not None and projection == f".data.{field}.pullRequest"
         for _, field, projection in commands
@@ -553,14 +613,18 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
                 else url_count
             )
             parse_result = functools.partial(
-                _graphql_prs, field=field, projection=projection, expected_count=expected_count
+                _graphql_prs,
+                field=field,
+                projection=projection,
+                expected_count=expected_count,
+                explicit_targets=explicit_targets,
             )
         ops.append(
             ShellPrOp(
                 tracks=_tracks_pr(tokens),
                 creates=_creates_pr(tokens),
                 target=_command_target(tokens),
-                content_only=_content_only(tokens),
+                content_only=_content_only(tokens) or (field is not None and not output_eligible),
                 parse_result=parse_result,
             )
         )
