@@ -3454,7 +3454,7 @@ def test_server_auth_attaches_auth_for_expired_refreshable_login(
     assert isinstance(auth, chat_module._DatabricksTokenAuth)
 
 
-def test_databricks_token_auth_refreshes_expired_stored_token(
+def test_login_token_auth_refreshes_expired_stored_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The client auth renews an expired login and sends the new bearer."""
@@ -3465,7 +3465,7 @@ def test_databricks_token_auth_refreshes_expired_stored_token(
     assert posted == [f"{_REFRESH_SERVER}/oauth/token"]
 
 
-def test_databricks_token_auth_refused_refresh_skips_sdk_fallback(
+def test_login_token_auth_refused_refresh_skips_sdk_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A refused renewal must not fall through to unrelated Databricks SDK credentials."""
@@ -3480,7 +3480,7 @@ def test_databricks_token_auth_refused_refresh_skips_sdk_fallback(
     assert _first_auth_header(auth, f"{_REFRESH_SERVER}/v1/sessions") is None
 
 
-async def test_databricks_token_auth_refreshes_off_the_event_loop(
+async def test_login_token_auth_refreshes_off_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The blocking refresh runs in a worker thread, not on the async client's loop."""
