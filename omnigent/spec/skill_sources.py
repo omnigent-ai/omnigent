@@ -418,10 +418,13 @@ def _plugin_install_paths(
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
     # Profile managers (e.g. ccs) symlink ``plugins/cache`` to a cache shared
     # across config dirs; its target is as trusted as the root that links it.
-    trusted_roots = [plugins_root]
+    plugin_roots = [plugins_root]
     cache_link = plugins_root / "cache"
     try:
-        trusted_roots.append(cache_link.resolve())
+        if cache_link.is_symlink():
+            cache_target = cache_link.resolve()
+            if cache_target.is_dir():
+                plugin_roots.append(cache_target)
     except (OSError, RuntimeError) as exc:
         # A symlink loop raises here; the root alone keeps other plugins usable.
         _log.warning("Ignoring unresolvable plugins cache %s: %s", cache_link, exc)
@@ -445,15 +448,18 @@ def _plugin_install_paths(
                 ).resolve()
             except (OSError, RuntimeError) as exc:
                 _log.warning(
-                    "Skipping plugin %r: installPath %r is unresolvable: %s", key, path, exc
+                    "Skipping entry for plugin %r: installPath %r is unresolvable: %s",
+                    key,
+                    path,
+                    exc,
                 )
-                break
-            if not any(resolved.is_relative_to(root) for root in trusted_roots):
+                continue
+            if not any(resolved.is_relative_to(root) for root in plugin_roots):
                 _log.warning(
                     "Skipping plugin %r: installPath %r is outside the trusted roots %s",
                     key,
                     path,
-                    trusted_roots,
+                    plugin_roots,
                 )
                 break
             out[key] = resolved
