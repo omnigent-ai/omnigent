@@ -5582,3 +5582,244 @@ def test_run_turn_clears_stale_gateway_error_at_turn_start():
         assert not any(isinstance(e, ExecutorError) for e in events), events
 
     _run(_t())
+
+
+# A launcher certificate error plus a connection retry must fail the turn promptly.
+
+_CERTIFICATE_STDERR_LINE = (
+    "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
+    "ssl/tls alert certificate expired (_ssl.c:2580)"
+)
+
+
+def _connection_retry_event(*, http_status: int | None = None) -> dict:
+    """The ``error``/``willRetry`` notification codex-cli 0.154 emits per reconnect."""
+    return {
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Reconnecting... waiting for network",
+                "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": http_status}},
+                "additionalDetails": "Connection failed: error sending request",
+            },
+            "willRetry": True,
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+        },
+    }
+
+
+def _completed_turn_event() -> dict:
+    return {
+        "method": "turn/completed",
+        "params": {"turn": {"id": "turn-1", "status": "completed"}},
+    }
+
+
+def _session_with_scripted_turn() -> _CodexAppServerSession:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session._request = AsyncMock(
+        side_effect=[
+            {"result": {"thread": {"id": "thread-1"}}},
+            {"result": {"turn": {"id": "turn-1"}}},
+            {"result": {}},
+        ]
+    )
+    return session
+
+
+async def _run_turn_with_events(session: _CodexAppServerSession, events: list[dict]) -> list:
+    async def _inject() -> None:
+        for event in events:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(event)
+
+    inject_task = asyncio.create_task(_inject())
+    # Bounded so a head that keeps waiting on Codex's reconnect loop fails
+    # here instead of hanging the suite.
+    async with asyncio.timeout(10):
+        collected = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+    await inject_task
+    return collected
+
+
+def test_certificate_failure_on_stderr_fails_fast_on_connection_retry():
+    """The launcher's certificate line plus Codex's first reconnect ends the turn."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(session, [_connection_retry_event()])
+
+            errors = [event for event in events if isinstance(event, ExecutorError)]
+            assert len(errors) == 1, events
+            error = errors[0]
+            assert error.retryable is False
+            assert "could not connect to its model endpoint for gpt-5" in error.message
+            assert "the TLS certificate has expired" in error.message
+            assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in error.message
+            assert "wedged LLM" not in error.message
+            assert error.code == "model_endpoint_certificate_rejected"
+            assert error.title == "Codex can't reach its model endpoint"
+            assert error.remediation is not None and "run dbcert" in error.remediation
+            session._request.assert_any_await(
+                "turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}
+            )
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_connection_retry_without_certificate_evidence_keeps_waiting():
+    """Codex reconnecting on its own stays a retry; only the idle-watchdog cause is recorded."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+            detail = native_forwarder_health.recent_post_failure(60.0)
+            assert detail is not None
+            assert "reconnecting to its model endpoint" in detail
+            assert "Connection failed: error sending request" in detail
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_retry_with_http_status_is_not_blamed_on_certificate():
+    """A retry that got an HTTP response reached the endpoint over TLS, so the turn continues."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(http_status=503), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def _failed_turn_event(message: str) -> dict:
+    return {"method": "turn/failed", "params": {"turn": {"id": "turn-1"}, "message": message}}
+
+
+def test_turn_failed_on_connection_names_certificate_cause():
+    """A connection-level turn failure after the certificate line names the certificate."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("stream disconnected: error sending request")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+        assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in errors[0].message
+        assert "Codex reported: stream disconnected: error sending request" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_after_connection_retry_names_certificate_cause():
+    """A retry that got no response, then a bare failure, is still the certificate's doing."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        # Interrupting is best-effort; a failed interrupt must not mask the cause.
+        session._interrupt_failed_turn = AsyncMock()
+
+        events = await _run_turn_with_events(
+            session, [_connection_retry_event(), _failed_turn_event("turn failed")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_for_unrelated_reason_keeps_its_own_error():
+    """A tool or provider failure keeps Codex's text and stays retryable despite the line."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("command exited with code 1")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is True
+        assert errors[0].message == "command exited with code 1"
+
+    _run(_t())
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [{"id": "turn-1", "status": "completed"}, {"id": "turn-1"}],
+    ids=["status-completed", "legacy-no-status"],
+)
+def test_completed_turn_clears_certificate_evidence(turn: dict):
+    """A turn that reaches the model proves the egress works; the launch-time line is forgotten."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        assert session._certificate_failure is not None
+
+        events = await _run_turn_with_events(
+            session, [{"method": "turn/completed", "params": {"turn": turn}}]
+        )
+
+        assert not any(isinstance(event, ExecutorError) for event in events), events
+        assert session._certificate_failure is None
+
+    _run(_t())

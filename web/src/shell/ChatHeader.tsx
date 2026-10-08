@@ -6,6 +6,7 @@ import {
   FolderPlusIcon,
   GitCompareIcon,
   GitForkIcon,
+  GitPullRequestIcon,
   InfoIcon,
   ListIcon,
   MenuIcon,
@@ -17,7 +18,6 @@ import {
   TerminalIcon,
   UserPlusIcon,
 } from "lucide-react";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -95,9 +95,9 @@ interface MobileSessionMenuProps {
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
-  /** True while the mobile GitHub drawer is open. */
+  /** True while the mobile Pull Requests drawer is open. */
   githubPanelOpen: boolean;
-  /** Open the mobile GitHub drawer. */
+  /** Open the mobile Pull Requests drawer. */
   onOpenGithub: () => void;
   /** True while the mobile side-chats drawer is open. */
   sideChatsPanelOpen: boolean;
@@ -429,8 +429,8 @@ export function ChatHeader({
             onSelect={mobileMenu.onOpenGithub}
             className="gap-2.5 px-2.5 py-2 text-ui"
           >
-            <GithubMono size={16} className="shrink-0" />
-            GitHub
+            <GitPullRequestIcon className="size-4" />
+            Pull Requests
           </DropdownMenuItem>
         )}
         {/* Agents — always present (the panel lists at least

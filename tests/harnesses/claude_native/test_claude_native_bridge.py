@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import itertools
 import json
 import os
 import queue
@@ -11029,6 +11030,109 @@ def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
     )
 
 
+# What the pane shows behind a launch wrapper before Claude Code draws its
+# input box (captured from ``isaac -- --resume <id>``).
+_LAUNCHER_OUTPUT_PANE = """\
+Generating claude-code MCP client config...
+No changes made to /home/user/.claude.json.
+"""
+
+
+def test_inject_user_message_sends_no_escape_into_launcher_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Launcher output shown before the input box is drawn draws no Escape.
+
+    The screen has no composer, but it is not a surface an Escape can clear,
+    and Escapes spent on it reach Claude Code once its input box mounts —
+    where two in a row open the rewind dialog.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captures = {"n": 0}
+    tui = {"pane": _LAUNCHER_OUTPUT_PANE}
+    sent: list[str] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Show launcher output for a few polls, then the mounted input box.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            captures["n"] += 1
+            if captures["n"] > 20 and tui["pane"] == _LAUNCHER_OUTPUT_PANE:
+                tui["pane"] = _composer_pane()
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("hello")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        sent.append(cmd[-1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="hello")
+
+    assert "Escape" not in sent, f"Escape typed into launcher output: {sent}"
+    assert sent[-1] == "Enter"
+
+
+def test_occupied_input_retries_stay_outside_the_double_escape_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Repeated dismissal Escapes are spaced wider than a double-Escape.
+
+    Two Escapes 0.77s apart on Claude Code's composer open the rewind
+    dialog; 1.0s apart they do not. A retry that lands after the first
+    Escape already cleared the surface must not form that pair. Runs on
+    :class:`_VirtualClock`, so the spacing under test is the production
+    constant rather than wall-clock scheduling.
+    """
+    clock = _VirtualClock()
+    escape_times: list[float] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Keep a surface that ignores Escape on screen.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_MODEL_PICKER_PANE, stderr="")
+        if cmd[-1] == "Escape":
+            escape_times.append(clock.monotonic())
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    claude_native_bridge._restore_occupied_input("/tmp/example/tmux.sock", "claude:0.0")
+
+    gaps = [later - earlier for earlier, later in itertools.pairwise(escape_times)]
+    assert len(escape_times) >= 2, f"Expected a retried Escape, got {len(escape_times)}"
+    assert min(gaps) >= 1.0, f"Escapes {gaps} apart can open Claude Code's rewind dialog"
+
+
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11057,6 +11161,103 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+
+
+def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A composer-less dialog with no Escape hint gets no keystrokes at all.
+
+    The restore leaves such a surface alone (an Escape would not clear it,
+    and one spent on launcher output reaches the composer later), and a
+    slash command has no readiness gate behind it: nothing would draft, so
+    the blind submit Enter would accept the dialog's highlighted option
+    instead of running the command, while the call reported success. The
+    ``/effort`` confirmation shows the shape — the pending-user-prompt
+    guard does not recognize it as a decision prompt either.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_EFFORT_DIALOG_PANE])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert sends == [], f"Nothing may be typed into the dialog; got {sends}."
+
+
+def test_inject_slash_command_fails_loud_when_dismissal_is_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A surface that outlives the dismissal retries gets no command either.
+
+    The picker advertises Escape and takes each one, yet never leaves; the
+    restore gives up at :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` and hands
+    the surface back. Only the dismissal Escapes may reach the pane — not
+    the ``C-u``, the command text, or the Enter that used to follow blind.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    tails = [args[-1] for args in sends]
+    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+
+
+def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    One hint-less frame right after a dismissible surface is not a refusal.
+
+    A repaint caught mid-redraw can show neither the composer nor the
+    surface's footer. Giving the pane up on that single frame would fail the
+    slash command loud at a surface that was about to clear; the hint-less
+    read must be seen twice in a row before it counts.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _MODEL_PICKER_PANE,
+            "● Working on it",
+            _IDLE_PANE,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+
+
+def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Footer casing is not reliable (see ``_DIALOG_FOOTER_RE``): ``esc to`` counts.
+
+    A dismissible surface read as unclearable would be refused instead of
+    cleared, so the hint check must not depend on the capital E.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _MODEL_PICKER_PANE.replace("Esc to cancel", "esc to cancel")
+    sends = _fake_tmux(
+        monkeypatch,
+        [pane, pane, _IDLE_PANE, _composer_pane("/compact"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert [args[-1] for args in sends] == ["Escape", "C-u", "/compact", "Enter"]
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(

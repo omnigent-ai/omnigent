@@ -40,7 +40,7 @@ export function SetupTerminalStep({
   /** Subscribe to the run action's log lines (server boot); returns unsubscribe. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
   onBack: () => void;
-  /** Offered only when remote runner startup failed; opens the server without it. */
+  /** Open an existing server after setup fails, without installing or starting a runner. */
   onConnectAnyway?: () => void;
   /** Heading + verb for the run phase ("Starting Omnigent" / "Connecting…"). */
   runningLabel?: string;

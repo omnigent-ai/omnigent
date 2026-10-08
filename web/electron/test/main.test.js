@@ -132,6 +132,9 @@ function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } 
 }
 
 function loadNavigationHarness({
+  isPackaged = false,
+  platform,
+  env = {},
   serverUrl = "https://host.example/ml/omnigents",
   savedServerUrl,
   registerFallbacks = true,
@@ -305,7 +308,7 @@ function loadNavigationHarness({
 
   const electron = {
     app: {
-      isPackaged: false,
+      isPackaged,
       getPath: () => userData,
       setName: () => {},
       setPath: () => {},
@@ -579,7 +582,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -595,8 +598,8 @@ function loadNavigationHarness({
     module,
     process: {
       ...process,
-      platform: internalFeatures ? "darwin" : process.platform,
-      env: { ...process.env },
+      platform: platform ?? (internalFeatures ? "darwin" : process.platform),
+      env: { ...process.env, OMNIGENT_SERVER_SELECTOR_V2: "", ...env },
     },
     require: (specifier) => {
       if (specifier === "electron") return electron;
@@ -1423,7 +1426,7 @@ describe("Databricks auth mode wiring", () => {
           assert.equal(h.calls.auth.length, attempts, "Cancel stops the pending reconnect");
         }
         assert.equal(h.overlay.hint, null);
-        const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+        const params = new URL(h.webContents.getURL()).searchParams;
         // The setup page keeps the mounted server URL for the next Connect.
         finals.push([params.get("error"), params.get("url")]);
       }
@@ -2291,6 +2294,135 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
   });
 });
 
+describe("server selector default", () => {
+  const devUrl = "http://localhost:5174/server-selector-v2.html";
+
+  for (const [name, options, settings, v2] of [
+    ["new internal macOS install", { internalFeatures: true }, null, true],
+    [
+      "existing internal macOS install",
+      { internalFeatures: true },
+      { recent_servers: ["https://team.example.com/"] },
+      true,
+    ],
+    ["new public macOS install", {}, null, false],
+    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, false],
+    [
+      "MDM server presets without internal features",
+      { managedServers: ["https://team.example.com/"] },
+      null,
+      false,
+    ],
+    ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
+    ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
+    ["unpackaged internal macOS build", { isPackaged: false, internalFeatures: true }, null, true],
+    ["unpackaged public macOS build", { isPackaged: false }, null, false],
+    ["null selector preference", { internalFeatures: true }, { server_selector_v2: null }, true],
+    [
+      "explicit V2 preference outside the default rollout",
+      { platform: "win32" },
+      { server_selector_v2: true },
+      true,
+    ],
+    [
+      "explicit legacy preference",
+      { internalFeatures: true },
+      { server_selector_v2: false },
+      false,
+    ],
+  ]) {
+    it(`opens the expected selector for ${name}`, async () => {
+      const h = loadNavigationHarness({
+        isPackaged: true,
+        platform: "darwin",
+        env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
+        ...options,
+      });
+      try {
+        if (settings) fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
+        h.api.createWindow();
+        if (v2 && !h.electron.app.isPackaged) {
+          await until(() => h.calls.loadURL.length > 0, "dev selector load");
+          assert.equal(h.calls.loadURL[0][0], devUrl);
+          assert.equal(h.calls.loadFile.length, 0);
+        } else {
+          await until(() => h.calls.loadFile.length > 0, "setup page load");
+          assert.equal(
+            h.calls.loadFile[0][0],
+            v2 ? h.api.SERVER_SELECTOR_V2_PAGE : h.api.SETUP_PAGE,
+          );
+          assert.equal(h.calls.loadURL.length, 0);
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
+  it("falls back to bundled V2 when the internal macOS dev server is unavailable", async () => {
+    const h = loadNavigationHarness({
+      internalFeatures: true,
+      env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
+      loadURL: async () => {
+        throw new Error("Dev server unavailable");
+      },
+    });
+    try {
+      await h.api.loadSetupPage(h.win);
+      assert.equal(h.calls.loadURL[0][0], devUrl);
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("persists switching to legacy and back to V2", async () => {
+    const h = loadNavigationHarness({ isPackaged: true, internalFeatures: true });
+    try {
+      h.api.registerIpc();
+      await h.api.loadSetupPage(h.win, "error=offline&ephemeral=1");
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+      assert.equal(h.calls.loadFile[0][1].search, "error=offline&ephemeral=1");
+      for (const [enabled, page] of [
+        [false, h.api.SETUP_PAGE],
+        [true, h.api.SERVER_SELECTOR_V2_PAGE],
+      ]) {
+        const previousLoads = h.calls.loadFile.length;
+        h.ipc.get("omnigent:set-server-selector-v2")(
+          {
+            sender: h.webContents,
+            senderFrame: { url: h.webContents.getURL() },
+          },
+          enabled,
+        );
+        // oxlint-disable-next-line no-await-in-loop -- Each toggle reloads the sending page.
+        await until(() => h.calls.loadFile.length > previousLoads, "selector switch");
+        assert.equal(h.calls.loadFile.at(-1)[0], page);
+        assert.equal(
+          JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).server_selector_v2,
+          enabled,
+        );
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("keeps the environment override above a legacy preference", async () => {
+    const h = loadNavigationHarness({
+      isPackaged: true,
+      env: { OMNIGENT_SERVER_SELECTOR_V2: "1" },
+    });
+    try {
+      fs.writeFileSync(h.settingsPath, JSON.stringify({ server_selector_v2: false }));
+      await h.api.loadSetupPage(h.win);
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("navigation fallback wiring (src/main.js)", () => {
   it("boots a saved Databricks API URL on the UI mount without losing URL state", () => {
     const saved = "https://workspace.cloud.databricks.com/api/2.0/omnigent/?o=123#conversation";
@@ -3060,6 +3192,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
 
   it("goes straight to setup for other windows and non-network errors", async (t) => {
     const embedded = loadNavigationHarness({
+      isPackaged: true,
       serverUrl: workspace,
       databricksMode: "embedded",
       internalFeatures: true,
@@ -3099,6 +3232,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   async function connected(t, delays) {
     const network = createWorkspaceNetwork(origin);
     const h = loadNavigationHarness({
+      isPackaged: true,
       serverUrl: workspace,
       databricksMode: "browser",
       internalFeatures: true,

@@ -131,6 +131,65 @@ def test_unpin_moves_session_back_to_recent(
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
 
+def test_undo_unpin_restores_pinned_slot(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Undo on the post-unpin toast re-pins the session in its old slot.
+
+    Pins ``a`` then ``b`` (``a`` on top), unpins ``a``, and clicks Undo on the
+    toast. ``a`` must return above ``b`` rather than land at the bottom as a
+    fresh pin would, and the restored order must survive a reload.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two
+        runner-bound sessions in the same server.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    title_a = f"e2e-undo-A-{uuid.uuid4().hex[:8]}"
+    _set_title(base_url, session_a, title_a)
+    _set_title(base_url, session_b, f"e2e-undo-B-{uuid.uuid4().hex[:8]}")
+    page.goto(f"{base_url}/c/{session_a}")
+
+    for session_id in (session_a, session_b):
+        row = _row(page, session_id)
+        expect(row).to_be_visible()
+        _pin_and_wait(page, row, session_id)
+        expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+    pinned_row_a = (
+        _section(page, "Pinned")
+        .locator("li")
+        .filter(has=page.locator(f'a[href="/c/{session_a}"]'))
+    )
+    _pin_and_wait(page, pinned_row_a, session_a)
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_have_count(0)
+
+    toast = page.get_by_test_id("unpin-undo-toast-item")
+    expect(toast).to_contain_text("Unpinned session")
+    expect(toast).to_contain_text(title_a)
+    with page.expect_response(
+        lambda r: r.request.method == "PATCH" and r.url.endswith(f"/v1/sessions/{session_a}")
+    ) as repin:
+        toast.get_by_role("button", name="Undo").click()
+    assert repin.value.ok, repin.value.status
+    expect(toast).to_have_count(0)
+
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+    order = _pinned_session_order(page)
+    assert order.index(f"/c/{session_a}") < order.index(f"/c/{session_b}"), (
+        f"Undo should restore the original pin slot, got {order}"
+    )
+
+    page.reload()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+    order_after = _pinned_session_order(page)
+    assert order_after.index(f"/c/{session_a}") < order_after.index(f"/c/{session_b}"), (
+        f"restored pin slot should persist across reload, got {order_after}"
+    )
+
+
 def _pinned_session_order(page: Page) -> list[str]:
     """Return the ``/c/{id}`` hrefs under "Pinned" in top-to-bottom DOM order.
 

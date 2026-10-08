@@ -100,6 +100,10 @@ _logger = logging.getLogger("omnigent.runner.app")
 _OMNIGENT_PACKAGE_DIR = Path(__file__).resolve().parent.parent.parent
 
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
+_NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES = {
+    ErrorCode.SESSION_AGENT_MISSING,
+    ErrorCode.WORKSPACE_MISSING,
+}
 
 _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
@@ -894,6 +898,23 @@ def _runner_workspace_dir() -> str:
             "OMNIGENT_RUNNER_WORKSPACE is unset and the runner's working "
             "directory no longer exists."
         ) from exc
+
+
+def _claude_session_workspace(session_workspace: str | None) -> Path:
+    """Resolve and validate the session workspace without an eager cwd lookup."""
+    raw = session_workspace or os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+    try:
+        workspace = Path(raw).expanduser() if raw else Path.cwd()
+        workspace = workspace.absolute()
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise OmnigentError(
+            "The session workspace is no longer available.", code=ErrorCode.WORKSPACE_MISSING
+        ) from exc
+    if not workspace.is_dir():
+        raise OmnigentError(
+            "The session workspace is not a directory.", code=ErrorCode.WORKSPACE_MISSING
+        )
+    return workspace
 
 
 def _codex_session_workspace(session_workspace: str | None) -> Path:
@@ -7593,39 +7614,50 @@ def _native_terminal_start_error_payload(
         their safe message directly; other causes point to the runner log.
     """
     error_id = f"err_{uuid.uuid4().hex}"
-    missing_agent = isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING
+    lifecycle_code = (
+        exc.code
+        if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
+        else None
+    )
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
         error_id=error_id,
         runtime=runtime_name,
-        code=ErrorCode.SESSION_AGENT_MISSING
-        if missing_agent
-        else _NATIVE_TERMINAL_START_FAILED_CODE,
+        code=lifecycle_code or _NATIVE_TERMINAL_START_FAILED_CODE,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
         # The warning below carries no exc_info for a missing agent, so the
         # sink cannot derive its category.
         error_category=exc.category.value
-        if isinstance(exc, OmnigentError) and missing_agent
+        if isinstance(exc, OmnigentError) and lifecycle_code is not None
         else None,
         error_impact=ErrorImpact.BLOCKING.value,
     )
-    if missing_agent:
-        # Expected session-lifecycle condition: the session's agent was deleted
-        # or rebound, so its bundle no longer resolves. This is not a
-        # terminal-startup defect — log it without a stack and surface a
-        # distinct code plus a client-safe message (never the internal
-        # resolver text) so KPI/error attribution reflects the lifecycle event
-        # rather than a generic runner startup fault.
+    if lifecycle_code is not None:
+        # Expected session-lifecycle condition: a required session resource was
+        # removed. Log it without a stack and surface a distinct code plus a
+        # client-safe message so KPI/error attribution does not count it as a
+        # terminal-startup defect.
         _logger.warning(
-            "Native %s terminal skipped; session agent unavailable; error_id=%s: %s",
+            "Native %s terminal skipped; session resource unavailable; error_id=%s: %s",
             runtime_name,
             error_id,
             exc,
             extra=extra,
         )
+        if lifecycle_code == ErrorCode.WORKSPACE_MISSING:
+            return {
+                "code": ErrorCode.WORKSPACE_MISSING,
+                "error_id": error_id,
+                "message": (
+                    "This session's workspace is no longer available. Restore the intended "
+                    "workspace and restart the runner, or start a new session with an existing "
+                    "workspace. Restarting alone does not restore the directory. "
+                    f"Error ID: {error_id}."
+                ),
+            }
         return {
             "code": ErrorCode.SESSION_AGENT_MISSING,
             "error_id": error_id,
@@ -7723,12 +7755,11 @@ def _native_terminal_start_error_response(
     :param exc: Exception raised by terminal auto-create.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal ensure failed.
-    :returns: HTTP 410 when the session's agent was removed (the status of
-        ``session_agent_missing``), else 500, with an ``error`` object
-        carrying the real failure message.
+    :returns: The lifecycle status for a removed agent or workspace, else 500,
+        with an ``error`` object carrying the real failure message.
     """
     status_code = 500
-    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+    if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES:
         status_code = exc.http_status
     return JSONResponse(
         status_code=status_code,
@@ -8169,10 +8200,10 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
-    workspace = (
-        session_init.snapshot.workspace
-        if session_init is not None and session_init.snapshot.workspace
-        else _runner_workspace_dir()
+    workspace = str(
+        _claude_session_workspace(
+            session_init.snapshot.workspace if session_init is not None else None
+        )
     )
     started_at = time.monotonic()
     _logger.info(
@@ -8836,7 +8867,7 @@ async def _auto_create_claude_terminal(
         resolve_harness_command,
     )
 
-    _harness_cfg = load_effective_config()
+    _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
@@ -9866,12 +9897,15 @@ async def _ensure_native_terminal(
                 ),
             )
         except Exception as exc:
-            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
-                # Expected lifecycle event (agent deleted/rebound), not an
+            if (
+                isinstance(exc, OmnigentError)
+                and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
+            ):
+                # Expected lifecycle event (session resource removed), not an
                 # ensure defect: log without a stack so it stays out of the
                 # terminal-startup error signal.
                 _logger.warning(
-                    "%s terminal ensure skipped; session %s agent unavailable: %s",
+                    "%s terminal ensure skipped; session %s resource unavailable: %s",
                     agent.display_name,
                     ctx.session_id,
                     exc,

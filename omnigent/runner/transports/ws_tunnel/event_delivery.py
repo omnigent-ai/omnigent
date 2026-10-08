@@ -193,6 +193,9 @@ class RunnerEventDispatcher:
                 continue
             finally:
                 self._pending.pop(batch_id, None)
+                # A disconnect may fail the future after its waiter stopped; mark it retrieved.
+                if future.done() and not future.cancelled():
+                    future.exception()
             if ack.applied < 0 or ack.applied > len(remaining):
                 raise ValueError("invalid event acknowledgement")
             remaining = remaining[ack.applied :]

@@ -1412,6 +1412,46 @@ async def test_stop_session_stops_host_launched_runner(
     )
 
 
+@pytest.mark.parametrize("runner_status", ["alive", "dead", "unknown", "offline", None])
+async def test_stop_session_requires_confirmed_host_runner_exit(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: str | None,
+) -> None:
+    """An unacknowledged stop succeeds only when the host confirms the runner is gone."""
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    if runner_status == "offline":
+        await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await comm.wait(timeout=budget(5.0))
+    monkeypatch.setattr(sessions, "_stop_session_via_runner", AsyncMock(return_value=True))
+    host_stop = AsyncMock(return_value=False)
+    status_query = AsyncMock(return_value=runner_status)
+    monkeypatch.setattr(routes_events, "_stop_host_runner_intentionally", host_stop)
+    monkeypatch.setattr(routes_events, "_query_host_runner_status", status_query)
+    stopped = runner_status in {"dead", "unknown"}
+    try:
+        for _ in range(2 if stopped else 1):
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+            )
+            assert response.status_code == (202 if stopped else 503), response.text
+        if runner_status == "offline":
+            status_query.assert_not_awaited()
+        else:
+            assert status_query.await_args.args[2] == session["runner_id"]
+        if not stopped:
+            assert session_id in routes_events._interrupt_fenced_sessions
+        assert host_stop.await_count == (2 if stopped else 1)
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
+
+
 async def test_stopped_host_session_writes_no_label_and_host_stays_online(
     client: httpx.AsyncClient,
     app: FastAPI,

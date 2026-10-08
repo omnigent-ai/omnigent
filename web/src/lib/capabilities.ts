@@ -57,8 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey =
-  "usage_page" | "harness_install" | "canvas" | "arca_shutdown_warnings" | "harness_settings_ui";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "arca_shutdown_warnings";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

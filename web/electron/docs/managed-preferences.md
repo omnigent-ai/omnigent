@@ -12,10 +12,10 @@ ai.omnigent.desktop
 
 ## Keys
 
-| Key                                 | Type             | Required | Default | Description                                                                                                                                                                                     |
-| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                                                                               |
-| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Enables Databricks-internal features (e.g. the Arca host option) on windows connected to a Databricks-managed server. Fails closed — anything but an explicit boolean `true` reads as disabled. |
+| Key                                 | Type             | Required | Default | Description                                                                                                                                     |
+| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                               |
+| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Defaults macOS apps to V2 onboarding and enables Databricks-internal features on supported servers. Only an explicit boolean `true` enables it. |
 
 A schemeless host is accepted and interpreted as `https://`. Paths are
 preserved, so an administrator can provide a workspace mount directly:
@@ -56,12 +56,19 @@ is opened or the connect screen is loaded.
 
 ## Databricks-internal features
 
+When `databricksInternalFeaturesEnabled` is `true`, macOS apps, including unpackaged
+development, default to V2 onboarding for new and existing profiles. This does not require
+`serverUrls` or a connected server. An explicit selector choice still wins,
+and saved servers still reconnect on launch. Other platforms
+keep the legacy default; `OMNIGENT_SERVER_SELECTOR_V2=1` still
+forces V2.
+
 When `databricksInternalFeaturesEnabled` is `true` **and** the window is
 connected to a Databricks-managed server (a workspace mount on
 `*.databricks.com` / `*.azuredatabricks.net`, or a Databricks App on
 `*.databricksapps.com`, https only), the new-session host picker offers
 **Run on Arca**: connecting the user's Arca dev instance to the current
-server as a host. On any other server the flag reads as disabled. Selecting it
+server as a host. On any other server the Arca option is disabled. Selecting it
 opens a shell-owned connect console that shows the exact command — `arca ssh`
 with a remote `isaac omni host --background --non-interactive` — and, after
 confirmation, streams the command's live output into an embedded terminal

@@ -71,8 +71,8 @@ async def _register_routes(page: Page) -> None:
     await stub_empty_host_picker_data(page, _HOST_ID)
 
 
-def test_import_modal_opens_once_and_reopens_from_settings(live_server: str) -> None:
-    """A new host's imports show once, stay dismissed on reload, and reopen in Settings."""
+def test_import_modal_opens_once_and_links_to_harnesses(live_server: str) -> None:
+    """A new host's imports link to Harnesses and stay dismissed on reload."""
     _run_in_fresh_loop(_drive(live_server))
 
 
@@ -106,7 +106,9 @@ async def _drive(base_url: str) -> None:
             await expect(dialog.get_by_role("list", name="Skills")).to_contain_text("fix-ci")
             await expect(dialog).not_to_contain_text("Databricks Unity Gateway")
 
-            await dialog.get_by_role("button", name="Confirm").click()
+            await dialog.get_by_role("link", name="See more").click()
+            await expect(page).to_have_url(f"{base_url}/settings/harnesses")
+            await expect(page.get_by_role("heading", name="Harnesses", exact=True)).to_be_visible()
             await expect(dialog).to_be_hidden()
             reviewed = await page.evaluate(
                 f"window.localStorage.getItem('omnigent:imports-reviewed:{_HOST_ID}')"
@@ -114,16 +116,12 @@ async def _drive(base_url: str) -> None:
             assert reviewed is not None
 
             await page.reload()
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
+            await expect(page.get_by_role("heading", name="Harnesses", exact=True)).to_be_visible()
             await expect(dialog).to_be_hidden()
 
             await page.goto(f"{base_url}/settings/import")
-            await page.get_by_role("button", name="Review imports on import-e2e-host").click()
-            await expect(dialog).to_be_visible()
-            await expect(dialog.get_by_role("list", name="MCPs")).to_contain_text("github")
-            await dialog.get_by_role("button", name="Close").click()
+            await expect(page.get_by_role("heading", name="Import from a machine")).to_be_visible()
+            await expect(page.get_by_role("heading", name="Harness imports")).to_have_count(0)
             await expect(dialog).to_be_hidden()
         finally:
             await browser.close()

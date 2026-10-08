@@ -44,6 +44,7 @@ import {
 } from "@/lib/sessionDrafts";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
+import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   setOmnigentHostConfig,
   type OmnigentAnalyticsEvent,
@@ -13832,6 +13833,481 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     sinks[sinks.length - 1]!.close();
     await drainAsync(2);
     await loop;
+  });
+
+  // A stream opened before its session's host was known sits on the wrong
+  // replica; learning the routing host must re-key it and reconcile the gap.
+  describe("routing-host rebind", () => {
+    const SLICE_KEY = "X-Databricks-Omnigent-Slice-Key";
+
+    interface StreamOpen {
+      headers: Headers;
+      aborted: boolean;
+    }
+
+    interface KeyedStreamRoute {
+      sinks: StreamSink[];
+      opens: StreamOpen[];
+      /** Network order: `open:<key|none>`, `snapshot:<id>`, `items:<id>`. */
+      log: string[];
+    }
+
+    // A real fetch's abort rejection. Plain Error: jsdom's DOMException is not
+    // `instanceof Error` here, so the pump would misread it as a failed open.
+    function abortError(): Error {
+      return Object.assign(new Error("aborted"), { name: "AbortError" });
+    }
+
+    /**
+     * `routeStreamOpens` plus per-open routing headers and abort wiring (a real
+     * fetch fails on abort). `snapshotExtras` adds host/parent fields to a GET
+     * snapshot; `pendingFirstOpenFor` parks that session's first open pre-headers,
+     * and `failFirstOpenFor` answers it with a 503.
+     */
+    function routeKeyedStreamOpens(
+      opts: {
+        snapshotExtras?: Map<string, Record<string, unknown>>;
+        pendingFirstOpenFor?: string;
+        failFirstOpenFor?: string;
+      } = {},
+    ): KeyedStreamRoute {
+      const sinks: StreamSink[] = [];
+      const opens: StreamOpen[] = [];
+      const log: string[] = [];
+      let firstOpenParked = false;
+      let firstOpenFailed = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0]!;
+        const streamMatch = /^\/v1\/sessions\/([^/]+)\/stream$/.exec(path);
+        if (streamMatch) {
+          const open: StreamOpen = { headers: new Headers(init?.headers), aborted: false };
+          opens.push(open);
+          log.push(`open:${open.headers.get(SLICE_KEY) ?? "none"}`);
+          if (opts.failFirstOpenFor === streamMatch[1] && !firstOpenFailed) {
+            firstOpenFailed = true;
+            return mockResponse({}, { ok: false, status: 503 });
+          }
+          if (opts.pendingFirstOpenFor === streamMatch[1] && !firstOpenParked) {
+            firstOpenParked = true;
+            return new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                open.aborted = true;
+                reject(abortError());
+              });
+            });
+          }
+          const sink = pushableStream();
+          sinks.push(sink);
+          init?.signal?.addEventListener("abort", () => {
+            open.aborted = true;
+            sink.error(abortError());
+          });
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        const itemsMatch = /^\/v1\/sessions\/([^/]+)\/items$/.exec(path);
+        if (itemsMatch) log.push(`items:${itemsMatch[1]!}`);
+        const snapshotMatch = /^\/v1\/sessions\/([^/]+)$/.exec(path);
+        if (snapshotMatch && (init?.method ?? "GET") === "GET") {
+          const sessionId = snapshotMatch[1]!;
+          log.push(`snapshot:${sessionId}`);
+          const extras = opts.snapshotExtras?.get(sessionId);
+          if (extras !== undefined) {
+            return mockResponse({
+              id: sessionId,
+              agent_id: "agent_xyz",
+              status: "idle",
+              created_at: 0,
+              items: sessionSnapshots.get(sessionId) ?? [],
+              labels: {},
+              pending_elicitations: [],
+              pending_inputs: [],
+              ...extras,
+            });
+          }
+        }
+        return defaultFetchHandler(input, init);
+      });
+      return { sinks, opens, log };
+    }
+
+    /** Optimistic bubble for a message whose commit this stream never saw. */
+    function postedBubble(tempId: string, text: string): PendingUserMessage {
+      return { tempId, content: [{ type: "input_text", text }], posted: true };
+    }
+
+    /** Frame proving a stream is the one being pumped: flips sessionStatus. */
+    function runningStatus(id: string): string {
+      return sse("session.status", {
+        conversation_id: id,
+        status: "running",
+        response_id: "resp_live",
+      });
+    }
+
+    async function teardown(controller: AbortController, loop: Promise<void>): Promise<void> {
+      controller.abort();
+      await drainAsync(2);
+      await loop;
+    }
+
+    // `isDatabricksWorkspace()` gates slice-key routing. The standalone build
+    // never keys a request, so there the rebind has nothing to correct.
+    function workspaceMode(): void {
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+    }
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("re-keys a healthy hostless stream once the session's routing host is learned", async () => {
+      workspaceMode();
+      const id = "conv_rekey_learned";
+      seedSession(id, []);
+      const extras = new Map<string, Record<string, unknown>>([[id, { host_id: null }]]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras });
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+      // Opened before the host was known: keyless, to the default replica.
+      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+
+      // Bytes are flowing, so no stale or stall path could explain a recycle.
+      route.sinks[0]!.push(sse("session.heartbeat", {}));
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+
+      // The managed host is assigned: what the forced snapshot refresh after
+      // wrong_replica, or the sidebar poll, records on the map.
+      extras.set(id, { host_id: "host_b" });
+      setSessionHost(id, "host_b");
+      await drainAsync(50);
+
+      expect(route.opens).toHaveLength(2);
+      expect(route.opens[0]!.aborted).toBe(true);
+      expect(route.opens[1]!.headers.get(SLICE_KEY)).toBe("host_b");
+      expect(route.opens[1]!.aborted).toBe(false);
+      // Only the attempt was recycled; the binding itself is intact.
+      expect(controller.signal.aborted).toBe(false);
+      expect(useChatStore.getState().abortController).toBe(controller);
+
+      // The re-keyed stream is the one being pumped now.
+      route.sinks[1]!.push(runningStatus(id));
+      await drainAsync();
+      expect(useChatStore.getState().sessionStatus).toBe("running");
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+    });
+
+    it("reconciles the gap on a re-key: snapshot and items refetched, pending bubble acked", async () => {
+      workspaceMode();
+      const id = "conv_rekey_gap";
+      const before = userMessage("rekey_pre", "before the gap");
+      seedSession(id, [before]);
+      const extras = new Map<string, Record<string, unknown>>([[id, { host_id: null }]]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [postedBubble("pend_rekey", "only once")],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(route.log).toEqual(["open:none"]);
+
+      // The message was dispatched on the owning replica while this stream sat
+      // on the wrong one: its commit and the reply never arrived here.
+      const committed = userMessage("rekey_gap", "only once");
+      const reply = assistantMessage("rekey_gap", "the reply");
+      seedSessionItems(id, [before, committed, reply]);
+      extras.set(id, { host_id: "host_b" });
+      setSessionHost(id, "host_b");
+      await drainAsync(50);
+
+      expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
+        "open:none",
+        "open:host_b",
+      ]);
+      const reopenedAt = route.log.indexOf("open:host_b");
+      expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(reopenedAt);
+      expect(route.log.indexOf(`items:${id}`)).toBeGreaterThan(reopenedAt);
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+    });
+
+    it("forces gap reconciliation when the host is learned while the first open is still pending", async () => {
+      workspaceMode();
+      const id = "conv_rekey_pending_open";
+      const before = userMessage("pend_pre", "before the gap");
+      seedSession(id, [before]);
+      const extras = new Map<string, Record<string, unknown>>([[id, { host_id: null }]]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras, pendingFirstOpenFor: id });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [postedBubble("pend_open", "only once")],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      // The keyless open's headers never arrive: nothing has connected yet.
+      expect(route.log).toEqual(["open:none"]);
+      expect(route.sinks).toHaveLength(0);
+
+      const committed = userMessage("pend_gap", "only once");
+      const reply = assistantMessage("pend_gap", "the reply");
+      seedSessionItems(id, [before, committed, reply]);
+      extras.set(id, { host_id: "host_b" });
+      setSessionHost(id, "host_b");
+      await drainAsync(50);
+
+      expect(route.opens).toHaveLength(2);
+      expect(route.opens[0]!.aborted).toBe(true);
+      expect(route.opens[1]!.headers.get(SLICE_KEY)).toBe("host_b");
+      // Never having connected is no reason to skip the gap: the snapshot that
+      // hydrated `before` predates the keyed subscription, so anything committed
+      // in between must be backfilled on this first keyed connection.
+      const reopenedAt = route.log.indexOf("open:host_b");
+      expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(reopenedAt);
+      expect(route.log.indexOf(`items:${id}`)).toBeGreaterThan(reopenedAt);
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+    });
+
+    it("forces gap reconciliation when the host is learned during a failed open's backoff", async () => {
+      workspaceMode();
+      const id = "conv_rekey_backoff";
+      const before = userMessage("backoff_pre", "before the gap");
+      seedSession(id, [before]);
+      const extras = new Map<string, Record<string, unknown>>([[id, { host_id: null }]]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras, failFirstOpenFor: id });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [postedBubble("pend_backoff", "only once")],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      // The keyless open failed; the first backoff (125-250 ms) is pending.
+      expect(route.log).toEqual(["open:none"]);
+
+      const committed = userMessage("backoff_gap", "only once");
+      const reply = assistantMessage("backoff_gap", "the reply");
+      seedSessionItems(id, [before, committed, reply]);
+      extras.set(id, { host_id: "host_b" });
+      setSessionHost(id, "host_b");
+      await vi.advanceTimersByTimeAsync(250);
+      await drainAsync(50);
+
+      expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
+        "open:none",
+        "open:host_b",
+      ]);
+      // No attempt was live to recycle, but the host still changed after the
+      // bind snapshot, so the first keyed connection must backfill the gap.
+      const reopenedAt = route.log.indexOf("open:host_b");
+      expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(reopenedAt);
+      expect(route.log.indexOf(`items:${id}`)).toBeGreaterThan(reopenedAt);
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+    });
+
+    it("rebinds a hostless child's stream when its parent's host is learned", async () => {
+      workspaceMode();
+      const parent = "conv_rekey_parent";
+      const child = "conv_rekey_child";
+      seedSession(child, []);
+      const extras = new Map<string, Record<string, unknown>>([
+        [child, { host_id: null, parent_session_id: parent }],
+      ]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras });
+      setSessionParent(child, parent);
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: child, abortController: controller });
+
+      const loop = startStreamPump(child, controller, setState, getState);
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+
+      // The child keys by its nearest host-bound ancestor.
+      setSessionHost(parent, "host_p");
+      expect(getSessionHost(child)).toBe("host_p");
+      await drainAsync(50);
+
+      expect(route.opens).toHaveLength(2);
+      expect(route.opens[0]!.aborted).toBe(true);
+      expect(route.opens[1]!.headers.get(SLICE_KEY)).toBe("host_p");
+
+      await teardown(controller, loop);
+      setSessionHost(parent, null);
+      setSessionParent(child, null);
+    });
+
+    it("rebinds a child whose parent link is learned after the parent's host is known", async () => {
+      workspaceMode();
+      const parent = "conv_rekey_late_parent";
+      const child = "conv_rekey_late_child";
+      seedSession(child, []);
+      const extras = new Map<string, Record<string, unknown>>([
+        [child, { host_id: null, parent_session_id: null }],
+      ]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras });
+      setSessionHost(parent, "host_p");
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: child, abortController: controller });
+
+      const loop = startStreamPump(child, controller, setState, getState);
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+      // No parent link yet, so the child resolves no host of its own.
+      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+
+      // A cold /c/<child> open learns the parent from the child's own snapshot
+      // after the parent's host is already on the map.
+      extras.set(child, { host_id: null, parent_session_id: parent });
+      setSessionParent(child, parent);
+      expect(getSessionHost(child)).toBe("host_p");
+      await drainAsync(50);
+
+      expect(route.opens).toHaveLength(2);
+      expect(route.opens[0]!.aborted).toBe(true);
+      expect(route.opens[1]!.headers.get(SLICE_KEY)).toBe("host_p");
+
+      await teardown(controller, loop);
+      setSessionParent(child, null);
+      setSessionHost(parent, null);
+    });
+
+    it("ignores same-host, null, and unrelated-session notifications", async () => {
+      workspaceMode();
+      const id = "conv_rekey_steady";
+      seedSession(id, []);
+      const extras = new Map<string, Record<string, unknown>>([[id, { host_id: "host_b" }]]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras });
+      setSessionHost(id, "host_b");
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toBe("host_b");
+
+      // Re-recording the same host, as every sidebar poll does.
+      setSessionHost(id, "host_b");
+      await drainAsync();
+      // Another session's routing changes.
+      setSessionHost("conv_rekey_other", "host_z");
+      setSessionParent("conv_rekey_other_child", "conv_rekey_other");
+      await drainAsync();
+      // A row that momentarily omits the host must not churn the connection,
+      // and re-recording the attempt's own host afterwards is not a change.
+      setSessionHost(id, null);
+      await drainAsync();
+      setSessionHost(id, "host_b");
+      await drainAsync(50);
+
+      expect(route.opens).toHaveLength(1);
+      expect(route.opens[0]!.aborted).toBe(false);
+      expect(controller.signal.aborted).toBe(false);
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+      setSessionHost("conv_rekey_other", null);
+      setSessionParent("conv_rekey_other_child", null);
+    });
+
+    it("does not reopen a released conversation's stream on a host change", async () => {
+      workspaceMode();
+      const id = "conv_rekey_released";
+      seedSession(id, []);
+      const route = routeKeyedStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+
+      conversationRegistry.release(id);
+      setSessionHost(id, "host_b");
+      await drainAsync(50);
+      expect(route.opens).toHaveLength(1);
+
+      // Release may or may not have severed the attempt; tear down explicitly so
+      // the parked read settles either way.
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+    });
+
+    it("does not reopen after the binding itself was aborted", async () => {
+      workspaceMode();
+      const id = "conv_rekey_aborted";
+      seedSession(id, []);
+      const route = routeKeyedStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+
+      await teardown(controller, loop);
+
+      setSessionHost(id, "host_b");
+      await drainAsync(50);
+      expect(route.opens).toHaveLength(1);
+      setSessionHost(id, null);
+    });
+
+    it("stays inert outside a Databricks workspace", async () => {
+      const id = "conv_rekey_standalone";
+      seedSession(id, []);
+      const route = routeKeyedStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(route.opens).toHaveLength(1);
+      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+
+      // An unsharded server routes every request to its one replica: learning
+      // a host changes nothing about where the stream should live.
+      setSessionHost(id, "host_b");
+      await drainAsync(50);
+      expect(route.opens).toHaveLength(1);
+      expect(route.opens[0]!.aborted).toBe(false);
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+    });
   });
 });
 

@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
@@ -962,6 +963,20 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: workspace-claude\n"
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -994,7 +1009,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
                 "snapshot": {
                     "created_at": 10,
                     "updated_at": 11,
-                    "workspace": str(tmp_path),
+                    "workspace": str(workspace),
                     "reasoning_effort": "high",
                     "labels": {},
                 },
@@ -1014,6 +1029,8 @@ async def test_auto_create_claude_terminal_passes_session_effort(
         )
 
     args = captured["spec"].args
+    assert captured["spec"].os_env.cwd == str(workspace)
+    assert captured["spec"].command == "workspace-claude"
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
@@ -1026,6 +1043,47 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     assert str(bridge_dir_for_bridge_id(session_id)) not in messages[0]
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_rejects_missing_recorded_workspace_before_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing recorded workspace stops startup before bridge or terminal setup."""
+    missing_workspace = tmp_path / "removed-workspace"
+    session_id = "f89fd41f6eefee45b2117ac0fcbc73fa"
+    session_init = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": "agent",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(missing_workspace),
+                "labels": {},
+            },
+        }
+    )
+
+    def unexpected_bridge_setup(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("bridge setup must not run for a missing workspace")
+
+    monkeypatch.setattr(claude_native_bridge, "prepare_bridge_dir", unexpected_bridge_setup)
+
+    with pytest.raises(OmnigentError) as failure:
+        await _auto_create_claude_terminal(
+            session_id,
+            object(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+            session_init=session_init,
+        )
+
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
 
 
 @pytest.mark.asyncio
@@ -1971,6 +2029,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
     # Pin the launch config to Claude's native auth so the test does not
     # depend on the runner process's ambient Databricks profile.
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -2129,6 +2188,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
     # Write the previous claude_session_id into the bridge state.json *before*

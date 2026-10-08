@@ -6525,10 +6525,10 @@ class _SessionImportResult:
 @click.option(
     "--last",
     "recent_session_count",
-    type=click.IntRange(min=1, max=100),
+    type=click.IntRange(min=1, max=1000),
     default=None,
     metavar="N",
-    help="Import the N most recently modified parent sessions (maximum 100).",
+    help="Import the N most recently modified parent sessions (maximum 1000).",
 )
 @click.option(
     "--server",
