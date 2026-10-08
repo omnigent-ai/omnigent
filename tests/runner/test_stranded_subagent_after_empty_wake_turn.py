@@ -20,11 +20,14 @@ and assert the recovery contract on the recorded wake POSTs:
   ``response.completed``
 * interrupting an output-free wake turn posts no recovery wake — the explicit
   stop is not overridden
+* a user message buffered behind an empty wake turn still recovers — the
+  intervening non-wake turn must not drop or reclassify the recorded outcome
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -34,6 +37,7 @@ from tests.runner.conftest import (
     _BlockingHarnessClient,
     _FakeProcessManager,
     _runner_client,
+    _ScriptedHarnessClient,
     _sse,
 )
 from tests.runner.test_app_sessions_native_supervision import _WakeRecordingServerClient
@@ -486,3 +490,191 @@ async def test_interrupting_empty_wake_turn_posts_no_recovery_wake() -> None:
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert session_inbox.qsize() == 1
+
+
+class _PerTurnHarnessClient(_ScriptedHarnessClient):
+    """Serves one scripted stream per turn and gates only the first turn.
+
+    The empty wake turn must block mid-stream so a user message can buffer
+    behind it; the buffered turn then streams its own script unblocked.
+    """
+
+    def __init__(self, turn_scripts: list[list[str]], first_turn_gate: asyncio.Event) -> None:
+        super().__init__([])
+        self._turn_scripts = list(turn_scripts)
+        self._gate = first_turn_gate
+        self._turn_index = 0
+        self.post_seen: asyncio.Event = asyncio.Event()
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        index = self._turn_index
+        self._turn_index += 1
+        if index == 0:
+            self.post_seen.set()
+        frames = self._turn_scripts[min(index, len(self._turn_scripts) - 1)]
+        gate = self._gate if index == 0 else None
+
+        class _Ctx:
+            status_code = 200
+
+            async def __aenter__(self) -> _PerTurnHarnessClient._Handle:
+                return _PerTurnHarnessClient._Handle(frames, gate)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+    class _Handle:
+        status_code = 200
+
+        def __init__(self, frames: list[str], gate: asyncio.Event | None) -> None:
+            self._frames = frames
+            self._gate = gate
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            for i, frame in enumerate(self._frames):
+                if i == 1 and self._gate is not None:
+                    await self._gate.wait()
+                yield frame
+
+
+@pytest.mark.asyncio
+async def test_empty_wake_turn_recovers_with_a_user_message_buffered_behind_it() -> None:
+    """A user message buffered behind an empty wake turn must not lose recovery.
+
+    The empty wake turn records its outcome, but a user message buffered behind
+    it dispatches as the next turn before the stranded-inbox check runs. That
+    non-wake turn must neither drop the recorded empty outcome nor reclassify it
+    as output when it replies, so the still-undrained failure earns exactly one
+    recovery wake.
+    """
+    parent_id = "e5f6a7b8c9d01234567890abcdef0156"
+    child_id = "f6a7b8c9d0e11234567890abcdef0167"
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _WakeRecordingServerClient(parent_id)
+
+    gate = asyncio.Event()
+    harness_client = _PerTurnHarnessClient(
+        [
+            # Turn 1: the empty auto-wake turn (response.completed, output:[]).
+            [
+                _sse({"type": "response.created", "response": {"id": "resp_wake_empty"}}),
+                _sse(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": "resp_wake_empty", "output": []},
+                    }
+                ),
+            ],
+            # Turn 2: the buffered user turn replies with text, draining nothing.
+            [
+                _sse({"type": "response.created", "response": {"id": "resp_user_reply"}}),
+                _sse(
+                    {
+                        "type": "response.output_text.delta",
+                        "delta": "Sure, standing by.",
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": "resp_user_reply", "output": []},
+                    }
+                ),
+            ],
+        ],
+        gate,
+    )
+    pm = _FakeProcessManager(harness_client)  # type: ignore[arg-type]
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="acp-worker",
+        title="research",
+    )
+
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "failed",
+                        "output": "inner executor error: Internal error",
+                    },
+                },
+            )
+            assert resp.status_code == 204, resp.text
+
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            assert len(server_client.wake_posts) == 1
+            first_wake_text = server_client.wake_posts[0]["data"]["content"][0]["text"]
+            server_client.wake_seen.clear()
+
+            # Deliver the wake notice; the empty wake turn starts and blocks.
+            parent_resp = await client.post(
+                f"/v1/sessions/{parent_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "a7b8c9d0e1f21234567890abcdef0178",
+                    "model": "test-agent",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": first_wake_text}],
+                },
+            )
+            assert parent_resp.status_code == 202, parent_resp.text
+            await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
+
+            # A user message arrives mid wake turn and buffers behind it.
+            user_resp = await client.post(
+                f"/v1/sessions/{parent_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "a7b8c9d0e1f21234567890abcdef0178",
+                    "model": "test-agent",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "What is the weather?"}],
+                },
+            )
+            assert user_resp.status_code == 202, user_resp.text
+
+            # Release the empty wake turn; the buffered user turn then runs.
+            gate.set()
+
+            try:
+                await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            except TimeoutError:
+                raise AssertionError(
+                    "No recovery wake fired after a user message buffered behind the "
+                    "empty wake turn. The non-wake turn dropped or reclassified the "
+                    f"recorded empty outcome. Wake posts so far: "
+                    f"{len(server_client.wake_posts)} (expected 2)."
+                ) from None
+
+            wake_notices = [p for p in server_client.wake_posts if p.get("type") == "message"]
+            assert len(wake_notices) == 2, (
+                f"Expected exactly 2 wake notices (initial + recovery); got {len(wake_notices)}"
+            )
+
+    finally:
+        gate.set()
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    assert session_inbox.qsize() == 1, (
+        f"Expected the failed-child payload to remain undrained; "
+        f"got {session_inbox.qsize()} item(s)"
+    )

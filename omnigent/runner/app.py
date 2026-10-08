@@ -4800,7 +4800,9 @@ def create_runner_app(
             # only an observed empty completion (not a native/interrupt end)
             # earns recovery.
             _wake_turn_outcome[conv] = "armed"
-        else:
+        elif _wake_turn_outcome.get(conv) != "empty":
+            # Preserve a recorded empty outcome across an intervening user turn;
+            # the stranded-inbox check re-validates the inbox before recovering.
             _wake_turn_outcome.pop(conv, None)
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
@@ -5795,7 +5797,10 @@ def create_runner_app(
                                     delta = event.get("delta")
                                     if delta is not None:
                                         _text_acc.append(delta)
-                                    if delta and conv_id in _wake_turn_outcome:
+                                    # Only the wake turn (armed) is tracked; a later
+                                    # turn's output must not reclassify a preserved
+                                    # empty outcome.
+                                    if delta and _wake_turn_outcome.get(conv_id) == "armed":
                                         _wake_turn_outcome[conv_id] = "output"
                                 elif _evt_type == "response.completed":
                                     _stream_failed_error = None
@@ -5832,7 +5837,7 @@ def create_runner_app(
                                     if isinstance(_item, dict):
                                         _it = _item.get("type")
                                         if _it in ("function_call", "function_call_output") and (
-                                            conv_id in _wake_turn_outcome
+                                            _wake_turn_outcome.get(conv_id) == "armed"
                                         ):
                                             _wake_turn_outcome[conv_id] = "output"
                                         if _it == "function_call":
