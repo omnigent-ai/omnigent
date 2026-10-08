@@ -106,6 +106,86 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Pi context files
+
+With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
+and `CLAUDE.md` from the workspace, its ancestors, and Pi's global agent
+directory. To disable this discovery for an agent, set `context_files: false`:
+
+```yaml
+name: focused-agent
+executor:
+  harness: pi
+  context_files: false
+prompt: |
+  Follow these explicit agent instructions.
+```
+
+For a directory bundle using `config.yaml`, place the option in `executor.config`:
+
+```yaml
+spec_version: 1
+name: focused-agent
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    context_files: false
+instructions: AGENTS.md
+```
+
+The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
+`instructions:` content (including an explicitly referenced `AGENTS.md`) and
+Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
+`--no-context-files` flag. It does not disable skills, extensions, or Pi's
+separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
+or other harnesses.
+
+### Pi system prompt
+
+With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed
+instructions to Pi:
+
+- `append` (default) keeps Pi's base prompt and appends Omnigent's instructions
+  using `--append-system-prompt`. The base is Pi's built-in coding prompt or a
+  discovered `SYSTEM.md`.
+- `replace` sends Omnigent's instructions as the base using `--system-prompt`.
+  Pi's built-in coding prompt and discovered `SYSTEM.md` are omitted. An explicit
+  empty `--append-system-prompt` also prevents discovery of `APPEND_SYSTEM.md`.
+
+To replace the base prompt and disable workspace context discovery:
+
+```yaml
+name: support-agent
+executor:
+  harness: pi
+  system_prompt_mode: replace
+  context_files: false
+prompt: |
+  You are a customer-support assistant.
+```
+
+For a directory bundle, set `executor.config.system_prompt_mode`:
+
+```yaml
+spec_version: 1
+name: support-agent
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    system_prompt_mode: replace
+    context_files: false
+instructions: AGENTS.md
+```
+
+Both modes preserve explicit agent instructions, per-request instructions, and
+Omnigent's appended runtime instructions. Replacement removes Pi's default tool
+summaries and coding guidelines; tool schemas and execution still work.
+`context_files` is independent and still defaults to `true`. Skills, the working
+directory footer, and extension hooks remain active; extensions can modify the
+final prompt. This setting only supports `pi`, not `pi-native` or other harnesses.
+
 ### GitHub Copilot
 
 `harness: copilot` runs the agent through the
@@ -248,6 +328,123 @@ os_env:
       - .
     allow_network: true
 ```
+
+On Linux, the `openai-agents` harness supports disposable copy-on-write mounts:
+
+```yaml
+executor:
+  harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    write_paths:
+      - ./artifacts
+      - path: ./dependencies
+        copy_on_write: true
+
+terminals:
+  bash:
+    command: bash
+    os_env: inherit
+```
+
+Create `artifacts` and `dependencies` before starting the session. The agent
+sees `dependencies` at its original path and can create, edit, rename, and delete
+files there. `sys_os_*` tools, shell commands, and inherited terminals share those
+changes, including across turns and terminal reopen. The host's original files
+stay unchanged. Writes to `artifacts` persist normally. A string entry is
+shorthand for `{path: ..., copy_on_write: false}`.
+
+The disposable view belongs to the session's OS environment. Its changes are
+discarded when that environment closes; they are not restored after a runner
+restart. Separate sessions get separate views. Export anything to keep into a
+persistent write path before closing the session. Overlay data uses temporary
+memory-backed storage and consumes memory/swap as files are copied up.
+
+<a id="copy-on-write-requirements"></a>
+
+**Host requirements apply only to paths with `copy_on_write: true`.** Ordinary
+`read_paths` and persistent `write_paths` retain their existing sandbox
+requirements; they do not need OverlayFS or Bubblewrap 0.11's overlay options.
+The requirements are checked on the machine running the sandbox, not the UI:
+
+- **Bubblewrap 0.11+**, providing `--overlay-src` and `--tmp-overlay`.
+- **Unprivileged OverlayFS mounts with `userxattr` support.** These are supported
+  by upstream Linux **5.11+**; some distributions backport them to older kernels.
+  The temporary upper layer has an additional requirement below.
+- **tmpfs `user.*` extended attributes**, added upstream in **Linux 6.6**,
+  for Bubblewrap's temporary upper layer. The upstream baseline for this
+  implementation is therefore **6.6+**, or equivalent distro backports of both
+  features. Older tmpfs can allow mounting but fail later directory operations.
+- **Kernel facilities:** user/mount namespaces (`CONFIG_NAMESPACES`,
+  `CONFIG_USER_NS`), OverlayFS (`CONFIG_OVERLAY_FS`, built in or an available
+  module), and tmpfs with extended attributes (`CONFIG_TMPFS`, `CONFIG_TMPFS_XATTR`).
+- **Host permission to use those facilities:** sufficient `user.max_user_namespaces`
+  and `user.max_mnt_namespaces` quotas, and `kernel.unprivileged_userns_clone=1`
+  on distributions that expose that switch. AppArmor, SELinux, seccomp, or an
+  enclosing container must allow namespace creation/entry and OverlayFS mounts.
+  For example, Ubuntu 24.04's AppArmor restrictions can block unprivileged user
+  namespaces even on a recent kernel; use an administrator-approved policy for
+  the sandbox launcher. Omnigent does not change host security settings.
+
+Omnigent attempts the actual mounts and tests tmpfs user extended attributes
+when initializing a copy-on-write environment. It does not reject a working
+distro backport based on `uname`, or accept a host solely because its kernel is
+new enough. Failure reports the running kernel,
+these prerequisites, and Bubblewrap's original error. Unsupported hosts fail
+before running tools in that environment; they never fall back to writing the
+original directory. A missing or unlaunchable Bubblewrap binary and a mount
+startup timeout also produce copy-on-write-specific errors.
+
+To check support, run this as the same user and inside the same container/VM as
+the runner, from a directory containing an existing `dependencies` folder:
+
+```bash
+uname -r
+bwrap --version
+cow_probe_dir=$(mktemp -d)
+bwrap --unshare-user --ro-bind / / \
+  --overlay-src "$PWD/dependencies" --tmp-overlay "$PWD/dependencies" \
+  --tmpfs "$cow_probe_dir" \
+  -- python3 -c 'import os,sys,tempfile; f=tempfile.TemporaryFile(dir=sys.argv[1]); os.setxattr(f.fileno(), "user.cow_probe", b"1")' "$cow_probe_dir"
+cow_probe_status=$?
+rmdir "$cow_probe_dir"
+test "$cow_probe_status" -eq 0
+```
+
+The probe should exit successfully without changing `dependencies`.
+An unknown overlay option indicates an old Bubblewrap build. A namespace or
+mount permission error can indicate host policy restrictions; an unsupported
+filesystem/option can indicate missing kernel support. The original diagnostic
+and the host's security logs distinguish these cases.
+
+See the [Bubblewrap manual](https://github.com/containers/bubblewrap/blob/v0.12.0/bwrap.xml),
+[kernel OverlayFS documentation](https://docs.kernel.org/filesystems/overlayfs.html),
+and [Linux 6.6 tmpfs extended-attribute handlers](https://github.com/torvalds/linux/blob/v6.6/mm/shmem.c#L3711).
+
+Copy-on-write paths must name existing directories. Nested copy-on-write roots,
+persistent write paths inside a copy-on-write root, and `write_files` within one
+are rejected. `os_env.fork` and sandbox overrides are also unsupported with
+copy-on-write paths. A persistent parent with a copy-on-write child is supported.
+Other harnesses are rejected because their native tools do not yet share the
+session's mount namespace. File uploads, agent bundle downloads, local agent
+config discovery, skill loading/reading, and session creation from `config_path` return an
+explicit unsupported-operation error in copy-on-write sessions. Use `sys_os_*`
+and inherited terminals for filesystem operations, and export results to a
+persistent write path.
+
+The lower directory should remain unchanged on the host while its overlay is
+active; OverlayFS does not provide a snapshot of concurrent host edits.
+
+To verify this example, ask the agent to write `dependencies/probe.txt` using
+`sys_os_write`, then read and edit it in the inherited bash terminal. Ask the
+agent to read the terminal's edit and save a copy under `artifacts`. From an
+ordinary host terminal, confirm that `dependencies/probe.txt` was not created
+and the exported artifact exists. Start a new session and confirm that its
+`dependencies` view contains only the original files.
 
 For trusted local development, examples may use `sandbox.type: none`:
 

@@ -19,7 +19,12 @@ const {
 } = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
 const { isDatabricksOAuthServerUrl } = require("./url");
-const { cookieMatchesOrigin } = require("./databricks-auth");
+const {
+  cookieMatchesOrigin,
+  isTransientRenewalError,
+  IP_ACL_BLOCKED,
+  SESSION_TRANSPORT,
+} = require("./databricks-auth");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
 // Bound on the session-create request so a stalled socket can't hang connect.
@@ -29,20 +34,19 @@ const NETWORK_TIMEOUT_MS = 20_000;
  * Ensure ``ses`` holds a live DBAUTH cookie for a workspace, and return that
  * workspace origin. Two entry points with deliberately different behavior:
  *
- * - Explicit connect/login (``interactive: true``): ALWAYS authenticate fresh —
- *   never silently reuse a stored token. So a new window connecting to a SPOG
- *   URL re-runs the account flow + picker (choosing the workspace for THIS
- *   window) instead of dropping into another window's workspace. A workspace URL
- *   re-authenticates directly (usually a silent browser SSO round-trip). The
- *   result is persisted keyed by the resolved workspace origin.
+ * - Explicit connect/login (``interactive: true``): try the stored credentials
+ *   for the entered origin (unless ``useStoredCredentials: false``), else
+ *   authenticate fresh in the browser. Tokens are keyed by WORKSPACE origin, so a
+ *   SPOG URL still re-runs the account flow + picker for THIS window. The result
+ *   is persisted keyed by the resolved workspace origin.
  * - Restore/renewal (``interactive: false``): reuse the stored token for this
  *   (already-resolved) workspace, refreshing if needed, and re-mint the cookie
- *   against the SAME workspace — no browser, no picker. This is the ONLY path
- *   that reads the cache, including relaunch and additional windows.
+ *   against the SAME workspace — no browser, no picker.
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin The entered/pinned origin (account or workspace host).
- * @param {{ interactive?: boolean, nextPath?: string, workspaceId?: string, signal?: AbortSignal,
+ * @param {{ interactive?: boolean, useStoredCredentials?: boolean, nextPath?: string,
+ *   workspaceId?: string, signal?: AbortSignal,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
  *   ``workspaceId`` (from a ``?o=`` hint) auto-selects that workspace for an
@@ -52,7 +56,14 @@ const NETWORK_TIMEOUT_MS = 20_000;
 async function ensureDatabricksSession(
   ses,
   origin,
-  { interactive = true, nextPath = "/omnigent", pickWorkspace, workspaceId, signal } = {},
+  {
+    interactive = true,
+    useStoredCredentials = true,
+    nextPath = "/omnigent",
+    pickWorkspace,
+    workspaceId,
+    signal,
+  } = {},
 ) {
   signal?.throwIfAborted();
   if (!isDatabricksOAuthServerUrl(origin)) {
@@ -63,8 +74,23 @@ async function ensureDatabricksSession(
     interactive,
     workspaceHint: workspaceId ?? null,
   });
+  if (interactive && useStoredCredentials) {
+    try {
+      return await ensureDatabricksSession(ses, origin, { interactive: false, nextPath, signal });
+    } catch (error) {
+      signal?.throwIfAborted();
+      // A browser sign-in can't finish while the workspace is unreachable either.
+      if (isTransientRenewalError(error)) throw error;
+      console.log("[omnigent] databricks session: stored credentials unusable", { origin });
+    }
+  }
   let bridgeOrigin;
   let accessToken;
+  // Silent reconnects reuse credentials stored for `origin`; a failure before those exist can't resume.
+  const notResumable = (error) => {
+    if (error && typeof error === "object") error.resumable = false;
+    throw error;
+  };
 
   if (!interactive) {
     // Shared refreshes must persist rotated credentials even if this caller cancels.
@@ -73,7 +99,9 @@ async function ensureDatabricksSession(
     bridgeOrigin = origin;
   } else {
     // Explicit login: authenticate fresh, never reusing the cache.
-    const { tokens, issuerOrigin } = await runInteractiveLogin(origin, { signal });
+    const { tokens, issuerOrigin } = await runInteractiveLogin(origin, { signal }).catch(
+      notResumable,
+    );
     signal?.throwIfAborted();
     const account = parseAccountFromToken(tokens.access_token);
     console.log("[omnigent] databricks session: token routing", {
@@ -88,7 +116,9 @@ async function ensureDatabricksSession(
       if (!isTrustedDatabricksOrigin(account.accountOrigin)) {
         throw new Error(`refusing to use an untrusted account origin: ${account.accountOrigin}`);
       }
-      const workspaces = await listRunningWorkspaces(account, tokens.access_token, { signal });
+      const workspaces = await listRunningWorkspaces(account, tokens.access_token, {
+        signal,
+      }).catch(notResumable);
       signal?.throwIfAborted();
       console.log("[omnigent] databricks session: workspace lookup", {
         accountOrigin: account.accountOrigin,
@@ -140,7 +170,8 @@ async function ensureDatabricksSession(
     throw new Error(`refusing to send credentials to untrusted workspace origin: ${bridgeOrigin}`);
   }
 
-  await mintSessionCookie(ses, bridgeOrigin, accessToken, nextPath, { signal });
+  const minted = mintSessionCookie(ses, bridgeOrigin, accessToken, nextPath, { signal });
+  await (bridgeOrigin === origin ? minted : minted.catch(notResumable));
   signal?.throwIfAborted();
   return bridgeOrigin;
 }
@@ -208,8 +239,10 @@ async function mintSessionCookie(
           reject(error);
         } else resolve(code);
       };
-      const abort = (message) => {
-        finish(new Error(message));
+      const transportError = (message) =>
+        Object.assign(new Error(message), { errorCode: SESSION_TRANSPORT });
+      const abort = (error) => {
+        finish(error);
         request.abort();
       };
       const onAbort = () => {
@@ -217,7 +250,7 @@ async function mintSessionCookie(
         request.abort();
       };
       const timer = setTimeoutFn(
-        () => abort("Databricks session creation timed out"),
+        () => abort(transportError("Databricks session creation timed out")),
         NETWORK_TIMEOUT_MS,
       );
       request.setHeader("Authorization", `Bearer ${accessToken}`);
@@ -241,7 +274,9 @@ async function mintSessionCookie(
         // Follow only the intended app destination so Chromium commits Set-Cookie.
         if (!accepted) {
           abort(
-            "Databricks session creation redirected to authentication or an unexpected destination",
+            new Error(
+              "Databricks session creation redirected to authentication or an unexpected destination",
+            ),
           );
           return;
         }
@@ -267,9 +302,9 @@ async function mintSessionCookie(
         });
         response.on("end", () => finish(null, response.statusCode));
         response.on("error", (error) => finish(error));
-        response.on("aborted", () => finish(new Error("Databricks session response aborted")));
+        response.on("aborted", () => finish(transportError("Databricks session response aborted")));
         response.on("close", () =>
-          finish(new Error("Databricks session response closed before completion")),
+          finish(transportError("Databricks session response closed before completion")),
         );
       });
       // ClientRequest's Writable closes after end(), before the response arrives.
@@ -288,6 +323,9 @@ async function mintSessionCookie(
         if (typeof code === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(code)) errorCode = code;
       } catch {
         /* HTML and unstructured errors are not displayed. */
+      }
+      if (status === 403 && /is blocked by Databricks IP ACL/.test(errorBody)) {
+        errorCode = IP_ACL_BLOCKED;
       }
       const details = [errorCode, requestId && `request ID ${requestId}`]
         .filter(Boolean)

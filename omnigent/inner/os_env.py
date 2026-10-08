@@ -25,6 +25,7 @@ from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
 )
+from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import strip_desktop_session_env
@@ -46,6 +47,7 @@ from .sandbox import (
     reachable_roots,
     resolve_sandbox,
     set_sandbox_env,
+    with_additional_read_roots,
     with_additional_write_roots,
 )
 
@@ -227,7 +229,9 @@ def build_helper_env(
         # Opted out of sandboxing (incl. env filtering): mirror parent
         # env, but still drop the runner-auth secret — opting out of the
         # sandbox must not also hand the agent the binding token.
-        return strip_runner_auth_secrets(parent_env)
+        env = strip_runner_auth_secrets(parent_env)
+        env.pop(SHARED_ENVIRONMENT_VAR, None)
+        return env
 
     allowed = set(_DEFAULT_ENV_PASSTHROUGH)
     if sandbox.env_passthrough is not None:
@@ -241,6 +245,7 @@ def build_helper_env(
     # The default allowlist already excludes the runner-auth secrets,
     # but strip again so a spec author can't re-admit one by naming it
     # in ``sandbox.env_passthrough``.
+    env.pop(SHARED_ENVIRONMENT_VAR, None)
     return strip_runner_auth_secrets(env)
 
 
@@ -316,7 +321,7 @@ class OSEnvironment(ABC):
         path: str,
         offset: int = 1,
         limit: int | None = None,
-        max_binary_bytes: int | None = None,
+        max_bytes: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -344,6 +349,15 @@ class OSEnvironment(ABC):
     ) -> OpResult:
         raise NotImplementedError
 
+    def prepare_sandbox(self, policy: SandboxPolicy) -> None:
+        """Attach environment-owned resources before launching a consumer."""
+        if policy.copy_on_write_roots:
+            raise RuntimeError("This environment cannot own copy-on-write mounts")
+
+    @property
+    def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
+        return None
+
     def close(self) -> None:  # noqa: B027 — optional override hook; default is a no-op
         """Release any process or file resources held by the environment.
 
@@ -365,7 +379,9 @@ class _HelperProcessClient:
         start_in_scratch: bool = False,
         egress_rules: list[str] | None = None,
         egress_allow_private_destinations: bool = False,
+        copy_on_write_environment: CopyOnWriteEnvironment | None = None,
     ) -> None:
+        self._copy_on_write_environment = copy_on_write_environment
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
@@ -451,6 +467,8 @@ class _HelperProcessClient:
 
     def _start_locked(self) -> None:
         sandbox = self.sandbox
+        if self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.prepare(sandbox)
         env = build_helper_env(os.environ, sandbox)
         project_root = str(_project_root())
         existing_pythonpath = env.get("PYTHONPATH")
@@ -606,7 +624,7 @@ class _HelperProcessClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                cwd=str(self.cwd),
+                cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
                 env=env,
                 **popen_kwargs,
             )
@@ -841,7 +859,33 @@ class CallerProcessOSEnvironment(OSEnvironment):
     _egress_rules: list[str] | None = None
     _egress_allow_private_destinations: bool = False
 
+    _copy_on_write_environment: CopyOnWriteEnvironment | None = None
+    _owns_copy_on_write: bool = False
+
+    @property
+    def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
+        return self._copy_on_write_environment
+
+    def prepare_sandbox(self, policy: SandboxPolicy) -> None:
+        if self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.prepare(policy)
+        elif policy.copy_on_write_roots:
+            if policy.copy_on_write_roots != self.sandbox.copy_on_write_roots:
+                raise ValueError("Inherited copy-on-write paths must match their environment")
+            policy.copy_on_write_namespace = self.sandbox.copy_on_write_namespace
+            if policy.copy_on_write_namespace is None:
+                raise RuntimeError("Missing copy-on-write environment")
+
     def __post_init__(self) -> None:
+        if (
+            self.sandbox.copy_on_write_roots
+            and self._copy_on_write_environment is None
+            and self.sandbox.copy_on_write_namespace is None
+        ):
+            self._copy_on_write_environment = CopyOnWriteEnvironment(
+                self.sandbox.copy_on_write_roots
+            )
+            self._owns_copy_on_write = True
         self._helper = _HelperProcessClient(
             cwd=self.cwd,
             shell_path=self.shell_path,
@@ -849,6 +893,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             start_in_scratch=self._start_in_scratch,
             egress_rules=self._egress_rules,
             egress_allow_private_destinations=self._egress_allow_private_destinations,
+            copy_on_write_environment=self._copy_on_write_environment,
         )
 
     async def read(
@@ -856,7 +901,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         path: str,
         offset: int = 1,
         limit: int | None = None,
-        max_binary_bytes: int | None = None,
+        max_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -869,7 +914,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "path": path,
                 "offset": offset,
                 "limit": limit,
-                "max_binary_bytes": max_binary_bytes,
+                "max_bytes": max_bytes,
             },
         )
         return cast(OpResult, result)
@@ -928,6 +973,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
 
     def close(self) -> None:
         self._helper.close()
+        if self._owns_copy_on_write and self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.close()
         if self._fork_dir is not None:
             shutil.rmtree(self._fork_dir, ignore_errors=True)
             self._fork_dir = None
@@ -936,7 +983,13 @@ class CallerProcessOSEnvironment(OSEnvironment):
         self.close()
 
 
-def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
+def create_os_environment(
+    spec: OSEnvSpec | None,
+    *,
+    copy_on_write_environment: CopyOnWriteEnvironment | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
+    additional_read_roots: Sequence[Path] = (),
+) -> OSEnvironment | None:
     """Instantiate the configured OS environment."""
     if spec is None:
         return None
@@ -950,7 +1003,9 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
         effective_cwd = fork_dir / "root"
         _copy_tree(cwd, effective_cwd)
         cwd = effective_cwd
-    sandbox = resolve_sandbox(spec, cwd)
+    sandbox = replace(sandbox_policy) if sandbox_policy is not None else resolve_sandbox(spec, cwd)
+    if additional_read_roots:
+        sandbox = with_additional_read_roots(sandbox, list(additional_read_roots))
     if spec.start_in_scratch and not sandbox.active:
         raise ValueError(
             "os_env.start_in_scratch requires an active sandbox; "
@@ -970,6 +1025,7 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
         cwd=cwd,
         sandbox=sandbox,
         shell_path=shell_path,
+        _copy_on_write_environment=copy_on_write_environment,
         _fork_dir=fork_dir,
         _start_in_scratch=spec.start_in_scratch,
         _egress_rules=egress_rules,
@@ -1010,13 +1066,13 @@ def _handle_helper_request(
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
-        max_binary_raw = request.get("max_binary_bytes")
-        max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
+        max_bytes_raw = request.get("max_bytes")
+        max_bytes = max_bytes_raw if isinstance(max_bytes_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
-            max_binary_bytes=max_binary_bytes,
+            max_bytes=max_bytes,
         )
 
     if op == "write":
@@ -1246,21 +1302,21 @@ def _is_binary_file(path: Path) -> bool:
     return False
 
 
-def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
-    """Read a binary file as base64, bounded by *max_binary_bytes*.
+def _read_binary_impl(path: Path, max_bytes: int | None) -> OpResult:
+    """Read a binary file as base64, bounded by *max_bytes*.
 
-    Only ``stat`` (for the total size) and at most *max_binary_bytes* are read
+    Only ``stat`` (for the total size) and at most *max_bytes* are read
     from disk, so a large file neither saturates memory nor inflates IPC.
 
     :param path: Absolute path of the binary file.
-    :param max_binary_bytes: Byte cap. ``None`` returns a descriptor only (the
+    :param max_bytes: Byte cap. ``None`` returns a descriptor only (the
         agent ``sys_os_read`` path); a positive int inlines up to that many
         base64-encoded bytes (the filesystem-service path).
     :returns: An :class:`OpResult` with ``encoding="base64"`` (see
         :func:`_read_impl`).
     """
     total = path.stat().st_size
-    if max_binary_bytes is None:
+    if max_bytes is None:
         # Agent tool path: return a descriptor only — inlining base64 the
         # model cannot use would waste (and risk saturating) the context.
         return {
@@ -1276,7 +1332,7 @@ def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
             ),
         }
     with path.open("rb") as fh:
-        payload = fh.read(max_binary_bytes)
+        payload = fh.read(max_bytes)
     return {
         "path": str(path),
         "content": base64.b64encode(payload).decode("ascii"),
@@ -1291,18 +1347,19 @@ def _read_impl(
     path: Path,
     offset: int,
     limit: JsonValue,
-    max_binary_bytes: int | None = None,
+    max_bytes: int | None = None,
 ) -> OpResult:
     """
     Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
 
     The file's first chunk is sniffed for UTF-8 validity (see
     :func:`_is_binary_file`). Files that look like text are read and returned
-    with the usual line-oriented ``offset``/``limit`` windowing. Files that do
-    *not* (images, archives, fonts, …) cannot be line-windowed, so they are
-    capped by *bytes* instead, reading at most ``max_binary_bytes`` from disk.
+    with the usual line-oriented ``offset``/``limit`` windowing. ``max_bytes``
+    bounds both text and binary reads before decoding or returning content
+    through the helper's IPC channel. Text reads use one extra byte to detect
+    truncation, dropping an incomplete trailing UTF-8 character.
 
-    For binary files the behaviour depends on ``max_binary_bytes``:
+    For binary files the behaviour depends on ``max_bytes``:
 
     * ``None`` (the default, used by the agent ``sys_os_read`` tool) — the
       base64 payload is **not** inlined. A model cannot decode base64, and a
@@ -1318,11 +1375,12 @@ def _read_impl(
         limit (return all lines from *offset* to end of file).  Callers
         that want the default agent-tool cap should pass
         :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
-    :param max_binary_bytes: Byte cap for binary files (see above). ``None``
-        returns a descriptor only.
+    :param max_bytes: Byte cap applied before text line-windowing. ``None``
+        leaves text uncapped and returns a descriptor only for binary files.
     :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
         ``content``, ``offset``, ``limit``, ``returned_lines``, and
-        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``total_lines`` (unknown when byte-truncated), and ``truncated``.
+        For binary, ``encoding="base64"``, ``total_bytes``,
         ``truncated`` and either ``content`` (the base64 string, byte-capped
         callers) or a ``note`` (descriptor-only callers).
     """
@@ -1331,19 +1389,28 @@ def _read_impl(
     if limit is not None:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
-    if max_binary_bytes is not None and max_binary_bytes < 1:
-        return {"error": "max_binary_bytes must be >= 1"}
+    if max_bytes is not None and max_bytes < 1:
+        return {"error": "max_bytes must be >= 1"}
 
     if _is_binary_file(path):
-        return _read_binary_impl(path, max_binary_bytes)
+        return _read_binary_impl(path, max_bytes)
 
+    truncated = False
     try:
-        text = path.read_text(encoding="utf-8", errors="strict")
+        if max_bytes is None:
+            text = path.read_text(encoding="utf-8", errors="strict")
+        else:
+            with path.open("rb") as fh:
+                raw = fh.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            text = codecs.getincrementaldecoder("utf-8")("strict").decode(
+                raw[:max_bytes], final=not truncated
+            )
     except UnicodeDecodeError:
         # The sniffed prefix decoded cleanly but bytes further in did not (a
         # file that is text up front and binary later). Fall back to the binary
         # path so we never return garbled text.
-        return _read_binary_impl(path, max_binary_bytes)
+        return _read_binary_impl(path, max_bytes)
 
     lines = text.splitlines(keepends=True)
     start = offset - 1
@@ -1357,7 +1424,8 @@ def _read_impl(
         "offset": offset,
         "limit": effective_limit,
         "returned_lines": max(0, resolved_limit - start),
-        "total_lines": len(lines),
+        "total_lines": None if truncated else len(lines),
+        "truncated": truncated,
     }
 
 

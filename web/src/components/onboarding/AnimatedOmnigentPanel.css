@@ -14,10 +14,11 @@
   border-radius: 24px;
   background: var(--background);
   box-shadow: var(--onboarding-modal-shadow);
-  /* Replaces motion's spring — the flow changes width/height per step. */
+  /* The prototype's resize curve: a soft ease-out with no overshoot. */
+  --omnigent-resize: 0.5s cubic-bezier(0.22, 1, 0.36, 1);
   transition:
-    width 0.42s var(--ease-otto, cubic-bezier(0.34, 1.4, 0.64, 1)),
-    height 0.42s var(--ease-otto, cubic-bezier(0.34, 1.4, 0.64, 1));
+    width var(--omnigent-resize),
+    height var(--omnigent-resize);
 }
 
 /* Dark cards read as a translucent overlay surface, not the solid page bg. */
@@ -30,10 +31,11 @@
   flex-shrink: 0;
   overflow: hidden;
   margin: -12px;
+  margin-bottom: 0;
   /* Hard cutoff at the band's bottom edge (matches the prototype's two-region
      split); the blob grid fades on its own, so no soft mask here. */
   border-radius: 14px 14px 0 0;
-  transition: height 0.42s var(--ease-otto, cubic-bezier(0.34, 1.4, 0.64, 1));
+  transition: height var(--omnigent-resize);
 }
 
 .omnigent-panel-logo {
@@ -96,9 +98,24 @@
   flex-direction: column;
 }
 
+/* Each step mounts a fresh body child; fade it in rather than snapping. */
+.omnigent-card-body > * {
+  animation: omnigent-step-in 0.2s ease-out;
+}
+
+@keyframes omnigent-step-in {
+  from {
+    opacity: 0;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .omnigent-card,
   .omnigent-animated-panel {
     transition: none;
+  }
+
+  .omnigent-card-body > * {
+    animation: none;
   }
 }

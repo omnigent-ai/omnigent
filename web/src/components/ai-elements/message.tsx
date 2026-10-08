@@ -5,9 +5,10 @@ import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
 import { getEmbedRoot } from "@/lib/host";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
-import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode, RefObject } from "react";
 import {
   cloneElement,
@@ -22,10 +23,17 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { Streamdown, type StreamdownProps } from "streamdown";
+import {
+  Streamdown,
+  StreamdownContext,
+  TableCopyDropdown,
+  TableDownloadDropdown,
+  type ControlsConfig,
+  type StreamdownProps,
+} from "streamdown";
 
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
-import { MERMAID_STREAMDOWN_OPTIONS } from "./MermaidError";
+import { mermaidOptionsForTheme } from "./MermaidError";
 
 import {
   CHAT_LINK_SAFETY,
@@ -403,6 +411,114 @@ const CodeFullscreenIcon = (props: CodeHeaderIconProps) => (
   </svg>
 );
 
+function tableControlEnabled(
+  controls: ControlsConfig,
+  control: "copy" | "download" | "fullscreen",
+): boolean {
+  if (typeof controls === "boolean") return controls;
+  if (controls.table === false) return false;
+  if (controls.table === true || controls.table === undefined) return true;
+  return controls.table[control] !== false;
+}
+
+type ChatTableProps = ComponentProps<"table"> & { node?: unknown };
+
+function ChatTable({ children, className, node: _node, ...props }: ChatTableProps) {
+  const { controls, isAnimating } = useContext(StreamdownContext);
+  const [fullscreen, setFullscreen] = useState(false);
+  const showCopy = tableControlEnabled(controls, "copy");
+  const showDownload = tableControlEnabled(controls, "download");
+  const showFullscreen = tableControlEnabled(controls, "fullscreen");
+  const showControls = showCopy || showDownload || showFullscreen;
+  const closeFullscreen = useCallback(() => setFullscreen(false), []);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeFullscreen();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [closeFullscreen, fullscreen]);
+
+  const fullscreenOverlay = fullscreen
+    ? createPortal(
+        <div
+          aria-label="View fullscreen"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex flex-col bg-background"
+          data-streamdown="table-fullscreen"
+          onClick={closeFullscreen}
+          role="dialog"
+        >
+          <div
+            className="flex h-full flex-col"
+            data-streamdown="table-wrapper"
+            onClick={(event) => event.stopPropagation()}
+            role="presentation"
+          >
+            <div className="flex items-center justify-end gap-1 p-4">
+              {showCopy && <TableCopyDropdown />}
+              {showDownload && <TableDownloadDropdown />}
+              <button
+                className="cursor-pointer rounded-md p-1 text-muted-foreground transition-all hover:bg-muted hover:text-foreground"
+                onClick={closeFullscreen}
+                title="Exit fullscreen"
+                type="button"
+              >
+                <XIcon size={20} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-4 pt-0 [&_thead]:sticky [&_thead]:top-0 [&_thead]:z-10">
+              <table
+                className="w-full border-collapse border border-border"
+                data-streamdown="table"
+              >
+                {children}
+              </table>
+            </div>
+          </div>
+        </div>,
+        getEmbedRoot() ?? document.body,
+      )
+    : null;
+
+  return (
+    <div
+      className="my-4 flex flex-col gap-2 rounded-lg border border-border bg-sidebar p-2"
+      data-streamdown="table-wrapper"
+    >
+      {showControls && (
+        <div className="flex items-center justify-end gap-1">
+          {showCopy && <TableCopyDropdown />}
+          {showDownload && <TableDownloadDropdown />}
+          {showFullscreen && (
+            <button
+              className="cursor-pointer p-1 text-muted-foreground transition-all hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={isAnimating}
+              onClick={() => setFullscreen(true)}
+              title="View fullscreen"
+              type="button"
+            >
+              <CodeFullscreenIcon />
+            </button>
+          )}
+        </div>
+      )}
+      <div className="border-collapse overflow-x-auto overflow-y-auto rounded-md border border-border bg-background">
+        <table
+          className={cn("w-full divide-y divide-border", className)}
+          data-streamdown="table"
+          {...props}
+        >
+          {children}
+        </table>
+      </div>
+      {fullscreenOverlay}
+    </div>
+  );
+}
+
 const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
   <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
     <g stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75}>
@@ -638,16 +754,21 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
 
 export const MessageResponse = memo(
   ({ className, components, controls, markFileLinks = false, ...props }: MessageResponseProps) => {
+    const themeMode = useResolvedThemeMode();
     const messageComponents = useMemo(
-      () => ({ ...components, pre: ChatCodeBlockPre }),
+      () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
       [components],
     );
 
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
+    const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
 
     return (
       <MarkdownErrorBoundary source={props.children}>
+        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+            so remount on theme change to recolor already-rendered diagrams. */}
         <Streamdown
+          key={themeMode}
           // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
           className={cn(
             "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
@@ -660,7 +781,7 @@ export const MessageResponse = memo(
           {...props}
           components={messageComponents}
           controls={messageControls}
-          mermaid={MERMAID_STREAMDOWN_OPTIONS}
+          mermaid={mermaidOptions}
           // Block remote image fetches that can exfiltrate data through URLs.
           rehypePlugins={
             markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS

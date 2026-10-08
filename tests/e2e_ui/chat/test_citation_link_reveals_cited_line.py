@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import gzip
 import io
-import json
 import re
 import shutil
 import tarfile
@@ -41,6 +40,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.session import post_session_bundle
 
 _AGENT_NAME = "cited_line_target_demo"
 _FILE_REL = "src/module.py"
@@ -131,11 +132,8 @@ def cited_line_session(
     (ws / "src").mkdir()
     (ws / _FILE_REL).write_text(_module_source())
 
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _agent_bundle(str(ws)), "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]

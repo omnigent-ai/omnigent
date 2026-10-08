@@ -13,12 +13,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -26,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
 )
+from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
 _ERROR_ID_RE = re.compile(r" Error ID: (err_[0-9a-f]{32})\.$")
 
@@ -48,7 +52,7 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     assert payload["code"] == ErrorCode.SESSION_AGENT_MISSING
     message = payload["message"]
     # Actionable, client-safe wording about the lifecycle condition.
-    assert "agent is no longer available" in message
+    assert "agent no longer exists" in message
     # Must NOT relabel the lifecycle event as a generic startup defect.
     assert "Native Claude terminal failed to start" not in message
     # Must NOT leak the internal resolver detail or the raw agent id.
@@ -60,7 +64,14 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     assert payload["error_id"] == match.group(1)
 
 
-def test_other_causes_keep_generic_startup_failure_code() -> None:
+@pytest.mark.parametrize(
+    "cause",
+    [
+        RuntimeError("tmux server exited before the pane was ready"),
+        FileNotFoundError("missing executable"),
+    ],
+)
+def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> None:
     """A non-lifecycle cause keeps the generic startup-defect code.
 
     The reclassification is scoped to the missing-agent lifecycle condition;
@@ -68,14 +79,170 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     ``native_terminal_start_failed`` terminal-startup defect.
     """
     payload = _native_terminal_start_error_payload(
-        RuntimeError("tmux server exited before the pane was ready"),
+        cause,
         "Claude",
         session_id="conv_1",
     )
 
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
     assert payload["code"] == "native_terminal_start_failed"
-    assert "agent is no longer available" not in payload["message"]
+    assert "agent no longer exists" not in payload["message"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "category"),
+    [
+        (RuntimeError("tmux server exited before the pane was ready"), "unknown"),
+        (OSError(28, "No space left on device"), "host"),
+        (
+            OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
+            "user",
+        ),
+        (
+            OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
+            "user",
+        ),
+    ],
+)
+def test_start_failure_log_row_is_blocking_with_derived_category(
+    caplog: pytest.LogCaptureFixture, exc: Exception, category: str
+) -> None:
+    """Every start failure blocks; its owner comes from the exception, and an
+    unrecognized one stays unknown rather than guessed."""
+    with caplog.at_level(logging.WARNING, logger=orchestration._logger.name):
+        _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_terminal_start_failed"
+    ]
+    attrs = record_to_row(record, source="runner")["attributes"]
+    assert attrs["error_impact"] == "blocking"
+    assert attrs["error_category"] == category
+
+
+def test_generic_cause_names_errno_without_free_form_text() -> None:
+    """The generic startup-defect message now names a structured errno cause.
+
+    Production telemetry for these failures only carries this message, so an
+    environmental cause (e.g. disk-full) must be legible without the runner
+    log — but only via structured facts, never the raw exception text.
+    """
+    payload = _native_terminal_start_error_payload(
+        OSError(28, "No space left on device"),
+        "Codex",
+        session_id="conv_1",
+    )
+
+    assert (
+        "Native Codex terminal failed to start (OSError errno 28 ENOSPC); "
+        "see the runner log for details:"
+    ) in payload["message"]
+    assert "No space left on device" not in payload["message"]
+
+
+def test_cause_includes_errno_name_for_os_errors() -> None:
+    """An ``OSError`` cause names its errno, never its free-form strerror text."""
+    exc = OSError(28, "No space left on device")
+
+    assert orchestration._native_terminal_start_failure_cause(exc) == "OSError errno 28 ENOSPC"
+
+
+def test_cause_names_direct_cause_type_for_chained_exception() -> None:
+    """A wrapping exception names its direct cause's type, not any message text."""
+    exc = RuntimeError("private launch configuration detail")
+    exc.__cause__ = httpx.ReadTimeout("private upstream URL")
+
+    cause = orchestration._native_terminal_start_failure_cause(exc)
+
+    assert cause == "RuntimeError (cause ReadTimeout)"
+
+
+def test_cause_never_includes_exception_message_text() -> None:
+    """No part of the exception's message — secrets or multi-line text — ever appears."""
+    exc = RuntimeError("token=super-secret-value andmultiline\nsecond line with more detail")
+
+    cause = orchestration._native_terminal_start_failure_cause(exc)
+
+    assert cause == "RuntimeError"
+    assert "secret" not in cause
+    assert "token" not in cause
+    assert "\n" not in cause
+
+
+def test_cause_is_class_name_only_when_no_structured_facts_available() -> None:
+    """An exception with a message but no errno/code/cause is class-name only."""
+    assert orchestration._native_terminal_start_failure_cause(RuntimeError()) == "RuntimeError"
+
+
+def test_cause_names_omnigent_error_code() -> None:
+    """An ``OmnigentError`` cause names its structured error code, not its message."""
+    exc = OmnigentError("some internal detail", code=ErrorCode.INTERNAL_ERROR)
+
+    assert (
+        orchestration._native_terminal_start_failure_cause(exc)
+        == f"OmnigentError code {ErrorCode.INTERNAL_ERROR}"
+    )
+    assert "internal detail" not in orchestration._native_terminal_start_failure_cause(exc)
+
+
+def test_cause_names_omnigent_error_code_and_cause_type() -> None:
+    """A coded launch-config failure keeps the underlying transport cause visible."""
+    exc = OmnigentError("could not fetch", code=ErrorCode.INTERNAL_ERROR)
+    exc.__cause__ = httpx.ReadTimeout("slow")
+
+    assert orchestration._native_terminal_start_failure_cause(exc) == (
+        f"OmnigentError code {ErrorCode.INTERNAL_ERROR} (cause ReadTimeout)"
+    )
+
+
+def test_codex_early_exit_with_unknown_status_does_not_invent_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+    )
+    read_output = Mock(side_effect=AssertionError("capture is disabled"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Codex", session_id="conv_1"
+    )
+
+    assert "Codex terminal exited before becoming available." in payload["message"]
+    assert "with status" not in payload["message"]
+    assert "Codex startup terminal output:" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+    read_output.assert_not_called()
+
+
+def test_codex_early_exit_diagnostic_failure_preserves_exit_cause(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+    )
+    instance._remember_exit_status("1 2")
+    read_output = Mock(side_effect=ValueError("private diagnostic failure detail"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Codex", session_id="conv_1"
+    )
+
+    assert "Codex terminal exited with status 2 before becoming available." in payload["message"]
+    assert "Codex startup terminal output:" not in payload["message"]
+    assert "private diagnostic failure detail" not in payload["message"]
+    read_output.assert_called_once_with()
 
 
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
@@ -90,20 +257,23 @@ def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
 
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
-    assert "agent is no longer available" not in payload["message"]
+    assert "agent no longer exists" not in payload["message"]
 
 
-@pytest.mark.parametrize("missing_agent", [False, True])
+@pytest.mark.parametrize(
+    "lifecycle_code",
+    [None, ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING],
+)
 def test_startup_failure_diagnostics_belong_to_failing_child(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    missing_agent: bool,
+    lifecycle_code: ErrorCode | None,
 ) -> None:
     """A shared runner's parent must not receive a child's startup failure evidence."""
     monkeypatch.setattr(orchestration, "runner_primary_session_id", lambda: "parent-session")
     private_detail = "private launch configuration"
-    if missing_agent:
-        exc = OmnigentError(private_detail, code=ErrorCode.SESSION_AGENT_MISSING)
+    if lifecycle_code is not None:
+        exc = OmnigentError(private_detail, code=lifecycle_code)
     else:
         exc = RuntimeError(private_detail)
         exc.__cause__ = httpx.ReadTimeout("private upstream URL")
@@ -125,11 +295,31 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
     assert attributes["exception_type"] == type(exc).__name__
     assert private_detail not in str(attributes)
     assert private_detail not in payload["message"]
-    if missing_agent:
+    if lifecycle_code is not None:
         assert row["stack_trace"] is None
     else:
         assert attributes["exception_cause_type"] == "ReadTimeout"
         assert "ReadTimeout" in str(row["stack_trace"])
+        # The generic startup-defect branch names the direct cause's type as
+        # a structured, non-sensitive fact — never the free-form message.
+        assert "(cause ReadTimeout)" in payload["message"]
+
+
+@pytest.mark.parametrize("code", [ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING])
+def test_ensure_response_for_a_removed_session_resource_is_410(code: ErrorCode) -> None:
+    """A removed session resource is a lifecycle condition, not a runner failure."""
+    removed = _native_terminal_start_error_response(
+        OmnigentError("resource gone", code=code), "Claude", session_id="conv_1"
+    )
+    assert removed.status_code == 410
+    assert json.loads(removed.body)["error"]["code"] == code
+
+
+def test_ensure_response_for_other_failure_is_500() -> None:
+    other = _native_terminal_start_error_response(
+        OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR), "Claude", session_id="conv_1"
+    )
+    assert other.status_code == 500
 
 
 def test_ensure_response_and_diagnostic_share_error_and_session_ids(
@@ -152,3 +342,6 @@ def test_ensure_response_and_diagnostic_share_error_and_session_ids(
     assert attributes["exception_type"] == "OSError"
     assert "private launch path" not in str(attributes)
     assert "private launch path" not in payload["message"]
+    # This ``OSError`` has no numeric errno (single-arg constructor), so the
+    # structured cause is the class name only.
+    assert "(OSError)" in payload["message"]

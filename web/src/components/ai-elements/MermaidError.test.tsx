@@ -1,8 +1,26 @@
-import { describe, expect, it } from "vitest";
-import { describeMermaidError, escapeSequenceTextSemicolons } from "./MermaidError";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describeMermaidError, escapeSequenceTextSemicolons, MermaidError } from "./MermaidError";
+
+const mermaidRender = vi.hoisted(() => vi.fn());
+
+vi.mock("@streamdown/mermaid", () => ({
+  mermaid: {
+    getMermaid: () => ({ render: mermaidRender }),
+  },
+}));
 
 const PARSE_ERROR_LINE_2 =
   "Parse error on line 2:\n...once; twice\n-----^\nExpecting 'X', got 'NEWLINE'";
+
+beforeEach(() => {
+  mermaidRender.mockReset();
+  mermaidRender.mockResolvedValue({
+    svg: '<svg aria-roledescription="sequence"><text>recovered</text></svg>',
+  });
+});
+
+afterEach(cleanup);
 
 describe("escapeSequenceTextSemicolons", () => {
   it("escapes semicolons in message and note text after the colon", () => {
@@ -131,5 +149,35 @@ describe("describeMermaidError", () => {
       hint: null,
       escaped: null,
     });
+  });
+});
+
+describe("MermaidError recovery", () => {
+  it.each([
+    [
+      "punctuation semicolons",
+      "sequenceDiagram\n  A->>B: proceed once; do not call Save\n",
+      "sequenceDiagram\n  A->>B: proceed once#59; do not call Save\n",
+      "one semicolon escaped as #59; (first on line 2)",
+    ],
+    [
+      "statement separators",
+      "sequenceDiagram\n  A->>B: first; B->>C: second\n  C->>D: punctuation; retry me\n",
+      "sequenceDiagram\n  A->>B: first; B->>C: second\n  C->>D: punctuation#59; retry me\n",
+      "one semicolon escaped as #59; (first on line 3)",
+    ],
+  ])("renders escaped SVG while preserving %s", async (_label, chart, expectedChart, notice) => {
+    render(<MermaidError chart={chart} error={PARSE_ERROR_LINE_2} retry={vi.fn()} />);
+
+    const recovered = await screen.findByTestId("mermaid-escaped");
+    expect(recovered.querySelector('svg[aria-roledescription="sequence"]')).toBeInTheDocument();
+    expect(recovered).toHaveTextContent(notice);
+    expect(recovered.querySelectorAll("details pre")[1]).toHaveTextContent(chart.trim(), {
+      normalizeWhitespace: false,
+    });
+    await waitFor(() => {
+      expect(mermaidRender).toHaveBeenCalledTimes(1);
+    });
+    expect(mermaidRender.mock.calls[0][1]).toBe(expectedChart);
   });
 });

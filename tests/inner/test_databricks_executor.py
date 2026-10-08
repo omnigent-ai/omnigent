@@ -2590,3 +2590,71 @@ def test_databrickscfg_workspace_id_for_host_missing_file_returns_none(
     """A missing ~/.databrickscfg never raises — it resolves to None."""
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
     assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") is None
+
+
+def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(monkeypatch):
+    """A stale cached auth is replaced before retrying the mint."""
+    from omnigent.inner.databricks_executor import (
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    class _Cfg:
+        def __init__(self, token):
+            self.token = token
+            self.stale = False
+
+        def authenticate(self):
+            if self.stale:
+                raise FileNotFoundError("baked CLI binary path was deleted")
+            return {"Authorization": f"Bearer {self.token}"}
+
+    cfgs = []
+
+    def _fake_resolve(profile=None, *, host=None):
+        cfgs.append(_Cfg(f"tok-{len(cfgs) + 1}"))
+        return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    source = _ReusedDatabricksTokenSource()
+    assert source.current_token() == "tok-1"
+    assert source.current_token() == "tok-1"
+    assert len(cfgs) == 1, "happy-path mints must reuse the resolved auth"
+
+    cfgs[0].stale = True
+    assert source.current_token() == "tok-2", (
+        "the source kept the stale auth instead of re-resolving"
+    )
+    assert len(cfgs) == 2
+
+
+def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
+    """A failed resolution is retried on the next mint."""
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    class _Cfg:
+        def authenticate(self):
+            return {"Authorization": "Bearer tok-late"}
+
+    available = {"ok": False}
+
+    def _fake_resolve(profile=None, *, host=None):
+        if not available["ok"]:
+            raise DatabricksAuthError("not logged in")
+        return _DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    source = _ReusedDatabricksTokenSource()
+    assert source.current_token() is None
+    available["ok"] = True
+    assert source.current_token() == "tok-late"

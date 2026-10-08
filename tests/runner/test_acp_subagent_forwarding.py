@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner import app as runner_app_mod
+from omnigent.runner import acp_subagent_sessions
 
 
 @dataclass
@@ -79,7 +79,7 @@ async def test_mint_subagent_child_uses_the_acp_start_type() -> None:
     )
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
-    await runner_app_mod._mint_acp_subagent_child(
+    await acp_subagent_sessions._mint_acp_subagent_child(
         client,  # type: ignore[arg-type]
         parent_id="parent1",
         child_key="a0ac9364",
@@ -116,7 +116,7 @@ async def test_mint_subagent_child_seeds_the_task_into_the_child_chat() -> None:
     )
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
-    await runner_app_mod._mint_acp_subagent_child(
+    await acp_subagent_sessions._mint_acp_subagent_child(
         client,  # type: ignore[arg-type]
         parent_id="parent1",
         child_key="a0ac9364",
@@ -144,7 +144,7 @@ async def test_mint_subagent_child_skips_the_seed_without_a_task() -> None:
     client = _RecordingServerClient([_ok(parent_url, {"child_session_id": "c"})])
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
-    await runner_app_mod._mint_acp_subagent_child(
+    await acp_subagent_sessions._mint_acp_subagent_child(
         client,  # type: ignore[arg-type]
         parent_id="p",
         child_key="k1",
@@ -170,7 +170,7 @@ async def test_mint_subagent_child_records_failure_on_non_2xx() -> None:
     client = _RecordingServerClient([_resp(500, parent_url, {"error": "boom"})])
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
-    await runner_app_mod._mint_acp_subagent_child(
+    await acp_subagent_sessions._mint_acp_subagent_child(
         client,  # type: ignore[arg-type]
         parent_id="parent1",
         child_key="a0ac9364",
@@ -196,7 +196,7 @@ async def test_complete_subagent_child_posts_summary_then_idle_status() -> None:
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     fut.set_result("child_abc")
 
-    await runner_app_mod._complete_acp_subagent_child(
+    await acp_subagent_sessions._complete_acp_subagent_child(
         client,  # type: ignore[arg-type]
         child_key="a0ac9364",
         ok=True,
@@ -230,7 +230,7 @@ async def test_summary_author_falls_back_to_child_key_without_a_title() -> None:
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     fut.set_result("child_abc")
 
-    await runner_app_mod._complete_acp_subagent_child(
+    await acp_subagent_sessions._complete_acp_subagent_child(
         client,  # type: ignore[arg-type]
         child_key="a0ac9364",
         ok=True,
@@ -248,7 +248,7 @@ async def test_complete_subagent_child_marks_failed_when_not_ok() -> None:
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     fut.set_result("child_abc")
 
-    await runner_app_mod._complete_acp_subagent_child(
+    await acp_subagent_sessions._complete_acp_subagent_child(
         client,  # type: ignore[arg-type]
         child_key="a0ac9364",
         ok=False,
@@ -269,7 +269,7 @@ async def test_complete_subagent_child_skips_when_mint_failed() -> None:
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     fut.set_exception(RuntimeError("mint failed"))
 
-    await runner_app_mod._complete_acp_subagent_child(
+    await acp_subagent_sessions._complete_acp_subagent_child(
         client,  # type: ignore[arg-type]
         child_key="a0ac9364",
         ok=True,
@@ -293,7 +293,7 @@ async def test_transcript_failure_does_not_break_the_turn() -> None:
     )
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
-    await runner_app_mod._mint_acp_subagent_child(
+    await acp_subagent_sessions._mint_acp_subagent_child(
         client,  # type: ignore[arg-type]
         parent_id="parent1",
         child_key="a0ac9364",
@@ -318,7 +318,7 @@ async def test_post_tool_call_appends_a_function_call_to_the_child() -> None:
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     fut.set_result("child_abc")
 
-    await runner_app_mod._post_acp_subagent_tool_call(
+    await acp_subagent_sessions._post_acp_subagent_tool_call(
         client,  # type: ignore[arg-type]
         child_key="a0ac9364",
         call_id="toolu_01",
@@ -349,7 +349,7 @@ async def test_post_tool_call_skips_when_mint_failed() -> None:
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     fut.set_exception(RuntimeError("mint failed"))
 
-    await runner_app_mod._post_acp_subagent_tool_call(
+    await acp_subagent_sessions._post_acp_subagent_tool_call(
         client,  # type: ignore[arg-type]
         child_key="a0ac9364",
         call_id="toolu_01",
@@ -367,7 +367,7 @@ async def test_post_tool_call_defaults_agent_to_child_key() -> None:
     client = _RecordingServerClient([_ok(child_url)])
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     fut.set_result("c")
-    await runner_app_mod._post_acp_subagent_tool_call(
+    await acp_subagent_sessions._post_acp_subagent_tool_call(
         client,  # type: ignore[arg-type]
         child_key="k1",
         call_id="t1",
@@ -395,10 +395,10 @@ async def test_chain_orders_posts_and_survives_a_failure() -> None:
         raise RuntimeError("post failed")
 
     # mint (no prev) -> tool1 -> failing tool2 -> summary, each chained on the last.
-    t = runner_app_mod._chain_acp_subagent_post(None, _append("mint"))
-    t = runner_app_mod._chain_acp_subagent_post(t, _append("tool1"))
-    t = runner_app_mod._chain_acp_subagent_post(t, _boom())
-    t = runner_app_mod._chain_acp_subagent_post(t, _append("summary"))
+    t = acp_subagent_sessions._chain_acp_subagent_post(None, _append("mint"))
+    t = acp_subagent_sessions._chain_acp_subagent_post(t, _append("tool1"))
+    t = acp_subagent_sessions._chain_acp_subagent_post(t, _boom())
+    t = acp_subagent_sessions._chain_acp_subagent_post(t, _append("summary"))
     await t
 
     # Order preserved, and the failing post did not stop the summary from running.
