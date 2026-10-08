@@ -11,6 +11,7 @@ Recordings linked in chat and opened from Files render in an inline player with 
 - `recording-failure`: Failed reads and unsupported codecs show a download fallback and Retry.
 - `recording-lifecycle`: Workspace bytes load only on Play; switching files cancels pending reads and releases loaded media.
 - `recording-actions`: Optional WebVTT chapters seek to agent actions and highlight the current step during playback.
+- `recording-actions-scroll`: Long action lists scroll within a bounded panel instead of stretching the video card.
 - `recording-actions-collapse`: Hide the action panel to enlarge the video, and reopen it from the footer without resetting playback.
 
 ## How to get to it (user POV)
@@ -30,7 +31,7 @@ Preconditions: build this checkout and install its Playwright Chromium. The brow
 
 - Chat, chat file link, Files browsing, deep link, and mobile playback: `tests/browser_ui/files/test_video_rendering.py::test_workspace_recording_playback`.
 - Desktop and mobile chat footer layout and keyboard file opening: `tests/browser_ui/files/test_video_rendering.py::test_chat_recording_label_stays_inside_footer`.
-- Desktop and mobile action navigation, keyboard collapse/reopen, and playback preservation in chat, file links, Files, Changes, and deep links: `tests/browser_ui/files/test_video_rendering.py::test_recording_action_navigation`.
+- Desktop and mobile action navigation, scrolling long action lists, keyboard collapse/reopen, and playback preservation in chat, file links, Files, Changes, and deep links: `tests/browser_ui/files/test_video_rendering.py::test_recording_action_navigation`.
 - Optional annotations: `tests/browser_ui/files/test_video_rendering.py::test_optional_recording_annotations` covers malformed and truncated WebVTT; the ordinary playback checks cover missing annotations.
 - Remote recording: `tests/browser_ui/files/test_video_rendering.py::test_remote_recording_playback`.
 - Failed download: `tests/browser_ui/files/test_video_rendering.py::test_recording_download_failure`.

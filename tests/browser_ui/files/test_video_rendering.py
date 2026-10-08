@@ -102,7 +102,12 @@ def test_recording_action_navigation(
         "WEBVTT\n\n"
         "00:00.000 --> 00:00.400\nOpen the app\n\n"
         "00:00.500 --> 00:10.000\nVerify the result\n\n"
-        "00:16:39.000 --> 00:16:40.000\nOutside the recording\n"
+        + "".join(
+            f"00:00.{600 + i * 20:03d} --> 00:00.{619 + i * 20:03d}\n"
+            f"Recorded action {i + 1}: verify the application responds correctly\n\n"
+            for i in range(20)
+        )
+        + "00:16:39.000 --> 00:16:40.000\nOutside the recording\n"
     )
     session.contract.json(
         f"{api}/filesystem/demo.webm.chapters.vtt",
@@ -150,7 +155,8 @@ def test_recording_action_navigation(
     page.wait_for_function(
         "el => el.readyState >= 2 && el.currentTime >= 0.5", arg=player.element_handle()
     )
-    player.evaluate("el => el.pause()")
+    player.evaluate("el => { el.pause(); el.currentTime = 0.5; }")
+    page.wait_for_function("el => !el.seeking", arg=player.element_handle())
     expect(verify).to_have_attribute("aria-current", "step")
     expect(
         actions.get_by_role("button", name=re.compile("Outside the recording"))
@@ -172,6 +178,26 @@ def test_recording_action_navigation(
         assert ab["y"] >= vb["y"] + vb["height"]
     elif entry == "chat":
         assert ab["x"] >= vb["x"] + vb["width"]
+    scrolling = actions.get_by_role("button", name=re.compile("Recorded action 20:")).locator("..")
+    assert scrolling.evaluate("el => el.scrollHeight > el.clientHeight")
+    if width == 1600 and entry == "chat":
+        footer_box = player.locator("..").bounding_box()
+        assert footer_box is not None
+        assert abs(ab["height"] - footer_box["height"]) < 2
+    else:
+        assert scrolling.bounding_box()["height"] <= 288
+    last = scrolling.get_by_role("button", name=re.compile("Recorded action 20:"))
+    last.focus()
+    last.press("Enter")
+    page.wait_for_function(
+        "el => !el.seeking && Math.abs(el.currentTime - 0.98) < 0.05", arg=player.element_handle()
+    )
+    assert scrolling.evaluate("el => el.scrollTop > 0"), "Keyboard focus scrolls to later actions"
+    expect(last).to_have_attribute("aria-current", "step")
+    verify.click()
+    page.wait_for_function(
+        "el => !el.seeking && Math.abs(el.currentTime - 0.5) < 0.1", arg=player.element_handle()
+    )
     media = player.element_handle()
     assert media is not None
     hide = actions.get_by_role("button", name="Hide recording actions", exact=True)
