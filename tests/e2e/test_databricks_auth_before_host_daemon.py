@@ -137,28 +137,47 @@ def databricks_apps_edge() -> Iterator[_DatabricksAppsEdge]:
         thread.join(timeout=5)
 
 
-def _recorded_daemon_pids(data_dir: Path) -> set[int]:
+def _recorded_daemons(data_dir: Path) -> list[tuple[int, float | None]]:
     registry = data_dir / "daemons"
-    pids: set[int] = set()
+    found: list[tuple[int, float | None]] = []
     for record in registry.glob("*.json") if registry.exists() else []:
         with contextlib.suppress(FileNotFoundError, ValueError):
             data = json.loads(record.read_text())
-            pid = data.get("pid") if isinstance(data, dict) else None
-            if isinstance(pid, int):
-                pids.add(pid)
-    return pids
+            if not isinstance(data, dict) or not isinstance(data.get("pid"), int):
+                continue
+            started = data.get("started_at")
+            started_at = float(started) if isinstance(started, (int, float)) else None
+            found.append((data["pid"], started_at))
+    return found
+
+
+def _is_recorded_daemon(proc: psutil.Process, started_at: float | None) -> bool:
+    """Confirm the recorded PID is still our daemon before killing it.
+
+    A daemon can exit and the OS can hand its PID to an unrelated process on the
+    shared CI host; match the recorded start time and an omnigent command line so
+    teardown never signals a stranger.
+    """
+    try:
+        if started_at is not None and abs(proc.create_time() - started_at) > 120:
+            return False
+        return any("omnigent" in part.lower() for part in proc.cmdline())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
 
 
 def _reap_recorded_daemons(data_dir: Path) -> None:
     """Kill every daemon the isolated registry still names, with its children."""
     procs: list[psutil.Process] = []
-    for pid in _recorded_daemon_pids(data_dir):
+    for pid, started_at in _recorded_daemons(data_dir):
         try:
             proc = psutil.Process(pid)
-            procs.extend(proc.children(recursive=True))
-            procs.append(proc)
         except psutil.NoSuchProcess:
             continue
+        if not _is_recorded_daemon(proc, started_at):
+            continue
+        procs.extend(proc.children(recursive=True))
+        procs.append(proc)
     gone = (psutil.NoSuchProcess, psutil.AccessDenied)
     for proc in procs:
         with contextlib.suppress(*gone):
@@ -186,13 +205,19 @@ def credential_stub(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     It also touches ``$OMNIGENT_TEST_STUB_MARKER`` so the launch can assert the stub
     actually loaded; without it the child would fall through to the real Databricks
-    SDK, whose network probe against the loopback stub is what used to hang CI.
+    SDK, whose credential resolution makes a nondeterministic network attempt against
+    the loopback stub.
     """
     stub = tmp_path_factory.mktemp("credential-stub")
+    # Assert the patch target exists before assigning: a rename in cli.py would
+    # otherwise create a dangling attribute and let the real SDK reach the network
+    # nondeterministically. site runs sitecustomize for effect, so a failed assert
+    # aborts it before the marker is written.
     (stub / "sitecustomize.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
         "from omnigent import cli\n"
+        "assert hasattr(cli, '_databricks_workspace_auth_info'), 'stub target missing'\n"
         "cli._databricks_workspace_auth_info = lambda _host: None\n"
         "_marker = os.environ.get('OMNIGENT_TEST_STUB_MARKER')\n"
         "if _marker:\n"
@@ -228,13 +253,15 @@ def _launch_env(home: Path, credential_stub: Path) -> dict[str, str]:
     env["no_proxy"] = "127.0.0.1,localhost"
     env["TERM"] = "dumb"
     env["PYTHONPATH"] = os.pathsep.join(
-        [
+        entry
+        for entry in (
             str(credential_stub),
             str(_REPO_ROOT),
             str(_REPO_ROOT / "sdks" / "python-client"),
             str(_REPO_ROOT / "sdks" / "ui"),
             env.get("PYTHONPATH", ""),
-        ]
+        )
+        if entry  # a trailing empty entry would put the child's CWD on sys.path
     )
     return env
 
