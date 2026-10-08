@@ -147,7 +147,9 @@ def _interval_for(runner_id: str) -> float:
     the fast agent_sandbox cadence so a short-window sandbox is never under-refreshed."""
     with _state_lock:
         interval = _runner_interval_s.get(runner_id)
-    return interval or resolve_managed_keepalive_interval_s("agent_sandbox")
+    if interval is not None:
+        return interval
+    return resolve_managed_keepalive_interval_s("agent_sandbox")
 
 
 def keepalive_interval_s(runner_id: str) -> float:
@@ -259,11 +261,8 @@ def touch(runner_id: str) -> None:
 
 
 def _prune_throttle(now: float) -> None:
-    """Drop throttle entries older than two slow intervals (their runners are gone).
-
-    A runner whose attempt is still outstanding keeps its stamp, so the loop
-    still sees it as due and retries shortly once the stalled call clears.
-    """
+    """Drop throttle entries older than two slow intervals (their runners are gone),
+    keeping a runner whose attempt is still outstanding so the loop still sees it as due."""
     cutoff = now - 2 * resolve_managed_keepalive_interval_s()
     with _state_lock:
         stale = [rid for rid, seen in _last_kept.items() if seen < cutoff and rid not in _inflight]

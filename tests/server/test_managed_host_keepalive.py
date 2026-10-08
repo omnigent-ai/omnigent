@@ -424,48 +424,6 @@ def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.Monk
     assert managed_host_keepalive.keepalive_interval_s("r1") == 600.0
 
 
-def test_worker_evidence_contains_queue_and_provider_duration(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Worker events carry bounded scheduling and provider timing evidence."""
-
-    class _SignalingLauncher(_Launcher):
-        def __init__(self) -> None:
-            super().__init__()
-            self.started = threading.Event()
-
-        def keep_alive(self, sandbox_id: str) -> object:
-            self.started.set()
-            return super().keep_alive(sandbox_id)
-
-    launcher = _SignalingLauncher()
-    _wire(
-        monkeypatch,
-        launcher=launcher,
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
-    )
-    pool = ThreadPoolExecutor(
-        max_workers=managed_host_keepalive._KEEPALIVE_MAX_WORKERS,
-        thread_name_prefix="test-managed-keepalive",
-    )
-    monkeypatch.setattr(managed_host_keepalive, "_executor", pool)
-    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
-    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
-    monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
-    try:
-        with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
-            managed_host_keepalive.touch("r1")
-            assert launcher.started.wait(timeout=1.0)
-            pool.shutdown(wait=True)
-        event = next(
-            r for r in caplog.records if getattr(r, "attributes", {}).get("outcome") == "extended"
-        )
-        assert event.attributes["queue_delay_s"] >= 0
-        assert event.attributes["provider_duration_s"] >= 0
-    finally:
-        pool.shutdown(wait=True)
-
-
 _HOST_OF = {"runner-a": "host-a", "runner-b": "host-b"}
 _HOSTS = {
     "host-a": SimpleNamespace(sandbox_id="sbx-a", sandbox_provider="modal"),
@@ -901,10 +859,11 @@ def test_next_delay_uses_the_interval_when_managed_keepalive_is_disabled(
 
 
 def test_saturated_pool_keeps_a_queued_runner_single_flight(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A runner queued behind a saturated pool holds one reservation, runs once capacity
-    returns, and is then throttled like any other refresh: no submission burst."""
+    returns with its wait recorded as queue delay, and is then throttled like any other
+    refresh: no submission burst."""
     workers = managed_host_keepalive._KEEPALIVE_MAX_WORKERS
     busy = [f"busy-{index}" for index in range(workers)]
     launcher = _GatedLauncher(block={f"sbx-{runner_id}" for runner_id in busy})
@@ -932,11 +891,13 @@ def test_saturated_pool_keeps_a_queued_runner_single_flight(
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    queued_wait = 0.02
     try:
         for runner_id in busy:
             managed_host_keepalive.touch(runner_id)
         assert all(launcher.started(f"sbx-{runner_id}").wait(1.0) for runner_id in busy)
 
+        caplog.set_level(logging.INFO, logger=_KEEPALIVE_LOGGER)
         for _ in range(6):
             managed_host_keepalive.touch("queued")
         assert submitted.count("queued") == 1
@@ -944,6 +905,7 @@ def test_saturated_pool_keeps_a_queued_runner_single_flight(
             assert "queued" in managed_host_keepalive._inflight
         assert not launcher.started("sbx-queued").is_set()
 
+        time.sleep(queued_wait)
         launcher.release.set()
         assert launcher.started("sbx-queued").wait(1.0)
         deadline = time.monotonic() + 1.0
@@ -962,3 +924,12 @@ def test_saturated_pool_keeps_a_queued_runner_single_flight(
     finally:
         launcher.release.set()
         pool.shutdown(wait=True)
+
+    extended = next(
+        record
+        for record in caplog.records
+        if getattr(record, "attributes", {}).get("sandbox_id") == "sbx-queued"
+    )
+    assert extended.attributes["outcome"] == "extended"
+    assert extended.attributes["queue_delay_s"] >= queued_wait
+    assert extended.attributes["provider_duration_s"] >= 0
