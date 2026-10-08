@@ -14,7 +14,7 @@ Recordings linked in chat and opened from Files render in an inline player with 
 ## How to get to it (user POV)
 
 - Chat: ask the agent to save a recording in the workspace and return a Markdown link labeled `Screen recording` targeting `demo.webm` or its absolute path. Click Play recording in its reply.
-- Chat file link: click the recording's link below the inline player to open the file viewer.
+- Chat file link: click the recording name in the player footer to open the file viewer.
 - Remote recording: open a conversation containing a direct HTTP MP4, WebM, MOV, M4V, or OGV link.
 - Files: open the Files panel, choose Explore or Changes, and select a recording.
 - Deep link: open a conversation URL with `?file=demo.webm`.
@@ -25,6 +25,7 @@ Recordings linked in chat and opened from Files render in an inline player with 
 Preconditions: build this checkout and install its Playwright Chromium. The browser-contract lane uses a sealed mock backend and a generated, decodable WebM, so it needs no running server.
 
 - Chat, chat file link, Files browsing, deep link, and mobile playback: `tests/browser_ui/files/test_video_rendering.py::test_workspace_recording_playback`.
+- Desktop and mobile chat footer layout and keyboard file opening: `tests/browser_ui/files/test_video_rendering.py::test_chat_recording_label_stays_inside_footer`.
 - Remote recording: `tests/browser_ui/files/test_video_rendering.py::test_remote_recording_playback`.
 - Failed download: `tests/browser_ui/files/test_video_rendering.py::test_recording_download_failure`.
 - Run `uv run --no-sync pytest tests/browser_ui/files/test_video_rendering.py --browser-ui-skip-build --video=on --output=/tmp/omnigent-video-evidence`.

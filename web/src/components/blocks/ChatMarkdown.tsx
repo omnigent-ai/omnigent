@@ -363,42 +363,42 @@ function WorkspaceFileLink({
     );
   }
 
+  if (conversationId && isVideoFile(resolvedPath)) {
+    return (
+      <VideoPlayer
+        conversationId={conversationId}
+        path={resolvedPath}
+        title={
+          typeof children === "string" ? children : (resolvedPath.split("/").pop() ?? resolvedPath)
+        }
+        onOpenFile={openWorkspaceFile}
+      />
+    );
+  }
+
   // No href: the parked fragment would still navigate on cmd/middle-click, and
   // no URL opens the FileViewer. role/tabIndex/onKeyDown restore button semantics.
   return (
-    <>
-      {conversationId && isVideoFile(resolvedPath) && (
-        <VideoPlayer
-          conversationId={conversationId}
-          path={resolvedPath}
-          title={
-            typeof children === "string"
-              ? children
-              : (resolvedPath.split("/").pop() ?? resolvedPath)
-          }
-        />
-      )}
-      <a
-        {...props}
-        role="button"
-        tabIndex={0}
-        title={title ?? path}
-        data-streamdown="link"
-        // Dotted underline distinguishes "opens in the FileViewer" from a link
-        // that leaves the app; the rest matches Streamdown so a file link in a
-        // table cell wraps like any other.
-        className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
-        onClick={openWorkspaceFile}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            openWorkspaceFile();
-          }
-        }}
-      >
-        {children}
-      </a>
-    </>
+    <a
+      {...props}
+      role="button"
+      tabIndex={0}
+      title={title ?? path}
+      data-streamdown="link"
+      // Dotted underline distinguishes "opens in the FileViewer" from a link
+      // that leaves the app; the rest matches Streamdown so a file link in a
+      // table cell wraps like any other.
+      className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
+      onClick={openWorkspaceFile}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openWorkspaceFile();
+        }
+      }}
+    >
+      {children}
+    </a>
   );
 }
 

@@ -32,6 +32,15 @@ afterEach(() => {
 const props = { conversationId: "sess_1", path: "demo.webm", title: "Feature demo" };
 
 describe("VideoPlayer", () => {
+  it("opens the file from its footer label", () => {
+    const onOpenFile = vi.fn();
+    render(<VideoPlayer {...props} onOpenFile={onOpenFile} />);
+    const label = screen.getByRole("button", { name: "Feature demo" });
+    expect(label).toHaveAttribute("type", "button");
+    fireEvent.click(label);
+    expect(onOpenFile).toHaveBeenCalledOnce();
+  });
+
   it("downloads only on Play and exposes native inline controls without autoplay", async () => {
     const { container, unmount } = render(<VideoPlayer {...props} />);
     expect(fetchBlob).not.toHaveBeenCalled();

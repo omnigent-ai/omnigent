@@ -101,6 +101,31 @@ def _assert_playback(page: Page, player: Locator) -> None:
     player.evaluate("el => el.pause()")
 
 
+@pytest.mark.parametrize("width", [1600, 390])
+def test_chat_recording_label_stays_inside_footer(
+    page: Page, seeded_session: BrowserSession, recording: bytes, width: int
+) -> None:
+    """The file action stays below the video at desktop and mobile widths."""
+    session = seeded_session
+    _seed_video(session, recording)
+    _post_message(session, "[Screen recording](demo.webm)")
+    page.set_viewport_size({"width": width, "height": 1000})
+    page.goto(f"{session.contract.base_url}/c/{session.session_id}")
+    label = page.get_by_role("button", name="Screen recording", exact=True)
+    expect(page.get_by_text("Screen recording", exact=True)).to_have_count(1)
+    page.get_by_role("button", name="Play video: Screen recording", exact=True).click()
+    video = page.locator('video[aria-label="Screen recording"]')
+    _assert_playback(page, video)
+    video_box, label_box = video.bounding_box(), label.bounding_box()
+    assert video_box is not None and label_box is not None
+    assert label_box["y"] >= video_box["y"] + video_box["height"]
+    assert label_box["x"] >= video_box["x"]
+    assert label_box["x"] + label_box["width"] <= video_box["x"] + video_box["width"]
+    label.focus()
+    label.press("Enter")
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_be_visible()
+
+
 @pytest.mark.parametrize("entry", ["chat", "file-link", "files", "changes", "deep-link", "mobile"])
 def test_workspace_recording_playback(
     page: Page, seeded_session: BrowserSession, recording: bytes, entry: str
