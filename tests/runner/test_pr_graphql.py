@@ -132,6 +132,20 @@ def test_multiple_graphql_creations_preserve_returned_identities(
     assert created
 
 
+def test_multiple_graphql_response_aliases_preserve_returned_identities() -> None:
+    other = "https://github.com/example/project/pull/43"
+    aliased_query = QUERY.replace("createPullRequest(", "opened: createPullRequest(")
+    references, created = extract_prs(
+        "shell",
+        {"command": command() + "; " + command(aliased_query)},
+        creation_output(None)
+        + "\n"
+        + creation_output(None, other).replace('"createPullRequest"', '"opened"'),
+    )
+    assert {ref.url for ref in references} == {URL, other}
+    assert created
+
+
 def test_native_graphql_creation_persists_explicit_repo_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -287,15 +301,20 @@ def test_incomplete_json_output_is_not_reparsed_as_pr_identity(
 
 @pytest.mark.parametrize("created", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_full_response_reads_only_the_mutation_identity(created: bool, reverse: bool) -> None:
-    unrelated = json.dumps({"url": "https://github.com/example/another/pull/7"})
+@pytest.mark.parametrize("response_shaped", [False, True])
+def test_full_response_reads_only_the_mutation_identity(
+    created: bool, reverse: bool, response_shaped: bool
+) -> None:
+    other = "https://github.com/example/another/pull/7"
+    unrelated = creation_output(None, other) if response_shaped else json.dumps({"url": other})
+    commands = [command(), "cat saved-response.json"]
     outputs = [creation_output(None, URL if created else None), unrelated]
     references, _ = extract_prs(
         "shell",
-        {"command": command()},
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
         {"stdout": "\n".join(reversed(outputs) if reverse else outputs)},
     )
-    assert [ref.url for ref in references] == ([URL] if created else [])
+    assert [ref.url for ref in references] == ([URL] if created and not response_shaped else [])
 
 
 @pytest.mark.parametrize(

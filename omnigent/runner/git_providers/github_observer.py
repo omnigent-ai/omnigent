@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import json
 import re
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import PurePath
 
@@ -382,7 +383,11 @@ def _content_only(tokens: list[str]) -> bool:
 
 
 def _graphql_output_values(result: object, depth: int = 0) -> list[object]:
-    """Unwrap the command output, preserving each emitted JSON document intact."""
+    """Unwrap output while preserving emitted JSON documents intact.
+
+    Unknown bracket-prefixed logs are ambiguous with incomplete JSON arrays;
+    only complete Git summaries and the success footer are recognized as text.
+    """
     if depth > 6:
         return []
     if isinstance(result, dict):
@@ -443,7 +448,7 @@ def _graphql_output_values(result: object, depth: int = 0) -> list[object]:
 
 
 def _graphql_prs(
-    result: object, *, field: str, projection: str, object_count: int, url_count: int
+    result: object, *, field: str, projection: str, expected_count: int
 ) -> list[PullRequestRef]:
     """Read only the response shape requested by the validated creation command."""
     values = _graphql_output_values(result)
@@ -456,8 +461,9 @@ def _graphql_prs(
             for value in values
             if isinstance(value, str) and len(value.split()) == 1 and (ref := pr_reference(value))
         ]
-        return references if len(references) <= url_count else []
+        return references if len(references) <= expected_count else []
     references: list[PullRequestRef] = []
+    response_count = 0
     for value in values:
         if not isinstance(value, dict):
             continue
@@ -465,15 +471,20 @@ def _graphql_prs(
             pr = value
         elif not projection:
             data = value.get("data")
-            mutation = data.get(field) if isinstance(data, dict) else None
+            if not isinstance(data, dict) or field not in data:
+                continue
+            response_count += 1
+            mutation = data[field]
             pr = mutation.get("pullRequest") if isinstance(mutation, dict) else None
         else:
             continue
         if isinstance(pr, dict) and (ref := pr_reference(pr.get("url"))):
             references.append(ref)
+    if not projection and response_count > expected_count:
+        return []
     # Extra projected objects or a null result leave their command attribution ambiguous.
     if projection == path and (
-        any(value is None for value in values) or len(references) > object_count
+        any(value is None for value in values) or len(references) > expected_count
     ):
         return []
     return references
@@ -527,25 +538,30 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         else tokens[:2] == ["pr", "create"] or (_creates_pr(tokens) and projection == ".html_url")
         for tokens, field, projection in commands
     )
+    response_counts = Counter(
+        field for _, field, projection in commands if field is not None and not projection
+    )
     ops: list[ShellPrOp] = []
     for tokens, field, projection in commands:
+        parse_result = None
+        if field:
+            expected_count = (
+                response_counts[field]
+                if not projection
+                else object_count
+                if projection == f".data.{field}.pullRequest"
+                else url_count
+            )
+            parse_result = functools.partial(
+                _graphql_prs, field=field, projection=projection, expected_count=expected_count
+            )
         ops.append(
             ShellPrOp(
                 tracks=_tracks_pr(tokens),
                 creates=_creates_pr(tokens),
                 target=_command_target(tokens),
                 content_only=_content_only(tokens),
-                parse_result=(
-                    functools.partial(
-                        _graphql_prs,
-                        field=field,
-                        projection=projection,
-                        object_count=object_count,
-                        url_count=url_count,
-                    )
-                    if field
-                    else None
-                ),
+                parse_result=parse_result,
             )
         )
     return ops
