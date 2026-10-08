@@ -29,7 +29,7 @@ from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
-from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
@@ -1507,7 +1507,7 @@ def _build_session_response(
     )
 
 
-_WARNED_UNCONFIGURED_PRICING_PROVIDERS: set[str] = set()
+_WARNED_UNCONFIGURED_PRICING_PROVIDERS: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
 def _resolve_session_provider_entry(
