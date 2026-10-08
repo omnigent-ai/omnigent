@@ -387,10 +387,18 @@ _MODEL_PICKER_OPEN_HINT = "use this session only"
 # swallow one (same reasoning as ``_SUBMIT_RETRY_INTERVAL_S``). The spacing
 # also bounds a residual hazard: were a successful Escape's repaint to
 # outlast it, the stale frame would draw a retry onto the bare composer
-# (interrupting a turn). 0.75s dwarfs a TUI repaint, so that window is
-# accepted rather than confirmation-gated.
+# (interrupting a turn). The spacing must also exceed Claude Code's
+# double-Escape window: two Escapes 0.77s apart on the composer open the rewind
+# dialog (whose Enter restores a checkpoint), while 1.0s apart do not.
 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
-_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
+_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
+# What :func:`_occupying_surface` reports when no input box is drawn.
+_OVERLAY_SURFACE = "an overlay"
+# The dismissal every surface drawn over the input box advertises in its
+# footer ("Esc to cancel", "Esc to clear"). A screen without a composer that
+# lacks it is not such a surface — e.g. a launch wrapper's output before
+# Claude Code has drawn its input box — and an Escape cannot clear it.
+_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -2201,7 +2209,8 @@ def build_hook_settings(
     Besides the hooks, the fragment pre-approves every project ``.mcp.json``
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
-    can never answer.
+    can never answer. It also turns off auto mode's post-turn
+    environment-setup offer (``skillOverrides``) for the same reason.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -2501,6 +2510,10 @@ def build_hook_settings(
     # approval dialog in every new directory (each worktree included). It
     # fires no hook either, so pre-approve them like the other consent gates.
     settings["enableAllProjectMcpServers"] = True
+    # Auto mode offers "Teach auto mode about your environment?" after a turn;
+    # only the terminal can answer it, so web-UI messages stall behind it. This
+    # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
+    settings["skillOverrides"] = {"auto-mode-setup": "off"}
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -2596,6 +2609,7 @@ def augment_claude_args(
     api_key_helper: str | None = None,
     model_overrides: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
+    workspace: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
     append_system_prompt: str | None = None,
@@ -2634,6 +2648,7 @@ def augment_claude_args(
         skills natively — the CLI mirror of the SDK executor's plugin
         wiring. ``None`` (e.g. the ``omnigent claude`` CLI's minimal
         spec) adds no plugin args.
+    :param workspace: Session workspace used to discover portable ``.agents`` skills.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -2686,7 +2701,7 @@ def augment_claude_args(
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
-    from omnigent.inner.bundle_skills import claude_native_skill_args
+    from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
     args.extend(
         claude_native_skill_args(
@@ -2695,6 +2710,9 @@ def augment_claude_args(
             skills_filter=skills_filter,
         )
     )
+    if workspace is not None:
+        roots = (workspace, bundle_dir) if bundle_dir is not None else (workspace,)
+        args.extend(claude_agents_skill_args(bridge_dir, roots, skills_filter))
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)
@@ -4552,8 +4570,9 @@ def wait_for_input_ready(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time, if the
         input box does not render within *ready_timeout_s*
-        (:class:`ClaudePromptTimeout`), or if a dialog, sign-in prompt or
-        pending question holds the terminal.
+        (:class:`ClaudePromptTimeout`), or if a dialog, input mode (shell mode,
+        the prompt-history search), sign-in prompt or pending question holds
+        the terminal.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _reclaim_and_wait_for_prompt(
@@ -4585,6 +4604,10 @@ def inject_slash_command(
     the person left occupying the composer from the embedded terminal (ctrl+r
     history search, rewind dialog, ``!`` shell mode) is dismissed first — see
     :func:`_restore_occupied_input` — so the command cannot be typed into it.
+    A surface that stays (a dialog with no Escape dismissal, or one that
+    outlived the retries) fails the call instead — see
+    :func:`_reclaim_and_wait_for_prompt`: nothing would draft, so the submit
+    Enter would answer the dialog rather than run the command.
 
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
@@ -4620,6 +4643,10 @@ def inject_slash_command(
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
+    :raises ClaudeTerminalDialog: If shell mode or the prompt-history search
+        still covers the input box after the restore, or the readiness gate
+        finds a dialog holding it; no keystroke was sent. The person clears it
+        from the embedded terminal and retries.
     :raises RuntimeError: If the tmux target is not advertised in
         time, if the input box never renders (:class:`ClaudePromptTimeout`),
         if a ``tmux send-keys`` invocation fails, if the typed
@@ -5694,7 +5721,7 @@ def _restore_occupied_input(
     *,
     bridge_dir: Path | None = None,
     timeout_s: float | None = None,
-) -> None:
+) -> str | None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
 
@@ -5716,27 +5743,37 @@ def _restore_occupied_input(
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
-    in-flight turn. An empty (torn) capture means "unknown" and gets no
-    Escape, and a surface seen in a single frame is re-confirmed a poll
-    later before an Escape is spent on it, so a repaint artifact cannot
-    draw one. A swallowed Escape is re-sent while the surface remains,
-    spaced by :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`.
-    Best-effort: a surface that outlives
-    :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` is left on screen and the
-    caller's readiness gate or delivery verification fails loud, exactly
-    as it did before this restore existed.
+    in-flight turn. A screen with no input box counts only when it
+    advertises Escape as its dismissal; before Claude Code draws its input
+    box the pane holds launcher output, which is handed back to the caller
+    untouched: :func:`inject_user_message` and :func:`inject_slash_command`
+    (through :func:`_reclaim_and_wait_for_prompt`) wait on the readiness
+    gate (:func:`_wait_for_claude_prompt_ready`) rather than type into it.
+    An empty (torn) capture means "unknown" and gets no Escape, and a
+    surface seen in a single frame is re-confirmed a poll later before an
+    Escape is spent on it — or before it is given up as unclearable — so a
+    repaint artifact cannot draw one.
+    A swallowed Escape is re-sent while the surface remains, spaced by
+    :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`. Best-effort: a
+    surface that outlives the dismissal window (*timeout_s*,
+    :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` by default) is left on screen
+    and returned, so the caller's readiness gate or delivery verification
+    fails loud, exactly as it did before this restore existed.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
         :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
-    :returns: None.
+    :returns: ``None`` once the input box is free (or the capture is torn);
+        otherwise the :func:`_occupying_surface` description of what is
+        still on screen, for the caller to refuse to type into.
     """
     dismiss_timeout_s = _OCCUPIED_INPUT_DISMISS_TIMEOUT_S if timeout_s is None else timeout_s
     deadline = time.monotonic() + dismiss_timeout_s
     last_escape: float | None = None
     confirmed = False
+    unclearable_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
@@ -5748,10 +5785,10 @@ def _restore_occupied_input(
             )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
-            return
+            return None
         surface = _occupying_surface(pane)
         if surface is None:
-            return
+            return None
         now = time.monotonic()
         if now >= deadline:
             _logger.warning(
@@ -5759,17 +5796,27 @@ def _restore_occupied_input(
                 surface,
                 dismiss_timeout_s,
             )
-            return
+            return surface
+        # Nothing an Escape can clear: launcher output before the input box
+        # mounts, or a dialog that offers no dismissal.
+        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame
             # can misreport during a repaint. A real surface is still there a
             # poll later; a repaint artifact is not.
             confirmed = True
+        elif unclearable:
+            # Give it up only on two consecutive hint-less sightings, so a
+            # torn frame mid-redraw of a dismissible surface does not hand a
+            # transient back to a caller that will refuse to type into it.
+            if unclearable_seen:
+                return surface
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             _logger.info("claude-native: dismissing %s covering the input box", surface)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
+        unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -5805,7 +5852,7 @@ def _occupying_surface(pane: str) -> str | None:
         return "the prompt-history search"
     row = _composer_row(pane)
     if row is None:
-        return "an overlay"
+        return _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return "shell mode"
@@ -6259,6 +6306,13 @@ def _reclaim_and_wait_for_prompt(
     composer hides the input box from the readiness gate, so it is dismissed
     first, and only then is the pane waited on until the prompt renders.
 
+    Shell mode or the prompt-history search left on screen is refused at once:
+    typing there would run the text as bash or filter history, and the wait
+    could only end in a readiness timeout. Any other leftover (launcher output
+    before the input box mounts, or a dialog with no Escape dismissal) goes to
+    the readiness gate and its own outcome stands. Nothing is typed until the
+    prompt renders, so the submit Enter cannot answer a dialog.
+
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -6269,22 +6323,34 @@ def _reclaim_and_wait_for_prompt(
         *timeout_s* as the base budget, extended while a live pane is still
         booting.
     :returns: None.
+    :raises ClaudeTerminalDialog: If shell mode or the prompt-history search
+        still covers the input box after the restore; no keystroke was sent.
     :raises RuntimeError: As :func:`_wait_for_claude_prompt_ready` and
         :func:`_restore_occupied_input` raise.
     """
+    started = time.monotonic()
+    surface = _restore_occupied_input(
+        socket_path,
+        tmux_target,
+        bridge_dir=bridge_dir,
+        timeout_s=(
+            None
+            if ready_timeout_s is None
+            else min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, ready_timeout_s)
+        ),
+    )
+    if surface is not None and surface != _OVERLAY_SURFACE:
+        # Typing into these would run bash or filter history, and the wait below
+        # could only poll out its whole budget on them.
+        raise ClaudeTerminalDialog(
+            f"Claude Code's input box is occupied by {surface}, so the command was "
+            "not sent. Open the terminal, dismiss it, then retry."
+        )
     if ready_timeout_s is None:
-        _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
         _wait_for_claude_prompt_ready(
             socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir
         )
         return
-    started = time.monotonic()
-    _restore_occupied_input(
-        socket_path,
-        tmux_target,
-        bridge_dir=bridge_dir,
-        timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, ready_timeout_s),
-    )
     _wait_for_claude_prompt_ready(
         socket_path,
         tmux_target,
@@ -6812,7 +6878,12 @@ def _tool_relay_handler_factory(
             # Heavy policy imports stay off this module's import path (hook
             # subprocesses import it); the relay runs inside the runner
             # process where these modules are already loaded.
+            import httpx
+
             from omnigent.native.native_policy_hook import (
+                _EVALUATE_POLICY_RETRY_BUDGET_S,
+                _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
+                _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
@@ -6844,9 +6915,16 @@ def _tool_relay_handler_factory(
             url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
             verdict: object = None
             last_error: str | None = None
-            for attempt in range(3):
-                if attempt:
-                    time.sleep(0.4)
+            attempts = 0
+            non_connect_failures = 0
+            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
+            retry_delay = 0.4
+            while non_connect_failures < 3:
+                if attempts:
+                    time.sleep(retry_delay)
+                attempts += 1
+                retry_delay = 0.4
                 future = asyncio.run_coroutine_threadsafe(
                     policy_client.post(url, json=request_body), loop
                 )
@@ -6854,9 +6932,18 @@ def _tool_relay_handler_factory(
                     resp = future.result(timeout=86400.0)
                 except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
                     last_error = str(exc).strip() or type(exc).__name__
+                    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                        # Resolver failures can outlast three quick attempts.
+                        if time.monotonic() + backoff_s >= deadline:
+                            break
+                        retry_delay = backoff_s
+                        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                    else:
+                        non_connect_failures += 1
                     continue
                 if resp.status_code != HTTPStatus.OK:
                     last_error = f"server returned HTTP {resp.status_code}"
+                    non_connect_failures += 1
                     continue
                 try:
                     verdict = json.loads(resp.content)
@@ -6866,9 +6953,10 @@ def _tool_relay_handler_factory(
             if not isinstance(verdict, dict) or not verdict.get("result"):
                 _logger.warning(
                     "policy_eval_relay_failure: session=%s hook_event=%s "
-                    "attempts=3 last_error=%r; falling back to fail-closed",
+                    "attempts=%d last_error=%r; falling back to fail-closed",
                     session_id,
                     hook_event,
+                    attempts,
                     last_error,
                     extra={"session_id": session_id},
                 )

@@ -344,18 +344,23 @@ function createOidcAuth({
     // synchronously, the cookie removed, and revocation finishes after. The
     // windows reach the connect screen even if forgetting the grant fails.
     let revocation = Promise.resolve();
+    let complete = true;
     try {
       revocation = credentials.signOut(serverUrl);
     } catch (error) {
+      complete = false;
       console.warn("[omnigent] oidc auth: could not forget the grant", { origin, error });
     }
     try {
       await session.cookies.remove(origin, cookieName);
-    } catch {
-      // Already gone.
+    } catch (error) {
+      complete = false;
+      console.warn("[omnigent] oidc auth: could not clear the session cookie", { origin, error });
     }
-    for (const c of signedOut) if (!c.win.isDestroyed()) onSignedOut(c.win, serverUrl);
+    for (const c of signedOut)
+      if (!c.win.isDestroyed()) onSignedOut(c.win, serverUrl, { complete });
     await revocation.catch(() => {});
+    return complete;
   }
 
   /**
@@ -426,10 +431,24 @@ function createOidcAuth({
   };
   session.cookies.on("changed", onCookieChanged);
 
+  /**
+   * Sign the window's server out, as the web app's own sign-out does: every
+   * window on it returns to the connect screen.
+   *
+   * @returns {Promise<boolean>} false when the window has no OIDC session
+   *   here, or the saved sign-in couldn't be fully cleared.
+   */
+  async function signOutWindow(win) {
+    const ctx = connections.get(win);
+    if (!ctx || !current(ctx)) return false;
+    return signOut(ctx);
+  }
+
   return {
     ensureSession,
     attach,
     detach,
+    signOutWindow,
     isAttached: (win) => connections.has(win),
     dispose() {
       for (const win of [...connections.keys()]) detach(win);

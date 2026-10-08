@@ -32,6 +32,7 @@ import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import Conversation
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
@@ -72,6 +73,22 @@ pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
 _WORKSPACE = "/work/repo"
+_RUNNER_NOT_AVAILABLE = (
+    "The runner for this session is not available — it may have failed to start. "
+    "See the host logs."
+)
+
+
+def _host_offline_message() -> str:
+    """Return the failure text a send gets when its session's host is offline.
+
+    Built from ``cli_invocation()`` so hosts that wrap the CLI (``isaac omni``)
+    see the same spelling the server renders.
+    """
+    return (
+        "The host for this session is offline. "
+        f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
+    )
 
 
 class _NoopRunnerWS:
@@ -1085,13 +1102,21 @@ async def test_offline_host_gets_real_grace_before_native_failure(
     assert time.monotonic() - started >= grace_s
     assert response.status_code == 202, response.text
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    assert [item["code"] for item in items if item["type"] == "error"] == [
-        "runner_failed_to_start"
-    ]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    # The host never came back, so the failure names it rather than a runner start.
+    assert errors[0]["message"] == _host_offline_message()
     assert len([item for item in items if item.get("role") == "user"]) == 1
     messages = [record.getMessage() for record in caplog.records]
     assert any("to reconnect for session" in message for message in messages)
     assert not any("to spawn a runner for session" in message for message in messages)
+    [wait_event] = [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event_name") == "runner_client_wait"
+    ]
+    assert wait_event.attributes["outcome"] == "host_offline"
+    assert wait_event.attributes["attempts"] == 0
 
 
 async def test_host_reconnect_on_another_replica_redirects_without_failing_input(
@@ -1385,6 +1410,46 @@ async def test_stop_session_stops_host_launched_runner(
         f"host should be told to stop the session's bound runner "
         f"{session['runner_id']!r}, got {stopped_runner_id!r}"
     )
+
+
+@pytest.mark.parametrize("runner_status", ["alive", "dead", "unknown", "offline", None])
+async def test_stop_session_requires_confirmed_host_runner_exit(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: str | None,
+) -> None:
+    """An unacknowledged stop succeeds only when the host confirms the runner is gone."""
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    if runner_status == "offline":
+        await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await comm.wait(timeout=budget(5.0))
+    monkeypatch.setattr(sessions, "_stop_session_via_runner", AsyncMock(return_value=True))
+    host_stop = AsyncMock(return_value=False)
+    status_query = AsyncMock(return_value=runner_status)
+    monkeypatch.setattr(routes_events, "_stop_host_runner_intentionally", host_stop)
+    monkeypatch.setattr(routes_events, "_query_host_runner_status", status_query)
+    stopped = runner_status in {"dead", "unknown"}
+    try:
+        for _ in range(2 if stopped else 1):
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+            )
+            assert response.status_code == (202 if stopped else 503), response.text
+        if runner_status == "offline":
+            status_query.assert_not_awaited()
+        else:
+            assert status_query.await_args.args[2] == session["runner_id"]
+        if not stopped:
+            assert session_id in routes_events._interrupt_fenced_sessions
+        assert host_stop.await_count == (2 if stopped else 1)
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
 
 
 async def test_stopped_host_session_writes_no_label_and_host_stays_online(
@@ -1805,6 +1870,268 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     ]
     assert timeout.attributes["error_category"] == "host"
     assert timeout.attributes["error_impact"] == "transient"
+
+
+async def _native_host_session(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    comm: ApplicationCommunicator,
+) -> str:
+    """Inline-launch a host session, label it a native terminal, and return its id.
+
+    No runner ever registers for the launched binding, so the next message
+    finds no runner and takes the host relaunch path.
+    """
+    from omnigent.runtime import set_runner_client
+
+    session = await _inline_launch_session(client, comm)
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session["id"], {"omnigent.wrapper": "claude-code-native-ui"}
+    )
+    set_runner_client(None)
+    return session["id"]
+
+
+async def _swallow_relaunch_launch_frame(
+    comm: ApplicationCommunicator, *, then_disconnect: bool
+) -> None:
+    """Answer the relaunch's stat, then swallow its launch frame unacknowledged.
+
+    Mimics a host whose link is half-open: it receives nothing it can answer.
+    With ``then_disconnect`` the host's tunnel is dropped right after, as when
+    the machine goes away mid-launch.
+
+    :param comm: The connected host communicator.
+    :param then_disconnect: Drop the host tunnel once the launch frame arrives.
+    """
+    deadline = Deadline(20.0)
+    for _ in range(40):
+        output = await comm.receive_output(timeout=deadline.next_wait(5.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStatFrame):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostStatResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            exists=True,
+                            type="directory",
+                            canonical_path=frame.path,
+                        )
+                    ),
+                }
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            if then_disconnect:
+                await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+                await comm.wait(timeout=budget(5.0))
+            return
+
+
+async def _post_hello(client: httpx.AsyncClient, session_id: str) -> httpx.Response:
+    """Post a plain user message to a session."""
+    return await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+
+def _runner_client_wait_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return the structured ``runner_client_wait`` records captured so far."""
+    return [r for r in caplog.records if r.__dict__.get("event_name") == "runner_client_wait"]
+
+
+async def test_message_relaunch_resolves_runner_client_that_misses_after_connect(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A relaunched runner that connected is used even when its first lookups miss.
+
+    The tunnel registers but the routed client lookup misses twice (the binding
+    the router checks settles a moment later). The wait must retry instead of
+    reporting a runner that is up as unavailable.
+
+    Mutation check: resolve with a single lookup after the connect and the send
+    fails 503 instead of reaching the runner.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_RUNNER_CLIENT_RESOLVE_RETRY_S", 0.05)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    forwarded: list[str] = []
+
+    def _runner_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(request.url.path)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_request), base_url="http://runner"
+    )
+    relaunched: list[str] = []
+    lookups_after_connect = 0
+
+    async def _get_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient | None:
+        nonlocal lookups_after_connect
+        if not relaunched or app.state.tunnel_registry.get(relaunched[0]) is None:
+            return None
+        lookups_after_connect += 1
+        return None if lookups_after_connect <= 2 else fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    set_runner_client(None)
+    post = asyncio.create_task(_post_hello(client, session_id))
+    try:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        runner_id = token_bound_runner_id(launch.binding_token)
+        relaunched.append(runner_id)
+        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        response = await asyncio.wait_for(post, budget(10.0))
+    finally:
+        post.cancel()
+        await asyncio.gather(post, return_exceptions=True)
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    assert lookups_after_connect == 3
+    assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
+    [event] = _runner_client_wait_events(caplog)
+    assert (event.attributes["outcome"], event.attributes["attempts"]) == ("resolved", 3)
+
+
+async def test_native_message_relaunch_runner_never_connects_keeps_runner_failed_to_start(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner the host launched that never connects still reads as a failed start.
+
+    The host acknowledged the launch, so the failure is the runner's, not the
+    host's. It lands at the existing connect deadline, without any client lookup.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.3)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    started = time.monotonic()
+    try:
+        response = await _post_hello(client, session_id)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == _RUNNER_NOT_AVAILABLE
+    # Failed at the (shortened) connect deadline, not after extra lookup retries.
+    assert elapsed < 0.3 + budget(5.0)
+    [event] = _runner_client_wait_events(caplog)
+    assert (event.attributes["outcome"], event.attributes["attempts"]) == ("never_connected", 0)
+
+
+async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_while_connected(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A launch the host never answered is not called offline while the host is connected."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(_swallow_relaunch_launch_frame(comm, then_disconnect=False))
+    try:
+        response = await _post_hello(client, session_id)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+    assert response.status_code == 202, response.text
+    assert app.state.host_registry.get(_HOST_ID) is not None
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["message"] for item in errors] == [_RUNNER_NOT_AVAILABLE]
+    assert [e.attributes["outcome"] for e in _runner_client_wait_events(caplog)] == [
+        "never_connected"
+    ]
+
+
+async def test_native_message_relaunch_host_lost_after_launch_reports_host_offline(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A host that drops right after the launch frame fails the send as offline, promptly."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(_swallow_relaunch_launch_frame(comm, then_disconnect=True))
+    started = time.monotonic()
+    try:
+        response = await _post_hello(client, session_id)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 202, response.text
+    assert elapsed < 0.4 + budget(5.0)
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == _host_offline_message()
+    assert [e.attributes["outcome"] for e in _runner_client_wait_events(caplog)] == [
+        "never_connected",
+        "host_offline",
+    ]
 
 
 async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(

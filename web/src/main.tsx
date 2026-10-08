@@ -23,10 +23,9 @@ import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
-  applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
-  readUiFontSizePx,
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -60,7 +59,9 @@ initChatStore(queryClient);
 // Let a host-scoped request resolve its session's routing host on demand,
 // walking a hostless sub-agent child up to its host-bound ancestor (a cold
 // /c/<child> open) before the request is keyed.
-setSessionHostResolver((sessionId) => prefetchSessionHostChain(queryClient, sessionId));
+setSessionHostResolver((sessionId, options) =>
+  prefetchSessionHostChain(queryClient, sessionId, options),
+);
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
@@ -86,8 +87,9 @@ initNativeInsets();
 // can never float it — on any route, chat or auth. No-op off the iOS shell.
 hideNativeChatTerminalBar();
 
-// Apply the saved desktop UI font size and family before first paint so there's no flash.
-applyDesktopUiFontSize(readUiFontSizePx());
+// Apply saved font preferences before first paint. Without a saved size, CSS
+// keeps its viewport-specific default.
+applyStoredUiFontSize();
 applyUiFontFamily(readUiFontFamily());
 
 // The standalone sidebar font size control was removed. Clear its legacy value

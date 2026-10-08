@@ -39,6 +39,13 @@ async def test_native_session_tracks_prs_across_repositories(
         "import json, sys\n"
         "args = sys.argv[1:]\n"
         "if args[0] not in {'pr', 'api'}: sys.exit(0)\n"
+        "if args[:2] == ['api', 'graphql']:\n"
+        "    if not any(arg.startswith('query=') and 'createPullRequest(' in arg "
+        "for arg in args):\n"
+        "        sys.exit(1)\n"
+        "    print(json.dumps({'data': {'createPullRequest': {'pullRequest': "
+        "{'url': 'https://github.com/example/six/pull/42', 'number': 42}}}}))\n"
+        "    sys.exit(0)\n"
         "repo = ('/'.join(args[1].strip('/').split('/')[1:3])\n"
         "        if args[0] == 'api' else "
         "args[args.index('-R') + 1].removeprefix('github.com/'))\n"
@@ -107,7 +114,26 @@ async def test_native_session_tracks_prs_across_repositories(
         view_output = subprocess.check_output(
             ["/bin/sh", "-c", view_command], text=True, cwd=workspace
         )
+        graphql_command = shlex.join(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                'query=mutation { createPullRequest(input: {repositoryId: "base", '
+                'headRepositoryId: "fork", baseRefName: "main", headRefName: "user/topic", '
+                'title: "A change"}) { pullRequest { number url } } }',
+            ]
+        )
+        graphql_output = subprocess.check_output(
+            ["/bin/sh", "-c", graphql_command], text=True, cwd=workspace
+        )
         payloads = [
+            {
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": graphql_command},
+                "tool_response": {"output": graphql_output, "exit_code": 0},
+            },
             {
                 "tool_name": "Bash",
                 "tool_input": {"command": shell_command},
@@ -199,13 +225,14 @@ async def test_native_session_tracks_prs_across_repositories(
                 assert completed.stdout == ""
         registry = SessionPrRegistry("conv_owned")
         entries = registry.list()
-        assert len(entries) == 5
+        assert len(entries) == 6
         assert {entry.repository: entry.relationship for entry in entries} == {
             "example/one": "created",
             "example/two": "created",
             "example/three": "created",
             "example/four": "created",
             "example/five": "worked_on",
+            "example/six": "created",
         }
         registry.remove("https://github.com/example/five/pull/42")
         # A new observation, as well as hook replay, must respect explicit unlinking.
@@ -228,14 +255,14 @@ async def test_native_session_tracks_prs_across_repositories(
         relay.close()
     # Closing the relay and using a fresh reader models the parked-runner host path.
     entries = SessionPrRegistry("conv_owned").list()
-    assert len(entries) == 4
+    assert len(entries) == 5
     assert all(entry.relationship == "created" for entry in entries)
     assert SessionPrRegistry("provider-session").list() == []
     reader = WorkspaceReader(workspace)
     for entry in entries:
         result = reader.github_info(session_id="conv_owned", pr_url=entry.url)
         assert result["pr"]["title"] == entry.repository
-        assert len(result["prs"]) == 4
+        assert len(result["prs"]) == 5
         assert (
             reader.github_pr_diff(session_id="conv_owned", pr_url=entry.url)["patch"].strip()
             == f"patch for {entry.repository}"

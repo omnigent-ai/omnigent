@@ -18,6 +18,11 @@ describe("RunningDot", () => {
     expect(svg).toHaveClass("size-full");
   });
 
+  it("centers the svg so a CSS-resized glyph still spins around its own center", () => {
+    render(<RunningDot />);
+    expect(screen.getByTestId("running-dot")).toHaveClass("items-center", "justify-center");
+  });
+
   it("defaults the wrapper to size-3 when no className is passed", () => {
     render(<RunningDot />);
     const dot = screen.getByTestId("running-dot");

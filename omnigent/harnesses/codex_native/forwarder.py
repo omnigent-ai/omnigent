@@ -19,6 +19,11 @@ import httpx
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.harnesses.codex_egress import (
+    CERTIFICATE_REMEDIATION,
+    certificate_failure_message,
+    is_connection_retry,
+)
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -34,9 +39,12 @@ from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
     clear_active_turn_id_if_matches,
+    clear_certificate_failure,
+    codex_config_revision,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
     read_bridge_state,
+    read_certificate_failure,
     read_codex_config_developer_instructions_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -372,6 +380,8 @@ class _CodexForwarderState:
         the last ``_refresh_effort_from_config`` read, so the refresh can tell
         an unchanged file from a rewritten one (an unchanged file must not roll
         back a live ``thread/settings/updated`` effort).
+    :param last_config_effort_revision: File identity and modification time used
+        to retry mirroring after a same-value config rewrite.
     :param collaboration_mode: Latest known Codex collaboration mode kind, e.g.
         ``"plan"`` or ``"default"``.
     :param posted_collaboration_mode: Last collaboration mode kind already
@@ -445,6 +455,7 @@ class _CodexForwarderState:
     # The config.toml effort as of the last _refresh_effort_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
     last_config_effort: str | None = None
+    last_config_effort_revision: tuple[int, int] | None = None
     collaboration_mode: str | None = None
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -3348,7 +3359,15 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
         updated in place.
     :returns: None.
     """
+    # Stat before reading, so a rewrite that races this read shows on the next pass.
+    revision = codex_config_revision(bridge_dir)
     config_effort = read_codex_config_effort(bridge_dir)
+    if revision is not None:
+        previous_revision = forwarder_state.last_config_effort_revision
+        forwarder_state.last_config_effort_revision = revision
+        if config_effort and previous_revision is not None and previous_revision != revision:
+            # Retry a failed immediate mirror even when the effort is unchanged.
+            forwarder_state.posted_effort_known = False
     if not config_effort:
         return
     # Change is detected by VALUE, not file revision, so an ABA rewrite between
@@ -3519,6 +3538,92 @@ async def _sync_codex_approval_mode_change(
             forwarder_state.posted_approval_preset = preset
 
 
+async def _maybe_fail_turn_on_certificate_failure(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    params: _JsonObject,
+    usage_coalescer: _SessionUsageCoalescer,
+    delta_coalescer: _OutputTextDeltaCoalescer | None,
+    codex_client: CodexAppServerClient | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> bool:
+    """
+    Fail a turn Codex keeps retrying when its launcher reported a bad TLS certificate.
+
+    Codex never ends such a turn on its own, so the forwarder interrupts it and
+    surfaces the launcher's certificate cause and the next step as the failure.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param params: Codex ``error`` notification params carrying ``willRetry``.
+    :param usage_coalescer: Token-usage coalescer flushed with the failure.
+    :param delta_coalescer: Optional text-delta coalescer flushed first.
+    :param codex_client: Optional app-server client used to interrupt the turn.
+    :param forwarder_state: Optional forwarder state for per-turn deduplication.
+    :returns: ``True`` when the turn was failed, or already had been.
+    """
+    if not is_connection_retry(params):
+        return False
+    failure = read_certificate_failure(bridge_dir)
+    if failure is None:
+        return False
+    turn_id = _turn_id_from_payload(params)
+    if forwarder_state is None or turn_id is None:
+        # Without per-turn state the failure could be posted once per retry and
+        # the interrupt's own boundary could flip it back to idle; leave the
+        # retry to Codex.
+        _logger.info(
+            "Codex forwarder cannot fail retrying turn on certificate failure "
+            "without turn state: turn_id=%s",
+            turn_id,
+        )
+        return False
+    if turn_id in forwarder_state.surfaced_terminal_error_turns:
+        return True
+    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    thread_id = _thread_id_from_params(params)
+    if codex_client is not None and thread_id is not None:
+        try:
+            await codex_client.request(
+                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+            )
+        except Exception:  # noqa: BLE001 - the failure is surfaced either way.
+            _logger.warning(
+                "Codex turn interrupt after a certificate failure failed", exc_info=True
+            )
+    clear_active_turn_id_if_matches(bridge_dir, turn_id)
+    _logger.warning(
+        "Codex forwarder failing turn on launcher certificate failure: turn_id=%s evidence=%s",
+        turn_id,
+        failure.evidence,
+    )
+    model = forwarder_state.model
+    async with _conversation_item_delivery_scope(session_id):
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error:certificate",
+                error=_CodexTerminalError(
+                    message=(
+                        f"{certificate_failure_message(failure, model=model)}\n\n"
+                        f"{CERTIFICATE_REMEDIATION}"
+                    ),
+                    kind=_CODEX_ERROR_KIND_GENERIC,
+                ),
+            ),
+        )
+        await usage_coalescer.flush()
+    return True
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -3552,6 +3657,16 @@ async def _maybe_handle_turn_event(
             _logger.info(
                 "Codex forwarder observed retryable turn error: turn_id=%s",
                 _turn_id_from_payload(params),
+            )
+            await _maybe_fail_turn_on_certificate_failure(
+                client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                params=params,
+                usage_coalescer=usage_coalescer,
+                delta_coalescer=delta_coalescer,
+                codex_client=codex_client,
+                forwarder_state=forwarder_state,
             )
             return True
         async with _conversation_item_delivery_scope(session_id):
@@ -4881,13 +4996,18 @@ def _terminal_turn_status_edge(
             turn_id=terminal_turn_id,
             source=f"{source}:turn-failed",
         )
-    if method == "turn/completed" and _turn_items_are_empty(params):
-        _logger.warning(
-            "Codex forwarder observed an empty turn (zero items): "
-            "turn_id=%s method=%s; mapping to idle",
-            terminal_turn_id,
-            method,
-        )
+    if method == "turn/completed":
+        if _turn_items_are_empty(params):
+            _logger.warning(
+                "Codex forwarder observed an empty turn (zero items): "
+                "turn_id=%s method=%s; mapping to idle",
+                terminal_turn_id,
+                method,
+            )
+        if _turn_status_from_params(params) in (None, "completed"):
+            # The model answered, so a certificate failure recorded at launch
+            # no longer describes this app-server's egress.
+            clear_certificate_failure(bridge_dir)
     return _CodexTurnStatusEdge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
@@ -4906,13 +5026,7 @@ def _turn_status_is_failed(params: _JsonObject) -> bool:
     :param params: Codex turn event params.
     :returns: ``True`` when ``params['turn']['status']`` resolves to ``failed``.
     """
-    turn = params.get("turn")
-    if not isinstance(turn, dict):
-        return False
-    status = turn.get("status")
-    if isinstance(status, dict):
-        status = status.get("type") or status.get("status")
-    return status in {"failed", "errored"}
+    return _turn_status_from_params(params) in {"failed", "errored"}
 
 
 def _turn_items_are_empty(params: _JsonObject) -> bool:

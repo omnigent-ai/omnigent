@@ -18,9 +18,10 @@ and steers messages while the agent is busy.
   configuration menu.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. States: catalog loading, delayed catalog,
-  alias vs. full model ID.
+  alias vs. full model ID, refused switch (the pill keeps the applied model).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
-  Pi). States: available, unavailable placeholder, max/ultra levels.
+  Pi). States: available, unavailable placeholder, max/ultra levels, refused
+  change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
@@ -29,6 +30,7 @@ and steers messages while the agent is busy.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
+  Shift+Enter and Alt/Option+Enter insert a newline in both composers.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -37,6 +39,13 @@ and steers messages while the agent is busy.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
+- `delivered-send-recovery`: a sent message stays out of the composer when its
+  HTTP acknowledgement is lost. Delivery during draft restoration clears the
+  untouched draft; user edits remain.
+- `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
+  bundle and selects it. States: import in flight (Cancel and Create locked),
+  rejected bundle, imported agent missing from the refreshed list, and hidden on
+  a server without agent install.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
@@ -69,6 +78,10 @@ and steers messages while the agent is busy.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
 - Attach files or type `/` before the first send.
+- Open the agent picker's custom agents, then Create custom agent → Import
+  bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
+  selects the agent, which stays listed after a reload. A rejected bundle (for
+  example a server agent's name) keeps the dialog open with the server's reason.
 
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
@@ -106,6 +119,11 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
+- **`model-picker`, `effort-picker`, refused change:** the rollback cases in
+  `web/src/store/chatStore.test.ts` and the composer case in
+  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). Manually,
+  pick another effort in a Codex session right after Start session, while the
+  terminal is still starting: the pill keeps the previous effort.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
@@ -118,7 +136,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
   `tests/e2e_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
 - **`send-shortcut`:**
-  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`
+  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
+  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`
@@ -137,8 +156,19 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   once after compaction. Repeat the queued flow while viewing another session.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
+- **`delivered-send-recovery`, in-session composer (desktop and mobile):**
+  `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
+  runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
+  for the desktop entry point. The restore/delivery ordering and preservation of
+  user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
+- **`import-bundle`:** no browser-level coverage; the web unit tests for the
+  Create custom agent and new-session dialogs cover it. Manually: open the agent
+  picker's custom agents, then Create custom agent → Import bundle, and pick a
+  `.tar.gz` of an agent directory. Expect the dialog to close with the agent
+  selected, and the agent still listed after a reload. A bundle named like a
+  server agent keeps the dialog open with the server's reason.
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 
@@ -153,6 +183,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   A tooltip that returns after clicking away is a regression.
 - Effort exists only for some harnesses. Check at least one harness with effort
   and one without, since the pill and tooltip rows change.
+- A refused model or effort change rolls the pill back to the applied setting.
+  There is no separate error control to inspect.
 - Codex effort can change from the terminal as well as the composer. Confirm the
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'

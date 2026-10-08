@@ -132,6 +132,8 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Keep the broad standalone-bearer behavior: short or punctuation-heavy
     # credentials are still secrets.
     re.compile(r"(?i)(\bbearer\s+)\S+"),
+    # URL userinfo (``scheme://user:pass@host``): keep the "@" and the host.
+    re.compile(r"(://)[^\s/?#@]+(?=@)"),
     # Common provider-specific token shapes.
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),

@@ -8469,6 +8469,41 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     assert "Codex is running in the session terminal" in result
 
 
+@pytest.mark.asyncio
+async def test_create_codex_session_retries_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh Codex session creation retries an explicit rate-limit response."""
+    attempts = 0
+    request_bodies: list[bytes] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        request_bodies.append(await request.aread())
+        if attempts == 1:
+            return httpx.Response(429, request=request)
+        return httpx.Response(201, json={"session_id": "conv_new"}, request=request)
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.native.native_terminal._sleep", _fake_sleep)
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        session_id = await codex_native._create_codex_session(
+            client,
+            b"bundle",
+            bridge_id=None,
+            terminal_launch_args=["--config", "approval_policy=on-request"],
+        )
+
+    assert session_id == "conv_new"
+    assert attempts == 2
+    assert all(b"bundle" in body for body in request_bodies)
+    assert all(b"approval_policy=on-request" in body for body in request_bodies)
+
+
 def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"

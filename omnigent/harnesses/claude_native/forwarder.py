@@ -279,10 +279,17 @@ def _observe_transcript_discovery(
         "observer_stderr_bytes=%s hook_settings=%s"
     )
     if escalate:
-        _logger.error(
+        # An idle pane nobody has used yet never fires a hook; only evidence of a
+        # broken observer (stderr, hooks without a path, no settings) is an error.
+        hook_failure = bool(stderr_size) or hooks_size is not None or not settings_present
+        log = _logger.error if hook_failure else _logger.warning
+        log(
             "Claude transcript forwarding has not started: no observer hook reported a " + detail,
             *args,
-            extra={"session_id": session_id},
+            extra={
+                "session_id": session_id,
+                "discovery_verdict": "hook_failure" if hook_failure else "idle",
+            },
         )
         diagnostics.error_logged = True
         diagnostics.warning_logged = True
@@ -2425,6 +2432,21 @@ def _tool_use_ids_in_transcript(
     return tool_use_ids
 
 
+def _subagent_own_spawn_tool_use_id(agent_jsonl_path: Path) -> str | None:
+    """Return the spawn tool-use id that created the sub-agent owning
+    *agent_jsonl_path*, read from its sibling ``agent-<id>.meta.json``.
+
+    Used by :func:`_subagent_parents_by_tool_use` to drop a sub-agent's own
+    spawn id from the ownership its transcript contributes. Returns ``None``
+    when the meta is missing or malformed, which leaves correlation unchanged.
+    """
+    meta_path = agent_jsonl_path.with_name(
+        agent_jsonl_path.name.removesuffix(".jsonl") + ".meta.json"
+    )
+    meta = _read_subagent_meta(meta_path)
+    return meta["toolUseId"] if meta is not None else None
+
+
 def _subagent_parents_by_tool_use(
     transcript_path: Path,
     subagents_dir: Path,
@@ -2445,10 +2467,23 @@ def _subagent_parents_by_tool_use(
         for path in sorted(subagents_dir.glob("agent-*.jsonl"))
     )
     for path, owner_id in transcript_owners:
+        # A ``fork`` sub-agent starts from a copy of the parent conversation,
+        # which includes the Agent/Task record that spawned the fork itself.
+        # Counting that inherited copy would make the fork an owner of its own
+        # spawn id — self-parenting it, or colliding with the real issuer so
+        # the id is dropped as ambiguous below. Either way the fork never
+        # resolves to a parent and is never registered as a child row. An agent
+        # is never its own parent, so skip only its own spawn id; ids it
+        # genuinely issued for its children still count.
+        own_spawn_tool_use_id = (
+            _subagent_own_spawn_tool_use_id(path) if owner_id is not None else None
+        )
         for tool_use_id in _tool_use_ids_in_transcript(
             path,
             include_sidechains=owner_id is not None,
         ):
+            if tool_use_id == own_spawn_tool_use_id:
+                continue
             if tool_use_id in owners and owners[tool_use_id] != owner_id:
                 ambiguous.add(tool_use_id)
             else:
