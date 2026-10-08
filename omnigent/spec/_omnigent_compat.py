@@ -98,6 +98,7 @@ OMNIGENT_HARNESSES = frozenset(
         "kimi",
         "kimi-native",
         "cursor-native",
+        "databricks-genie",
         "kiro-native",
         "goose",
         "goose-native",
@@ -130,6 +131,7 @@ OMNIGENT_HARNESS_ALIASES = frozenset(
         "native-hermes",
         "github-copilot",
         "native-kimi",
+        "genie",
     }
 )
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES
