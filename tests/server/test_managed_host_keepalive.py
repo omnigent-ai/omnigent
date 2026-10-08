@@ -272,9 +272,10 @@ def test_a_runner_already_in_flight_is_not_queued_twice(
 
 
 def test_inflight_is_released_even_when_the_provider_raises(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failed attempt must not wedge the runner out of all future keepalives."""
+    """A failed attempt must not wedge the runner out of all future keepalives, and
+    its record names the error type without the provider's message."""
     launcher = _Launcher(raises=RuntimeError("boom"))
     _wire(
         monkeypatch,
@@ -282,8 +283,52 @@ def test_inflight_is_released_even_when_the_provider_raises(
         host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="modal"),
     )
     monkeypatch.setattr(managed_host_keepalive, "_inflight", {"r1"})
-    managed_host_keepalive._keep_alive_for_runner("r1")
+    with caplog.at_level(logging.WARNING, logger=_KEEPALIVE_LOGGER):
+        managed_host_keepalive._keep_alive_for_runner("r1")
     assert "r1" not in managed_host_keepalive._inflight
+    assert _outcomes(caplog) == ["provider_error"]
+    assert caplog.records[0].attributes["error_type"] == "RuntimeError"
+    assert "boom" not in caplog.text
+
+
+@pytest.mark.parametrize("failing_step", ["get_host", "for_provider"])
+def test_one_hosts_resolution_failure_does_not_block_the_runners_other_hosts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failing_step: str
+) -> None:
+    """A session spanning several hosts still refreshes the hosts that resolve."""
+    launcher = _Launcher()
+    hosts = {
+        "host-bad": SimpleNamespace(sandbox_id="sbx-bad", sandbox_provider="broken"),
+        "host-ok": SimpleNamespace(sandbox_id="sbx-ok", sandbox_provider="modal"),
+    }
+
+    def get_host(host_id: str) -> object:
+        if failing_step == "get_host" and host_id == "host-bad":
+            raise RuntimeError("row read failed: detail")
+        return hosts[host_id]
+
+    def for_provider(provider: str) -> object:
+        if provider == "broken":
+            raise RuntimeError("provider config failed: detail")
+        return SimpleNamespace(launcher_factory=lambda: launcher)
+
+    conversations = SimpleNamespace(
+        list_conversations_by_runner_id=lambda _rid: [
+            SimpleNamespace(host_id="host-bad"),
+            SimpleNamespace(host_id="host-ok"),
+        ]
+    )
+    monkeypatch.setattr(managed_host_keepalive, "_conversation_store", conversations)
+    monkeypatch.setattr(managed_host_keepalive, "_host_store", SimpleNamespace(get_host=get_host))
+    monkeypatch.setattr(
+        managed_host_keepalive, "_sandbox_config", SimpleNamespace(for_provider=for_provider)
+    )
+    with caplog.at_level(logging.INFO, logger=_KEEPALIVE_LOGGER):
+        managed_host_keepalive._keep_alive_for_runner("r1")
+    assert launcher.calls == ["sbx-ok"]
+    failure = "resolution_error" if failing_step == "get_host" else "provider_error"
+    assert sorted(_outcomes(caplog)) == sorted([failure, "extended"])
+    assert "detail" not in caplog.text
 
 
 def test_keepalive_interval_is_provider_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -377,31 +422,6 @@ def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.Monk
     managed_host_keepalive._keep_alive_for_runner("r1")
     # now cached at modal's slower cadence
     assert managed_host_keepalive.keepalive_interval_s("r1") == 600.0
-
-
-def test_provider_error_is_recorded_without_the_exception_message(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The outcome record names the error type; provider payloads stay out of the log."""
-    launcher = _Launcher(raises=RuntimeError("boom"))
-    _wire(
-        monkeypatch,
-        launcher=launcher,
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="modal"),
-    )
-    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
-    monkeypatch.setattr(managed_host_keepalive, "_inflight", {"r1"})
-    with caplog.at_level(logging.WARNING, logger=_KEEPALIVE_LOGGER):
-        managed_host_keepalive._run_keepalive_job("r1", queued_at=time.monotonic())
-    assert "r1" not in managed_host_keepalive._inflight
-    error_events = [
-        record
-        for record in caplog.records
-        if getattr(record, "attributes", {}).get("outcome") == "provider_error"
-    ]
-    assert error_events
-    assert all("boom" not in record.getMessage() for record in error_events)
-    assert error_events[0].attributes["error_type"] == "RuntimeError"
 
 
 def test_worker_evidence_contains_queue_and_provider_duration(
@@ -763,6 +783,37 @@ async def test_a_rejected_submission_is_retried_with_a_bounded_delay(
         f"rejected submission left the runner reserved, so it can never refresh again: {observed}"
     )
     assert len(executor.attempts) >= 2, f"rejected submission was never retried: {observed}"
+    # Paced by the interval: one attempt and one record per cadence, no faster.
+    assert executor.attempts == [0.0, interval, 2 * interval, 3 * interval], observed
+    assert sleeps == [interval] * 4, observed
+    assert _outcomes(caplog) == ["submission_failed"] * 4, observed
+
+
+def test_pruning_keeps_the_stamp_of_a_runner_with_an_outstanding_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long-stalled attempt must not lose its stamp to pruning, or the loop would
+    wait a full interval instead of retrying shortly once the call clears."""
+    monkeypatch.delenv(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, raising=False)
+    clock = _FakeClock()
+    clock.now = 2000.0
+    monkeypatch.setattr(managed_host_keepalive, "time", clock)
+    monkeypatch.setattr(managed_host_keepalive, "_THROTTLE_MAX_ENTRIES", 2)
+    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
+    monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
+    monkeypatch.setattr(
+        managed_host_keepalive, "_executor", SimpleNamespace(submit=lambda *_: None)
+    )
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    monkeypatch.setattr(
+        managed_host_keepalive, "_last_kept", {"stuck": 0.0, "gone-1": 0.0, "gone-2": 0.0}
+    )
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", {"stuck"})
+
+    managed_host_keepalive.touch("fresh")  # grows the map past the cap: prune runs
+
+    assert set(managed_host_keepalive._last_kept) == {"stuck", "fresh"}
+    assert managed_host_keepalive.next_keepalive_delay_s("stuck", now=clock.now) == 1.0
 
 
 def test_submission_failure_releases_the_runner_and_paces_the_retry(

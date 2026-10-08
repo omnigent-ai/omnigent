@@ -23,13 +23,10 @@ Rate-limited per runner at a provider-scoped cadence
 write that wakes a controller reconcile — so agent_sandbox refreshes fast (short
 window) while other providers stay on the cheap default.
 
-Refreshes run on a small bounded worker pool with at most one queued or running
-attempt per runner, so one stalled provider call cannot starve unrelated live
-runners. The tunnel loop wakes from the remaining due time
-(:func:`next_keepalive_delay_s`) rather than a fixed cadence, so a tick that
-finds an attempt still outstanding retries shortly instead of a full interval
-later. Each attempt is recorded as a bounded ``managed_keepalive`` outcome that
-names identifiers and error types, never provider exception payloads.
+Refreshes run on an eight-worker pool with at most one queued or running attempt
+per runner, and the tunnel loop wakes from the remaining due time
+(:func:`next_keepalive_delay_s`). ``managed_keepalive`` outcome records carry
+identifiers and error types, never provider exception payloads.
 """
 
 from __future__ import annotations
@@ -238,9 +235,8 @@ def touch(runner_id: str) -> None:
         if last is not None and now - last < interval:
             return
         if runner_id in _inflight:
-            # Previous attempt for this runner has not finished; skip rather than
-            # queue a duplicate. _last_kept stays untouched, so the loop keeps
-            # the runner due and retries as soon as the in-flight one clears.
+            # One outstanding attempt per runner; _last_kept stays untouched so
+            # the loop keeps the runner due and retries once this one clears.
             return
         _inflight.add(runner_id)
         _last_kept[runner_id] = now
@@ -263,10 +259,15 @@ def touch(runner_id: str) -> None:
 
 
 def _prune_throttle(now: float) -> None:
-    """Drop throttle entries older than two slow intervals (their runners are gone)."""
+    """Drop throttle entries older than two slow intervals (their runners are gone).
+
+    A runner whose attempt is still outstanding keeps its stamp, so the loop
+    still sees it as due and retries shortly once the stalled call clears.
+    """
     cutoff = now - 2 * resolve_managed_keepalive_interval_s()
     with _state_lock:
-        for runner_id in [rid for rid, seen in _last_kept.items() if seen < cutoff]:
+        stale = [rid for rid, seen in _last_kept.items() if seen < cutoff and rid not in _inflight]
+        for runner_id in stale:
             _last_kept.pop(runner_id, None)
             _runner_interval_s.pop(runner_id, None)
 
