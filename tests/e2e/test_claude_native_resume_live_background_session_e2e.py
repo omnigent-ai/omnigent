@@ -100,8 +100,8 @@ def test_resume_of_still_live_session_is_not_refused(
     proceed.
     """
     mock = isolated_mock_llm_server_url
-    # A fallback lets a later (fixed) resume turn complete; the background holder
-    # itself parks without a model call, so no queued response is needed for it.
+    # Fallback response lets the resume turn complete; the parked background
+    # holder makes no model call, so no queued response is needed for it.
     for key in (_MODEL, "default"):
         httpx.post(
             f"{mock}/mock/set_fallback",

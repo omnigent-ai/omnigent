@@ -2071,10 +2071,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         _fake_synth,
     )
 
-    # The resume branch probes whether a separate live process still holds the
-    # id (which would make Claude fork instead of reattach). Stub it off so this
-    # test exercises the in-place reattach path without spawning ``claude``; the
-    # live-holder fork path has its own coverage.
+    # No live holder: keep this test on the in-place reattach path without
+    # spawning ``claude``; the fork path is covered separately.
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._claude_background_session_holds_id",
         lambda *args, **kwargs: False,
@@ -2329,6 +2327,136 @@ async def test_auto_create_claude_terminal_forks_when_a_live_process_holds_the_s
     # the forwarder seeks to the tail with no synthesized prefix to skip past.
     assert forwarder_kwargs.get("start_at_end") is True
     assert forwarder_kwargs.get("start_at_offset") is None
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_resumes_in_place_when_holder_probe_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A raising holder probe is contained; the resume stays in place.
+
+    If the live-holder probe raises, the launch must still proceed as a plain
+    in-place ``claude --resume <id>`` (no ``--fork-session``) rather than
+    aborting or silently dropping ``--resume``.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    resume_id = "02857840-6362-408f-b41f-309e396ed7c6"
+
+    forwarder_kwargs: dict[str, Any] = {}
+
+    async def _capture_forwarder(**kwargs: Any) -> None:
+        """Record the forwarder launch kwargs without opening a stream."""
+        forwarder_kwargs.update(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _capture_forwarder,
+    )
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+    ) -> Path:
+        """Return a transcript path so the resume branch sets ``--resume``."""
+        del client, session_id, workspace, bridge_dir
+        return tmp_path / f"{external_session_id}.jsonl"
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+
+    def _boom(external_session_id: str, **kwargs: Any) -> bool:
+        """Simulate the holder probe raising an unexpected error."""
+        del external_session_id, kwargs
+        raise RuntimeError("agents query blew up")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._claude_background_session_holds_id",
+        _boom,
+    )
+
+    class _SnapshotServerClient(NullServerClient):
+        """Server client whose session snapshot carries the resume id."""
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            """Return the session snapshot, or empty labels for the bridge check."""
+            del kwargs
+            if url.endswith("/labels"):
+
+                class _LabelsResponse(NullServerClient._Response):
+                    """Empty labels -> bridge_id resolves to session_id."""
+
+                    def json(self) -> dict[str, Any]:
+                        """Return an empty labels payload."""
+                        return {"labels": {}}
+
+                return _LabelsResponse()
+
+            assert url == "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2"
+
+            class _SnapResponse(NullServerClient._Response):
+                """Snapshot response carrying the live-held resume id."""
+
+                def json(self) -> dict[str, Any]:
+                    """Return the session snapshot dict."""
+                    return {"external_session_id": resume_id}
+
+            return _SnapResponse()
+
+    launched_args: list[str] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that returns a terminal without launching."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Return a terminal resource view without spawning a TTY."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched_args.extend(spec.args)
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_claude_terminal(
+        "5cdbea97a2fb0c659bc09605401e2bb2",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+    )
+
+    await asyncio.sleep(0)
+
+    # The probe raised, so the launch stays in place: ``--resume`` is still
+    # passed, with no ``--fork-session`` appended.
+    assert "--resume" in launched_args, launched_args
+    assert "--fork-session" not in launched_args, launched_args
 
 
 @pytest.mark.asyncio

@@ -8378,11 +8378,9 @@ async def _auto_create_claude_terminal(
     # hook, and the executor's prompt inject waits on the same boot, so a
     # ``stat`` taken later routinely skips the freshly-injected message.
     resume_prefix_bytes: int | None = None
-    # Whether to resume via ``--fork-session`` (branch a copy) rather than
-    # reattach in place. Default off: the common cold resume reattaches to the
-    # transcript we just synthesized. Flipped on only when a separate live
-    # process still holds this id, which otherwise makes Claude's CLI refuse a
-    # bare ``--resume`` (its background-session guard) — the reported bug.
+    # Fork (``--fork-session``) instead of reattaching only when a separate
+    # live process still holds this id; a bare ``--resume`` is then refused
+    # by Claude's background-session guard.
     resume_fork = False
     if server_client is not None and session_external_id is not None:
         from omnigent.harnesses.claude_native.main import (
@@ -8401,17 +8399,18 @@ async def _auto_create_claude_terminal(
             if _transcript is not None:
                 resume_external_session_id = session_external_id
                 resume_prefix_bytes = _measured_prefix_bytes(_transcript)
-                if await asyncio.to_thread(
-                    _claude_background_session_holds_id,
-                    session_external_id,
-                    cwd=str(Path(workspace).resolve()),
-                ):
-                    # A separate live process (e.g. a local terminal still
-                    # attached) holds this id, so a bare ``--resume`` is
-                    # refused. Fork a copy instead. The fork starts from the
-                    # live session, not our synthesized file, so clear the
-                    # synthesized prefix and let the forwarder's
-                    # ``start_at_end`` seek to the fork's own tail.
+                try:
+                    _held = await asyncio.to_thread(
+                        _claude_background_session_holds_id,
+                        session_external_id,
+                        cwd=str(Path(workspace).resolve()),
+                    )
+                except Exception:  # noqa: BLE001 — best-effort probe; keep in-place resume
+                    _held = False
+                if _held:
+                    # A live process holds this id, so a bare ``--resume`` is
+                    # refused: fork a copy. The fork tails the live session,
+                    # not our synthesized file, so drop the synthesized prefix.
                     resume_fork = True
                     resume_prefix_bytes = None
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure

@@ -5247,7 +5247,7 @@ def _claude_background_session_holds_id(
     claude_binary: str | None = None,
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
-    timeout: float = 5.0,
+    timeout: float = 10.0,
 ) -> bool:
     """
     Return whether a separate live Claude process still holds this id.
@@ -5292,16 +5292,20 @@ def _claude_background_session_holds_id(
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
+        if proc.returncode != 0:
+            return False
         entries = json.loads(proc.stdout or "[]")
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
     if not isinstance(entries, list):
         return False
     # The guard refuses the resume for any live holder that is not a parked
-    # interactive session (``kind != "interactive"``), e.g. a background job.
+    # interactive session, e.g. a background job. Require ``kind`` to be present
+    # so an unrecognized schema fails closed rather than over-forking.
     return any(
         isinstance(entry, dict)
         and entry.get("sessionId") == external_session_id
+        and entry.get("kind") is not None
         and entry.get("kind") != "interactive"
         for entry in entries
     )

@@ -6025,9 +6025,9 @@ async def test_resolve_cold_resume_args_warning_lands_in_logger(
 class _FakeAgentsProc:
     """Minimal stand-in for a completed ``claude agents --json`` run."""
 
-    def __init__(self, stdout: str) -> None:
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
         self.stdout = stdout
-        self.returncode = 0
+        self.returncode = returncode
 
 
 @pytest.mark.parametrize(
@@ -6040,10 +6040,13 @@ class _FakeAgentsProc:
         ('[{"sessionId": "sid-live", "kind": "interactive"}]', False),
         # A different session is held, not ours.
         ('[{"sessionId": "sid-other", "kind": "background"}]', False),
+        # An entry without a ``kind`` field fails closed: an unrecognized schema
+        # is not treated as a live holder.
+        ('[{"sessionId": "sid-live"}]', False),
         # No sessions at all.
         ("[]", False),
     ],
-    ids=["held-background", "held-interactive", "other-session", "none"],
+    ids=["held-background", "held-interactive", "other-session", "no-kind", "none"],
 )
 def test_claude_background_session_holds_id_matches_live_non_interactive(
     monkeypatch: pytest.MonkeyPatch,
@@ -6111,6 +6114,24 @@ def test_claude_background_session_holds_id_false_without_binary(
 
     assert claude_native._claude_background_session_holds_id("sid-live") is False
     assert calls == []
+
+
+def test_claude_background_session_holds_id_fails_closed_on_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-zero ``claude agents`` exit is not trusted, even with JSON stdout."""
+
+    def _fake_run(cmd: object, **kwargs: object) -> _FakeAgentsProc:
+        """Return a holder payload but with a failing exit code."""
+        del cmd, kwargs
+        return _FakeAgentsProc('[{"sessionId": "sid-live", "kind": "background"}]', returncode=1)
+
+    monkeypatch.setattr(claude_native.subprocess, "run", _fake_run)
+
+    assert (
+        claude_native._claude_background_session_holds_id("sid-live", claude_binary="/fake/claude")
+        is False
+    )
 
 
 # ── _prepare_claude_terminal cold-resume integration ─────────
