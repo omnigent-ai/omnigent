@@ -140,7 +140,10 @@ tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
 and cancellation lead to the shell's connect/retry screen—not embedded workspace
 SSO. Failed connections stay blocked through the selector handoff so a late login
 redirect cannot replace it. Connect reuses stored credentials and opens the
-system browser only when they can't sign in. To use another account, choose
+system browser only when they can't sign in. Credentials are stored per
+workspace, so an account URL that names its workspace (`?o=<workspace id>`)
+reuses the credentials of the workspace it reached last time; without `?o=` it
+runs the account sign-in and workspace picker. To use another account, choose
 **Server → Sign Out of Server** (or **Sign out of <workspace>** in the server
 picker at the bottom of the sidebar, on servers whose web app includes it): it
 forgets the stored OAuth token, clears DBAUTH, and returns every window on that

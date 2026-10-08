@@ -2,7 +2,12 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { parseServerLabels, serverLabel, withConnectLabel } = require("../src/server_labels");
+const {
+  parseServerLabels,
+  serverLabel,
+  labeledWorkspace,
+  withConnectLabel,
+} = require("../src/server_labels");
 
 const PICKED = "https://accounts.cloud.databricks.com/omnigent?o=123";
 const WORKSPACE = "https://dbc-1234.cloud.databricks.com";
@@ -31,6 +36,22 @@ describe("server labels", () => {
     assert.equal(serverLabel(labels, 42), null);
     // Inherited keys never count as labels.
     assert.equal(serverLabel({}, "https://constructor"), null);
+  });
+
+  it("finds the workspace an account URL naming it reached before", () => {
+    const labels = { [OTHER]: "https://accounts.cloud.databricks.com/?o=456", [WORKSPACE]: PICKED };
+    // The same pick, whatever its path.
+    assert.equal(labeledWorkspace(labels, PICKED), WORKSPACE);
+    assert.equal(
+      labeledWorkspace(labels, "https://accounts.cloud.databricks.com/?o=123"),
+      WORKSPACE,
+    );
+    assert.equal(labeledWorkspace(labels, "https://accounts.cloud.databricks.com/?o=456"), OTHER);
+    // No workspace named, another workspace, or another account host.
+    assert.equal(labeledWorkspace(labels, "https://accounts.cloud.databricks.com/omnigent"), null);
+    assert.equal(labeledWorkspace(labels, "https://accounts.cloud.databricks.com/?o=789"), null);
+    assert.equal(labeledWorkspace(labels, "https://other.cloud.databricks.com/?o=123"), null);
+    assert.equal(labeledWorkspace(labels, "not a url"), null);
   });
 
   it("labels a host sign-in moved to, and drops the label on a direct connect", () => {
