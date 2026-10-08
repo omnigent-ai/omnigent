@@ -87,13 +87,23 @@ interface HastElement {
 // extra confirmation click.
 export const CHAT_LINK_SAFETY: LinkSafetyConfig = { enabled: false };
 
-/** Rewrites safe local `file:` URIs before sanitization removes their hrefs. */
+/** Preserves local file URIs and basename citations through sanitization. */
 export function rewriteFileUriLinks() {
   return (tree: HastElement) => {
     visitElements(tree, (node) => {
       if (node.tagName !== "a") return;
       const href = node.properties?.href;
-      if (typeof href !== "string" || !/^file:/i.test(href)) return;
+      if (typeof href !== "string") return;
+      // A basename citation looks like a URL scheme to sanitize (README.md:12).
+      const citation = splitWorkspaceFileCitation(href);
+      if (citation.line && /^[^:?#]+\.[\w-]+$/.test(citation.path)) {
+        node.properties = {
+          ...node.properties,
+          href: `${citation.path}#L${citation.line}${citation.column ? `C${citation.column}` : ""}`,
+        };
+        return;
+      }
+      if (!/^file:/i.test(href)) return;
       const path = fileUriToLocalPath(href);
       if (!path) return;
       node.properties = { ...node.properties, href: path };
@@ -188,7 +198,7 @@ function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehype
   let sawSanitize = false;
 
   for (const [key, plugin] of Object.entries(defaultRehypePlugins)) {
-    // Preserve local file URIs before sanitize removes their href.
+    // Preserve local file URIs and line citations before sanitization.
     if (key === "sanitize") {
       sawSanitize = true;
       if (markFileLinks) plugins.push(rewriteFileUriLinks);
