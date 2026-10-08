@@ -156,23 +156,27 @@ async def test_turn_end_freezes_gc_once_only_when_armed(monkeypatch: pytest.Monk
 
     class _App(HarnessApp):
         async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
-            if outcomes.pop(0) == "fail":
+            outcome = outcomes.pop(0)
+            if outcome == "fail":
                 raise RuntimeError("turn failed")
+            if outcome == "cancel":  # observed the cancel and returned normally
+                ctx.cancelled.set()
 
     app = _App()
     request = CreateResponseRequest(model="test-agent", input="hi")
 
-    async def _turn(outcome: str) -> list[str]:
+    async def _turn(outcome: str, terminal: str = "response.completed") -> list[str]:
         outcomes.append(outcome)
         ctx = TurnContext(f"resp_{len(gc_calls)}", asyncio.Queue(), asyncio.Event())
         frames = [frame async for frame in app._stream_turn(request, ctx, model="test-agent")]
-        assert frames, "the turn must stream its events"
+        assert f"event: {terminal}".encode() in frames[-1]
         return gc_calls[:]
 
     assert await _turn("ok") == []  # an embedding process never arms it
 
     _scaffold.arm_gc_freeze_after_first_turn()
-    assert await _turn("fail") == []  # a failed turn keeps it armed
+    assert await _turn("fail", "response.failed") == []  # a failed turn keeps it armed
+    assert await _turn("cancel", "response.cancelled") == []  # so does a cancelled one
     assert await _turn("ok") == ["collect", "freeze"]
     assert await _turn("ok") == ["collect", "freeze"]  # one-shot
 
