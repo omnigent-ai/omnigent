@@ -1524,37 +1524,31 @@ def _resolve_session_provider_entry(
     if conv is None or not getattr(conv, "agent_id", None):
         return None
     try:
-        from omnigent.onboarding.provider_config import load_providers
-        from omnigent.runtime import get_agent_cache
-        from omnigent.runtime._globals import _agent_store
-        from omnigent.runtime.workflow import effective_config_with_detected
+        from omnigent.onboarding.provider_config import load_config, load_providers
+        from omnigent.runtime import get_agent_cache, get_agent_store
         from omnigent.spec.types import ProviderAuth
 
-        agent_store = _agent_store
-        if agent_store is None:
-            return None
-        agent = agent_store.get(conv.agent_id)
+        agent = get_agent_store().get(conv.agent_id)
         if agent is None:
             return None
         agent_cache = get_agent_cache()
         loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
-        # For sub-agent sessions, use the sub-agent's own executor.
+        # Sub-agent sessions price on their own executor; resolve the child
+        # spec recursively (as the policy builder does) so nested sub-agents
+        # and the synthesized web_fetch researcher use their own provider.
         executor = loaded.spec.executor
         if conv.sub_agent_name:
-            sub = next(
-                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
-                None,
-            )
-            if sub is not None:
+            from omnigent.runtime.workflow import _find_spec_by_name
+
+            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+            if sub is not None and sub is not loaded.spec:
                 executor = sub.executor
         auth = executor.auth if executor else None
         if not isinstance(auth, ProviderAuth):
             return None
-        from omnigent.onboarding.provider_config import load_config
-
-        providers = load_providers(effective_config_with_detected(load_config()))
+        providers = load_providers(load_config())
         return providers.get(auth.name)
     except Exception:  # noqa: BLE001 — broken spec must never break cost accounting
         _logger.debug("named-provider lookup failed for pricing", exc_info=True)

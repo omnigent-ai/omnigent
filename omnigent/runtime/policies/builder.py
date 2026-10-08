@@ -833,11 +833,9 @@ def build_policy_engine(
         harness = (
             conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
-        # Resolve the actual named provider so sessions on non-default
-        # providers are priced at their configured rate rather than the
-        # harness default's rate. A sub-agent session runs the CHILD spec's
-        # executor, so its auth decides the provider identity.
-        from omnigent.onboarding.detected import effective_config_with_detected
+        # Price sessions on non-default providers at their configured rate,
+        # not the harness default's. A sub-agent session runs the CHILD
+        # spec's executor, so its auth decides the provider identity.
         from omnigent.spec.types import ProviderAuth
 
         _executor = child_spec.executor if child_spec is not None else spec.executor
@@ -850,7 +848,7 @@ def build_policy_engine(
             try:
                 from omnigent.onboarding.provider_config import load_providers
 
-                _providers = load_providers(effective_config_with_detected(provider_config))
+                _providers = load_providers(provider_config)
                 _provider_entry = _providers.get(_executor.auth.name)
             except Exception:
                 # Provider resolution must never break policy pricing; fall

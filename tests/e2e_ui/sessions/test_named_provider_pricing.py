@@ -66,11 +66,9 @@ _WORKING = '[data-testid="working-indicator"]'
 
 _FINAL_TEXT = "Hello from the named provider."
 
-# The turn reports a flat 1,000,000 in / 1,000,000 out. At the cheap DEFAULT
-# rate ($1/$1 per million) that is $2.00; at the expensive NAMED rate
-# ($10/$10 per million) it is $20.00. The 10x gap makes the mis-pricing
-# unambiguous and dominates the two-decimal display, so a stray tiny extra
-# request cannot shift the rendered cost.
+# The turn reports a flat 1,000,000 in / 1,000,000 out: $2.00 at the cheap
+# DEFAULT rate ($1/$1 per million), $20.00 at the expensive NAMED rate
+# ($10/$10 per million). The 10x gap makes the mis-pricing unambiguous.
 _USAGE = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
 _DEFAULT_RATE_COST = "$2.00"
 _NAMED_RATE_COST = "$20.00"

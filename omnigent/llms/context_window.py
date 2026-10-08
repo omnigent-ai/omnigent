@@ -9,12 +9,18 @@ conservative 128K fallback.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from omnigent.onboarding.providers import ModelInfo, find_catalog_models
+
+if TYPE_CHECKING:
+    from omnigent.onboarding.provider_config import ProviderEntry
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
@@ -312,7 +318,7 @@ def fetch_model_pricing_with_provider(
     model: str,
     provider_config: dict[str, Any] | None = None,
     harness: str | None = None,
-    provider_entry: Any | None = None,
+    provider_entry: ProviderEntry | None = None,
 ) -> ModelPricing | None:
     """
     Fetch model pricing, checking provider config first then catalog.
@@ -401,9 +407,9 @@ def fetch_model_pricing_with_provider(
                             ),
                         )
         except Exception:
-            # If provider lookup fails (e.g., malformed config, import error),
-            # fall through to catalog rather than breaking cost tracking entirely.
-            pass
+            # Provider lookup failed (e.g. malformed config); fall through to
+            # catalog rather than breaking cost tracking entirely.
+            _logger.debug("provider pricing lookup failed; using catalog", exc_info=True)
 
     # Step 2: Fall back to catalog pricing when provider pricing is not configured
     catalog_pricing = fetch_model_pricing(model)

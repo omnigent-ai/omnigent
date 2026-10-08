@@ -34,9 +34,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from tests.server.helpers import build_agent_bundle
 
 # Two providers serving the SAME family (anthropic / claude-sdk) at DIFFERENT
-# custom rates. ``cheap-default`` is the family default; ``expensive-named`` is
-# a named, non-default provider a session may be launched with via
-# ``executor.auth``. Rates are per-million tokens.
+# per-million custom rates: ``cheap-default`` is the family default,
+# ``expensive-named`` a non-default provider a session may launch with.
 _CHEAP_INPUT_PER_M = 1.0
 _CHEAP_OUTPUT_PER_M = 2.0
 _EXPENSIVE_INPUT_PER_M = 10.0
@@ -177,4 +176,68 @@ async def test_named_provider_session_priced_at_named_rate_not_default(
     )
     assert cost == pytest.approx(_EXPECTED_NAMED_COST), (
         f"expected named-provider cost {_EXPECTED_NAMED_COST}, got {cost}. usage={usage}"
+    )
+
+
+def test_resolve_session_provider_entry_resolves_nested_sub_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NESTED sub-agent session prices on its own named provider.
+
+    A sub-agent session's turns must price on the sub-agent's executor auth,
+    resolved by a recursive spec search (as the policy builder does). A sub-agent
+    nested below a direct child must still resolve its own provider rather than
+    falling back to the root's — a shallow direct-children lookup would re-acquire
+    the default-provider mispricing this change fixes for exactly those sessions.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions.orchestration import (
+        _resolve_session_provider_entry,
+    )
+    from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
+
+    leaf = AgentSpec(
+        spec_version=1,
+        name="leaf",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="expensive-named"), config={"harness": "claude-sdk"}
+        ),
+    )
+    mid = AgentSpec(
+        spec_version=1,
+        name="mid",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        sub_agents=[leaf],
+    )
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="cheap-default"), config={"harness": "claude-sdk"}
+        ),
+        sub_agents=[mid],
+    )
+
+    agent = SimpleNamespace(id="a1", bundle_location="loc", session_id=None)
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_store",
+        lambda: SimpleNamespace(get=lambda _agent_id: agent),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_cache",
+        lambda: SimpleNamespace(load=lambda *a, **k: SimpleNamespace(spec=root)),
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: _PROVIDER_CONFIG,
+    )
+
+    conv = SimpleNamespace(id="s1", agent_id="a1", sub_agent_name="leaf")
+    entry = _resolve_session_provider_entry(conv)
+
+    assert entry is not None, "nested sub-agent provider did not resolve"
+    assert entry.name == "expensive-named", (
+        f"nested sub-agent priced on {entry.name!r}, not its own provider — a "
+        "shallow direct-children lookup fell back to the root's provider"
     )
