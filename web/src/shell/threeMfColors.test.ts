@@ -1195,7 +1195,8 @@ describe("Bambu filament colours through the stock 3MF loader", () => {
       [1, 2, 3],
       [12, 2, 3],
     ]);
-    const copiedPayloadBytes = Math.floor(MAX_EMITTED_BYTES / 3) + 4096;
+    expect(MAX_EMITTED_BYTES).toBe(MAX_SELECTED_BYTES);
+    const copiedPayloadBytes = Math.floor(MAX_SELECTED_BYTES / 3) + 4096;
     const oversized = archive(
       {
         "3D/root.model": model(
