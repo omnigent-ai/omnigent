@@ -237,6 +237,15 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(_color_theme_select(page)).to_be_visible(timeout=30_000)
 
 
+def _set_color(page: Page, test_id: str, value: str) -> None:
+    """Type a hex value into one of the guided color pickers and close it."""
+    page.get_by_test_id(f"{test_id}-trigger").click()
+    hex_input = page.get_by_test_id(f"{test_id}-input")
+    expect(hex_input).to_be_visible()
+    hex_input.fill(value)
+    page.keyboard.press("Escape")
+
+
 def test_color_palette_applies_persists_and_resets(page: Page, live_server: str) -> None:
     """Selecting a palette skins ``<html>`` + persists; the default clears it.
 
@@ -394,6 +403,42 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     )
     assert surface_background == "rgba(0, 0, 0, 0)", (
         "workspace content should not cover the translucent rail"
+    )
+
+
+def test_background_tint_recolors_the_dark_canvas(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """The shared Background tint reaches the dark canvas, not only the light one."""
+    page.emulate_media(color_scheme="dark")
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+    stock_dark = _computed_theme_tokens(page)
+
+    light = _theme_radiogroup(page).get_by_role("radio", name="Light")
+    light.click()
+    expect(light).to_have_attribute("aria-checked", "true")
+    stock_light = _computed_theme_tokens(page)
+    _set_color(page, "custom-theme-tint", "#ff0000")
+    expect(_color_theme_select(page)).to_contain_text("Custom")
+    assert _computed_theme_tokens(page)["background"] != stock_light["background"], (
+        "control case: the tint did not change the light canvas"
+    )
+
+    dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
+    dark.click()
+    expect(dark).to_have_attribute("aria-checked", "true")
+    assert _html_has_dark(page)
+
+    page.get_by_role("link", name="Back", exact=True).click()
+    expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=30_000)
+    tinted_dark = _computed_theme_tokens(page)
+    assert _data_theme(page) == "custom"
+    assert tinted_dark["background"] != stock_dark["background"], (
+        f"Background tint left the dark canvas at the stock {stock_dark['background']}"
+    )
+    assert tinted_dark["shell"] != stock_dark["shell"], (
+        "the dark shell gradient did not follow the tint"
     )
 
 

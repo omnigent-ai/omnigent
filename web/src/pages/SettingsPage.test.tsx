@@ -11,6 +11,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import * as host from "@/lib/host";
+import { PALETTES } from "@/lib/themePalette";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -641,6 +642,24 @@ describe("SettingsPage", () => {
     });
     expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
       "#2563eb",
+    );
+  });
+
+  it("re-tints the dark canvas when the background tint changes", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.click(screen.getByTestId("custom-theme-tint-trigger"));
+    const tint = screen.getByTestId("custom-theme-tint-input") as HTMLInputElement;
+    expect(tint.value).toBe("#FFFFFF");
+    fireEvent.change(tint, { target: { value: "#ff0000" } });
+
+    const style = document.documentElement.style;
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
+    expect(style.getPropertyValue("--custom-light-background")).not.toBe("#ffffff");
+    expect(style.getPropertyValue("--custom-dark-background")).not.toBe("#0e1013");
+    // The dark canvas is painted with the shell gradient, so that must follow too.
+    expect(style.getPropertyValue("--custom-dark-shell-background")).not.toBe(
+      PALETTES[0].tokens.dark.shellBackground,
     );
   });
 

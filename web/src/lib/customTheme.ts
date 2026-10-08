@@ -11,6 +11,9 @@ import { getStyleRoot, getThemeRoots } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+const CSS_COLOR_LITERAL = /#[0-9a-f]{6}(?:[0-9a-f]{2})?\b|rgba?\([^)]*\)/gi;
+// How much of the tint's hue a dark surface takes on.
+const DARK_TINT_WEIGHT = 0.2;
 
 export interface CustomTheme {
   basePalette: ThemePalette;
@@ -144,6 +147,20 @@ function mix(first: string, second: string, secondWeight: number): string {
   });
 }
 
+// Dark surfaces take only the tint's hue: the tint is a light-mode colour, so
+// mixing it in directly would wash the canvas out instead of tinting it. The
+// reference rebase measures that hue against the preset's own light background.
+function castTint(surface: string, tint: string, weight: number): string {
+  const surfaceRgb = hexToRgb(surface);
+  const tintRgb = hexToRgb(tint);
+  const grey = tintRgb.r * 0.2126 + tintRgb.g * 0.7152 + tintRgb.b * 0.0722;
+  return rgbToHex({
+    r: surfaceRgb.r + (tintRgb.r - grey) * weight,
+    g: surfaceRgb.g + (tintRgb.g - grey) * weight,
+    b: surfaceRgb.b + (tintRgb.b - grey) * weight,
+  });
+}
+
 function luminance(hex: string): number {
   const color = hexToRgb(hex);
   const linear = (channel: number) => {
@@ -269,11 +286,18 @@ function setAlpha(color: string, alpha: number): string {
   return parsed ? formatCssColor({ ...parsed, alpha }, "rgba") : color;
 }
 
+// Preset shell and sidebar backgrounds are literal colours or gradients, so
+// shift every colour in them by the same delta as the surface they paint.
+function rebaseBackgroundImage(base: string, reference: string, current: string): string {
+  if (current === reference) return base;
+  return base.replace(CSS_COLOR_LITERAL, (color) => rebaseColor(color, reference, current));
+}
+
 function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
   const normalized = normalizeTheme(theme) ?? DEFAULT_CUSTOM_THEME;
   const contrast = normalized.contrast / 100;
   const lightBackground = mix(normalized.tint, "#fffdff", 0.79 - contrast * 0.15);
-  const darkBackground = normalized.darkTint;
+  const darkBackground = castTint(normalized.darkTint, normalized.tint, DARK_TINT_WEIGHT);
 
   const lightCard = mix(lightBackground, "#ffffff", 0.72 + contrast * 0.16);
   const darkCard = mix(darkBackground, "#ffffff", 0.05 + contrast * 0.08);
@@ -439,8 +463,16 @@ function rebaseVariant(
     sidebarActiveForeground: primaryChanged
       ? rebaseColor(base.sidebarForeground, reference.foreground, current.foreground)
       : base.sidebarActiveForeground,
-    sidebarBackground: base.sidebarBackground,
-    shellBackground: base.shellBackground,
+    sidebarBackground: rebaseBackgroundImage(
+      base.sidebarBackground,
+      reference.sidebar,
+      current.sidebar,
+    ),
+    shellBackground: rebaseBackgroundImage(
+      base.shellBackground,
+      reference.background,
+      current.background,
+    ),
   };
 }
 

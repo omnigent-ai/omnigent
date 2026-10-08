@@ -13,6 +13,11 @@ import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
 
+function rgbChannel(hex: string, name: "r" | "g" | "b"): number {
+  const offset = { r: 1, g: 3, b: 5 }[name];
+  return Number.parseInt(hex.slice(offset, offset + 2), 16);
+}
+
 afterEach(() => {
   localStorage.clear();
   setEmbedScopeRoot(null);
@@ -210,19 +215,92 @@ describe("customTheme", () => {
       accent: "#2563eb",
       darkAccent: "#2563eb",
       tint: "#dbeafe",
-      darkTint: "#160e24",
+      darkTint: "#0e1013",
       contrast: 60,
       translucentSidebar: false,
     });
 
     expect(variants.light.background).not.toBe(PALETTES[0].tokens.light.background);
-    expect(variants.dark.background).toBe("#160e24");
+    expect(variants.dark.background).not.toBe(PALETTES[0].tokens.dark.background);
     expect(variants.light.primary).toBe("#2563eb");
     expect(variants.dark.primary).toBe("#2563eb");
     expect(variants.light.primaryForeground).toBe("#ffffff");
     expect(variants.dark.primaryForeground).toBe("#ffffff");
     expect(variants.light.foreground).not.toBe(variants.dark.foreground);
+    // Omnigent's light shell is `var(--background)`, so it follows the canvas token as is.
     expect(variants.light.shellBackground).toBe(PALETTES[0].tokens.light.shellBackground);
+    expect(variants.dark.shellBackground).not.toBe(PALETTES[0].tokens.dark.shellBackground);
+  });
+
+  it.each(PALETTES)("tints $label's dark canvas and shell with the background tint", (palette) => {
+    const theme = createCustomThemeFromPalette(palette);
+
+    const tinted = deriveCustomTheme({ ...theme, tint: "#ff0000" });
+
+    expect(tinted.light.background).not.toBe(palette.tokens.light.background);
+    expect(tinted.dark.background).not.toBe(palette.tokens.dark.background);
+    expect(tinted.dark.shellBackground).not.toBe(palette.tokens.dark.shellBackground);
+  });
+
+  it.each(PALETTES)("measures the tint's hue against $label's own light background", (palette) => {
+    const theme = createCustomThemeFromPalette(palette);
+    const preset = palette.tokens.dark.background;
+    const red = deriveCustomTheme({ ...theme, tint: "#ff0000" }).dark.background;
+
+    // A saturated tint pulls the canvas toward its hue without lifting it toward
+    // the tint's lightness...
+    expect(rgbChannel(red, "r")).toBeGreaterThan(rgbChannel(preset, "r"));
+    expect(rgbChannel(red, "g")).toBeLessThanOrEqual(rgbChannel(preset, "g"));
+    expect(rgbChannel(red, "b")).toBeLessThanOrEqual(rgbChannel(preset, "b"));
+    // ...and re-entering the preset's own light background changes nothing.
+    expect(
+      deriveCustomTheme({ ...theme, tint: palette.tokens.light.background }).dark.background,
+    ).toBe(preset);
+  });
+
+  it("treats a neutral tint relative to the preset's light background", () => {
+    // Omnigent's light canvas is white, so a grey tint carries no hue change.
+    const omni = deriveCustomTheme({
+      ...createCustomThemeFromPalette(PALETTES[0]),
+      tint: "#808080",
+    });
+    expect(omni.dark).toMatchObject({
+      background: PALETTES[0].tokens.dark.background,
+      shellBackground: PALETTES[0].tokens.dark.shellBackground,
+    });
+
+    // Gruvbox's light canvas is a warm cream, so the same grey removes that
+    // warmth from its dark canvas instead of leaving it untouched.
+    const gruvbox = PALETTES.find((candidate) => candidate.id === "gruvbox")!;
+    const cooled = deriveCustomTheme({ ...createCustomThemeFromPalette(gruvbox), tint: "#808080" });
+    expect(cooled.dark.background).not.toBe(gruvbox.tokens.dark.background);
+    expect(rgbChannel(cooled.dark.background, "b")).toBeGreaterThan(
+      rgbChannel(gruvbox.tokens.dark.background, "b"),
+    );
+  });
+
+  it("shifts the colours inside Omnigent's preset gradients and keeps their structure", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+
+    const variants = deriveCustomTheme({ ...theme, tint: "#ff0000" });
+
+    expect(variants.dark.shellBackground).toMatch(
+      /^radial-gradient\(rgba\(\d+, \d+, \d+, 0\.12\), transparent 50%\), radial-gradient\(at 80% 20%, rgba\(\d+, \d+, \d+, 0\.08\), transparent 45%\), linear-gradient\(145deg, #[0-9a-f]{6}, #[0-9a-f]{6}, #[0-9a-f]{6}\)$/,
+    );
+    expect(variants.dark.shellBackground).not.toContain("#1a0e2d");
+    expect(variants.light.sidebarBackground).toMatch(
+      /^linear-gradient\(90deg, #[0-9a-f]{6}, #[0-9a-f]{6}\)$/,
+    );
+    expect(variants.light.sidebarBackground).not.toBe(PALETTES[0].tokens.light.sidebarBackground);
+    expect(variants.light.shellBackground).toBe("var(--background)");
+  });
+
+  it("keeps the dark canvas on the preset when only contrast changes", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+
+    const variants = deriveCustomTheme({ ...theme, contrast: 90 });
+
+    expect(variants.dark.background).toBe(PALETTES[0].tokens.dark.background);
     expect(variants.dark.shellBackground).toBe(PALETTES[0].tokens.dark.shellBackground);
   });
 
@@ -279,7 +357,7 @@ describe("customTheme", () => {
 
     const style = document.documentElement.style;
     expect(style.getPropertyValue("--custom-light-background")).not.toBe("");
-    expect(style.getPropertyValue("--custom-dark-background")).toBe("#160e24");
+    expect(style.getPropertyValue("--custom-dark-background")).toMatch(/^#[0-9a-f]{6}$/);
     expect(style.getPropertyValue("--custom-light-sidebar")).toMatch(/^rgba\(/);
     expect(style.getPropertyValue("--custom-dark-sidebar")).toMatch(/^rgba\(/);
     expect(document.documentElement).toHaveAttribute("data-custom-translucent-sidebar");
@@ -302,7 +380,7 @@ describe("customTheme", () => {
       contrast: 60,
       translucentSidebar: true,
     });
-    expect(scope.style.getPropertyValue("--custom-dark-background")).toBe("#160e24");
+    expect(scope.style.getPropertyValue("--custom-dark-background")).toMatch(/^#[0-9a-f]{6}$/);
     expect(scope).toHaveAttribute("data-custom-translucent-sidebar");
     expect(inner).toHaveAttribute("data-custom-translucent-sidebar");
     expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe("");
