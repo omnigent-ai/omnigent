@@ -176,6 +176,21 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
   });
 });
 
+describe("useResizableInlinePanel elevated content minimum (comments open)", () => {
+  // A raised content minimum preserves the rail's base width.
+  it("keeps the rail's 240 base minimum when the elevated-minimum content can't fit", () => {
+    setInnerWidth(900);
+    const reservedPx = 320; // open left sidebar
+    const elevated = renderHook(() => useResizableInlinePanel(SESSION, 720, reservedPx));
+    expect(elevated.result.current.panelWidth).toBe(240);
+    elevated.unmount();
+
+    const plain = renderHook(() => useResizableInlinePanel(SESSION, undefined, reservedPx));
+    expect(plain.result.current.panelWidth).toBe(92);
+    plain.unmount();
+  });
+});
+
 describe("useResizableInlinePanel drag overlay", () => {
   const overlaySelector = () =>
     [...document.body.children].find(

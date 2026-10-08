@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import {
-  resetCommentsWidthStoreForTesting,
+  resetCommentsSizeStoreForTesting,
   useResizableCommentsPanel,
 } from "./useResizableCommentsPanel";
 
@@ -18,7 +18,7 @@ beforeEach(() => {
 
 afterEach(() => {
   localStorage.clear();
-  resetCommentsWidthStoreForTesting();
+  resetCommentsSizeStoreForTesting();
   setInnerWidth(originalInnerWidth);
 });
 
@@ -38,12 +38,35 @@ describe("useResizableCommentsPanel persistence", () => {
     expect(readPanelSizePreference("commentsPanelWidthPx")).toBe(260);
 
     unmount();
-    resetCommentsWidthStoreForTesting();
+    resetCommentsSizeStoreForTesting();
     const restored = renderHook(() => useResizableCommentsPanel());
 
     // The restored hook must use the saved comments width instead of the fixed
     // 240px default, matching a browser refresh while comments are open.
     expect(restored.result.current.width).toBe(260);
+    restored.unmount();
+  });
+
+  it("persists the stacked height separately from the width", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+
+    // Default stacked height is 256. ArrowUp grows it by 20px.
+    act(() => {
+      result.current.handleProps.onKeyDown({
+        key: "ArrowUp",
+        preventDefault: () => {},
+      } as React.KeyboardEvent);
+    });
+
+    expect(result.current.height).toBe(276);
+    expect(result.current.width).toBe(240);
+    expect(readPanelSizePreference("commentsPanelHeightPx")).toBe(276);
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
+
+    unmount();
+    resetCommentsSizeStoreForTesting();
+    const restored = renderHook(() => useResizableCommentsPanel());
+    expect(restored.result.current.height).toBe(276);
     restored.unmount();
   });
 });
@@ -67,7 +90,9 @@ describe("useResizableCommentsPanel drag overlay", () => {
     );
     const overlay = overlaySelector();
     expect(overlay).not.toBeNull();
-    expect(overlay?.style.cursor).toBe("col-resize");
+    // With no measured row the panel stacks, so the drag is a height drag.
+    expect(result.current.handleProps["aria-orientation"]).toBe("horizontal");
+    expect(overlay?.style.cursor).toBe("row-resize");
 
     act(() => window.dispatchEvent(new MouseEvent("mouseup")));
     expect(overlaySelector()).toBeNull();
