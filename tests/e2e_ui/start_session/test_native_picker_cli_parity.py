@@ -207,68 +207,21 @@ def _subprocess_pythonpath() -> str:
 
 
 def _sanitized_env() -> dict[str, str]:
-    preserved_policy_vars = {"OMNIGENT_WRAPPER_BYPASS"}
-    state_vars = {
-        "CLAUDECODE",
-        "RUNNER_SERVER_URL",
-        "OMNIGENT",
-        "OMNIGENT_CONFIG_HOME",
-        "OMNIGENT_DATA_DIR",
-        "OMNIGENT_DATABASE_URI",
-        "OMNIGENT_DATABRICKS_CLIENT_ID",
-        "OMNIGENT_DATABRICKS_CLIENT_SECRET",
-        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
-        "OMNIGENT_HARNESS_AUTH_TOKEN",
-        "OMNIGENT_HOST_DAEMON_CONFIG_SIG",
-        "OMNIGENT_HOST_ID",
-        "OMNIGENT_HOST_NAME",
-        "OMNIGENT_HOST_TOKEN",
-        "OMNIGENT_INFERENCE_CONFIG",
-        "OMNIGENT_PROCESS_LOG_FILE",
-        "OMNIGENT_REPO",
-        "OMNIGENT_REQUIRE_WRAPPER",
-        "OMNIGENT_RUNNER_CONNECT_MARKER",
-        "OMNIGENT_RUNNER_DELEGATED_AUTH",
-        "OMNIGENT_RUNNER_ID",
-        "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN",
-        "OMNIGENT_RUNNER_INTERACTIVE_SHELLS",
-        "OMNIGENT_RUNNER_ISOLATE_SESSION",
-        "OMNIGENT_RUNNER_LAUNCH_HARNESS",
-        "OMNIGENT_RUNNER_OS_ENV_ROOT",
-        "OMNIGENT_RUNNER_PARENT_PID",
-        "OMNIGENT_RUNNER_PRIMARY_SESSION_ID",
-        "OMNIGENT_RUNNER_SLICE_KEY",
-        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
-        "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-        "OMNIGENT_RUNNER_WORKSPACE",
-        "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD",
-        "OMNIGENT_RUNNER_ZYGOTE_HARNESS_FD",
-        "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_EXIT",
-        "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE",
-        "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP",
-        "OMNIGENT_SESSION_ID",
-        "OMNIGENT_WRAPPER_COMMAND",
-        "_OMNIGENT_SERVER_URL",
-        "_OMNIGENT_SESSION_ID",
+    state_names = {"CLAUDE_CODE", "CLAUDECODE", "CODEX", "RUNNER_SERVER_URL", "OMNIGENT"}
+    state_prefixes = (
+        "ANTHROPIC_",
+        "CLAUDE_CODE_",
+        "CODEX_",
+        "DATABRICKS_",
+        "OPENAI_",
+        "OMNIGENT_",
+        "_OMNIGENT_",
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in state_names and not key.startswith(state_prefixes)
     }
-    env = dict(os.environ)
-    for key in list(env):
-        if key in preserved_policy_vars:
-            continue
-        if (
-            key.startswith(
-                (
-                    "DATABRICKS_",
-                    "CODEX_",
-                    "ANTHROPIC_",
-                    "OPENAI_",
-                    "CLAUDE_CODE_",
-                    "OMNIGENT_REPRO_",
-                )
-            )
-            or key in state_vars
-        ):
-            env.pop(key)
     env["OMNIGENT_SKIP_ONBOARD"] = "1"
     env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
     env["PYTHONPATH"] = _subprocess_pythonpath()
