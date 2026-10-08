@@ -1065,6 +1065,53 @@ def test_combined_operations_keep_prs_without_misattributing_creation(
 
 
 @pytest.mark.parametrize(
+    "content_command,target,created",
+    [
+        (
+            "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .description",
+            None,
+            True,
+        ),
+        (
+            "glab api projects/example%2Fone/merge_requests/7 -X PUT "
+            "--hostname gitlab.com --jq .description",
+            "https://gitlab.com/example/one/-/merge_requests/7",
+            False,
+        ),
+        (
+            "az repos pr create --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            None,
+            True,
+        ),
+        (
+            "az repos pr update --id 7 --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            "https://dev.azure.com/example/project/_git/repo/pullrequest/7",
+            False,
+        ),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_graphql_with_other_providers_content_preserves_only_explicit_targets(
+    content_command: str, target: str | None, created: bool, reverse: bool
+) -> None:
+    graphql = (
+        "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+        "{ pullRequest { url } } }' --jq .data.createPullRequest.pullRequest.url"
+    )
+    commands = [graphql, content_command]
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        A + "\n" + B,
+    )
+    assert [ref.url for ref in refs] == ([target] if target else [])
+    assert was_created is created
+
+
+@pytest.mark.parametrize(
     "result",
     [
         {"html_url": A + "#issuecomment-123", "body": B},

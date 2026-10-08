@@ -37,12 +37,17 @@ def creation_output(projection: str | None, url: str | None = URL) -> str:
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["shell", "login-shell"])
+@pytest.mark.parametrize("commit_first", [False, True], ids=["create", "commit-push-create"])
 @pytest.mark.parametrize(
     "projection",
     [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
 )
-def test_graphql_create_tracks_returned_pr(wrapped: bool, projection: str | None) -> None:
+def test_graphql_create_tracks_returned_pr(
+    wrapped: bool, commit_first: bool, projection: str | None
+) -> None:
     shell = command(projection=projection)
+    if commit_first:
+        shell = "git commit -m 'A change' && git push && " + shell
     if wrapped:
         shell = shlex.join(
             ["/bin/zsh", "-lc", "repo_id=$(gh api repos/example/project --jq .node_id)\n" + shell]
@@ -53,6 +58,8 @@ def test_graphql_create_tracks_returned_pr(wrapped: bool, projection: str | None
         if projection and projection.endswith(".url")
         else json.dumps(pr if projection else {"data": {"createPullRequest": {"pullRequest": pr}}})
     )
+    if commit_first:
+        output = "[contributor/topic 1a2b3c4] A change\n" + output
     references, created = extract_prs(
         "exec_command", {"cmd": shell}, {"exit_code": 0, "output": output}
     )
@@ -66,14 +73,14 @@ def test_graphql_create_tracks_returned_pr(wrapped: bool, projection: str | None
     [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
 )
 def test_graphql_shell_result_formats(transport: str, projection: str | None) -> None:
-    output = creation_output(projection)
+    output = "[1 (root-commit) 1a2b3c4] A change\n" + creation_output(projection)
     if transport == "runner-shell":
         output = json.dumps({"stdout": output, "stderr": "", "exit_code": 0})
     else:
         output += "\n[exit code: 0]"
     references, created = extract_prs(
         "sys_os_shell" if transport == "runner-shell" else "shell",
-        {"command": command(projection=projection)},
+        {"command": "git commit -m 'A change' && " + command(projection=projection)},
         output,
     )
     assert [ref.url for ref in references] == [URL]
@@ -275,6 +282,22 @@ def test_graphql_json_output_does_not_fall_back_to_unrelated_url(
 ) -> None:
     output = json.dumps({"data": {"createPullRequest": None}}) + "\n" + URL
     references, _ = extract_prs("shell", {"command": command(projection=projection)}, output)
+    assert not references
+
+
+@pytest.mark.parametrize("prefix", ['{"message":\n', "[\n", '"unfinished\n'])
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_incomplete_json_output_is_not_reparsed_as_pr_identity(
+    prefix: str, projection: str | None
+) -> None:
+    references, _ = extract_prs(
+        "shell",
+        {"command": command(projection=projection)},
+        prefix + creation_output(projection),
+    )
     assert not references
 
 

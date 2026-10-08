@@ -95,6 +95,8 @@ def pr_session(
             "-qm",
             "Initial",
         ],
+        # Avoid racing the startup cache probe against the test's real commit.
+        ["-C", str(workspace), "config", "core.untrackedCache", "true"],
         [
             "-C",
             str(workspace),
@@ -181,6 +183,20 @@ def test_pr_appears_in_composer_and_workspace(
                 ".data.createPullRequest.pullRequest",
             ]
         )
+        commit = shlex.join(
+            [
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "A change",
+            ]
+        )
+        shell = f"{commit} && {shell}"
         configure_mock_llm(
             mock_llm_server_url,
             [

@@ -419,7 +419,10 @@ def _graphql_output_values(result: object, depth: int = 0) -> list[object]:
         if end == -1:
             end = len(result)
         line = result[index:end].strip()
-        if line == "[exit code: 0]":
+        # Git's bracketed branch/object-ID summary is text, not a JSON array.
+        if line == "[exit code: 0]" or re.fullmatch(
+            r"\[[^\]\r\n]+ [0-9a-f]{4,64}\](?: .*)?", line
+        ):
             index = end
             continue
         if result[index] in '{["' or line == "null":
