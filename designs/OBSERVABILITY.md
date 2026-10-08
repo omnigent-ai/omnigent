@@ -484,15 +484,17 @@ Two shared helpers keep the common cases one-liners:
 **Worked example — skill-execution telemetry (turn-scoped).** The executor
 adapter observes the `Skill` / `load_skill` tool call, stamps the ungated
 `omnigent.skill.name` on that tool span (`TracingContext.set_skill_name`), and
-`set_active_skill(name)` so `omnigent.skill.active` lands on every later span in
-the turn — that is how "which tools ran during skill X" is derivable with no
+`set_active_skill(name)` so `omnigent.skill.active` lands on later spans started in
+the turn's updated context. This identifies the tools used during a skill without
 per-tool code. At turn end the adapter records, per skill call,
 `omnigent.skill.invocations` (by outcome) and `omnigent.skill.execution.duration`;
-`omnigent.skill.tool_calls` counts each later tool call against the most recent
-skill (`omnigent/runtime/skill_metrics.py`). It then releases the active-skill
-binding. Boundaries are turn-scoped and therefore approximate: there is no native
+`omnigent.skill.tool_calls` counts each later tool call once by call ID, against
+the skill active at its first observation (`omnigent/runtime/skill_metrics.py`).
+It then releases the active-skill binding. Boundaries are turn-scoped and
+therefore approximate: there is no native
 "skill finished" signal, so each call's window is the Skill call → end of that
-agent turn.
+agent turn. Invocations represent attempts, including failed loads; outcome comes
+from the turn, and a failed load does not clear the active-skill binding.
 
 The skill name is read only from the tool's name field (`skill` / `command` for
 `Skill`, `name` for `load_skill`) and must look like a skill name (optionally

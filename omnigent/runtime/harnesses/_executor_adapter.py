@@ -308,6 +308,7 @@ class ExecutorAdapter(HarnessApp):
         # recent last. The first token restores the pre-turn active skill.
         _active_skill_token: Any = None
         _skill_calls: list[tuple[str, float]] = []
+        _seen_tool_call_ids: set[str] = set()
         _turn_outcome: str | None = None
 
         user_message = _extract_last_user_message(request.input)
@@ -388,10 +389,16 @@ class ExecutorAdapter(HarnessApp):
                                     if _active_skill_token is None:
                                         _active_skill_token = _token
                                     _skill_calls.append((_skill_name, time.monotonic()))
-                            elif _skill_calls:
-                                skill_metrics.record_skill_tool_call(
-                                    _skill_calls[-1][0], _bare_tool_name
-                                )
+                            else:
+                                # Codex reports the same call at start and completion.
+                                _call_id = _call_id_from_metadata(event.metadata)
+                                if not _call_id or _call_id not in _seen_tool_call_ids:
+                                    if _skill_calls:
+                                        skill_metrics.record_skill_tool_call(
+                                            _skill_calls[-1][0], _bare_tool_name
+                                        )
+                                    if _call_id:
+                                        _seen_tool_call_ids.add(_call_id)
                         elif isinstance(event, ToolCallComplete):
                             if _active_tool_span is not None:
                                 tctx.end_tool_span(

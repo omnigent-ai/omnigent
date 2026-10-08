@@ -125,6 +125,7 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> _Recorded:
 def exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
     """Enable tracing on a fresh provider with the active-skill processor."""
     monkeypatch.delenv("OMNIGENT_OTEL_CAPTURE_CONTENT", raising=False)
+    monkeypatch.setattr(telemetry, "_capture_content", False)
     previous = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
     previous_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
     in_mem = InMemorySpanExporter()
@@ -154,7 +155,7 @@ def _tool(name: str, args: dict[str, object], call_id: str) -> list[ExecutorEven
 
 
 async def _run(events: list[ExecutorEvent]) -> None:
-    """Run one adapter turn over *events*; executor errors are swallowed."""
+    """Run one adapter turn over *events*."""
     executor = MockExecutor()
     executor.enqueue_events(events)
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
@@ -164,8 +165,7 @@ async def _run(events: list[ExecutorEvent]) -> None:
         cancelled=asyncio.Event(),
     )
     try:
-        with contextlib.suppress(RuntimeError):
-            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hi"), ctx)
+        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hi"), ctx)
     finally:
         await adapter.on_shutdown()
 
@@ -209,6 +209,57 @@ async def test_each_skill_call_is_counted_and_timed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("call_id", "initial_skill", "next_skill", "observations", "expected"),
+    [
+        pytest.param("shell-1", "a", None, [False, True], ["a"], id="live-and-completed"),
+        pytest.param("shell-1", "a", None, [True], ["a"], id="completed-only"),
+        pytest.param(None, "a", None, [False, False], ["a", "a"], id="missing-ids"),
+        pytest.param("", "a", None, [False, False], ["a", "a"], id="empty-ids"),
+        pytest.param("shell-1", None, "a", [False, True], [], id="started-before-skill"),
+        pytest.param("shell-1", "a", "b", [False, True], ["a"], id="skill-changed"),
+    ],
+)
+async def test_tool_metrics_count_each_observed_call_once(
+    exporter: InMemorySpanExporter,
+    recorded: _Recorded,
+    call_id: str | None,
+    initial_skill: str | None,
+    next_skill: str | None,
+    observations: list[bool],
+    expected: list[str],
+) -> None:
+    """Codex completion observations preserve the first observation's attribution."""
+    del exporter
+    events: list[ExecutorEvent] = []
+    if initial_skill:
+        events.extend(_tool("load_skill", {"name": initial_skill}, "skill-1"))
+    for index, completed in enumerate(observations):
+        if index and next_skill:
+            events.extend(_tool("load_skill", {"name": next_skill}, "skill-2"))
+        events.append(
+            ToolCallRequest(
+                name="shell",
+                args={"command": "pwd"},
+                metadata={
+                    "call_id": call_id,
+                    "internally_executed": True,
+                    "observed_call_completed": completed,
+                },
+            )
+        )
+    events.extend(
+        [
+            ToolCallComplete(name="shell", result="/tmp", metadata={"call_id": call_id}),
+            TurnComplete(response="done"),
+        ]
+    )
+    await _run(events)
+
+    assert recorded.tool_calls == [(skill, "shell") for skill in expected]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("terminal", "outcome"),
     [
         (TurnComplete(response="done"), "success"),
@@ -224,7 +275,12 @@ async def test_turn_outcome_and_active_skill_cleanup(
 ) -> None:
     """The turn's outcome labels the invocation and the active skill is always released."""
     del exporter
-    await _run([*_tool("Skill", {"skill": "deploy"}, "c1"), terminal])
+    with (
+        pytest.raises(RuntimeError, match="inner executor error: boom")
+        if outcome == "error"
+        else contextlib.nullcontext()
+    ):
+        await _run([*_tool("Skill", {"skill": "deploy"}, "c1"), terminal])
 
     assert recorded.invocations == [("deploy", outcome)]
     assert telemetry._active_skill_var.get() is None
