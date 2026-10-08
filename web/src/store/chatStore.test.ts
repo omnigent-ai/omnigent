@@ -33,6 +33,11 @@ import type {
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
+import {
+  buildPendingBubbles,
+  computeIsWorking,
+  mergePendingBubbles,
+} from "@/components/chat/chatBubbleParts";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
@@ -1319,6 +1324,381 @@ describe("chatStore — switchTo", () => {
     expect(kinds[0]).toBe("user_message");
     expect(state.blocks[0]!.ctx.itemId).toBe("item_bg_user");
     expect(kinds.slice(1)).not.toContain("user_message");
+
+    sink.close();
+  });
+
+  // Compose transcript bubbles like Transcript.tsx (buildBubbles + pending
+  // merge); the elicitation/routing-chip reorders it also runs do not affect
+  // these ordering scenarios. Then assert prompt-above-reply ordering.
+  const composeNativeRoles = (): string[] => {
+    const state = useChatStore.getState();
+    const committed = buildBubbles(
+      state.blocks,
+      state.activeResponse,
+      undefined,
+      [],
+      computeIsWorking(state.sessionStatus),
+    );
+    const bubbles = mergePendingBubbles(
+      committed,
+      buildPendingBubbles(state.pendingUserMessages, getCurrentAuthorId()),
+    );
+    return bubbles.map((b) => b.kind);
+  };
+  const expectUserAboveReply = (label: string): void => {
+    const roles = composeNativeRoles();
+    const userIdx = roles.indexOf("user");
+    const assistantIdx = roles.indexOf("assistant");
+    expect(userIdx, `${label}: user bubble present`).toBeGreaterThanOrEqual(0);
+    expect(assistantIdx, `${label}: assistant bubble present`).toBeGreaterThanOrEqual(0);
+    expect(userIdx, `${label}: user renders above the reply`).toBeLessThan(assistantIdx);
+  };
+
+  it("keeps the user message above a native reply that previews before input.consumed, through consumption and the committed item", async () => {
+    // Forwarder ordering: the reply's `live:` preview, then input.consumed, then
+    // the committed assistant item. The user's input must stay above the reply at
+    // every step, including after input.consumed when no pending bubble remains.
+    const sink = pushableStream();
+    seedSession("conv_omni5555_full", []);
+    sessionLabels.set("conv_omni5555_full", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_omni5555_full/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_omni5555_full");
+    expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
+    await useChatStore.getState().send("what is the capital of France?", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+
+    // 1. The reply previews before input.consumed acks the user's message.
+    sink.push(sse("response.created", { id: "resp_5555f", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "The capital of France is Paris.",
+        message_id: "msg_5555f",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_5555f");
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    expectUserAboveReply("preview, user still pending");
+
+    // 2. input.consumed promotes the user message out of `pendingUserMessages`
+    //    while the preview is still the trailing committed block.
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_user_5555f",
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "what is the capital of France?" }],
+          },
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
+    expectUserAboveReply("after input.consumed, preview still live");
+
+    // 3. The authoritative assistant item lands and replaces the preview.
+    sink.push(
+      sse("response.output_item.done", {
+        message_id: "msg_5555f",
+        item: {
+          type: "message",
+          role: "assistant",
+          id: "item_asst_5555f",
+          response_id: "resp_5555f",
+          content: [{ type: "output_text", text: "The capital of France is Paris." }],
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expectUserAboveReply("after the committed assistant item");
+
+    sink.close();
+  });
+
+  it("flags a local idle send but not one steered into an already-streaming native reply", async () => {
+    // send() records whether the agent was idle at submit time, so the renderer
+    // lifts an idle send that merely raced the forwarder above the preview while
+    // keeping a steered follow-up below the in-flight reply it steers into.
+    const sink = pushableStream();
+    seedSession("conv_5555_steer", []);
+    sessionLabels.set("conv_5555_steer", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_5555_steer/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_5555_steer");
+    await useChatStore.getState().send("first question", "agent_xyz");
+
+    // The reply to the first message is already previewing...
+    sink.push(sse("response.created", { id: "resp_steer", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "Working on it.",
+        message_id: "msg_steer",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_steer");
+
+    // ...when the user steers a follow-up into that live response.
+    await useChatStore.getState().send("actually, use metric units", "agent_xyz");
+
+    const pending = useChatStore.getState().pendingUserMessages;
+    const textOf = (m: (typeof pending)[number]): string =>
+      m.content.map((c) => (c.type === "input_text" ? c.text : "")).join("");
+    const idle = pending.find((m) => textOf(m) === "first question");
+    const steered = pending.find((m) => textOf(m) === "actually, use metric units");
+    expect(idle, "idle send present").toBeDefined();
+    expect(steered, "steered send present").toBeDefined();
+    expect(idle?.sentWhileIdle).toBe(true);
+    expect(steered?.sentWhileIdle ?? false).toBe(false);
+
+    sink.close();
+  });
+
+  it("after a settled turn, never lifts the next prompt above the prior answer", async () => {
+    // buildBubbles fuses a settled answer with the next reply's `live:` preview
+    // into one bubble, so the merge layer keeps the optimistic follow-up at the
+    // tail; input.consumed then settles the prompt above only its own preview.
+    const sink = pushableStream();
+    seedSession("conv_5555_follow", [
+      userMessage("resp_prev", "first question"),
+      assistantMessage("resp_prev", "The capital of France is Paris."),
+    ]);
+    sessionLabels.set("conv_5555_follow", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_5555_follow/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_5555_follow");
+    await useChatStore.getState().send("and Germany?", "agent_xyz");
+
+    // The reply previews before input.consumed acks the follow-up.
+    sink.push(sse("response.created", { id: "resp_follow", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "The capital of Germany is Berlin.",
+        message_id: "msg_follow",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_follow");
+
+    // The follow-up stays at the tail, never above the prior settled answer.
+    expect(composeNativeRoles()).toEqual(["user", "assistant", "user"]);
+
+    // input.consumed settles the follow-up above only its own live preview.
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_follow",
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "and Germany?" }] },
+        },
+      }),
+    );
+    await tick();
+    await tick();
+
+    const order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    const userIdx = order.indexOf("item_follow");
+    const liveIdx = order.indexOf("live:msg_follow");
+    expect(userIdx).toBeGreaterThanOrEqual(0);
+    expect(liveIdx).toBeGreaterThan(userIdx);
+    // The settled prior answer renders above the promoted prompt, which in turn
+    // renders above its own streaming reply.
+    expect(composeNativeRoles()).toEqual(["user", "assistant", "user", "assistant"]);
+
+    sink.close();
+  });
+
+  it("keeps a reloaded reply above a hydrated pending message through input.consumed", async () => {
+    // Reload mid-reply: pending_inputs hydration has unknown provenance, so the
+    // message stays below the re-previewed reply before and after input.consumed
+    // names its id -- never flipping above the reply like a known idle send.
+    const sink = pushableStream();
+    seedSession("conv_5555_reload", []);
+    seedPendingInputs("conv_5555_reload", [
+      { pending_id: "pending_steer", content: [{ type: "input_text", text: "use metric units" }] },
+    ]);
+    sessionLabels.set("conv_5555_reload", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_5555_reload/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_5555_reload");
+    // Hydrated from pending_inputs: no local send timing, so no idle flag.
+    const hydrated = useChatStore.getState().pendingUserMessages;
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]!.sentWhileIdle ?? false).toBe(false);
+
+    // The reply re-previews before input.consumed re-acks the queued message.
+    sink.push(sse("response.created", { id: "resp_reload", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "Converting to metric.",
+        message_id: "msg_reload",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_reload");
+    // Unknown provenance never lifts: the reply stays above the hydrated message.
+    expect(composeNativeRoles()).toEqual(["assistant", "user"]);
+
+    // input.consumed names the hydrated entry by its pending id (branch 1).
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_reload_user",
+          type: "message",
+          cleared_pending_id: "pending_steer",
+          data: { role: "user", content: [{ type: "input_text", text: "use metric units" }] },
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
+    const order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    expect(order.indexOf("live:msg_reload")).toBeLessThan(order.indexOf("item_reload_user"));
+    expect(composeNativeRoles()).toEqual(["assistant", "user"]);
+
+    sink.close();
+  });
+
+  it("keeps a fresh send below a stopped turn's lingering preview", async () => {
+    // Stop leaves the interrupted reply's `live:` preview behind without
+    // settling it. A fresh idle send must stay below that prior turn's reply,
+    // not lift above it the way it lifts above its own in-flight reply.
+    const sink = pushableStream();
+    seedSession("conv_5555_stop", []);
+    sessionLabels.set("conv_5555_stop", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_5555_stop/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_5555_stop");
+    await useChatStore.getState().send("first question", "agent_xyz");
+
+    // The reply previews, then the user stops it before it settles.
+    sink.push(sse("response.created", { id: "resp_stop", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "Partial answer so far",
+        message_id: "msg_stop",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_stop");
+
+    useChatStore.getState().stop();
+    await tick();
+    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
+
+    // A fresh idle send after the stop, while the old preview still lingers.
+    await useChatStore.getState().send("second question", "agent_xyz");
+    await tick();
+    const pending = useChatStore.getState().pendingUserMessages;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.sentWhileIdle).toBe(true);
+    // The lingering preview is no longer the active streaming turn, so the new
+    // prompt stays below the prior reply instead of overtaking it.
+    expect(composeNativeRoles()).toEqual(["assistant", "user"]);
+
+    // The forwarder then mirrors the transcript in order: the stopped turn's
+    // partial answer, Claude's own interrupt marker, and only then the new input.
+    sink.push(
+      sse("response.output_item.done", {
+        message_id: "msg_stop",
+        item: {
+          type: "message",
+          role: "assistant",
+          id: "item_asst_stop",
+          response_id: "resp_stop",
+          content: [{ type: "output_text", text: "Partial answer so far" }],
+        },
+      }),
+    );
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_interrupt_marker",
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "[Request interrupted by user]" }],
+          },
+        },
+      }),
+    );
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_user_2",
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "second question" }] },
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
+    let order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    expect(order).not.toContain("live:msg_stop");
+    expect(order.indexOf("item_asst_stop")).toBeLessThan(order.indexOf("item_interrupt_marker"));
+    expect(order.indexOf("item_interrupt_marker")).toBeLessThan(order.indexOf("item_user_2"));
+
+    // The new reply's preview races in: the promoted prompt stays above its own
+    // reply, and the stopped turn's answer stays above everything that followed.
+    sink.push(sse("response.created", { id: "resp_2", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", { delta: "Second answer", message_id: "msg_2", index: 0 }),
+    );
+    await tick();
+    await tick();
+    order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    expect(order.indexOf("item_user_2")).toBeLessThan(order.indexOf("live:msg_2"));
+    expect(order.indexOf("item_asst_stop")).toBeLessThan(order.indexOf("item_user_2"));
+    // The interrupt marker renders as a (system-styled) user bubble.
+    expect(composeNativeRoles()).toEqual(["assistant", "user", "user", "assistant"]);
 
     sink.close();
   });
@@ -3200,6 +3580,9 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(isTempConvId(tempConvId)).toBe(true);
     // One optimistic bubble is shown under the temp id, entry pre-streaming.
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    // The first send of a new conversation is idle, so its reply cannot overtake
+    // it when the preview races input.consumed.
+    expect(useChatStore.getState().pendingUserMessages[0]!.sentWhileIdle).toBe(true);
 
     hydrateLocalConversation(
       tempConvId,
@@ -4028,6 +4411,8 @@ describe("chatStore — sendSlashCommand", () => {
     const pending = useChatStore.getState().pendingUserMessages;
     expect(pending).toHaveLength(1);
     expect(pending[0]!.content).toEqual([{ type: "input_text", text: "/grill-me review this" }]);
+    // Sent while idle, so a racing native reply preview cannot overtake the echo.
+    expect(pending[0]!.sentWhileIdle).toBe(true);
 
     resolvePost();
     await p;

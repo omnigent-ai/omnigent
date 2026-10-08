@@ -351,6 +351,9 @@ export function beginLocalConversation(
     content,
     initialDraft: { text, files: files ?? [] },
     createdAtS: Math.floor(Date.now() / 1000),
+    // A new conversation has no reply in flight, so the first send is idle: its
+    // own reply may preview before input.consumed and must stay below it.
+    sentWhileIdle: true,
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
 
@@ -536,6 +539,11 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /** The send happened locally while the agent was idle, so a native reply
+   *  that previews before input.consumed can be lifted below this message.
+   *  Absent on sends that steered into an in-flight reply and on
+   *  snapshot-replayed entries (unknown provenance), which stay at the tail. */
+  sentWhileIdle?: boolean;
 }
 
 /**
@@ -2361,6 +2369,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+                ...(alreadyStreaming ? {} : { sentWhileIdle: true }),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -2673,6 +2682,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           content: [{ type: "input_text" as const, text: commandText }],
           createdAtS: Math.floor(Date.now() / 1000),
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+          ...(alreadyStreaming ? {} : { sentWhileIdle: true }),
         },
       ],
     }));
@@ -6739,6 +6749,21 @@ function committedUserBlock(
   };
 }
 
+// Claude-native forwards a reply's delta preview before the user item, so a
+// trailing `live:` preview can sit at the tail when the message is promoted.
+// Lift the user above it only for a known local idle send.
+function blocksWithPromotedUserMessage(
+  blocks: AnyBlock[],
+  userBlock: UserMessageBlock,
+  liftAboveReply: boolean,
+): AnyBlock[] {
+  if (!liftAboveReply) return [...blocks, userBlock];
+  let at = blocks.length;
+  while (at > 0 && isLiveProvisionalBlock(blocks[at - 1]!)) at -= 1;
+  if (at === blocks.length) return [...blocks, userBlock];
+  return [...blocks.slice(0, at), userBlock, ...blocks.slice(at)];
+}
+
 interface RefetchRunnerBackedSessionStateOptions {
   /** Force the AP server to re-read runner-backed caches before returning. */
   refreshState?: boolean;
@@ -7542,8 +7567,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
               // stableKey = the optimistic bubble's temp id → the
               // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
+              blocks: blocksWithPromotedUserMessage(
+                s.blocks,
                 committedUserBlock(
                   event.itemId,
                   content,
@@ -7551,7 +7576,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
                 ),
-              ],
+                matched.sentWhileIdle === true,
+              ),
             };
           }
         }
@@ -7577,8 +7603,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             pendingUserMessages: s.pendingUserMessages.slice(1),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
+            blocks: blocksWithPromotedUserMessage(
+              s.blocks,
               committedUserBlock(
                 event.itemId,
                 content,
@@ -7586,12 +7612,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.createdBy ?? head.author,
                 head.createdAtS,
               ),
-            ],
+              head.sentWhileIdle === true,
+            ),
           };
         }
 
         // 3. Nothing pending (or a marker that owns no bubble) — render the
-        //    event payload fresh.
+        //    event payload fresh. No local send timing (another client), so
+        //    append below any streaming preview instead of guessing a lift.
         if (eventContent === null) return {};
         return {
           blocks: [

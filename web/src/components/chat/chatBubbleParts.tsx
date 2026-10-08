@@ -61,6 +61,7 @@ import {
   imagePreview,
   isTextBlock,
   keyedAttachments,
+  LIVE_ITEM_PREFIX,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -221,6 +222,7 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      ...(p.sentWhileIdle ? { sentWhileIdle: true } : {}),
     };
   });
 }
@@ -267,17 +269,61 @@ function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
   return start === 0 ? start : end;
 }
 
+// A new prompt may lift above only a streaming turn's pure `live:` preview. A
+// settled item (a committed id, or any non-text/reasoning kind, which never
+// stream id-less) or a non-streaming lifecycle keeps the prompt below it.
+function isNativeLivePreviewBubble(bubble: Bubble): boolean {
+  if (bubble.kind !== "assistant" || bubble.lifecycle !== "streaming") return false;
+  let hasPreview = false;
+  let hasSettled = false;
+  for (const item of bubble.items) {
+    const itemId = "itemId" in item ? item.itemId : null;
+    if (itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false) hasPreview = true;
+    else if (itemId !== null || (item.kind !== "text" && item.kind !== "reasoning"))
+      hasSettled = true;
+  }
+  return hasPreview && !hasSettled;
+}
+
 // Place optimistic pending user bubbles into the committed timeline, keeping
-// the prompt above a trailing REQUEST-phase card or create-time routing chip.
+// the prompt above a trailing REQUEST-phase card, a streaming native reply
+// preview, or a create-time routing chip.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
-  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
+  while (
+    insertAt > 0 &&
+    (isStandaloneElicitationBubble(committed[insertAt - 1]!) ||
+      isNativeLivePreviewBubble(committed[insertAt - 1]!))
+  ) {
     insertAt -= 1;
   }
   insertAt = liftAboveCreateRoutingChips(committed, insertAt);
-  if (insertAt === committed.length) return [...committed, ...pending];
-  return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+  // A known local idle send that raced a streaming preview lifts above it;
+  // other sends stay below. Only the FIFO prefix of idle sends lifts so a mixed
+  // batch keeps its order on each side of the trailing preview.
+  const trailingPreview = committed.slice(insertAt).some(isNativeLivePreviewBubble);
+  if (!trailingPreview) {
+    if (insertAt === committed.length) return [...committed, ...pending];
+    return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
+  }
+  const isIdleLocalSend = (bubble: Bubble): boolean =>
+    bubble.kind === "user" && (bubble.sentWhileIdle ?? false);
+  const firstKept = pending.findIndex((bubble) => !isIdleLocalSend(bubble));
+  const lifted = firstKept === -1 ? pending : pending.slice(0, firstKept);
+  const kept = firstKept === -1 ? [] : pending.slice(firstKept);
+  // Non-idle sends stay below the preview but above a trailing REQUEST card.
+  let keptAt = committed.length;
+  while (keptAt > 0 && isStandaloneElicitationBubble(committed[keptAt - 1]!)) {
+    keptAt -= 1;
+  }
+  return [
+    ...committed.slice(0, insertAt),
+    ...lifted,
+    ...committed.slice(insertAt, keptAt),
+    ...kept,
+    ...committed.slice(keptAt),
+  ];
 }
 
 type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;

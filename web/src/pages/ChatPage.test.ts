@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
+import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
@@ -514,6 +515,62 @@ const assistantText = (id: string): Bubble => ({
   error: null,
   items: [{ kind: "text", itemId: id, text: "hi", final: true }],
 });
+// A streaming native reply whose text is still a provisional `live:<id>`
+// preview block, before its authoritative transcript item lands.
+const livePreviewReply = (id: string): Bubble => ({
+  kind: "assistant",
+  responseId: id,
+  stableId: id,
+  lifecycle: "streaming",
+  error: null,
+  items: [{ kind: "text", itemId: `${LIVE_ITEM_PREFIX}${id}`, text: "Paris", final: true }],
+});
+// The same preview after its turn was stopped: a cancelled lifecycle, so a new
+// send must stay below it rather than jump above the prior reply.
+const cancelledPreviewReply = (id: string): Bubble => ({
+  kind: "assistant",
+  responseId: id,
+  stableId: id,
+  lifecycle: "cancelled",
+  error: null,
+  items: [{ kind: "text", itemId: `${LIVE_ITEM_PREFIX}${id}`, text: "Paris", final: true }],
+});
+// A single assistant bubble fusing a settled answer with the next reply's
+// trailing `live:` preview — the shape buildBubbles yields when a new turn
+// previews before its user item commits.
+const settledThenPreviewReply = (settledId: string, previewId: string): Bubble => ({
+  kind: "assistant",
+  responseId: previewId,
+  stableId: settledId,
+  lifecycle: "streaming",
+  error: null,
+  items: [
+    { kind: "text", itemId: settledId, text: "Earlier answer", final: true },
+    { kind: "text", itemId: `${LIVE_ITEM_PREFIX}${previewId}`, text: "Next", final: true },
+  ],
+});
+// An optimistic prompt from a local send while the agent was idle -- the only
+// provenance the renderer lifts above a trailing native live preview.
+const idleUserBubble = (id: string): Bubble => ({
+  kind: "user",
+  itemId: id,
+  content: [{ type: "input_text", text: id }],
+  sentWhileIdle: true,
+});
+// A streaming reply bubble that already holds a settled non-text item (a native
+// tool call, here with the id-less shape such items can take) plus the next
+// reply's trailing `live:` preview.
+const toolThenPreviewReply = (toolId: string, previewId: string): Bubble => ({
+  kind: "assistant",
+  responseId: previewId,
+  stableId: toolId,
+  lifecycle: "streaming",
+  error: null,
+  items: [
+    { kind: "native_tool", itemId: null, toolType: "read", label: "Read", data: {} },
+    { kind: "text", itemId: `${LIVE_ITEM_PREFIX}${previewId}`, text: "Next", final: true },
+  ],
+});
 // A card with no turn to anchor to carries the `elicit_*` response id
 // blockStream stamps for exactly that case; pass `responseId` to model a
 // card that DOES belong to a turn (an inline approval, or a question card
@@ -640,6 +697,86 @@ describe("mergePendingBubbles", () => {
       "e1",
       "pend_1",
     ]);
+  });
+
+  it("lifts an idle local send above a trailing native live-preview reply", () => {
+    // A native reply previews as a `live:` block before input.consumed promotes
+    // the just-sent idle message, so appending after it would show the reply above
+    // the user's own input.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [idleUserBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "a1"]);
+  });
+
+  it("does NOT lift even an idle send above a bubble fusing a settled answer with a preview", () => {
+    // buildBubbles groups a settled answer and the next reply's `live:` preview
+    // into one bubble; lifting it would push the prompt above the prior settled
+    // answer, so an idle send -- the only one eligible to lift -- stays below.
+    const committed = [userBubble("u1"), settledThenPreviewReply("a1", "a2")];
+    const merged = mergePendingBubbles(committed, [idleUserBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1"]);
+  });
+
+  it("does NOT lift a send of unknown or steered provenance above a trailing preview", () => {
+    // Only a known idle send lifts; a steered send and a snapshot-replayed entry
+    // carry no idle flag, so they stay below the live preview.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["a1", "pend_1"]);
+  });
+
+  it("lifts the idle prefix of a mixed batch but keeps a trailing steered send below", () => {
+    // A mixed pending batch -- an idle prompt whose reply is previewing followed
+    // by a steered one -- lifts only the leading idle prefix above the preview and
+    // keeps the rest below it in order.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [
+      idleUserBubble("idle_1"),
+      userBubble("steer_1"),
+    ]);
+    expect(bubbleIds(merged)).toEqual(["idle_1", "a1", "steer_1"]);
+  });
+
+  it("keeps FIFO order when a steered send precedes an idle one in the batch", () => {
+    // The FIFO prefix is lifted, not every idle send: a steered send at the head
+    // pins the whole batch below the preview so the original order is preserved.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [
+      userBubble("steer_1"),
+      idleUserBubble("idle_1"),
+    ]);
+    expect(bubbleIds(merged)).toEqual(["a1", "steer_1", "idle_1"]);
+  });
+
+  it("does NOT lift even an idle send above a bubble whose settled content is an id-less tool call", () => {
+    // A streaming bubble can fuse a tool call with the next reply's trailing
+    // preview; a non-text item is settled content even without an item id, so
+    // it keeps an idle send below just like settled text would.
+    const committed = [userBubble("u1"), toolThenPreviewReply("t1", "a2")];
+    const merged = mergePendingBubbles(committed, [idleUserBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "t1", "pend_1"]);
+  });
+
+  it("does NOT lift an idle send above a cancelled turn's lingering preview", () => {
+    // A stopped reply leaves its `live:` preview behind as a cancelled turn; a
+    // fresh idle send must stay below it, not jump above the prior reply.
+    const committed = [cancelledPreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [idleUserBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["a1", "pend_1"]);
+  });
+
+  it("keeps a steered send below the preview but above a trailing request card", () => {
+    // With a reply preview AND a trailing REQUEST card, a steered send still
+    // stays below the preview, yet above the card it would otherwise sink under.
+    const committed = [livePreviewReply("a1"), elicitationBubble("e1", "request")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["a1", "pend_1", "e1"]);
+  });
+
+  it("lifts an idle send above both the preview and a trailing request card", () => {
+    const committed = [livePreviewReply("a1"), elicitationBubble("e1", "request")];
+    const merged = mergePendingBubbles(committed, [idleUserBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "a1", "e1"]);
   });
 });
 

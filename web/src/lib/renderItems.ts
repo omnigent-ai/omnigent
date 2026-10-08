@@ -172,6 +172,10 @@ export type Bubble =
       /** Epoch seconds of this message, when known — server-stamped from
        *  history, client-stamped while live. Display-only. */
       createdAtS?: number;
+      /** The optimistic send happened while the agent was idle, so it can lift
+       *  above a native reply that previews before input.consumed. Absent on
+       *  steered and snapshot-replayed sends, which stay below the preview. */
+      sentWhileIdle?: boolean;
       /**
        * Stable React key when promoted from an optimistic
        * `pendingUserMessages` entry — carries that entry's client temp
