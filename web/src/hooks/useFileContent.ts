@@ -177,7 +177,11 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * once at end-of-turn, avoiding continuous refetches that would reset the
  * editor's scroll and cursor position.
  */
-export function useFileContent(conversationId: string | undefined, path: string | null) {
+export function useFileContent(
+  conversationId: string | undefined,
+  path: string | null,
+  options: { retry?: boolean } = {},
+) {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =
@@ -210,5 +214,6 @@ export function useFileContent(conversationId: string | undefined, path: string 
     queryFn: () => fetchFileContent(conversationId!, path!),
     enabled: !!conversationId && !!path && serveable !== false,
     staleTime: 5_000,
+    ...(options.retry === undefined ? {} : { retry: options.retry }),
   });
 }

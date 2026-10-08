@@ -10,6 +10,7 @@ Recordings linked in chat and opened from Files render in an inline player with 
 - `recording-playback`: Play, pause, seek, and fullscreen use the browser's media controls without automatic playback on mount.
 - `recording-failure`: Failed reads and unsupported codecs show a download fallback and Retry.
 - `recording-lifecycle`: Workspace bytes load only on Play; switching files cancels pending reads and releases loaded media.
+- `recording-actions`: Optional WebVTT chapters seek to agent actions and highlight the current step during playback.
 
 ## How to get to it (user POV)
 
@@ -19,6 +20,7 @@ Recordings linked in chat and opened from Files render in an inline player with 
 - Files: open the Files panel, choose Explore or Changes, and select a recording.
 - Deep link: open a conversation URL with `?file=demo.webm`.
 - Mobile web: use the same deep link or file selection at a narrow viewport; playback stays inline.
+- Annotated recording: save a `.chapters.vtt` file beside the video using the [annotation format](../docs/video-recordings.md), then select an action beside or below the player.
 
 ## Driving it with the repro environment
 
@@ -26,6 +28,8 @@ Preconditions: build this checkout and install its Playwright Chromium. The brow
 
 - Chat, chat file link, Files browsing, deep link, and mobile playback: `tests/browser_ui/files/test_video_rendering.py::test_workspace_recording_playback`.
 - Desktop and mobile chat footer layout and keyboard file opening: `tests/browser_ui/files/test_video_rendering.py::test_chat_recording_label_stays_inside_footer`.
+- Desktop and mobile action navigation in chat, file links, Files, Changes, and deep links: `tests/browser_ui/files/test_video_rendering.py::test_recording_action_navigation`.
+- Optional annotations: `tests/browser_ui/files/test_video_rendering.py::test_optional_recording_annotations` covers malformed and truncated WebVTT; the ordinary playback checks cover missing annotations.
 - Remote recording: `tests/browser_ui/files/test_video_rendering.py::test_remote_recording_playback`.
 - Failed download: `tests/browser_ui/files/test_video_rendering.py::test_recording_download_failure`.
 - Run `uv run --no-sync pytest tests/browser_ui/files/test_video_rendering.py --browser-ui-skip-build --video=on --output=/tmp/omnigent-video-evidence`.
@@ -34,7 +38,8 @@ Preconditions: build this checkout and install its Playwright Chromium. The brow
 
 ## Gotchas
 
-- This feature renders existing recordings. Capture, annotation, auto-zoom, and video transcoding are separate capabilities.
+- This feature renders existing recordings and agent-supplied WebVTT chapters. Capture, automatic timestamp alignment, auto-zoom, and video transcoding are separate capabilities.
+- Actions need video-relative seconds in the companion annotation file; session timestamps alone cannot align a recording. Missing or invalid annotations preserve ordinary playback. Remote video links do not discover annotation files.
 - Browser codec support determines playback. A MOV container can contain codecs the browser cannot decode; download remains available.
 - Workspace playback buffers the complete file in a Blob before playback. Large recordings need time and memory; bytes are released when the player unmounts.
 - The raw download endpoint needs a runner. Host-only offline filesystem previews cannot provide complete video bytes.

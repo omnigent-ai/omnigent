@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
+import type * as fileContentModule from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
@@ -10,6 +11,10 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof fileContentModule>()),
+  useFileContent: vi.fn(() => ({ data: undefined })),
+}));
 // Stub Shiki so the highlighting effect never fires an async callback that
 // would mutate state after the test cleans up.
 vi.mock("@/components/ai-elements/code-block", () => ({
