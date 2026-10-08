@@ -154,8 +154,16 @@ def test_graphql_alias_uses_its_response_identity() -> None:
         json.dumps('A "quoted" path: C:\\work\\repo.\ncreatePullRequest(input: {})'),
         '"""A note about C:\\work\\repo.\nExample: createPullRequest(input: {})\n"""',
         r'"""Code sample: \"""createPullRequest\""". Keep this text."""',
+        r'"""An escaped delimiter and quote: \"""" remain text."""',
+        json.dumps("An ordinary paragraph in the pull request description.\n" * 400),
     ],
-    ids=["quoted-string", "multiline-block", "escaped-block-quotes"],
+    ids=[
+        "quoted-string",
+        "multiline-block",
+        "escaped-block-quotes",
+        "escaped-block-delimiter-and-quote",
+        "long-description",
+    ],
 )
 def test_graphql_string_contents_do_not_change_operation(operation: str, body: str) -> None:
     query = QUERY.replace('title: "A change"', f'title: "A change", body: {body}').replace(
@@ -169,6 +177,14 @@ def test_graphql_string_contents_do_not_change_operation(operation: str, body: s
     expected = operation == "createPullRequest"
     assert [ref.url for ref in references] == ([URL] if expected else [])
     assert created is expected
+
+
+@pytest.mark.parametrize("literal", ['"unfinished', '"""unfinished'])
+def test_unfinished_graphql_string_does_not_attach_pr(literal: str) -> None:
+    query = (
+        "mutation { createPullRequest(input: {title: " + literal + "}) { pullRequest { url } } }"
+    )
+    assert extract_prs("shell", {"command": command(query)}, URL) == ([], False)
 
 
 def test_graphql_errors_do_not_supply_pr_identity() -> None:

@@ -7,6 +7,7 @@ dispatch, streaming, and transcript persistence use the real backend.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Iterator
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
@@ -91,14 +93,32 @@ def test_slash_menu_lists_side_command(page: Page, seeded_session: tuple[str, st
     expect(page.get_by_test_id("slash-menu-item-side")).to_be_visible()
 
 
-def test_composer_add_tray_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
-    """The composer ``+`` tray has a "Start a new side chat" item."""
+def test_composer_add_tray_offers_a_side_chat(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """The composer ``+`` tray starts a working chat on the parent's runner."""
     base_url, session_id = seeded_session
+    question = f"tray-side-{session_id}: answer in the side chat"
+    reply = "The add tray started a side chat."
+    configure_mock_llm(mock_llm_server_url, [{"text": reply}], match=question)
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
     page.get_by_test_id("composer-attach").click()
-    expect(page.get_by_role("menuitem", name="Start a new side chat")).to_be_visible()
+    page.get_by_role("menuitem", name="Start a new side chat").click()
+    page.get_by_test_id("side-chat-input").fill(question)
+    page.get_by_test_id("side-chat-send").click()
+    expect(page.locator(".side-chat-backdrop").get_by_text(reply, exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    assert len(side_chat_forks) == 1
+    response = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
+    response.raise_for_status()
+    assert response.json()["runner_id"] == runner_id
 
 
 def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
@@ -122,12 +142,13 @@ def test_side_chat_sends_with_stale_branch_metadata(
     mock_llm_server_url: str,
     entrypoint: str,
 ) -> None:
-    """A working parent can fork and chat even if its saved branch no longer exists."""
+    """A stopped parent restarts before a chat even if its saved branch is stale."""
     base_url, session_id = seeded_session
     host_id = "side-chat-test-host"
     workspace = "/workspace/existing-checkout"
     stale_branch = "worktree-from-another-machine"
-    launches: list[dict[str, object]] = []
+    retry_posts: list[dict[str, object]] = []
+    parent_stopped = True
 
     def source_snapshot(route: Route) -> None:
         response = fetch_with_retry(route)
@@ -135,30 +156,25 @@ def test_side_chat_sends_with_stale_branch_metadata(
         snapshot.update(
             host_id=host_id,
             host_online=True,
+            runner_online=not parent_stopped,
             workspace=workspace,
             git_branch=stale_branch,
         )
         route.fulfill(response=response, json=snapshot)
 
-    def launch_on_fixture_runner(route: Route) -> None:
-        launch = route.request.post_data_json
-        launches.append(launch)
-        if "git" in launch:
-            route.fulfill(
-                status=400,
-                json={"detail": f"base branch does not exist: {stale_branch}"},
-            )
+    def recover_parent(route: Route) -> None:
+        nonlocal parent_stopped
+        body = route.request.post_data_json
+        if body.get("type") != "retry_session":
+            route.fallback()
             return
-        response = httpx.patch(
-            f"{base_url}/v1/sessions/{launch['session_id']}",
-            json={"runner_id": runner_id},
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        route.fulfill(json={"runner_id": runner_id})
+        retry_posts.append(body)
+        response = fetch_with_retry(route)
+        parent_stopped = False
+        route.fulfill(response=response)
 
     page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), source_snapshot)
-    page.route(f"**/v1/hosts/{host_id}/runners", launch_on_fixture_runner)
+    page.route(f"**/v1/sessions/{session_id}/events", recover_parent)
     parent_question = f"main-{session_id}: remember our main conversation"
     parent_reply = "The parent conversation is ready."
     question = f"side-{session_id}: answer this side question"
@@ -186,7 +202,10 @@ def test_side_chat_sends_with_stale_branch_metadata(
         timeout=30_000
     )
     assert len(side_chat_forks) == 1
-    assert launches == [{"session_id": side_chat_forks[0], "workspace": workspace}]
+    assert retry_posts == [{"type": "retry_session", "data": {}}]
+    child = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
+    child.raise_for_status()
+    assert child.json()["runner_id"] == runner_id
     expect(pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
 
     page.get_by_test_id("side-chat-input").fill(followup)
@@ -203,6 +222,17 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert followup in child_text
     assert "First side answer." in child_text
     assert "Second side answer." in child_text
+    model_inputs = [
+        json.dumps(request.get("input", []))
+        for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
+    ]
+    first_input = next(text for text in model_inputs if question in text and followup not in text)
+    followup_input = next(text for text in model_inputs if followup in text)
+    assert parent_question in first_input
+    assert parent_reply in first_input
+    assert parent_reply in followup_input
+    assert question in followup_input
+    assert "First side answer." in followup_input
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
 
 

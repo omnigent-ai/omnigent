@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from typing import Any
 
@@ -251,3 +252,29 @@ async def test_preview_drops_when_negotiated_tunnel_is_down() -> None:
         response = await asyncio.wait_for(client.post(_URL, json=preview), timeout=3)
     assert response.status_code == 503
     assert http_posts == []
+
+
+async def test_disconnect_during_failed_send_leaves_no_unretrieved_future_error() -> None:
+    dispatcher = RunnerEventDispatcher()
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+
+    async def send(_text: str) -> None:
+        # The tunnel drops mid-send: the pending future fails, then the send itself fails.
+        dispatcher.disconnected()
+        raise OSError("socket closed")
+
+    dispatcher.ready(send)
+    delivery = asyncio.create_task(dispatcher._deliver("session-a", [_ITEM]))
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if delivery.done() or dispatcher._state == "disconnected":
+            break
+    delivery.cancel()
+    await asyncio.gather(delivery, return_exceptions=True)
+    del delivery  # The cancelled task's traceback would otherwise keep the future alive.
+    gc.collect()
+    await asyncio.sleep(0)
+    assert dispatcher._pending == {}
+    assert not reported

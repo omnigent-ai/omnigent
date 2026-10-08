@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import shlex
 import subprocess
 import sys
-import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -23,8 +21,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from dev.repro_env.runtime import isolated_env
-from omnigent.runner.identity import token_bound_runner_id
-from tests._helpers.live_server import isolated_local_server, terminate_process
+from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 
@@ -75,7 +72,6 @@ def pr_session(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[tuple[str, str, str, Path]]:
     binary = tmp_path / "bin"
     binary.mkdir()
@@ -110,49 +106,16 @@ def pr_session(
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     env = isolated_env(dict(os.environ), runtime)
-    token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(token)
     env.update(
         PATH=f"{binary}{os.pathsep}{os.environ['PATH']}",
         OPENAI_API_KEY="mock-key",
         OPENAI_BASE_URL=f"{mock_llm_server_url}/v1",
-        OMNIGENT_RUNNER_TUNNEL_TOKEN=token,
-        OMNIGENT_PROCESS_LOG_FILE=str(runtime / "process.log"),
     )
-    for key in set(os.environ) - set(env):
-        monkeypatch.delenv(key)
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
     model = f"pr-display-{uuid.uuid4().hex[:8]}"
-    bootstrap = (
-        f"import os\nos.environ['OMNIGENT_RUNNER_TUNNEL_TOKEN'] = {token!r}\n"
-        "from omnigent.cli import main\nmain()\n"
-    )
-    with (
-        isolated_local_server(runtime, bootstrap=bootstrap) as base_url,
-        (runtime / "runner.log").open("w") as log,
-    ):
-        runner = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env={
-                **env,
-                "RUNNER_SERVER_URL": base_url,
-                "OMNIGENT_RUNNER_ID": runner_id,
-                "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": token,
-                "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            },
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
-        try:
-            deadline = time.monotonic() + 60
-            while True:
-                response = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=5)
-                if response.status_code == 200 and response.json().get("online"):
-                    break
-                assert runner.poll() is None and time.monotonic() < deadline
-                time.sleep(0.2)
-            spec = f"""name: pr-display
+    with server_runner(runtime, base_env=env, workspace=workspace) as stack:
+        stack.start_runner()
+        base_url = stack.base_url
+        spec = f"""name: pr-display
 prompt: Run the requested shell command and report completion.
 executor:
   model: {model}
@@ -163,21 +126,19 @@ os_env:
   sandbox:
     type: none
 """
-            response = post_session_bundle(
-                httpx.post,
-                f"{base_url}/v1/sessions",
-                bundle_files({"pr-display.yaml": spec.encode()}),
-                metadata={"workspace": str(workspace)},
-                timeout=30,
-            )
-            response.raise_for_status()
-            session_id = response.json()["session_id"]
-            httpx.patch(
-                f"{base_url}/v1/sessions/{session_id}", json={"runner_id": runner_id}
-            ).raise_for_status()
-            yield base_url, session_id, model, binary
-        finally:
-            terminate_process(runner)
+        response = post_session_bundle(
+            httpx.post,
+            f"{base_url}/v1/sessions",
+            bundle_files({"pr-display.yaml": spec.encode()}),
+            metadata={"workspace": str(workspace)},
+            timeout=30,
+        )
+        response.raise_for_status()
+        session_id = response.json()["session_id"]
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}", json={"runner_id": stack.runner_id}
+        ).raise_for_status()
+        yield base_url, session_id, model, binary
 
 
 @pytest.mark.parametrize(
@@ -244,7 +205,9 @@ def test_pr_appears_in_composer_and_workspace(
     expect(indicator).to_have_accessible_name("#42", timeout=15_000)
     indicator.click()
     rail = page.get_by_role("complementary", name="Workspace")
-    expect(rail.get_by_role("tab", name="GitHub")).to_have_attribute("aria-selected", "true")
+    expect(rail.get_by_role("tab", name="Pull Requests")).to_have_attribute(
+        "aria-selected", "true"
+    )
     expect(rail.get_by_role("combobox", name="Session pull request")).to_contain_text(_TITLE)
     expect(rail.get_by_role("link", name=f"{_TITLE} #42")).to_have_attribute("href", _URL)
     expect(rail.get_by_text("Created from the active session checkout.")).to_be_visible()
