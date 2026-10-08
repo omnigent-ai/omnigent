@@ -8,12 +8,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
-/**
- * Load the console page in JSDOM behind a fake `arcaConnect` bridge (Electron
- * supplies the real one; no remote process is launched by a renderer test).
- * Returns the main→page event senders. A fake xterm `Terminal` mounts the
- * output pane synchronously; without one it stays hidden.
- */
+// Console page in JSDOM behind a fake `arcaConnect` bridge. A fake xterm
+// `Terminal` mounts the output pane synchronously; without one it stays hidden.
 function loadConsolePage(t, { Terminal } = {}) {
   const dom = new JSDOM(
     fs.readFileSync(path.join(__dirname, "../arca-connect/index.html"), "utf8"),
