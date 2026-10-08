@@ -6,7 +6,11 @@ import { showToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 
 type VideoSource = { conversationId: string; path: string } | { src: string };
-export type VideoPlayerProps = VideoSource & { title: string; className?: string };
+export type VideoPlayerProps = VideoSource & {
+  title: string;
+  className?: string;
+  onOpenFile?: () => void;
+};
 
 /** Reset playback and release media when a transcript slot or file tab changes source. */
 export function VideoPlayer(props: VideoPlayerProps) {
@@ -15,7 +19,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
 }
 
 function VideoPlayerContent(props: VideoPlayerProps) {
-  const { title, className } = props;
+  const { title, className, onOpenFile } = props;
   const remoteSrc = "src" in props ? props.src : undefined;
   const conversationId = "conversationId" in props ? props.conversationId : undefined;
   const path = "path" in props ? props.path : undefined;
@@ -104,9 +108,20 @@ function VideoPlayerContent(props: VideoPlayerProps) {
       )}
       <span className="flex min-w-0 items-center gap-2 px-3 py-2">
         <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate" title={title}>
-          {title}
-        </span>
+        {onOpenFile ? (
+          <button
+            type="button"
+            className="min-w-0 flex-1 truncate text-left underline decoration-dotted underline-offset-2 hover:text-primary"
+            title={title}
+            onClick={onOpenFile}
+          >
+            {title}
+          </button>
+        ) : (
+          <span className="min-w-0 flex-1 truncate" title={title}>
+            {title}
+          </span>
+        )}
         {remoteSrc ? (
           <a
             href={remoteSrc}

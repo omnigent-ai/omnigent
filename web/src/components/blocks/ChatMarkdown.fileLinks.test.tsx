@@ -116,6 +116,7 @@ describe("markdown links to workspace files", () => {
   it("renders a workspace recording inline and keeps its file-viewer link", () => {
     renderMarkdown("[Screen recording](demo.webm)", ["demo.webm"], FILE_VIEWER_WITH_SESSION);
     expect(screen.getByRole("button", { name: "Play video: Screen recording" })).toBeVisible();
+    expect(screen.getAllByText("Screen recording")).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Screen recording" }));
     expect(openFile).toHaveBeenCalledWith("demo.webm");
   });
