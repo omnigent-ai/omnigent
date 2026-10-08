@@ -173,7 +173,6 @@ def test_program_broken_two_row_terminal_url_opens_full_destination(
         expect(
             popup.get_by_role("heading", name="Destination opened from the terminal")
         ).to_be_visible()
-        popup.wait_for_timeout(1_000)
 
         assert popup.url == _WRAPPED_URL, (
             f"clicking row {row} of the two-row URL opened {popup.url!r} "

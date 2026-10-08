@@ -1,6 +1,6 @@
-// Clickable http(s) URLs in terminal output. Ported from @xterm/addon-web-links
-// (MIT), which only rejoins rows xterm soft-wrapped; this provider also follows
-// a URL across the hard rows a program leaves when it wraps at the pane width.
+// Clickable http(s) URLs in terminal output. Ported from @xterm/addon-web-links,
+// copyright (c) 2017-2019 The xterm.js authors, MIT license (see NOTICE), and
+// extended to follow a URL across the hard rows a program leaves at the pane width.
 
 import type { IBufferLine, ILink, ILinkProvider, Terminal } from "@xterm/xterm";
 
