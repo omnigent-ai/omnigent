@@ -1,18 +1,21 @@
 from __future__ import annotations
 
-import re
 from itertools import pairwise
 from pathlib import Path
 
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.chat.test_claude_model_picker import _patch_session_as_claude_native
-from tests.e2e_ui.chat.test_working_indicator_background_tasks import (
-    _MONITOR_TASK,
-    _publish_status,
-)
-from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
+from tests._helpers.workspace_geometry import workspace_bar_needs_collapse
+from tests.browser_ui.chat.session_contract import ChatSessionContract
+
+_MONITOR_TASK = {
+    "id": "monitor-ci",
+    "type": "shell",
+    "status": "running",
+    "description": "Watch PR checks and review comments",
+    "command": "gh pr checks 123 --watch",
+}
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -56,7 +59,7 @@ from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
 )
 def test_pr_context_and_background_tasks_share_workspace_bar(
     page: Page,
-    seeded_session: tuple[str, str],
+    chat_session_contract: ChatSessionContract,
     tmp_path: Path,
     theme: str,
     viewport_width: int,
@@ -64,24 +67,36 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     pr_number: int,
     font_family: str | None,
 ) -> None:
-    base_url, session_id = seeded_session
+    chat = chat_session_contract
+    session_id = chat.session_id
+    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
     is_mobile = viewport_width < 768
+    chat.contract.json("/v1/sessions/acceptance-child/child_sessions", {"data": []})
+    chat.contract.json(
+        f"/v1/sessions/{session_id}/resources/environments/default",
+        {
+            "metadata": {"root": "/work/repo", "home": "/home/browser"},
+        },
+    )
 
-    def snapshot(route):
-        response = fetch_with_retry(route)
-        body = response.json()
-        body.update(
-            workspace="/work/repo",
-            host_id="acceptance-host",
-            git_branch="old",
-            context_window=1_000_000,
-            last_total_tokens=1_000_000,
-        )
-        route.fulfill(response=response, json=body)
-
-    page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), snapshot)
+    chat.contract.json(
+        f"/v1/sessions/{session_id}/resources/environments/default/filesystem", {"data": []}
+    )
+    chat.contract.json(
+        f"/v1/sessions/{session_id}/resources/environments/default/changes", {"data": []}
+    )
+    chat.contract.json(f"/v1/sessions/{session_id}/resources/github/changes", {"data": []})
+    chat.contract.json(f"/v1/sessions/{session_id}/resources/github/diff", {"patch": ""})
+    chat.update_session(
+        workspace="/work/repo",
+        git_branch="old",
+        context_window=1_000_000,
+        last_total_tokens=1_000_000,
+        background_task_count=1,
+        background_tasks=[_MONITOR_TASK],
+    )
     page.route(
-        "**/v1/hosts/acceptance-host/worktrees?*",
+        f"**/v1/hosts/{chat.host_id}/worktrees?*",
         lambda route: route.fulfill(
             json={
                 "data": [
@@ -141,14 +156,8 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
             f"localStorage.setItem('omnigent:ui-font-family', JSON.stringify('{font_family}'))"
         )
     page.set_viewport_size({"width": viewport_width, "height": 844 if is_mobile else 900})
-    _publish_status(
-        base_url,
-        session_id,
-        "idle",
-        background_task_count=1,
-        background_tasks=[_MONITOR_TASK],
-    )
-    page.goto(f"{base_url}/c/{session_id}")
+    page.goto(chat.url)
+    chat.wait_for_stream()
     bar = page.get_by_test_id("composer-workspace-controls")
     pr_link = bar.get_by_test_id("composer-pr-link")
     pr_label = pr_link.locator("span").last
@@ -283,27 +292,40 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         panel.get_by_role("button", name="Close", exact=True).tap()
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
-    _publish_status(base_url, session_id, "idle", background_task_count=0)
+    chat.emit(
+        {
+            "event": "session.status",
+            "data": {
+                "conversation_id": session_id,
+                "status": "idle",
+                "background_task_count": 0,
+            },
+        }
+    )
     expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
-    page.unroute_all(behavior="wait")
 
 
 @pytest.mark.parametrize("width", [390, 768, 1440, 3200])
 def test_long_model_and_permission_remain_single_row(
-    page: Page, seeded_session: tuple[str, str], tmp_path: Path, width: int
+    page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path, width: int
 ) -> None:
-    base_url, session_id = seeded_session
+    chat = chat_session_contract
+    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
     model = "system.ai.claude-opus-4-8[1m]"
     display_name = "Opus 4.8 (1M context)"
-    _patch_session_as_claude_native(
-        page,
-        session_id,
-        llm_model=model,
-        permission_mode="bypassPermissions",
-        model_options=[{"id": model, "model": model, "displayName": display_name}],
+    chat.set_catalog(
+        harness="claude",
+        selected_model=model,
+        models=[{"id": model, "model": model, "displayName": display_name}],
+    )
+    chat.update_session(
+        labels={
+            "omnigent.wrapper": "claude-code-native-ui",
+            "omnigent.claude_native.permission_mode": "bypassPermissions",
+        }
     )
     page.set_viewport_size({"width": width, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}")
+    page.goto(chat.url)
     label = page.get_by_test_id("composer-agent-config-value")
     expect(label).to_contain_text("Opus 4.8 1M", timeout=30_000)
     permission = page.get_by_test_id("composer-permission-chip")
@@ -341,5 +363,4 @@ def test_long_model_and_permission_remain_single_row(
     expect(summary).to_have_attribute("title", display_name)
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_role("menuitemcheckbox", name=display_name, exact=True)).to_be_visible()
-    page.unroute_all(behavior="wait")
     assert all(results.values()), results

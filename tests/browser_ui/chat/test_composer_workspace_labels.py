@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
+from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
 _WORKSPACE = "/workspace/projects/" + "long-unbroken-directory-name-" * 4 + "/checkout"
 _BRANCH = "feature/" + "long-branch-name-" * 5
@@ -19,27 +18,27 @@ _BRANCH = "feature/" + "long-branch-name-" * 5
 @pytest.mark.parametrize("has_binding", [True, False], ids=["long-label", "fallback"])
 def test_composer_details_wrap_without_clipping(
     page: Page,
-    seeded_session: tuple[str, str],
+    chat_session_contract: ChatSessionContract,
     tmp_path: Path,
     viewport_width: int,
     font_size: int,
     has_binding: bool,
 ) -> None:
     """Long values and fallback explanations fit both informational popovers."""
-    base_url, session_id = seeded_session
-    seed_committed_turn(session_id, prompt="Hello", reply="Inspect the session details.")
+    chat = chat_session_contract
+    base_url, session_id = chat.base_url, chat.session_id
+    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+    chat.set_items(
+        [
+            message_item("reply", "assistant", "Inspect the session details.", response_id="turn"),
+            message_item("prompt", "user", "Hello", response_id="turn"),
+        ]
+    )
 
-    def session_details(route: Route) -> None:
-        response = fetch_with_retry(route)
-        snapshot = response.json()
-        snapshot.update(
-            workspace=_WORKSPACE if has_binding else None,
-            git_branch=_BRANCH if has_binding else None,
-            host_id="composer-workspace-host",
-        )
-        route.fulfill(response=response, json=snapshot)
-
-    page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+    chat.update_session(
+        workspace=_WORKSPACE if has_binding else None,
+        git_branch=_BRANCH if has_binding else None,
+    )
     page.route(
         f"**/v1/sessions/{session_id}/resources/github",
         lambda route: route.fulfill(
@@ -52,7 +51,7 @@ def test_composer_details_wrap_without_clipping(
         ),
     )
     page.route(
-        "**/v1/hosts/composer-workspace-host/worktrees?*",
+        f"**/v1/hosts/{chat.host_id}/worktrees?*",
         lambda route: route.fulfill(
             json={
                 "data": [
@@ -92,28 +91,30 @@ def test_composer_details_wrap_without_clipping(
 @pytest.mark.parametrize("long_labels", [False, True], ids=["readable-name", "long-labels"])
 def test_composer_workspace_labels_use_available_width(
     page: Page,
-    seeded_session: tuple[str, str],
+    chat_session_contract: ChatSessionContract,
     tmp_path: Path,
     viewport_width: int,
     font_size: int,
     long_labels: bool,
 ) -> None:
     """Names fit wide bars; when they can't, the bar collapses to icons, not ellipses."""
-    base_url, session_id = seeded_session
-    seed_committed_turn(session_id, prompt="Hello", reply="Inspect the workspace labels.")
+    chat = chat_session_contract
+    base_url, session_id = chat.base_url, chat.session_id
+    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+    chat.set_items(
+        [
+            message_item(
+                "reply", "assistant", "Inspect the workspace labels.", response_id="turn"
+            ),
+            message_item("prompt", "user", "Hello", response_id="turn"),
+        ]
+    )
     name = "new-composer-width" * (8 if long_labels else 1)
 
-    def session_details(route: Route) -> None:
-        response = fetch_with_retry(route)
-        snapshot = response.json()
-        snapshot.update(
-            workspace=f"/workspace/{name}",
-            git_branch="creation-branch",
-            host_id="composer-workspace-host",
-        )
-        route.fulfill(response=response, json=snapshot)
-
-    page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
+    chat.update_session(
+        workspace=f"/workspace/{name}",
+        git_branch="creation-branch",
+    )
     page.route(
         f"**/v1/sessions/{session_id}/resources/github",
         lambda route: route.fulfill(
@@ -126,7 +127,7 @@ def test_composer_workspace_labels_use_available_width(
         ),
     )
     page.route(
-        "**/v1/hosts/composer-workspace-host/worktrees?*",
+        f"**/v1/hosts/{chat.host_id}/worktrees?*",
         lambda route: route.fulfill(
             json={
                 "data": [

@@ -240,6 +240,42 @@ def test_a_failing_shell_hook_answers_with_no_operations(install: Install) -> No
     assert ([ref.url for ref in refs], created) == ([GITHUB_PR], True)
 
 
+@pytest.mark.parametrize("command", [GLAB_CREATE, BOTH_CREATE])
+@pytest.mark.parametrize("mode", ["created", "foreign", "error"])
+def test_structured_parser_does_not_fall_back_to_unrelated_output(
+    install: Install, monkeypatch: pytest.MonkeyPatch, command: str, mode: str
+) -> None:
+    facet = install(WORKING, parses=True)
+
+    def parse(result: object) -> list[PullRequestRef]:
+        if mode == "error":
+            raise RuntimeError("unreadable result")
+        assert isinstance(result, dict)
+        ref = pr_reference(result["created_pr"])
+        assert ref is not None
+        return [ref]
+
+    monkeypatch.setattr(
+        facet,
+        "shell_pr_operations",
+        lambda _: [
+            ShellPrOp(
+                tracks=True, creates=True, target=None, content_only=False, parse_result=parse
+            )
+        ],
+    )
+    refs, created = extract_prs(
+        "Bash",
+        {"command": command},
+        {"created_pr": GITHUB_PR if mode == "foreign" else MR, "stdout": GITHUB_PR},
+    )
+    expected = {MR} if mode == "created" else set()
+    if command == BOTH_CREATE:
+        expected.add(GITHUB_PR)
+    assert {ref.url for ref in refs} == expected
+    assert created
+
+
 def test_a_failing_object_hook_answers_with_no_pr(install: Install) -> None:
     install("broken", failing={"pr_from_object"})
     install(WORKING, parses=True)

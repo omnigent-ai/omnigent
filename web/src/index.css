@@ -1053,6 +1053,11 @@ html:has([data-electron-mac])
     padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
   }
 
+  :is([data-ios-native], [data-android-native])
+    .chat-conversation-content.chat-content-under-arca-banner {
+    padding-top: 1rem;
+  }
+
   [data-ios-native] .main-terminal-view,
   [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));

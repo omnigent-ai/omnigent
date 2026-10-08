@@ -136,10 +136,13 @@ class ShellSegment:
     :ivar invocation_tokens: The real command and its arguments, after
         ``real_invocation_tokens`` from ``omnigent.policies.builtins._shell``
         drops those prefixes. Never empty.
+    :ivar output_eligible: False when redirection, piping, or background execution
+        prevents assigning the shared output to this invocation.
     """
 
     raw_tokens: tuple[str, ...]
     invocation_tokens: tuple[str, ...]
+    output_eligible: bool = True
 
 
 @dataclass(frozen=True)
@@ -149,8 +152,7 @@ class ShellPrOp:
     The observer records PRs only when at least one op tracks. The PRs are
     ``created`` when every tracking op creates, else ``worked_on``. It records
     the ``target`` of each tracking op. It takes PR URLs from the shared output
-    only when every recognized op tracks and, if there is only one op, that op
-    is not ``content_only``.
+    only when every recognized op tracks and none is ``content_only``.
 
     :ivar tracks: The command changes the PR, e.g. create, edit, merge, close,
         or a review that approves or requests changes. Reads and comment-only
@@ -162,6 +164,8 @@ class ShellPrOp:
         diff), so URLs in its output do not identify the PR.
     :ivar parse_output: Optional network-free parser for command-specific output.
         Replaces generic JSON/bare-URL extraction for this operation.
+    :ivar parse_result: Optional parser that also needs structured tool results.
+        Takes precedence over ``parse_output`` and generic extraction.
     """
 
     tracks: bool
@@ -169,6 +173,7 @@ class ShellPrOp:
     target: PullRequestRef | None
     content_only: bool
     parse_output: Callable[[str], Sequence[PullRequestRef]] | None = None
+    parse_result: Callable[[object], Sequence[PullRequestRef]] | None = None
 
 
 @runtime_checkable

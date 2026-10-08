@@ -6,12 +6,13 @@ request facet recognizes its own shell commands, output objects, and MCP tools.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shlex
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from omnigent.git_providers import load_facet, providers
 from omnigent.policies.builtins._shell import (
@@ -48,10 +49,11 @@ def _failed(result: object) -> bool:
     return False
 
 
-def _join_shell_lines(command: str) -> str:
-    """Apply shell line continuations while preserving single-quoted literals."""
+def _prepare_shell_text(command: str) -> tuple[str, bool]:
+    """Join shell continuations and detect unquoted redirection without changing argv."""
     result: list[str] = []
     quote: str | None = None
+    redirected = False
     index = 0
     while index < len(command):
         char = command[index]
@@ -69,6 +71,8 @@ def _join_shell_lines(command: str) -> str:
             result.append(command[index:end])
             index = end
             continue
+        if quote is None and char in "<>":
+            redirected = True
         if char in {"'", '"'}:
             if quote is None:
                 quote = char
@@ -76,7 +80,7 @@ def _join_shell_lines(command: str) -> str:
                 quote = None
         result.append(char)
         index += 1
-    return "".join(result)
+    return "".join(result), redirected
 
 
 def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
@@ -88,15 +92,19 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     if depth > MAX_SHELL_NESTING:
         return []
     found: list[ShellSegment] = []
-    lexer = shlex.shlex(_join_shell_lines(command), posix=True, punctuation_chars=";&|\n")
+    joined, redirected = _prepare_shell_text(command)
+    lexer = shlex.shlex(joined, posix=True, punctuation_chars=";&|\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     segments: list[list[str]] = [[]]
+    output_eligible = not redirected
     try:
         for token in lexer:
             if token == "||":
                 return []
             if token and all(char in ";&|\n" for char in token):
+                if token.strip(";\n") not in {"", "&&"}:
+                    output_eligible = False
                 segments.append([])
             else:
                 segments[-1].append(token)
@@ -108,10 +116,13 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
-            found.extend(_shell_segments(inner, depth + 1))
+            nested = _shell_segments(inner, depth + 1)
+            if not nested:
+                output_eligible = False
+            found.extend(nested)
         else:
             found.append(ShellSegment(raw_tokens=tuple(segment), invocation_tokens=tuple(tokens)))
-    return found
+    return found if output_eligible else [replace(item, output_eligible=False) for item in found]
 
 
 def _log_provider_failure(provider_id: str, step: str) -> None:
@@ -218,6 +229,15 @@ def extract_prs(
     tool_name: str, arguments: dict[str, object], result: object
 ) -> tuple[list[PullRequestRef], bool]:
     """Return positively identified PRs and whether the operation created them."""
+    if tool_name == "sys_os_shell" and isinstance(result, str):
+        # This tool serializes its result envelope; native shell strings are stdout.
+        try:
+            envelope = json.loads(result)
+        except ValueError:
+            pass
+        else:
+            if isinstance(envelope, dict) and "stdout" in envelope and "exit_code" in envelope:
+                result = envelope
     if _failed(result):
         return [], False
     facets = _facets()
@@ -249,21 +269,31 @@ def extract_prs(
         references = [target for op in commands if (target := op.target) is not None]
         if any(op.creates for op in commands) and (ref := _created_pr_metadata(result)):
             references.append(ref)
-        # Shared stdout cannot attribute a result to a write when reads/comments also ran.
+        # Reads, comments, and content-only output make shared stdout ambiguous.
         if (
             len(commands) == len(ops)
             and any(op.target is None for op in commands)
-            and (len(commands) > 1 or not commands[0].content_only)
+            and not any(op.content_only for op in commands)
         ):
             for provider_id, op in provider_ops:
-                if op.parse_output is not None and op.target is None and not op.content_only:
-                    try:
-                        references.extend(
-                            ref for ref in op.parse_output(text) if ref.provider == provider_id
-                        )
-                    except Exception:  # noqa: BLE001 — one parser must not hide other providers
-                        _log_provider_failure(provider_id, "parse_output")
-            if any(op.parse_output is None and op.target is None for op in commands):
+                if op.target is not None:
+                    continue
+                try:
+                    if op.parse_result is not None:
+                        parsed = op.parse_result(result)
+                    elif op.parse_output is not None:
+                        parsed = op.parse_output(text)
+                    else:
+                        continue
+                    references.extend(ref for ref in parsed if ref.provider == provider_id)
+                except Exception:  # noqa: BLE001 — one parser must not hide other providers
+                    _log_provider_failure(
+                        provider_id, "parse_result" if op.parse_result else "parse_output"
+                    )
+            if any(
+                op.parse_result is None and op.parse_output is None and op.target is None
+                for op in commands
+            ):
                 for obj in result_objects(result):
                     if ref := _object_pr(obj, facets):
                         references.append(ref)

@@ -234,6 +234,21 @@ Cross-harness journeys:
   `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
   keeps a resumed effort whose config write failed for later updates.
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`chat-render`, Claude shell commands from the web composer:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
+  drives the built SPA at desktop and phone widths with controlled backend
+  events. The shell prompt remains one user bubble after settlement, with its
+  output below it; a following prompt and reload preserve both user turns.
+  `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_web_shell_command_settles_before_the_next_prompt`
+  covers the real CLI and transcript forwarder through the repro environment.
+  It requires Claude Code and tmux; machine-managed Claude settings need an
+  isolated container for the scripted model endpoint.
+- **`chat-render`, Claude shell commands from the agent terminal:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
+  replays terminal-origin records in the built SPA at desktop and phone widths.
+  After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
+  prompt must remain a separate user turn outside the assistant's folded work,
+  including after reload. This browser contract does not launch the Claude CLI.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain

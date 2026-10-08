@@ -132,9 +132,9 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
 - **`attachments`:**
-  `tests/e2e_ui/chat/test_composer_attachments.py::test_attach_then_remove_file`,
-  `tests/e2e_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
-  `tests/e2e_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
+  `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
+  `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
+  `tests/browser_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`

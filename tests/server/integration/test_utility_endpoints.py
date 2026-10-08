@@ -87,9 +87,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert isinstance(data["managed_sandboxes_enabled"], bool)
     assert data["features"] == {
         "usage_page": False,
-        "harness_settings_ui": True,
         "harness_install": False,
         "canvas": False,
+        "arca_shutdown_warnings": False,
+        "harness_settings_ui": True,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False

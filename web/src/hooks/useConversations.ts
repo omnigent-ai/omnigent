@@ -1410,6 +1410,8 @@ export async function undoArchiveConversations(
       data,
       candidates,
       filtersFromConversationQueryKey(key),
+      undefined,
+      getCurrentUserId(),
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
