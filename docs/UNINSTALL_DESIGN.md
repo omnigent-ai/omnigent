@@ -268,7 +268,13 @@ Targets (default `cli` if none given):
 Flags:
 
 - `--purge` - implies `state`; deletes state/caches; backs up first unless
-  `--no-backup`.
+  `--no-backup`. After the backup it deletes the OS-keychain secrets the
+  effective config references (`keychain:<name>`, read from
+  `OMNIGENT_CONFIG_HOME` or `~/.omnigent`) through
+  `omnigent _internal delete-keychain-secret` and records each as `done`,
+  `skipped` (no entry), `reported` (unverified) or `failed`. Any unresolved
+  keychain outcome keeps the state tree and exits 1 (section 7); a standalone
+  script run without the CLI can only report the names it finds.
 - `--dry-run` - print exact planned actions (paths, sizes, line ranges); make no
   changes.
 - With no destructive flag (`--yes`, `--purge`, `--force`,
@@ -278,7 +284,8 @@ Flags:
   only. Does NOT imply `--purge`.
 - `--json` - machine-readable output.
 - `--force` - allow SIGKILL after the SIGTERM grace window; proceed if daemons
-  resist; override tamper-refusal.
+  resist; override tamper-refusal; remove the state tree even when a keychain
+  deletion stayed unresolved (the exit code stays 1).
 - `--modify-external-config` - primary gate to touch third-party config files.
 - `--no-backup` - with `state`/`--purge`, skip archive creation.
 - `--assume-inferred` - secondary gate to act on `inferred` entries.
@@ -300,7 +307,8 @@ friction, never grant it.
 | Delimited PATH block (marker match) | dry-run preview | auto-remove | none; refuse if `block_sha256` mismatch (tampered) unless `--force` |
 | Injected external config, marker/observed | reported, skipped | reported, skipped | `--modify-external-config` |
 | Injected external config, inferred (no marker) | reported, skipped | reported, skipped | `--modify-external-config` AND `--assume-inferred` |
-| `~/.omnigent` state root | reported, skipped | removed only with `--purge` | `--purge` |
+| `~/.omnigent` state root | reported, skipped | removed only with `--purge` | `--purge`; kept when a keychain deletion is unresolved unless `--force` |
+| OS-keychain secrets referenced by config (`keychain:<name>`) | reported, skipped | removed only with `--purge` | `--purge` (needs the `omnigent` CLI; the standalone script reports) |
 | `~/omnigent` workspace | reported, skipped | kept unless `--purge-workspace` | `--purge` AND (`--purge-workspace` or interactive confirm) |
 | Desktop data | via `desktop-data`/`all` | same | none beyond target |
 | Shared deps (uv/node/tmux/bwrap) | report-only | report-only | none - never removed this version |
@@ -339,7 +347,10 @@ execs the shell script for removal. Sequence:
    back to `<ts>.tar.gz` (gzip is POSIX-baseline) otherwise. Never silently skip
    the backup because a compressor is missing - a purge that can't write its
    backup must fail closed (exit 1) unless `--no-backup` was given. Print the
-   restore command, then delete. Never back up into `~/.omnigent`. Clearing
+   restore command, delete the keychain secrets the manifest lists (the backup
+   never contains keychain values), then delete the tree - unless a keychain
+   deletion stayed unresolved, in which case the tree is kept for a retry and
+   only `--force` removes it. Never back up into `~/.omnigent`. Clearing
    `~/omnigent` non-interactively requires `--purge-workspace` (see section 5);
    otherwise it prompts for a separate confirm. Note that purging
    `installation_id` makes a reinstall look like a new device (telemetry).
@@ -367,7 +378,8 @@ failed."
 Exit codes:
 
 - `0` - all planned actions done or already-absent
-- `1` - one or more actions failed (details in summary)
+- `1` - one or more actions failed, or a keychain secret could not be proven
+  gone (details in summary)
 - `2` - aborted before destructive steps (e.g. process would not stop without
   `--force`)
 - `3` - refused (tampered block / anchor guard / ambiguous, no `--force`)

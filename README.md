@@ -241,6 +241,13 @@ To also remove Omnigent state under `~/.omnigent`, pass `--purge`; Omnigent
 backs it up outside the target before deletion. Your `~/omnigent` workspace is
 kept unless you explicitly add `--purge-workspace`.
 
+`--purge` also deletes the API keys `omnigent setup` stored in the OS keychain
+and reports each one. When an entry cannot be proven gone (keychain locked or
+unavailable, keyring disabled, or no `omnigent` CLI to call from the standalone
+script), the purge keeps `~/.omnigent` for a retry and exits 1; add `--force` to
+remove the state anyway (the exit code stays 1). Scripts that run under `set -e`
+should expect that exit.
+
 ```bash
 omnigent uninstall --purge --yes
 ```

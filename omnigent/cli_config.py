@@ -1624,10 +1624,18 @@ def _manage_cursor_sdk_harness() -> None:
             ref = cursor_api_key_ref(config)
             # Only a keychain-stored secret is ours to delete; an ``env:`` ref
             # points at the user's own environment, so just drop the config.
+            unresolved = ""
             if ref is not None and ref.startswith("keychain:"):
-                secret_store.delete_secret(ref[len("keychain:") :])
+                unresolved = secret_store.delete_secret(ref[len("keychain:") :]).unresolved_reason
             _save_global_config({}, unset_keys=("cursor",))
-            status = "✓ Removed Cursor API key"
+            status = _secret_removal_status("Cursor API key", unresolved)
+
+
+def _secret_removal_status(label: str, unresolved: str) -> str:
+    """Status line for a remove-key action; warns when a stored copy may remain."""
+    if unresolved:
+        return f"⚠ Removed {label} from config; {unresolved}"
+    return f"✓ Removed {label}"
 
 
 def _set_cursor_api_key() -> str | None:
@@ -1921,10 +1929,11 @@ def _manage_antigravity_harness() -> None:
             # delete: a hand-edited block may point at a shared ``keychain:<other>``
             # secret, and an ``env:`` ref names the user's own environment. In
             # both of those cases just drop the config block and leave the secret.
+            unresolved = ""
             if ref == f"keychain:{ANTIGRAVITY_SECRET_NAME}":
-                secret_store.delete_secret(ANTIGRAVITY_SECRET_NAME)
+                unresolved = secret_store.delete_secret(ANTIGRAVITY_SECRET_NAME).unresolved_reason
             _save_global_config({}, unset_keys=(ANTIGRAVITY_CONFIG_KEY,))
-            status = "✓ Removed Gemini API key"
+            status = _secret_removal_status("Gemini API key", unresolved)
 
 
 def _set_antigravity_api_key() -> str | None:
@@ -2983,15 +2992,16 @@ def _manage_copilot_harness() -> None:
             # hand-edited block may point at a shared ``keychain:<other>`` secret,
             # and an ``env:`` ref names the user's own environment. In both of
             # those cases just drop the config block and leave the secret.
+            unresolved = ""
             if ref == f"keychain:{COPILOT_SECRET_NAME}":
-                secret_store.delete_secret(COPILOT_SECRET_NAME)
+                unresolved = secret_store.delete_secret(COPILOT_SECRET_NAME).unresolved_reason
             # Keep a configured GHE host: the saver replaces the whole block, so
             # unsetting it wholesale would discard the host along with the token.
             if (remaining := copilot_token_removal_settings()) is not None:
                 _save_global_config(remaining)
             else:
                 _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
-            status = "✓ Removed Copilot GitHub token"
+            status = _secret_removal_status("Copilot GitHub token", unresolved)
 
 
 def _set_copilot_github_host() -> str | None:

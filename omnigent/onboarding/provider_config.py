@@ -597,6 +597,16 @@ def _config_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".omnigent", "config.yaml")
 
 
+def config_path() -> str:
+    """Return the path to the global omnigent config file.
+
+    Public form of :func:`_config_path` for callers outside this module.
+
+    :returns: Path to ``config.yaml``, e.g. ``"/home/u/.omnigent/config.yaml"``.
+    """
+    return _config_path()
+
+
 def _load_config() -> dict[str, object]:
     """Load and parse the global config file.
 

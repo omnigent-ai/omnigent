@@ -24,12 +24,16 @@ DONE=0
 SKIPPED=0
 FAILED=0
 REPORTED=0
+KEYCHAIN_UNRESOLVED=0
 EXIT_CODE=0
 ACTIONS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-actions.XXXXXX")" || exit 1
 BACKUPS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-backups.XXXXXX")" || exit 1
+SECRETS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-secrets.XXXXXX")" || exit 1
+HELPER_OUT="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-helper-out.XXXXXX")" || exit 1
+HELPER_ERR="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-helper-err.XXXXXX")" || exit 1
 
 cleanup() {
-  rm -f "$ACTIONS_FILE" "$BACKUPS_FILE"
+  rm -f "$ACTIONS_FILE" "$BACKUPS_FILE" "$SECRETS_FILE" "$HELPER_OUT" "$HELPER_ERR"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -38,7 +42,7 @@ usage() {
 Usage: uninstall_oss.sh [cli|state|desktop-data|all ...] [flags]
 
 Flags:
-  --purge                    Remove state data (backs up first)
+  --purge                    Remove state data and OS-keychain secrets (backs up state first)
   --purge-workspace          With --purge, also remove ~/omnigent non-interactively
   --dry-run                  Print planned actions only
   --yes                      Non-interactive for auto-removable artifacts
@@ -51,7 +55,9 @@ EOF
 }
 
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
+  # Fold line breaks, escape tabs, then drop any other control character: JSON
+  # strings cannot carry them raw.
+  printf '%s' "$1" | tr '\n\r' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/[[:cntrl:]]//g'
 }
 
 record_action() {
@@ -137,6 +143,11 @@ state_home() {
   else
     printf '%s/.omnigent\n' "$HOME"
   fi
+}
+
+config_file() {
+  # The same location rule as the CLI: the config may live apart from the state.
+  printf '%s/config.yaml\n' "${OMNIGENT_CONFIG_HOME:-$HOME/.omnigent}"
 }
 
 is_pid_alive() {
@@ -560,6 +571,7 @@ remove_tree() {
   artifact="$1"
   path="$2"
   gate="$3"
+  backed_up="${4:-}"
   if [ ! -e "$path" ]; then
     record_action "$artifact" "$path" remove skipped "" "already absent"
     return 0
@@ -573,7 +585,7 @@ remove_tree() {
     record_action "$artifact" "$path" remove reported "" "would remove $size"
     return 0
   fi
-  if backup_path "$path" && rm -rf "$path"; then
+  if { [ "$backed_up" = backed_up ] || backup_path "$path"; } && rm -rf "$path"; then
     record_action "$artifact" "$path" remove done "" "removed"
   else
     record_action "$artifact" "$path" remove failed "" "failed to remove"
@@ -597,8 +609,119 @@ desktop_paths() {
   esac
 }
 
+collect_keychain_secret_names() {
+  # Each line is "<name for the helper><TAB><name for display>". The CLI
+  # manifest carries percent-encoded names; without it, scan the effective
+  # config (the CLI's own location rule) before purge_state deletes it.
+  if [ -n "${OMNIGENT_UNINSTALL_LEDGER_MANIFEST:-}" ] && [ -f "$OMNIGENT_UNINSTALL_LEDGER_MANIFEST" ]; then
+    while IFS="$TAB" read -r artifact name display rest; do
+      if [ "$artifact" = keychain_discovery_error ]; then
+        KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+        record_action keychain_secret config.yaml discover failed "" "could not read the config to discover keychain secrets: $name"
+        continue
+      fi
+      [ "$artifact" = keychain_secret ] || continue
+      [ -n "$name" ] || continue
+      printf '%s\t%s\n' "$name" "${display:-$name}" >>"$SECRETS_FILE"
+    done <"$OMNIGENT_UNINSTALL_LEDGER_MANIFEST"
+  else
+    config="$(config_file)"
+    [ -e "$config" ] || return 0
+    # HELPER_OUT is free until the helper runs; use it as the scan scratch file.
+    if ! sed -E 's/(^|[[:space:]])#.*//' "$config" >"$HELPER_OUT" 2>/dev/null; then
+      KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+      record_action keychain_secret config.yaml discover failed "" "could not read $config to discover keychain secrets"
+      return 0
+    fi
+    # Quoted names carrying characters the text scan cannot extract are set
+    # aside (HELPER_ERR is also free until the helper runs) and reported below
+    # instead of being truncated into a different name.
+    bad_quoted="\"keychain:[^\"]*[][:space:]',{}[][^\"]*\"|'keychain:[^']*[][:space:]\",{}[][^']*'"
+    grep -vE "$bad_quoted" "$HELPER_OUT" >"$HELPER_ERR" || true
+    # A reference starts a value; "keychain:" inside another token is not one.
+    ref="(^|[][:space:]\"',:{}[])keychain:"
+    # Names reach the helper untouched apart from "%", which it percent-decodes.
+    grep -oE "${ref}[^][:space:]\"',{}[]+" "$HELPER_ERR" | sed 's/^.*keychain://' | sort -u |
+      awk '{ raw = $0; enc = $0; gsub(/%/, "%25", enc); print enc "\t" raw }' >>"$SECRETS_FILE" || true
+    # Any reference the scan did not extract must not vanish silently.
+    mentioned="$(grep -oE "$ref" "$HELPER_ERR" | wc -l | tr -d ' ')"
+    extracted="$(grep -oE "${ref}[^][:space:]\"',{}[]+" "$HELPER_ERR" | wc -l | tr -d ' ')"
+    if [ "$mentioned" != "$extracted" ] || grep -qE "$bad_quoted" "$HELPER_OUT"; then
+      KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+      record_action keychain_secret config.yaml discover failed "" "$config references keychain secrets the standalone scan could not parse; run the purge through the omnigent CLI"
+    fi
+  fi
+}
+
+purge_keychain_secrets() {
+  while IFS="$TAB" read -r name display; do
+    [ -n "$name" ] || continue
+    display="${display:-$name}"
+    if [ "$DRY_RUN" = true ] && [ -z "${OMNIGENT_UNINSTALL_PYTHON:-}" ]; then
+      record_action keychain_secret "$display" remove reported "" "would be left in the OS keychain (service omnigent): no omnigent CLI to delete it; remove it manually"
+    elif [ "$DRY_RUN" = true ]; then
+      record_action keychain_secret "$display" remove reported "" "would remove from the OS keychain (service omnigent)"
+    elif [ -z "${OMNIGENT_UNINSTALL_PYTHON:-}" ]; then
+      KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+      record_action keychain_secret "$display" remove reported "" "left in the OS keychain (service omnigent); remove it manually"
+    elif "$OMNIGENT_UNINSTALL_PYTHON" -m omnigent _internal delete-keychain-secret -- "$name" </dev/null >"$HELPER_OUT" 2>"$HELPER_ERR"; then
+      # The helper prints exactly one result line on stdout; logging goes to stderr.
+      outcome="$(grep -m1 -E '^(removed|absent|file-only|partial|unverified)( |$)' "$HELPER_OUT" || true)"
+      case "$outcome" in
+        removed)
+          record_action keychain_secret "$display" remove done "" "removed from the OS keychain (service omnigent)"
+          ;;
+        absent)
+          record_action keychain_secret "$display" remove skipped "" "no entry in the OS keychain (service omnigent)"
+          ;;
+        file-only*)
+          KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+          record_action keychain_secret "$display" remove reported "" "removed the file-backed copy; the OS keychain (service omnigent) was not reachable (${outcome#file-only }), check it manually"
+          ;;
+        partial*)
+          KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+          record_action keychain_secret "$display" remove reported "" "removed from the OS keychain (service omnigent); the file-backed store could not be read or updated (${outcome#partial }), check it manually"
+          ;;
+        unverified*)
+          KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+          record_action keychain_secret "$display" remove reported "" "no entry in the OS keychain (service omnigent); the file-backed store could not be read or updated (${outcome#unverified }), check it manually"
+          ;;
+        *)
+          KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+          record_action keychain_secret "$display" remove failed "" "failed to remove from the OS keychain (service omnigent): helper returned no result"
+          ;;
+      esac
+    else
+      # Prefer the helper's own error line; later lines may be generic hints.
+      reason="$(awk '/^Error: / { sub(/^Error: /, ""); print; found = 1; exit } NF { last = $0 } END { if (!found) print last }' "$HELPER_ERR" | sed 's/[[:cntrl:]]//g')"
+      KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+      record_action keychain_secret "$display" remove failed "" "failed to remove from the OS keychain (service omnigent)${reason:+: $reason}"
+    fi
+  done <"$SECRETS_FILE"
+}
+
 purge_state() {
-  remove_tree state "$(state_home)" ""
+  state_dir="$(state_home)"
+  collect_keychain_secret_names
+  # Archive the state before the irreversible keychain deletes so a failed
+  # backup leaves both in place. The deletes still precede the removal: the
+  # helper's CLI startup recreates log dirs under the state home.
+  if [ "$DRY_RUN" != true ] && [ -e "$state_dir" ] && ! backup_path "$state_dir"; then
+    record_action state "$state_dir" remove failed "" "backup failed; state and keychain secrets kept"
+  else
+    purge_keychain_secrets
+    if [ "$KEYCHAIN_UNRESOLVED" -gt 0 ] && [ "$EXIT_CODE" = 0 ]; then
+      # A purge that may have left a credential behind must not look clean.
+      EXIT_CODE=1
+    fi
+    if [ "$KEYCHAIN_UNRESOLVED" -gt 0 ] && [ "$FORCE" != true ]; then
+      # config.yaml is the only durable list of keychain secrets; keep it so the
+      # unresolved deletions can be retried.
+      record_action state "$state_dir" remove skipped "--force" "kept so the unresolved keychain secrets can be retried; pass --force to remove it anyway"
+    else
+      remove_tree state "$state_dir" "" backed_up
+    fi
+  fi
   workspace="$HOME/omnigent"
   if [ -e "$workspace" ]; then
     if [ "$PURGE_WORKSPACE" = true ]; then

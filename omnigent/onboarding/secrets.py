@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 
 import keyring
 import keyring.errors
@@ -222,23 +223,80 @@ def load_secret(name: str) -> str | None:
     return stored
 
 
-def delete_secret(name: str) -> None:
-    """Delete the secret stored under *name*, if present.
+@dataclass(frozen=True)
+class SecretDeletion:
+    """What :func:`delete_secret` established about a name afterwards.
 
-    Tries the OS keychain when enabled; on a :class:`keyring.errors.KeyringError`
-    (which includes ``PasswordDeleteError`` for an absent entry) it falls
-    back to the file backend. Deleting a name that does not exist is a
-    no-op in either backend.
+    :param removed: An entry was removed from the keychain or the file backend.
+    :param keyring_error: The :class:`keyring.errors.KeyringError` class name
+        when the OS keychain could not be consulted, or the variable that
+        disabled it, so a copy there may survive; ``None`` when it answered.
+    :param survives: The keychain refused the delete and still returns the
+        secret, or could not be read back afterwards.
+    :param file_error: The exception class name when the file-backed store
+        could not be read or rewritten, so a copy there may survive.
+    """
+
+    removed: bool
+    keyring_error: str | None = None
+    survives: bool = False
+    file_error: str | None = None
+
+    @property
+    def unresolved_reason(self) -> str:
+        """Why a copy may remain, or ``""`` when every reachable copy is gone."""
+        if self.survives:
+            return "the OS keychain still holds the secret"
+        if self.keyring_error is not None:
+            return f"the OS keychain was not consulted or reachable ({self.keyring_error})"
+        if self.file_error is not None:
+            return f"the file-backed secret store could not be read or updated ({self.file_error})"
+        return ""
+
+
+def delete_secret(name: str) -> SecretDeletion:
+    """Delete the secret stored under *name* from the backends that hold it.
+
+    Tries the OS keychain when enabled, confirms with a lookup when the
+    backend refuses the delete, then removes any file-backed copy. Backend
+    problems are reported per backend in the result rather than raised, so a
+    best-effort caller can ignore them while ``uninstall --purge`` can refuse
+    to claim success. As in :func:`load_secret`, a secret the file backend
+    held counts as removed even when the keychain was unreachable.
 
     :param name: The stable secret name to delete, e.g. ``"anthropic"``.
+    :returns: The :class:`SecretDeletion` outcome.
     """
-    if _use_keyring():
+    removed = False
+    keyring_error: str | None = None
+    survives = False
+    if not _use_keyring():
+        # A disabled keychain is unreachable, not empty.
+        keyring_error = _DISABLE_KEYRING_ENV
+    else:
         try:
             keyring.delete_password(_KEYRING_SERVICE, name)
-            return
-        except _KEYRING_ERRORS:
-            pass
-    secrets = _read_secrets_file()
-    if name in secrets:
-        del secrets[name]
-        _write_secrets_file(secrets)
+            removed = True
+        except keyring.errors.PasswordDeleteError:
+            # Raised for an absent entry and for a refused delete alike; a
+            # lookup tells them apart. If that lookup fails too, assume the
+            # refused entry survives rather than downgrade it to "unreachable".
+            try:
+                survives = keyring.get_password(_KEYRING_SERVICE, name) is not None
+            except _KEYRING_ERRORS as exc:
+                keyring_error = type(exc).__name__
+                survives = True
+        except _KEYRING_ERRORS as exc:
+            keyring_error = type(exc).__name__
+    file_error: str | None = None
+    try:
+        secrets = _read_secrets_file()
+        if name in secrets:
+            del secrets[name]
+            _write_secrets_file(secrets)
+            removed = True
+    except (OSError, ValueError) as exc:
+        file_error = type(exc).__name__
+    return SecretDeletion(
+        removed=removed, keyring_error=keyring_error, survives=survives, file_error=file_error
+    )
