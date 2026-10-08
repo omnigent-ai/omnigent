@@ -78,7 +78,7 @@ def _disabled_menu_action(page: Page, item: Locator, reason: str) -> None:
     page.mouse.move(0, 0)
     expect(tooltip).to_have_count(0)
     menu_items = page.get_by_role("menu").locator('[role="menuitem"]:visible:not([data-disabled])')
-    item_index = menu_items.all_text_contents().index(item.inner_text())
+    item_index = menu_items.all_inner_texts().index(item.inner_text())
     page.keyboard.press("Home")
     expect(menu_items.first).to_be_focused()
     for index in range(item_index):
@@ -134,7 +134,7 @@ def test_sandbox_fork_and_switch_host_disabled(
         lambda request: (
             writes.append(request.url)
             if request.method in {"POST", "PATCH"}
-            and re.search(r"/v1/(sessions|hosts)/", request.url)
+            and re.search(r"/v1/(sessions|hosts)(/|\?|$)", request.url)
             else None
         ),
     )
@@ -162,15 +162,16 @@ def test_sandbox_fork_and_switch_host_disabled(
 
     assistant.hover()
     message_fork = page.get_by_test_id("fork-from-response")
+    message_fork_target = page.get_by_role("group", name="Fork from here", exact=True)
     expect(message_fork).to_be_disabled()
-    message_fork.locator("..").hover()
+    message_fork_target.hover()
     fork_tooltip = _reason_tooltip(page, _FORK_REASON)
     expect(fork_tooltip).to_have_text(_FORK_REASON)
     page.keyboard.press("Escape")
     expect(fork_tooltip).to_have_count(0)
     page.mouse.move(0, 0)
-    message_fork.locator("..").focus()
-    expect(message_fork.locator("..")).to_be_focused()
+    message_fork_target.focus()
+    expect(message_fork_target).to_be_focused()
     expect(fork_tooltip).to_have_text(_FORK_REASON)
     page.keyboard.press("Enter")
     expect(page.get_by_test_id("fork-session-dialog")).to_have_count(0)

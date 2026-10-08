@@ -94,7 +94,9 @@ devices fold some row controls into the menu.
 
 **Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
 sidebar menus, and message actions. The composer's host menu shows a disabled
-**Switch host…** item. Hover or focus either action to read why it is unsupported.
+**Switch host…** item when you have write access. Read-only viewers retain the
+existing host menu without switching controls. Hover or focus a disabled action
+to read why it is unsupported.
 The reconnect dialog also disables Clone and Switch host; directory selection
 cannot enable either action.
 While support is being checked, actions stay disabled. If that check fails,

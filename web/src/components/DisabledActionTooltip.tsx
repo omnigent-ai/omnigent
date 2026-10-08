@@ -14,7 +14,7 @@ export function DisabledActionTooltip({
 }: {
   reason?: string;
   children: ReactNode;
-  /** Gives native disabled buttons a keyboard-focusable tooltip target. */
+  /** Wraps one native button, handing focus to it when the reason clears. */
   label?: string;
   className?: string;
 }) {

@@ -171,7 +171,7 @@ export function HostBadge({
                 Reconnect host
               </DropdownMenuItem>
             )}
-            {(canSwitch || switchHostDisabledReason) && (
+            {!readOnly && (canSwitch || switchHostDisabledReason) && (
               <SessionActionMenuItem
                 disabledReason={switchHostDisabledReason}
                 onSelect={() => setSwitchOpen(true)}
@@ -215,9 +215,7 @@ export function HostBadge({
         aria-hidden
         className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[badge.status])}
       />
-      <span className="truncate" title={switchHostDisabledReason ? title : undefined}>
-        {badge.label}
-      </span>
+      <span className="truncate">{badge.label}</span>
       <span className="sr-only">, {statusWord}</span>
     </>
   );
@@ -236,46 +234,44 @@ export function HostBadge({
     );
   }
 
-  // Sandbox-backed hosts are provisioned (and relaunched) by the server, so a
-  // manual move isn't meaningful. An unresolved record — a shared session, or
-  // the list still loading — can't be confirmed non-sandbox, so it stays
-  // passive too rather than offering a switch that may not apply.
+  // Only a resolved, supported host can offer a manual switch.
   const canSwitch = host !== undefined && !switchHostDisabledReason;
-  if (!canSwitch) {
-    return (
-      // No aria-label: on a non-interactive div it's announced unreliably and
-      // would only duplicate the sr-only text where it is honored.
-      <div
-        data-testid="host-badge"
-        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
-        title={switchHostDisabledReason ? undefined : title}
-      >
-        {content}
-        {switchHostDisabledReason && (
-          <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
-            <button type="button" disabled className="pointer-events-none opacity-50">
-              Switch host…
-            </button>
-          </DisabledActionTooltip>
-        )}
-      </div>
-    );
-  }
-
   return (
     <>
-      <button
-        type="button"
-        data-testid="host-badge"
-        onClick={() => setSwitchOpen(true)}
-        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-        title={`${title} — click to switch`}
+      <DisabledActionTooltip
+        reason={switchHostDisabledReason}
+        label="Switch host"
+        className="min-w-0"
       >
-        {content}
-      </button>
+        {canSwitch ? (
+          <button
+            type="button"
+            data-testid="host-badge"
+            onClick={() => setSwitchOpen(true)}
+            className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            title={`${title} — click to switch`}
+          >
+            {content}
+          </button>
+        ) : (
+          // Avoid a native title competing with the disabled-action tooltip.
+          <div
+            data-testid="host-badge"
+            className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
+            title={switchHostDisabledReason ? undefined : title}
+          >
+            {content}
+            {switchHostDisabledReason && (
+              <button type="button" disabled className="pointer-events-none opacity-50">
+                Switch host…
+              </button>
+            )}
+          </div>
+        )}
+      </DisabledActionTooltip>
       {/* Mounted only while open: the badge renders on every session, and a
           closed dialog would still run its host query and workspace hooks. */}
-      {switchOpen && (
+      {switchOpen && canSwitch && (
         <SwitchHostDialog
           open
           onOpenChange={setSwitchOpen}

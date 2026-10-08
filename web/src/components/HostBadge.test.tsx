@@ -217,6 +217,43 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
   });
 
+  it("moves focus to the default badge when the host lookup enables switching", async () => {
+    useHostsMock.mockReturnValue({ data: undefined, isLoading: true });
+    const user = userEvent.setup();
+    const { rerender } = render(<HostBadge sessionId="conv_1" />);
+    await user.tab();
+    expect(screen.getByRole("group", { name: "Switch host" })).toHaveFocus();
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(SESSION_ACTIONS_LOADING),
+    );
+
+    useHostsMock.mockReturnValue({ data: [host()], isLoading: false });
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByRole("button", { name: "mac-laptop, online" })).toHaveFocus();
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
+  });
+
+  it.each(["ordinary", "arclet", "lakebox", "loading", "failed"])(
+    "hides switch host in read-only %s sessions",
+    (state) => {
+      useHostsMock.mockReturnValue(
+        state === "loading" || state === "failed"
+          ? {
+              data: undefined,
+              isLoading: state === "loading",
+              error: state === "failed" ? new Error("Hosts unavailable") : null,
+            }
+          : { data: [host({ sandbox_provider: state === "ordinary" ? null : state })] },
+      );
+      render(<HostBadge sessionId="conv_1" appearance="composer" readOnly />);
+      fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
+    },
+  );
+
   it("does not offer host switching for a shared host omitted from the host list", () => {
     useHostsMock.mockReturnValue({ data: [] });
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
