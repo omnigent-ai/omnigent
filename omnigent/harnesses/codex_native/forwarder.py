@@ -2062,6 +2062,43 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+# Bounds the best-effort unsubscribe so a stalled app-server cannot block event handling.
+_UNSUBSCRIBE_TIMEOUT_SECONDS = 10.0
+
+
+async def _unsubscribe_retired_thread(
+    client: CodexAppServerClient,
+    *,
+    thread_id: str,
+) -> None:
+    """
+    Drop this connection's subscription to a thread retired by a native ``/clear``.
+
+    Codex keeps a thread and its stdio MCP servers loaded while any connection
+    stays subscribed, so the forwarder's own ``thread/resume`` would otherwise
+    pin the retired thread for the app-server's lifetime. Best effort: failures
+    are logged, not raised.
+
+    :param client: The forwarder's long-lived app-server client.
+    :param thread_id: Retired Codex thread id, e.g. ``"thread_old"``.
+    :returns: None.
+    """
+    try:
+        await asyncio.wait_for(
+            client.request("thread/unsubscribe", {"threadId": thread_id}),
+            _UNSUBSCRIBE_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - unsubscribe is best-effort cleanup.
+        _logger.warning(
+            "Codex forwarder could not unsubscribe retired thread %s after "
+            "rotation; its MCP servers may linger until the app server stops",
+            thread_id,
+            exc_info=True,
+        )
+
+
 async def supervise_forwarder(
     *,
     base_url: str,
@@ -2073,6 +2110,7 @@ async def supervise_forwarder(
     client: CodexAppServerClient | None = None,
     auth: httpx.Auth | None = None,
     ap_transport: httpx.AsyncBaseTransport | None = None,
+    on_session_rotated: Callable[[str, str], None] | None = None,
 ) -> None:
     """
     Mirror Codex app-server notifications into an Omnigent session.
@@ -2095,6 +2133,11 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
+    :param on_session_rotated: Optional callback invoked as
+        ``on_session_rotated(old_session_id, new_session_id)`` after a native
+        ``/clear`` rotates Omnigent ownership onto a fresh session. The runner
+        uses it to move its app-server/forwarder teardown bookkeeping onto the
+        session that now owns the terminal.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -2163,6 +2206,8 @@ async def supervise_forwarder(
         try:
             async for event in client.iter_events():
                 try:
+                    retiring_session_id = target.session_id
+                    retiring_thread_id = target.thread_id
                     rotated = await _maybe_rotate_session_on_thread_started(
                         ap_client=ap_client,
                         target=target,
@@ -2175,6 +2220,10 @@ async def supervise_forwarder(
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await subscribe_task
+                        await _unsubscribe_retired_thread(client, thread_id=retiring_thread_id)
+                        # Let the runner move its teardown bookkeeping onto the rotated session.
+                        if on_session_rotated is not None:
+                            on_session_rotated(retiring_session_id, target.session_id)
                         # Fresh thread after a /clear rotation — start its
                         # own active signal so the new subscription parks
                         # until the rotated thread's first turn.

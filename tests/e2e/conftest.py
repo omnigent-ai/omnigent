@@ -871,6 +871,66 @@ def live_server(
         log_handle.close()
 
 
+def restart_live_runner_process(live_server: str, live_runner_id: str) -> None:
+    """
+    Kill and replace the live runner subprocess, then wait for it to reconnect.
+
+    The replacement uses the same runner id, tunnel binding, and server, and the
+    environment currently recorded in ``_live_runner_state["env"]``, so a test
+    can adjust that environment before calling this.
+
+    :param live_server: Base URL of the live server kept across the restart.
+    :param live_runner_id: Stable runner identity reused by the replacement.
+    :returns: None. Returns once the replacement tunnel is online.
+    """
+    old_proc = cast(subprocess.Popen[bytes], _live_runner_state["process"])
+    old_proc.kill()
+    old_proc.wait(timeout=10)
+
+    # Do not mistake the dead tunnel's briefly stale registry entry for the
+    # replacement connection; observe the disconnect before starting it.
+    disconnect_deadline = time.monotonic() + HEALTH_TIMEOUT_S
+    while time.monotonic() < disconnect_deadline:
+        response = httpx.get(
+            f"{live_server}/v1/runners/{live_runner_id}/status",
+            timeout=2,
+        )
+        if response.status_code == 200 and response.json().get("online") is False:
+            break
+        time.sleep(POLL_INTERVAL_S)
+    else:
+        raise AssertionError("killed runner tunnel remained online before restart")
+
+    replacement = subprocess.Popen(
+        cast(list[str], _live_runner_state["args"]),
+        env=cast(dict[str, str], _live_runner_state["env"]),
+        cwd=cast(str | None, _live_runner_state["cwd"]),
+        stdout=cast(IO[bytes], _live_runner_state["log_handle"]),
+        stderr=subprocess.STDOUT,
+    )
+    _live_runner_state["process"] = replacement
+
+    deadline = time.monotonic() + HEALTH_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if replacement.poll() is not None:
+            raise AssertionError(
+                f"replacement runner exited early with code {replacement.returncode}"
+            )
+        try:
+            response = httpx.get(
+                f"{live_server}/v1/runners/{live_runner_id}/status",
+                timeout=2,
+            )
+            if response.status_code == 200 and response.json().get("online") is True:
+                return
+        except httpx.HTTPError:
+            # The server may briefly refuse connections while the tunnel
+            # re-registers; keep polling until the deadline.
+            pass
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError("replacement runner did not reconnect before timeout")
+
+
 @pytest.fixture
 def restart_live_runner(live_server: str, live_runner_id: str) -> Callable[[], None]:
     """
@@ -886,52 +946,7 @@ def restart_live_runner(live_server: str, live_runner_id: str) -> Callable[[], N
     """
 
     def restart() -> None:
-        old_proc = cast(subprocess.Popen[bytes], _live_runner_state["process"])
-        old_proc.kill()
-        old_proc.wait(timeout=10)
-
-        # Do not mistake the dead tunnel's briefly stale registry entry for the
-        # replacement connection; observe the disconnect before starting it.
-        disconnect_deadline = time.monotonic() + HEALTH_TIMEOUT_S
-        while time.monotonic() < disconnect_deadline:
-            response = httpx.get(
-                f"{live_server}/v1/runners/{live_runner_id}/status",
-                timeout=2,
-            )
-            if response.status_code == 200 and response.json().get("online") is False:
-                break
-            time.sleep(POLL_INTERVAL_S)
-        else:
-            raise AssertionError("killed runner tunnel remained online before restart")
-
-        replacement = subprocess.Popen(
-            cast(list[str], _live_runner_state["args"]),
-            env=cast(dict[str, str], _live_runner_state["env"]),
-            cwd=cast(str | None, _live_runner_state["cwd"]),
-            stdout=cast(IO[bytes], _live_runner_state["log_handle"]),
-            stderr=subprocess.STDOUT,
-        )
-        _live_runner_state["process"] = replacement
-
-        deadline = time.monotonic() + HEALTH_TIMEOUT_S
-        while time.monotonic() < deadline:
-            if replacement.poll() is not None:
-                raise AssertionError(
-                    f"replacement runner exited early with code {replacement.returncode}"
-                )
-            try:
-                response = httpx.get(
-                    f"{live_server}/v1/runners/{live_runner_id}/status",
-                    timeout=2,
-                )
-                if response.status_code == 200 and response.json().get("online") is True:
-                    return
-            except httpx.HTTPError:
-                # The server may briefly refuse connections while the tunnel
-                # re-registers; keep polling until the deadline.
-                pass
-            time.sleep(POLL_INTERVAL_S)
-        raise AssertionError("replacement runner did not reconnect before timeout")
+        restart_live_runner_process(live_server, live_runner_id)
 
     return restart
 

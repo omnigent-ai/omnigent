@@ -496,3 +496,67 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     assert [event for event in session_events if event.session_id == "conv_old"] == []
     assert hook_posts == []
     assert fake_client.responses == []
+
+
+def test_supervise_forwarder_unsubscribes_retired_thread_after_rotation(tmp_path: Path) -> None:
+    """A /clear rotation releases the forwarder's subscription to the retired
+    thread; Codex keeps a thread's stdio MCP servers loaded while subscribed, so the
+    forwarder's own thread/resume must not pin it for the app server's lifetime."""
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
+    )
+    fake_client = _FakeCodexAppServerClient(
+        events=[_thread_started_event("thread_new"), _started_event("turn_new")]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve AP calls made while the supervise loop rotates sessions."""
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_codex",
+                    "runner_id": "runner_123",
+                    "labels": {},
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "PATCH" and request.url.path in {
+            "/v1/sessions/conv_new",
+            "/v1/sessions/conv_old",
+        }:
+            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
+        if request.method == "POST" and request.url.path == (
+            "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer"
+        ):
+            return httpx.Response(200, json={"id": "terminal_codex_main"})
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(
+            500,
+            json={"error": f"unexpected {request.method} {request.url.path}"},
+        )
+
+    async def run() -> None:
+        """Run the supervise loop through a native thread switch."""
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=tmp_path,
+            app_server_url="ws://127.0.0.1:9876",
+            thread_id="thread_old",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
+        )
+
+    asyncio.run(run())
+
+    resumed = [
+        params["threadId"] for method, params in fake_client.requests if method == "thread/resume"
+    ]
+    assert resumed[:1] == ["thread_old"]
+    assert ("thread/unsubscribe", {"threadId": "thread_old"}) in fake_client.requests
+    assert ("thread/unsubscribe", {"threadId": "thread_new"}) not in fake_client.requests

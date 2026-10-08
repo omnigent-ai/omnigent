@@ -17,6 +17,7 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
 from omnigent.runner import subagent_work
+from omnigent.runner.native import orchestration as native_orchestration
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 
@@ -1607,3 +1608,106 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
+async def test_rekey_codex_native_session_moves_entries_and_evicts_under_new_key() -> None:
+    """
+    A native ``/clear`` rotation moves both registry entries onto the new session id.
+
+    The forwarder task and app-server stay the same objects, so the moved
+    forwarder's exit must still evict its entry even though it was registered
+    under the pre-rotation id.
+    """
+    old_id = "aaaa1111aaaa1111aaaa1111aaaa1111"
+    new_id = "bbbb2222bbbb2222bbbb2222bbbb2222"
+    run = _ForwarderRun()
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    class _FakeAppServer:
+        async def close(self) -> None:
+            pass
+
+    app_server = _FakeAppServer()
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(old_id, task)
+        runner_app_mod._AUTO_CODEX_APP_SERVERS[old_id] = app_server
+        await asyncio.sleep(0)
+
+        native_orchestration._rekey_codex_native_session(old_id, new_id)
+
+        assert old_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert old_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+        assert runner_app_mod._AUTO_FORWARDER_TASKS[new_id] is task
+        assert runner_app_mod._AUTO_CODEX_APP_SERVERS[new_id] is app_server
+
+        task.cancel()
+        await asyncio.wait({task})
+        # Done callbacks run on the next loop iteration.
+        await asyncio.sleep(0)
+        assert new_id not in runner_app_mod._AUTO_FORWARDER_TASKS, (
+            "a finished forwarder must be evicted under the key it was moved to"
+        )
+    finally:
+        for key in (old_id, new_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(key, None)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(key, None)
+        await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
+async def test_teardown_after_rekey_closes_codex_app_server_under_new_session_id() -> None:
+    """
+    After rotation, teardown reaches the app-server through the new session id only.
+
+    ``DELETE /v1/sessions`` and the idle reaper key teardown by the session that
+    now owns the terminal; the retired id must no longer stop the live server.
+    """
+    old_id = "cccc3333cccc3333cccc3333cccc3333"
+    new_id = "dddd4444dddd4444dddd4444dddd4444"
+    run = _ForwarderRun()
+    closed = False
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    class _FakeAppServer:
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    try:
+        task = asyncio.create_task(_parked())
+        runner_app_mod._register_auto_forwarder_task(old_id, task)
+        runner_app_mod._AUTO_CODEX_APP_SERVERS[old_id] = _FakeAppServer()
+        await asyncio.sleep(0)
+        native_orchestration._rekey_codex_native_session(old_id, new_id)
+
+        await runner_app_mod.teardown_codex_native_app_server(old_id)
+        assert not task.done(), "the retired session id must not stop the live forwarder"
+        assert closed is False
+
+        await runner_app_mod.teardown_codex_native_app_server(new_id)
+        assert task.cancelled()
+        assert run.cancelled is True
+        assert closed is True, "teardown by the rotated session id must close the app-server"
+        assert new_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+        assert new_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+    finally:
+        for key in (old_id, new_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(key, None)
+            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(key, None)
+        await _drain_forwarder_runs([run])
