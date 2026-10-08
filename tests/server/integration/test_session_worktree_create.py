@@ -22,8 +22,10 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostLaunchRunnerFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
@@ -61,6 +63,7 @@ class _HostCapture:
 
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
+    launches: list[HostLaunchRunnerFrame] = field(default_factory=list)
 
 
 # Factory yielded by the ``register_worktree_host`` fixture:
@@ -97,12 +100,18 @@ async def register_worktree_host(
         create_status: str = "ok",
         create_error: str | None = None,
         workspace: str | None = None,
+        capabilities: list[str] | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
-            hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
+            hello=HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="wt-host",
+                capabilities=HOST_CAPABILITIES if capabilities is None else capabilities,
+            ),
             owner=RESERVED_USER_LOCAL,
         )
         cap = _HostCapture()
@@ -155,6 +164,11 @@ async def register_worktree_host(
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
+                elif isinstance(frame, HostLaunchRunnerFrame):
+                    cap.launches.append(frame)
+                    fut = conn.pending_launches.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result({"status": "launched", "error": None})
 
         conn._drain_task_for_test = asyncio.create_task(_drain())  # type: ignore[attr-defined]
         conns.append(conn)
@@ -584,6 +598,7 @@ async def test_create_rejects_forged_worktree_identity(
         json={"agent_id": agent["id"], "labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}},
     )
     assert response.status_code == 400, response.text
+
 
 @pytest.mark.parametrize("failed_write", ["update_conversation", "set_host_id"])
 async def test_registry_metadata_failure_preserves_persisted_worktree(

@@ -55,6 +55,26 @@ The upstream MCP server lives at the administrator's URL. It is an outbound
 request from the Omnigent server. A `transport: registry` entry does not start a
 local MCP subprocess. Existing direct HTTP and stdio entries retain their behavior.
 
+## Server and execution-host versions
+
+Install the MCP registry build on both the server and every execution host that
+will run selected registry services. For this prototype, use the same commit on
+both sides, including the Omnigent package baked into sandbox images. Restart the
+host daemon and the session's runner after updating; changing a checkout does not
+replace an already running `uv tool` installation or daemon.
+
+Hosts and runners advertise `mcp_registry` in their existing hello capabilities.
+Selecting a registry service on a connected older build returns
+`runner_capability_mismatch` with upgrade instructions before launch or saving the
+selection. An upgraded host with an old runner still needs that runner restarted.
+For a new sandbox, compatibility is checked when its host connects; a rejected
+first launch reports the reason and tears down the fresh sandbox.
+
+Older clients can still use direct HTTP/stdio MCPs and sessions without registry
+references. Earlier prototype builds must also be updated to advertise the
+capability; a version string alone is not proof of support. Upstream URLs and
+credentials remain on the server; adding a URL to the reference is not the fix.
+
 ## Choose tools before launch
 
 On **New session**, open **MCPs** in the composer footer and check the services

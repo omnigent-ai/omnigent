@@ -9,9 +9,6 @@ from omnigent.server.auth import delegated_path_allowed
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_session_agent_owner import auth_app as auth_app
-from tests.server.integration.test_session_agent_owner import (
-    auth_client as auth_client,
-)  # pytest fixture re-export
 
 
 @pytest.fixture(autouse=True)

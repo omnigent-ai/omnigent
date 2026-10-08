@@ -172,6 +172,7 @@ def create_session_mcp_servers_router(
         agent, user_id = await _editable_agent(request, session_id)
         if body.transport == "registry":
             _require_registry_service(request, body.name, user_id)
+            await _require_registry_runtime(request, session_id, body.name)
         await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
@@ -197,6 +198,7 @@ def create_session_mcp_servers_router(
         agent, user_id = await _editable_agent(request, session_id)
         if body.transport == "registry":
             _require_registry_service(request, body.name, user_id)
+            await _require_registry_runtime(request, session_id, body.name)
         await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
@@ -234,6 +236,22 @@ def create_session_mcp_servers_router(
         _publish_agent_changed(session_id, agent)
         add_audit_attrs(server_name=server_name)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    async def _require_registry_runtime(request: Request, session_id: str, service: str) -> None:
+        from omnigent.runner.routing import routing_host_id
+        from omnigent.server.mcp_compatibility import require_registry_mcp_runtime
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise session_not_found()
+        require_registry_mcp_runtime(
+            [service],
+            host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
+            runner_id=conv.runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
+        )
 
     async def _editable_agent(request: Request, session_id: str) -> tuple[Agent, str | None]:
         """Authorize the owner and return an editable session-scoped agent.
