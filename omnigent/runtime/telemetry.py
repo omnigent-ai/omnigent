@@ -30,10 +30,11 @@ concerns:
 from __future__ import annotations
 
 import contextvars
+import functools
 import logging
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -66,6 +67,14 @@ _logs_initialized: bool = False
 # generically, with no per-operation code. Default None = no stamping.
 _session_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "omnigent_session_id", default=None
+)
+
+# Active skill for the current turn. Set when the executor observes a Skill /
+# load_skill tool call and reset at turn end. The active-skill span processor
+# reads it on_start and stamps `omnigent.skill.active` on every span in the
+# turn, so "which tools ran during skill X" needs no per-tool code.
+_active_skill_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "omnigent_active_skill", default=None
 )
 
 
@@ -112,6 +121,35 @@ def telemetry_enabled() -> bool:
     :returns: ``True`` when ``OMNIGENT_TELEMETRY_ENABLED`` is truthy.
     """
     return _env_bool("OMNIGENT_TELEMETRY_ENABLED")
+
+
+def telemetry_guarded(func: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Decorate a best-effort ``record_*`` so it no-ops when telemetry is off and
+    never raises.
+
+    Wraps the ``if not telemetry_enabled(): return`` guard plus the
+    debug-log-never-raise ``try/except`` that every metric emitter needs, so
+    new telemetry modules don't copy that boilerplate. See
+    ``designs/OBSERVABILITY.md`` for the telemetry-extension pattern.
+
+    :param func: A best-effort telemetry function whose return value is ignored.
+    :returns: The wrapped function.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        if not telemetry_enabled():
+            return None
+        try:
+            return func(*args, **kwargs)
+        except Exception:  # pragma: no cover - telemetry must never break callers
+            _logger.debug(
+                "telemetry hook %r failed", getattr(func, "__name__", func), exc_info=True
+            )
+            return None
+
+    return wrapper
 
 
 # Max characters of a serialized payload to attach to a span. Bodies can be
@@ -275,6 +313,67 @@ def session_scope(session_id: str | None) -> Iterator[None]:
         _session_id_var.reset(token)
 
 
+def set_active_skill(skill_name: str) -> contextvars.Token[str | None]:
+    """
+    Bind *skill_name* as the active skill for the current context.
+
+    Every span started until the returned token is reset is tagged with
+    ``omnigent.skill.active`` by the active-skill span processor, so the tools a
+    skill drives are attributable to it with no per-tool code. The executor
+    adapter sets this when it observes a Skill / load_skill tool call and resets
+    it at turn end.
+
+    :param skill_name: The skill name, e.g. ``"code-review"``.
+    :returns: A token to pass to :func:`reset_active_skill`.
+    """
+    return _active_skill_var.set(skill_name)
+
+
+def reset_active_skill(token: contextvars.Token[str | None]) -> None:
+    """Reset the active-skill binding created by :func:`set_active_skill`."""
+    _active_skill_var.reset(token)
+
+
+def current_active_skill() -> str | None:
+    """Return the active skill bound in the current context, or ``None``."""
+    return _active_skill_var.get()
+
+
+def make_contextvar_span_processor(
+    attribute_key: str, source: contextvars.ContextVar[str | None]
+) -> Any:
+    """
+    Build a span processor that stamps *attribute_key* on every recording span
+    from the current value of *source*.
+
+    This is the blessed way to propagate a cross-cutting, low-cardinality
+    attribute onto all spans with no per-call-site code — the pattern behind
+    ``session.id`` and ``omnigent.skill.active``. Registered on the runtime
+    ``TracerProvider`` in :func:`_init_otel_traces`.
+
+    :param attribute_key: The span attribute to set, e.g. ``"omnigent.skill.active"``.
+    :param source: The context var supplying the value.
+    :returns: A ``SpanProcessor`` instance.
+    """
+    from opentelemetry.sdk.trace import SpanProcessor
+
+    class _ContextVarSpanProcessor(SpanProcessor):
+        def on_start(self, span: Any, parent_context: Any = None) -> None:
+            try:
+                value = source.get()
+                if value and span.is_recording():
+                    span.set_attribute(attribute_key, value)
+            except Exception:  # pragma: no cover - telemetry must never break spans
+                pass
+
+    return _ContextVarSpanProcessor()
+
+
+def _make_active_skill_processor() -> Any:
+    """Span processor stamping ``omnigent.skill.active`` from :data:`_active_skill_var`."""
+    return make_contextvar_span_processor("omnigent.skill.active", _active_skill_var)
+
+
 def _make_session_id_processor() -> Any:
     """
     Build a span processor that stamps ``session.id`` from the active
@@ -282,25 +381,42 @@ def _make_session_id_processor() -> Any:
 
     Registered on the runtime ``TracerProvider`` (:func:`_init_otel_traces`)
     so the session id flows onto all spans — server, runner, harness, and any
-    future operation — with no per-call-site code. Subclasses the SDK
-    ``SpanProcessor`` so it satisfies the full processor interface (e.g. the
-    internal ``_on_ending`` hook); only ``on_start`` is overridden. Built
-    lazily because the OTel SDK is not a hard import dependency of this module.
+    future operation — with no per-call-site code. Delegates to
+    :func:`make_contextvar_span_processor`, the shared context-var seam.
+
+    :returns: A ``SpanProcessor`` instance.
+    """
+    return make_contextvar_span_processor("session.id", _session_id_var)
+
+
+def _make_user_id_processor() -> Any:
+    """
+    Build a span processor that stamps ``user.id`` from the ``USER``
+    environment variable onto every recording span.
+
+    Unlike ``session.id`` (per-turn, via :data:`_session_id_var`), the
+    process owner is fixed for the process's lifetime, so this reads
+    ``USER`` once at processor-construction time rather than per-span.
+    Deployments that run one Omnigent process per analyst (e.g. EAP's
+    per-notebook container) get every span attributed to that analyst with
+    no per-call-site code — matching MLflow's OTLP ingest, which already
+    promotes ``session.id`` and ``user.id`` to trace-level fields.
 
     :returns: A ``SpanProcessor`` instance.
     """
     from opentelemetry.sdk.trace import SpanProcessor
 
-    class _SessionIdSpanProcessor(SpanProcessor):
+    user_id = os.environ.get("USER")
+
+    class _UserIdSpanProcessor(SpanProcessor):
         def on_start(self, span: Any, parent_context: Any = None) -> None:
             try:
-                session_id = _session_id_var.get()
-                if session_id and span.is_recording():
-                    span.set_attribute("session.id", session_id)
+                if user_id and span.is_recording():
+                    span.set_attribute("user.id", user_id)
             except Exception:  # pragma: no cover - telemetry must never break spans
                 pass
 
-    return _SessionIdSpanProcessor()
+    return _UserIdSpanProcessor()
 
 
 def _fastapi_instrumentation_enabled() -> bool:
@@ -1023,6 +1139,13 @@ def _init_otel_traces(endpoint: str) -> None:
             # Enrich every span with session.id from the active context (set via
             # session_scope at the request hook / executor turn / forwarder).
             provider.add_span_processor(_make_session_id_processor())
+            # Enrich every span with user.id (the process owner), so dashboards
+            # can group spans per analyst alongside the per-turn session.id.
+            provider.add_span_processor(_make_user_id_processor())
+            # Stamp omnigent.skill.active on every span while a skill runs, so the
+            # tools it drives are attributable to it (executor adapter sets the
+            # active skill from the observed Skill / load_skill tool call).
+            provider.add_span_processor(_make_active_skill_processor())
             provider.add_span_processor(BatchSpanProcessor(_create_otlp_span_exporter()))
             trace.set_tracer_provider(provider)
 

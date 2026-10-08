@@ -78,6 +78,12 @@ _TOOL_NAME = "tool.name"
 # content capture just like input.value / output.value.
 _ERROR_MESSAGE = "error.message"
 
+# Skill identity is low-cardinality structural metadata (not payload), so it is
+# stamped unconditionally — independent of content capture — onto the tool span
+# for a Skill / load_skill call. The active-skill span processor separately tags
+# every later span in the turn with `omnigent.skill.active`.
+_SKILL_NAME = "omnigent.skill.name"
+
 # ---------------------------------------------------------------------------
 # Global enable/disable
 # ---------------------------------------------------------------------------
@@ -306,6 +312,11 @@ class TracingContext:
         span.end()
         if span is self._current_span:
             self._current_span = parent_span
+
+    def set_skill_name(self, span: Span | None, skill_name: str) -> None:
+        """Stamp ``omnigent.skill.name`` on *span* (a Skill / load_skill tool span)."""
+        if span is not None and skill_name:
+            span.set_attribute(_SKILL_NAME, skill_name)
 
     def start_policy_span(
         self,

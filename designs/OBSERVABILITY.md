@@ -455,5 +455,71 @@ replay/diff tooling for transcript reconstruction, fork, and resume.
   app's own origin. A future cross-origin deployment that introduces CORS must allow the
   `traceparent`/`tracestate` request headers (server and any reverse proxy) or the header
   is silently stripped.
+
+## 13. Extending telemetry: adding new spans & metrics
+
+There is no telemetry hook/plugin bus — new telemetry uses one of four seams
+below. Whichever you pick, obey the content discipline from §9: **structural /
+id / enum / low-cardinality attributes are emitted unconditionally; free-text or
+payload attributes go behind `should_capture_content()`** (or
+`record_message_payload`, which also redacts + caps). Metrics carry only bounded
+low-cardinality labels — never content, never ids like `session.id`.
+
+| Need | Seam | Reference |
+|---|---|---|
+| Structured, per-turn, tree-nested span (agent/tool/skill-like) | New `start_X_span`/`end_X_span` on `TracingContext` + an `elif isinstance(event, …)` branch in the executor-adapter event loop | `omnigent/inner/tracing.py`, `omnigent/runtime/harnesses/_executor_adapter.py` |
+| Cross-cutting attribute on **every** span from ambient context | A `ContextVar` + `make_contextvar_span_processor(attr, var)`, registered in `_init_otel_traces` | `telemetry.py` (`_session_id_var`, `_active_skill_var`) |
+| Aggregatable counts / latency (dashboards, alerting) | A metric module copied from `omnigent/db/metrics.py`, with module-level `record_*` wrapped in `@telemetry_guarded` | `omnigent/runtime/skill_metrics.py`, `omnigent/db/metrics.py` |
+| Ad-hoc span around a code block | `telemetry.span()` (+ `record_message_payload` for a gated body) | `telemetry.py`, `omnigent/runtime/policies/engine.py` |
+
+Two shared helpers keep the common cases one-liners:
+
+- **`telemetry.telemetry_guarded`** — decorator that no-ops when telemetry is off
+  and never raises; wraps the `telemetry_enabled()` guard + debug-log-never-raise
+  boilerplate every `record_*` needs.
+- **`telemetry.make_contextvar_span_processor(attribute_key, contextvar)`** —
+  builds the "stamp `attribute_key` from a context var on every span" processor.
+  `omnigent.skill.active` uses it; the older `session.id`/`user.id` processors
+  predate it (`session.id` is a direct fit and can adopt it later; `user.id`
+  reads a static env value, not a context var, so it stays bespoke).
+
+**Worked example — skill-execution telemetry (turn-scoped).** The executor
+adapter observes the `Skill` / `load_skill` tool call, stamps the ungated
+`omnigent.skill.name` on that tool span (`TracingContext.set_skill_name`), and
+`set_active_skill(name)` so `omnigent.skill.active` lands on every later span in
+the turn — that is how "which tools ran during skill X" is derivable with no
+per-tool code. At turn end the adapter records `omnigent.skill.invocations`
+(by outcome), `omnigent.skill.execution.duration`, and `omnigent.skill.tool_calls`
+(`omnigent/runtime/skill_metrics.py`) and releases the active-skill binding.
+Boundaries are turn-scoped and therefore approximate: there is no native
+"skill finished" signal, so a skill's window is the Skill call → end of that
+agent turn.
+
+**Harness coverage & known gaps.** Detection fires only on a `ToolCallRequest`
+whose name (after `_strip_mcp_tool_prefix`) is in `_SKILL_TOOL_NAMES`
+(`{"Skill", "load_skill"}`). That covers every harness that surfaces a skill as a
+bare or MCP-prefixed `load_skill` tool call, plus claude-sdk's native `Skill`:
+
+- **Covered:** claude-sdk (native `Skill` + `load_skill`), codex (`load_skill`
+  dynamic tool), pi (bridged `load_skill`), openai-agents-sdk, copilot, cursor.
+- **Not covered (documented gaps):**
+  - *Native, non-tool-call skill mechanisms* — codex's `$CODEX_HOME/skills`
+    slash-menu (expands to a hidden message) and pi's `--skill` launch flag
+    (surfaces as a `read` of `SKILL.md`). Not tool calls, so no
+    `load_skill`/`Skill` event is emitted.
+  - *Harnesses that don't surface a usable `ToolCallRequest`* — goose (tool-call
+    updates only logged), qwen (event carries the ACP display title, not the raw
+    tool name), kimi (`load_skill` not exposed), hermes (text-only, no tool
+    events).
+  - *All `*_native` harnesses* — their executors yield only `TurnComplete`;
+    `load_skill` is dispatched out-of-band through the runner relay, which the
+    adapter loop never observes.
+- **Universal choke point if coverage must extend later:** the runner's
+  `_execute_skill_tool` (`runner/tool_dispatch.py`) — every harness that executes
+  the `load_skill` builtin funnels through it. Instrumenting there (deduped
+  against this adapter path) would add invocation/outcome/latency for all of
+  them; "tools used during skill" would stay adapter-only, since the uncovered
+  harnesses emit no tool spans to tag.
+
 </content>
 </invoke>

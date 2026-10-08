@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import secrets
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -105,6 +106,34 @@ def _strip_mcp_tool_prefix(name: str) -> str:
         if len(parts) == 3:
             return parts[2]
     return name
+
+
+# Tool names that load/activate a skill. "Skill" is Claude Code's native skill
+# tool (claude-sdk harness); "load_skill" is Omnigent's builtin (arrives as
+# mcp__omnigent__load_skill, stripped by _strip_mcp_tool_prefix). Harnesses whose
+# skills never surface as a load_skill/Skill tool call are a documented gap — see
+# designs/OBSERVABILITY.md §13 (Harness coverage & known gaps).
+_SKILL_TOOL_NAMES = frozenset({"Skill", "load_skill"})
+
+
+def _extract_skill_name(tool_name: str, args: dict[str, Any]) -> str | None:
+    """Best-effort skill name from a Skill / load_skill tool call's args.
+
+    ``load_skill`` uses ``{"name": ...}``; Claude Code's native ``Skill`` tool is
+    CLI-owned (its input key is not fixed by the SDK — commonly ``command``), so
+    probe the known keys then fall back to the first string value. Returns
+    ``None`` when nothing usable is present.
+    """
+    if not isinstance(args, dict):
+        return None
+    for key in ("command", "name", "skill", "skill_name"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for value in args.values():
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 # Prefix for local host-tool-bridge calls (``sys_os_*``). An orphaned host-tool callback
@@ -269,6 +298,14 @@ class ExecutorAdapter(HarnessApp):
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
         _active_tool_span = None
         _active_tool_parent = None
+        # Skill telemetry (turn-scoped). Token for the active-skill contextvar;
+        # distinct skills invoked this turn (the most-recent is _turn_skills[-1]);
+        # its start time for a turn-bounded execution duration. _turn_outcome is
+        # set at each terminal branch and consumed once in the finally.
+        _active_skill_token: Any = None
+        _turn_skills: list[str] = []
+        _last_skill_start: float | None = None
+        _turn_outcome: str | None = None
 
         user_message = _extract_last_user_message(request.input)
 
@@ -301,6 +338,13 @@ class ExecutorAdapter(HarnessApp):
                         user_message=user_message,
                         model=request.model_override or request.model,
                     )
+                    # Skill-telemetry helpers, bound once per traced turn so the
+                    # per-tool-call path below never re-imports them.
+                    from omnigent.runtime import skill_metrics
+                    from omnigent.runtime.telemetry import (
+                        reset_active_skill,
+                        set_active_skill,
+                    )
 
                 response_text: str | None = None
                 async for event in executor.run_turn(
@@ -326,16 +370,34 @@ class ExecutorAdapter(HarnessApp):
                         # Mark clean_exit AFTER the interrupt completes: if it raises,
                         # the finally's _safe_interrupt fallback still fires.
                         await executor.interrupt_session(self._session_key)
+                        _turn_outcome = "cancelled"
                         clean_exit = True
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
                         if isinstance(event, ToolCallRequest):
                             _active_tool_parent = tctx._current_span
+                            _bare_tool_name = _strip_mcp_tool_prefix(event.name)
                             _active_tool_span = tctx.start_tool_span(
-                                _strip_mcp_tool_prefix(event.name),
+                                _bare_tool_name,
                                 event.args or {},
                             )
+                            if _bare_tool_name in _SKILL_TOOL_NAMES:
+                                _skill_name = _extract_skill_name(
+                                    _bare_tool_name, event.args or {}
+                                )
+                                if _skill_name:
+                                    tctx.set_skill_name(_active_tool_span, _skill_name)
+                                    if _active_skill_token is not None:
+                                        with contextlib.suppress(Exception):
+                                            reset_active_skill(_active_skill_token)
+                                    _active_skill_token = set_active_skill(_skill_name)
+                                    _turn_skills.append(_skill_name)
+                                    _last_skill_start = time.monotonic()
+                            elif _turn_skills:
+                                skill_metrics.record_skill_tool_call(
+                                    _turn_skills[-1], _bare_tool_name
+                                )
                         elif isinstance(event, ToolCallComplete):
                             if _active_tool_span is not None:
                                 tctx.end_tool_span(
@@ -366,6 +428,7 @@ class ExecutorAdapter(HarnessApp):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None
+                        _turn_outcome = "success"
                         clean_exit = True
                         return
                     if isinstance(event, TurnCancelled):
@@ -383,9 +446,11 @@ class ExecutorAdapter(HarnessApp):
                             record_cancellation(agent_span)
                             tctx.end_agent_span(agent_span, response=None, error="cancelled")
                         # Inner executor wound down cleanly.
+                        _turn_outcome = "cancelled"
                         clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
+                        _turn_outcome = "error"
                         log_input_event(
                             _logger,
                             "native_input_execution_finished",
@@ -446,6 +511,7 @@ class ExecutorAdapter(HarnessApp):
                 "elicitation explicitly declined for response %s — aborting turn",
                 ctx.response_id,
             )
+            _turn_outcome = "cancelled"
             if tctx is not None and agent_span is not None:
                 from omnigent.runtime.telemetry import record_cancellation
 
@@ -455,6 +521,7 @@ class ExecutorAdapter(HarnessApp):
             if self._executor is not None:
                 await self._executor.interrupt_session(self._session_key)
         except BaseException as exc:
+            _turn_outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
             if input_identity and not input_outcome_logged:
                 log_input_event(
                     _logger,
@@ -476,6 +543,25 @@ class ExecutorAdapter(HarnessApp):
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await injection_watcher
+            # Skill telemetry: record turn-scoped invocations/duration once, then
+            # release the active-skill binding (backstop for the per-call reset)
+            # so it never leaks into the next turn on the reused tracing context.
+            if _turn_skills:
+                from omnigent.runtime import skill_metrics
+
+                _outcome = _turn_outcome or "unknown"
+                for _skill in dict.fromkeys(_turn_skills):
+                    skill_metrics.record_skill_invocation(_skill, _outcome)
+                if _last_skill_start is not None:
+                    skill_metrics.record_skill_execution_duration(
+                        _turn_skills[-1],
+                        (time.monotonic() - _last_skill_start) * 1000.0,
+                    )
+            if _active_skill_token is not None:
+                from omnigent.runtime.telemetry import reset_active_skill
+
+                with contextlib.suppress(Exception):
+                    reset_active_skill(_active_skill_token)
             if tctx is not None:
                 try:
                     from opentelemetry import trace as otel_trace
