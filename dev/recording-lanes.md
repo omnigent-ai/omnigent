@@ -297,9 +297,11 @@ tape and note that rendering was skipped.
   `projects["<abs cwd>"].hasTrustDialogAccepted` into
   `$CLAUDE_CONFIG_DIR/.claude.json` (or `~/.claude.json`), the same pre-accept the
   runner performs for native sessions — or answer the dialog on-tape as a visible
-  step. `claude agents` then opens an interactive view that stays open: `Wait` for
-  the listed session, leave the view (Claude Code asks for Ctrl-C twice), and
-  `Wait` for the shell prompt before typing the next command.
+  step. Export `CLAUDE_CONFIG_DIR` to the recording's own config directory before
+  calling the helper and keep it set for the tape, so the seeded trust never lands
+  in your real `~/.claude.json`. `claude agents` then opens an interactive view
+  that stays open: `Wait` for the listed session, leave the view (Claude Code asks
+  for Ctrl-C twice), and `Wait` for the shell prompt before typing the next command.
 - **A clip of the reproduction TEST running is NOT the journey.** If the tape
   won't render (server boot times out, `ttyd` missing, VHS unavailable), do
   **not** substitute a recording of `pytest … FAILS` / an `AssertionError`. That

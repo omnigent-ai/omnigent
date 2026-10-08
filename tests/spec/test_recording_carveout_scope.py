@@ -49,7 +49,9 @@ def test_cli_lane_pre_answers_harness_first_run_prompts_before_filming() -> None
     assert "Do you trust this folder?" in lanes
     assert "ensure_claude_workspace_trusted(Path(cwd))" in lanes
     assert 'projects["<abs cwd>"].hasTrustDialogAccepted' in lanes
+    assert "Export `CLAUDE_CONFIG_DIR` to the recording's own config directory" in lanes
     assert "`claude agents` then opens an interactive view that stays open" in lanes
+    assert "`Wait` for the shell prompt before typing the next command" in lanes
 
 
 def test_finishing_a_clip_checks_every_captioned_step() -> None:
