@@ -53,7 +53,9 @@ pnpm --filter web run build          # build the SPA the server serves
 cd web/electron && pnpm install      # brings in electron + playwright
 ```
 
-On a headless CI box, wrap the run in `xvfb-run` so Electron has a display.
+On a headless Linux box with no `DISPLAY`, the harness starts a private `Xvfb`
+(and passes Chromium `--no-sandbox` / `--disable-dev-shm-usage`) so a plain
+`node --test` run works; wrapping it in `xvfb-run -a` still works too.
 The harness still skips cleanly (not fails) when `electron` or `playwright`
 are absent (e.g. a `--filter web`-only checkout), so those runs stay green.
 
@@ -63,9 +65,9 @@ are absent (e.g. a `--filter web`-only checkout), so those runs stay green.
 cd web/electron
 # after building the SPA (see above):
 node --test e2e/desktop_connect.e2e.js
-# headless CI (needs a virtual display; set OMNIGENT_PW_NO_SANDBOX so Electron's
-# Chromium starts under xvfb / as root / in a container — same flag the Python
-# e2e_ui suite uses):
+# headless CI: with no DISPLAY the harness starts its own Xvfb. To supply the
+# display yourself, set OMNIGENT_PW_NO_SANDBOX so Electron's Chromium starts
+# under xvfb / as root / in a container — same flag the Python e2e_ui suite uses:
 OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_connect.e2e.js
 ```
 

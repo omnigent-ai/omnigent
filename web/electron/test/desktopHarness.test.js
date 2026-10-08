@@ -7,11 +7,12 @@
 
 const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { saveRecording } = require("../e2e/desktopHarness");
+const { saveRecording, startPrivateDisplay } = require("../e2e/desktopHarness");
 
 describe("saveRecording", () => {
   let dir;
@@ -59,4 +60,42 @@ describe("saveRecording", () => {
   it("returns empty when nothing was recorded", () => {
     assert.deepEqual(saveRecording(dir, "clip"), []);
   });
+});
+
+describe("startPrivateDisplay", () => {
+  const xvfbAvailable =
+    process.platform === "linux" &&
+    spawnSync("Xvfb", ["-help"], { stdio: "ignore" }).error === undefined;
+  let savedDisplay;
+
+  beforeEach(() => {
+    savedDisplay = process.env.DISPLAY;
+  });
+
+  afterEach(() => {
+    if (savedDisplay === undefined) delete process.env.DISPLAY;
+    else process.env.DISPLAY = savedDisplay;
+  });
+
+  it("leaves an existing display alone", async () => {
+    process.env.DISPLAY = ":42";
+    assert.equal(await startPrivateDisplay(), null);
+  });
+
+  it(
+    "starts its own Xvfb when Linux has no display and stops it on request",
+    { skip: xvfbAvailable ? false : "needs Linux with Xvfb installed" },
+    async () => {
+      delete process.env.DISPLAY;
+      const owned = await startPrivateDisplay();
+      const socket = `/tmp/.X11-unix/X${owned.display.slice(1)}`;
+      try {
+        assert.match(owned.display, /^:\d+$/);
+        assert.ok(fs.existsSync(socket), `no X socket at ${socket}`);
+      } finally {
+        await owned.stop();
+      }
+      assert.equal(fs.existsSync(socket), false);
+    },
+  );
 });

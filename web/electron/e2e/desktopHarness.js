@@ -349,6 +349,75 @@ function startDisplayCapture(recordDir, display) {
   return { stop };
 }
 
+/** SIGTERM a child and wait for it to exit (SIGKILL after 5s). */
+function stopProcess(proc) {
+  return new Promise((resolve) => {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const hardKill = setTimeout(() => proc.kill("SIGKILL"), 5_000);
+    proc.once("exit", () => {
+      clearTimeout(hardKill);
+      resolve();
+    });
+    proc.kill("SIGTERM");
+  });
+}
+
+/**
+ * Start a private Xvfb when Linux has no display, so the lane runs on a
+ * headless box without an `xvfb-run` wrapper. Resolves null when a display
+ * already exists (or off Linux); rejects with a named error when Xvfb is
+ * missing or never comes up.
+ *
+ * @returns {Promise<{ display: string, stop: () => Promise<void> } | null>}
+ */
+function startPrivateDisplay() {
+  if (process.platform !== "linux" || process.env.DISPLAY) return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    // -displayfd lets Xvfb pick a free display and report it on fd 3 once it
+    // accepts connections, so there is no lock-file race to poll.
+    const proc = spawn(
+      "Xvfb",
+      ["-displayfd", "3", "-screen", "0", "1280x1024x24", "-nolisten", "tcp"],
+      { stdio: ["ignore", "ignore", "pipe", "pipe"] },
+    );
+    let number = "";
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    const fail = (message) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`${message}\n${stderr}`.trim()));
+    };
+    timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      fail("Xvfb did not report a display within 15s");
+    }, 15_000);
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    proc.stdio[3].on("data", (chunk) => {
+      number += chunk;
+      if (settled || !number.includes("\n")) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ display: `:${number.trim()}`, stop: () => stopProcess(proc) });
+    });
+    proc.on("error", (err) => {
+      fail(
+        err.code === "ENOENT"
+          ? "No DISPLAY and Xvfb is not installed; install Xvfb or run under xvfb-run"
+          : String(err),
+      );
+    });
+    proc.on("exit", (code, signal) => fail(`Xvfb exited early (${signal ?? code})`));
+  });
+}
+
 /**
  * Launch the real desktop shell (Electron main process) under Playwright with
  * video recording on, in an isolated userData dir so it never touches the
@@ -369,8 +438,8 @@ function startDisplayCapture(recordDir, display) {
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
  *   window: import("playwright").Page, userDataDir: string,
  *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
- *   awaited before `saveRecording` (it finalizes the composited capture; a
- *   no-op when no display capture ran).
+ *   awaited before `saveRecording` (it finalizes the composited capture and
+ *   shuts down a harness-owned Xvfb; a no-op when neither ran).
  */
 async function launchDesktop(opts) {
   const { _electron: electron } = require("playwright");
@@ -397,12 +466,16 @@ async function launchDesktop(opts) {
   );
   const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
   const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
+  // A headless Linux box gets a private Xvfb so the lane runs without an
+  // xvfb-run wrapper; that box also needs the hardening flags below.
+  const privateDisplay = await startPrivateDisplay();
+  const display = privateDisplay ? privateDisplay.display : process.env.DISPLAY;
   // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
   // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
   // as root or in a container — Electron's Chromium refuses to start without
   // --no-sandbox, and --disable-dev-shm-usage avoids the tiny /dev/shm a
   // container gives it. Off by default so local (macOS/dev) runs are unchanged.
-  if (process.env.OMNIGENT_PW_NO_SANDBOX) {
+  if (process.env.OMNIGENT_PW_NO_SANDBOX || privateDisplay) {
     args.push("--no-sandbox", "--disable-dev-shm-usage");
   }
 
@@ -412,10 +485,11 @@ async function launchDesktop(opts) {
   // recording" would silently drop the very content a journey renders inside
   // an embedded browser view. The display capture becomes the primary clip in
   // saveRecording; the per-page clips remain as context.
-  const displayCapture = startDisplayCapture(opts.recordDir, process.env.DISPLAY);
+  const displayCapture = startDisplayCapture(opts.recordDir, display);
 
   const stopDisplayCapture = async () => {
     if (displayCapture) await displayCapture.stop();
+    if (privateDisplay) await privateDisplay.stop();
   };
 
   let electronApp;
@@ -425,7 +499,12 @@ async function launchDesktop(opts) {
       recordVideo: { dir: opts.recordDir },
       // Dev builds read dev-app-update.yml and would try to reach the update
       // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0", ...opts.env },
+      env: {
+        ...process.env,
+        OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0",
+        ...(display ? { DISPLAY: display } : {}),
+        ...opts.env,
+      },
     });
   } catch (err) {
     await stopDisplayCapture();
@@ -523,4 +602,5 @@ module.exports = {
   spawnServer,
   launchDesktop,
   saveRecording,
+  startPrivateDisplay,
 };
