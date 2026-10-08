@@ -966,7 +966,8 @@ def _run_cli_probe(argv: list[str], *, timeout: float) -> subprocess.CompletedPr
 
     ``subprocess.run(timeout=...)`` kills only the direct child, so anything the CLI
     spawned (an update-check ``git fetch``, an npm launcher's native binary) outlives
-    the probe, and the readiness loop re-probes failures every refresh.
+    the probe, and the readiness loop re-probes failures every refresh. The tree is
+    also killed when the wait is interrupted (Ctrl-C during setup, cancellation).
 
     :raises subprocess.TimeoutExpired: When the probe exceeds *timeout*.
     """
@@ -980,7 +981,7 @@ def _run_cli_probe(argv: list[str], *, timeout: float) -> subprocess.CompletedPr
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException:
         kill_tree(process)
         # Reap the leader, but never wait on a descendant that escaped the group
         # and kept the pipe open.
