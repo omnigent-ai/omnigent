@@ -312,6 +312,8 @@ export interface Session {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;
+  /** Unix seconds of the last persisted change (the sidebar's sort key); absent on older servers. */
+  updatedAt?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string
@@ -463,6 +465,8 @@ export interface Session {
    * identity label when the user is inside a child.
    */
   parentSessionId: string | null;
+  /** First-class project the session is filed under; ``null``/absent when unfiled. */
+  projectId?: string | null;
   /**
    * For sub-agent (child) sessions, the sub-agent type name within
    * the parent's spec tree, e.g. ``"claude_code"``. ``null`` for

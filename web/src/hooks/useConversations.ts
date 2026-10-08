@@ -32,6 +32,7 @@ import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
+  conversationRowFromSession,
   filtersFromConversationQueryKey,
   lastIdAfterFiltering,
   insertNewRowsIntoPages,
@@ -1766,18 +1767,7 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
 
 function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | undefined {
   const session = queryClient.getQueryData<Session>(["session", id]);
-  if (!session) return undefined;
-  return {
-    id,
-    object: "conversation",
-    title: session.title,
-    created_at: session.createdAt,
-    updated_at: session.createdAt,
-    labels: session.labels ?? {},
-    permission_level: session.permissionLevel,
-    agent_id: session.agentId,
-    archived: session.archived,
-  };
+  return session ? conversationRowFromSession(session) : undefined;
 }
 
 // Pin, unpin, and reorder writes share a mutation key, and a new one is refused

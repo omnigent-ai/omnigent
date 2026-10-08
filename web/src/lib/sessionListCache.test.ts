@@ -1,15 +1,20 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { Session } from "@/lib/types";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
+  clearRecentlyCreated,
   collectConversationIds,
+  conversationRowFromSession,
   filtersFromConversationQueryKey,
+  insertCreatedRowIntoCaches,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
+  recentlyCreatedSessions,
   removeIdsFromPages,
 } from "./sessionListCache";
 
@@ -521,5 +526,97 @@ describe("insertNewRowsIntoPages", () => {
       (id) => id === "gone",
     );
     expect(inserted).toHaveLength(0);
+  });
+});
+
+function session(overrides: Partial<Session> = {}): Session {
+  return {
+    id: "conv_fork",
+    agentId: "ag_1",
+    agentName: "hello",
+    status: "idle",
+    createdAt: 100,
+    title: "Fork of My session",
+    items: [],
+    permissionLevel: 4,
+    parentSessionId: null,
+    subAgentName: null,
+    kind: "default",
+    ...overrides,
+  };
+}
+
+describe("conversationRowFromSession", () => {
+  it("maps a session snapshot onto the sidebar row shape", () => {
+    const row = conversationRowFromSession(
+      session({
+        updatedAt: 150,
+        labels: { k: "v" },
+        hostId: "host_1",
+        workspace: "/repo",
+        gitBranch: "feat",
+        projectId: "proj_1",
+      }),
+    );
+    expect(row).toMatchObject({
+      id: "conv_fork",
+      object: "conversation",
+      title: "Fork of My session",
+      created_at: 100,
+      updated_at: 150,
+      labels: { k: "v" },
+      permission_level: 4,
+      agent_id: "ag_1",
+      agent_name: "hello",
+      host_id: "host_1",
+      workspace: "/repo",
+      git_branch: "feat",
+      parent_session_id: null,
+      project_id: "proj_1",
+    });
+    // A snapshot names no owner, so the row reads as the viewer's own.
+    expect(row.owner).toBeUndefined();
+  });
+
+  it("falls back to created_at when the snapshot carries no updated_at", () => {
+    const row = conversationRowFromSession(session());
+    expect(row.updated_at).toBe(100);
+    expect(row.labels).toEqual({});
+    expect(row.project_id).toBeNull();
+  });
+});
+
+describe("insertCreatedRowIntoCaches", () => {
+  afterEach(() => clearRecentlyCreated());
+
+  const ids = (qc: QueryClient, key: unknown[]) =>
+    qc.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data.map((c) => c.id);
+
+  it("prepends the row to the unfiltered lists and arms the keep-alive", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(["conversations", "", false], data([conv("old")]));
+    qc.setQueryData(["conversations", "", false, null, "mine"], data([conv("old")]));
+    // A search list and the archived tab can't place a brand-new row.
+    qc.setQueryData(["conversations", "old", false], data([conv("old")]));
+    qc.setQueryData(
+      ["conversations", "", true, null, "archived"],
+      data([conv("gone", { archived: true })]),
+    );
+
+    const row = conv("fork", { title: "Fork of old" });
+    insertCreatedRowIntoCaches(qc, row);
+
+    expect(ids(qc, ["conversations", "", false])).toEqual(["fork", "old"]);
+    expect(ids(qc, ["conversations", "", false, null, "mine"])).toEqual(["fork", "old"]);
+    expect(ids(qc, ["conversations", "old", false])).toEqual(["old"]);
+    expect(ids(qc, ["conversations", "", true, null, "archived"])).toEqual(["gone"]);
+    expect(recentlyCreatedSessions.get("fork")).toEqual(row);
+  });
+
+  it("does not duplicate a row a list already holds", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(["conversations", "", false], data([conv("fork"), conv("old")]));
+    insertCreatedRowIntoCaches(qc, conv("fork"));
+    expect(ids(qc, ["conversations", "", false])).toEqual(["fork", "old"]);
   });
 });

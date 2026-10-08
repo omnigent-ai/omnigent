@@ -145,6 +145,8 @@ interface SessionResponseWire {
    */
   background_tasks?: BackgroundTaskInfo[] | null;
   created_at: number;
+  /** Unix seconds of the last persisted change; absent on older servers. */
+  updated_at?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent or a user-supplied string for a top-level session.
@@ -234,6 +236,8 @@ interface SessionResponseWire {
    * regular session without an extra request.
    */
   parent_session_id?: string | null;
+  /** First-class project the session is filed under; ``null``/absent when unfiled. */
+  project_id?: string | null;
   /**
    * For sub-agent (child) sessions, the sub-agent type name within
    * the parent's spec tree, e.g. ``"claude_code"``. ``null`` (or
@@ -332,6 +336,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     createdAt: wire.created_at,
+    updatedAt: wire.updated_at ?? null,
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
@@ -360,6 +365,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     })),
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
+    projectId: wire.project_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],

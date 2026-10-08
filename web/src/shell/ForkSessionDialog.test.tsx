@@ -14,6 +14,12 @@ import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import {
+  clearRecentlyCreated,
+  recentlyCreatedSessions,
+  type ConversationsInfiniteData,
+} from "@/lib/sessionListCache";
+import type { Conversation } from "@/hooks/useConversations";
+import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
   type AvailableAgent,
@@ -164,7 +170,7 @@ function renderDialog(
       </TooltipProvider>
     </QueryClientProvider>,
   );
-  return { ...utils, invalidateSpy };
+  return { ...utils, invalidateSpy, client };
 }
 
 /** Open the Radix host <Select> (hosts + sandbox rows). */
@@ -225,7 +231,10 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useHostFilesystem>);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  clearRecentlyCreated();
+});
 
 describe("ForkSessionDialog", () => {
   it("leaves the name optional, suggesting 'Fork of <title>' as the placeholder", () => {
@@ -276,6 +285,50 @@ describe("ForkSessionDialog", () => {
     // refetch too — otherwise a filed fork stays missing from its folder.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+  });
+
+  it("paints the fork into the cached sidebar list and arms the recently-created keep-alive", async () => {
+    // On a search-indexed deployment the list refetch lags the write; if the
+    // `session_added` push is missed too, the fork would stay hidden. The
+    // dialog inserts the row itself and holds it there like a created session.
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+      title: "Fork of My session",
+      createdAt: 1_700_000_000,
+      labels: {},
+      permissionLevel: null,
+      agentId: "ag_source",
+      parentSessionId: null,
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    const { client } = renderDialog();
+    const existing: Conversation = {
+      id: "conv_old",
+      object: "conversation",
+      title: "Older",
+      created_at: 1,
+      updated_at: 1,
+      labels: {},
+      permission_level: null,
+    };
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [{ data: [existing], first_id: "conv_old", last_id: "conv_old", has_more: false }],
+      pageParams: [undefined],
+    });
+
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+
+    const page = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+      .pages[0];
+    expect(page.data.map((c) => c.id)).toEqual(["conv_fork", "conv_old"]);
+    expect(page.data[0]).toMatchObject({
+      title: "Fork of My session",
+      created_at: 1_700_000_000,
+      updated_at: 1_700_000_000,
+      agent_id: "ag_source",
+    });
+    // The keep-alive re-injects the row into a first-page fetch that lags it.
+    expect(recentlyCreatedSessions.has("conv_fork")).toBe(true);
   });
 
   it("spins the submit button while the fork is in flight", async () => {

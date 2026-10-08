@@ -30,6 +30,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { conversationRowFromSession, insertCreatedRowIntoCaches } from "@/lib/sessionListCache";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
@@ -1242,6 +1243,10 @@ export function ForkSessionForm({
           console.warn(`Clone ${fork.id}: background runner launch failed`, e);
         });
       }
+      // Paint the fork into the sidebar now and keep it there through the
+      // refetch below, which on a search-indexed deployment can lag the write
+      // and come back without the fork — the same keep-alive a create arms.
+      insertCreatedRowIntoCaches(queryClient, conversationRowFromSession(fork));
       // Fire-and-forget: the sidebar refresh must not gate navigation.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // The fork inherits the source's project, and each folder renders its

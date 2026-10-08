@@ -352,6 +352,48 @@ export function unmarkRecentlyCreated(id: string): void {
 }
 
 /**
+ * Sidebar row from a session snapshot; snapshots carry no `owner`, so it reads as viewer-owned.
+ */
+export function conversationRowFromSession(session: Session): Conversation {
+  return {
+    id: session.id,
+    object: "conversation",
+    title: session.title,
+    created_at: session.createdAt,
+    updated_at: session.updatedAt ?? session.createdAt,
+    labels: session.labels ?? {},
+    permission_level: session.permissionLevel,
+    agent_id: session.agentId,
+    agent_name: session.agentName,
+    runner_id: session.runnerId ?? null,
+    host_id: session.hostId ?? null,
+    workspace: session.workspace ?? null,
+    git_branch: session.gitBranch ?? null,
+    archived: session.archived,
+    parent_session_id: session.parentSessionId,
+    project_id: session.projectId ?? null,
+  };
+}
+
+/**
+ * Paint a just-created session (a fork) into every cached sidebar list and arm create's keep-alive.
+ */
+export function insertCreatedRowIntoCaches(queryClient: QueryClient, row: Conversation): void {
+  markRecentlyCreated(row);
+  const candidates = new Map([[row.id, row]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = insertNewRowsIntoPages(
+      data,
+      candidates,
+      filtersFromConversationQueryKey(key),
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
