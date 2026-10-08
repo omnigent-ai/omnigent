@@ -43,3 +43,27 @@ def test_repro_recording_rules_match_the_shared_guide() -> None:
     assert "Text-only CLI output is not a reason to skip recording" in instructions
     assert "name the specific blocker in `recording_unavailable_reason`" in instructions
     assert "Do not block the verdict because footage is missing or rejected" in instructions
+
+
+def test_lane_screen_claims_come_from_frames_not_the_expected_surface() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "What the caption says is or is not on screen must come from the frames" in lanes
+    assert "which program the pane shows" in lanes
+    assert 'equally the negative: "not drawn", "not legible", "no overlay"' in lanes
+    assert "with no image viewer, OCR it" in lanes
+    assert "the attach WebSocket or PTY byte stream are not the screen" in lanes
+    assert "dropped, not flipped into a negative" in lanes
+    assert (
+        "`recording_unavailable_reason`, `evidence`, the PR body, and the live-validation prompt"
+        in lanes
+    )
+
+
+def test_lane_terminal_dumps_are_the_screen_read_when_frames_cannot_be_viewed() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    terminal = lanes.split("## `terminal` facets", 1)[1].split("## `cli` facets", 1)[0]
+
+    assert "they hold what the pane draws" in terminal
+    assert "check a caption's screen claims when you cannot view a frame" in terminal
+    assert "The attach WebSocket or PTY byte stream is not the screen" in terminal

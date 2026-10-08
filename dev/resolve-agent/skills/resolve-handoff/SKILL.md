@@ -177,9 +177,14 @@ readiness; name pending publication/review steps in `remaining_work`.
   Follow the recording rules in Step 2B.5 on both author and review runs; in
   review mode, record the reviewed PR head. Keep recovered before-clips and
   captions unchanged. Each after-clip's caption lists the actions shown, ending
-  with the corrected behavior. A missing before-clip is not a reason to skip
-  the after-clip. Use `[]` only for internal/API-only results with no visible
-  user interaction, or when recording is blocked as described above.
+  with the corrected behavior. What a caption says is or is not on screen —
+  which program the pane shows, whether a line or overlay is drawn — follows
+  "Finishing a clip" in `dev/recording-lanes.md`: take it from an inspected or
+  OCR'd frame or a rendered-screen read, never from the surface you expected,
+  and repeat the same wording in `recording_unavailable_reason`, `evidence`,
+  the PR body, and `validation_prompt`. A missing before-clip is not a reason
+  to skip the after-clip. Use `[]` only for internal/API-only results with no
+  visible user interaction, or when recording is blocked as described above.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 
@@ -187,6 +192,10 @@ readiness; name pending publication/review steps in `remaining_work`.
     and put the written before/after evidence in the PR Demo section.
   - For a recording failure, name the missing tool or the environment problem.
     Text-only CLI output is not a reason to skip recording.
+  - When a clip exists but you say it does not show the symptom, that is a
+    screen claim: name the frame or rendered-screen read that established it.
+    Without one, write `frames not inspected` and keep the claim out of this
+    field, the caption, and the PR.
   - Do not substitute a video of test output or a made-up demonstration.
     Missing or rejected footage must not block the fix or PR.
 - `test_audit` — required in both author and review modes for reproduction-driven
