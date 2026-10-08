@@ -108,7 +108,7 @@ async function pollUntil(probe, timeoutMs) {
 
 /** Unix socket an X display such as ":99" listens on. */
 function displaySocketPath(display) {
-  return `/tmp/.X11-unix/X${display.slice(1)}`;
+  return `/tmp/.X11-unix/X${display.slice(1).split(".")[0]}`;
 }
 
 /** Whether a private display can be started here: Linux with the Xvfb binary. */
@@ -448,9 +448,17 @@ function startPrivateDisplay() {
       proc.stdio[3].unref();
       const killOnExit = () => proc.kill("SIGTERM");
       process.once("exit", killOnExit);
+      const display = `:${number.trim()}`;
+      let stopping = false;
+      // A mid-run crash would otherwise surface only as opaque Chromium errors.
+      proc.once("exit", (code, signal) => {
+        if (!stopping)
+          console.warn(`[desktopHarness] owned Xvfb ${display} exited (${signal ?? code})`);
+      });
       resolve({
-        display: `:${number.trim()}`,
+        display,
         stop: async () => {
+          stopping = true;
           try {
             await stopProcess(proc);
           } finally {
@@ -556,8 +564,9 @@ async function launchDesktop(opts) {
       env: {
         ...process.env,
         OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0",
-        ...(display ? { DISPLAY: display } : {}),
         ...opts.env,
+        // The harness captures and tears down this display, so it must win.
+        ...(display ? { DISPLAY: display } : {}),
       },
     });
     // A lane that only closes Electron must not leave the capture running or an
@@ -591,7 +600,7 @@ async function launchDesktop(opts) {
     // Nothing must outlive a failed launch: not an Electron the caller never got
     // a handle to, not the capture, not an owned display.
     if (electronApp) await electronApp.close().catch(() => {});
-    await stopDisplayCapture();
+    await stopDisplayCapture().catch(() => {});
     throw err;
   }
 }

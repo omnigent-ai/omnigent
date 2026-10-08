@@ -84,6 +84,13 @@ describe("saveRecording", () => {
   });
 });
 
+describe("displaySocketPath", () => {
+  it("maps a display to its socket and ignores a screen suffix", () => {
+    assert.equal(displaySocketPath(":99"), "/tmp/.X11-unix/X99");
+    assert.equal(displaySocketPath(":99.0"), "/tmp/.X11-unix/X99");
+  });
+});
+
 describe("startPrivateDisplay", () => {
   let savedDisplay;
 

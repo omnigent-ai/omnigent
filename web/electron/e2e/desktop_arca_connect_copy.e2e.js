@@ -116,9 +116,12 @@ describe(
           setTimeout(() => {
             // Hold the menu briefly for the recording, then activate Copy through
             // Electron's documented menuItem.click(event, window, webContents).
-            copy?.click(undefined, options?.window, options?.window?.webContents);
-            this.closePopup();
-            globalThis.openContextMenus -= 1;
+            try {
+              copy?.click(undefined, options?.window, options?.window?.webContents);
+            } finally {
+              this.closePopup();
+              globalThis.openContextMenus -= 1;
+            }
           }, 800);
           return popup.call(this, options);
         };
@@ -197,11 +200,11 @@ describe(
       try {
         if (app) {
           await app.electronApp.close().catch(() => {});
-          await app.stopDisplayCapture();
+          await app.stopDisplayCapture().catch(() => {});
           saved = saveRecording(RECORD_DIR, "arca-console-copy");
-          fs.rmSync(app.userDataDir, { recursive: true, force: true });
         }
       } finally {
+        if (app) fs.rmSync(app.userDataDir, { recursive: true, force: true });
         if (server) await server.close();
         if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
       }
