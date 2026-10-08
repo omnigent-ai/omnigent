@@ -8,9 +8,9 @@ const MAX_NAMESPACE_PREFIX_BYTES = 12;
 const MAX_GENERATED_BYTES = 128;
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
-export const MAX_CONFIG_BYTES = 8 * 1024 * 1024;
+export const MAX_CONFIG_BYTES = 1024 * 1024;
 export const MAX_XML_MARKUP = 2_600_000;
-export const MAX_CONFIG_XML_MARKUP = 160_000;
+export const MAX_CONFIG_XML_MARKUP = 32_000;
 export const MAX_EMITTED_ELEMENTS = MAX_XML_MARKUP;
 export const MAX_EMITTED_ELEMENT_OVERHEAD = 1024;
 const XML_MARKUP_START = "<".charCodeAt(0);
@@ -353,8 +353,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       ...entries,
     ]) {
       let markup = 0;
-      for (const byte of data) {
-        if (byte !== XML_MARKUP_START) continue;
+      for (let index = 0; index < data.length; index++) {
+        if (data[index] !== XML_MARKUP_START) continue;
         markup++;
         if (
           ++parsedMarkup > MAX_XML_MARKUP ||
