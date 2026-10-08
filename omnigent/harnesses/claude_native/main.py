@@ -5241,6 +5241,72 @@ async def _fetch_claude_session_labels(
     return {str(key): str(value) for key, value in labels.items()}
 
 
+def _claude_background_session_holds_id(
+    external_session_id: str,
+    *,
+    claude_binary: str | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: float = 5.0,
+) -> bool:
+    """
+    Return whether a separate live Claude process still holds this id.
+
+    Claude's CLI refuses ``claude --resume <id>`` with its background-session
+    guard whenever a non-interactive process (e.g. a local terminal left
+    running) still holds ``<id>`` alive. This queries the same per-user session
+    daemon that guard consults -- ``claude agents --json`` -- so a resume can
+    branch a copy with ``--fork-session`` instead of launching a command the
+    CLI will reject. The daemon is scoped by the ambient ``HOME`` /
+    ``CLAUDE_CONFIG_DIR``, so querying with the launch's env/cwd sees exactly
+    the sessions the guard will.
+
+    Best-effort and fail-closed: a missing binary, an unreachable daemon or
+    malformed output returns ``False`` so resume falls back to the unchanged
+    in-place path.
+
+    :param external_session_id: Claude-native session id being resumed.
+    :param claude_binary: Resolved ``claude`` executable; defaults to the same
+        ``OMNIGENT_CLAUDE_PATH`` / PATH resolution the launch uses.
+    :param cwd: Working directory for the query, normally the resume workspace.
+    :param env: Environment for the query; defaults to the process env.
+    :param timeout: Seconds to wait for the daemon query before giving up.
+    :returns: ``True`` only when a live, non-interactive session reports this
+        exact ``sessionId``.
+    """
+    if not external_session_id:
+        return False
+    if claude_binary is None:
+        from omnigent._platform import resolve_cli_binary
+
+        claude_binary = resolve_cli_binary("claude", env_var="OMNIGENT_CLAUDE_PATH")
+    if not claude_binary:
+        return False
+    try:
+        proc = subprocess.run(
+            [claude_binary, "agents", "--json"],
+            cwd=os.fspath(cwd) if cwd is not None else None,
+            env=dict(env) if env is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        entries = json.loads(proc.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    if not isinstance(entries, list):
+        return False
+    # The guard refuses the resume for any live holder that is not a parked
+    # interactive session (``kind != "interactive"``), e.g. a background job.
+    return any(
+        isinstance(entry, dict)
+        and entry.get("sessionId") == external_session_id
+        and entry.get("kind") != "interactive"
+        for entry in entries
+    )
+
+
 async def _resolve_cold_resume_args(
     client: httpx.AsyncClient,
     session_id: str,

@@ -7400,17 +7400,18 @@ def _build_claude_native_base_args(
     model_override: str | None,
     terminal_launch_args: list[str] | None,
     resume_external_session_id: str | None = None,
+    resume_fork: bool = True,
 ) -> tuple[str, ...]:
     """
     Assemble the base ``claude`` CLI args for a native-terminal launch.
 
     These are the args before :func:`augment_claude_args` layers on the
     bridge / MCP / hook / Omnigent wiring. The order is: ``--resume`` for a
-    cold resume, then persisted reasoning effort, then the user's
-    pass-through ``terminal_launch_args``, then a ``--model`` derived
-    from ``model_override`` — appended only when the user did not
-    already pass an explicit ``--model``. That precedence (explicit
-    ``--model`` in pass-through args wins over ``model_override``)
+    cold resume (optionally followed by ``--fork-session``), then persisted
+    reasoning effort, then the user's pass-through ``terminal_launch_args``,
+    then a ``--model`` derived from ``model_override`` — appended only when
+    the user did not already pass an explicit ``--model``. That precedence
+    (explicit ``--model`` in pass-through args wins over ``model_override``)
     mirrors the CLI's ``_merge_default_model_arg``, moved runner-side.
     The ``--resume``-first ordering mirrors the CLI's
     ``(*cold_resume_args, *claude_args)``. See
@@ -7437,6 +7438,16 @@ def _build_claude_native_base_args(
         the same plain ``--resume`` path serves both cold resume and
         fork resume. ``None`` (a fresh launch, or no local transcript
         could be synthesized) adds nothing.
+    :param resume_fork: When resuming, also pass ``--fork-session`` so
+        Claude branches a copy instead of reattaching in place. Claude's
+        CLI refuses a bare ``--resume <id>`` whenever a separate live
+        process still holds ``<id>`` (its background-session guard), so the
+        default is ``True`` to keep the resume working when liveness has not
+        been checked. Callers that have confirmed no live holder — the
+        common same-dir resume and the fork-clone path, which resumes a
+        transcript it wrote under a fresh uuid — pass ``False`` to reattach
+        in place and avoid a forwarder double-render. Ignored when
+        ``resume_external_session_id`` is ``None``.
     :returns: The assembled base args, e.g.
         ``("--resume", "<sid>", "--effort", "high")``.
     """
@@ -7445,6 +7456,8 @@ def _build_claude_native_base_args(
     args: list[str] = []
     if resume_external_session_id:
         args.extend(("--resume", resume_external_session_id))
+        if resume_fork:
+            args.append("--fork-session")
     if reasoning_effort is not None and reasoning_effort in CLAUDE_EFFORTS:
         args.extend(("--effort", reasoning_effort))
     if terminal_launch_args:
@@ -8365,8 +8378,17 @@ async def _auto_create_claude_terminal(
     # hook, and the executor's prompt inject waits on the same boot, so a
     # ``stat`` taken later routinely skips the freshly-injected message.
     resume_prefix_bytes: int | None = None
+    # Whether to resume via ``--fork-session`` (branch a copy) rather than
+    # reattach in place. Default off: the common cold resume reattaches to the
+    # transcript we just synthesized. Flipped on only when a separate live
+    # process still holds this id, which otherwise makes Claude's CLI refuse a
+    # bare ``--resume`` (its background-session guard) — the reported bug.
+    resume_fork = False
     if server_client is not None and session_external_id is not None:
-        from omnigent.harnesses.claude_native.main import _ensure_local_claude_resume_transcript
+        from omnigent.harnesses.claude_native.main import (
+            _claude_background_session_holds_id,
+            _ensure_local_claude_resume_transcript,
+        )
 
         try:
             _transcript = await _ensure_local_claude_resume_transcript(
@@ -8379,6 +8401,19 @@ async def _auto_create_claude_terminal(
             if _transcript is not None:
                 resume_external_session_id = session_external_id
                 resume_prefix_bytes = _measured_prefix_bytes(_transcript)
+                if await asyncio.to_thread(
+                    _claude_background_session_holds_id,
+                    session_external_id,
+                    cwd=str(Path(workspace).resolve()),
+                ):
+                    # A separate live process (e.g. a local terminal still
+                    # attached) holds this id, so a bare ``--resume`` is
+                    # refused. Fork a copy instead. The fork starts from the
+                    # live session, not our synthesized file, so clear the
+                    # synthesized prefix and let the forwarder's
+                    # ``start_at_end`` seek to the fork's own tail.
+                    resume_fork = True
+                    resume_prefix_bytes = None
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _logger.warning(
                 "Could not synthesize Claude resume transcript for %s; launching without --resume",
@@ -8783,6 +8818,7 @@ async def _auto_create_claude_terminal(
         model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
+        resume_fork=resume_fork,
     )
 
     # Pass ``ap_server_url`` so ``build_hook_settings`` registers the

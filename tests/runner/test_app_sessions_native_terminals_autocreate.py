@@ -2071,6 +2071,15 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         _fake_synth,
     )
 
+    # The resume branch probes whether a separate live process still holds the
+    # id (which would make Claude fork instead of reattach). Stub it off so this
+    # test exercises the in-place reattach path without spawning ``claude``; the
+    # live-holder fork path has its own coverage.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._claude_background_session_holds_id",
+        lambda *args, **kwargs: False,
+    )
+
     snapshot: dict[str, Any] = {}
     if snapshot_external_id is not None:
         snapshot["external_session_id"] = snapshot_external_id
@@ -2171,6 +2180,158 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_forks_when_a_live_process_holds_the_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Resume branches a copy when a live process still holds the session id.
+
+    When the user resumes a session whose Claude id is still held alive by a
+    separate process (e.g. the local terminal that created it is still
+    attached), a bare ``claude --resume <id>`` is refused by Claude's
+    background-session guard -- the reported failure. The runner must detect
+    the live holder and launch ``claude --resume <id> --fork-session`` so the
+    resume branches a copy instead of erroring. Because the fork starts from
+    the live session rather than the synthesized transcript, the forwarder must
+    also drop the synthesized prefix (``start_at_offset=None``) while still
+    seeking to the tail (``start_at_end=True``) so it does not re-post history.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    resume_id = "02857840-6362-408f-b41f-309e396ed7c6"
+
+    forwarder_kwargs: dict[str, Any] = {}
+
+    async def _capture_forwarder(**kwargs: Any) -> None:
+        """Record the forwarder launch kwargs without opening a stream."""
+        forwarder_kwargs.update(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _capture_forwarder,
+    )
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+    ) -> Path:
+        """Return a transcript path so the resume branch sets ``--resume``."""
+        del client, session_id, workspace, bridge_dir
+        return tmp_path / f"{external_session_id}.jsonl"
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+
+    holds_calls: list[str] = []
+
+    def _fake_holds(external_session_id: str, **kwargs: Any) -> bool:
+        """Report the id as held live by a separate process."""
+        del kwargs
+        holds_calls.append(external_session_id)
+        return True
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._claude_background_session_holds_id",
+        _fake_holds,
+    )
+
+    class _SnapshotServerClient(NullServerClient):
+        """Server client whose session snapshot carries the resume id."""
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            """Return the session snapshot, or empty labels for the bridge check."""
+            del kwargs
+            if url.endswith("/labels"):
+
+                class _LabelsResponse(NullServerClient._Response):
+                    """Empty labels -> bridge_id resolves to session_id."""
+
+                    def json(self) -> dict[str, Any]:
+                        """Return an empty labels payload."""
+                        return {"labels": {}}
+
+                return _LabelsResponse()
+
+            assert url == "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2"
+
+            class _SnapResponse(NullServerClient._Response):
+                """Snapshot response carrying the live-held resume id."""
+
+                def json(self) -> dict[str, Any]:
+                    """Return the session snapshot dict."""
+                    return {"external_session_id": resume_id}
+
+            return _SnapResponse()
+
+    launched_args: list[str] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that returns a terminal without launching."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Return a terminal resource view without spawning a TTY."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched_args.extend(spec.args)
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_claude_terminal(
+        "5cdbea97a2fb0c659bc09605401e2bb2",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+    )
+
+    await asyncio.sleep(0)
+
+    # The live holder was probed with the resumed id.
+    assert holds_calls == [resume_id]
+
+    # Launch forks the live session: ``--fork-session`` sits immediately after
+    # ``--resume <id>`` so Claude branches a copy instead of being refused.
+    assert "--fork-session" in launched_args, launched_args
+    resume_index = launched_args.index("--resume")
+    assert launched_args[resume_index : resume_index + 3] == [
+        "--resume",
+        resume_id,
+        "--fork-session",
+    ], launched_args
+
+    # The fork starts from the live session, not the synthesized transcript, so
+    # the forwarder seeks to the tail with no synthesized prefix to skip past.
+    assert forwarder_kwargs.get("start_at_end") is True
+    assert forwarder_kwargs.get("start_at_offset") is None
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_bridge_sid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2219,6 +2380,13 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
         _fake_synth,
+    )
+
+    # Keep the resume branch on the in-place reattach path (no live holder) so
+    # it does not spawn ``claude`` to probe; the fork path is covered elsewhere.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._claude_background_session_holds_id",
+        lambda *args, **kwargs: False,
     )
 
     forwarder_kwargs: dict[str, Any] = {}
