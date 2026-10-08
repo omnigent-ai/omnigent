@@ -944,6 +944,12 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+#: Codex ``-32600`` messages for a thread with no active turn at all. The
+#: superseded-turn rejection (``expected active turn id ... but found ...``) is
+#: separate because a newer turn is still live there.
+_NO_ACTIVE_TURN_MESSAGES = frozenset({"no active turn to steer", "no active turn to interrupt"})
+
+
 def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex rejected a turn id that ended or was replaced.
 
@@ -956,9 +962,25 @@ def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
     if error.code != -32600 or error.message is None:
         return False
     message = error.message.strip().casefold()
-    return message in {"no active turn to steer", "no active turn to interrupt"} or (
+    return message in _NO_ACTIVE_TURN_MESSAGES or (
         "expected active turn id" in message and "but found" in message
     )
+
+
+def is_no_active_turn_error(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex rejected because the thread has no active turn at all.
+
+    This is the subset of :func:`is_stale_active_turn_error` where the turn
+    genuinely ended. It excludes the superseded-turn rejection (``expected
+    active turn id ... but found ...``), where a newer turn is still live.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``True`` only when no turn is currently active.
+    """
+    if error.code != -32600 or error.message is None:
+        return False
+    message = error.message.strip().casefold()
+    return message in _NO_ACTIVE_TURN_MESSAGES
 
 
 #: JSON-RPC internal-error code codex returns when its thread-store fails.

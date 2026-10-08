@@ -101,6 +101,29 @@ describe("AssistantBubble fork source", () => {
     items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
   };
 
+  it("disables the message fork without hiding its explanation", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            canFork: true,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       name: "side chat",
@@ -492,6 +515,25 @@ describe("AssistantBubble sealed side-chat recovery", () => {
   });
 });
 
+describe("UserBubble shell prompts", () => {
+  it("preserves shell syntax and attachment-like text literally", () => {
+    const command = "printf '%s\\n' '**hi**' '[Attached: /tmp/file]' '`pwd`'\necho done";
+    const bubble: Extract<Bubble, { kind: "user" }> = {
+      kind: "user",
+      itemId: "shell-input",
+      content: [{ type: "input_text", text: `!${command}` }],
+      shellCommand: command,
+    };
+    render(<BubbleView bubble={bubble} />);
+
+    const prompt = screen.getByTestId("message-bubble");
+    expect(prompt).toHaveAttribute("data-role", "user");
+    expect(prompt).toHaveAttribute("data-user-message-id", "shell-input");
+    expect(prompt.querySelector("pre")?.textContent).toBe(`!${command}`);
+    expect(screen.getByTestId("copy-message-link")).toBeEnabled();
+  });
+});
+
 describe("UserBubble long-prompt collapse", () => {
   const COLLAPSE_THRESHOLD = 12000;
   const TAIL = "UNIQUE_TAIL";
@@ -566,5 +608,51 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent("🔥");
     expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
     expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
+  });
+});
+
+describe("AssistantBubble copy", () => {
+  const MARKDOWN = "## Findings\n\nA **bold** claim and `code`.";
+
+  function assistantBubble(text: string): Extract<Bubble, { kind: "assistant" }> {
+    return {
+      kind: "assistant",
+      responseId: "resp_copy",
+      stableId: "copy_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "copy_text", text, final: true }],
+      createdAtS: 1_700_000_000,
+    };
+  }
+
+  it("offers rendered HTML alongside the markdown so a rich-text paste keeps formatting", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    class FakeClipboardItem {
+      items: Record<string, Blob>;
+
+      constructor(items: Record<string, Blob>) {
+        this.items = items;
+      }
+    }
+
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    vi.stubGlobal("navigator", { clipboard: { write } });
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={assistantBubble(MARKDOWN)} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
+
+    await waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+
+    const [item] = write.mock.calls[0][0] as FakeClipboardItem[];
+    expect(await item.items["text/plain"].text()).toBe(MARKDOWN);
+    expect(await item.items["text/html"].text()).toBe(
+      "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
+    );
   });
 });

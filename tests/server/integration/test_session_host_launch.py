@@ -23,6 +23,7 @@ import logging
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -57,6 +58,10 @@ from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.host_registry import HostConnection
+from omnigent.server.routes._host_launch import (
+    LAUNCH_TIMEOUT_ENV_VAR,
+    resolve_launch_timeout_s,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -675,6 +680,91 @@ async def test_inline_launch_failure_still_returns_bound_session(
         "runner binding should persist even when the host reports launch failure"
     )
     assert conv.host_id == _HOST_ID
+
+
+@pytest.fixture
+def _uncached_launch_budget() -> Iterator[None]:
+    """Let a test set the launch budget, and leave no cached value behind.
+
+    :func:`resolve_launch_timeout_s` caches for the process lifetime, so
+    clearing on the way out matters even when the test fails.
+    """
+    resolve_launch_timeout_s.cache_clear()
+    try:
+        yield
+    finally:
+        resolve_launch_timeout_s.cache_clear()
+
+
+async def test_inline_launch_timeout_honors_the_configured_budget(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    _uncached_launch_budget: None,
+) -> None:
+    """A launch that never answers is failed at the CONFIGURED budget, not the
+    built-in 30s.
+
+    Launches that build a container sandbox, pull an image or start the app the
+    agent will test legitimately run past 30s, and failing them loses a session
+    nothing was wrong with. The budget is operator-tunable; this pins that the
+    inline create path reads it. Driven downward (1s) so the assertion is fast —
+    the same wiring is what lets a deployment drive it upward.
+    """
+    monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "1")
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    async def _answer_stat_but_never_the_launch() -> None:
+        """Validate the workspace, then leave the launch unanswered."""
+        deadline = Deadline(30.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostStatFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStatResultFrame(
+                                request_id=frame.request_id,
+                                status="ok",
+                                exists=True,
+                                type="directory",
+                                canonical_path=frame.path,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                return
+        raise AssertionError("host never received a launch frame from the inline path")
+
+    responder = asyncio.create_task(_answer_stat_but_never_the_launch())
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        )
+    elapsed = time.monotonic() - started
+    await responder
+
+    # Lenient inline contract: the create still returns the bound session.
+    assert resp.status_code == 201, f"expected 201 despite launch timeout, got {resp.status_code}"
+    # The point of the test: it gave up at the configured 1s, so the
+    # hard-coded 30s is no longer what bounds a launch. Unscaled on purpose:
+    # a CI-scaled budget would exceed 30s and pass against the old wait.
+    assert elapsed < 20.0, (
+        f"create waited {elapsed:.1f}s — the configured launch budget was ignored"
+    )
+    assert "host launch timed out after 1s" in caplog.text
+    assert LAUNCH_TIMEOUT_ENV_VAR in caplog.text, (
+        "the timeout error should name the override so an operator can raise it"
+    )
 
 
 @pytest.mark.parametrize("disconnect", [False, True], ids=["replaced", "disconnected"])

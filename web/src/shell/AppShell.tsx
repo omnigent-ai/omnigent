@@ -124,6 +124,7 @@ import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -752,6 +753,7 @@ export function AppShell() {
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
+  const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // Agent tools/policies exist to show.
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
@@ -2264,7 +2266,11 @@ export function AppShell() {
   const forkDialogContextValue = useMemo<ForkDialogContextValue>(
     () => ({
       canFork: canClone,
+      disabledReason: forkDisabledReason,
       openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => {
+        // A scoped source resolves its own restrictions in the form, independently
+        // of the session currently displayed by the shell.
+        if (forkDisabledReason && !opts?.sourceSessionId) return;
         const sourceSessionId = opts?.sourceSessionId ?? null;
         const sourceState = sourceSessionId
           ? queryClient.getQueryState(["session", sourceSessionId])
@@ -2278,7 +2284,7 @@ export function AppShell() {
         setForkOpen(true);
       },
     }),
-    [canClone, queryClient, serverConversationId],
+    [canClone, forkDisabledReason, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2445,6 +2451,7 @@ export function AppShell() {
                     wrapperLabel={wrapperLabel}
                     canShare={canShare}
                     canFork={canClone}
+                    forkDisabledReason={forkDisabledReason}
                     shareDisabled={shareDisabled}
                     shareDisabledReason={shareDisabledReason}
                     onShare={() => setShareOpen(true)}

@@ -49,13 +49,14 @@ def test_web_shell_command_settles_before_the_next_prompt(
     _ensure_chat_view(page)
     _send(page, f"!echo {marker}")
 
-    shell = page.locator('[data-testid="terminal-command-card"][data-terminal-kind="input"]')
-    expect(shell.filter(has_text=f"echo {marker}")).to_have_count(1, timeout=60_000)
+    shell = page.locator(_USER, has_text=f"!echo {marker}")
+    expect(shell).to_have_count(1, timeout=60_000)
     output = page.locator('[data-testid="terminal-command-card"][data-terminal-kind="output"]')
     expect(output).to_have_count(1, timeout=60_000)
     output.click()
     expect(page.get_by_text(marker, exact=True)).to_be_visible(timeout=30_000)
-    expect(page.locator(_USER, has_text=f"!echo {marker}")).to_have_count(0)
+    expect(shell).to_have_count(1)
+    expect(shell.get_by_test_id("copy-message-link")).to_be_enabled()
     with httpx.Client(base_url=base_url, timeout=15) as client:
         snapshot = client.get(f"/v1/sessions/{session_id}")
         snapshot.raise_for_status()
@@ -64,7 +65,7 @@ def test_web_shell_command_settles_before_the_next_prompt(
         _send(page, f"Reply with {reply}")
         expect(page.locator(_ASSISTANT, has_text=reply).first).to_be_visible(timeout=60_000)
         expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
-        expect(page.locator(_USER)).to_have_count(1)
+        expect(page.locator(_USER)).to_have_count(2)
         items = client.get(
             f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
         )
@@ -74,6 +75,6 @@ def test_web_shell_command_settles_before_the_next_prompt(
 
     page.reload()
     _ensure_chat_view(page)
-    expect(page.locator(_USER)).to_have_count(1, timeout=30_000)
-    expect(shell.filter(has_text=f"echo {marker}")).to_have_count(1)
+    expect(page.locator(_USER)).to_have_count(2, timeout=30_000)
+    expect(shell).to_have_count(1)
     expect(page.locator(_ASSISTANT, has_text=reply).first).to_be_visible()

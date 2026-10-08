@@ -8195,7 +8195,7 @@ async def _relay_persist_error_once(
                 and existing.data.message == item.data.message
             ):
                 return "duplicate"
-        await asyncio.to_thread(
+        persisted_items = await asyncio.to_thread(
             conversation_store.append,
             session_id,
             [item],
@@ -8210,6 +8210,8 @@ async def _relay_persist_error_once(
                 code=item.data.code,
                 level=item.data.level,
                 source=item.data.source,
+                item_id=persisted_items[0].id,
+                response_id=persisted_items[0].response_id,
             ),
         )
         return "persisted"

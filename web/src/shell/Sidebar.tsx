@@ -229,6 +229,8 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
@@ -1247,7 +1249,7 @@ function SidebarImpl({
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
                 className={cn(
-                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16 md:mr-1",
+                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16",
                   // Reserve the gutter so toggling the thumb never reflows the list.
                   "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
                   isScrolling
@@ -3338,6 +3340,8 @@ interface MenuItemProps {
   children?: ReactNode;
   className?: string;
   disabled?: boolean;
+  "aria-disabled"?: boolean;
+  "aria-describedby"?: string;
   textValue?: string;
   variant?: "default" | "destructive";
   // Radix's menu `onSelect` receives a native Event in both families.
@@ -3443,6 +3447,7 @@ function ConversationMenuItems({
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
+  const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
   // to the side. `view` swaps between the main actions and that sub-view;
@@ -3542,10 +3547,15 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
-      <C.Item data-testid="fork-conversation" onSelect={() => setForkOpen(true)}>
+      <SessionActionMenuItem
+        Item={C.Item}
+        data-testid="fork-conversation"
+        disabledReason={forkDisabledReason}
+        onSelect={() => setForkOpen(true)}
+      >
         <GitForkIcon className="size-3.5" />
         Fork
-      </C.Item>
+      </SessionActionMenuItem>
       {isOwner ? (
         <C.Item
           data-testid="rename-conversation"

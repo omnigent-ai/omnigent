@@ -71,6 +71,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
@@ -3562,12 +3563,15 @@ def create_runner_app(
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
 
-    async def _codex_native_bridge_state_for_session(
+    async def _codex_native_bridge_state_and_dir_for_session(
         conv_id: str,
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> CodexNativeBridgeState | None:
+    ) -> tuple[CodexNativeBridgeState | None, Path]:
+        # Resolve the directory and read its state from one label lookup, so a
+        # caller clearing or idling the bridge acts on the same one the state
+        # came from; a second lookup can fall back to conv id and pick another.
         from omnigent.harnesses.codex_native.bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
@@ -3579,7 +3583,8 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
-        state = read_bridge_state(bridge_dir_for_bridge_id(bridge_id))
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        state = read_bridge_state(bridge_dir)
         if state is None:
             _logger.log(
                 missing_state_log_level,
@@ -3587,7 +3592,7 @@ def create_runner_app(
                 action,
                 conv_id,
             )
-            return None
+            return None, bridge_dir
         if state.session_id != conv_id:
             _logger.warning(
                 "Codex-native %s skipped for %s: bridge belongs to %s.",
@@ -3595,7 +3600,18 @@ def create_runner_app(
                 conv_id,
                 state.session_id,
             )
-            return None
+            return None, bridge_dir
+        return state, bridge_dir
+
+    async def _codex_native_bridge_state_for_session(
+        conv_id: str,
+        *,
+        action: str,
+        missing_state_log_level: int = logging.WARNING,
+    ) -> CodexNativeBridgeState | None:
+        state, _ = await _codex_native_bridge_state_and_dir_for_session(
+            conv_id, action=action, missing_state_log_level=missing_state_log_level
+        )
         return state
 
     async def _codex_native_bridge_dir_for_session(conv_id: str) -> Path:
@@ -4534,7 +4550,7 @@ def create_runner_app(
         publish_event=_publish_event,
         mark_subagent_terminal_and_wake=_mark_subagent_terminal_and_wake,
         session_sub_agent_names=_session_sub_agent_names,
-        codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
+        codex_bridge_state_for_session=_codex_native_bridge_state_and_dir_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
         subagent_work_id_for_session=_subagent_work_id_for_session,
@@ -5014,6 +5030,7 @@ def create_runner_app(
                 _model_override,
                 extra={"session_id": conv},
             )
+        harness_body.update(input_attributes(msg_body))
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union

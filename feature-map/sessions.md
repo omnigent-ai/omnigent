@@ -35,6 +35,9 @@ the header menu), and each place is a separate entry point.
   fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
+- `unsupported-sandbox-actions`: Databricks Sandbox and Arclet fork and
+  host-switch controls stay visible but disabled, with hover and keyboard
+  explanations. Their forms cannot submit.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app can reconnect a local host
@@ -88,6 +91,22 @@ and send a follow-up after its parent runner is replaced.
 
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
+
+**Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
+sidebar menus, and message actions. The composer's host menu shows a disabled
+**Switch host…** item when you have write access. Read-only viewers retain the
+existing host menu without switching controls. Hover or focus a disabled action
+to read why it is unsupported.
+The reconnect dialog also disables Clone and Switch host; directory selection
+cannot enable either action.
+While support is being checked, actions stay disabled. If that check fails,
+the explanation asks you to reload. A missing source-host record keeps switching
+disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
+an action button until the check finishes; supported forms then receive keyboard focus.
+If the reconnect dialog is already on Clone when an unsupported result arrives,
+it selects Reconnect and explains the restriction.
+An open switch dialog closes when switching becomes unavailable and stays closed
+if support returns; choose Switch host again to reopen it.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
 choose Stop session while a side chat or sub-agent is working. On mobile, open
@@ -186,6 +205,28 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
+- **`unsupported-sandbox-actions`:**
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_fork_and_switch_host_disabled`
+  covers the header, sidebar context menu, message action, and composer host menu
+  at desktop and phone widths, plus the desktop sidebar dropdown. It checks
+  hover, keyboard focus, and ignored activation.
+  The server and transcript are real; Databricks Sandbox and Arclet metadata is
+  patched at the browser boundary, and no live sandbox is provisioned. Direct form
+  and reconnect guards have component coverage in `web/src/shell/ForkSessionDialog.test.tsx`,
+  `web/src/shell/SwitchHostDialog.test.tsx`, and
+  `web/src/shell/ReconnectSessionDialog.test.tsx`. Header fallbacks, including
+  mobile, are covered by `web/src/shell/ChatHeader.test.tsx`.
+  Failed lookups, recovery, hostless sessions, and shared sessions with unlisted
+  hosts are covered by `web/src/hooks/useSessionActionRestrictions.test.tsx`.
+  Host-menu loading/error explanations and the default status badge's disabled
+  action have component coverage in `web/src/components/HostBadge.test.tsx`.
+  Loading-to-enabled keyboard focus is covered there and in
+  `web/src/components/DisabledActionTooltip.test.tsx`. The fork and switch-host
+  dialog suites also cover loading-to-form focus; the tooltip suite checks that a
+  cleared explanation does not reopen without interaction.
+  Supported host-switch UI coverage:
+  `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
+  checks the release/launch requests with stubbed host APIs.
 - **`reconnect`, spinner:**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
 - **`reconnect`, offline-host cause (own environment):**
@@ -297,6 +338,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
+- Databricks Sandbox and Arclet restrictions apply to managed sources, including
+  shared sessions. Other sandbox providers support forking. Verify the supported
+  path with
+  `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
 - A custom agent outlives its sessions: forks of your own sessions share it,
   and forking someone else's session gives you your own copy. Appearing in the
   picker does not prove the fork API accepts it; check the bound agent after
