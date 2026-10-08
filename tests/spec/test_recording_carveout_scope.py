@@ -54,6 +54,10 @@ def test_before_clip_of_an_absence_must_rule_out_a_different_failure() -> None:
         'page.locator(\'[data-testid="error-pill"][data-level="error"]\')).to_have_count(0)'
         in lanes
     )
+    assert (
+        'row.locator(\'[data-testid="session-state-badge"][data-state="error"]\')).to_have_count(0)'
+        in lanes
+    )
     assert "the stall context the caption describes is visible" in lanes
     assert "demonstrates that error, not a silent stall" in lanes
 
