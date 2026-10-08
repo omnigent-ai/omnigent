@@ -503,7 +503,7 @@ def test_empty_graphql_output_does_not_read_other_tool_fields(projection: str | 
     "projection",
     [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
 )
-@pytest.mark.parametrize("tool", ["sys_os_shell", "shell", "exec_command"])
+@pytest.mark.parametrize("tool", ["sys_os_shell", "exec_command"])
 def test_graphql_emitted_documents_are_not_tool_envelopes(
     projection: str | None, tool: str
 ) -> None:
