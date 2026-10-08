@@ -33,6 +33,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import ConversationUpdateResult
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -486,6 +487,121 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
         conversation_store.update_conversation("c55a64c3f6f954fe0fc8738ba3f45f26", title="x")
         is None
     )
+
+
+def test_update_conversation_with_changes_reports_effort_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert isinstance(first, ConversationUpdateResult)
+    assert first.conversation.reasoning_effort == "high"
+    assert first.reasoning_effort_changed is True
+    assert first.model_override_changed is False
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert no_op is not None
+    assert no_op.reasoning_effort_changed is False
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="low")
+    assert changed is not None
+    assert changed.conversation.reasoning_effort == "low"
+    assert changed.reasoning_effort_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.reasoning_effort is None
+    assert cleared.reasoning_effort_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.reasoning_effort_changed is False
+
+    unrelated = conversation_store.update_conversation_with_changes(conv.id, title="Renamed")
+    assert unrelated is not None
+    assert unrelated.reasoning_effort_changed is False
+    assert unrelated.model_override_changed is False
+
+
+def test_update_conversation_with_changes_reports_model_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert first is not None
+    assert first.conversation.model_override == "model-a"
+    assert first.reasoning_effort_changed is False
+    assert first.model_override_changed is True
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert no_op is not None
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(
+        conv.id, model_override="model-b"
+    )
+    assert changed is not None
+    assert changed.conversation.model_override == "model-b"
+    assert changed.model_override_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.model_override is None
+    assert cleared.model_override_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.model_override_changed is False
+
+
+def test_update_conversation_with_changes_missing_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    assert (
+        conversation_store.update_conversation_with_changes(
+            "c55a64c3f6f954fe0fc8738ba3f45f26",
+            reasoning_effort="high",
+            model_override="model-a",
+        )
+        is None
+    )
+
+
+def test_update_conversation_with_changes_retries_commit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
+    conversation_store._conv_session_immediate = retrying_maker
+
+    result = conversation_store.update_conversation_with_changes(
+        conv.id,
+        reasoning_effort="high",
+        model_override="model-a",
+    )
+
+    assert retrying_maker.attempts == 2
+    assert result is not None
+    assert result.reasoning_effort_changed is True
+    assert result.model_override_changed is True
+    assert result.conversation.reasoning_effort == "high"
+    assert result.conversation.model_override == "model-a"
+
+    committed = conversation_store.get_conversation(conv.id)
+    assert committed is not None
+    assert committed.reasoning_effort == "high"
+    assert committed.model_override == "model-a"
 
 
 def test_reported_model_round_trips_beside_the_request(

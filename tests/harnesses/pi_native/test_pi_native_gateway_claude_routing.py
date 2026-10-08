@@ -160,7 +160,7 @@ def test_gateway_anthropic_override_keeps_databricks_prefix_verbatim() -> None:
     ``_inline_family_pi_provider`` hardcodes ``KEY_KIND`` in its
     ``normalize_model_for_provider`` call, so a gateway override of
     ``databricks-claude-fable-5-1`` is stripped to ``claude-fable-5-1`` - wrong
-    for a gateway fronting the Databricks AI Gateway, which expects the
+    for a gateway fronting the Databricks Unity Gateway, which expects the
     prefixed endpoint name. The family ``models.default`` path (control below)
     already keeps it verbatim; the override path must too.
     """

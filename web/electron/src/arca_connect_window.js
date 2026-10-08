@@ -20,6 +20,7 @@
 /** Channels between this window's preload and main. */
 const CONFIRM_CHANNEL = "arca-connect:confirm";
 const CANCEL_CHANNEL = "arca-connect:cancel";
+const { arcaTarget } = require("./arcaIdentity");
 
 /**
  * @param {{
@@ -86,6 +87,12 @@ function createArcaConnectFlow({
     // window), so a repeat click surfaces it and awaits the same outcome
     // rather than erroring with "already in progress".
     if (activeRun) {
+      if (activeRun.target !== arcaTarget(serverUrl)) {
+        return Promise.resolve({
+          ok: false,
+          error: "An Arca connection to another server is in progress. Try again when it finishes.",
+        });
+      }
       try {
         if (!activeRun.win.isDestroyed()) {
           activeRun.win.show();
@@ -231,7 +238,7 @@ function createArcaConnectFlow({
         win.show();
       });
       void win.loadFile(pagePath);
-      activeRun = { win, promise: null };
+      activeRun = { win, promise: null, target: arcaTarget(serverUrl) };
     });
     if (activeRun) activeRun.promise = promise;
     return promise;

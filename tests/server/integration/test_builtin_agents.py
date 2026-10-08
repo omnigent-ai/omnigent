@@ -264,8 +264,8 @@ async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
     # exact name + description the composer menu renders. A missing or
     # renamed entry means the landing "/" menu regressed to empty.
     assert entry["skills"] == [
-        {"name": "review-pr", "description": "Review a pull request"},
-        {"name": "triage", "description": "Triage issues"},
+        {"name": "review-pr", "description": "Review a pull request", "display_name": None},
+        {"name": "triage", "description": "Triage issues", "display_name": None},
     ]
     # SkillSummary is the safe subset — the SKILL.md body must not leak
     # into the catalog payload.

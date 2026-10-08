@@ -642,6 +642,41 @@ async def test_coded_executor_error_is_raised_with_its_code() -> None:
     assert raised.value.undelivered is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [None, "databricks_sign_in_pending"])
+@pytest.mark.parametrize("undelivered", [False, True])
+async def test_executor_delivery_evidence_survives_without_an_error_code(
+    code: str | None, undelivered: bool
+) -> None:
+    """The relay needs delivery evidence independently of error classification."""
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", code=code, undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.undelivered is (True if undelivered else None)
+        assert detail.code == (code or "RuntimeError")
+        assert detail.message == (
+            "Terminal is not ready" if code else "inner executor error: Terminal is not ready"
+        )
+    finally:
+        await adapter.on_shutdown()
+
+
 def test_build_error_detail_uses_omnigent_error_code() -> None:
     """
     :class:`OmnigentError` (and its
@@ -690,21 +725,28 @@ _OLD_CLI_REFUSAL = (
 )
 
 
-def test_build_error_detail_codes_old_cli_model_refusal() -> None:
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_codes_old_cli_model_refusal(undelivered: bool) -> None:
     """
     A claude-sdk turn ending on Claude Code's "version N or newer is required"
     refusal reaches the adapter as a bare ``RuntimeError``; the detail is coded
     ``client_update_required`` and names both versions and the update command,
     with the raw text kept as the message.
     """
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
-    error = RuntimeError(f"inner executor error: {_OLD_CLI_REFUSAL}")
+    message = f"inner executor error: {_OLD_CLI_REFUSAL}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
 
     detail = adapter._build_error_detail(error)
 
     assert detail.code == "client_update_required"
+    assert detail.undelivered is (True if undelivered else None)
     assert detail.message == str(error)
     assert detail.title == "Claude Code needs an update"
     assert detail.cause is not None

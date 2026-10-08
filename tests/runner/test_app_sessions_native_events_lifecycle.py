@@ -2577,12 +2577,10 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
         )
         assert created.status_code == 201, created.text
         if case == "rpc_failure":
-            with pytest.raises(
-                codex_native_app_server.CodexAppServerResponseError,
-                match="thread-store internal error",
-            ) as error:
-                await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
-            assert error.value.code == -32603
+            response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert response.status_code == 409, response.text
+            assert response.json()["error"] == "codex_side_chat_rejected"
+            assert response.json()["detail"] == "thread-store internal error"
         else:
             response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
             assert response.status_code == (400 if case == "missing_turn" else 202), response.text
@@ -4854,3 +4852,90 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "status", "error", "detail"),
+    [
+        (
+            {
+                "code": -32600,
+                "message": "direct app-server input is not allowed for multi-agent v2 sub-agents",
+            },
+            409,
+            "codex_side_chat_rejected",
+            "direct app-server input is not allowed for multi-agent v2 sub-agents",
+        ),
+        (
+            {"code": -32600, "message": "thread not found: 0199-abc"},
+            404,
+            "codex_side_chat_not_found",
+            "thread not found: 0199-abc",
+        ),
+        (ConnectionError("websocket closed 1011"), 503, "codex_side_chat_unavailable", None),
+    ],
+)
+async def test_events_codex_side_chat_message_failure_is_structured(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: Any,
+    status: int,
+    error: str,
+    detail: str | None,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210", client_name="omnigent-codex-native-runner"
+    )
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(failure, dict):
+            raise codex_native_app_server.CodexAppServerResponseError(failure)
+        raise failure
+
+    monkeypatch.setattr(fake_client, "request", request)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    spec = _harness_spec("codex-native")
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "codex_side_thread_id": "thread_side",
+            },
+        )
+    assert response.status_code == status, response.text
+    assert response.json()["error"] == error
+    if detail is not None:
+        assert response.json()["detail"] == detail
+    assert fake_client.closed

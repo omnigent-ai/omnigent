@@ -42,7 +42,6 @@ import {
   useRef,
   useState,
 } from "react";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
@@ -51,6 +50,7 @@ import {
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
+  GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
   LogOutIcon,
@@ -99,7 +99,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { MOD_KEY } from "@/components/KeyboardShortcut";
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
@@ -117,7 +117,6 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -262,7 +261,6 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
-import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -417,7 +415,7 @@ const workspaceTabCards: {
 }[] = [
   { value: "files", label: "Files", icon: FilesIcon },
   { value: "changes", label: "Changes", icon: FileDiffIcon },
-  { value: "github", label: "GitHub", icon: GithubMono },
+  { value: "github", label: "Pull Requests", icon: GitPullRequestIcon },
   { value: "subagents", label: "Agents", icon: BotIcon },
 ];
 
@@ -1368,7 +1366,7 @@ function DeleteWorktreesOnArchiveControl() {
 
 /**
  * Connect / disconnect a Databricks workspace. Once connected, a managed
- * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
+ * sandbox launched by this user reaches the Databricks Unity Gateway (MCP + model
  * serving) as them, using their per-user OAuth token. Databricks is
  * multi-workspace, so the user supplies their workspace URL. The connect action
  * is a full-page redirect to the workspace OAuth consent; on return the callback
@@ -1449,8 +1447,8 @@ function DatabricksIntegrationControl() {
           className="flex-1"
           description={
             status.connected && status.workspace_host
-              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
-              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks Unity Gateway (MCP + model serving) as you.`
+              : "Connect your Databricks workspace so new sandboxes reach its Unity Gateway (MCP + model serving) as you."
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1542,7 +1540,7 @@ function ComposerSendShortcutControl() {
         className="flex-1"
         description={
           <>
-            <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
+            <p>Off: Enter submits and Shift+Enter or {ALT_KEY}+Enter inserts a newline.</p>
             <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
           </>
         }
@@ -2718,7 +2716,6 @@ function selectValueToRetentionDays(value: string): number | null {
 }
 
 function ImportSection() {
-  const info = useServerInfo();
   return (
     <Section
       title="Import sessions"
@@ -2730,17 +2727,6 @@ function ImportSection() {
           <ImportSessionsPanel />
         </div>
       </div>
-      {!isFeatureEnabled(info, "harness_settings_ui") && (
-        <div className="mt-8 flex flex-col gap-3">
-          <h2 className="text-ui font-medium">Harness imports</h2>
-          <p className="-mt-2 text-ui text-muted-foreground">
-            See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
-          </p>
-          <div className="rounded-xl border border-border bg-card p-4">
-            <ReviewImportsPanel />
-          </div>
-        </div>
-      )}
     </Section>
   );
 }

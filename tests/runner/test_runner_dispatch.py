@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -2621,6 +2622,71 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
         shell_result = json.loads(shell)
         assert shell_result["exit_code"] == 0
         assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owned OS-tool cleanup keeps the runner loop live before cancellation."""
+    import omnigent.inner.os_env as os_env_module
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    close_started = threading.Event()
+    release_close = threading.Event()
+    close_finished = threading.Event()
+    heartbeat_ran_while_blocked = asyncio.Event()
+
+    class _BlockingEnvironment:
+        async def read(self, **kwargs: object) -> dict[str, str]:
+            del kwargs
+            return {"content": "ok"}
+
+        def close(self) -> None:
+            close_started.set()
+            assert release_close.wait(timeout=2.0)
+            close_finished.set()
+
+    monkeypatch.setattr(
+        os_env_module, "create_os_environment", lambda *args, **kwargs: _BlockingEnvironment()
+    )
+
+    async def heartbeat() -> None:
+        while not close_finished.is_set():
+            if close_started.is_set():
+                heartbeat_ran_while_blocked.set()
+                return
+            await asyncio.sleep(0.01)
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    tool_task: asyncio.Task[str] | None = None
+    watchdog = threading.Thread(
+        target=lambda: (release_close.wait(timeout=2.0), release_close.set()),
+        name="test-os-env-watchdog",
+        daemon=True,
+    )
+    watchdog.start()
+    try:
+        heartbeat_task = asyncio.create_task(heartbeat())
+        tool_task = asyncio.create_task(_execute_os_env_tool("sys_os_read", {"path": "x"}))
+        await asyncio.wait_for(heartbeat_ran_while_blocked.wait(), timeout=1.0)
+        tool_task.cancel()
+        await asyncio.sleep(0)
+        tool_task.cancel()
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await tool_task
+    finally:
+        release_close.set()
+        if tool_task is not None and not tool_task.done():
+            tool_task.cancel()
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(tool_task, heartbeat_task, return_exceptions=True)
+        watchdog.join(timeout=1.0)
+
+    assert close_finished.is_set()
+    assert heartbeat_ran_while_blocked.is_set()
 
 
 @pytest.mark.asyncio

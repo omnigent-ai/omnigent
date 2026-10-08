@@ -45,7 +45,7 @@ from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
@@ -216,6 +216,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -1269,6 +1270,7 @@ def register_core_routes(
         session_id: str,
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
+        include_live_status: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
         include_usage: bool = Query(default=True),
     ) -> SessionResponse:
@@ -1291,6 +1293,11 @@ def register_core_routes(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param include_live_status: When ``False``, skip the live-status
+            probe of the session's bound runner on a status-cache miss
+            and report ``status`` from the cached or persisted value.
+            Runner-owned reads pass ``False`` because the probe targets
+            the very runner waiting on this response.
         :param include_usage: When ``False``, skip the subtree usage read and
             return null usage fields with ``usage_included=False``. Display
             clients can independently request this route with
@@ -1323,6 +1330,7 @@ def register_core_routes(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
+            include_live_status=include_live_status,
             include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
@@ -2606,6 +2614,25 @@ def register_core_routes(
             else:
                 from omnigent.server.routes import sessions as _sf
 
+                if (
+                    runner_router is not None
+                    and conv.host_id is None
+                    and conv.kind == "default"
+                    and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+                    and not runner_router.runner_is_online(body.runner_id.strip())
+                ):
+                    host_id = await asyncio.to_thread(
+                        routing_host_id,
+                        dataclasses.replace(conv, runner_id=body.runner_id.strip()),
+                        conversation_store,
+                    )
+                    if host_id is not None and await asyncio.to_thread(
+                        runner_router.host_is_on_another_replica, host_id
+                    ):
+                        raise OmnigentError(
+                            "side chat runner is connected to another server replica",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
                 )
@@ -2751,8 +2778,8 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        updated = await asyncio.to_thread(
-            conversation_store.update_conversation,
+        update_result = await asyncio.to_thread(
+            conversation_store.update_conversation_with_changes,
             session_id,
             title=body.title,
             reasoning_effort=None if clear_effort else effort,
@@ -2771,8 +2798,10 @@ def register_core_routes(
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
-        if updated is None:
+        if update_result is None:
             raise _session_not_found()
+        updated = update_result.conversation
+        effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
             # An active live change orders this write against its own when refused.
@@ -2823,7 +2852,11 @@ def register_core_routes(
         negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
         combined_model_forward = False
         _model_forward = None
-        if live_forward and (effort is not None or clear_effort):
+        if (
+            live_forward
+            and (effort is not None or clear_effort)
+            and (effort_changed or (live_model_change and codex_native))
+        ):
             effort_event: dict[str, object] = {
                 "type": "effort_change",
                 "effort": updated.reasoning_effort,
@@ -3466,10 +3499,11 @@ def register_core_routes(
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
 
-        # A side-chat fork is hidden from the left sidebar (it surfaces only as a
-        # Workspace-rail tab). Stamp the label the sessions-list filter reads.
+        # Side chats use the source for shared-runner routing and stay hidden
+        # from the sidebar while appearing in the Workspace rail.
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
+            extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the

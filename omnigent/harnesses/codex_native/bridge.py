@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import tomllib
 
+from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.native import native_bridge_common
 
 if TYPE_CHECKING:
@@ -58,6 +59,7 @@ _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
+_EGRESS_CERTIFICATE_FILE = "egress_certificate_failure.json"
 # Applied model/effort that config.toml failed to record, for every reader of it.
 _UNMIRRORED_SETTINGS_FILE = "unmirrored_settings.json"
 _UNMIRRORED_SETTINGS_LOCK_FILE = "unmirrored_settings.lock"
@@ -1118,6 +1120,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
             _STARTUP_ERROR_FILE,
             _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
+            _EGRESS_CERTIFICATE_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()
@@ -1157,10 +1160,15 @@ def write_bridge_startup_error(
         record["title"] = title
     if remediation:
         record["remediation"] = remediation
+    _write_bridge_record(bridge_dir, _STARTUP_ERROR_FILE, record)
+
+
+def _write_bridge_record(bridge_dir: Path, filename: str, record: Mapping[str, object]) -> None:
+    """Atomically write one best-effort JSON record into the bridge directory."""
     try:
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = bridge_dir / _STARTUP_ERROR_FILE
-        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_ERROR_FILE}.", dir=str(bridge_dir))
+        path = bridge_dir / filename
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{filename}.", dir=str(bridge_dir))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(record, handle, sort_keys=True)
@@ -1170,7 +1178,7 @@ def write_bridge_startup_error(
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
     except OSError:
-        return  # best-effort; the real failure is already logged
+        return  # best-effort; the cause is already logged
 
 
 def clear_bridge_startup_error(bridge_dir: Path) -> None:
@@ -1253,6 +1261,53 @@ def record_app_server_stopped(bridge_dir: Path) -> None:
         title=failure.title,
         remediation=failure.remediation,
     )
+
+
+def record_certificate_failure(bridge_dir: Path, failure: CertificateFailure) -> None:
+    """
+    Record a TLS certificate failure the app-server's launcher printed to stderr.
+
+    The forwarder reads it when Codex reports a connection retry.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param failure: The failure read off the app-server's stderr.
+    :returns: None.
+    """
+    _write_bridge_record(
+        bridge_dir,
+        _EGRESS_CERTIFICATE_FILE,
+        {"evidence": failure.evidence, "expired": failure.expired},
+    )
+
+
+def read_certificate_failure(bridge_dir: Path) -> CertificateFailure | None:
+    """
+    Read the recorded launcher TLS certificate failure, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The failure, or ``None`` if absent/unreadable.
+    """
+    try:
+        raw = json.loads((bridge_dir / _EGRESS_CERTIFICATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    evidence = raw.get("evidence")
+    if not isinstance(evidence, str) or not evidence:
+        return None
+    return CertificateFailure(evidence=evidence, expired=raw.get("expired") is True)
+
+
+def clear_certificate_failure(bridge_dir: Path) -> None:
+    """
+    Forget a recorded certificate failure once a turn has reached the model.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _EGRESS_CERTIFICATE_FILE).unlink()
 
 
 def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:

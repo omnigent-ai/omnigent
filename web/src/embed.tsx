@@ -65,7 +65,7 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 
-export type { OmnigentHostConfig } from "./lib/host";
+export type { HtmlPreviewFrameProps, OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
 
 // Re-export the host-config setter so the host can install transport config
@@ -171,7 +171,9 @@ function OmnigentProviders({
     initChatStore(hostQueryClient);
     // Resolve a session's routing host on demand (a hostless sub-agent child
     // walks up to its host-bound ancestor) before host-scoped requests key.
-    setSessionHostResolver((sessionId) => prefetchSessionHostChain(hostQueryClient, sessionId));
+    setSessionHostResolver((sessionId, options) =>
+      prefetchSessionHostChain(hostQueryClient, sessionId, options),
+    );
     void resolveIdentity();
     return null;
   });

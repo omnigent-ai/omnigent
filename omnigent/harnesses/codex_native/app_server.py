@@ -35,12 +35,15 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
 from omnigent.harnesses.codex_native.bridge import (
+    clear_certificate_failure,
     mirror_applied_codex_settings,
     read_codex_config_model,
     read_codex_home_config_effort,
     read_codex_home_config_model,
     read_unmirrored_codex_settings,
+    record_certificate_failure,
     write_policy_hook_config,
 )
 from omnigent.harnesses.codex_native.launch_args import (
@@ -1961,6 +1964,9 @@ class CodexNativeAppServer:
     config_profile: str | None = None
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
+    # First TLS certificate failure the launcher printed; mirrored into the
+    # bridge so the forwarder can fail a stuck turn with the cause.
+    certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
     async def start(self) -> None:
@@ -1977,6 +1983,8 @@ class CodexNativeAppServer:
             )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
+        # A previous launch's certificate record must not fail this launch's turns.
+        clear_certificate_failure(self.bridge_dir)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()
@@ -2507,6 +2515,11 @@ class CodexNativeAppServer:
                 self.recent_stderr.append(text)
                 if len(self.recent_stderr) > 20:
                     self.recent_stderr.pop(0)
+            if self.certificate_failure is None:
+                failure = detect_certificate_failure(text)
+                if failure is not None:
+                    self.certificate_failure = failure
+                    record_certificate_failure(self.bridge_dir, failure)
             if diagnostics is not None:
                 diagnostics.submit(
                     bytes(pending) + (b"\n" if newline else b""), bytes_omitted=omitted_bytes
@@ -3075,7 +3088,7 @@ class _DatabricksLaunchMaterialization:
     app-server build and the model-options probe so the two cannot drift.
 
     :param config_overrides: ``-c`` overrides routing Codex through the
-        profile's AI Gateway (provider block + auth command + model pin).
+        profile's Unity Gateway (provider block + auth command + model pin).
     :param model: The model the overrides pin, e.g. ``"databricks-gpt-5-4"``
         — the explicit *model* when given, else the catalog default.
     :param host: The profile's workspace origin for ``DATABRICKS_HOST``.
@@ -4033,7 +4046,7 @@ def resolve_native_codex_launch(
             )
             log_info_once(
                 _logger,
-                "native-codex routing: managed connect host — Databricks AI gateway "
+                "native-codex routing: managed connect host — Databricks Unity Gateway "
                 "via the credential broker (host-only [omnigent] profile + sidecar).",
             )
             return NativeCodexLaunch(
@@ -4046,7 +4059,7 @@ def resolve_native_codex_launch(
                 ),
                 model=resolved_model,
                 profile=None,
-                summary="Databricks AI gateway (managed connect host, broker-minted)",
+                summary="Databricks Unity Gateway (managed connect host, broker-minted)",
             )
 
     if entry is None:

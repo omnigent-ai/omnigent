@@ -1600,7 +1600,7 @@ def _cli_config_default_config() -> dict[str, object]:
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
                 "default": True,
             }
         }
@@ -1638,7 +1638,7 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
     """A codex ``subscription`` default pins the built-in ``openai`` provider.
 
     The executor bridges the user's ~/.codex/config.toml, whose custom
-    default model_provider (e.g. isaac's Databricks AI Gateway) would
+    default model_provider (e.g. isaac's Databricks Unity Gateway) would
     otherwise silently hijack a Subscription selection. Failure means
     "Subscription" stops meaning "ChatGPT login" on machines with a custom
     config.toml default.
@@ -1678,7 +1678,7 @@ def test_pi_cli_config_databricks_default_routes_gateway(
     """A cli-config Databricks gateway default routes the pi (gateway) harness.
 
     Unlike openai-agents (which fails loud), pi CAN consume a cli-config
-    Databricks AI Gateway — the gateway's Anthropic Messages surface is one Pi
+    Databricks Unity Gateway — the gateway's Anthropic Messages surface is one Pi
     speaks. The gateway-harness pi path must translate it into the
     ``HARNESS_PI_GATEWAY_*`` transport (the same vars an inline gateway emits),
     pointing at the gateway's ``/anthropic`` surface — NOT raise the
@@ -1779,7 +1779,7 @@ _DISMISSIBLE_CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]

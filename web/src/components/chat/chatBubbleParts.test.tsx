@@ -4,6 +4,7 @@ import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
@@ -87,6 +88,72 @@ describe("Mermaid diagram width", () => {
         { kind: "text", itemId: "prose", text: "A Mermaid diagram would help.", final: true },
       ]),
     ).toBe(false);
+  });
+});
+
+describe("AssistantBubble fork source", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_side_reply",
+    stableId: "side_reply",
+    lifecycle: "completed",
+    error: null,
+    items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
+  };
+
+  it("disables the message fork without hiding its explanation", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            canFork: true,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "side chat",
+      scope: "conv_side_child",
+      expected: {
+        sourceSessionId: "conv_side_child",
+        upToResponseId: "resp_side_reply",
+      },
+    },
+    {
+      name: "main chat",
+      scope: null,
+      expected: { sourceSessionId: undefined, upToResponseId: "resp_side_reply" },
+    },
+  ])("opens from the $name session", ({ scope, expected }) => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={bubble} isLastAssistant={false} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("fork-from-response"));
+
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(openForkDialog).toHaveBeenCalledWith(expected);
   });
 });
 
@@ -445,6 +512,25 @@ describe("AssistantBubble sealed side-chat recovery", () => {
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended."),
     );
+  });
+});
+
+describe("UserBubble shell prompts", () => {
+  it("preserves shell syntax and attachment-like text literally", () => {
+    const command = "printf '%s\\n' '**hi**' '[Attached: /tmp/file]' '`pwd`'\necho done";
+    const bubble: Extract<Bubble, { kind: "user" }> = {
+      kind: "user",
+      itemId: "shell-input",
+      content: [{ type: "input_text", text: `!${command}` }],
+      shellCommand: command,
+    };
+    render(<BubbleView bubble={bubble} />);
+
+    const prompt = screen.getByTestId("message-bubble");
+    expect(prompt).toHaveAttribute("data-role", "user");
+    expect(prompt).toHaveAttribute("data-user-message-id", "shell-input");
+    expect(prompt.querySelector("pre")?.textContent).toBe(`!${command}`);
+    expect(screen.getByTestId("copy-message-link")).toBeEnabled();
   });
 });
 

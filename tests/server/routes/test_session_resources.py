@@ -5114,6 +5114,65 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry()
 
 
 @pytest.mark.asyncio
+async def test_claude_native_mirror_without_text_match_never_takes_an_interrupted_entry() -> None:
+    """A message typed in the TUI after a cancelled web message is not the cancelled one.
+
+    With no text match the mirror falls back to the oldest entry. A cancelled
+    entry is never that guess: the TUI message would inherit its attachment,
+    author and client id, and the entry would be reported as settled.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cancelled = pending_inputs.record(
+        sid,
+        [
+            {"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"},
+            {"type": "input_text", "text": "the cancelled web message"},
+        ],
+        created_by="alice@example.com",
+        stable_id="ab" * 16,
+    )
+    pending_inputs.mark_interrupted(sid, [cancelled])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "typed in the terminal"}],
+            },
+            "response_id": "resp_typed",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            created_by="bob@example.com",
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        typed = store.appended_items[0]
+        assert typed.data.content == [{"type": "input_text", "text": "typed in the terminal"}]
+        assert typed.created_by == "bob@example.com"
+        assert store.persisted_by_stable_id == {}
+        # The cancelled entry is untouched: hidden, and left to a later match or the TTL.
+        assert pending_inputs.pending_ids(sid) == [cancelled]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_claude_native_mirror_matches_text_behind_attachment_markers() -> None:
     """Attachment marker lines the executor prepends don't defeat the text match."""
     from omnigent.runtime import pending_inputs
@@ -7073,6 +7132,113 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         assert consumed[0]["data"]["cleared_pending_id"] == pending_id
         assert consumed[0]["data"]["created_by"] == "alice@example.com"
     finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("undelivered", [True, False])
+async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
+    undelivered: bool,
+) -> None:
+    """Preserve one real error without a second missing-transcript error on the next turn."""
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_content = [{"type": "input_text", "text": "set up the worktree"}]
+    next_content = [{"type": "input_text", "text": "then run the tests"}]
+    first_pending = pending_inputs.record(
+        sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
+    )
+    next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    # Script only the executor boundary; the real adapter must transport its evidence.
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="test-agent", input=first_content), ctx
+            )
+        error = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        client = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_not_ready", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_not_ready",
+                            "model": "claude",
+                            "error": error,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        if not undelivered:
+            assert [item.type for item in store.appended_items] == ["error"]
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+                first_pending,
+                next_pending,
+            ]
+            return
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        first, failure = store.appended_items
+        assert first.data.content == first_content
+        assert first.created_by == "alice@example.com"
+        assert first.response_id == failure.response_id == "resp_not_ready"
+        assert failure.data.code == "RuntimeError"
+        assert failure.data.message == "inner executor error: Terminal is not ready"
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            next_pending
+        ]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": next_content},
+                    "response_id": "resp_next",
+                    "source_id": "claude:next-input:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[-1].data.content == next_content
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        await adapter.on_shutdown()
         pending_inputs.reset_for_tests()
 
 

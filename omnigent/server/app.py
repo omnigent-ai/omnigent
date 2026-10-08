@@ -53,6 +53,7 @@ from omnigent.errors import (
     ErrorPhase,
     OmnigentError,
     is_cancelled_rpc_error,
+    is_permission_denied_rpc_error,
 )
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
@@ -2445,6 +2446,32 @@ def create_app(
                 ),
             )
             return await _handle_omnigent_error(request, cancelled)
+        if is_permission_denied_rpc_error(exc):
+            # An upstream PERMISSION_DENIED (e.g. a proxied workspace-hierarchy
+            # 403) is an access outcome, not a fault: answer the coded 403 naming
+            # the resource instead of an unhandled 500 on every client retry.
+            denied = OmnigentError(
+                f"Access to {request.url.path} was denied by a backing "
+                "service. Verify you still have access to the underlying "
+                "resource, or ask an administrator to grant it.",
+                code=ErrorCode.UPSTREAM_PERMISSION_DENIED,
+            )
+            _logger.warning(
+                "Upstream call denied by a backing service: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="denied",
+                    code=str(denied.code),
+                    http_status=str(denied.http_status),
+                    error_category=denied.category.value,
+                    error_impact=denied.impact.value,
+                    error_phase=denied.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, denied)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real
@@ -2794,8 +2821,13 @@ def create_app(
            ``"none"``. ``"oidc"`` also promises the native loopback sign-in
            (``/auth/login`` native parameters + ``POST /auth/native-token``).
            ``session_cookie`` names the session cookie for ``oidc`` and
-           ``accounts`` and is ``null`` otherwise. A missing ``auth`` (older
-           servers) means "sign in as before".
+           ``accounts`` and is ``null`` otherwise. ``native_redirect_uris``
+           lists the private-use-scheme redirects (e.g. the iOS app's
+           ``ai.omnigent.ios:/oauth/callback``) the native sign-in accepts
+           besides loopback, sorted, for ``oidc``; ``null`` otherwise. The
+           iOS app gates on its URI being listed, because servers that only
+           support loopback answer the custom scheme with 400. A missing
+           ``auth`` (older servers) means "sign in as before".
         6. ``server_name`` (str | null) is the operator's display name for
            this deployment (``branding.server_name``), for clients that list
            several servers. Self-asserted by the server, so clients show it
@@ -2821,6 +2853,12 @@ def create_app(
 
         :returns: The manifest described above.
         """
+        mode = auth_mode(auth_provider)
+        native_redirect_uris: list[str] | None = None
+        if mode == "oidc":
+            from omnigent.server.routes.auth import NATIVE_APP_REDIRECT_URIS
+
+            native_redirect_uris = sorted(NATIVE_APP_REDIRECT_URIS)
         return {
             "manifest_version": WELL_KNOWN_MANIFEST_VERSION,
             "server_version": _server_version(),
@@ -2830,8 +2868,9 @@ def create_app(
             "min_desktop_version": None,
             "ui": {"server_picker": "sidebar"},
             "auth": {
-                "mode": auth_mode(auth_provider),
+                "mode": mode,
                 "session_cookie": getattr(auth_provider, "session_cookie_name", None),
+                "native_redirect_uris": native_redirect_uris,
             },
             "server_name": branding_snapshot.server_name,
         }
