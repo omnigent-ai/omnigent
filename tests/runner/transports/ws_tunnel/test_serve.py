@@ -493,6 +493,7 @@ async def test_http_auth_rejection_hint_pastes_into_nomatch_shell(
 
     shims = tmp_path / "bin"
     shims.mkdir()
+    # Shim both names so a regressed bare `omnigent` hint never reaches a real install.
     for name in ("isaac", "omnigent"):
         shim = shims / name
         shim.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")

@@ -539,7 +539,7 @@ async def serve_tunnel(
                         if server_url:
                             # `omnigent login` infers the fronting workspace itself,
                             # unlike `databricks auth login --host`, which needs the
-                            # workspace host. Quoted where the shell would glob `?o=`.
+                            # workspace host.
                             from omnigent.util.server_url import display_server_url
 
                             login_hint = (
