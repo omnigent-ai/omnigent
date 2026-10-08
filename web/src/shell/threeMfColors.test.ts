@@ -15,6 +15,8 @@ import {
   applyThreeMfColors,
   INFLATE_CHUNK_BYTES,
   MAX_SELECTED_BYTES,
+  MAX_CONFIG_BYTES,
+  MAX_CONFIG_XML_MARKUP,
   MAX_EMITTED_RATIO,
   MAX_EMITTED_OVERHEAD,
   MAX_EMITTED_BYTES,
@@ -156,6 +158,118 @@ function multibyteVariants(note: string, count = 6) {
 }
 
 describe("Bambu filament colours through the stock 3MF loader", () => {
+  it.each(["Metadata/model_settings.config", "Metadata/project_settings.config"])(
+    "bounds config bytes before inflation and parsing: %s",
+    (name) => {
+      const realistic = {
+        "Metadata/model_settings.config": `<config>${config(part(1, 1) + part(2, 2) + Array.from({ length: 128 }, (_, index) => part(1000 + index, 1)).join(""))}</config>`,
+        "Metadata/project_settings.config": JSON.stringify({
+          filament_colour: palette,
+          ...Object.fromEntries(
+            Array.from({ length: 500 }, (_, index) => [`option_${index}`, "x".repeat(100)]),
+          ),
+        }),
+      };
+      const admitted = archive(realistic);
+      check(admitted);
+      const node = `<x note="${"x".repeat(500)}"/>`;
+      const oversized = archive({
+        ...realistic,
+        [name]:
+          name === "Metadata/model_settings.config"
+            ? realistic[name].replace(
+                "<config>",
+                `<config><ignored>${node.repeat(Math.ceil(MAX_CONFIG_BYTES / node.length))}</ignored>`,
+              )
+            : JSON.stringify({ filament_colour: palette, ignored: "x".repeat(MAX_CONFIG_BYTES) }),
+      });
+      const forged = admitted.slice(0);
+      declareOriginalSize(forged, name, MAX_CONFIG_BYTES + 1);
+      const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
+      const inflater = vi.spyOn(Inflate.prototype, "push");
+      try {
+        for (const input of [oversized, forged]) {
+          expect(applyThreeMfColors(input) === input).toBe(true);
+          expect(parser).not.toHaveBeenCalled();
+          expect(inflater).not.toHaveBeenCalled();
+        }
+      } finally {
+        parser.mockRestore();
+        inflater.mockRestore();
+      }
+      check(oversized, ["ffffff", "ffffff"]);
+    },
+  );
+
+  it("bounds dense config markup before parsing within the byte ceiling", () => {
+    check(archive());
+    const input = archive({
+      "Metadata/model_settings.config": `<config><ignored>${"<x/>".repeat(MAX_CONFIG_XML_MARKUP + 1)}</ignored>${config(part(1, 1) + part(2, 2))}</config>`,
+    });
+    expect(
+      unzipSync(new Uint8Array(input))["Metadata/model_settings.config"].byteLength,
+    ).toBeLessThan(MAX_CONFIG_BYTES);
+    const parser = vi.spyOn(DOMParser.prototype, "parseFromString");
+    try {
+      expect(applyThreeMfColors(input) === input).toBe(true);
+      expect(parser).not.toHaveBeenCalled();
+    } finally {
+      parser.mockRestore();
+    }
+    check(input, ["ffffff", "ffffff"]);
+  });
+
+  it("counts neutral shared-mesh variants alongside emitted colours", () => {
+    const shared = mesh(1).replace('x="0"', `x="0.${"0".repeat(1200 * 1024)}"`);
+    const input = archive({
+      "3D/root.model": model(
+        [100, 101, 102]
+          .map((id, index) => composite(id, component(1, index * 10, "/3D/shared.model")))
+          .join(""),
+        [100, 101, 102].map((id) => `<item objectid="${id}"/>`).join(""),
+      ),
+      "3D/shared.model": model(shared, ""),
+      "Metadata/model_settings.config": `<config>${[1, 2, 9].map((slot, index) => config(part(1, slot), undefined, 100 + index)).join("")}</config>`,
+    });
+    expect(applyThreeMfColors(input)).not.toBe(input);
+    check(input, ["f53b9d", "4dc5a0", "ffffff"], [0, 10, 20], [1, 1, 1]);
+  });
+
+  it("bounds two-colour composite variants by their actual palette size", () => {
+    const fixture = (length: number) =>
+      archive({
+        "3D/root.model": model(
+          mesh(1) +
+            composite(300, component(1)).replace(
+              "<components>",
+              `<metadata name="note">${"x".repeat(length)}</metadata><components>`,
+            ) +
+            [100, 101, 102].map((id, index) => composite(id, component(300, index * 10))).join(""),
+          [100, 101, 102].map((id) => `<item objectid="${id}"/>`).join(""),
+        ),
+        "Metadata/model_settings.config": `<config>${[100, 101, 102].map((id, index) => config(part(300, index + 1), undefined, id)).join("")}</config>`,
+        "Metadata/project_settings.config": JSON.stringify({
+          filament_colour: ["#F53B9D", "#4DC5A0", "#F53B9D"],
+        }),
+      });
+    check(fixture(64), ["f53b9d", "4dc5a0", "f53b9d"], [0, 10, 20], [1, 1, 1]);
+    const payload = MAX_EMITTED_OVERHEAD + 4096;
+    const input = fixture(payload);
+    const selected = Object.values(unzipSync(new Uint8Array(input))).reduce(
+      (total, bytes) => total + bytes.length,
+      0,
+    );
+    expect(payload * 3).toBeGreaterThan(selected * 2 + MAX_EMITTED_OVERHEAD);
+    expect(payload * 3).toBeLessThan(selected * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD);
+    const serializer = vi.spyOn(XMLSerializer.prototype, "serializeToString");
+    try {
+      expect(applyThreeMfColors(input) === input).toBe(true);
+      expect(serializer).not.toHaveBeenCalled();
+    } finally {
+      serializer.mockRestore();
+    }
+  });
+
   it("uses the central-directory palette instead of a stale local record", () => {
     const paletteName = "Metadata/project_settings.config";
     const pairs = Object.entries(unzipSync(new Uint8Array(archive())));
