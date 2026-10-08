@@ -19,15 +19,12 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
 import filelock
 import pytest
-from playwright.sync_api import Locator, Page, Playwright, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WEB_DIR = _REPO_ROOT / "web"
@@ -118,6 +115,8 @@ def embed_host_dist(request: pytest.FixtureRequest) -> Path:
     if request.config.getoption("--ui-skip-build") and (_HOST_DIST / "index.html").is_file():
         return _HOST_DIST
     with filelock.FileLock(str(_WEB_DIR / ".build-embed.lock"), timeout=900):
+        if not _VITE.is_file():
+            raise RuntimeError(f"{_VITE} is missing; run `pnpm install --filter web` first")
         subprocess.run(
             [str(_VITE), "build", "--config", "vite.embed.config.ts"],
             cwd=_WEB_DIR,
@@ -136,34 +135,6 @@ def embed_host_dist(request: pytest.FixtureRequest) -> Path:
         )
     assert (_HOST_DIST / "index.html").is_file(), "host page build produced no index.html"
     return _HOST_DIST
-
-
-@contextmanager
-def embed_capable_page(
-    playwright: Playwright,
-    browser_type_launch_args: dict[str, Any],
-    browser_context_args: dict[str, Any],
-) -> Iterator[Page]:
-    """A page whose route-fulfilled host document may open loopback sockets.
-
-    Chromium's Local Network Access check gives a fulfilled document no address
-    space and blocks its loopback WebSocket; the real same-origin host page
-    never hits that, so the check is disabled for this harness only.
-    """
-    launch_args = {**browser_type_launch_args}
-    launch_args["args"] = [
-        *launch_args.get("args", []),
-        "--disable-features=LocalNetworkAccessChecks",
-    ]
-    browser = playwright.chromium.launch(**launch_args)
-    try:
-        context = browser.new_context(**browser_context_args)
-        try:
-            yield context.new_page()
-        finally:
-            context.close()
-    finally:
-        browser.close()
 
 
 def install_embed_host(page: Page, host_dist: Path) -> None:
@@ -282,27 +253,22 @@ def assert_sidebar_stays_dark(backgrounds: dict[str, str], pane_background: str)
 
 
 def test_embed_opaque_custom_sidebar_keeps_dark_palette(
-    playwright: Playwright,
-    browser_type_launch_args: dict[str, Any],
-    browser_context_args: dict[str, Any],
-    live_server: str,
-    embed_host_dist: Path,
+    page: Page, live_server: str, embed_host_dist: Path
 ) -> None:
     """Embedded, dark host: opaque and translucent custom sidebars both stay dark."""
-    with embed_capable_page(playwright, browser_type_launch_args, browser_context_args) as page:
-        install_embed_host(page, embed_host_dist)
-        page.goto(f"{live_server}/settings/appearance")
+    install_embed_host(page, embed_host_dist)
+    page.goto(f"{live_server}/settings/appearance")
 
-        scope_root = page.locator("div.omnigent-app")
-        expect(scope_root).to_be_visible(timeout=30_000)
-        dark_root = page.locator("div.omnigent-app > div.dark")
-        expect(dark_root).to_be_attached()
+    scope_root = page.locator("div.omnigent-app")
+    expect(scope_root).to_be_visible(timeout=30_000)
+    dark_root = page.locator("div.omnigent-app > div.dark")
+    expect(dark_root).to_be_attached()
 
-        apply_dracula_custom_theme(page, scope_root)
-        backgrounds = drive_translucency_journey(page, scope_root)
-        pane_background = dark_root.evaluate(
-            "el => getComputedStyle(el).getPropertyValue('--background').trim()"
-        )
+    apply_dracula_custom_theme(page, scope_root)
+    backgrounds = drive_translucency_journey(page, scope_root)
+    pane_background = dark_root.evaluate(
+        "el => getComputedStyle(el).getPropertyValue('--background').trim()"
+    )
     assert_sidebar_stays_dark(backgrounds, pane_background)
 
 

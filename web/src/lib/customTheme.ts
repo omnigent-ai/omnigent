@@ -501,12 +501,11 @@ export function customThemeSwatches(theme: CustomTheme): {
 
 const PALETTE_TOKEN_NAMES = new Set<string>(Object.values(PALETTE_TOKEN_CSS_NAMES));
 
-// CSS substitutes `var()` at the declaring element, and the style root never
-// carries `.dark` when embedded (dark lives on an inner root), so a raw
-// `var(--sidebar)` in a dark-variant value resolves against the light tokens.
-// Pin palette-token references to the mode's own `--custom-*` variable.
+// CSS substitutes `var()` at the declaring element, and the embedded style root
+// never carries `.dark`, so raw palette-token refs in dark-variant values resolve
+// against the light tokens; pin them to the mode's own `--custom-*` variable.
 function pinTokenRefsToMode(value: string, mode: "light" | "dark"): string {
-  return value.replace(/var\(--([a-z-]+)\)/g, (reference, token: string) =>
+  return value.replace(/var\(\s*--([a-z\d-]+)\s*\)/g, (reference, token: string) =>
     PALETTE_TOKEN_NAMES.has(token) ? `var(--custom-${mode}-${token})` : reference,
   );
 }

@@ -310,11 +310,9 @@ describe("customTheme", () => {
   });
 
   it("pins palette-token var() references to the variant's own custom variables", () => {
-    // Non-omni bases keep the palette default `sidebarBackground: var(--sidebar)`.
-    // Applied verbatim, that reference substitutes at the declaring style root —
-    // embedded, the scope root, which never carries `.dark` — so the dark opaque
-    // sidebar rendered the LIGHT palette. The applied value must reference the
-    // mode's own derived variable instead.
+    // Non-omni bases keep `sidebarBackground: var(--sidebar)`; that reference
+    // substitutes at the declaring style root (embedded: the scope root, which
+    // never carries `.dark`), so it must be pinned to the mode's own variable.
     const scope = document.createElement("div");
     const inner = document.createElement("div");
     setEmbedScopeRoot(scope);
@@ -340,9 +338,24 @@ describe("customTheme", () => {
     expect(style.getPropertyValue("--custom-dark-sidebar-active")).toBe(
       "color-mix(in srgb, var(--custom-dark-sidebar-foreground) 7%, var(--custom-dark-sidebar))",
     );
+    expect(style.getPropertyValue("--custom-dark-sidebar-active-foreground")).toBe(
+      "var(--custom-dark-sidebar-foreground)",
+    );
     // The pinned target resolves to a concrete color on the same root.
     expect(style.getPropertyValue("--custom-dark-sidebar")).not.toContain("var(");
     // Concrete values pass through untouched.
     expect(style.getPropertyValue("--custom-dark-background")).toBe("#282a36");
+  });
+
+  it("pins Omnigent's shell-background reference and keeps its concrete gradient", () => {
+    applyCustomTheme({ ...createCustomThemeFromPalette(PALETTES[0]), contrast: 60 });
+
+    const style = document.documentElement.style;
+    expect(style.getPropertyValue("--custom-light-shell-background")).toBe(
+      "var(--custom-light-background)",
+    );
+    expect(style.getPropertyValue("--custom-dark-shell-background")).toBe(
+      PALETTES[0].tokens.dark.shellBackground,
+    );
   });
 });
