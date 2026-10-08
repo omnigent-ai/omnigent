@@ -23,6 +23,7 @@ import logging
 import subprocess
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -2671,6 +2672,45 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     )
 
 
+def _stage_relaunch(
+    monkeypatch: pytest.MonkeyPatch,
+    on_connect: Callable[..., Awaitable[httpx.AsyncClient | None]],
+) -> None:
+    """Send the next message down the relaunch branch, with *on_connect* as the runner wait.
+
+    ``_get_runner_client`` reports the runner offline, so the route relaunches it, and
+    *on_connect* answers ``_wait_for_runner_client`` (the relaunched runner connecting). The
+    relay readiness wait is a no-op: a MockTransport runner never emits the relay's heartbeat,
+    and the relay has its own coverage.
+
+    :param monkeypatch: The test's monkeypatch fixture.
+    :param on_connect: Stand-in for ``_wait_for_runner_client``.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    async def _offline(sid: str, router: object, **kwargs: Any) -> None:
+        """Report no runner for the session.
+
+        :param sid: Session id being routed (unused).
+        :param router: Real app runner router (unused).
+        :param kwargs: Ignored keyword args (e.g. ``conversation``).
+        """
+        del sid, router, kwargs
+
+    async def _noop_relay_ready(*args: Any, **kwargs: Any) -> None:
+        """Stand in for ``_ensure_runner_relay_ready``.
+
+        :param args: Ignored positional args.
+        :param kwargs: Ignored keyword args.
+        """
+        del args, kwargs
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _offline)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", on_connect)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+
 async def test_relaunch_posts_session_init_before_forwarding_message(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -2704,10 +2744,6 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     leading ``/v1/sessions`` POST (first assertion fails). Move it after
     the forward and the index-ordering assertion fails.
     """
-    from omnigent.server.routes import sessions as sessions_module
-
-    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
-
     comm = await _connect_host(app)
     session = await _inline_launch_session(client, comm)
     session_id = session["id"]
@@ -2738,18 +2774,6 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         base_url="http://runner",
     )
 
-    async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
-        """Return ``None`` so the route enters the relaunch branch.
-
-        :param sid: Session id being routed (unused; one session here).
-        :param router: Real app runner router (unused — staged here).
-        :returns: ``None``.
-        """
-        del sid, router
-        return None
-
-    monkeypatch.setattr(sessions_module, "_get_runner_client", _staged_get_runner_client)
-
     async def _staged_wait_for_runner_client(
         session_id_arg: str,
         runner_router_arg: object,
@@ -2776,22 +2800,7 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         assert runner_id is not None and runner_id.startswith("runner_token_")
         return fake_runner
 
-    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _staged_wait_for_runner_client)
-
-    # Neutralize the SSE relay readiness wait: a MockTransport never
-    # emits the relay's ready heartbeat, so the real wait would 5s-
-    # timeout and 503. The relay is orthogonal to the ordering invariant
-    # here and has its own coverage.
-    async def _noop_relay_ready(*args: Any, **kwargs: Any) -> None:
-        """Stand in for ``_ensure_runner_relay_ready`` as a no-op.
-
-        :param args: Ignored positional args from the call site.
-        :param kwargs: Ignored keyword args from the call site.
-        :returns: ``None`` (no relay handle).
-        """
-        del args, kwargs
-
-    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
+    _stage_relaunch(monkeypatch, _staged_wait_for_runner_client)
 
     try:
         resp = await client.post(
@@ -2833,6 +2842,73 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     assert init_bodies and init_bodies[0]["session_id"] == session_id, (
         f"handshake body should target session {session_id!r}; got {init_bodies!r}"
     )
+
+
+@pytest.mark.parametrize("runner_connects", [True, False], ids=["connects", "never-connects"])
+async def test_relaunching_message_is_in_flight_until_its_request_ends(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_connects: bool,
+) -> None:
+    """A message that relaunches a stopped runner counts as in flight while that runner connects.
+
+    The connect fires ``_on_runner_connect``, whose session init skips the runner's recovery turn
+    only while a message is being dispatched, so the message stays its turn's only trigger. The
+    count must also end with the request, or later reconnects would skip recovery.
+
+    Mutation check: mark the dispatch after the relaunch instead of at the start of the request,
+    and ``in_flight_at_connect`` records ``False``.
+    """
+    from omnigent.server.routes._sessions.orchestration import _dispatch_is_in_flight
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    in_flight_at_connect: list[bool] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept every runner POST.
+
+        :param request: Request the server sent to the relaunched runner.
+        :returns: A 2xx so the server proceeds past each step.
+        """
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+
+    async def _connect(session_id_arg: str, *args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        """Record whether the message is in flight when the relaunched runner connects.
+
+        :param session_id_arg: Session id being routed.
+        :param args: The router and tunnel registry (unused).
+        :param kwargs: The runner id, wait budget and exit reports (unused).
+        :returns: The fake runner, or ``None`` when it never connects.
+        """
+        del args, kwargs
+        in_flight_at_connect.append(_dispatch_is_in_flight(session_id_arg))
+        return fake_runner if runner_connects else None
+
+    _stage_relaunch(monkeypatch, _connect)
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    if runner_connects:
+        assert resp.status_code < 300, resp.text
+    assert in_flight_at_connect and all(in_flight_at_connect), in_flight_at_connect
+    assert not _dispatch_is_in_flight(session_id), "the request ended but its message is in flight"
 
 
 async def test_codex_goal_relaunch_posts_session_init_before_goal_event(

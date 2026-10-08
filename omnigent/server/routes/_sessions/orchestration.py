@@ -6984,6 +6984,16 @@ def _mark_dispatch_in_flight(conversation_id: str) -> Iterator[None]:
             _dispatch_in_flight.pop(conversation_id, None)
 
 
+def _dispatch_is_in_flight(conversation_id: str) -> bool:
+    """
+    Whether a message to *conversation_id* is still being dispatched.
+
+    :param conversation_id: Session/conversation identifier.
+    :returns: ``True`` inside a :func:`_mark_dispatch_in_flight` block.
+    """
+    return _dispatch_in_flight.get(conversation_id, 0) > 0
+
+
 def _session_is_starting(conversation_id: str) -> bool:
     """
     Whether a session has a message waiting on a runner that has not taken it.
@@ -6992,9 +7002,7 @@ def _session_is_starting(conversation_id: str) -> bool:
     :returns: ``True`` while a dispatch is in flight or a native message is
         parked in :mod:`omnigent.runtime.pending_inputs`.
     """
-    return _dispatch_in_flight.get(conversation_id, 0) > 0 or pending_inputs.has_pending(
-        conversation_id
-    )
+    return _dispatch_is_in_flight(conversation_id) or pending_inputs.has_pending(conversation_id)
 
 
 def _list_status_with_starting(

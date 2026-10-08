@@ -1058,6 +1058,7 @@ async def _reconnect_fires_connect_hook(
     fake_pm: Any,
     *,
     wait_for_recover: str,
+    init_payloads: list[dict[str, Any]] | None = None,
     runner_client: httpx.AsyncClient | None = None,
     expect_recovered: bool = True,
 ) -> AsyncIterator[list[str]]:
@@ -1075,6 +1076,8 @@ async def _reconnect_fires_connect_hook(
 
     With ``runner_client``, keep the real relay and replace only its transport.
 
+    :param init_payloads: When given, collects the session-init payloads the hook
+        sends to the stub client (not collected when ``runner_client`` is set).
     :yields: The list of session ids the recovery helper ran for.
     """
     from omnigent.runner.routing import RoutedRunner
@@ -1094,6 +1097,8 @@ async def _reconnect_fires_connect_hook(
 
     class _StubClient:
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
+            if init_payloads is not None and args and args[0] == "/v1/sessions":
+                init_payloads.append(kwargs["json"])
             return _StubResponse()
 
     def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
@@ -1394,6 +1399,59 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
             assert sessions_module._last_task_error_from_labels(cleared.labels) is None
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("dispatching", [True, False], ids=["message-dispatching", "idle"])
+async def test_on_runner_connect_suppresses_recovery_only_while_a_message_dispatches(
+    tunnel_three_layer_stack: _TunnelStack,
+    dispatching: bool,
+) -> None:
+    """The reconnect hook skips the recovery turn only while a message is being dispatched.
+
+    A message that relaunches a stopped runner forwards its item once that runner connects. The
+    initializer sends one init per connection, so if the hook's init started a recovery turn from
+    history, the message would queue behind it. With no message in flight, a reconnect still
+    recovers an interrupted turn.
+
+    Mutation check: drop ``suppress_recovery_turn`` from ``_on_runner_connect``'s init, and the
+    ``message-dispatching`` case fails.
+    """
+    from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
+
+    create_resp = await tunnel_three_layer_stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    # Bound via the store, not PATCH, so no relay races the reconnect (see _bind_failed_session).
+    get_conversation_store().replace_runner_id(session_id, _RUNNER_ID)
+
+    init_payloads: list[dict[str, Any]] = []
+    with _mark_dispatch_in_flight(session_id) if dispatching else contextlib.nullcontext():
+        async with _reconnect_fires_connect_hook(
+            tunnel_three_layer_stack.ap_app,
+            tunnel_three_layer_stack.fake_pm,
+            wait_for_recover=session_id,
+            init_payloads=init_payloads,
+        ):
+            pass
+
+    envelopes = [
+        parse_runner_session_init_envelope(payload)
+        for payload in init_payloads
+        if payload.get("session_id") == session_id
+    ]
+    assert envelopes, f"no session init for {session_id!r}; recorded {init_payloads!r}"
+    assert all(
+        envelope is not None and envelope.suppress_recovery_turn is dispatching
+        for envelope in envelopes
+    ), envelopes
 
 
 @pytest.mark.asyncio
