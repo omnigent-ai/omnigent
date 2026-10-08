@@ -1,5 +1,12 @@
-import { useEffect, useRef, useState } from "react";
-import { DownloadIcon, PlayIcon, VideoIcon } from "lucide-react";
+import { useEffect, useId, useRef, useState } from "react";
+import {
+  ChevronRightIcon,
+  ChevronUpIcon,
+  DownloadIcon,
+  ListVideoIcon,
+  PlayIcon,
+  VideoIcon,
+} from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import {
   downloadWorkspaceFile,
@@ -35,6 +42,10 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState<number | null>(null);
   const [wide, setWide] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(true);
+  const actionsId = useId();
+  const showActionsRef = useRef<HTMLButtonElement>(null);
+  const hideActionsRef = useRef<HTMLButtonElement>(null);
   const cardRef = useRef<HTMLSpanElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const pendingSeek = useRef<number | null>(null);
@@ -104,7 +115,10 @@ function VideoPlayerContent(props: VideoPlayerProps) {
       )}
     >
       <span
-        className={cn("grid min-w-0", chapters.length && wide && "grid-cols-[minmax(0,1fr)_18rem]")}
+        className={cn(
+          "grid min-w-0",
+          chapters.length && actionsOpen && wide && "grid-cols-[minmax(0,1fr)_18rem]",
+        )}
       >
         <span className="flex min-w-0 flex-col">
           {src && !failed ? (
@@ -191,6 +205,24 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                 {title}
               </span>
             )}
+            {chapters.length > 0 && !actionsOpen && (
+              <button
+                ref={showActionsRef}
+                type="button"
+                aria-label="Show recording actions"
+                aria-expanded={false}
+                aria-controls={actionsId}
+                title="Show recording actions"
+                className="flex shrink-0 items-center gap-1 rounded px-2 py-1 hover:bg-accent"
+                onClick={() => {
+                  setActionsOpen(true);
+                  requestAnimationFrame(() => hideActionsRef.current?.focus());
+                }}
+              >
+                <ListVideoIcon aria-hidden="true" className="size-4" />
+                Actions
+              </button>
+            )}
             {remoteSrc ? (
               <a
                 href={remoteSrc}
@@ -221,12 +253,37 @@ function VideoPlayerContent(props: VideoPlayerProps) {
         </span>
         {chapters.length > 0 && (
           <span
+            id={actionsId}
+            hidden={!actionsOpen}
             role="group"
             aria-label={`Recording actions: ${title}`}
-            className={cn("flex min-w-0 flex-col border-border", wide ? "border-l" : "border-t")}
+            className={cn(
+              "flex min-w-0 flex-col border-border",
+              wide ? "border-l" : "border-t",
+              !actionsOpen && "hidden",
+            )}
           >
             <span className="flex flex-wrap items-center gap-3 border-b border-border px-3 py-2 font-medium">
-              <span>Recording actions</span>
+              <span className="flex-1">Recording actions</span>
+              <button
+                ref={hideActionsRef}
+                type="button"
+                aria-label="Hide recording actions"
+                aria-expanded={true}
+                aria-controls={actionsId}
+                title="Hide recording actions"
+                className="shrink-0 rounded p-1 hover:bg-accent"
+                onClick={() => {
+                  setActionsOpen(false);
+                  requestAnimationFrame(() => showActionsRef.current?.focus());
+                }}
+              >
+                {wide ? (
+                  <ChevronRightIcon aria-hidden="true" className="size-4" />
+                ) : (
+                  <ChevronUpIcon aria-hidden="true" className="size-4" />
+                )}
+              </button>
             </span>
             <span
               className={cn(

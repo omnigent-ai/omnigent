@@ -172,6 +172,29 @@ def test_recording_action_navigation(
         assert ab["y"] >= vb["y"] + vb["height"]
     elif entry == "chat":
         assert ab["x"] >= vb["x"] + vb["width"]
+    media = player.element_handle()
+    assert media is not None
+    hide = actions.get_by_role("button", name="Hide recording actions", exact=True)
+    expect(hide).to_have_attribute("aria-expanded", "true")
+    hide.focus()
+    hide.press("Enter")
+    expect(actions).not_to_be_visible()
+    show = player.locator("..").get_by_role("button", name="Show recording actions", exact=True)
+    expect(show).to_be_focused()
+    expect(show).to_have_attribute("aria-expanded", "false")
+    if width == 1600 and entry == "chat":
+        assert player.bounding_box()["width"] > vb["width"]
+    assert media.evaluate(
+        "el => el.isConnected && el.paused && Math.abs(el.currentTime - 0.5) < 0.1"
+    )
+    show.press("Enter")
+    expect(actions).to_be_visible()
+    expect(hide).to_be_focused()
+    expect(verify).to_have_attribute("aria-current", "step")
+    assert media.evaluate(
+        "el => el.isConnected && el.paused && Math.abs(el.currentTime - 0.5) < 0.1"
+    )
+    assert len(reads) == 1, "Collapsing actions must not reload the recording"
 
 
 @pytest.mark.parametrize("truncated", [False, True])
