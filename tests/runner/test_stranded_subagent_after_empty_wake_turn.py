@@ -7,7 +7,7 @@ Codex-native behavior). ``_run_turn_bg`` discards ``_subagent_wake_pending``
 at turn start, so without inbox-state recovery nothing re-wakes the parent and
 the failure stays silently undrained until a human sends another message.
 
-Both tests drive the full sequence through the runner's in-process HTTP layer
+These tests drive the full sequence through the runner's in-process HTTP layer
 and assert the recovery contract on the recorded wake POSTs:
 
 * an EMPTY wake turn with an undrained inbox triggers exactly one bounded
@@ -15,6 +15,11 @@ and assert the recovery contract on the recorded wake POSTs:
 * a wake turn that produced output is NOT re-woken — the parent answered the
   notice and chose not to drain, so re-waking would burn a model turn on
   every sub-agent completion
+* a wake turn that ends with no completion signal (native prompt injection or a
+  dropped stream) is NOT re-woken — recovery requires an observed empty
+  ``response.completed``
+* interrupting an output-free wake turn posts no recovery wake — the explicit
+  stop is not overridden
 """
 
 from __future__ import annotations
@@ -452,11 +457,22 @@ async def test_interrupting_empty_wake_turn_posts_no_recovery_wake() -> None:
             )
             assert interrupt_resp.status_code in (202, 204), interrupt_resp.text
 
-            # Let the cancellation settle and any erroneously-armed recovery wake
-            # post. The interrupt forwards a "[System: interrupted]" conversation
-            # item (type "external_conversation_item"); a spurious recovery would
-            # be a SECOND wake notice (type "message") like the first.
-            await asyncio.sleep(2.0)
+            # The interrupt forwards a "[System: interrupted]" cancellation item
+            # (type "external_conversation_item"); wait for it to confirm the stop
+            # was processed, then grace the concurrent rewake path before asserting.
+            def _interrupt_forwarded() -> bool:
+                return any(
+                    p.get("type") == "external_conversation_item" for p in server_client.wake_posts
+                )
+
+            for _ in range(50):
+                if _interrupt_forwarded():
+                    break
+                await asyncio.sleep(0.1)
+            assert _interrupt_forwarded(), (
+                "Expected the interrupt to forward a cancellation item to the parent."
+            )
+            await asyncio.sleep(0.5)
 
             wake_notices = [p for p in server_client.wake_posts if p.get("type") == "message"]
             assert len(wake_notices) == 1, (
@@ -464,9 +480,6 @@ async def test_interrupting_empty_wake_turn_posts_no_recovery_wake() -> None:
                 f"explicitly interrupted before any completion; wake notices: "
                 f"{len(wake_notices)}"
             )
-            assert any(
-                p.get("type") == "external_conversation_item" for p in server_client.wake_posts
-            ), "Expected the interrupt to forward a cancellation item to the parent."
     finally:
         gate.set()
         subagent_work.unregister_subagent_work(child_id)

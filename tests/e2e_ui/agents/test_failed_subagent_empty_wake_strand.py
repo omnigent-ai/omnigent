@@ -236,7 +236,12 @@ def _parent_request_count(session: StrandSession) -> int:
         f"{session.mock_url}/mock/requests", params={"key": session.parent_model}, timeout=10.0
     )
     resp.raise_for_status()
-    return len(resp.json()["requests"])
+    # Count only turn-consuming requests; no-tools title requests are also captured.
+    return sum(
+        1
+        for req in resp.json()["requests"]
+        if any("sys_session_send" in json.dumps(tool) for tool in (req.get("tools") or []))
+    )
 
 
 def _wait_for(check: Callable[[], bool], *, timeout_s: float, what: str) -> None:
@@ -245,6 +250,8 @@ def _wait_for(check: Callable[[], bool], *, timeout_s: float, what: str) -> None
         if check():
             return
         time.sleep(_POLL_S)
+    if check():
+        return
     raise AssertionError(f"Timed out after {timeout_s:.0f}s waiting for {what}.")
 
 
@@ -297,9 +304,11 @@ def test_failed_subagent_is_surfaced_after_empty_wake_turn(
 
     deadline = time.monotonic() + _RECOVERY_WINDOW_S
     recovery_seen = False
-    while time.monotonic() < deadline:
+    while True:
         if _wake_notice_count(session) >= 2 or _FAILURE_REPORT in _items_blob(session):
             recovery_seen = True
+            break
+        if time.monotonic() >= deadline:
             break
         time.sleep(_POLL_S)
 

@@ -4422,11 +4422,9 @@ def create_runner_app(
             # Keep the wake-pending flag consistent with a drained inbox.
             _subagent_wake_pending.discard(parent_session_id)
             return
-        # Recover the undrained inbox only when delivery is known broken: the
-        # wake never started a turn (pending), its POST exhausted retries
-        # (stranded), or the delivered turn reported an empty response.completed.
-        # A turn that surfaced output answered the notice; one that ended with no
-        # completion signal (native injection, interrupt) never confirmed empty.
+        # Recover only when delivery is known broken: the wake never started a
+        # turn (pending), its POST exhausted retries (stranded), or the turn
+        # observed an empty completion. Output or a native/interrupt end did not.
         if (
             wake_turn_outcome != "empty"
             and parent_session_id not in _subagent_wake_pending
