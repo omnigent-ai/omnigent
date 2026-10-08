@@ -484,7 +484,10 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
     : null;
 
   return (
-    <div className="my-4 flex flex-col gap-1" data-streamdown="table-wrapper">
+    <div
+      className="my-4 flex flex-col gap-2 rounded-lg border border-border bg-sidebar p-2"
+      data-streamdown="table-wrapper"
+    >
       {showControls && (
         <div className="flex items-center justify-end gap-1">
           {showCopy && <TableCopyDropdown />}
@@ -502,7 +505,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
           )}
         </div>
       )}
-      <div className="overflow-x-auto rounded-lg border border-border [&_td]:align-top [&_th]:align-top [&_thead]:bg-muted/40">
+      <div className="border-collapse overflow-x-auto overflow-y-auto rounded-md border border-border bg-background">
         <table
           className={cn("w-full divide-y divide-border", className)}
           data-streamdown="table"
@@ -527,9 +530,14 @@ const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
   </svg>
 );
 
-// Copy and wrap share the compact code-header toolbar with download.
+// Shared visual style for the buttons in a chat code block header (copy, wrap
+// toggle). Keeps the frosted resting look that matches Streamdown's own button
+// pill, but pins the hover background to that same frosted fill so the ghost
+// variant's grey hover box never appears — on hover only the icon brightens,
+// exactly like Streamdown's built-in buttons (e.g. download). Positioning lives
+// on the container in ChatCodeBlockPre, so the buttons stay layout-agnostic.
 const CODE_BLOCK_OVERLAY_BUTTON_CLASS =
-  "size-6 text-muted-foreground hover:bg-muted/50 hover:text-foreground";
+  "size-6 bg-sidebar/80 text-muted-foreground hover:bg-sidebar/80 hover:text-foreground dark:hover:bg-sidebar/80 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur";
 
 function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
   const [isCopied, setIsCopied] = useState(false);
@@ -732,10 +740,11 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   }
 
   return (
-    <div className={cn("chat-code-block relative my-4", wrap && "chat-code-wrap")}>
+    <div className={cn("chat-code-block relative", wrap && "chat-code-wrap")}>
       {block}
-      {/* Reserve the rightmost toolbar slot for Streamdown's download button. */}
-      <div className="absolute top-0 right-10 z-10 flex items-center gap-0.5">
+      {/* Match Streamdown's action-pill height and reserve its rightmost slot
+          for download. All controls stay anchored to the header. */}
+      <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>

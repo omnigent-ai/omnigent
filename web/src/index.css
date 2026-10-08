@@ -1367,45 +1367,9 @@ html[data-electron-mac]
   font-size: 1em;
 }
 
-/* Code and tables share one content border with controls above it. */
-.chat-code-block > [data-streamdown="code-block"] {
-  margin: 0;
-  gap: 0.125rem;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  padding: 0;
-}
-
-.chat-code-block [data-streamdown="code-block-header"] {
-  height: 1.5rem;
-  padding-inline: 0.5rem 6rem;
-}
-
-.chat-code-block [data-streamdown="code-block-header"] > span {
-  margin-left: 0;
-}
-
-.chat-code-block > [data-streamdown="code-block"] > [data-streamdown="code-block-body"] {
-  border-radius: 0.5rem;
-}
-
-/* Keep actions in the header while the transcript scrolls. */
-.chat-code-block > [data-streamdown="code-block"] > .sticky {
-  position: absolute;
-  top: 0;
-  right: 0.5rem;
-  margin: 0;
-  height: 1.5rem;
-}
-
-.chat-code-block [data-streamdown="code-block-actions"] {
-  border: 0;
-  background: transparent;
-  padding: 0;
-  backdrop-filter: none;
-}
-
+/* Keep Streamdown's actions aligned with our header overlays; sticky controls
+ * otherwise drift into the block body when the transcript scrolls. */
+.chat-code-block > [data-streamdown="code-block"] > .sticky,
 .chat-mermaid > [data-streamdown="mermaid-block"] > .sticky {
   position: static;
 }
@@ -1553,11 +1517,6 @@ html[data-electron-mac]
 
 .chat-markdown li > :is(ul, ol) {
   margin-block: 0.35em;
-}
-
-.message-markdown [data-streamdown="table-cell"],
-.message-markdown [data-streamdown="table-header-cell"] {
-  padding: 0.65em 1em;
 }
 
 /* GitHub task lists in chat messages (Streamdown + remark-gfm). remark-gfm tags
