@@ -1274,6 +1274,126 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+def test_extract_user_text_role_keyed_user_message() -> None:
+    """
+    A role-keyed user message item yields its block text.
+
+    Mid-turn steering injections arrive in the conversation-history
+    shape (``type: message`` with ``content`` blocks) when the
+    client mirrors the request input. ``_extract_user_text`` must
+    read the ``content`` blocks — not just a top-level ``text`` —
+    or the runner logs "no text payload" and silently drops the
+    person's message.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _extract_user_text,
+    )
+
+    input_value = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "also check the logs"}],
+        },
+    ]
+
+    assert _extract_user_text(input_value) == "also check the logs"
+
+
+def test_extract_user_text_role_keyed_string_content() -> None:
+    """
+    A role-keyed user message with plain-string content yields that string.
+
+    Some callers send ``content`` as a bare string instead of a
+    block list; the steering path must treat it the same.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _extract_user_text,
+    )
+
+    input_value = [
+        {"type": "message", "role": "user", "content": "steer me"},
+    ]
+
+    assert _extract_user_text(input_value) == "steer me"
+
+
+def test_extract_user_text_skips_non_user_roles() -> None:
+    """
+    Assistant/system message items contribute nothing to steering text.
+
+    A mirrored-history injection can include the assistant's last
+    turn; only the person's own message should be forwarded into
+    the running turn.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _extract_user_text,
+    )
+
+    input_value = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "working on it"}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "stop that"}],
+        },
+    ]
+
+    assert _extract_user_text(input_value) == "stop that"
+
+
+def test_extract_user_text_mixed_blocks_keep_text_only() -> None:
+    """
+    Non-text blocks (images, files) in a user message are skipped.
+
+    Steering delivery is text-only (``enqueue_session_message``),
+    so multimodal content forwards just its text blocks.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _extract_user_text,
+    )
+
+    input_value = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is in this image?"},
+                {"type": "input_image", "image_url": "https://example.com/x.png"},
+            ],
+        },
+    ]
+
+    assert _extract_user_text(input_value) == "what is in this image?"
+
+
+def test_extract_user_text_existing_shapes_unchanged() -> None:
+    """
+    Plain strings and bare content blocks keep their current behaviour.
+
+    Backwards-compat pin: the pre-history wire shapes must extract
+    exactly as before the role-keyed branch was added.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _extract_user_text,
+    )
+
+    assert _extract_user_text("hello") == "hello"
+    assert (
+        _extract_user_text(
+            [
+                {"type": "input_text", "text": "Hello"},
+                {"type": "input_text", "text": "world"},
+            ]
+        )
+        == "Hello\nworld"
+    )
+
+
 # ── MCP tool-call observed/dispatch correlation ──────────
 #
 # These unit tests pin the queue mechanic that fixes the tool-call
@@ -2165,6 +2285,50 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     assert isinstance(marker, InjectionConsumedEvent)
     assert marker.type == "injection.consumed"
     assert marker.injection_id == "inj_x"
+
+
+@pytest.mark.asyncio
+async def test_watch_injections_forwards_role_keyed_message_item() -> None:
+    """A message-item injection reaches the executor with its text.
+
+    Clients that mirror the request input send the steering message
+    as a role-keyed message item (``content`` blocks, no top-level
+    ``text``). The watcher must forward the block text into
+    ``enqueue_session_message`` rather than log "no text payload"
+    and drop the person's message.
+    """
+    import asyncio as _aio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = _AcceptingInjectionExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(
+            model="m",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "steer me"}],
+                },
+            ],
+        )
+    )
+
+    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if executor.received:
+                break
+            await _aio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(_aio.CancelledError):
+            await task
+
+    assert executor.received == [("sk", "steer me")]
 
 
 @pytest.mark.asyncio

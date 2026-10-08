@@ -1444,6 +1444,19 @@ def _extract_user_text(
         text_value = block.get("text")
         if isinstance(text_value, str):
             parts.append(text_value)
+            continue
+        # Role-keyed message items carry text under content; only user turns steer.
+        if block.get("type") != "message" or block.get("role") != "user":
+            continue
+        content = block.get("content")
+        if isinstance(content, str) and content:
+            parts.append(content)
+        elif isinstance(content, list):
+            parts.extend(
+                item["text"]
+                for item in content
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            )
     return "\n".join(parts)
 
 
