@@ -175,15 +175,6 @@ def test_other_graphql_operations_do_not_attach_prs(query: str) -> None:
     assert extract_prs("shell", {"command": command(query)}, URL) == ([], False)
 
 
-@pytest.mark.parametrize("exit_code", [1, None])
-def test_unsuccessful_graphql_create_does_not_attach_pr(exit_code: int | None) -> None:
-    result = {"exit_code": exit_code, "stdout": creation_output(None)}
-    if exit_code is None:
-        result["session_id"] = "still-running"
-    references, _ = extract_prs("exec_command", {"cmd": command()}, result)
-    assert not references
-
-
 @pytest.mark.parametrize("compound", [False, True], ids=["single", "shared-output"])
 @pytest.mark.parametrize("formatter", ["--jq", "--template", "-t"])
 def test_graphql_body_projection_is_not_pr_identity(formatter: str, compound: bool) -> None:
@@ -390,11 +381,36 @@ def test_graphql_projection_does_not_read_metadata_without_output(field: str) ->
 
 
 @pytest.mark.parametrize("created", [False, True])
-def test_ambiguous_projected_objects_are_not_attributed(created: bool) -> None:
-    projection = ".data.createPullRequest.pullRequest"
-    output = creation_output(projection, URL if created else None)
-    output += "\n" + json.dumps({"url": "https://github.com/example/another/pull/7"})
-    references, _ = extract_prs("shell", {"command": command(projection=projection)}, output)
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "projection",
+    [".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_ambiguous_projected_results_are_not_attributed(
+    created: bool, reverse: bool, projection: str
+) -> None:
+    unrelated = creation_output(projection, "https://github.com/example/another/pull/7")
+    commands = [command(projection=projection), shlex.join(["printf", "%s\n", unrelated])]
+    outputs = [creation_output(projection, URL if created else None), unrelated]
+    references, _ = extract_prs(
+        "shell",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        "\n".join(reversed(outputs) if reverse else outputs),
+    )
+    assert not references
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
+)
+def test_unknown_bracketed_log_is_ambiguous_with_incomplete_json(projection: str | None) -> None:
+    """Only known complete Git summaries are distinguishable from broken JSON arrays."""
+    references, _ = extract_prs(
+        "shell",
+        {"command": command(projection=projection)},
+        "[INFO] building\n" + creation_output(projection),
+    )
     assert not references
 
 

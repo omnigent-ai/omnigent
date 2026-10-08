@@ -1024,10 +1024,31 @@ def test_gh_subcommand_and_host(command: str, urls: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    "result", [{"backgroundTaskId": "job-1"}, {"status": "running"}, {"interrupted": True}]
+    "result",
+    [
+        {"backgroundTaskId": "job-1"},
+        {"status": "running"},
+        {"interrupted": True},
+        {"exit_code": 1},
+        {"exit_code": None, "session_id": "still-running"},
+    ],
 )
-def test_background_or_interrupted_shell_does_not_attach_target(result: dict) -> None:
-    refs, _ = extract_prs("Bash", {"command": f"gh pr edit {A} --title new"}, result)
+@pytest.mark.parametrize(
+    "command,output",
+    [
+        (f"gh pr edit {A} --title new", A),
+        (
+            "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+            "{ pullRequest { url } } }'",
+            json.dumps({"data": {"createPullRequest": {"pullRequest": {"url": A}}}}),
+        ),
+    ],
+    ids=["cli", "graphql"],
+)
+def test_unsuccessful_shell_does_not_attach_target(
+    result: dict, command: str, output: str
+) -> None:
+    refs, _ = extract_prs("exec_command", {"cmd": command}, {**result, "stdout": output})
     assert refs == []
 
 

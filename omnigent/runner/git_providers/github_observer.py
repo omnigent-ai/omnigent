@@ -443,7 +443,7 @@ def _graphql_output_values(result: object, depth: int = 0) -> list[object]:
 
 
 def _graphql_prs(
-    result: object, *, field: str, projection: str, object_count: int
+    result: object, *, field: str, projection: str, object_count: int, url_count: int
 ) -> list[PullRequestRef]:
     """Read only the response shape requested by the validated creation command."""
     values = _graphql_output_values(result)
@@ -451,11 +451,12 @@ def _graphql_prs(
     if projection == f"{path}.url":
         if any(value is None for value in values):
             return []
-        return [
+        references = [
             ref
             for value in values
             if isinstance(value, str) and len(value.split()) == 1 and (ref := pr_reference(value))
         ]
+        return references if len(references) <= url_count else []
     references: list[PullRequestRef] = []
     for value in values:
         if not isinstance(value, dict):
@@ -520,6 +521,12 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         field is not None and projection == f".data.{field}.pullRequest"
         for _, field, projection in commands
     )
+    url_count = sum(
+        projection == f".data.{field}.pullRequest.url"
+        if field is not None
+        else tokens[:2] == ["pr", "create"] or (_creates_pr(tokens) and projection == ".html_url")
+        for tokens, field, projection in commands
+    )
     ops: list[ShellPrOp] = []
     for tokens, field, projection in commands:
         ops.append(
@@ -534,6 +541,7 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
                         field=field,
                         projection=projection,
                         object_count=object_count,
+                        url_count=url_count,
                     )
                     if field
                     else None
