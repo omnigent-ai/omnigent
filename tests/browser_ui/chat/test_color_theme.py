@@ -1,4 +1,4 @@
-"""E2E: the Settings → Appearance color-palette picker skins the app and persists.
+"""Browser contract: the Appearance color-palette picker skins the app and persists.
 
 Alongside the light/dark **mode** tiles, ``AppearanceSection``
 (``pages/SettingsPage.tsx``) renders a "Color theme" dropdown (a shadcn
@@ -13,7 +13,8 @@ The palette axis is orthogonal to the light/dark class next-themes toggles, so
 palette is re-applied before first paint (``main.tsx``), so the skin survives a
 refresh with no flash.
 
-No LLM turn is involved.
+The strict browser contract supplies session and transcript data. All checks
+exercise the real SPA without starting an Omnigent server or runner.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import json
 
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.conftest import seed_committed_turn
+from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
 
 def _data_theme(page: Page) -> str | None:
@@ -237,7 +238,9 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(_color_theme_select(page)).to_be_visible(timeout=30_000)
 
 
-def test_color_palette_applies_persists_and_resets(page: Page, live_server: str) -> None:
+def test_color_palette_applies_persists_and_resets(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
     """Selecting a palette skins ``<html>`` + persists; the default clears it.
 
     Fresh load is the default "Omnigent" (its name shown, nothing stored, no
@@ -245,7 +248,7 @@ def test_color_palette_applies_persists_and_resets(page: Page, live_server: str)
     and survives a reload (re-applied at boot). Returning to Omnigent removes the
     attribute and clears the stored key.
     """
-    base_url = live_server
+    base_url = chat_session_contract.base_url
     _open_appearance(page, base_url)
 
     # Fresh context → default "Omnigent": the trigger shows it, no override, and
@@ -275,7 +278,9 @@ def test_color_palette_applies_persists_and_resets(page: Page, live_server: str)
     assert _stored_palette(page) is None, "the palette key was not cleared for the default"
 
 
-def test_color_palette_composes_with_dark_mode(page: Page, live_server: str) -> None:
+def test_color_palette_composes_with_dark_mode(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
     """The palette (``data-theme``) and light/dark mode (``dark`` class) coexist.
 
     They are independent axes, so a palette + Dark mode leaves <html> carrying
@@ -284,7 +289,7 @@ def test_color_palette_composes_with_dark_mode(page: Page, live_server: str) -> 
     # Pin a light OS so Dark is an explicit, observable change.
     page.emulate_media(color_scheme="light")
 
-    base_url = live_server
+    base_url = chat_session_contract.base_url
     _open_appearance(page, base_url)
 
     # Pick a palette (dropdown), then Dark mode (radiogroup) — independent axes.
@@ -299,10 +304,12 @@ def test_color_palette_composes_with_dark_mode(page: Page, live_server: str) -> 
     assert _html_has_dark(page), "dark class missing — the palette should compose with dark mode"
 
 
-def test_solarized_dark_uses_canonical_canvas(page: Page, live_server: str) -> None:
+def test_solarized_dark_uses_canonical_canvas(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
     """Solarized is selectable and applies its canonical dark surface colors."""
     page.emulate_media(color_scheme="light")
-    base_url = live_server
+    base_url = chat_session_contract.base_url
     _open_appearance(page, base_url)
 
     _pick_palette(page, "Solarized")
@@ -330,11 +337,11 @@ def test_solarized_dark_uses_canonical_canvas(page: Page, live_server: str) -> N
 
 
 def test_guided_custom_theme_applies_to_both_modes_and_persists(
-    page: Page, seeded_session: tuple[str, str]
+    page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
     """Editing a preset creates one custom configuration with light/dark variants."""
     page.emulate_media(color_scheme="light")
-    base_url, session_id = seeded_session
+    base_url, session_id = chat_session_contract.base_url, chat_session_contract.session_id
     _open_appearance(page, base_url)
 
     _pick_palette(page, "GitHub")
@@ -381,6 +388,7 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     assert _data_theme(page) == "custom"
 
     page.goto(f"{base_url}/c/{session_id}")
+    page.get_by_role("button", name="Expand right panel").click()
     workspace = page.get_by_role("complementary", name="Workspace")
     expect(workspace).to_be_visible(timeout=30_000)
     for rail in [page.locator(".conversations-sidebar"), workspace]:
@@ -397,9 +405,11 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     )
 
 
-def test_contrast_round_trip_restores_preset_tokens(page: Page, live_server: str) -> None:
+def test_contrast_round_trip_restores_preset_tokens(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
     page.emulate_media(color_scheme="light")
-    base_url = live_server
+    base_url = chat_session_contract.base_url
     _open_appearance(page, base_url)
 
     for mode in ["Light", "Dark"]:
@@ -414,9 +424,11 @@ def test_contrast_round_trip_restores_preset_tokens(page: Page, live_server: str
             assert _computed_theme_tokens(page) == before, f"{mode} {palette} did not round-trip"
 
 
-def test_text_selection_stands_out_in_every_palette(page: Page, live_server: str) -> None:
+def test_text_selection_stands_out_in_every_palette(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
     page.emulate_media(color_scheme="light")
-    base_url = live_server
+    base_url = chat_session_contract.base_url
     _open_appearance(page, base_url)
 
     for mode in ["Light", "Dark"]:
@@ -433,9 +445,11 @@ def test_text_selection_stands_out_in_every_palette(page: Page, live_server: str
                     assert result["highlightDeltaE"] >= 8, context
 
 
-def test_custom_theme_colors_can_be_randomized(page: Page, live_server: str) -> None:
+def test_custom_theme_colors_can_be_randomized(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
     """Randomizing accent and tint updates the picker and persisted theme."""
-    base_url = live_server
+    base_url = chat_session_contract.base_url
     _open_appearance(page, base_url)
     # The color popover animates in and Floating UI repositions it on mount,
     # which can leave its controls briefly unstable / remounting on a loaded
@@ -467,7 +481,7 @@ def test_custom_theme_colors_can_be_randomized(page: Page, live_server: str) -> 
 
 
 def test_omnigent_selection_keeps_the_brand_tint(
-    page: Page, seeded_session: tuple[str, str]
+    page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
     """Selected chat text on the default palette is the translucent brand pink.
 
@@ -475,8 +489,15 @@ def test_omnigent_selection_keeps_the_brand_tint(
     primary-colour block: ``rgba(240, 1, 150, 0.1)`` with plum text in light
     mode and ``rgba(240, 1, 150, 0.15)`` with pink text in dark mode.
     """
-    base_url, session_id = seeded_session
-    seed_committed_turn(session_id, prompt="Hello", reply="Select this reply.")
+    base_url, session_id = chat_session_contract.base_url, chat_session_contract.session_id
+    chat_session_contract.set_items(
+        [
+            message_item(
+                "theme-reply", "assistant", "Select this reply.", response_id="theme-turn"
+            ),
+            message_item("theme-prompt", "user", "Hello", response_id="theme-turn"),
+        ]
+    )
     expected = {
         "Light": ["rgba(240, 1, 150, 0.1)", "rgb(101, 18, 73)"],
         "Dark": ["rgba(240, 1, 150, 0.15)", "rgb(249, 168, 212)"],
