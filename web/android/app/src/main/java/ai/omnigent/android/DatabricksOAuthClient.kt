@@ -1,7 +1,6 @@
 package ai.omnigent.android
 
 import org.json.JSONObject
-import java.net.HttpURLConnection
 import java.net.URI
 
 /** Opaque OAuth grant plus the verified authority required to refresh it. */
@@ -16,59 +15,6 @@ data class DatabricksOAuthTokens(
             accessToken.isSafeTokenValue() &&
                 refreshToken.isSafeTokenValue() &&
                 expiresAtEpochMillis > 0
-}
-
-internal data class OAuthHttpRequest(
-    val uri: URI,
-    val method: String = "GET",
-    val headers: Map<String, String> = emptyMap(),
-    val body: ByteArray? = null,
-)
-
-internal data class OAuthHttpResponse(
-    val uri: URI,
-    val status: Int,
-    val body: ByteArray,
-)
-
-internal fun interface OAuthTransport {
-    fun execute(request: OAuthHttpRequest): OAuthHttpResponse
-}
-
-/** Redirect-disabled, cookie-independent native OAuth transport. */
-internal class UrlConnectionOAuthTransport : OAuthTransport {
-    override fun execute(request: OAuthHttpRequest): OAuthHttpResponse {
-        val connection = request.uri.toURL().openConnection() as HttpURLConnection
-        connection.instanceFollowRedirects = false
-        connection.useCaches = false
-        connection.connectTimeout = TIMEOUT_MS
-        connection.readTimeout = TIMEOUT_MS
-        return try {
-            // Opening the body stream connects, so a POST fails here when the host is unreachable.
-            connection.requestMethod = request.method
-            request.headers.forEach(connection::setRequestProperty)
-            request.body?.let { body ->
-                connection.doOutput = true
-                connection.setFixedLengthStreamingMode(body.size)
-                connection.outputStream.use { it.write(body) }
-            }
-            val status = connection.responseCode
-            val stream = if (status >= 400) connection.errorStream else connection.inputStream
-            OAuthHttpResponse(
-                uri = connection.url.toURI(),
-                status = status,
-                body = stream?.use { it.readBytes() } ?: byteArrayOf(),
-            )
-        } catch (_: Throwable) {
-            throw DatabricksOAuthException.NetworkUnavailable()
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    private companion object {
-        const val TIMEOUT_MS = 30_000
-    }
 }
 
 internal fun interface DatabricksTokenRefreshing {
@@ -154,7 +100,12 @@ class DatabricksOAuthClient internal constructor(
     }
 
     private fun send(request: OAuthHttpRequest): OAuthHttpResponse {
-        val response = transport.execute(request)
+        val response =
+            try {
+                transport.execute(request)
+            } catch (_: OAuthNetworkException) {
+                throw DatabricksOAuthException.NetworkUnavailable()
+            }
         if (response.uri != request.uri) throw DatabricksOAuthException.TokenExchangeFailed()
         return response
     }
@@ -166,10 +117,7 @@ class DatabricksOAuthClient internal constructor(
             issuer: DatabricksOAuthIssuer?,
         ): OAuthHttpRequest {
             val endpoint = issuer?.tokenEndpoint ?: URI("${scope.workspaceOrigin}/oidc/v1/token")
-            val body =
-                (listOf("client_id" to scope.clientId) + fields)
-                    .joinToString("&") { (key, value) -> "$key=${formEncode(value)}" }
-                    .toByteArray()
+            val body = OAuthSupport.formBody(listOf("client_id" to scope.clientId) + fields)
             return OAuthHttpRequest(
                 uri = endpoint,
                 method = "POST",

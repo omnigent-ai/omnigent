@@ -158,6 +158,15 @@ class DatabricksOAuthClientTest {
     }
 
     @Test
+    fun `a request with no HTTP response reports Databricks as unreachable`() {
+        val transport = OAuthTransport { throw OAuthNetworkException() }
+
+        assertThrows(DatabricksOAuthException.NetworkUnavailable::class.java) {
+            DatabricksOAuthClient(transport).refresh("refresh", attempt.credentialScope, issuer)
+        }
+    }
+
+    @Test
     fun `token parser rejects malformed or incomplete responses`() {
         listOf(
             "{}",

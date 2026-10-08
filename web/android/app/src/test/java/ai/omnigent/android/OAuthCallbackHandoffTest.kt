@@ -8,13 +8,13 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
-class DatabricksCallbackHandoffTest {
+class OAuthCallbackHandoffTest {
     private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
 
     @Test
     fun `marker distinguishes a recent callback handoff and expires`() {
         var now = 1_000L
-        val handoff = DatabricksCallbackHandoff(context) { now }
+        val handoff = OAuthCallbackHandoff(context) { now }
         handoff.clear()
 
         assertFalse(handoff.isInProgress())
@@ -27,7 +27,7 @@ class DatabricksCallbackHandoffTest {
 
     @Test
     fun `clear removes callback handoff`() {
-        val handoff = DatabricksCallbackHandoff(context) { 5_000L }
+        val handoff = OAuthCallbackHandoff(context) { 5_000L }
         handoff.markInProgress()
 
         handoff.clear()

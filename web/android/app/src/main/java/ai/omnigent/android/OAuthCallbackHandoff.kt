@@ -3,7 +3,7 @@ package ai.omnigent.android
 import android.content.Context
 
 /** Non-secret lifecycle marker that distinguishes Custom Tabs handoff from user cancellation. */
-internal class DatabricksCallbackHandoff(
+internal class OAuthCallbackHandoff(
     context: Context,
     private val now: () -> Long = System::currentTimeMillis,
 ) {

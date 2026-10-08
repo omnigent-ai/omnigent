@@ -33,7 +33,7 @@ class DatabricksOAuthAttemptTest {
     fun `PKCE challenge matches RFC 7636 vector`() {
         assertEquals(
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-            DatabricksOAuthAttempt.challenge(
+            OAuthSupport.challenge(
                 "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
             ),
         )

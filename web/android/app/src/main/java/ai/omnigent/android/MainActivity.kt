@@ -62,8 +62,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var blobSaver: BlobSaver
     private val oidcLoginManager = OidcLoginManager()
     private var databricksLoginManager: DatabricksLoginManager? = null
-    private val databricksCallbackHandoff by lazy {
-        DatabricksCallbackHandoff(applicationContext)
+    private val callbackHandoff by lazy {
+        OAuthCallbackHandoff(applicationContext)
     }
     private var ignoreNextAuthTabCancellation = false
     private val databricksAuthExecutor = Executors.newSingleThreadExecutor()
@@ -316,7 +316,7 @@ class MainActivity : AppCompatActivity() {
             }
         when (result.resultCode) {
             AuthTabIntent.RESULT_CANCELED -> {
-                if (ignoreNextAuthTabCancellation || databricksCallbackHandoff.isInProgress()) {
+                if (ignoreNextAuthTabCancellation || callbackHandoff.isInProgress()) {
                     ignoreNextAuthTabCancellation = false
                     return
                 }
@@ -1112,7 +1112,7 @@ class MainActivity : AppCompatActivity() {
         setIntent(intent)
 
         if (intent.getBooleanExtra(OAuthCallbackActivity.EXTRA_OAUTH_CALLBACK, false)) {
-            databricksCallbackHandoff.clear()
+            callbackHandoff.clear()
             ignoreNextAuthTabCancellation = true
             val error = intent.getStringExtra(OAuthCallbackActivity.EXTRA_OAUTH_ERROR)
             if (error != null) {
