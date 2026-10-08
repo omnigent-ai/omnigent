@@ -218,7 +218,7 @@ def apply_dracula_custom_theme(page: Page, style_root: Locator) -> None:
     """Pick the Dracula preset, then tune it so the selection becomes Custom.
 
     Every non-omni preset leaves ``sidebarBackground`` at the palette default
-    ``var(--sidebar)``, which is the value the report's failing state resolves.
+    ``var(--sidebar)``, which exercises declaration-scope token resolution.
     """
     palette_select = page.get_by_test_id("color-theme-select")
     expect(palette_select).to_be_visible(timeout=30_000)
