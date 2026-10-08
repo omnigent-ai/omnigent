@@ -393,7 +393,7 @@ def test_graphql_json_output_does_not_fall_back_to_unrelated_url(
     assert not references
 
 
-@pytest.mark.parametrize("prefix", ['{"message":\n', "[\n", '"unfinished\n'])
+@pytest.mark.parametrize("prefix", ['{"message":\n', "[\n", '"unfinished\n', "[INFO] building\n"])
 @pytest.mark.parametrize(
     "projection",
     [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
@@ -516,20 +516,6 @@ def test_ambiguous_projected_results_are_not_attributed(
         "shell",
         {"command": command(projection=projection)},
         "\n".join(reversed(outputs) if reverse else outputs),
-    )
-    assert not references
-
-
-@pytest.mark.parametrize(
-    "projection",
-    [None, ".data.createPullRequest.pullRequest", ".data.createPullRequest.pullRequest.url"],
-)
-def test_unknown_bracketed_log_is_ambiguous_with_incomplete_json(projection: str | None) -> None:
-    """Only known complete Git summaries are distinguishable from broken JSON arrays."""
-    references, _ = extract_prs(
-        "shell",
-        {"command": command(projection=projection)},
-        "[INFO] building\n" + creation_output(projection),
     )
     assert not references
 

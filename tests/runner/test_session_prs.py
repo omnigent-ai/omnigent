@@ -397,6 +397,39 @@ def test_pr_changes_still_use_command_targets(command: str) -> None:
     assert not created
 
 
+@pytest.mark.parametrize("redirection", ["2>errors.log", "2>>errors.log", "2>&1", "3<input.txt"])
+@pytest.mark.parametrize("target", ["", "2", "42"])
+def test_shell_redirection_descriptors_are_not_pr_targets(redirection: str, target: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"gh pr merge {target} -R example/one --squash {redirection}"},
+        {"exit_code": 0, "stdout": "Done."},
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command,target",
+    [
+        ("gh pr edit -R example/one --title new 2>&1", None),
+        ("gh pr ready -R example/one 2>&1", None),
+        ("gh pr edit -R example/one 2 >out", "2"),
+        ("gh pr edit 42 -R example/one 2>&1", "42"),
+    ],
+)
+def test_shell_redirections_preserve_positional_arguments(
+    command: str, target: str | None
+) -> None:
+    refs, created = extract_prs(
+        "Bash", {"command": command}, {"exit_code": 0, "stdout": "Updated"}
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
+    assert not created
+
+
 @pytest.mark.parametrize("repo", ["comments", "reviews"])
 def test_repository_name_does_not_classify_rest_operation(repo: str) -> None:
     url = f"https://github.com/example/{repo}/pull/42"

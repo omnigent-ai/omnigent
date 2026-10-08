@@ -33,11 +33,17 @@ _QUERY = """mutation CreatePullRequest($repositoryId: ID!, $headRepositoryId: ID
     baseRefName: "main", headRefName: "contributor/topic", title: "A change"
   }) { pullRequest { number url title isDraft } }
 }"""
-_GH = """import json, sys
+_GH = """import json, re, sys
 from pathlib import Path
 
 root = Path(__file__).parent
 args = sys.argv[1:]
+
+def unexpected_api():
+    with (root / "unexpected-api").open("a") as log:
+        print(json.dumps(args), file=log)
+    sys.exit(1)
+
 pr = {
     "number": 42, "url": "https://github.com/example/project/pull/42",
     "title": "Show the session pull request", "state": "OPEN", "isDraft": True,
@@ -47,8 +53,10 @@ pr = {
     "body": "Created from the active session checkout.",
 }
 if args[:2] == ["api", "graphql"]:
-    if not any(arg.startswith("query=") and "createPullRequest(" in arg for arg in args):
-        sys.exit(1)
+    if args[-2:] != ["--jq", ".data.createPullRequest.pullRequest"] or not any(
+        arg.startswith("query=") and "createPullRequest(" in arg for arg in args
+    ):
+        unexpected_api()
     (root / "created").touch()
     print(json.dumps(pr))
 elif args[:2] == ["pr", "view"]:
@@ -62,8 +70,17 @@ elif args[:2] == ["repo", "view"]:
 elif args[:2] == ["auth", "status"]:
     account = {"login": "contributor", "active": True, "state": "success"}
     print(json.dumps({"hosts": {"github.com": [account]}}))
-elif args[0] == "api":
+elif len(args) == 2 and args[0] == "api" and re.fullmatch(
+    r"repos/example/project-dev/commits/[0-9a-f]{40}/pulls", args[1]
+):
     print("[]")
+elif args == [
+    "api", "--hostname", "github.com", "--paginate", "--slurp",
+    "repos/example/project/pulls/42/files?per_page=100",
+]:
+    print("[[]]")
+elif args[0] == "api":
+    unexpected_api()
 else:
     sys.exit(1)
 """
@@ -241,3 +258,5 @@ def test_pr_appears_in_composer_and_workspace(
     assert info["repo"]["name_with_owner"] == "example/project"
     assert info["pr"]["head_ref"] == "contributor/topic"
     assert info["prs"][0]["relationship"] == ("inferred" if existing else "created")
+    unexpected_api = binary / "unexpected-api"
+    assert not unexpected_api.exists(), unexpected_api.read_text()

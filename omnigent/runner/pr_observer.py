@@ -89,12 +89,18 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     if depth > MAX_SHELL_NESTING:
         return []
     found: list[ShellSegment] = []
-    lexer = shlex.shlex(_join_shell_lines(command), posix=True, punctuation_chars=";&|\n<>")
+    joined = _join_shell_lines(command)
+    lexer = shlex.shlex(joined, posix=True, punctuation_chars=";&|\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     segments: list[list[str]] = [[]]
-    output_eligible = True
     try:
+        # Keep redirect file descriptors out of argv so they cannot become PR numbers.
+        redirects = shlex.shlex(joined, posix=True, punctuation_chars="<>")
+        redirects.whitespace_split = True
+        output_eligible = not any(
+            token and all(char in "<>" for char in token) for token in redirects
+        )
         for token in lexer:
             if token == "||":
                 return []
@@ -103,8 +109,6 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
                     output_eligible = False
                 segments.append([])
             else:
-                if token and all(char in "<>&|" for char in token):
-                    output_eligible = False
                 segments[-1].append(token)
     except ValueError:
         return []
