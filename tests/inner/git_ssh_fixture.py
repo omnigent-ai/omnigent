@@ -31,6 +31,30 @@ def _nonloopback_ip() -> str | None:
     return address if not address.startswith("127.") else None
 
 
+def _stop_sshd(server: subprocess.Popen[bytes]) -> None:
+    if server.poll() is None:
+        server.terminate()
+    try:
+        server.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        server.kill()
+        server.wait(timeout=5)
+
+
+def _has_host_key(address: str, port: int, expected_key: list[str]) -> bool:
+    try:
+        scan = subprocess.run(
+            ["ssh-keyscan", "-T", "1", "-p", str(port), "-t", "ed25519", address],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return any(line.split()[1:3] == expected_key for line in scan.stdout.splitlines())
+
+
 @pytest.fixture
 def ssh_git_server(
     tmp_path: Path, request: pytest.FixtureRequest
@@ -43,10 +67,6 @@ def ssh_git_server(
         listen_ip = _nonloopback_ip()
         if listen_ip is None:
             pytest.skip("no non-loopback local address is available")
-    port_socket = socket.socket()
-    port_socket.bind(("127.0.0.1", 0))
-    port = port_socket.getsockname()[1]
-    port_socket.close()
     host_key = tmp_path / "host_key"
     client_key = tmp_path / "client_key"
     for path in (host_key, client_key):
@@ -55,74 +75,76 @@ def ssh_git_server(
     authorized_keys.write_text((tmp_path / "client_key.pub").read_text())
     known_hosts = tmp_path / "known_hosts"
     known_hosts.write_text(f"127.0.0.1 {(tmp_path / 'host_key.pub').read_text()}")
+    expected_key = (tmp_path / "host_key.pub").read_text().split()[:2]
     server_config = tmp_path / "sshd_config"
     listen_addresses = "ListenAddress 127.0.0.1\n"
     if listen_ip:
         listen_addresses += f"ListenAddress {listen_ip}\n"
-    server_config.write_text(
-        f"Port {port}\n"
-        f"{listen_addresses}"
-        f"HostKey {host_key}\n"
-        f"AuthorizedKeysFile {authorized_keys}\n"
-        f"PidFile {tmp_path / 'sshd.pid'}\n"
-        "StrictModes no\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\n"
-        "LogLevel ERROR\n"
-    )
-    _run(sshd, "-t", "-f", str(server_config))
-    server_log = (tmp_path / "sshd.log").open("wb")
-    try:
-        server = subprocess.Popen([sshd, "-D", "-e", "-f", str(server_config)], stderr=server_log)
-    except Exception:
-        server_log.close()
-        raise
-    try:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    break
-            except OSError:
+    addresses = ["127.0.0.1"] + ([listen_ip] if listen_ip else [])
+    with (tmp_path / "sshd.log").open("wb") as server_log:
+        server: subprocess.Popen[bytes] | None = None
+        for _ in range(3):
+            with socket.socket() as port_socket:
+                port_socket.bind(("127.0.0.1", 0))
+                port = port_socket.getsockname()[1]
+            server_config.write_text(
+                f"Port {port}\n"
+                f"{listen_addresses}"
+                f"HostKey {host_key}\n"
+                f"AuthorizedKeysFile {authorized_keys}\n"
+                f"PidFile {tmp_path / 'sshd.pid'}\n"
+                "StrictModes no\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\n"
+                "LogLevel ERROR\n"
+            )
+            _run(sshd, "-t", "-f", str(server_config))
+            server = subprocess.Popen(
+                [sshd, "-D", "-e", "-f", str(server_config)], stderr=server_log
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and server.poll() is None:
+                if all(_has_host_key(address, port, expected_key) for address in addresses):
+                    if server.poll() is None:
+                        break
                 time.sleep(0.05)
-        else:
+            else:
+                _stop_sshd(server)
+                server = None
+                continue
+            break
+        if server is None:
             pytest.fail(f"sshd failed to listen: {(tmp_path / 'sshd.log').read_text()}")
-        repo = tmp_path / "repo.git"
-        work = tmp_path / "work"
-        _run("git", "init", "--bare", str(repo))
-        _run("git", "init", str(work))
-        (work / "README.md").write_text("Git SSH fixture\n")
-        _run("git", "add", "README.md", cwd=work)
-        _run(
-            "git",
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.test",
-            "commit",
-            "-m",
-            "initial",
-            cwd=work,
-        )
-        _run("git", "remote", "add", "origin", str(repo), cwd=work)
-        _run("git", "push", "origin", "HEAD:main", cwd=work)
-        binding = GitSshBinding(
-            host="127.0.0.1",
-            port=port,
-            username=getpass.getuser(),
-            repository=str(repo),
-            operations=frozenset({"fetch"}),
-            identity_file=str(client_key),
-            known_hosts_file=str(known_hosts),
-            allowed_cidrs=("127.0.0.1/32",),
-            allow_loopback=True,
-        )
-        url = f"ssh://{binding.username}@127.0.0.1:{port}{repo}"
-        yield binding, url, work
-    finally:
-        server.terminate()
         try:
-            server.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait(timeout=5)
+            repo = tmp_path / "repo.git"
+            work = tmp_path / "work"
+            _run("git", "init", "--bare", str(repo))
+            _run("git", "init", str(work))
+            (work / "README.md").write_text("Git SSH fixture\n")
+            _run("git", "add", "README.md", cwd=work)
+            _run(
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-m",
+                "initial",
+                cwd=work,
+            )
+            _run("git", "remote", "add", "origin", str(repo), cwd=work)
+            _run("git", "push", "origin", "HEAD:main", cwd=work)
+            binding = GitSshBinding(
+                host="127.0.0.1",
+                port=port,
+                username=getpass.getuser(),
+                repository=str(repo),
+                operations=frozenset({"fetch"}),
+                identity_file=str(client_key),
+                known_hosts_file=str(known_hosts),
+                allowed_cidrs=("127.0.0.1/32",),
+                allow_loopback=True,
+            )
+            url = f"ssh://{binding.username}@127.0.0.1:{port}{repo}"
+            yield binding, url, work
         finally:
-            server_log.close()
+            _stop_sshd(server)
