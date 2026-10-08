@@ -213,14 +213,19 @@ jobs:
             --output-markdown ../comparison.md "${require[@]}"
           RC=$?
           set -e
-          # 3 = a required journey was not measured on both sides.
+          # Exit 1 (regression) can also have unmeasured journeys, so read them from the report.
           complete=true
           unmeasured=""
-          if [ "$RC" -eq 3 ]; then
-            complete=false
+          if [ -n "$REQUIRE_JOURNEYS" ]; then
+            if [ ! -f ../comparison.json ]; then
+              echo "::error::compare.py exited $RC without writing its JSON report."
+              exit 1
+            fi
             unmeasured="$(jq -r '.unmeasured | join(",")' ../comparison.json)"
-            RC=0
+            [ -z "$unmeasured" ] || complete=false
           fi
+          # 3 = no regression, but a required journey was not measured on both sides.
+          [ "$RC" -ne 3 ] || RC=0
           {
             echo "regression=$([ $RC -ne 0 ] && echo 'true' || echo 'false')"
             echo "complete=${complete}"

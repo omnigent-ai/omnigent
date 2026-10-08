@@ -384,6 +384,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not rows:
         console.print("[yellow]No journeys found to compare.[/yellow]")
+        if unmeasured and args.output_markdown:
+            args.output_markdown.write_text(
+                "No journeys found to compare.\n\n"
+                f"**INCOMPLETE** — not measured on both sides: {', '.join(unmeasured)}.\n"
+            )
         return 3 if unmeasured else 0
 
     print_table(rows, args.threshold)

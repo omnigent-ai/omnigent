@@ -215,6 +215,16 @@ def test_cli_a_regression_outranks_an_incomplete_recheck(tmp_path: Path) -> None
     assert main([*_write_reports(tmp_path, baseline, candidate), "--require", "interrupt"]) == 1
 
 
+def test_cli_writes_incomplete_markdown_when_no_rows(tmp_path: Path) -> None:
+    args = _write_reports(tmp_path, {"journeys": {}}, {"journeys": {}})
+    md = tmp_path / "out.md"
+
+    rc = main([*args, "--require", "interrupt", "--output-markdown", str(md)])
+
+    assert rc == 3
+    assert "**INCOMPLETE** — not measured on both sides: interrupt." in md.read_text()
+
+
 def test_cli_output_json_lists_rows(tmp_path: Path) -> None:
     baseline = {"journeys": {"interrupt": _journey([100, 101, 102], [120, 125, 130])}}
     candidate = {"journeys": {"interrupt": _journey([300, 301, 302], [320, 325, 330])}}

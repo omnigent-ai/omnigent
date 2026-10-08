@@ -290,11 +290,14 @@ jobs:
           nightly="artifacts/benchmark-pr-nightly-comparison-${GITHUB_RUN_ID}/comparison.md"
           base="\`${BASE_SHA:0:12}\`"
           flagged="\`${FLAGGED//,/\`, \`}\`"
+          decided=""
           if [ "$CONFIRM_RESULT" = "success" ] && [ "$CONFIRMED" = "true" ]; then
             verdict="FAIL"
+            decided=" (decided the verdict)"
             why="Confirmed: the base commit ${base} and this PR ran on one runner, and that comparison also flags a regression."
           elif [ "$CONFIRM_RESULT" = "success" ] && [ "$COMPLETE" = "true" ] && [ -f "$same_runner" ]; then
             verdict="PASS"
+            decided=" (decided the verdict)"
             why="The comparison against the latest nightly flagged ${flagged}, but the base commit ${base} and this PR ran on one runner, both measured every flagged journey, and that comparison did not reproduce the regression. The same-runner comparison decided."
           elif [ "$CONFIRM_RESULT" = "success" ]; then
             verdict="FAIL"
@@ -317,7 +320,7 @@ jobs:
             echo "**Verdict: ${verdict}.** ${why}"
             echo ""
             if [ -f "$same_runner" ]; then
-              echo "### Same-runner comparison: base ${base} vs this PR (decided the verdict)"
+              echo "### Same-runner comparison: base ${base} vs this PR${decided}"
               echo ""
               sed '1{/^## /d;}' "$same_runner"
               echo ""
