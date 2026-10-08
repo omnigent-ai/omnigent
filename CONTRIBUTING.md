@@ -416,6 +416,8 @@ GitHub requests these reviews automatically. The `main-no-force-push` ruleset
 requires code-owner approval and dismisses stale approvals after changes are
 pushed. This requirement is enforced by GitHub alongside the CI checks.
 
+<a name="every-pr-needs-an-issue"></a>
+
 ### When a PR needs an issue
 
 We require an issue for contributor-authored pull requests, with the exceptions
