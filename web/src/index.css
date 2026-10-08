@@ -877,14 +877,15 @@ aside[aria-label="Workspace"][data-maximized] {
  * sidebar (z above the rail) then covers the window corner, so the lights and
  * cluster sit over IT, not the strip — the strip starts right of the sidebar
  * with nothing to clear, and the padding would shove the tabs into the middle. */
-[data-electron-mac]:not([data-sidebar-open])
+[data-electron-mac]
+  .app-shell:not([data-sidebar-open])
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
- * Scope through html to cover portals outside AppShell on macOS only. */
-html:has([data-electron-mac])
+ * Scoped from <html> to cover portals outside AppShell on macOS only. */
+html[data-electron-mac]
   :is(
     a,
     button,

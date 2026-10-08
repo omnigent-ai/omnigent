@@ -2308,10 +2308,11 @@ export function AppShell() {
         index.css); bg-sidebar is the fallback the gradient sits over. The
         white sidebar / workspace cards float on this canvas.
 
-        data-electron-mac scopes the frameless-window CSS in index.css: the
-        macOS Electron shell hides the native title bar (titleBarStyle
-        "hiddenInset"), so the web layer drops the sidebar below the
-        traffic lights and supplies a drag strip in the freed space. */}
+        The frameless-window CSS in index.css is scoped by data-electron-mac
+        on <html> (set at boot): the macOS Electron shell hides the native
+        title bar (titleBarStyle "hiddenInset"), so the web layer drops the
+        sidebar below the traffic lights and supplies a drag strip in the
+        freed space. */}
           <div
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
             // Reflect the docked sidebar's open state so CSS can drop the
@@ -2319,7 +2320,6 @@ export function AppShell() {
             // maximized workspace rail's tab strip in index.css): with the
             // sidebar open over the window corner there are no lights to clear.
             data-sidebar-open={sidebarOpen ? "true" : undefined}
-            data-electron-mac={isMacElectronShell() ? "true" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
           >
