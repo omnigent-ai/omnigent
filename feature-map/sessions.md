@@ -212,6 +212,8 @@ plain `uv run pytest`, which starts a private server for the test.
   hosts are covered by `web/src/hooks/useSessionActionRestrictions.test.tsx`.
   Host-menu loading/error explanations and the default status badge's disabled
   action have component coverage in `web/src/components/HostBadge.test.tsx`.
+  Loading-to-enabled keyboard focus is covered there and in
+  `web/src/components/DisabledActionTooltip.test.tsx`.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.

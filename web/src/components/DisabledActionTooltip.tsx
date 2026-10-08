@@ -1,40 +1,53 @@
-import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 /**
  * Keep hover and focus on a wrapper when the control itself is disabled.
- * A natively disabled child needs `pointer-events: none` so hover reaches here.
+ * The wrapper persists through capability loading so keyboard focus survives.
  */
 export function DisabledActionTooltip({
   reason,
   children,
   label,
+  className,
 }: {
   reason?: string;
   children: ReactNode;
   /** Gives native disabled buttons a keyboard-focusable tooltip target. */
   label?: string;
+  className?: string;
 }) {
-  if (!reason) return children;
+  const triggerRef = useRef<HTMLSpanElement>(null);
+  const [open, setOpen] = useState(false);
+  useLayoutEffect(() => {
+    if (!reason && label && document.activeElement === triggerRef.current) {
+      triggerRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    }
+  }, [reason, label]);
+
   return (
     <TooltipProvider>
-      <Tooltip>
+      <Tooltip open={!!reason && open} onOpenChange={(value) => setOpen(!!reason && value)}>
         <TooltipTrigger asChild>
           <span
-            role={label ? "group" : undefined}
-            tabIndex={label ? 0 : undefined}
-            aria-label={label}
-            aria-disabled={label ? true : undefined}
-            className={
+            ref={triggerRef}
+            role={reason && label ? "group" : "presentation"}
+            tabIndex={reason && label ? 0 : undefined}
+            aria-label={reason ? label : undefined}
+            aria-disabled={reason && label ? true : undefined}
+            className={cn(
               label
                 ? "inline-flex rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                : "block"
-            }
+                : "block",
+              "[&_[disabled]]:pointer-events-none",
+              className,
+            )}
           >
             {children}
           </span>
         </TooltipTrigger>
-        <TooltipContent>{reason}</TooltipContent>
+        {reason && <TooltipContent>{reason}</TooltipContent>}
       </Tooltip>
     </TooltipProvider>
   );

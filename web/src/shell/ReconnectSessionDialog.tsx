@@ -239,7 +239,11 @@ export function ReconnectSessionDialog({
               <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">
                 Reconnect
               </TabsTrigger>
-              <DisabledActionTooltip reason={forkRestriction} label="Clone session">
+              <DisabledActionTooltip
+                reason={forkRestriction}
+                label="Clone session"
+                className="h-full flex-1 items-center"
+              >
                 <TabsTrigger
                   value="clone"
                   data-testid="reconnect-session-tab-clone"
@@ -312,7 +316,11 @@ export function ReconnectSessionDialog({
                     {switchHostRestriction ??
                       "Can't bring that machine back? Move the session to another one instead."}
                   </p>
-                  <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
+                  <DisabledActionTooltip
+                    reason={switchHostDisabledReason}
+                    label="Switch host"
+                    className="self-start"
+                  >
                     <Button
                       variant="outline"
                       className="self-start"

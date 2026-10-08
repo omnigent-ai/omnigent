@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -200,6 +200,30 @@ describe("HostBadge", () => {
       expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
     },
   );
+
+  it("preserves the focused menu item when the host lookup enables switching", async () => {
+    useHostsMock.mockReturnValue({ data: undefined, isLoading: true });
+    const user = userEvent.setup();
+    const { rerender } = render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    const item = screen.getByRole("menuitem", { name: "Switch host…" });
+    act(() => item.focus());
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    useHostsMock.mockReturnValue({ data: [host()], isLoading: false });
+    rerender(<HostBadge sessionId="conv_1" appearance="composer" />);
+    expect(screen.getByRole("menuitem", { name: "Switch host…" })).toHaveFocus();
+    expect(item).not.toHaveAttribute("aria-disabled", "true");
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
+  });
+
+  it("does not offer host switching for a shared host omitted from the host list", () => {
+    useHostsMock.mockReturnValue({ data: [] });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByText("host_a1b2")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
+  });
 
   it("renders the host name with an online status when reachable", () => {
     render(<HostBadge sessionId="conv_1" />);

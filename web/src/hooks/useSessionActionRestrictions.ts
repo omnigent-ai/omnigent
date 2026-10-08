@@ -12,7 +12,7 @@ export function useSessionActionRestrictions(
   fallback?: SessionActionSource | null,
 ) {
   const { session, isLoading, error } = useSession(sessionId);
-  const hostId = session?.hostId ?? fallback?.hostId ?? fallback?.host_id;
+  const hostId = session ? session.hostId : (fallback?.hostId ?? fallback?.host_id);
   const {
     data: hosts,
     isLoading: hostsLoading,
@@ -27,11 +27,9 @@ export function useSessionActionRestrictions(
   // Successful host lists can omit shared hosts; their snapshot carries the managed label.
   const lookupFailed =
     Boolean(sessionId && !session && error) || Boolean(hostId && !hosts && hostsError);
-  const lookupReason = lookupFailed
-    ? SESSION_ACTIONS_UNAVAILABLE
-    : loading
-      ? SESSION_ACTIONS_LOADING
-      : undefined;
+  let lookupReason: string | undefined;
+  if (lookupFailed) lookupReason = SESSION_ACTIONS_UNAVAILABLE;
+  else if (loading) lookupReason = SESSION_ACTIONS_LOADING;
   return {
     forkDisabledReason: restrictions.forkDisabledReason ?? lookupReason,
     switchHostDisabledReason: restrictions.switchHostDisabledReason ?? lookupReason,

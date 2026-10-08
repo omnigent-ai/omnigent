@@ -7,12 +7,17 @@ export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
 export const SESSION_ACTIONS_UNAVAILABLE =
   "Unable to check session capabilities. Reload to try again.";
 
-/** Sandbox providers whose managed integration rejects forking. */
+/**
+ * Fallback when the embedded marker is absent; keep IDs aligned with
+ * capabilities.ts's provider labels. Other core sandbox providers support forking.
+ */
 const UNSUPPORTED_FORK_PROVIDERS = new Set(["arclet", "lakebox"]);
 
 export interface SessionActionSource {
   labels?: Record<string, string | null> | null;
+  /** Session snapshot shape. */
   hostId?: string | null;
+  /** Sidebar ConversationSummary wire shape. */
   host_id?: string | null;
 }
 

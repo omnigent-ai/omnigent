@@ -46,10 +46,11 @@ function hostsResponse(provider: string | null = null) {
   );
 }
 
-function renderRestrictions(fallback?: SessionActionSource) {
+function renderRestrictions(fallback?: SessionActionSource, cachedSession?: Session) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
+  if (cachedSession) client.setQueryData(["session", "session-1"], cachedSession);
   clients.add(client);
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -160,6 +161,15 @@ describe("useSessionActionRestrictions", () => {
         expect(client.getQueryState(["session", "session-1"])?.status).toBe("success"),
       );
       expect(result.current).toEqual(managed ? unsupported : unrestricted);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ hostId: "host-1" }, { host_id: "host-1" }])(
+    "uses the loaded hostless snapshot instead of a stale fallback %j",
+    (fallback) => {
+      const { result } = renderRestrictions(fallback, { ...session(), hostId: undefined });
+      expect(result.current).toEqual(unrestricted);
       expect(fetchMock).not.toHaveBeenCalled();
     },
   );

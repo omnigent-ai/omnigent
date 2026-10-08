@@ -41,7 +41,7 @@ export function SessionActionMenuItem({
         }}
       />
       {disabledReason && (
-        <span id={descriptionId} className="sr-only">
+        <span id={descriptionId} hidden>
           {disabledReason}
         </span>
       )}
