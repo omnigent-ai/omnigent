@@ -9,8 +9,9 @@ const MAX_GENERATED_BYTES = 128;
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
 export const INFLATE_CHUNK_BYTES = 16 * 1024;
-const MAX_EMITTED_RATIO = 2;
-const MAX_EMITTED_OVERHEAD = 1024 * 1024;
+export const MAX_EMITTED_RATIO = 4;
+export const MAX_EMITTED_OVERHEAD = 1024 * 1024;
+export const MAX_EMITTED_BYTES = 2 * MAX_SELECTED_BYTES + MAX_EMITTED_OVERHEAD;
 const MAX_OBJECTS = 10_000;
 const MAX_ID_WIDTH = String(MAX_OBJECTS + 1).length;
 const MAX_COMPONENTS = 10_000;
@@ -368,6 +369,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const rootPath = zipPath(rootRelationship.getAttribute("Target") ?? "");
     const models = new Map<string, Document>();
     const objects = new Map<string, Element>();
+    const meshes = new WeakSet<Element>();
     // Moved objects acquire new IDs; keep their original component targets.
     const links = new Map<string, { id: string; path: string }[]>();
     const namespaces = new Map<string, string>();
@@ -419,6 +421,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         const key = JSON.stringify([normalizedPath, object.getAttribute("id")]);
         if (objects.has(key)) return buffer;
         objects.set(key, object);
+        if (children(object, "mesh").length) meshes.add(object);
         links.set(
           key,
           children(object, "components").flatMap((components) =>
@@ -450,17 +453,21 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const memo = new Map<string, { id: string; height: number }>();
     const sourceSizes = new Map<string, number>();
     const moved = new Set<string>();
-    const emittedLimit = selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD;
-    let emittedBytes = serializationBound(outputModel, emittedLimit);
+    const emittedLimit = () =>
+      Math.min(
+        selectedBytes * Math.min(MAX_EMITTED_RATIO, Math.max(2, colors.length)) +
+          MAX_EMITTED_OVERHEAD,
+        MAX_EMITTED_BYTES,
+      );
+    let emittedBytes = serializationBound(outputModel, emittedLimit());
     const reserve = (source: Element, key: string) => {
       let size = sourceSizes.get(key);
       if (size === undefined) {
-        size = serializationBound(source, emittedLimit - emittedBytes);
+        size = serializationBound(source, emittedLimit() - emittedBytes);
         sourceSizes.set(key, size);
       }
       emittedBytes += size;
-      if (emittedBytes > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
-        throw new Error("3MF emitted byte limit");
+      if (emittedBytes > emittedLimit()) throw new Error("3MF emitted byte limit");
     };
     const visiting = new Set<string>();
     let nextId = 2;
@@ -479,7 +486,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       if (!source || visiting.has(sourceKey)) throw new Error("Invalid component graph");
       const effectiveSlot = cachedSlot(assigned, inherited);
       const recolor = enabled && (!assigned || normal(assigned));
-      const mesh = children(source, "mesh")[0];
+      const mesh = meshes.has(source);
       const effectiveColor = mesh && assigned && recolor ? color(effectiveSlot) : null;
       const key = JSON.stringify(
         mesh
@@ -493,6 +500,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         return previous;
       }
       if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
+      if (effectiveColor && !colors.includes(effectiveColor)) colors.push(effectiveColor);
       reserve(source, sourceKey);
       visiting.add(sourceKey);
       const object = moved.has(sourceKey)
@@ -526,17 +534,8 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       object.removeAttribute("pid");
       object.removeAttribute("pindex");
       if (effectiveColor) {
-        let index = colors.indexOf(effectiveColor);
-        if (index < 0) {
-          index = colors.length;
-          colors.push(effectiveColor);
-          const base = output.createElementNS(CORE, "base");
-          base.setAttribute("name", effectiveColor);
-          base.setAttribute("displaycolor", effectiveColor);
-          bases.append(base);
-        }
         object.setAttribute("pid", "1");
-        object.setAttribute("pindex", String(index));
+        object.setAttribute("pindex", String(colors.indexOf(effectiveColor)));
       }
       resources.append(object);
       return result;
@@ -569,19 +568,18 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       const { parts, inherited } = context;
       item.setAttribute(
         "objectid",
-        clone(
-          path,
-          id,
-          parts,
-          inherited,
-          children(source, "mesh").length ? parts.get(id) : undefined,
-          true,
-          0,
-        ).id,
+        clone(path, id, parts, inherited, meshes.has(source) ? parts.get(id) : undefined, true, 0)
+          .id,
       );
       item.removeAttributeNS(PRODUCTION, "path");
     }
     if (colors.length < 2) return buffer;
+    for (const color of colors) {
+      const base = output.createElementNS(CORE, "base");
+      base.setAttribute("name", color);
+      base.setAttribute("displaycolor", color);
+      bases.append(base);
+    }
     outputModel.append(build);
     for (const model of models.values()) model.documentElement.replaceChildren();
     entries.clear();
@@ -600,8 +598,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const encoded = strToU8(serialized);
     serialized = "";
     const modelBytes = new Uint8Array(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-    if (modelBytes.byteLength > selectedBytes * MAX_EMITTED_RATIO + MAX_EMITTED_OVERHEAD)
-      return buffer;
+    if (modelBytes.byteLength > emittedLimit()) return buffer;
     const relationships = `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="r" Type="${MODEL_RELATIONSHIP}"/></Relationships>`;
     return zipSync(
       {
