@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { SwitchHostDialog } from "./SwitchHostDialog";
@@ -170,7 +171,7 @@ describe("SwitchHostDialog", () => {
     ["managed snapshot", null],
     ["Arclet host", "arclet"],
     ["Databricks Sandbox host", "lakebox"],
-  ])("blocks a directly opened %s dialog before releasing its runner", (source, provider) => {
+  ])("blocks a directly opened %s dialog before releasing its runner", async (source, provider) => {
     vi.mocked(useSession).mockReturnValue({
       session: {
         id: "conv_1",
@@ -208,6 +209,20 @@ describe("SwitchHostDialog", () => {
     expect(screen.getByTestId("switch-host-button")).toBeDisabled();
     expect(screen.queryByTestId("mock-workspace-input")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("switch-host-button"));
+    const user = userEvent.setup();
+    const target = screen.getByRole("group", { name: "Switch host" });
+    expect(target).toHaveAttribute("tabindex", "0");
+    act(() => target.focus());
+    expect(target).toHaveFocus();
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "Switching hosts is not supported for this sandbox session yet.",
+      ),
+    );
+    expect(target).toHaveAccessibleDescription(
+      "Switching hosts is not supported for this sandbox session yet.",
+    );
+    await user.keyboard("{Enter} ");
     expect(updateSessionMock).not.toHaveBeenCalled();
     expect(launchRunnerMock).not.toHaveBeenCalled();
   });

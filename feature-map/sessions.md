@@ -102,6 +102,8 @@ cannot enable either action.
 While support is being checked, actions stay disabled. If that check fails,
 the explanation asks you to reload. Direct dialogs show a loading status without
 an action button until the check finishes; supported forms then receive keyboard focus.
+If the reconnect dialog is already on Clone when an unsupported result arrives,
+it selects Reconnect and explains the restriction.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
 choose Stop session while a side chat or sub-agent is working. On mobile, open

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   Dialog,
@@ -183,6 +183,7 @@ export function ReconnectSessionDialog({
   };
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
+  const [selectedTab, setSelectedTab] = useState<string>();
   const { forkDisabledReason, switchHostDisabledReason } = useSessionActionRestrictions(
     conversationId,
     { hostId: sourceHostId },
@@ -192,6 +193,10 @@ export function ReconnectSessionDialog({
   // Reconnect and activate it, so the loading placeholder never disables Clone.
   const forkRestriction =
     forkDisabledReason === SESSION_ACTIONS_LOADING ? undefined : forkDisabledReason;
+  useEffect(() => {
+    if (!open) setSelectedTab(undefined);
+    else if (forkRestriction) setSelectedTab("reconnect");
+  }, [open, forkRestriction]);
   // Loading stays out of the guidance, but the disabled action's tooltip explains the wait.
   const switchHostRestriction =
     switchHostDisabledReason === SESSION_ACTIONS_LOADING ? undefined : switchHostDisabledReason;
@@ -229,10 +234,13 @@ export function ReconnectSessionDialog({
               keeps the dialog described for screen readers. */}
             <DialogDescription className="sr-only">{description}</DialogDescription>
           </DialogHeader>
-          {/* Uncontrolled tabs: DialogContent unmounts on close, so the
-            default re-applies on every open. */}
+          {/* Restrictions can arrive after opening Clone; preserve the form
+            while moving the user to Reconnect. Closing resets the selection. */}
           <Tabs
-            defaultValue={showCommand || forkRestriction ? "reconnect" : "clone"}
+            value={
+              forkRestriction ? "reconnect" : (selectedTab ?? (showCommand ? "reconnect" : "clone"))
+            }
+            onValueChange={setSelectedTab}
             className="flex min-h-0 flex-1 flex-col gap-4"
             componentId="reconnect.tabs"
           >

@@ -44,8 +44,9 @@ reattach when the session moves to another host.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
-Databricks Sandbox and Arclet sessions show "Switch host…" disabled; hover or
-focus the item for the unsupported explanation. They cannot reach this move flow.
+Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+hosts. Their "Switch host…" item is disabled; hover or focus it for the
+unsupported explanation.
 
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
