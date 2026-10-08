@@ -31,6 +31,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -135,6 +136,9 @@ _UNBOUND_RUNNER_MESSAGE_FRAGMENT = "not bound to a runner"
 # hex + hyphens keeps it safe to interpolate into a rollout filename and a
 # ``codex resume`` argument (no path separators / traversal).
 _CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
+# Replayed tool arguments stay far below the Responses 1 MiB string cap; they also cost context.
+_REPLAYED_ARGUMENTS_MAX_CHARS = 100_000
+_REPLAYED_DIFF_MAX_CHARS = 8_000
 
 
 @dataclass(frozen=True)
@@ -2639,7 +2643,7 @@ def _codex_function_call_payload_from_session_item(
     payload: _JsonObject = {
         "type": "function_call",
         "name": name,
-        "arguments": arguments,
+        "arguments": _bounded_replayed_arguments(arguments, name=name, call_id=call_id),
         "call_id": call_id,
     }
     # The Responses API rejects a replayed namespaced call without it.
@@ -2647,6 +2651,76 @@ def _codex_function_call_payload_from_session_item(
     if isinstance(namespace, str) and namespace:
         payload["namespace"] = namespace
     return payload
+
+
+def _bounded_replayed_arguments(arguments: str, *, name: str, call_id: str) -> str:
+    """
+    Keep a replayed tool call's arguments under the Responses per-string cap.
+
+    A mirrored ``apply_patch`` call carries Codex's derived diffs, which are the
+    whole file for an add or delete. Codex truncates replayed tool outputs but
+    never arguments, so an oversized string fails every later request, including
+    ``/compact``. Oversized diffs are cut to a prefix and anything else too
+    large becomes a JSON marker, so the replayed arguments stay valid JSON.
+
+    :param arguments: Persisted arguments JSON string, e.g.
+        ``'{"changes": [{"path": "/repo/a.py", "diff": "..."}]}'``.
+    :param name: Tool name, e.g. ``"apply_patch"``; only used for logging.
+    :param call_id: Tool call id, e.g. ``"call_abc"``; only used for logging.
+    :returns: *arguments* unchanged when at most ``_REPLAYED_ARGUMENTS_MAX_CHARS``
+        long, otherwise a bounded JSON string.
+    """
+    original_chars = len(arguments)
+    if original_chars <= _REPLAYED_ARGUMENTS_MAX_CHARS:
+        return arguments
+    bounded = _arguments_with_shortened_diffs(arguments)
+    if bounded is None or len(bounded) > _REPLAYED_ARGUMENTS_MAX_CHARS:
+        bounded = json.dumps(
+            {"omitted": f"{original_chars} characters of arguments omitted from replayed history"}
+        )
+    _logger.info(
+        "Shortened oversized Codex tool arguments for resume replay: "
+        "call_id=%s tool=%s original_chars=%d replayed_chars=%d",
+        call_id,
+        name,
+        original_chars,
+        len(bounded),
+        extra=debug_event(
+            "codex_resume_rollout_arguments_shortened",
+            call_id=call_id,
+            tool_name=name,
+            original_chars=original_chars,
+            replayed_chars=len(bounded),
+        ),
+    )
+    return bounded
+
+
+def _arguments_with_shortened_diffs(arguments: str) -> str | None:
+    """
+    Cut each oversized ``diff`` in ``apply_patch``-style arguments to a prefix.
+
+    :param arguments: Arguments JSON string, e.g.
+        ``'{"changes": [{"path": "/repo/a.py", "kind": {"type": "add"}, "diff": "..."}]}'``.
+    :returns: Re-serialized arguments, or ``None`` when *arguments* is not a JSON
+        object holding a ``changes`` list.
+    """
+    try:
+        parsed = json.loads(arguments)
+        changes = parsed.get("changes") if isinstance(parsed, dict) else None
+        if not isinstance(changes, list):
+            return None
+        for change in changes:
+            diff = change.get("diff") if isinstance(change, dict) else None
+            if isinstance(diff, str) and len(diff) > _REPLAYED_DIFF_MAX_CHARS:
+                omitted = len(diff) - _REPLAYED_DIFF_MAX_CHARS
+                change["diff"] = (
+                    f"{diff[:_REPLAYED_DIFF_MAX_CHARS]}"
+                    f"\n[... {omitted} more characters omitted from replayed history]"
+                )
+        return json.dumps(parsed, ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return None
 
 
 def _codex_function_call_output_payload_from_session_item(

@@ -597,6 +597,193 @@ def test_rollout_records_keep_function_call_namespace() -> None:
     ]
 
 
+def _replayed_payloads(items: list[dict[str, Any]]) -> list[Any]:
+    """Return the ``response_item`` payloads the rollout builder emits for *items*."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+    return [record["payload"] for record in records if record["type"] == "response_item"]
+
+
+def _function_call_item(call_id: str, name: str, arguments: str, **extra: Any) -> dict[str, Any]:
+    """Build one persisted Omnigent ``function_call`` item."""
+    return {
+        "id": f"fc_{call_id}",
+        "response_id": "codex_turn_1",
+        "type": "function_call",
+        "name": name,
+        "arguments": arguments,
+        "call_id": call_id,
+        **extra,
+    }
+
+
+def _apply_patch_arguments(diff: str) -> str:
+    """Serialize ``apply_patch`` arguments as the forwarder mirrors a Codex ``fileChange``."""
+    return json.dumps(
+        {"changes": [{"path": "/repo/big.json", "kind": {"type": "delete"}, "diff": diff}]},
+        ensure_ascii=False,
+    )
+
+
+def test_rollout_records_shorten_oversized_apply_patch_diff() -> None:
+    """
+    A mirrored whole-file diff is cut so the replayed call fits the API string cap.
+
+    Codex reports an add or delete's diff as the entire file and never truncates
+    replayed function-call arguments, so a multi-megabyte mirrored patch made
+    every request after a cold resume, including ``/compact``, fail with
+    "string too long". Path and kind stay; neighbouring items are untouched.
+    """
+    payloads = _replayed_payloads(
+        [
+            _function_call_item(
+                "call_patch", "apply_patch", _apply_patch_arguments("x" * 5_000_000)
+            ),
+            {
+                "id": "fco_patch",
+                "response_id": "codex_turn_1",
+                "type": "function_call_output",
+                "call_id": "call_patch",
+                "output": "delete /repo/big.json",
+            },
+            _function_call_item("call_shell", "shell", '{"command":"ls"}'),
+        ]
+    )
+
+    patch_call, patch_output, shell_call = payloads
+    assert len(patch_call["arguments"]) < 1_048_576
+    [change] = json.loads(patch_call["arguments"])["changes"]
+    assert change["path"] == "/repo/big.json"
+    assert change["kind"] == {"type": "delete"}
+    assert change["diff"] == (
+        "x" * 8_000 + "\n[... 4992000 more characters omitted from replayed history]"
+    )
+    assert {key: value for key, value in patch_call.items() if key != "arguments"} == {
+        "type": "function_call",
+        "name": "apply_patch",
+        "call_id": "call_patch",
+        "id": "fc_call_patch",
+    }
+    assert patch_output == {
+        "type": "function_call_output",
+        "call_id": "call_patch",
+        "output": "delete /repo/big.json",
+        "id": "fco_patch",
+    }
+    assert shell_call == {
+        "type": "function_call",
+        "name": "shell",
+        "arguments": '{"command":"ls"}',
+        "call_id": "call_shell",
+        "id": "fc_call_shell",
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param("not json " * 20_000, id="not-json"),
+        pytest.param(json.dumps(["x" * 150_000]), id="not-an-object"),
+        pytest.param(json.dumps({"command": "x" * 150_000}), id="no-changes-list"),
+        pytest.param(
+            json.dumps({"changes": [{"path": "p" * 150_000, "diff": "d"}]}), id="oversized-path"
+        ),
+        pytest.param(
+            json.dumps({"changes": [{"path": f"/f{i}", "diff": "d" * 9_000} for i in range(15)]}),
+            id="still-oversized-after-shortening",
+        ),
+    ],
+)
+def test_rollout_records_replace_unshortenable_oversized_arguments_with_a_marker(
+    arguments: str,
+) -> None:
+    """Oversized arguments that cannot be shortened are replaced by a valid JSON marker."""
+    [call] = _replayed_payloads([_function_call_item("call_big", "shell", arguments)])
+
+    assert json.loads(call["arguments"]) == {
+        "omitted": f"{len(arguments)} characters of arguments omitted from replayed history"
+    }
+    assert (call["name"], call["call_id"]) == ("shell", "call_big")
+
+
+def test_rollout_records_leave_arguments_at_the_size_threshold_untouched() -> None:
+    """Arguments no longer than the threshold replay byte-for-byte, even with a large diff."""
+    limit = codex_native._REPLAYED_ARGUMENTS_MAX_CHARS
+    overhead = len(_apply_patch_arguments(""))
+    at_limit = _apply_patch_arguments("y" * (limit - overhead))
+    over_limit = _apply_patch_arguments("y" * (limit + 1 - overhead))
+    assert (len(at_limit), len(over_limit)) == (limit, limit + 1)
+
+    at_call, over_call = _replayed_payloads(
+        [
+            _function_call_item("call_at", "apply_patch", at_limit),
+            _function_call_item("call_over", "apply_patch", over_limit),
+        ]
+    )
+
+    assert at_call["arguments"] == at_limit
+    [change] = json.loads(over_call["arguments"])["changes"]
+    assert change["diff"].endswith("more characters omitted from replayed history]")
+
+
+def test_rollout_records_keep_namespace_on_shortened_function_call() -> None:
+    """A shortened namespaced call still replays under its namespace."""
+    [call] = _replayed_payloads(
+        [
+            _function_call_item(
+                "call_patch",
+                "apply_patch",
+                _apply_patch_arguments("x" * 500_000),
+                namespace="container",
+            )
+        ]
+    )
+
+    assert (call["name"], call["namespace"], call["call_id"]) == (
+        "apply_patch",
+        "container",
+        "call_patch",
+    )
+    assert len(call["arguments"]) < codex_native._REPLAYED_ARGUMENTS_MAX_CHARS
+
+
+def test_rollout_records_log_each_shortened_call_without_its_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One structured INFO event names each shortened call and carries no argument content."""
+    arguments = _apply_patch_arguments("secret " * 100_000)
+
+    with caplog.at_level("INFO", logger=codex_native.__name__):
+        patch_call, _ = _replayed_payloads(
+            [
+                _function_call_item("call_patch", "apply_patch", arguments),
+                _function_call_item("call_shell", "shell", '{"command":"ls"}'),
+            ]
+        )
+
+    [event] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_resume_rollout_arguments_shortened"
+    ]
+    assert event.levelname == "INFO"
+    assert event.attributes == {
+        "call_id": "call_patch",
+        "tool_name": "apply_patch",
+        "original_chars": len(arguments),
+        "replayed_chars": len(patch_call["arguments"]),
+    }
+    logged = event.getMessage() + json.dumps(event.attributes)
+    assert "secret" not in logged
+    assert "/repo/big.json" not in logged
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     tmp_path: Path,
