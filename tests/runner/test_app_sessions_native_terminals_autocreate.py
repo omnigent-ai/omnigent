@@ -9,6 +9,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -4011,6 +4012,91 @@ async def test_delete_cancels_recovery_before_same_session_reinitializes(
 
         cleanup_resp = await client.delete(f"/v1/sessions/{session_id}")
         assert cleanup_resp.status_code == 200, cleanup_resp.text
+
+
+class _RecordingCodexRegistry:
+    """Captures the launched Codex terminal spec."""
+
+    terminal_registry = None
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self.captured = captured
+
+    async def launch_auxiliary_terminal(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: Any,
+        resource_role: str | None = None,
+        parent_os_env: Any = None,
+    ) -> SessionResourceView:
+        """Record the spec and return a terminal resource view."""
+        del terminal_name, session_key, resource_role, parent_os_env
+        self.captured["spec"] = spec
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="codex:main"
+        )
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_launch_reads_project_config_from_session_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex TUI relaunch reads the session workspace's config after the runner cwd is gone."""
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _launch_codex_native_tui,
+    )
+
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+
+    captured: dict[str, Any] = {}
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=None,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    await _launch_codex_native_tui(
+        "conv_codex_cwd_gone",
+        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        app_server=app_server,  # type: ignore[arg-type]
+        launch_config=_CodexNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+        ),
+        bridge_dir=tmp_path / "bridge",
+        thread_id=None,
+        agent_spec=None,
+    )
+
+    spec = captured["spec"]
+    assert spec.command == "workspace-codex"
+    assert spec.args[0] == "--workspace-arg"
+    assert spec.os_env.cwd == str(workspace)
 
 
 @pytest.mark.asyncio
