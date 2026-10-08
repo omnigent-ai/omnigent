@@ -7417,6 +7417,8 @@ async def _resolve_skill_meta_text_via_runner(
     skill_name: str,
     arguments: str,
     runner_client: httpx.AsyncClient,
+    *,
+    legacy_name: str | None = None,
 ) -> str:
     """
     Resolve a skill's hidden ``<skill>`` meta text on the bound runner.
@@ -7434,6 +7436,10 @@ async def _resolve_skill_meta_text_via_runner(
     :param arguments: Raw argument string typed after the slash
         command, e.g. ``"review this plan"``. Empty when none.
     :param runner_client: HTTP client pointed at the bound runner.
+    :param legacy_name: The skill's frontmatter name, e.g. ``"code-review"``
+        for directory ``review``. Retried once when the runner rejects
+        ``skill_name`` but lists this name, as runners from before
+        directory-name invocation do.
     :returns: The hidden ``<skill>`` meta text for a single
         ``input_text`` block.
     :raises OmnigentError: If the skill is not exposed for the session
@@ -7477,6 +7483,10 @@ async def _resolve_skill_meta_text_via_runner(
         ) from exc
     if resp.status_code == 404:
         available = payload.get("available", [])
+        if legacy_name is not None and isinstance(available, list) and legacy_name in available:
+            return await _resolve_skill_meta_text_via_runner(
+                session_id, legacy_name, arguments, runner_client
+            )
         raise OmnigentError(
             f"Skill {skill_name!r} not found. Available skills: {available}",
             code=ErrorCode.INVALID_INPUT,
@@ -7500,6 +7510,7 @@ async def _dispatch_skill_slash_command_to_runner(
     agent: Agent,
     has_mcp_servers: bool,
     created_by: str | None,
+    legacy_skill_names: Mapping[str, str] | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -7533,6 +7544,9 @@ async def _dispatch_skill_slash_command_to_runner(
         servers; forwarded unchanged to the runner event.
     :param created_by: Authenticated actor id, e.g.
         ``"alice@example.com"``, or ``None`` in single-user mode.
+    :param legacy_skill_names: Frontmatter names of the agent's bundled
+        skills keyed by command, e.g. ``{"review": "code-review"}``, for
+        runners that predate directory-name invocation.
     :returns: The persisted visible ``slash_command`` item id.
     :raises OmnigentError: If the skill is not exposed for the
         session, or the runner is unreachable while resolving it.
@@ -7545,6 +7559,7 @@ async def _dispatch_skill_slash_command_to_runner(
         skill_name,
         arguments,
         runner_client,
+        legacy_name=(legacy_skill_names or {}).get(skill_name),
     )
 
     response_id = f"turn_{uuid.uuid4().hex}"
@@ -8180,7 +8195,7 @@ async def _relay_persist_error_once(
                 and existing.data.message == item.data.message
             ):
                 return "duplicate"
-        await asyncio.to_thread(
+        persisted_items = await asyncio.to_thread(
             conversation_store.append,
             session_id,
             [item],
@@ -8195,6 +8210,8 @@ async def _relay_persist_error_once(
                 code=item.data.code,
                 level=item.data.level,
                 source=item.data.source,
+                item_id=persisted_items[0].id,
+                response_id=persisted_items[0].response_id,
             ),
         )
         return "persisted"
@@ -10247,6 +10264,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if not labels:
         return
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+    from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
+
+    if SIDE_CHAT_SOURCE_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {SIDE_CHAT_SOURCE_LABEL_KEY!r} is server-internal"
+            " and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     if WORKTREE_ROOT_LABEL_KEY in labels:
         raise OmnigentError(

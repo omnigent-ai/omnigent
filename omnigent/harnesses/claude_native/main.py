@@ -226,7 +226,7 @@ _CLAUDE_ALIAS_RESOLUTION_CONCURRENCY = 12
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _CLAUDE_CODE_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
-# request headers. The Databricks AI gateway only serves Claude requests
+# request headers. The Databricks Unity Gateway only serves Claude requests
 # in coding-agent mode when this header is present.
 _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 # Claude Code's agent view (the session list opened by `claude agents`, the
@@ -3504,7 +3504,7 @@ def resolve_native_claude_config(
         if broker_config is not None:
             log_info_once(
                 _logger,
-                "native-claude routing: managed connect host — Databricks AI gateway via the "
+                "native-claude routing: managed connect host — Databricks Unity Gateway via the "
                 "credential broker (host-only [omnigent] profile + broker sidecar).",
             )
             return broker_config

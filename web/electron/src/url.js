@@ -12,9 +12,8 @@
   const api = factory();
   if (typeof module === "object" && module.exports) {
     module.exports = api;
-  } else {
-    root.omnigentUrl = api;
   }
+  root.omnigentUrl = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 

@@ -40,6 +40,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
@@ -62,6 +63,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runtime import (
     inflight_text,
+    pending_inputs,
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -205,6 +207,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_policy_deny,
     _publish_session_superseded,
     _publish_status,
+    _query_host_runner_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
     _require_filesystem_attachment_harness,
@@ -271,7 +274,11 @@ from omnigent.session_event_batch import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S, runner_seen_is_fresh
+from omnigent.stores.conversation_store import (
+    RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_LABEL_KEY,
+    runner_seen_is_fresh,
+)
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -330,9 +337,8 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
     Whether a batch entry can skip :func:`_post_event_impl` and be appended
     with its neighbors, which is the shape the claude-native forwarder posts.
 
-    For an external item that is not a user message (pending-input drain) or a
-    slash command (title seeding), the per-entry path only authorizes, persists
-    and broadcasts. Entries carrying ``created_by`` or ``tools`` also stay
+    User messages and shell inputs need pending-input settlement; slash commands
+    need title seeding. Entries carrying ``created_by`` or ``tools`` also stay
     per-entry so their validation is not duplicated here.
     """
     if (
@@ -346,7 +352,12 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
     is_user_message = (
         item_type == "message" and isinstance(item_data, dict) and item_data.get("role") == "user"
     )
-    return item_type != "slash_command" and not is_user_message
+    is_shell_input = (
+        item_type == "terminal_command"
+        and isinstance(item_data, dict)
+        and item_data.get("kind") == "input"
+    )
+    return item_type != "slash_command" and not is_user_message and not is_shell_input
 
 
 def _event_body_too_large() -> HTTPException:
@@ -1387,11 +1398,23 @@ def register_events_routes(
             )
             return wake_conv, _client
 
-        if body.type == _INTERRUPT_TYPE:
+        if body.type == _STOP_SESSION_TYPE:
+            await _require_access(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+        stop_codex_side_chat = (
+            body.type == _STOP_SESSION_TYPE
+            and _is_codex_native_subagent(conv)
+            and is_side_chat_child(conv.labels)
+        )
+        if stop_codex_side_chat and is_session_closed(conv.labels, conv.title):
+            return {"queued": False}
+        if body.type == _INTERRUPT_TYPE or stop_codex_side_chat:
             target_session_id = session_id
             interrupt_payload: dict[str, Any] = {"type": "interrupt"}
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             response_id = None
+            queued_pending_ids: list[str] = []
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -1406,6 +1429,12 @@ def register_events_routes(
                         raise OmnigentError(
                             "The side chat's active turn is not available yet. Try interrupting again.",
                             code=ErrorCode.CONFLICT,
+                        )
+                    if stop_codex_side_chat:
+                        await asyncio.to_thread(
+                            conversation_store.set_labels,
+                            session_id,
+                            {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
                         )
                     return {"queued": False}
                 if (
@@ -1428,6 +1457,9 @@ def register_events_routes(
                 _publish_interrupted(session_id)
                 # Fence the cancelled turn (see _interrupt_fenced_sessions).
                 _interrupt_fenced_sessions.add(session_id)
+                # Read before the forward so a message sent after Stop stays live;
+                # marked only if the interrupt lands, else the turn may still run them.
+                queued_pending_ids = pending_inputs.pending_ids(session_id)
             runner_client = await _get_runner_client(
                 target_session_id,
                 runner_router,
@@ -1456,15 +1488,16 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+            elif not codex_child:
+                pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+            if stop_codex_side_chat:
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
-            # Terminating the whole session (not just the current turn)
-            # is a lifecycle action; require owner access on top of the
-            # LEVEL_EDIT gate above so a shared editor can't kill the
-            # owner's session.
-            await _require_access(
-                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
-            )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -1485,25 +1518,56 @@ def register_events_routes(
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
                 _interrupt_fenced_sessions.discard(session_id)
-            # Host-spawned sessions run on a dedicated runner the host
-            # launched for this one session. Killing the pane (above) leaves
-            # that runner connected, so GET /health keeps reporting
-            # runner_online: true and the web UI never shows the session as
-            # disconnected — new messages hang on "working" against a dead
-            # pane. Stop the runner too so its tunnel drops and the web UI
-            # shows the same "Agent disconnected — click to show reconnect
-            # command" banner a CLI-launched session reaches on exit. Read
-            # host_id / runner_id from the owner-gated session row so we can
-            # only ever stop the runner bound to this session.
+            if (
+                stop_delivered
+                and not conv.host_id
+                and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+            ):
+                # A shared-runner chat owns its harness resources, while the
+                # parent owns the runner. Keep the persisted transcript.
+                try:
+                    cleanup_client = await _get_runner_client(session_id, runner_router)
+                    if cleanup_client is None:
+                        raise ConnectionError("Side-chat runner is unavailable")
+                    cleanup_resp = await cleanup_client.delete(
+                        f"/v1/sessions/{session_id}", timeout=60.0
+                    )
+                    cleanup_resp.raise_for_status()
+                except (httpx.HTTPError, ConnectionError) as exc:
+                    raise OmnigentError(
+                        "Couldn't release the side chat's resources. Please try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    ) from exc
+            # Only the host-bound parent owns the shared runner. Stopping
+            # that process disconnects all its chats; child bindings keep it alive.
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
-                await _stop_host_runner_intentionally(
+                stop_host_registry = getattr(request.app.state, "host_registry", None)
+                host_stopped = await _stop_host_runner_intentionally(
                     session_id,
                     stop_conv.host_id,
                     stop_conv.runner_id,
-                    getattr(request.app.state, "host_registry", None),
+                    stop_host_registry,
                     conversation_store,
                 )
+                if not host_stopped:
+                    host_conn = (
+                        stop_host_registry.get(stop_conv.host_id)
+                        if stop_host_registry is not None
+                        else None
+                    )
+                    runner_status = (
+                        await _query_host_runner_status(
+                            host_conn, stop_host_registry, stop_conv.runner_id
+                        )
+                        if host_conn is not None and stop_host_registry is not None
+                        else None
+                    )
+                    if runner_status not in {"dead", "unknown"}:
+                        raise OmnigentError(
+                            "Couldn't confirm the session's runner stopped. Please try again.",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
             if not stop_delivered:
                 # False-success backstop. The stop reached NO live runner
                 # (``_stop_session_via_runner`` returned False, so there was
@@ -2751,6 +2815,7 @@ def register_events_routes(
         # asyncio.to_thread wrapper covers the rare cold-cache path
         # where the bundle is extracted from disk for the first time.
         _has_mcp_servers = False
+        _legacy_skill_names: dict[str, str] = {}
         if _agent is not None and agent_cache is not None and _agent.bundle_location:
             try:
                 _loaded_agent = await asyncio.to_thread(
@@ -2759,6 +2824,19 @@ def register_events_routes(
                     _agent.bundle_location,
                 )
                 _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
+                # A declared sub-agent session resolves skills from its own child spec.
+                _skill_spec = _loaded_agent.spec
+                if conv.sub_agent_name:
+                    from omnigent.runtime.workflow import _find_spec_by_name
+
+                    _skill_spec = (
+                        _find_spec_by_name(_skill_spec, conv.sub_agent_name) or _skill_spec
+                    )
+                _legacy_skill_names = {
+                    skill.name: skill.display_name
+                    for skill in _skill_spec.skills
+                    if skill.display_name is not None
+                }
             except Exception:
                 _logger.warning(
                     "Failed to load agent spec for MCP hint for session=%s",
@@ -2803,6 +2881,7 @@ def register_events_routes(
                 agent=_agent,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=created_by,
+                legacy_skill_names=_legacy_skill_names,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
@@ -3166,8 +3245,27 @@ def register_events_routes(
             orphaned_blob_keys = await asyncio.to_thread(
                 file_store.delete_all_for_session, session_id
             )
+            # Best-effort: a backend failure on one blob must not abort the
+            # delete after the file rows are already gone.
+            failed_blob_count = 0
             for blob_key in orphaned_blob_keys:
-                await asyncio.to_thread(artifact_store.delete, blob_key)
+                try:
+                    await asyncio.to_thread(artifact_store.delete, blob_key)
+                except Exception as exc:
+                    failed_blob_count += 1
+                    _logger.warning(
+                        "Failed to delete attachment blob %s for session %s: %s",
+                        blob_key,
+                        session_id,
+                        type(exc).__name__,
+                    )
+            if failed_blob_count:
+                _logger.warning(
+                    "Session %s deleted with %d of %d attachment blobs left behind",
+                    session_id,
+                    failed_blob_count,
+                    len(orphaned_blob_keys),
+                )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)

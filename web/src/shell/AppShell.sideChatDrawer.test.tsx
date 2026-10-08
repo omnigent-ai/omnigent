@@ -8,7 +8,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
-import type * as UseGithubModule from "@/hooks/useGithub";
+import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -39,11 +39,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
     isLoading: false,
   })),
 }));
-vi.mock("@/hooks/useGithub", async (importOriginal) => ({
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   // Keep the real module (types, the panel's sibling hooks) — only the
   // info hook AppShell reads is replaced, per-test below.
-  ...(await importOriginal<typeof UseGithubModule>()),
-  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+  ...(await importOriginal<typeof UsePullRequestsModule>()),
+  usePullRequestInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
@@ -72,8 +72,8 @@ vi.mock("./Sidebar", () => ({
   Sidebar: () => <div data-testid="sidebar" />,
   isMobileViewport: vi.fn(() => false),
 }));
-vi.mock("./GithubPanel", () => ({
-  GithubPanel: () => <div data-testid="github-panel">Pull request details</div>,
+vi.mock("./PullRequestPanel", () => ({
+  PullRequestPanel: () => <div data-testid="github-panel">Pull request details</div>,
 }));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
@@ -93,12 +93,12 @@ vi.mock("./TerminalsPanel", () => ({
 
 import { AppShell } from "./AppShell";
 import { isMobileViewport } from "./Sidebar";
-import { useGithubInfo } from "@/hooks/useGithub";
+import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
-const useGithubInfoMock = vi.mocked(useGithubInfo);
+const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
 
 afterEach(cleanup);
 
@@ -109,9 +109,9 @@ beforeEach(() => {
   writeWorkspacePanelDefault("open");
   sessionStorage.clear();
   vi.mocked(isMobileViewport).mockReturnValue(false);
-  useGithubInfoMock.mockReset();
-  useGithubInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
-    typeof useGithubInfo
+  usePullRequestInfoMock.mockReset();
+  usePullRequestInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
+    typeof usePullRequestInfo
   >);
   vi.mocked(useConversations).mockReset();
   vi.mocked(useConversations).mockReturnValue({

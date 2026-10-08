@@ -120,7 +120,12 @@ import {
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
-import { matchSlashCommandInvocation, SlashCommandMenu } from "@/components/SlashCommandMenu";
+import {
+  matchSlashCommandInvocation,
+  skillDisplayNames,
+  skillMenuDescription,
+  SlashCommandMenu,
+} from "@/components/SlashCommandMenu";
 import {
   beginLocalConversation,
   hasPendingLocalMessage,
@@ -1302,6 +1307,7 @@ function visibleModelLabel(label: string): string {
 }
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
+type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
@@ -1385,6 +1391,7 @@ export function AgentHarnessPicker({
   triggerTooltip,
   triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  modelCatalogAvailability,
   triggerIcon,
   selectedConfigContent,
   isEntryConfigurable,
@@ -1445,6 +1452,10 @@ export function AgentHarnessPicker({
   triggerTooltipRows?: readonly { label: string; value: string }[];
   /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
+  /** Explicit status for the selected model catalog. `unknown` means there is
+   * no known catalog because lookup is disabled or still loading; omit it for
+   * consumers without catalog state. */
+  modelCatalogAvailability?: ModelCatalogAvailability;
   /** Harness glyph rendered before the joined model / effort label. */
   triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
@@ -1495,15 +1506,20 @@ export function AgentHarnessPicker({
     : null;
   const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
   const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
+  const modelCatalogUnavailable = modelCatalogAvailability === "unavailable";
   const visibleModelText = selectedUnavailable
     ? ""
-    : triggerModelText === "Default"
+    : modelCatalogUnavailable
       ? "Models unavailable"
       : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
-    .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
+    .map((detail) =>
+      detail.label === "Model" && modelCatalogUnavailable
+        ? "Model unavailable"
+        : `${detail.label} ${compactModelTriggerLabel(detail.value)}`,
+    )
     .join(", ");
   const triggerAccessibleName = [
     hasAgents ? agentLabel : "No agents",
@@ -1520,10 +1536,15 @@ export function AgentHarnessPicker({
     : visibleEffortText;
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
-  const visibleCachedPreview = selectedUnavailable ? null : cachedPreview;
+  const visibleCachedPreview =
+    selectedUnavailable || modelCatalogUnavailable ? null : cachedPreview;
   const resolvedPreview = useMemo<NewChatPickerPreview | null>(
     () =>
-      selectedEntry && hasAgents && visibleModelText !== "Models unavailable"
+      selectedEntry &&
+      hasAgents &&
+      !selectedUnavailable &&
+      modelCatalogAvailability !== "unavailable" &&
+      modelCatalogAvailability !== "unknown"
         ? {
             agent: { name: selectedEntry.name, harness: selectedEntry.harness },
             label: triggerAccessibleName,
@@ -1535,7 +1556,8 @@ export function AgentHarnessPicker({
     [
       selectedEntry,
       hasAgents,
-      visibleModelText,
+      selectedUnavailable,
+      modelCatalogAvailability,
       triggerAccessibleName,
       triggerText,
       triggerSecondaryText,
@@ -3223,7 +3245,7 @@ export function NewChatLandingScreen() {
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
   // via the fully-auto harness instead, which picks harness + model up front.
   // Each family gates on its OWN source: the external router's apply layer
-  // rewrites the model through the workspace AI gateway, so a host whose Claude
+  // rewrites the model through the workspace Unity Gateway, so a host whose Claude
   // Code runs off something else falls back to the built-in judge for that
   // family instead of losing the row — and loses it only when neither router
   // can answer.
@@ -3472,6 +3494,17 @@ export function NewChatLandingScreen() {
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
           : null;
+  const modelCatalogLookupEnabled = sandboxSelected
+    ? sandboxPreviewEnabled && sandboxInferenceConfigured
+    : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
+  const modelCatalogAvailability: ModelCatalogAvailability | undefined =
+    harnessTriggerDetails.some((row) => row.label === "Model") && !routingOn
+      ? pickerModelOptions.length > 0
+        ? "available"
+        : !modelCatalogLookupEnabled || pickerModelsLoading
+          ? "unknown"
+          : "unavailable"
+      : undefined;
   const pickerDataLoading =
     sandboxCatalogPending ||
     agentsLoading ||
@@ -4247,7 +4280,7 @@ export function NewChatLandingScreen() {
   const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
   // The fully-auto brain needs SOME router able to answer for both model
   // families — the router may land the session's work on either, and an arm the
-  // external router can't reach (off the workspace AI gateway) is only a loss
+  // external router can't reach (off the workspace Unity Gateway) is only a loss
   // when the built-in judge can't cover it either. The judge picks the bundle
   // brain's harness as well as its model, so unlike the native-pane row above
   // this surface stays on a judge-only deployment. Source availability ONLY:
@@ -4617,8 +4650,15 @@ export function NewChatLandingScreen() {
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
-        availableSkills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description]),
+        availableSkills.map((skill) => [
+          `${skillPrefix}${skill.name}`,
+          skillMenuDescription(skill),
+        ]),
       ),
+    [availableSkills, skillPrefix],
+  );
+  const skillLabels = useMemo(
+    () => skillDisplayNames(availableSkills, skillPrefix),
     [availableSkills, skillPrefix],
   );
   // Insert the selected skill at the caret while preserving surrounding text.
@@ -4629,6 +4669,7 @@ export function NewChatLandingScreen() {
     text: message,
     commands: skillCommands,
     skills: skillCommands,
+    labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
@@ -4862,15 +4903,11 @@ export function NewChatLandingScreen() {
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
-  // The Arca box's row in the host list, known only from the host id stored
-  // when Run on Arca connected it (a host's name is its machine hostname —
-  // no reliable relationship to the arca instance name, so no matching).
-  // While that host is online the Arca option disappears entirely; otherwise
-  // one click connects (starting a stopped instance along the way — the
-  // connect console shows what's happening, so no status needs pre-fetching).
+  // The Arca row is remembered by host ID, never inferred from its machine hostname.
+  // Reconnect remains available to recapture daemon identity after a desktop restart.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
-  const showArcaOption = arcaEnabled && !arcaHostOnline;
+  const showArcaOption = arcaEnabled;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca
@@ -5095,6 +5132,12 @@ export function NewChatLandingScreen() {
         if (!res.canceled && !res.shownInConsole) {
           setArcaError(res.error ?? "Couldn't connect to Arca.");
         }
+        return;
+      }
+      if (res.identity) {
+        writeArcaHostId(res.identity.hostId);
+        await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+        selectHost(res.identity.hostId);
         return;
       }
       // The box's daemon was already connected — its host has been in the
@@ -6393,6 +6436,7 @@ export function NewChatLandingScreen() {
                         onSelect={applySlashSelection}
                         commands={slashCompletion.commands}
                         builtinNames={slashCompletion.builtinNames}
+                        labels={slashCompletion.labels}
                         skillsStatus={skillsStatus}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}
@@ -6610,7 +6654,13 @@ export function NewChatLandingScreen() {
                             <span className="flex size-4 shrink-0 items-center justify-center">
                               <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                             </span>
-                            <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
+                            <span>
+                              {connectingArca
+                                ? "Connecting to Arca…"
+                                : arcaHostOnline
+                                  ? "Reconnect to Arca"
+                                  : "Run on Arca"}
+                            </span>
                           </DropdownMenuItem>
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}
@@ -6747,6 +6797,7 @@ export function NewChatLandingScreen() {
                             : undefined
                         }
                         triggerDetails={harnessTriggerDetails}
+                        modelCatalogAvailability={modelCatalogAvailability}
                         triggerIcon={
                           selectedAgent ? (
                             <span

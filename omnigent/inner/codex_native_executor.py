@@ -9,9 +9,10 @@ import contextlib
 import json
 import logging
 import os
+import uuid
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from websockets.exceptions import WebSocketException
 
@@ -20,6 +21,8 @@ from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
+    CodexMessage,
+    CodexParams,
     client_for_transport,
     is_stale_active_turn_error,
     resolve_codex_effort_for_model,
@@ -67,6 +70,10 @@ from omnigent.inner.native_attachments import (
     parse_data_uri,
     requires_filesystem,
     unresolved_attachment_marker,
+)
+from omnigent.native.input_diagnostics import (
+    log_input_event,
+    with_input_attributes,
 )
 from omnigent.process_logging import log_once
 from omnigent.util.reasoning_effort import (
@@ -172,6 +179,67 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
                 await client.close()
 
 
+async def _native_delivery_request(
+    client: CodexAppServerClient,
+    method: Literal["turn/start", "turn/steer"],
+    params: CodexParams,
+    state: CodexNativeBridgeState,
+) -> CodexMessage:
+    """Pair each RPC attempt with its result, including a rejected stale steer."""
+    attempt_id = uuid.uuid4().hex
+    stage = "turn_start" if method == "turn/start" else "turn_steer"
+    expected = params.get("expectedTurnId") if method == "turn/steer" else None
+    requested_turn_id = expected if isinstance(expected, str) else None
+    requested_thread = params.get("threadId")
+    thread_id = requested_thread if isinstance(requested_thread, str) else None
+    log_input_event(
+        _logger,
+        "codex_native_delivery_attempt",
+        session_id=state.session_id,
+        native_rpc_attempt_id=attempt_id,
+        stage=stage,
+        thread_id=thread_id,
+        native_turn_id=requested_turn_id,
+        requested_native_turn_id=requested_turn_id,
+    )
+    try:
+        response = await client.request(method, params)
+    except BaseException as exc:
+        log_input_event(
+            _logger,
+            "codex_native_delivery_finished",
+            session_id=state.session_id,
+            native_rpc_attempt_id=attempt_id,
+            stage=stage,
+            thread_id=thread_id,
+            native_turn_id=requested_turn_id,
+            requested_native_turn_id=requested_turn_id,
+            outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "rpc_error",
+            exception_type=type(exc).__name__,
+            rpc_error_code=exc.code if isinstance(exc, CodexAppServerResponseError) else None,
+        )
+        raise
+    result = _json_object(response.get("result"))
+    if method == "turn/start":
+        turn = _json_object(result.get("turn")) if result is not None else None
+        turn_id = turn.get("id") if turn is not None else None
+    else:
+        turn_id = result.get("turnId") if result is not None else None
+    native_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
+    log_input_event(
+        _logger,
+        "codex_native_delivery_finished",
+        session_id=state.session_id,
+        native_rpc_attempt_id=attempt_id,
+        stage=stage,
+        thread_id=thread_id,
+        requested_native_turn_id=requested_turn_id,
+        native_turn_id=native_turn_id,
+        outcome="rpc_accepted" if native_turn_id else "rpc_accepted_missing_turn_id",
+    )
+    return response
+
+
 async def _start_codex_turn(
     client: CodexAppServerClient,
     *,
@@ -226,7 +294,8 @@ async def _start_codex_turn(
         failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
         for key, value in failed.items():
             _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
-    response = await client.request(
+    response = await _native_delivery_request(
+        client,
         "turn/start",
         {
             "threadId": state.thread_id,
@@ -238,6 +307,7 @@ async def _start_codex_turn(
                 }
             ],
         },
+        state,
     )
     result = _json_object(response.get("result"))
     turn = _json_object(result.get("turn")) if result is not None else None
@@ -256,13 +326,15 @@ async def _steer_codex_turn(
 ) -> None:
     """Steer one bridge-recorded active Codex turn."""
     assert state.active_turn_id is not None
-    response = await client.request(
+    response = await _native_delivery_request(
+        client,
         "turn/steer",
         {
             "threadId": state.thread_id,
             "expectedTurnId": state.active_turn_id,
             "input": input_items,
         },
+        state,
     )
     result = _json_object(response.get("result"))
     turn_id = result.get("turnId") if result is not None else None
@@ -399,8 +471,25 @@ class CodexNativeExecutor(Executor):
                     input_items=input_items,
                     settings_overrides={},
                 )
-            except Exception:  # noqa: BLE001 - steering is best-effort from the runner facade.
-                _logger.warning("Codex native turn/steer failed", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - steering is best-effort from the runner facade.
+                _logger.warning(
+                    "Codex native turn/steer failed",
+                    exc_info=True,
+                    extra=with_input_attributes(
+                        debug_event(
+                            "codex_turn_injection_failed",
+                            session_id=state.session_id,
+                            turn_id=state.active_turn_id,
+                            initial_native_turn_id=state.active_turn_id,
+                            thread_id=state.thread_id,
+                            rpc_error_code=exc.code
+                            if isinstance(exc, CodexAppServerResponseError)
+                            else None,
+                            stage="native_rpc",
+                            outcome="error",
+                        )
+                    ),
+                )
                 return False
             finally:
                 await client.close()
@@ -644,16 +733,21 @@ class CodexNativeExecutor(Executor):
                     except Exception as exc:
                         _logger.exception(
                             "Codex native turn injection failed",
-                            extra=debug_event(
-                                "codex_turn_injection_failed",
-                                session_id=state.session_id,
-                                turn_id=state.active_turn_id,
-                                thread_id=state.thread_id,
-                                rpc_error_code=(
-                                    exc.code
-                                    if isinstance(exc, CodexAppServerResponseError)
-                                    else None
-                                ),
+                            extra=with_input_attributes(
+                                debug_event(
+                                    "codex_turn_injection_failed",
+                                    session_id=state.session_id,
+                                    turn_id=state.active_turn_id,
+                                    initial_native_turn_id=state.active_turn_id,
+                                    thread_id=state.thread_id,
+                                    rpc_error_code=(
+                                        exc.code
+                                        if isinstance(exc, CodexAppServerResponseError)
+                                        else None
+                                    ),
+                                    stage="native_rpc",
+                                    outcome="error",
+                                )
                             ),
                         )
                         error_msg = f"Codex native executor error: {exc}"
