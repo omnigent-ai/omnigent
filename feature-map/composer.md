@@ -39,9 +39,10 @@ and steers messages while the agent is busy.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
-- `delivered-send-recovery`: a sent message stays out of the composer when its
-  HTTP acknowledgement is lost. Delivery during draft restoration clears the
-  untouched draft; user edits remain.
+- `delivered-send-recovery`: a sent message stays out of recovery when its HTTP
+  acknowledgement is lost. A failed send is retained as a transcript card
+  (Retry/Edit/Discard); proof of delivery under its stable id drops the card
+  rather than re-offering it, and a newer composer draft is never overwritten.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
@@ -159,8 +160,10 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
-  for the desktop entry point. The restore/delivery ordering and preservation of
-  user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+  for the desktop entry point. Retained-card reconciliation — dropping a card
+  once delivery is proven, and never re-offering a delivered send — is covered in
+  `web/src/store/chatStore.test.ts` and
+  `tests/e2e_ui/chat/test_failed_send_recovery.py`.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the

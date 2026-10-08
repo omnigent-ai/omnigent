@@ -5,7 +5,7 @@ import {
   getConnectionProtocol,
   maxLiveConversations,
 } from "./conversationRegistry";
-import type { PendingUserMessage } from "./chatStore";
+import type { FailedUserMessage, PendingUserMessage } from "./chatStore";
 
 /** An unsettled optimistic bubble — the shape that pins an entry. */
 function unsentBubble(tempId = "pend_1"): PendingUserMessage {
@@ -15,6 +15,19 @@ function unsentBubble(tempId = "pend_1"): PendingUserMessage {
 /** A bubble whose POST has returned; the server owns it now. */
 function postedBubble(tempId = "pend_1"): PendingUserMessage {
   return { ...unsentBubble(tempId), posted: true };
+}
+
+/** A send retained after its POST failed — the other shape that pins an entry. */
+function retainedSend(conversationId: string, stableId: string): FailedUserMessage {
+  return {
+    stableId,
+    conversationId,
+    agentId: "agent_xyz",
+    text: "retry me",
+    files: [],
+    reason: "Failed to fetch",
+    serverRefused: false,
+  };
 }
 
 describe("maxLiveConversations", () => {
@@ -168,16 +181,16 @@ describe("ConversationRegistry", () => {
     expect(a.disposed).toBe(false);
   });
 
-  it("never evicts an entry holding a failed-send draft", () => {
-    // A send that failed rolls its optimistic bubble back but stashes the text
-    // + files as `failedSendDraft` — the only surviving copy, since the server
+  it("never evicts an entry holding a retained failed send", () => {
+    // A send that failed rolls its optimistic bubble back and is retained as a
+    // `failedUserMessages` entry — the only surviving copy, since the server
     // never received it. If that failure settles after the conversation was
     // backgrounded, the rolled-back bubble leaves nothing else pinning the
-    // entry, so eviction would drop the retry draft. Pin on the draft too.
+    // entry, so eviction would drop the retry copy. Pin on the retained send.
     const a = registry.acquire("conv_a");
     a.setState({
       pendingUserMessages: [], // bubble already rolled back
-      failedSendDraft: { conversationId: "conv_a", text: "retry me", files: [] },
+      failedUserMessages: [retainedSend("conv_a", "a".repeat(32))],
     });
     registry.acquire("conv_b");
     expect(registry.evictLruEvictable()).toBe("conv_b");
@@ -185,12 +198,26 @@ describe("ConversationRegistry", () => {
     expect(a.disposed).toBe(false);
   });
 
-  it("evicts once a failed-send draft is cleared (composer restored it)", () => {
-    // The pin releases as soon as the draft is consumed on return, so the entry
-    // stops holding a slot the moment its retry copy is safe in the composer.
+  it("never evicts an entry holding a stopped first message's draft", () => {
+    // `stop` hands a first message the user cancelled before dispatch back to
+    // the composer through `failedSendDraft`; it is held until restored.
     const a = registry.acquire("conv_a");
-    a.setState({ failedSendDraft: { conversationId: "conv_a", text: "x", files: [] } });
-    a.setState({ failedSendDraft: null });
+    a.setState({ failedSendDraft: { conversationId: "conv_a", text: "retry me", files: [] } });
+    registry.acquire("conv_b");
+    expect(registry.evictLruEvictable()).toBe("conv_b");
+    expect(registry.has("conv_a")).toBe(true);
+    expect(a.disposed).toBe(false);
+  });
+
+  it("evicts once the retained sends are gone and the draft is cleared", () => {
+    // The pins release as soon as the retained copy is delivered or discarded
+    // and the draft is consumed, so the entry stops holding a slot.
+    const a = registry.acquire("conv_a");
+    a.setState({
+      failedUserMessages: [retainedSend("conv_a", "a".repeat(32))],
+      failedSendDraft: { conversationId: "conv_a", text: "x", files: [] },
+    });
+    a.setState({ failedUserMessages: [], failedSendDraft: null });
     expect(registry.evictLruEvictable()).toBe("conv_a");
     expect(a.disposed).toBe(true);
   });
@@ -299,6 +326,36 @@ describe("ConversationRegistry", () => {
     ]);
     expect(temp.disposed).toBe(true);
     expect(registry.has("temp:aaaa0001")).toBe(false);
+  });
+
+  it("rekey re-addresses retained failed sends to the real id", () => {
+    const temp = registry.acquire("temp:new");
+    temp.setState({ failedUserMessages: [retainedSend("temp:new", "b".repeat(32))] });
+
+    registry.rekey("temp:new", "conv_real");
+
+    expect(registry.peek("conv_real")?.getState().failedUserMessages).toMatchObject([
+      { stableId: "b".repeat(32), conversationId: "conv_real" },
+    ]);
+  });
+
+  it("rekey onto an already-live id merges the retained failed sends it lacks", () => {
+    const live = registry.acquire("conv_real");
+    live.setState({ failedUserMessages: [retainedSend("conv_real", "a".repeat(32))] });
+    const temp = registry.acquire("temp:new");
+    temp.setState({
+      failedUserMessages: [
+        retainedSend("temp:new", "a".repeat(32)),
+        retainedSend("temp:new", "b".repeat(32)),
+      ],
+    });
+
+    registry.rekey("temp:new", "conv_real");
+
+    expect(live.getState().failedUserMessages).toMatchObject([
+      { stableId: "b".repeat(32), conversationId: "conv_real" },
+      { stableId: "a".repeat(32), conversationId: "conv_real" },
+    ]);
   });
 
   it("rekey is a no-op when the old id is not live", () => {

@@ -1,7 +1,7 @@
 """Browser journey for a host-launched runner that never connects.
 
 A real host spawns a runner that SIGSTOP freezes before its tunnel dial.
-After the send fails, check the error headline and expanded server cause.
+After the send fails, the retained card names the failed runner-connect phase.
 """
 
 from __future__ import annotations
@@ -27,9 +27,7 @@ from tests.e2e_ui.conftest import _register_extra_agent
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# The error code determines the banner headline.
-_EXPECTED_HEADLINE = "The session's runner isn't connected to the server."
-# The expanded body names the failed connection phase.
+# The retained failed-send card names the failed connection phase.
 _EXPECTED_CAUSE_SUBSTRING = "never connected to the server"
 _RUNNER_TOKEN_PATTERN = re.compile(r"runner_token_[0-9a-f]+")
 
@@ -188,19 +186,18 @@ def test_host_session_that_never_connects_names_the_cause(
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=30_000)
 
-        # The send relaunches; the wedger freezes that runner too.
+        # The send relaunches; the wedger freezes that runner too. The failed
+        # send is retained as a transcript card that names the connect phase
+        # and offers Retry.
         composer.fill("hello? is anything happening?")
         composer.press("Enter")
-        error_pill = page.get_by_test_id("error-pill")
-        expect(error_pill).to_be_visible(timeout=150_000)
-        expect(page.get_by_test_id("error-headline")).to_have_text(
-            _EXPECTED_HEADLINE, timeout=15_000
-        )
+        card = page.get_by_test_id("failed-send-message")
+        expect(card).to_be_visible(timeout=150_000)
+        expect(card.get_by_text(_EXPECTED_CAUSE_SUBSTRING)).to_be_visible(timeout=15_000)
+        expect(card.get_by_text(_RUNNER_TOKEN_PATTERN)).to_be_visible()
+        expect(card.get_by_role("button", name="Retry")).to_be_visible()
 
         # Keep the named runner and phase visible for the recording.
-        error_pill.click()
-        expect(page.get_by_text(_EXPECTED_CAUSE_SUBSTRING)).to_be_visible(timeout=15_000)
-        expect(page.get_by_text(_RUNNER_TOKEN_PATTERN)).to_be_visible()
         page.wait_for_timeout(2_500)
 
         assert not _runner_online(live_server, gen1_id), (

@@ -8,7 +8,7 @@
 // on revisit is a transcript cache in a different shape, which is what keeping
 // streams open replaces. Live-or-gone is the simplification.
 
-import type { ConversationState } from "./chatStore";
+import type { ConversationState, FailedUserMessage } from "./chatStore";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 
 /**
@@ -234,15 +234,26 @@ export class ConversationRegistry {
     const existing = this.entries.get(newId);
     if (existing !== undefined) {
       const existingState = existing.getState();
+      const oldState = old.getState();
       const existingPendingIds = new Set(
         existingState.pendingUserMessages.map((item) => item.tempId),
       );
-      const missingPending = old
-        .getState()
-        .pendingUserMessages.filter((item) => !existingPendingIds.has(item.tempId));
-      if (missingPending.length > 0) {
+      const missingPending = oldState.pendingUserMessages.filter(
+        (item) => !existingPendingIds.has(item.tempId),
+      );
+      const existingFailedIds = new Set(existingState.failedUserMessages.map((m) => m.stableId));
+      const missingFailed = rekeyFailedMessages(
+        oldState.failedUserMessages.filter((m) => !existingFailedIds.has(m.stableId)),
+        newId,
+      );
+      if (missingPending.length > 0 || missingFailed.length > 0) {
         existing.setState({
           pendingUserMessages: [...missingPending, ...existingState.pendingUserMessages],
+          // Keep the oldest-first order `send` establishes; a merged temp entry
+          // can carry a newer failed send than the ones already on the live id.
+          failedUserMessages: [...missingFailed, ...existingState.failedUserMessages].sort(
+            (a, b) => (a.seq ?? 0) - (b.seq ?? 0),
+          ),
         });
       }
       this.release(oldId);
@@ -250,7 +261,11 @@ export class ConversationRegistry {
       return;
     }
     const next = this.createEntry(newId);
-    next.setState(old.getState());
+    const oldState = old.getState();
+    next.setState({
+      ...oldState,
+      failedUserMessages: rekeyFailedMessages(oldState.failedUserMessages, newId),
+    });
     this.entries.set(newId, next);
     this.entries.delete(oldId);
     old.dispose();
@@ -337,21 +352,25 @@ export class ConversationRegistry {
   }
 }
 
+/** Retained failed sends re-addressed to the id their conversation now has. */
+function rekeyFailedMessages(
+  messages: FailedUserMessage[],
+  conversationId: string,
+): FailedUserMessage[] {
+  return messages.map((m) => (m.conversationId === conversationId ? m : { ...m, conversationId }));
+}
+
 /**
- * Whether an entry holds work the server has no record of.
- *
- * Two shapes of client-only work, each existing nowhere but this tab, so
- * evicting the entry would lose it outright — the cases where dropping an entry
- * is NOT equivalent to a cold load (the hazard `pendingByConversation` was built
- * to survive; pinning replaces that stash):
- *
- *   - an unsettled optimistic bubble (`send`'s POST hasn't returned); and
- *   - a `failedSendDraft` — a send that failed AND rolled its bubble back, so
- *     the draft is the sole surviving copy of the user's text and files. It is
- *     held until the composer restores it on return; evicting first drops it.
+ * Prevent eviction while an entry owns client-only work the server has no record
+ * of: an unacknowledged optimistic bubble, a retained failed send, or a stopped
+ * first message. Each exists only in this tab, so eviction would lose it.
  */
 function hasUnsentWork(state: ConversationState): boolean {
-  return state.pendingUserMessages.some((m) => m.posted !== true) || state.failedSendDraft !== null;
+  return (
+    state.pendingUserMessages.some((m) => m.posted !== true) ||
+    state.failedUserMessages.length > 0 ||
+    state.failedSendDraft !== null
+  );
 }
 
 /** The app's registry. Module-scope, like the store it backs. */

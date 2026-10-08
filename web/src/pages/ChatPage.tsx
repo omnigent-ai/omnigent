@@ -89,7 +89,6 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
-  committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
@@ -130,7 +129,6 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
-  restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
   type ComposerDraft,
@@ -2397,14 +2395,10 @@ function ComposerImpl(
   // "Attach to agent" button). Drained into ``mentionedItems`` below, then
   // cleared from the store so they aren't re-applied.
   const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
-  // Text + attachments handed back by a send that failed before the server
-  // took ownership. Drained below so the message can be retried.
+  // A first message the user stopped before dispatch, handed back so the
+  // composer can restore it (drained by the effect below). A send that FAILED
+  // is retained in the transcript instead (see `failedUserMessages`).
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
-  // A restored failed-send draft whose fate is still unknown — flips to
-  // `delivered` when the send turns out to have reached the server, so the
-  // retraction effect below can empty the composer.
-  const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
-  const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
@@ -2930,92 +2924,27 @@ function ComposerImpl(
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
   }, [pendingComposerAttachments, setMentionedItems]);
 
-  // Restore the text (and attachments) of a send that failed, so the user can
-  // fix and resend instead of retyping. The composer is empty in the normal
-  // case — `submit` clears it optimistically — so only fill it when the user
-  // hasn't already started something new; their in-progress text wins. Files
-  // are re-validated on the way in: when the upload itself was what failed
-  // (a 415 on an unsupported type), re-arming the same file would only fail
-  // again, so it's dropped with the same inline reason a fresh attach gives.
+  // Restore a first message the user stopped before dispatch so they can fix
+  // and resend; files are re-validated on the way in. A send that FAILED is
+  // retained in the transcript instead (see `failedUserMessages`).
   useEffect(() => {
     if (failedSendDraft === null) return;
     if (failedSendDraft.conversationId !== conversationId) return;
-    // Wait for the draft-restore effect to settle this conversation's text
-    // into value/files. Reading the refs mid-switch would see the PREVIOUS
-    // conversation's draft and wrongly conclude the user is mid-sentence,
-    // dropping the failed message on the way back to the session it failed in.
+    // Wait for the draft-restore effect to settle this conversation's text into
+    // value/files: reading the refs mid-switch would see the PREVIOUS session's
+    // draft and wrongly drop this message as the user being mid-sentence.
     if (settledConversationId !== conversationId) return;
-    // The send may have proven delivered since the render that scheduled this
-    // effect: its committed item landed under the send's stable id (see
-    // `retractDeliveredSendDraft`), so restoring now would prime a duplicate.
-    // Not so for a send the server refused: its item is persisted too, but the
-    // runner never took it, so the text must come back for a resend.
-    if (committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft)) {
-      useChatStore.setState({ failedSendDraft: null });
-      return;
-    }
-    useChatStore.setState({
-      failedSendDraft: null,
-      pendingRetryStableId: failedSendDraft.stableId ?? null,
-    });
-    // The user started something new while the send was in flight — their
-    // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      useChatStore.setState({ pendingRetryStableId: null });
-      return;
-    }
-    pendingFailedSendRestore.current = failedSendDraft.stableId
-      ? { stableId: failedSendDraft.stableId, draft }
-      : null;
+    useChatStore.setState({ failedSendDraft: null });
+    // The user started something new meanwhile — their in-progress text wins
+    // over a clobbering restore.
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
     replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0)
       attachmentsRef.current.replaceFiles(failedSendDraft.files);
-    // Remember what was restored: if the "failed" send proves delivered (its
-    // stable id shows up as a committed item), the retraction effect below
-    // empties the composer instead of priming a duplicate send.
-    if (failedSendDraft.stableId) {
-      useChatStore.setState({
-        restoredSendDraft: {
-          conversationId: failedSendDraft.conversationId,
-          stableId: failedSendDraft.stableId,
-          text: failedSendDraft.text,
-          files: failedSendDraft.files,
-          replyDraft: failedSendDraft.replyDraft,
-          serverRefused: failedSendDraft.serverRefused,
-          delivered: false,
-        },
-      });
-    }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, replaceText, draft]);
-
-  // Retract a restored failed-send draft once its send proves delivered (its
-  // committed item arrived over the stream or a reconnect snapshot). Edits win:
-  // the text is cleared only while it is exactly what the restore put there.
-  useEffect(() => {
-    if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
-    if (restoredSendDraft.conversationId !== conversationId) return;
-    if (settledConversationId !== conversationId) return;
-    // Delivery can interrupt the queued text restore with a store render.
-    // Wait for the local draft update before deciding whether the user edited it.
-    const pending = pendingFailedSendRestore.current;
-    if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
-    pendingFailedSendRestore.current = null;
-    useChatStore.setState({ restoredSendDraft: null });
-    const expected = serializeReplyDraft(
-      restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
-    );
-    const filesUnedited =
-      filesRef.current.length === restoredSendDraft.files.length &&
-      filesRef.current.every((f) => restoredSendDraft.files.includes(f));
-    if (valueRef.current !== expected || !filesUnedited) return;
-    replaceText("");
-    attachmentsRef.current.replaceFiles([]);
-    dirtyRef.current = false;
-    if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
-  }, [restoredSendDraft, conversationId, settledConversationId, replaceText, draft]);
+  }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
 
   /**
    * Execute a slash command by name + optional argument string.

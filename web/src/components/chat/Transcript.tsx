@@ -56,6 +56,7 @@ import {
   stripPendingElicitations,
 } from "@/components/chat/chatBubbleParts";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
+import { FailedSendMessages } from "@/components/chat/FailedSendMessage";
 
 export interface TranscriptProps {
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
@@ -118,6 +119,7 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedUserMessages = useChatStore((s) => s.failedUserMessages);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -342,7 +344,10 @@ function TranscriptImpl({
               scrollElement={scroller?.el ?? null}
               rowCount={display.streamBubbles.length}
             />
-            {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
+            {display.bubbles.length === 0 &&
+            failedUserMessages.length === 0 &&
+            !showWorkingIndicator &&
+            !display.mcpStartupActive ? (
               sandboxLaunching ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (
@@ -375,6 +380,10 @@ function TranscriptImpl({
                   messageId={messageId}
                   onGeometryChange={onGeometryChange}
                 />
+                {/* Sends that failed stay here, below the committed transcript,
+                each with its own Retry, so a newer composer draft is never
+                clobbered and no failure displaces an earlier one. */}
+                <FailedSendMessages messages={failedUserMessages} />
                 {/* Pending elicitation cards, floated to the bottom of the chat
                 so an outstanding question stays in view. Newest renders last,
                 nearest the composer. Above the Working… indicator. */}

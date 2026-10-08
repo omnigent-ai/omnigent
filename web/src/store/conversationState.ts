@@ -15,6 +15,7 @@ import type { ConversationState } from "./chatStore";
 const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   blocks: true,
   pendingUserMessages: true,
+  failedUserMessages: true,
   activeResponse: true,
   interruptedResponseIds: true,
   status: true,
@@ -60,8 +61,6 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   abortController: true,
   runnerLaunchedAt: true,
   failedSendDraft: true,
-  pendingRetryStableId: true,
-  restoredSendDraft: true,
   sendLatchedAt: true,
   historyGeneration: true,
   awaitingSideChatFor: true,
@@ -82,6 +81,7 @@ export function createInitialConversationState(): ConversationState {
   return {
     blocks: [],
     pendingUserMessages: [],
+    failedUserMessages: [],
     activeResponse: null,
     interruptedResponseIds: [],
     status: "idle",
@@ -127,8 +127,6 @@ export function createInitialConversationState(): ConversationState {
     abortController: null,
     runnerLaunchedAt: null,
     failedSendDraft: null,
-    pendingRetryStableId: null,
-    restoredSendDraft: null,
     sendLatchedAt: null,
     historyGeneration: 0,
     awaitingSideChatFor: null,

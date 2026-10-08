@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -463,5 +463,55 @@ describe("side chat sealed by the server", () => {
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
     );
+  });
+});
+
+describe("side-chat retained failed sends", () => {
+  const retainedFailedSend = (overrides = {}) => ({
+    stableId: "f".repeat(32),
+    conversationId: childId,
+    agentId: "agent_side",
+    text: "side question that failed",
+    files: [],
+    reason: "Failed to fetch",
+    serverRefused: false,
+    ...overrides,
+  });
+
+  it("keeps a failed send visible with its Retry even when the pane has no bubble yet", () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "idle",
+      failedUserMessages: [retainedFailedSend()],
+    });
+    renderPane(<SideChatPane childId={childId} />);
+
+    const card = screen.getByTestId("failed-send-message");
+    expect(card).toHaveTextContent("side question that failed");
+    expect(card).toHaveTextContent("Failed to send");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+  });
+
+  it("keeps a failed send recoverable below the load-error view", () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "idle",
+      conversationLoadError: new Error("stream unavailable"),
+      failedUserMessages: [retainedFailedSend()],
+    });
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.getByText("Couldn’t load this side chat")).toBeInTheDocument();
+    const card = screen.getByTestId("failed-send-message");
+    expect(card).toHaveTextContent("side question that failed");
+    expect(within(card).getByRole("button", { name: "Retry" })).toBeEnabled();
+  });
+
+  it("hides retained failed sends in a dead, read-only side chat", () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "idle",
+      failedUserMessages: [retainedFailedSend()],
+    });
+    renderPane(<SideChatPane childId={childId} readOnly />);
+
+    expect(screen.queryByTestId("failed-send-message")).toBeNull();
   });
 });

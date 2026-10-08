@@ -22,6 +22,7 @@ import {
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
 } from "@/components/chat/chatBubbleParts";
+import { FailedSendMessages } from "@/components/chat/FailedSendMessage";
 import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
@@ -120,6 +121,7 @@ export function SideChatPane({
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUserMessages,
     subagentRoutingOverride,
     sessionStatus,
     sessionHarness,
@@ -226,7 +228,15 @@ export function SideChatPane({
   }, [bubbles.length, activeResponse]);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
-  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
+  // A live pane never hides retained failed sends: they replace the empty state
+  // and render below the load-error view. A dead fork can't recover them.
+  const hasRetainedFailures = !readOnly && failedUserMessages.length > 0;
+  const isEmpty =
+    bubbles.length === 0 &&
+    !hasRetainedFailures &&
+    !loadingConversation &&
+    !loadFailed &&
+    !showsWorking;
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;
@@ -246,22 +256,29 @@ export function SideChatPane({
       <div className="side-chat-backdrop flex h-full min-h-0 flex-col">
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4">
           {loadFailed ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-              <TriangleAlertIcon className="size-6 text-muted-foreground" />
-              <p className="text-ui font-medium text-foreground">Couldn’t load this side chat</p>
-              <p className="max-w-[36ch] text-sm text-muted-foreground">
-                {conversationLoadError?.message ?? "Please try again."}
-              </p>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="mt-1"
-                onClick={() => void ensureConversationStreamed(childId)}
-              >
-                Retry
-              </Button>
-            </div>
+            <>
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+                <TriangleAlertIcon className="size-6 text-muted-foreground" />
+                <p className="text-ui font-medium text-foreground">Couldn’t load this side chat</p>
+                <p className="max-w-[36ch] text-sm text-muted-foreground">
+                  {conversationLoadError?.message ?? "Please try again."}
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="mt-1"
+                  onClick={() => void ensureConversationStreamed(childId)}
+                >
+                  Retry
+                </Button>
+              </div>
+              {hasRetainedFailures && (
+                <div className="flex flex-col gap-4">
+                  <FailedSendMessages messages={failedUserMessages} />
+                </div>
+              )}
+            </>
           ) : isEmpty ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <MessagesSquareIcon className="size-6 text-muted-foreground" />
@@ -279,6 +296,8 @@ export function SideChatPane({
                   recoveryDisabled={readOnly}
                 />
               ))}
+              {/* Failed sends render below the transcript, matching the main pane. */}
+              {!readOnly && <FailedSendMessages messages={failedUserMessages} />}
               {shouldShowWorkingIndicator(showsWorking, bubbles) && <WorkingIndicator />}
               <div ref={bottomRef} />
             </div>

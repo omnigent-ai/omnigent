@@ -231,22 +231,22 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     expect(error).to_have_count(0, timeout=10_000)
 
 
-def test_failed_upload_restores_the_message(
+def test_failed_upload_retains_the_message_for_retry(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    """A send whose upload fails hands the message back to the composer.
+    """A send whose upload fails stays in the transcript, editable and retryable.
 
-    Before, a failed upload left the user with an error and an empty composer:
-    ``submit`` clears the text optimistically, the optimistic bubble rolls
-    back, and nothing else held the message. Now ``send`` stashes it in
-    ``failedSendDraft`` and the composer restores it.
+    ``submit`` clears the composer optimistically and the optimistic bubble
+    rolls back, so the retained message is the only copy of the text and its
+    attachment. It must show the server's reason, let the user remove the
+    rejected attachment, and deliver on Retry — without touching the composer.
 
     The failure is injected at the network boundary (the upload route responds
     415 with the server's real body) rather than by attaching an unsupported
     file — client-side validation would reject that before any request, so it
-    would never exercise this path. The 415 body also pins the second half of
-    the fix: the banner must carry the server's reason, not a bare
-    ``upload failed: 415`` built from an empty HTTP/2 ``statusText``.
+    would never exercise this path. The 415 body also pins that the reason
+    shown is the server's, not a bare ``upload failed: 415`` built from an
+    empty HTTP/2 ``statusText``.
     """
     base_url, session_id = seeded_session
     sample = tmp_path / _ATTACH_NAME
@@ -271,16 +271,32 @@ def test_failed_upload_restores_the_message(
     composer.fill("look at this file")
     composer.press("Enter")
 
-    # The compact pill keeps the reason one expansion away instead of
-    # dropping it or replacing it with a bare status line.
-    pill = page.get_by_test_id("error-pill")
-    expect(pill).to_be_visible(timeout=30_000)
-    headline = pill.get_by_role("button", name="Something went wrong", exact=False)
-    expect(headline).to_have_attribute("aria-expanded", "false")
-    headline.click()
-    expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible()
-    # And the message is back in the composer, ready to retry.
-    expect(composer).to_have_value("look at this file", timeout=10_000)
+    # The message stays on the page with the server's reason and a Retry; the
+    # composer is free for whatever comes next.
+    failed = page.get_by_test_id("failed-send-message")
+    expect(failed).to_be_visible(timeout=30_000)
+    expect(failed).to_have_attribute("data-delivery-status", "not_sent")
+    expect(failed).to_contain_text("look at this file")
+    expect(failed).to_contain_text(_ATTACH_NAME)
+    expect(failed).to_contain_text("Failed to send")
+    expect(failed).to_contain_text("Unsupported attachment type")
+    expect(page.get_by_test_id("error-pill")).to_have_count(0)
+    expect(composer).to_have_value("")
+
+    # Drop the rejected attachment from the retained message, then retry: the
+    # text alone goes through and the retained copy is gone.
+    failed.get_by_role("button", name="Edit", exact=True).click()
+    failed.get_by_role("button", name=f"Remove {_ATTACH_NAME}").click()
+    failed.get_by_role("button", name="Save changes", exact=True).click()
+    expect(failed).not_to_contain_text(_ATTACH_NAME)
+    failed.get_by_role("button", name="Retry", exact=True).click()
+    expect(
+        page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+            has_text="look at this file"
+        )
+    ).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("failed-send-message")).to_have_count(0)
+    expect(composer).to_have_value("")
 
 
 # Synthesises an OS file drag: Playwright can't drive a real desktop-to-browser
