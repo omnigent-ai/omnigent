@@ -2628,6 +2628,11 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
     class _FakeFilesystemRegistry:
         """Records the watch_path it was created with; never touches git."""
 
+        # ``/changes`` reads the tracking descriptor off every registry; answer
+        # like the non-git registry this fake stands in for.
+        tracks_all_changes = False
+        tracking_limit_reason = filesystem_registry_mod.TRACKING_LIMIT_NON_GIT
+
         def __init__(self, watch_path: Path | None) -> None:
             self.watch_path = watch_path
 

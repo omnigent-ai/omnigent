@@ -13,6 +13,10 @@
 // Both hooks return `available: false` on 404 so the UI can degrade
 // gracefully when the runner has no OS environment for the session
 // (e.g. cloud-only agents).
+//
+// useWorkspaceChangedFiles also surfaces the runner's `tracking` field as
+// `trackingComplete` / `trackingReason`: non-git workspaces track only the
+// agent's own file-tool edits, so the panel can explain a partial list.
 
 import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -109,9 +113,22 @@ export interface WorkspaceChangedFile {
   lines_removed: number | null;
 }
 
+/**
+ * Why tracking is partial: `non_git_workspace` (only the agent's file-tool
+ * edits are recorded) or `no_workspace` (no tracked workspace at all).
+ */
+export type WorkspaceChangesTrackingReason = "non_git_workspace" | "no_workspace";
+
 export interface WorkspaceChangedFilesResult {
   available: boolean;
   data: WorkspaceChangedFile[];
+  /**
+   * Whether the list captures every working-tree edit. Defaults to `true`
+   * when an older runner omits `tracking`, so no spurious notice shows.
+   */
+  trackingComplete: boolean;
+  /** Reason tracking is incomplete, or `null` when {@link trackingComplete}. */
+  trackingReason: WorkspaceChangesTrackingReason | null;
 }
 
 /**
@@ -209,6 +226,29 @@ interface ChangedFilesResponse {
     lines_removed: number | null;
   }[];
   has_more: boolean;
+  tracking?: {
+    complete: boolean;
+    reason: string | null;
+  };
+}
+
+/**
+ * Normalize the runner's `tracking` descriptor: missing (older runner) means
+ * complete, a present descriptor is complete only when it says so, an
+ * unrecognized reason collapses to `null`, and a reason is only kept while
+ * tracking is incomplete.
+ */
+function parseTracking(tracking: ChangedFilesResponse["tracking"]): {
+  trackingComplete: boolean;
+  trackingReason: WorkspaceChangesTrackingReason | null;
+} {
+  if (!tracking) return { trackingComplete: true, trackingReason: null };
+  const reason =
+    tracking.reason === "non_git_workspace" || tracking.reason === "no_workspace"
+      ? tracking.reason
+      : null;
+  const trackingComplete = tracking.complete === true;
+  return { trackingComplete, trackingReason: trackingComplete ? null : reason };
 }
 
 async function fetchWorkspaceChangedFiles(
@@ -218,7 +258,7 @@ async function fetchWorkspaceChangedFiles(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/changes`,
   );
   if (res.status === 404) {
-    return { available: false, data: [] };
+    return { available: false, data: [], trackingComplete: true, trackingReason: null };
   }
   // The bound runner isn't connected. Throw the typed error so the panel
   // can show a reconnect hint — but only for the app's runner_unavailable
@@ -250,7 +290,7 @@ async function fetchWorkspaceChangedFiles(
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
   }));
-  return { available: true, data };
+  return { available: true, data, ...parseTracking(json.tracking) };
 }
 
 /**

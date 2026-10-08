@@ -37,6 +37,7 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  type WorkspaceChangedFilesResult,
 } from "./useWorkspaceChangedFiles";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
@@ -1571,5 +1572,152 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
     const url = String(fetchMock.mock.calls[1][0]);
     expect(url).toContain("/filesystem/src/inner?");
     expect(url).not.toContain("base=");
+  });
+});
+
+describe("useWorkspaceChangedFiles tracking signal", () => {
+  function ChangedFilesDataProbe({
+    id,
+    onData,
+  }: {
+    id: string | undefined;
+    onData: (data: WorkspaceChangedFilesResult) => void;
+  }) {
+    const query = useWorkspaceChangedFiles(id);
+    useEffect(() => {
+      if (query.isSuccess) onData(query.data);
+    }, [query.isSuccess, query.data, onData]);
+    return null;
+  }
+
+  it.each(["non_git_workspace", "no_workspace"] as const)(
+    "surfaces incomplete tracking with the %s reason",
+    async (reason) => {
+      // Both recognized reasons must survive parsing so the panel can explain
+      // why the (possibly empty) list is partial.
+      onlineMock.mockReturnValue(true);
+      fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
+        jsonResponse({
+          object: "list",
+          data: [],
+          has_more: false,
+          tracking: { complete: false, reason },
+        }),
+      );
+
+      const seen: WorkspaceChangedFilesResult[] = [];
+      const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+      render(
+        <Wrap>
+          <ChangedFilesDataProbe id={`conv_${reason}`} onData={onData} />
+        </Wrap>,
+      );
+
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+      const last = seen.at(-1) as WorkspaceChangedFilesResult;
+      expect(last.available).toBe(true);
+      expect(last.trackingComplete).toBe(false);
+      expect(last.trackingReason).toBe(reason);
+    },
+  );
+
+  it("defaults to complete tracking when the runner omits the tracking field", async () => {
+    // Older runners don't send `tracking`; treat that as complete so no
+    // spurious "limited" notice appears against a server that can't report it.
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_legacy" onData={onData} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(true);
+    expect(last.trackingReason).toBeNull();
+  });
+
+  it("drops a reason the runner sends alongside complete tracking", async () => {
+    // A reason only explains incomplete tracking; never surface one next to
+    // trackingComplete: true, whatever the server happened to send.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
+      jsonResponse({
+        object: "list",
+        data: [],
+        has_more: false,
+        tracking: { complete: true, reason: "non_git_workspace" },
+      }),
+    );
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_complete_reason" onData={onData} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(true);
+    expect(last.trackingReason).toBeNull();
+  });
+
+  it("keeps tracking incomplete but drops a reason it does not recognize", async () => {
+    // A newer runner may send a reason this build doesn't know; the panel must
+    // still show the notice, with the neutral explanation rather than a guess.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(environmentResponse()).mockResolvedValueOnce(
+      jsonResponse({
+        object: "list",
+        data: [],
+        has_more: false,
+        tracking: { complete: false, reason: "future_reason" },
+      }),
+    );
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_future_reason" onData={onData} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(false);
+    expect(last.trackingReason).toBeNull();
+  });
+
+  it("treats a descriptor without a verdict as incomplete", async () => {
+    // Only an explicit complete: true hides the notice; a malformed descriptor
+    // fails toward showing it rather than toward a misleading empty list.
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(
+        jsonResponse({ object: "list", data: [], has_more: false, tracking: { reason: null } }),
+      );
+
+    const seen: WorkspaceChangedFilesResult[] = [];
+    const onData = (d: WorkspaceChangedFilesResult) => seen.push(d);
+    render(
+      <Wrap>
+        <ChangedFilesDataProbe id="conv_no_verdict" onData={onData} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+    const last = seen.at(-1) as WorkspaceChangedFilesResult;
+    expect(last.trackingComplete).toBe(false);
+    expect(last.trackingReason).toBeNull();
   });
 });

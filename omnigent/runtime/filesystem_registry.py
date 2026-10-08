@@ -18,7 +18,10 @@ Use :func:`create_filesystem_registry` to obtain the correct implementation
 for a given workspace path.
 
 Both classes share the :class:`FilesystemRegistry` abstract base class, which
-defines the full public interface.
+defines the full public interface.  Registries also expose tracking
+completeness and a machine-readable limitation reason
+(:attr:`~FilesystemRegistry.tracks_all_changes` /
+:attr:`~FilesystemRegistry.tracking_limit_reason`).
 """
 
 from __future__ import annotations
@@ -124,6 +127,11 @@ class GitStatusUnavailable(RuntimeError):
         super().__init__(reason)
         self.reason = reason
 
+
+# ``tracking.reason`` values in the ``GET …/changes`` response; the web UI maps
+# them to the limited-tracking notice.
+TRACKING_LIMIT_NON_GIT = "non_git_workspace"
+TRACKING_LIMIT_NO_WORKSPACE = "no_workspace"
 
 # Filename patterns for ephemeral process artifacts that should never appear in
 # the Files panel regardless of .gitignore rules.  These are write-temp files
@@ -532,6 +540,29 @@ class FilesystemRegistry(ABC):
         """The workspace root directory being watched."""
         return self._cwd
 
+    # ── Concrete: change-tracking completeness ─────────────────────
+
+    @property
+    def tracks_all_changes(self) -> bool:
+        """Whether the registry observes *every* working-tree change.
+
+        ``True`` for git-backed tracking (``git status`` sees every process's
+        writes). ``False``, the default, means only edits routed through
+        :meth:`record_change` are visible, so the changes list may be partial.
+        """
+        return False
+
+    @property
+    def tracking_limit_reason(self) -> str | None:
+        """Machine-readable reason change tracking is incomplete.
+
+        Limited registries override this with a ``TRACKING_LIMIT_*`` constant,
+        surfaced verbatim in ``GET …/changes``. ``None`` alongside the base
+        default ``tracks_all_changes=False`` is an unspecified limitation, which
+        the UI reports neutrally.
+        """
+        return None
+
     @property
     def git_root(self) -> Path | None:
         """Root of the repository this registry reads, or ``None`` without one."""
@@ -690,6 +721,15 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # registered by that session.  Used by ``unregister_conversation`` to
         # evict snapshot entries when a session ends, preventing unbounded growth.
         self._snapshot_sessions: dict[str, set[str]] = {}
+
+    @property
+    def tracking_limit_reason(self) -> str | None:
+        """Non-git workspaces track only agent tool-call edits.
+
+        :returns: :data:`TRACKING_LIMIT_NON_GIT`; writes that bypass
+            :meth:`record_change` never reach the changes list.
+        """
+        return TRACKING_LIMIT_NON_GIT
 
     def record_change(
         self,
@@ -1030,6 +1070,14 @@ class GitFilesystemRegistry(FilesystemRegistry):
             (time.perf_counter() - config_started_at) * 1000,
             config.returncode,
         )
+
+    @property
+    def tracks_all_changes(self) -> bool:
+        """``git status`` sees every working-tree write, so tracking is complete.
+
+        :returns: ``True``.
+        """
+        return True
 
     def list_tracked_files(self, subdir: str = "") -> list[str] | None:
         """Return every path in git's index under *subdir*, relative to it.
