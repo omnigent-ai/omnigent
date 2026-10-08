@@ -10,12 +10,10 @@ later runs with the runner's authority.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.runtime.agent_cache import AgentCache
@@ -26,7 +24,6 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -67,29 +64,6 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         permission_store=SqlAlchemyPermissionStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """Async HTTP client wired to the auth-enabled app."""
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 async def _share_editor(
@@ -165,12 +139,15 @@ async def test_shared_editor_cannot_edit_mcp_servers(auth_client: httpx.AsyncCli
     assert resp.status_code == 403, resp.text
 
 
-async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> None:
+async def test_reuse_then_patch_never_reaches_the_owners_agent(
+    auth_client: httpx.AsyncClient,
+) -> None:
     """Binding the owner's agent into your own session does not let you patch it.
 
     This is the core exploit: BOB is shared ALICE's session, reuses her
-    session-scoped agent in a brand-new session of his own (becoming its
-    owner), then tries to replace the shared agent's code.
+    agent in a brand-new session of his own (becoming its owner), then tries
+    to replace the shared agent's code. His session runs on his own copy, so
+    the patch changes only that copy.
     """
     agent = await create_test_agent(auth_client, name="reused-agent", user=ALICE)
     alice_session = agent["_session_id"]
@@ -184,8 +161,8 @@ async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> Non
     )
     assert reuse.status_code == 201, reuse.text
     bob_session = reuse.json()["id"]
+    assert reuse.json()["agent_id"] != agent["id"], "BOB runs on his own copy"
 
-    # BOB owns his session, but not the agent — the patch must be refused.
     put = await auth_client.put(
         f"/v1/sessions/{bob_session}/agent",
         files={
@@ -197,7 +174,12 @@ async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> Non
         },
         headers={"X-Forwarded-Email": BOB},
     )
-    assert put.status_code == 403, put.text
+    assert put.status_code == 200, put.text
+    alices_agent = await auth_client.get(
+        f"/v1/sessions/{alice_session}/agent", headers={"X-Forwarded-Email": ALICE}
+    )
+    assert alices_agent.json()["id"] == agent["id"]
+    assert alices_agent.json()["description"] != "pwn"
 
 
 async def test_legacy_null_owner_is_admin_only(
@@ -206,10 +188,11 @@ async def test_legacy_null_owner_is_admin_only(
 ) -> None:
     """A legacy (NULL created_by) agent is admin-only to mutate.
 
-    Simulates a pre-migration agent by clearing created_by. Neither a reuser
-    (BOB) nor even the original session owner (ALICE) may mutate it — only an
-    admin. The original owner regains a mutable agent by re-uploading (which
-    creates a fresh owned row), which the other tests already cover.
+    Simulates a pre-migration agent by clearing created_by. Not even the
+    original session owner (ALICE) may mutate it, only an admin; a reuser
+    (BOB) runs on his own copy, so his edits never reach it. The original
+    owner regains a mutable agent by re-uploading (which creates a fresh
+    owned row), which the other tests already cover.
     """
     import sqlalchemy as sa
 
@@ -241,13 +224,14 @@ async def test_legacy_null_owner_is_admin_only(
         )
     }
 
-    # BOB (reuser) is refused.
+    # BOB (reuser) edits only his own copy.
+    assert reuse.json()["agent_id"] != agent["id"]
     bob_put = await auth_client.put(
         f"/v1/sessions/{bob_session}/agent",
         files=bundle_files,
         headers={"X-Forwarded-Email": BOB},
     )
-    assert bob_put.status_code == 403, bob_put.text
+    assert bob_put.status_code == 200, bob_put.text
 
     # Even ALICE (owning-session owner) is refused: a NULL row is admin-only.
     alice_put = await auth_client.put(

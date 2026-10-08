@@ -1327,6 +1327,25 @@ async def test_subtree_busy_counts_awaiting_input_as_busy() -> None:
 # ── list() ───────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("kind", ["default", "sub_agent", "any"])
+async def test_list_kind_preserves_owner_filter(
+    kind: Literal["default", "sub_agent", "any"],
+) -> None:
+    """Including children must retain the caller's ownership filter."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions"
+        assert request.url.params["kind"] == kind
+        assert request.url.params["visibility"] == "mine"
+        return httpx.Response(200, json={"data": []})
+
+    ns, client = _make_namespace(handler)
+    try:
+        assert await ns.list(kind=kind, visibility="mine") == []
+    finally:
+        await client.aclose()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_archived", [False, True])
 async def test_list_defaults_to_all_visibility(include_archived: bool) -> None:
@@ -1424,6 +1443,15 @@ async def test_list_preserves_host_id_on_rows() -> None:
                         "created_at": 1700000001,
                         "updated_at": 1700000043,
                     },
+                    {
+                        "id": "conv_child",
+                        "agent_id": "ag_abc",
+                        "status": "running",
+                        "created_at": 1700000002,
+                        "updated_at": 1700000044,
+                        "host_id": None,
+                        "parent_session_id": "conv_host_bound",
+                    },
                 ]
             },
         )
@@ -1437,3 +1465,6 @@ async def test_list_preserves_host_id_on_rows() -> None:
     by_id = {row.id: row for row in rows}
     assert by_id["conv_host_bound"].host_id == "a1b2c3d4e5f67890abcdef1234567890"
     assert by_id["conv_unbound"].host_id is None
+    assert by_id["conv_unbound"].parent_session_id is None
+    assert by_id["conv_child"].host_id is None
+    assert by_id["conv_child"].parent_session_id == "conv_host_bound"

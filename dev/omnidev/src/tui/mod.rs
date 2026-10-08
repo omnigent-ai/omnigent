@@ -586,6 +586,30 @@ mod tests {
     }
 
     #[test]
+    fn restart_key_targets_selected_tab() {
+        let (mut app, mut rx) = app();
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Restart(ProcId::Server))));
+
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Restart(ProcId::Host))));
+
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Restart(ProcId::Vite))));
+
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::RestartBackend)));
+
+        press(&mut app, KeyCode::Char('R'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::RestartBackend)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn renders_tail_by_default() {
         let (app, _rx) = app();
         seed(&app, 100);

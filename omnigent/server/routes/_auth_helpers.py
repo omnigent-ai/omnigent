@@ -412,6 +412,59 @@ def get_session_owner_id(
     return None
 
 
+def _can_mutate_agent(
+    user_id: str | None,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+) -> bool:
+    """Whether the caller satisfies the agent-ownership mutation gate."""
+    if permission_store is None or local_single_user_enabled():
+        return True
+    if user_id is not None and permission_store.is_admin(user_id):
+        return True
+    return agent.created_by is not None and user_id == agent.created_by
+
+
+def can_mutate_session_agent(
+    user_id: str | None,
+    conversation_id: str,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+    *,
+    conversation: Conversation | None = None,
+) -> bool:
+    """Return whether the caller may mutate this session's agent bundle.
+
+    The capability requires both effective session ownership (including a
+    child session's parent chain) and ownership of the bound agent. It mirrors
+    the two authorization gates used by bundle and MCP mutations, while
+    preserving auth-disabled, local-single-user, and administrator behavior.
+
+    :param user_id: The authenticated caller, or ``None`` when auth is off.
+    :param conversation_id: Session whose agent would be mutated.
+    :param agent: Agent bound to the session.
+    :param permission_store: Permission store, or ``None`` when auth is off.
+    :param conversation_store: Store used for parent-chain resolution.
+    :param conversation: Optional already-loaded authoritative session row.
+    :returns: ``True`` when both mutation gates allow the caller.
+    """
+    if agent.session_id is None:
+        return False
+    if permission_store is None:
+        return True
+    if not check_session_access(
+        user_id,
+        conversation_id,
+        LEVEL_OWNER,
+        permission_store,
+        conversation_store,
+        conversation=conversation,
+    ):
+        return False
+    return _can_mutate_agent(user_id, agent, permission_store)
+
+
 def require_agent_owner(
     user_id: str | None,
     agent: Agent,
@@ -443,16 +496,8 @@ def require_agent_owner(
     :raises OmnigentError: 403 when the caller is neither the owner nor an
         admin.
     """
-    # Auth disabled entirely: no ownership model to enforce.
-    if permission_store is None:
-        return
-    # Local single-user (header auth): grants are keyed by the "local"
-    # sentinel and there is no second identity to forge against. Mirror
-    # validate_session_agent's local handling and allow.
-    if local_single_user_enabled():
-        return
-    # Workspace admins bypass, mirroring check_session_access / resolved_allows.
-    if user_id is not None and permission_store.is_admin(user_id):
+    # Auth disabled, local single-user, and workspace admins bypass.
+    if _can_mutate_agent(user_id, agent, permission_store):
         return
     # Legacy / unowned row: admins only (handled above); everyone else denied.
     if agent.created_by is None:

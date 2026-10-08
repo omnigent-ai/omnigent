@@ -9,6 +9,7 @@ unreachable on the desktop viewport these tests run at.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import httpx
@@ -25,10 +26,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize(
-    ("tab_name", "tooltip", "expected_state"),
+    ("tab_name", "tooltip", "shortcut", "expected_state"),
     [
-        ("Files", "Files", "active"),
-        ("Agents", "Agents", "inactive"),
+        ("Files", "Files", "1", "active"),
+        ("Agents", "Agents", "4", "inactive"),
     ],
 )
 def test_workspace_tab_hover_tooltip(
@@ -36,6 +37,7 @@ def test_workspace_tab_hover_tooltip(
     terminal_session: tuple[str, str],
     tab_name: str,
     tooltip: str,
+    shortcut: str,
     expected_state: str,
 ) -> None:
     """Explain fixed workspace tabs on hover without changing selection."""
@@ -48,7 +50,14 @@ def test_workspace_tab_hover_tooltip(
 
     expect(tab).to_have_attribute("data-state", expected_state)
     tab.hover()
-    expect(page.get_by_role("tooltip")).to_have_text(tooltip)
+    tip = page.get_by_role("tooltip")
+    expect(tip).to_contain_text(tooltip)
+    keycaps = tip.locator('[data-slot="kbd"]')
+    expect(keycaps).to_have_count(4)
+    expect(keycaps.nth(0)).to_have_text("⌘" if sys.platform == "darwin" else "Ctrl")
+    expect(keycaps.nth(1)).to_have_text("⌥" if sys.platform == "darwin" else "Alt")
+    expect(keycaps.nth(2)).to_have_text("]")
+    expect(keycaps.nth(3)).to_have_text(shortcut)
     expect(tab).to_have_attribute("data-state", expected_state)
 
 

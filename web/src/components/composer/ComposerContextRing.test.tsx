@@ -38,7 +38,11 @@ describe("ComposerContextRing", () => {
     renderRing(1000, 123);
     await user.tab();
     expect(screen.getByTestId("composer-context-ring")).toHaveFocus();
-    expect(await screen.findByText("123 / 1,000 tokens (12% used)")).toBeInTheDocument();
+    expect(await screen.findByText("12% context used")).toBeInTheDocument();
+    expect(screen.getByText("123 / 1K tokens")).toHaveClass(
+      "text-neutral-400",
+      "dark:text-muted-foreground",
+    );
   });
 
   it("fits the SVG to the painted ring so its padding does not widen the label gap", () => {

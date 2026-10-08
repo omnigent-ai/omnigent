@@ -7,9 +7,8 @@ updates. These tests drive that list straight through the Sessions events route
 (the same path the forwarders post to), so they're deterministic: no live agent
 turn is needed to produce a plan.
 
-Mirrors ``chat/test_mcp_startup_indicator.py`` — seed before load to prove the
-snapshot path, then re-publish the idempotent full-state list until the live SSE
-subscription catches it.
+Seed before load to prove the snapshot path, then re-publish the idempotent
+full-state list until the live SSE subscription catches it.
 """
 
 from __future__ import annotations
