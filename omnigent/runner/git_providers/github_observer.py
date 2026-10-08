@@ -367,6 +367,7 @@ def _content_only(tokens: list[str]) -> bool:
         path = f".data.{field}.pullRequest"
         if projection is not None:
             return projection.strip() not in {path, f"{path}.url"}
+        return False
     fields = _flag(tokens, "--json")
     return (
         tokens[:2] == ["pr", "diff"]

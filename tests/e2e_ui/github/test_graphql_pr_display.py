@@ -47,6 +47,8 @@ pr = {
     "body": "Created from the active session checkout.",
 }
 if args[:2] == ["api", "graphql"]:
+    if not any(arg.startswith("query=") and "createPullRequest(" in arg for arg in args):
+        sys.exit(1)
     (root / "created").touch()
     print(json.dumps(pr))
 elif args[:2] == ["pr", "view"]:
