@@ -850,6 +850,14 @@ def build_policy_engine(
 
                 _providers = load_providers(provider_config)
                 _provider_entry = _providers.get(_executor.auth.name)
+                if _provider_entry is None:
+                    # A declared provider absent from config silently reverts
+                    # to default-provider pricing; surface the misconfiguration.
+                    _logger.warning(
+                        "session executor names provider %r but it is not "
+                        "configured; pricing falls back to the default provider",
+                        _executor.auth.name,
+                    )
             except Exception:
                 # Provider resolution must never break policy pricing; fall
                 # back to the default-provider lookup.

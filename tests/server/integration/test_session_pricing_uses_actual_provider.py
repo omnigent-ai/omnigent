@@ -1,23 +1,18 @@
 """Regression: session usage must be priced by the ACTUAL provider, not the
-harness DEFAULT provider (the provider identity bug).
+harness DEFAULT provider.
 
-Custom pricing resolves rates through
-``omnigent.llms.context_window.fetch_model_pricing_with_provider`` which, in
-the relay accounting path (``_accumulate_session_usage``), calls
-``default_provider_for_harness()`` to pick which provider's configured pricing
-to apply. That returns the DEFAULT provider for the harness family — never the
+Custom pricing is resolved through
+``omnigent.llms.context_window.fetch_model_pricing_with_provider``. In the relay
+accounting path (``_accumulate_session_usage``), the rate must come from the
 provider the session was actually launched with (a named provider selected via
-``executor.auth: {type: provider, name: ...}``).
+``executor.auth: {type: provider, name: ...}``), not the family DEFAULT.
 
-So when two providers serve the same family (anthropic) at different custom
-rates and a session is bound to the *non-default* named one, its turns are
-priced at the DEFAULT provider's cheaper rate. This test binds a session's
-agent to the expensive named provider, drives one real relay accounting turn,
-and asserts the persisted ``total_cost_usd`` reflects the NAMED provider's rate.
-
-On the current (buggy) build the persisted cost is the default provider's
-estimate, so this test FAILS — that failure is the live reproduction. A fix
-that threads the actual provider identity into pricing turns it green.
+When two providers serve the same family (anthropic) at different custom rates
+and a session is bound to the *non-default* named one, its persisted
+``total_cost_usd`` must reflect the NAMED provider's rate. This test binds a
+session's agent to the expensive named provider, drives one real relay
+accounting turn, and asserts the persisted cost is the NAMED rate, not the
+cheaper DEFAULT rate.
 """
 
 from __future__ import annotations
@@ -219,7 +214,9 @@ def test_resolve_session_provider_entry_resolves_nested_sub_agent(
         sub_agents=[mid],
     )
 
-    agent = SimpleNamespace(id="a1", bundle_location="loc", session_id=None)
+    agent = SimpleNamespace(
+        id="a1", bundle_location="loc", session_id=None, operator_authored=True
+    )
     monkeypatch.setattr(
         "omnigent.runtime.get_agent_store",
         lambda: SimpleNamespace(get=lambda _agent_id: agent),
@@ -240,4 +237,62 @@ def test_resolve_session_provider_entry_resolves_nested_sub_agent(
     assert entry.name == "expensive-named", (
         f"nested sub-agent priced on {entry.name!r}, not its own provider — a "
         "shallow direct-children lookup fell back to the root's provider"
+    )
+
+
+def test_resolve_session_provider_entry_does_not_expand_user_bundle_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent user bundle must not env-expand during pricing lookup.
+
+    ``session_id is None`` alone does not make a bundle operator-authored: a
+    user-uploaded agent can have no session yet still be tenant input. The
+    resolver must gate env expansion on ``operator_authored`` so a tenant's
+    ``${VAR}`` never captures a server secret into the cached spec.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.entities.agent import Agent
+    from omnigent.server.routes._sessions.orchestration import (
+        _resolve_session_provider_entry,
+    )
+    from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="user-agent",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="expensive-named"), config={"harness": "claude-sdk"}
+        ),
+    )
+    agent = Agent(
+        id="a1", created_at=0, name="user-agent", bundle_location="loc", kind="user"
+    )
+    assert agent.session_id is None and agent.operator_authored is False
+
+    captured: dict[str, Any] = {}
+
+    def _fake_load(agent_id: str, bundle_location: str, *, expand_env: bool) -> Any:
+        captured["expand_env"] = expand_env
+        return SimpleNamespace(spec=spec)
+
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_store",
+        lambda: SimpleNamespace(get=lambda _agent_id: agent),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_cache",
+        lambda: SimpleNamespace(load=_fake_load),
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: _PROVIDER_CONFIG,
+    )
+
+    conv = SimpleNamespace(id="s1", agent_id="a1", sub_agent_name=None)
+    _resolve_session_provider_entry(conv)
+
+    assert captured.get("expand_env") is False, (
+        "pricing lookup expanded env for a non-operator-authored user bundle; "
+        "a tenant ${VAR} could capture a server secret into the cached spec"
     )

@@ -240,19 +240,22 @@ def test_fetch_pricing_with_explicit_provider_entry_beats_default():
     always resolves the default provider, so sessions on a non-default named
     provider were charged the wrong rate.
     """
-    from omnigent.onboarding.provider_config import _parse_provider
+    from omnigent.onboarding.provider_config import load_providers
 
-    expensive_entry = _parse_provider(
-        "expensive-named",
+    expensive_entry = load_providers(
         {
-            "kind": "key",
-            "anthropic": {
-                "base_url": "https://expensive.example/v1",
-                "api_key": "expensive-key",
-                "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
-            },
-        },
-    )
+            "providers": {
+                "expensive-named": {
+                    "kind": "key",
+                    "anthropic": {
+                        "base_url": "https://expensive.example/v1",
+                        "api_key": "expensive-key",
+                        "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
+                    },
+                }
+            }
+        }
+    )["expensive-named"]
     provider_config = {
         "providers": {
             "cheap-default": {
@@ -291,20 +294,22 @@ def test_fetch_pricing_provider_entry_without_pricing_falls_through_to_catalog(
 ) -> None:
     """When the explicit provider_entry has no custom pricing, catalog is used."""
     from omnigent.llms.context_window import ModelPricing
-    from omnigent.onboarding.provider_config import _parse_provider
+    from omnigent.onboarding.provider_config import load_providers
 
     # Entry with no pricing block.
-    entry_no_pricing = _parse_provider(
-        "bare-provider",
+    entry_no_pricing = load_providers(
         {
-            "kind": "key",
-            "anthropic": {
-                "base_url": "https://bare.example/v1",
-                "api_key": "bare-key",
-                # No pricing block.
-            },
-        },
-    )
+            "providers": {
+                "bare-provider": {
+                    "kind": "key",
+                    "anthropic": {
+                        "base_url": "https://bare.example/v1",
+                        "api_key": "bare-key",
+                    },
+                }
+            }
+        }
+    )["bare-provider"]
     catalog_pricing = ModelPricing(input_per_token=5.0, output_per_token=15.0)
     monkeypatch.setattr(
         "omnigent.llms.context_window.fetch_model_pricing",
@@ -323,19 +328,22 @@ def test_fetch_pricing_provider_entry_takes_precedence_over_config_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """provider_entry beats the config default even when provider_config is also given."""
-    from omnigent.onboarding.provider_config import _parse_provider
+    from omnigent.onboarding.provider_config import load_providers
 
-    explicit_entry = _parse_provider(
-        "explicit",
+    explicit_entry = load_providers(
         {
-            "kind": "key",
-            "anthropic": {
-                "base_url": "https://explicit.example/v1",
-                "api_key": "explicit-key",
-                "pricing": {"input_per_million": 42.0, "output_per_million": 84.0},
-            },
-        },
-    )
+            "providers": {
+                "explicit": {
+                    "kind": "key",
+                    "anthropic": {
+                        "base_url": "https://explicit.example/v1",
+                        "api_key": "explicit-key",
+                        "pricing": {"input_per_million": 42.0, "output_per_million": 84.0},
+                    },
+                }
+            }
+        }
+    )["explicit"]
     provider_config = {
         "providers": {
             "some-default": {

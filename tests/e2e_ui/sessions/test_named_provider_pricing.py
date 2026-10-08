@@ -1,11 +1,10 @@
 """UI journey: a named-provider session must be priced at the named provider's rate.
 
-Custom pricing resolves the DEFAULT provider for the session's harness family
-(``default_provider_for_harness`` in ``omnigent/llms/context_window.py``) instead
-of the provider the session was actually launched with
-(``executor.auth: {type: provider}``). A session bound to a NAMED provider whose
-custom rates differ from the family default is therefore priced at the DEFAULT
-provider's rate.
+A session's custom pricing must follow the provider it was actually launched
+with (``executor.auth: {type: provider}``), not the harness family's DEFAULT
+provider (``default_provider_for_harness`` in
+``omnigent/llms/context_window.py``). When a NAMED provider's custom rates
+differ from the family default, the Session cost must reflect the NAMED rate.
 
 Journey (real web SPA, live server + runner, openai-agents harness against the
 mock ``/v1/responses``):
@@ -17,14 +16,11 @@ mock ``/v1/responses``):
 3. send a message; the turn completes through the named provider, reporting
    1,000,000 input and 1,000,000 output tokens
 4. open the agent-info popover and read Session cost
-5. observable failure: Session cost shows $2.00 (the cheap DEFAULT provider's
-   rate) instead of $20.00 (the expensive NAMED provider's rate)
+5. Session cost reflects the NAMED rate ($20.00), not the DEFAULT rate ($2.00)
 
-Regression guard: the final assertion (Session cost == $20.00, the named rate)
-FAILS on the current build (it shows $2.00) and passes once pricing threads the
-actual provider identity from session state. The turn-completes precondition and
-the "a priced cost rendered at all" check pass both before and after a fix,
-pinning the failure to mis-pricing rather than a broken turn or missing usage.
+The turn-completes precondition and the "a priced cost rendered at all" check
+hold regardless of the rate, pinning a failure to mis-pricing rather than a
+broken turn or missing usage.
 """
 
 from __future__ import annotations
@@ -385,11 +381,12 @@ def test_named_provider_session_priced_at_named_rate(
         # A priced cost rendered at all (not "<$0.01"): passes before and after
         # a fix, isolating the failure to the wrong rate rather than no pricing.
         expect(cost).to_have_text(re.compile(r"^\$\d"), timeout=30_000)
-        assert cost.text_content() != _DEFAULT_RATE_COST, (
+        expect(
+            cost,
             "Session cost shows the cheap DEFAULT provider's rate "
             f"({_DEFAULT_RATE_COST}); it must reflect the NAMED provider "
-            f"({_NAMED_RATE_COST}) the session actually ran through"
-        )
+            f"({_NAMED_RATE_COST}) the session actually ran through",
+        ).not_to_have_text(_DEFAULT_RATE_COST)
         expect(cost).to_have_text(_NAMED_RATE_COST)
     finally:
         with httpx.Client() as client:

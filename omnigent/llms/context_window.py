@@ -350,7 +350,8 @@ def fetch_model_pricing_with_provider(
         ``"anthropic/claude-sonnet-4-6"``.
     :param provider_config: Parsed provider config from
         :func:`~omnigent.onboarding.provider_config.load_config`. When
-        ``None``, skips provider lookup and falls through to catalog.
+        ``None``, the config-default provider lookup is skipped; an explicit
+        ``provider_entry`` is still consulted.
     :param harness: Harness name to determine which provider family to check,
         e.g. ``"claude-sdk"`` or ``"codex"``. When ``None``, skips provider
         lookup and falls through to catalog. SDK executors may pass
@@ -363,7 +364,8 @@ def fetch_model_pricing_with_provider(
         Callers that know which named provider a session was launched with
         (e.g. via ``executor.auth: {type: provider, name: ...}``) should
         pass it here so sessions on non-default providers are priced
-        correctly.
+        correctly. Callers that omit it get default-provider pricing for
+        the harness family.
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
     """
@@ -408,8 +410,15 @@ def fetch_model_pricing_with_provider(
                         )
         except Exception:
             # Provider lookup failed (e.g. malformed config); fall through to
-            # catalog rather than breaking cost tracking entirely.
-            _logger.debug("provider pricing lookup failed; using catalog", exc_info=True)
+            # catalog rather than breaking cost tracking entirely. An explicit
+            # provider_entry failing is a real misconfiguration, so log louder.
+            if provider_entry is not None:
+                _logger.warning(
+                    "pricing lookup failed for explicit provider entry; using catalog",
+                    exc_info=True,
+                )
+            else:
+                _logger.debug("provider pricing lookup failed; using catalog", exc_info=True)
 
     # Step 2: Fall back to catalog pricing when provider pricing is not configured
     catalog_pricing = fetch_model_pricing(model)

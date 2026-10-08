@@ -1532,8 +1532,11 @@ def _resolve_session_provider_entry(
         if agent is None:
             return None
         agent_cache = get_agent_cache()
+        # ``operator_authored`` (not merely ``session_id is None``) gates env
+        # expansion: a user-uploaded agent can have no session yet still be
+        # tenant input, so expanding its ``${VAR}`` would leak server secrets.
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
         # Sub-agent sessions price on their own executor; resolve the child
         # spec recursively (as the policy builder does) so nested sub-agents
@@ -1549,7 +1552,17 @@ def _resolve_session_provider_entry(
         if not isinstance(auth, ProviderAuth):
             return None
         providers = load_providers(load_config())
-        return providers.get(auth.name)
+        entry = providers.get(auth.name)
+        if entry is None:
+            # A declared provider absent from config silently reverts to
+            # default-provider pricing; surface it so persistent mispricing
+            # is operator-visible.
+            _logger.warning(
+                "session executor names provider %r but it is not configured; "
+                "pricing falls back to the default provider",
+                auth.name,
+            )
+        return entry
     except Exception:  # noqa: BLE001 — broken spec must never break cost accounting
         _logger.debug("named-provider lookup failed for pricing", exc_info=True)
         return None

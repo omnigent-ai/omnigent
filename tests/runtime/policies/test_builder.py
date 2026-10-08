@@ -318,6 +318,76 @@ llm:
     assert engine.usage["total_cost_usd"] == pytest.approx(expected_cost)
 
 
+def test_build_pricing_uses_named_provider_executor_auth(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session on a named provider seeds the cost gate at that provider's rate.
+
+    ``executor.auth`` names a non-default provider, so budget pricing must use
+    its rate ($10/M), not the anthropic family default's ($1/M).
+    """
+    agent_dir = _write_spec(
+        tmp_path,
+        """
+spec_version: 1
+name: named-provider-pricing
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+  auth:
+    type: provider
+    name: expensive-named
+llm:
+  model: self-hosted-model
+""",
+    )
+    spec = parse(agent_dir)
+    conv = conversation_store.create_conversation()
+
+    provider_config = {
+        "providers": {
+            "cheap-default": {
+                "kind": "local",
+                "default": True,
+                "anthropic": {
+                    "base_url": "http://cheap.local/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+                },
+            },
+            "expensive-named": {
+                "kind": "local",
+                "anthropic": {
+                    "base_url": "http://expensive.local/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
+                },
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: provider_config,
+    )
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(
+        input_tokens=1_000_000,
+        output_tokens=0,
+        total_tokens=1_000_000,
+    )
+
+    # Named provider rate ($10/M), not the cheap family default ($1/M).
+    assert engine.usage["total_cost_usd"] == pytest.approx(10.0)
+
+
 def test_build_resolves_model_none_without_llm_or_override(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,
