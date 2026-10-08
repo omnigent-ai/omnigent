@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
+import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
@@ -3380,6 +3381,36 @@ describe("useDeleteProject", () => {
 });
 
 describe("undoArchiveConversations optimistic restore", () => {
+  it("restores owned rows to Mine without inserting them into Shared", async () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
+    try {
+      const queryClient = new QueryClient();
+      const mineKey = ["conversations", "", false, null, "mine"];
+      const sharedKey = ["conversations", "", false, null, "shared"];
+      queryClient.setQueryData(mineKey, infinitePage([]));
+      queryClient.setQueryData(sharedKey, infinitePage([]));
+      queryClient.setQueryData(["session", "conv_owned"], {
+        id: "conv_owned",
+        archived: true,
+      });
+      fetchMock.mockResolvedValueOnce(
+        mockResponse(conversation({ id: "conv_owned", archived: false })),
+      );
+
+      await undoArchiveConversations(queryClient, [
+        conversation({ id: "conv_owned", owner: "local", archived: true }),
+      ]);
+
+      const mine = queryClient.getQueryData<ConversationsInfiniteData>(mineKey);
+      const shared = queryClient.getQueryData<ConversationsInfiniteData>(sharedKey);
+      expect(mine?.pages[0].data.map((row) => row.id)).toEqual(["conv_owned"]);
+      expect(mine?.pages[0].data[0].archived).toBe(false);
+      expect(shared?.pages[0].data).toEqual([]);
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
   it("re-injects evicted rows into cached lists before the unarchive PATCH settles", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     // A refetch already evicted the archived row from the sidebar list, so the

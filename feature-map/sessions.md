@@ -148,6 +148,10 @@ plain `uv run pytest`, which starts a private server for the test.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
   session, open the archived view, choose Unarchive on the row, and expect the
   session back in the main list.
+- **`unarchive`, Undo toast:**
+  `tests/e2e_ui/sessions/test_sidebar_lifecycle.py::test_sidebar_session_organization_round_trip`
+  archives two sessions and restores both to Mine through Undo, including after
+  a reload.
 - **`delete`:**
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
