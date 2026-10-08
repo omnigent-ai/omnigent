@@ -531,6 +531,42 @@ def test_run_isolated_timeout_kills_the_leader_when_group_teardown_is_denied(
                 psutil.Process(leader_pid).kill()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process semantics")
+@pytest.mark.timeout(30, method="signal")
+def test_run_isolated_kills_the_leader_even_if_kill_tree_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # kill_tree can raise an unexpected error from its psutil descendant walk;
+    # the teardown must still run so the live leader is killed and __exit__'s
+    # unbounded wait() cannot hang. The original kill_tree error propagates.
+    seen: dict[str, int] = {}
+
+    def boom_kill_tree(process: object) -> None:
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int):
+            seen["pid"] = pid
+        raise OSError("descendant walk failed")
+
+    monkeypatch.setattr(_proc, "kill_tree", boom_kill_tree)
+
+    leader_pid: int | None = None
+    try:
+        start = time.monotonic()
+        with pytest.raises(OSError, match="descendant walk failed"):
+            _proc.run_isolated(["sleep", "300"], timeout=1, capture_output=True, text=True)
+        assert time.monotonic() - start < 15
+        assert "pid" in seen
+        leader_pid = seen["pid"]
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(leader_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(leader_pid)
+    finally:
+        if leader_pid is not None and _proc.process_alive(leader_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(leader_pid).kill()
+
+
 def test_run_isolated_returns_the_completed_process() -> None:
     completed = _proc.run_isolated(
         [sys.executable, "-c", "import sys; print('out'); sys.exit(3)"],

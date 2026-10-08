@@ -458,19 +458,26 @@ def run_isolated(
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            kill_tree(process)
-            # Reap the leader without blocking on a surviving descendant that
-            # still holds the pipes; keep the probe's output like subprocess.run.
-            with suppress(Exception):
-                reaped: tuple[Any, Any] = process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
-                exc.stdout, exc.stderr = reaped
-            _kill_surviving_leader(process)
+            try:
+                kill_tree(process)
+            finally:
+                # Run teardown even if kill_tree raised: reap the leader without
+                # blocking on a surviving descendant holding the pipes, then end
+                # the leader directly so Popen.__exit__'s wait() cannot hang.
+                with suppress(Exception):
+                    reaped: tuple[Any, Any] = process.communicate(
+                        timeout=_RUN_ISOLATED_REAP_TIMEOUT_S
+                    )
+                    exc.stdout, exc.stderr = reaped
+                _kill_surviving_leader(process)
             raise
         except BaseException:
-            kill_tree(process)
-            with suppress(Exception):
-                process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
-            _kill_surviving_leader(process)
+            try:
+                kill_tree(process)
+            finally:
+                with suppress(Exception):
+                    process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
+                _kill_surviving_leader(process)
             raise
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
