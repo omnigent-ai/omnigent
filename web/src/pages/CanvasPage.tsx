@@ -24,7 +24,7 @@
  *   is remembered per server so coming back to `/canvas` reopens it.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   applyNodeChanges,
   Background,
@@ -169,6 +169,9 @@ function CanvasSurface() {
       (viewerId === null ? MAIN_CANVAS_ID : (readActiveCanvas(viewerId) ?? MAIN_CANVAS_ID)),
   );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  // False until the restored layout has been fitted once; the flow surface
+  // stays hidden until then so a reload never paints the default grid.
+  const [viewRestored, setViewRestored] = useState(false);
   const activeCanvasRef = useRef(activeCanvas);
   const activeCanvasViewerRef = useRef(viewerId);
   const userSelectedCanvasRef = useRef(false);
@@ -183,6 +186,10 @@ function CanvasSurface() {
   const viewportDirtyRef = useRef(false);
   // The card set the view was last fitted to; a different set refits.
   const fittedKeyRef = useRef<string | null>(null);
+  // Revealed for an empty/failed load; re-hide if content later arrives unfit.
+  const revealedEmptyRef = useRef(false);
+  // Bumped per fit so a superseded fit's resolution cannot reveal a newer view.
+  const fitGenerationRef = useRef(0);
   const pendingProjectNameRef = useRef<string | null>(null);
   const flowContainerRef = useRef<HTMLDivElement>(null);
   const aliveRef = useRef(true);
@@ -220,7 +227,18 @@ function CanvasSurface() {
   const fitCanvas = useCallback(
     (duration = 0) => {
       viewportDirtyRef.current = false;
-      void fitView({ ...FIT_VIEW, duration });
+      // A later fit supersedes this one; ignore the stale resolution so a
+      // canvas switch mid-fit cannot reveal the new view before it is fitted.
+      const generation = (fitGenerationRef.current += 1);
+      // fitView resolves once the fitted viewport is applied, so the revealed
+      // frame is already the restored view. Reveal on failure too: a lost fit
+      // must cost a flash, never an invisible canvas.
+      const reveal = () => {
+        if (aliveRef.current && generation === fitGenerationRef.current) {
+          setViewRestored(true);
+        }
+      };
+      void fitView({ ...FIT_VIEW, duration }).then(reveal, reveal);
     },
     [fitView],
   );
@@ -329,6 +347,39 @@ function CanvasSurface() {
     if (!viewportDirtyRef.current) fitCanvas();
   }, [fitCanvas, loaded, nodes]);
 
+  // An empty canvas has no layout to restore, so reveal once sessions and
+  // projects settle. If cards then arrive (e.g. a retry after an empty
+  // failure), re-hide until their first fit so they never paint unfitted.
+  useLayoutEffect(() => {
+    if (visibleSessions.length > 0) {
+      if (revealedEmptyRef.current && !viewportDirtyRef.current) {
+        revealedEmptyRef.current = false;
+        // Clear the fitted key so a returning, already-fitted card set still
+        // refits; otherwise the fit effect early-outs and the re-hidden
+        // surface would stay hidden forever.
+        fittedKeyRef.current = null;
+        // Invalidate any in-flight fit so its resolution cannot re-reveal early.
+        fitGenerationRef.current += 1;
+        setViewRestored(false);
+      }
+      return;
+    }
+    const sessionsSettled = networkConfirmed || error !== null;
+    const projectsSettled = projectsQuery.data !== undefined || projectsQuery.isError;
+    if (sessionsSettled && projectsSettled) {
+      revealedEmptyRef.current = true;
+      setViewRestored(true);
+    }
+  }, [error, networkConfirmed, projectsQuery.data, projectsQuery.isError, visibleSessions]);
+
+  // React 18's JSX has no `inert` prop; set the attribute directly so the
+  // invisible surface is not tabbable or read by assistive tech. `loaded`
+  // dependency applies the attribute when the container first mounts.
+  useLayoutEffect(() => {
+    if (!loaded) return;
+    flowContainerRef.current?.toggleAttribute("inert", !viewRestored);
+  }, [loaded, viewRestored]);
+
   // Mirror the selected canvas into the URL; Main keeps the URL clean.
   const writeCanvasParam = useCallback(
     (canvasId: string) => {
@@ -421,7 +472,9 @@ function CanvasSurface() {
       }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        if (loaded && !viewportDirtyRef.current) fitCanvas();
+        // Re-fit only an already-restored view; the initial reveal is owned by
+        // the fit and empty-settle effects, never a resize over empty content.
+        if (loaded && viewRestored && !viewportDirtyRef.current) fitCanvas();
       }, RESIZE_REFIT_DELAY_MS);
     });
     observer.observe(container);
@@ -429,7 +482,7 @@ function CanvasSurface() {
       if (timer) clearTimeout(timer);
       observer.disconnect();
     };
-  }, [fitCanvas, loaded]);
+  }, [fitCanvas, loaded, viewRestored]);
 
   const onNodesChange = useCallback((changes: NodeChange<SessionCardNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -581,7 +634,13 @@ function CanvasSurface() {
       )}
       <div
         ref={flowContainerRef}
-        className="canvas-flow relative min-h-0 min-w-0 flex-1 border-t"
+        // Hidden (layout intact so the flow can measure and fit) until the
+        // restored view is in place. Opacity, not visibility: React Flow sets
+        // inline `visibility: visible` on nodes, overriding an inherited hidden.
+        className={cn(
+          "canvas-flow relative min-h-0 min-w-0 flex-1 border-t",
+          !viewRestored && "pointer-events-none opacity-0",
+        )}
         data-testid="canvas-flow"
       >
         <ReactFlow<SessionCardNode>
