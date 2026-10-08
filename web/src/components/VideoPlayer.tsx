@@ -259,66 +259,68 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             aria-label={`Recording actions: ${title}`}
             className={cn(
               "flex min-w-0 flex-col border-border",
-              wide ? "border-l" : "border-t",
+              wide ? "relative border-l" : "border-t",
               !actionsOpen && "hidden",
             )}
           >
-            <span className="flex flex-wrap items-center gap-3 border-b border-border px-3 py-2 font-medium">
-              <span className="flex-1">Recording actions</span>
-              <button
-                ref={hideActionsRef}
-                type="button"
-                aria-label="Hide recording actions"
-                aria-expanded={true}
-                aria-controls={actionsId}
-                title="Hide recording actions"
-                className="shrink-0 rounded p-1 hover:bg-accent"
-                onClick={() => {
-                  setActionsOpen(false);
-                  requestAnimationFrame(() => showActionsRef.current?.focus());
-                }}
-              >
-                {wide ? (
-                  <ChevronRightIcon aria-hidden="true" className="size-4" />
-                ) : (
-                  <ChevronUpIcon aria-hidden="true" className="size-4" />
-                )}
-              </button>
-            </span>
-            <span
-              className={cn(
-                "flex flex-col gap-1 overflow-y-auto p-2",
-                wide ? "max-h-[70vh]" : "max-h-72",
-              )}
-            >
-              {chapters.map((chapter, index) => (
+            <span className={cn("flex min-h-0 flex-col", wide && "absolute inset-0")}>
+              <span className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-3 py-2 font-medium">
+                <span className="flex-1">Recording actions</span>
                 <button
+                  ref={hideActionsRef}
                   type="button"
-                  key={`${chapter.time}:${chapter.end}:${chapter.title}`}
-                  aria-current={index === activeChapter ? "step" : undefined}
-                  disabled={failed || (duration !== null && chapter.time >= duration)}
-                  className={cn(
-                    "flex items-start gap-2 rounded-md p-2 text-left hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50",
-                    index === activeChapter && "bg-accent text-accent-foreground",
-                  )}
-                  onClick={() => seek(chapter.time)}
+                  aria-label="Hide recording actions"
+                  aria-expanded={true}
+                  aria-controls={actionsId}
+                  title="Hide recording actions"
+                  className="shrink-0 rounded p-1 hover:bg-accent"
+                  onClick={() => {
+                    setActionsOpen(false);
+                    requestAnimationFrame(() => showActionsRef.current?.focus());
+                  }}
                 >
-                  <PlayIcon
-                    aria-hidden="true"
-                    className="mt-0.5 size-4 shrink-0 text-muted-foreground"
-                  />
-                  <span className="min-w-0 flex-1 break-words">{chapter.title}</span>
-                  <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                    {formatVideoTime(chapter.time)}
-                  </span>
+                  {wide ? (
+                    <ChevronRightIcon aria-hidden="true" className="size-4" />
+                  ) : (
+                    <ChevronUpIcon aria-hidden="true" className="size-4" />
+                  )}
                 </button>
-              ))}
-            </span>
-            {chapterQuery.isFetching && (
-              <span role="status" className="px-3 py-2 text-xs text-muted-foreground">
-                Updating actions…
               </span>
-            )}
+              <span
+                className={cn(
+                  "flex min-h-0 flex-col gap-1 overflow-y-auto overscroll-contain p-2",
+                  wide ? "flex-1" : "max-h-72",
+                )}
+              >
+                {chapters.map((chapter, index) => (
+                  <button
+                    type="button"
+                    key={`${chapter.time}:${chapter.end}:${chapter.title}`}
+                    aria-current={index === activeChapter ? "step" : undefined}
+                    disabled={failed || (duration !== null && chapter.time >= duration)}
+                    className={cn(
+                      "flex shrink-0 items-start gap-2 rounded-md p-2 text-left hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50",
+                      index === activeChapter && "bg-accent text-accent-foreground",
+                    )}
+                    onClick={() => seek(chapter.time)}
+                  >
+                    <PlayIcon
+                      aria-hidden="true"
+                      className="mt-0.5 size-4 shrink-0 text-muted-foreground"
+                    />
+                    <span className="min-w-0 flex-1 break-words">{chapter.title}</span>
+                    <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                      {formatVideoTime(chapter.time)}
+                    </span>
+                  </button>
+                ))}
+              </span>
+              {chapterQuery.isFetching && (
+                <span role="status" className="shrink-0 px-3 py-2 text-xs text-muted-foreground">
+                  Updating actions…
+                </span>
+              )}
+            </span>
           </span>
         )}
       </span>

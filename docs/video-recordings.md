@@ -54,7 +54,9 @@ known recording duration are disabled.
 Hide the panel using the arrow beside **Recording actions**. The video fills
 the card while the panel is hidden. Use **Actions** in the player footer to
 reopen it. Both controls work with the keyboard; toggling preserves playback
-and the selected action.
+and the selected action. Long action lists scroll within the panel. On wide
+previews, the panel stays as tall as the video and its footer; narrow previews
+limit the list height so the recording does not grow with every annotation.
 
 With no companion file, the player shows its ordinary controls and no action
 panel. Invalid, empty, oversized, or truncated files also leave ordinary video
