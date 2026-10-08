@@ -37,6 +37,8 @@ backend — no real provider creds.
   with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
   connect, silent renewal, relaunch, and sign-out, and asserts the app window
   never loads the IdP.
+- `desktop_display_lifecycle.e2e.js` — checks that a lane which only closes
+  Electron still releases the harness-owned Xvfb (headless Linux).
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.
@@ -54,8 +56,9 @@ cd web/electron && pnpm install      # brings in electron + playwright
 ```
 
 On a headless Linux box with no `DISPLAY`, the harness starts a private `Xvfb`
-(and passes Chromium `--no-sandbox` / `--disable-dev-shm-usage`) so a plain
-`node --test` run works; wrapping it in `xvfb-run -a` still works too.
+(the `Xvfb` executable must be installed) and passes Chromium `--no-sandbox` /
+`--disable-dev-shm-usage`, so a plain `node --test` run works; wrapping it in
+`xvfb-run -a` still works too.
 The harness still skips cleanly (not fails) when `electron` or `playwright`
 are absent (e.g. a `--filter web`-only checkout), so those runs stay green.
 

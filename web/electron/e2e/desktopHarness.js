@@ -462,6 +462,11 @@ function startPrivateDisplay() {
  */
 async function launchDesktop(opts) {
   const { _electron: electron } = require("playwright");
+  // A headless Linux box gets a private Xvfb so the lane runs without an
+  // xvfb-run wrapper; that box also needs the compatibility flags below. Start
+  // it before creating anything on disk so a failure leaves nothing behind.
+  const privateDisplay = await startPrivateDisplay();
+  const display = privateDisplay ? privateDisplay.display : process.env.DISPLAY;
   const userDataDir = opts.userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-"));
   fs.mkdirSync(userDataDir, { recursive: true });
   if (opts.serverUrl) {
@@ -485,15 +490,12 @@ async function launchDesktop(opts) {
   );
   const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
   const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
-  // A headless Linux box gets a private Xvfb so the lane runs without an
-  // xvfb-run wrapper; that box also needs the hardening flags below.
-  const privateDisplay = await startPrivateDisplay();
-  const display = privateDisplay ? privateDisplay.display : process.env.DISPLAY;
-  // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
-  // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
-  // as root or in a container — Electron's Chromium refuses to start without
-  // --no-sandbox, and --disable-dev-shm-usage avoids the tiny /dev/shm a
-  // container gives it. Off by default so local (macOS/dev) runs are unchanged.
+  // Headless-Linux / CI container compatibility, gated on the same env var the
+  // Python e2e_ui suite uses (conftest.browser_type_launch_args). Under xvfb —
+  // and especially as root or in a container — Electron's Chromium refuses to
+  // start without --no-sandbox, and --disable-dev-shm-usage avoids the tiny
+  // /dev/shm a container gives it. Off by default so local (macOS/dev) runs are
+  // unchanged.
   if (process.env.OMNIGENT_PW_NO_SANDBOX || privateDisplay) {
     args.push("--no-sandbox", "--disable-dev-shm-usage");
   }
@@ -535,7 +537,7 @@ async function launchDesktop(opts) {
   // A lane that only closes Electron must not leave the capture running or an
   // owned display behind.
   electronApp.on("close", () => {
-    void stopDisplayCapture();
+    void stopDisplayCapture().catch(() => {});
   });
   // If locating the shell fails after launch succeeds, close the app so the
   // Electron process isn't orphaned (the caller never got a handle to close).

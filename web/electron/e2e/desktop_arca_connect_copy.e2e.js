@@ -141,9 +141,10 @@ describe(
       });
 
       await window.locator('button[aria-label^="Host:"]').click();
-      const consoleOpened = electronApp.waitForEvent("window", { timeout: 15_000 });
-      await window.locator('[data-testid="new-chat-landing-run-on-arca"]').click();
-      const consolePage = await consoleOpened;
+      const [consolePage] = await Promise.all([
+        electronApp.waitForEvent("window", { timeout: 15_000 }),
+        window.locator('[data-testid="new-chat-landing-run-on-arca"]').click(),
+      ]);
       const command = consolePage.locator("#command");
       await consolePage.waitForFunction(
         () => /isaac omni host/.test(document.getElementById("command").textContent),
@@ -151,6 +152,7 @@ describe(
         { timeout: 15_000 },
       );
       seen.command = await command.textContent();
+      // Hold each state on screen long enough to read in the recording.
       await sleep(1000);
 
       await resetClipboard();
@@ -174,13 +176,14 @@ describe(
         null,
         { timeout: 20_000 },
       );
-      await sleep(1000);
+      await sleep(1000); // recording pacing
       const status = consolePage.locator("#status");
       seen.status = (await status.textContent()).trim();
-      await status.click({ clickCount: 3 });
-      seen.statusSelection = await selectionText(consolePage);
       await dragAcross(consolePage, status);
       seen.statusDragSelection = await selectionText(consolePage);
+      // Copy from the triple-click selection, which covers the whole line.
+      await status.click({ clickCount: 3 });
+      seen.statusSelection = await selectionText(consolePage);
       await consolePage.keyboard.press(COPY_SHORTCUT);
       seen.statusClipboard = await clipboardAfterCopy();
       seen.statusContextMenus = await rightClickAt(consolePage, status);
@@ -198,7 +201,7 @@ describe(
       await consolePage.keyboard.press(COPY_SHORTCUT);
       seen.terminalClipboard = await clipboardAfterCopy();
       seen.terminalContextMenus = await rightClickAt(consolePage, errorRow);
-      await sleep(1000);
+      await sleep(1000); // recording pacing
     });
 
     after(async () => {

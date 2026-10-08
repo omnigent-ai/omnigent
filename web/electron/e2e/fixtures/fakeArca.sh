@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stand-in arca CLI: replays the remote output from the report's screenshot.
+# Stand-in arca CLI that emits an authentication-required failure.
 url=""
 while [ $# -gt 0 ]; do
   if [ "$1" = "--server" ]; then url=$(printf '%s' "$2" | tr -d "'"); fi
