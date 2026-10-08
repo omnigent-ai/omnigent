@@ -954,20 +954,17 @@ def test_active_skill_processor_stamps_spans_while_active() -> None:
     assert spans["tool:Bash"].attributes.get("omnigent.skill.active") == "code-review"
     assert spans["tool:Read"].attributes.get("omnigent.skill.active") == "code-review"
     assert "omnigent.skill.active" not in (spans["tool:after"].attributes or {})
-    assert telemetry.current_active_skill() is None
+    assert telemetry._active_skill_var.get() is None
 
 
-def test_make_contextvar_span_processor_is_generic() -> None:
-    """
-    The factory stamps any attribute from any context var — the reusable seam
-    shared by ``session.id`` and ``omnigent.skill.active``.
-    """
+def test_make_span_attribute_processor_is_generic() -> None:
+    """The factory stamps any attribute from any value getter, e.g. a context var."""
     import contextvars
 
     var: contextvars.ContextVar[str | None] = contextvars.ContextVar("t", default=None)
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
-    provider.add_span_processor(telemetry.make_contextvar_span_processor("my.attr", var))
+    provider.add_span_processor(telemetry.make_span_attribute_processor("my.attr", var.get))
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     tracer = provider.get_tracer("test")
 

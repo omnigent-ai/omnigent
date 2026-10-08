@@ -18,24 +18,24 @@ def test_skill_tool_names_cover_native_and_builtin() -> None:
 
 
 def test_extract_skill_name_load_skill_name_key() -> None:
-    assert _extract_skill_name("load_skill", {"name": "code-review"}) == "code-review"
+    assert _extract_skill_name({"name": "code-review"}) == "code-review"
 
 
 def test_extract_skill_name_native_command_key() -> None:
     # Claude Code's native Skill tool is commonly {"command": "<skill>"}.
-    assert _extract_skill_name("Skill", {"command": "cardinal"}) == "cardinal"
+    assert _extract_skill_name({"command": "cardinal"}) == "cardinal"
 
 
 def test_extract_skill_name_falls_back_to_first_string() -> None:
     # Tolerant of an unexpected key so a schema change doesn't silently drop it.
-    assert _extract_skill_name("Skill", {"unexpected": "creditflow"}) == "creditflow"
+    assert _extract_skill_name({"unexpected": "creditflow"}) == "creditflow"
 
 
 def test_extract_skill_name_strips_whitespace() -> None:
-    assert _extract_skill_name("load_skill", {"name": "  imaforge  "}) == "imaforge"
+    assert _extract_skill_name({"name": "  imaforge  "}) == "imaforge"
 
 
 def test_extract_skill_name_none_when_no_usable_value() -> None:
-    assert _extract_skill_name("Skill", {}) is None
-    assert _extract_skill_name("Skill", {"n": 5}) is None
-    assert _extract_skill_name("Skill", None) is None  # type: ignore[arg-type]
+    assert _extract_skill_name({}) is None
+    assert _extract_skill_name({"n": 5}) is None
+    assert _extract_skill_name(None) is None  # type: ignore[arg-type]

@@ -1,18 +1,12 @@
 """OpenTelemetry metrics for skill execution.
 
-Aggregatable, low-cardinality counterparts to the per-turn skill spans: which
-skills ran, their turn-scoped outcome and duration, and the tools they drove.
-Skill names are a bounded set, so they are safe metric labels. No message
-content is ever recorded here — see ``designs/OBSERVABILITY.md``.
-
-Boundaries are turn-scoped and therefore approximate: a skill's "execution" is
-measured from the Skill / load_skill tool call to the end of that agent turn
-(there is no native skill-end signal), and outcome is the turn's outcome.
+Labels are low-cardinality (skill and tool names only, never content). Timing
+and outcome are turn-scoped: a skill runs from its Skill / load_skill call to
+the end of the turn, since there is no skill-end signal.
 """
 
 from __future__ import annotations
 
-import logging
 from functools import lru_cache
 from typing import Protocol
 
@@ -20,8 +14,6 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 
 from omnigent.runtime.telemetry import telemetry_guarded
-
-_logger = logging.getLogger(__name__)
 
 _OTEL_METER_NAME = "omnigent.skill"
 INVOCATIONS_METRIC_NAME = "omnigent.skill.invocations"
@@ -80,7 +72,7 @@ class SkillMetrics:
         self._invocations.add(1, attributes={"skill.name": skill_name, "outcome": outcome})
 
     def record_execution_duration(self, skill_name: str, duration_ms: float) -> None:
-        """Record a skill's turn-scoped execution duration in milliseconds."""
+        """Record a skill's execution duration in milliseconds."""
         self._execution_duration.record(duration_ms, attributes={"skill.name": skill_name})
 
     def record_tool_call(self, skill_name: str, tool_name: str) -> None:
@@ -96,17 +88,17 @@ def _default_metrics() -> SkillMetrics:
 
 @telemetry_guarded
 def record_skill_invocation(skill_name: str, outcome: str) -> None:
-    """Best-effort record of a skill invocation and its turn outcome."""
+    """Record a skill invocation and its turn outcome."""
     _default_metrics().record_invocation(skill_name, outcome)
 
 
 @telemetry_guarded
 def record_skill_execution_duration(skill_name: str, duration_ms: float) -> None:
-    """Best-effort record of a skill's turn-scoped execution duration (ms)."""
+    """Record a skill's execution duration in milliseconds."""
     _default_metrics().record_execution_duration(skill_name, duration_ms)
 
 
 @telemetry_guarded
 def record_skill_tool_call(skill_name: str, tool_name: str) -> None:
-    """Best-effort record of a tool call made while a skill was active."""
+    """Record a tool call made while a skill was active."""
     _default_metrics().record_tool_call(skill_name, tool_name)

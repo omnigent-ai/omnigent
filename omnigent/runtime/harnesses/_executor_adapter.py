@@ -108,29 +108,20 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     return name
 
 
-# Tool names that load/activate a skill. "Skill" is Claude Code's native skill
-# tool (claude-sdk harness); "load_skill" is Omnigent's builtin (arrives as
-# mcp__omnigent__load_skill, stripped by _strip_mcp_tool_prefix). Harnesses whose
-# skills never surface as a load_skill/Skill tool call are a documented gap — see
-# designs/OBSERVABILITY.md §13 (Harness coverage & known gaps).
+# Tool names that load a skill (after MCP-prefix stripping): Claude Code's native
+# "Skill" and Omnigent's builtin "load_skill". Coverage gaps: designs/OBSERVABILITY.md §13.
 _SKILL_TOOL_NAMES = frozenset({"Skill", "load_skill"})
 
+# Arg keys that may hold the skill name. Native ``Skill`` input is CLI-owned and
+# unpinned (commonly ``command``); ``load_skill`` uses ``name``.
+_SKILL_NAME_KEYS = ("command", "name", "skill", "skill_name")
 
-def _extract_skill_name(tool_name: str, args: dict[str, Any]) -> str | None:
-    """Best-effort skill name from a Skill / load_skill tool call's args.
 
-    ``load_skill`` uses ``{"name": ...}``; Claude Code's native ``Skill`` tool is
-    CLI-owned (its input key is not fixed by the SDK — commonly ``command``), so
-    probe the known keys then fall back to the first string value. Returns
-    ``None`` when nothing usable is present.
-    """
+def _extract_skill_name(args: dict[str, Any]) -> str | None:
+    """Skill name from a skill tool call's args: a known key, else the first string value."""
     if not isinstance(args, dict):
         return None
-    for key in ("command", "name", "skill", "skill_name"):
-        value = args.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    for value in args.values():
+    for value in (*(args.get(key) for key in _SKILL_NAME_KEYS), *args.values()):
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
@@ -288,7 +279,13 @@ class ExecutorAdapter(HarnessApp):
         self._pr_tool_calls.clear()
 
         tracing = is_tracing_enabled()
-        from omnigent.runtime.telemetry import current_session_id, session_scope
+        from omnigent.runtime import skill_metrics
+        from omnigent.runtime.telemetry import (
+            current_session_id,
+            reset_active_skill,
+            session_scope,
+            set_active_skill,
+        )
 
         turn_session_id = ctx.session_id or current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
@@ -298,10 +295,8 @@ class ExecutorAdapter(HarnessApp):
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
         _active_tool_span = None
         _active_tool_parent = None
-        # Skill telemetry (turn-scoped). Token for the active-skill contextvar;
-        # distinct skills invoked this turn (the most-recent is _turn_skills[-1]);
-        # its start time for a turn-bounded execution duration. _turn_outcome is
-        # set at each terminal branch and consumed once in the finally.
+        # Skill telemetry, turn-scoped. The first token restores the pre-turn
+        # active skill; _turn_skills[-1] is the most recent skill.
         _active_skill_token: Any = None
         _turn_skills: list[str] = []
         _last_skill_start: float | None = None
@@ -337,13 +332,6 @@ class ExecutorAdapter(HarnessApp):
                         agent_name=request.model or "unknown",
                         user_message=user_message,
                         model=request.model_override or request.model,
-                    )
-                    # Skill-telemetry helpers, bound once per traced turn so the
-                    # per-tool-call path below never re-imports them.
-                    from omnigent.runtime import skill_metrics
-                    from omnigent.runtime.telemetry import (
-                        reset_active_skill,
-                        set_active_skill,
                     )
 
                 response_text: str | None = None
@@ -383,15 +371,12 @@ class ExecutorAdapter(HarnessApp):
                                 event.args or {},
                             )
                             if _bare_tool_name in _SKILL_TOOL_NAMES:
-                                _skill_name = _extract_skill_name(
-                                    _bare_tool_name, event.args or {}
-                                )
+                                _skill_name = _extract_skill_name(event.args or {})
                                 if _skill_name:
                                     tctx.set_skill_name(_active_tool_span, _skill_name)
-                                    if _active_skill_token is not None:
-                                        with contextlib.suppress(Exception):
-                                            reset_active_skill(_active_skill_token)
-                                    _active_skill_token = set_active_skill(_skill_name)
+                                    _token = set_active_skill(_skill_name)
+                                    if _active_skill_token is None:
+                                        _active_skill_token = _token
                                     _turn_skills.append(_skill_name)
                                     _last_skill_start = time.monotonic()
                             elif _turn_skills:
@@ -543,12 +528,9 @@ class ExecutorAdapter(HarnessApp):
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await injection_watcher
-            # Skill telemetry: record turn-scoped invocations/duration once, then
-            # release the active-skill binding (backstop for the per-call reset)
-            # so it never leaks into the next turn on the reused tracing context.
+            # Record skill metrics once per turn, then clear the active skill so it
+            # can't leak into the next turn.
             if _turn_skills:
-                from omnigent.runtime import skill_metrics
-
                 _outcome = _turn_outcome or "unknown"
                 for _skill in dict.fromkeys(_turn_skills):
                     skill_metrics.record_skill_invocation(_skill, _outcome)
@@ -558,8 +540,6 @@ class ExecutorAdapter(HarnessApp):
                         (time.monotonic() - _last_skill_start) * 1000.0,
                     )
             if _active_skill_token is not None:
-                from omnigent.runtime.telemetry import reset_active_skill
-
                 with contextlib.suppress(Exception):
                     reset_active_skill(_active_skill_token)
             if tctx is not None:

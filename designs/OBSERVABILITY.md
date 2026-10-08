@@ -468,7 +468,7 @@ low-cardinality labels — never content, never ids like `session.id`.
 | Need | Seam | Reference |
 |---|---|---|
 | Structured, per-turn, tree-nested span (agent/tool/skill-like) | New `start_X_span`/`end_X_span` on `TracingContext` + an `elif isinstance(event, …)` branch in the executor-adapter event loop | `omnigent/inner/tracing.py`, `omnigent/runtime/harnesses/_executor_adapter.py` |
-| Cross-cutting attribute on **every** span from ambient context | A `ContextVar` + `make_contextvar_span_processor(attr, var)`, registered in `_init_otel_traces` | `telemetry.py` (`_session_id_var`, `_active_skill_var`) |
+| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `user.id`, `omnigent.skill.active`) |
 | Aggregatable counts / latency (dashboards, alerting) | A metric module copied from `omnigent/db/metrics.py`, with module-level `record_*` wrapped in `@telemetry_guarded` | `omnigent/runtime/skill_metrics.py`, `omnigent/db/metrics.py` |
 | Ad-hoc span around a code block | `telemetry.span()` (+ `record_message_payload` for a gated body) | `telemetry.py`, `omnigent/runtime/policies/engine.py` |
 
@@ -477,9 +477,9 @@ Two shared helpers keep the common cases one-liners:
 - **`telemetry.telemetry_guarded`** — decorator that no-ops when telemetry is off
   and never raises; wraps the `telemetry_enabled()` guard + debug-log-never-raise
   boilerplate every `record_*` needs.
-- **`telemetry.make_contextvar_span_processor(attribute_key, contextvar)`** —
-  builds the "stamp `attribute_key` from a context var on every span" processor.
-  `omnigent.skill.active` and `session.id` use it.
+- **`telemetry.make_span_attribute_processor(attribute_key, get_value)`** —
+  builds the "stamp `attribute_key` on every span" processor. `session.id`,
+  `user.id` and `omnigent.skill.active` use it.
 
 **Worked example — skill-execution telemetry (turn-scoped).** The executor
 adapter observes the `Skill` / `load_skill` tool call, stamps the ungated
