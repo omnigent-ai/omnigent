@@ -8,6 +8,9 @@ const MAX_NAMESPACE_PREFIX_BYTES = 12;
 const MAX_GENERATED_BYTES = 128;
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
+export const MAX_CONFIG_BYTES = 1024 * 1024;
+export const MAX_CONFIG_XML_MARKUP = 32_000;
+const XML_MARKUP_START = "<".charCodeAt(0);
 export const INFLATE_CHUNK_BYTES = 16 * 1024;
 export const MAX_EMITTED_RATIO = 4;
 export const MAX_EMITTED_OVERHEAD = 1024 * 1024;
@@ -206,7 +209,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       throw new Error("Invalid ZIP directory");
     let selectedBytes = 0;
     let extractedBytes = 0;
-    const extract = (needed: (name: string) => boolean) => {
+    const extract = (needed: (name: string) => boolean, entryLimit = MAX_SELECTED_BYTES) => {
       const ranges = new Map<
         string,
         { start: number; size: number; originalSize: number; compression: number }
@@ -244,6 +247,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         if (
           size === ZIP64_SIZE ||
           originalSize === ZIP64_SIZE ||
+          originalSize > entryLimit ||
           (compression !== ZIP_STORED && compression !== ZIP_DEFLATED) ||
           (compression === ZIP_STORED && size !== originalSize)
         )
@@ -293,7 +297,11 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         const receive = (data: Uint8Array) => {
           length += data.byteLength;
           extractedBytes += data.byteLength;
-          if (length > declared.originalSize || extractedBytes > MAX_SELECTED_BYTES)
+          if (
+            length > declared.originalSize ||
+            length > entryLimit ||
+            extractedBytes > MAX_SELECTED_BYTES
+          )
             throw new Error("3MF extracted byte limit");
           entry.set(data, length - data.byteLength);
         };
@@ -319,9 +327,14 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const configs = extract(
       (name) =>
         name === "Metadata/model_settings.config" || name === "Metadata/project_settings.config",
+      MAX_CONFIG_BYTES,
     );
     if (!configs["Metadata/model_settings.config"] || !configs["Metadata/project_settings.config"])
       return buffer;
+    // Ignored settings XML can be much denser than mesh data.
+    let configMarkup = 0;
+    for (const byte of configs["Metadata/model_settings.config"])
+      if (byte === XML_MARKUP_START && ++configMarkup > MAX_CONFIG_XML_MARKUP) return buffer;
     const palette: unknown = JSON.parse(
       strFromU8(configs["Metadata/project_settings.config"]),
     ).filament_colour;
@@ -450,12 +463,14 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     resources.append(bases);
     outputModel.append(resources);
     const colors: string[] = [];
+    let neutralVariant = false;
     const memo = new Map<string, { id: string; height: number }>();
     const sourceSizes = new Map<string, number>();
     const moved = new Set<string>();
     const emittedLimit = () =>
       Math.min(
-        selectedBytes * Math.min(MAX_EMITTED_RATIO, Math.max(2, colors.length)) +
+        selectedBytes *
+          Math.min(MAX_EMITTED_RATIO, Math.max(2, colors.length + (neutralVariant ? 1 : 0))) +
           MAX_EMITTED_OVERHEAD,
         MAX_EMITTED_BYTES,
       );
@@ -501,6 +516,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       }
       if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
       if (effectiveColor && !colors.includes(effectiveColor)) colors.push(effectiveColor);
+      if (mesh && !effectiveColor) neutralVariant = true;
       reserve(source, sourceKey);
       visiting.add(sourceKey);
       const object = moved.has(sourceKey)
@@ -589,6 +605,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     objectConfigs.clear();
     contexts.clear();
     slots.clear();
+    settings.documentElement.replaceChildren();
     sourceSizes.clear();
     memo.clear();
     moved.clear();
