@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from tests.runner.conftest import (
     _BlockingHarnessClient,
     _FakeProcessManager,
@@ -42,8 +42,6 @@ async def test_failed_subagent_stranded_after_empty_wake_turn() -> None:
     start, so after the empty turn only inbox-state recovery can re-wake the
     parent. Without the fix the second wake never arrives and this times out.
     """
-    from omnigent.runner import app as runner_app
-
     # Stable hex IDs so failures are searchable in logs.
     parent_id = "a1b2c3d4e5f601234567890abcdef012"
     child_id = "b2c3d4e5f6071234567890abcdef0123"
@@ -73,8 +71,8 @@ async def test_failed_subagent_stranded_after_empty_wake_turn() -> None:
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="acp-worker",
@@ -156,8 +154,8 @@ async def test_failed_subagent_stranded_after_empty_wake_turn() -> None:
 
     finally:
         gate.set()  # ensure the harness is never permanently blocked on teardown
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # The parent inbox must still hold the undrained failed-child payload,
     # because the empty wake turn did not call sys_read_inbox.
@@ -182,8 +180,6 @@ async def test_wake_turn_with_output_does_not_rewake_undrained_inbox() -> None:
     Re-waking it anyway would spend a model turn after every sub-agent
     completion (and, chained, would fire later scripted actions early).
     """
-    from omnigent.runner import app as runner_app
-
     parent_id = "c3d4e5f6a7b81234567890abcdef0134"
     child_id = "d4e5f6a7b8c91234567890abcdef0145"
 
@@ -213,8 +209,8 @@ async def test_wake_turn_with_output_does_not_rewake_undrained_inbox() -> None:
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="acp-worker",
@@ -269,8 +265,8 @@ async def test_wake_turn_with_output_does_not_rewake_undrained_inbox() -> None:
             assert len(server_client.wake_posts) == 1
     finally:
         gate.set()
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # The undrained payload stays in the inbox for the parent's next turn.
     assert session_inbox.qsize() == 1
