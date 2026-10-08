@@ -29,6 +29,22 @@ URL or credential. Direct HTTP/stdio declarations retain their existing behavior
 An administrator approves destinations and tool allowlists. The catalog API
 does not allow users to register arbitrary destinations.
 
+## Runtime compatibility
+
+Registry references require `mcp_registry` in the host and runner hello
+`capabilities` lists. Omitted tokens mean unsupported, independent of the version
+string. The server returns HTTP 503 with `error.code: runner_capability_mismatch`
+and an upgrade/restart message for known incompatible runtimes. This gate applies
+only when the agent bundle (including nested agents) uses registry MCPs. It does
+not change existing direct HTTP/stdio transport behavior.
+
+Creation checks known runtimes before persistence; live MCP edits and runner
+rebinding reject before changing their respective bundle or runner binding.
+Unbound authoring remains possible. Managed sandboxes are checked when their
+execution host connects, and runner initialization/dispatch checks the actual
+runner. Replica-local absence preserves existing offline/reroute behavior rather
+than treating an unseen host as an old build.
+
 ## Catalog and account connections
 
 | Method and path | Request | Success response |

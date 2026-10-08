@@ -4221,13 +4221,22 @@ async def _bind_and_launch_managed_runner(
     if host_registry is not None:
         host_conn = host_registry.get(managed.host_id)
         if host_conn is not None:
-            launch_attempt = await _launch_runner_on_host(
-                conv,
-                conversation_store,
-                host_registry,
-                host_conn,
-            )
-            if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            try:
+                launch_attempt = await _launch_runner_on_host(
+                    conv,
+                    conversation_store,
+                    host_registry,
+                    host_conn,
+                )
+                runner_id = launch_attempt.runner_id
+                reason = (
+                    launch_attempt.error or "harness not configured on the sandbox host"
+                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
+                    else None
+                )
+            except OmnigentError as exc:
+                reason = str(exc)
+            if reason is not None:
                 # The sandbox image should bake in the harness, but if the
                 # host refuses, fail the launch loudly (mirroring the
                 # delete-during-provisioning path) rather than waiting out
@@ -4236,7 +4245,6 @@ async def _bind_and_launch_managed_runner(
                 # session shouldn't outlive the launch that provisioned it;
                 # a relaunch generation on an existing host leaves the
                 # identity alone, same as a failed wake.
-                reason = launch_attempt.error or "harness not configured on the sandbox host"
                 if relaunch_host is None:
                     host = await asyncio.to_thread(host_store.get_host, managed.host_id)
                     if host is not None:
@@ -4244,7 +4252,6 @@ async def _bind_and_launch_managed_runner(
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
-            runner_id = launch_attempt.runner_id
     if runner_id is not None and tunnel_registry is not None:
         connected = await _wait_for_managed_runner_tunnel(
             session_id,
@@ -5102,6 +5109,9 @@ async def _run_managed_wake(
                 return
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
+    except OmnigentError as exc:
+        tracker.fail(session_id, str(exc))
+        _publish_sandbox_status(session_id, "failed", str(exc))
     except HTTPException as exc:
         tracker.fail(session_id, str(exc.detail))
         _publish_sandbox_status(session_id, "failed", str(exc.detail))
@@ -5344,6 +5354,8 @@ async def _ensure_native_terminal_ready(
     terminal_name = _native_terminal_name_for_harness(harness)
 
     async def _post_ensure() -> httpx.Response:
+        if runner_router is not None:
+            await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
         return await runner_client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={
@@ -7286,6 +7298,8 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    if runner_router is not None:
+        await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
@@ -10670,6 +10684,9 @@ async def _create_session_from_existing_agent(
 
     inference_snapshot = None
     selection_spec = None
+    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+
+    selected_registry_services = set(body.mcp_registry_services or [])
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime.workflow import _find_spec_by_name
@@ -10699,6 +10716,7 @@ async def _create_session_from_existing_agent(
                 "create-time model policy: agent %r failed to load", agent.name, exc_info=True
             )
             selection_spec = None
+        selected_registry_services.update(registry_services(selection_spec))
         if selection_spec is not None and body.sub_agent_name:
             selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
         from omnigent.server.routes.sandbox_inference import (
@@ -10788,6 +10806,14 @@ async def _create_session_from_existing_agent(
 
     from omnigent.server.routes._session_harness_readiness import (
         validate_create_harness_readiness,
+    )
+
+    require_registry_mcp_runtime(
+        selected_registry_services,
+        host_id=body.host_id,
+        runner_id=inherited_runner_id,
+        host_registry=getattr(request.app.state, "host_registry", None),
+        tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
     )
 
     selected_harness = (
@@ -10987,7 +11013,6 @@ async def _create_session_from_existing_agent(
         agent = await asyncio.to_thread(
             agent_for_user, agent_store, artifact_store, agent, user_id
         )
-
 
     session_persisted = False
     try:
@@ -11345,7 +11370,6 @@ def _create_session_from_bundle(
     inference_model: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
-
     *,
     derive_launch_args: bool = True,
 ) -> CreatedSessionResponse:

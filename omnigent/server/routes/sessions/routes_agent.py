@@ -338,6 +338,20 @@ def register_agent_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        from omnigent.runner.routing import routing_host_id
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(spec),
+            host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
+            runner_id=conv.runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
+        )
         new_loc = bundle_location(agent.id, bundle_bytes)
 
         # Idempotency: same bundle content = no-op

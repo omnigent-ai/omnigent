@@ -10,6 +10,13 @@ This describes the implemented prototype. Follow the
 The [API and integration contract](MCP_REGISTRY_API.md) describes the HTTP surface,
 existing Python hooks, and options for bringing an external registry or gateway.
 
+Execution hosts and runners must also run the MCP registry build. Their existing
+hello frames advertise `mcp_registry`; the server rejects incompatible registry
+launches, edits, bindings and dispatch with upgrade/restart guidance. Updating the
+server alone cannot teach an older runner to parse `transport: registry`. Plain
+sessions and direct HTTP/stdio MCPs keep their existing behavior. See the
+[deployment walkthrough](../examples/mcp-registry/README.md#server-and-execution-host-versions).
+
 ## Components and ownership
 
 The registry and gateway are modules in the existing Omnigent server, not new

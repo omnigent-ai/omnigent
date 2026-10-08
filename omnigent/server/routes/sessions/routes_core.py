@@ -1061,6 +1061,19 @@ def register_core_routes(
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
 
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(spec),
+            host_id=parsed_metadata.host_id,
+            runner_id=inherited_runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        )
+
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
         inference_snapshot, inference_model = await prepare_create_inference(
@@ -2657,6 +2670,11 @@ def register_core_routes(
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
                 )
+                if runner_router is not None:
+                    await asyncio.to_thread(
+                        runner_router.require_mcp_registry_support,
+                        dataclasses.replace(conv, runner_id=runner_id),
+                    )
                 try:
                     await asyncio.to_thread(
                         conversation_store.replace_runner_id, session_id, runner_id
