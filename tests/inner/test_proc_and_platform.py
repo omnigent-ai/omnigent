@@ -494,8 +494,14 @@ def test_run_isolated_timeout_kills_a_same_group_child_after_the_leader_exits(
                 psutil.Process(child_pid).kill()
 
 
+# POSIX interrupts a genuinely hung waitpid() with SIGALRM for a clean per-test
+# failure; Windows has no SIGALRM and skips these tests anyway, so fall back to
+# the default thread timer there to avoid crashing pytest-timeout's setup.
+_HANG_GUARD = pytest.mark.timeout(30, method="signal" if os.name == "posix" else "thread")
+
+
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process semantics")
-@pytest.mark.timeout(30, method="signal")
+@_HANG_GUARD
 def test_run_isolated_timeout_kills_the_leader_when_group_teardown_is_denied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -532,7 +538,7 @@ def test_run_isolated_timeout_kills_the_leader_when_group_teardown_is_denied(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process semantics")
-@pytest.mark.timeout(30, method="signal")
+@_HANG_GUARD
 def test_run_isolated_kills_the_leader_even_if_kill_tree_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
