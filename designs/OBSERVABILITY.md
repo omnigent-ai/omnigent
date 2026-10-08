@@ -479,16 +479,17 @@ Two shared helpers keep the common cases one-liners:
   boilerplate every `record_*` needs.
 - **`telemetry.make_contextvar_span_processor(attribute_key, contextvar)`** —
   builds the "stamp `attribute_key` from a context var on every span" processor.
-  `omnigent.skill.active` uses it; the older `session.id`/`user.id` processors
-  predate it (`session.id` is a direct fit and can adopt it later; `user.id`
-  reads a static env value, not a context var, so it stays bespoke).
+  `omnigent.skill.active` and `session.id` use it.
 
 **Worked example — skill-execution telemetry (turn-scoped).** The executor
 adapter observes the `Skill` / `load_skill` tool call, stamps the ungated
 `omnigent.skill.name` on that tool span (`TracingContext.set_skill_name`), and
 `set_active_skill(name)` so `omnigent.skill.active` lands on every later span in
 the turn — that is how "which tools ran during skill X" is derivable with no
-per-tool code. At turn end the adapter records `omnigent.skill.invocations`
+per-tool code. Every span also carries `user.id`, the authenticated Omnigent
+user from `debug_logging.current_user_id()` (request-scoped on the server,
+`OMNIGENT_USER_ID` on hosts/runners), so skill usage is attributable per user.
+`user.id` is a span attribute only, never a metric label (unbounded cardinality). At turn end the adapter records `omnigent.skill.invocations`
 (by outcome), `omnigent.skill.execution.duration`, and `omnigent.skill.tool_calls`
 (`omnigent/runtime/skill_metrics.py`) and releases the active-skill binding.
 Boundaries are turn-scoped and therefore approximate: there is no native

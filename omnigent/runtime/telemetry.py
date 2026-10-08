@@ -391,26 +391,32 @@ def _make_session_id_processor() -> Any:
 
 def _make_user_id_processor() -> Any:
     """
-    Build a span processor that stamps ``user.id`` from the ``USER``
-    environment variable onto every recording span.
+    Build a span processor that stamps ``user.id`` — the authenticated
+    Omnigent user — onto every recording span.
 
-    Unlike ``session.id`` (per-turn, via :data:`_session_id_var`), the
-    process owner is fixed for the process's lifetime, so this reads
-    ``USER`` once at processor-construction time rather than per-span.
-    Deployments that run one Omnigent process per analyst (e.g. EAP's
-    per-notebook container) get every span attributed to that analyst with
-    no per-call-site code — matching MLflow's OTLP ingest, which already
-    promotes ``session.id`` and ``user.id`` to trace-level fields.
+    Registered on the runtime ``TracerProvider`` (:func:`_init_otel_traces`)
+    so every span — server, runner, harness, and any future operation — is
+    attributable to a user with no per-call-site code. The identity comes from
+    :func:`omnigent.debug_logging.current_user_id`, the same attribution the
+    debug-log sink uses: the request-scoped user on the server (bound from the
+    auth provider per request) and ``OMNIGENT_USER_ID`` on hosts and runners
+    (the authenticated host owner, injected into every spawned runner). It is
+    read per span so concurrent requests on a multi-user server never share
+    an id. Unauthenticated contexts get no attribute.
+
+    ``user.id`` is a span attribute only — never a metric label, since user
+    ids are unbounded.
 
     :returns: A ``SpanProcessor`` instance.
     """
     from opentelemetry.sdk.trace import SpanProcessor
 
-    user_id = os.environ.get("USER")
+    from omnigent.debug_logging import current_user_id
 
     class _UserIdSpanProcessor(SpanProcessor):
         def on_start(self, span: Any, parent_context: Any = None) -> None:
             try:
+                user_id = current_user_id()
                 if user_id and span.is_recording():
                     span.set_attribute("user.id", user_id)
             except Exception:  # pragma: no cover - telemetry must never break spans
@@ -1139,8 +1145,8 @@ def _init_otel_traces(endpoint: str) -> None:
             # Enrich every span with session.id from the active context (set via
             # session_scope at the request hook / executor turn / forwarder).
             provider.add_span_processor(_make_session_id_processor())
-            # Enrich every span with user.id (the process owner), so dashboards
-            # can group spans per analyst alongside the per-turn session.id.
+            # Enrich every span with the authenticated user.id (request-scoped on
+            # the server, the host owner on hosts/runners).
             provider.add_span_processor(_make_user_id_processor())
             # Stamp omnigent.skill.active on every span while a skill runs, so the
             # tools it drives are attributable to it (executor adapter sets the

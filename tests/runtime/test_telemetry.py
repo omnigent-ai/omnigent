@@ -873,49 +873,61 @@ def test_session_scope_processor_stamps_every_span() -> None:
     assert "session.id" not in (spans["outside.scope"].attributes or {})
 
 
-def test_user_id_processor_stamps_every_span(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    ``_make_user_id_processor`` reads ``USER`` once and tags every span the
-    provider creates — no session scoping needed, since the process owner is
-    fixed for the process's lifetime (unlike the per-turn session.id).
-    """
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-
-    monkeypatch.setenv("USER", "analyst123")
+def _user_id_tracer() -> tuple[InMemorySpanExporter, otel_trace.Tracer]:
+    """Provider with only the user-id processor and an in-memory exporter."""
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(telemetry._make_user_id_processor())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracer = provider.get_tracer("test")
+    return exporter, provider.get_tracer("test")
 
-    with tracer.start_as_current_span("server.request"):
-        with tracer.start_as_current_span("db.query"):  # child span, never stamped by hand
-            pass
+
+def test_user_id_processor_stamps_request_scoped_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The authenticated user bound for the current context (server request
+    scope) lands on every span, including children never stamped by hand, and
+    takes precedence over the process-level owner.
+    """
+    from omnigent.debug_logging import USER_ID_ENV_VAR, current_user_id_scope
+
+    monkeypatch.setenv(USER_ID_ENV_VAR, "host-owner")
+    exporter, tracer = _user_id_tracer()
+
+    with current_user_id_scope("alice@example.com"):
+        with tracer.start_as_current_span("tool:Skill"):
+            with tracer.start_as_current_span("tool:Bash"):
+                pass
 
     spans = {s.name: s for s in exporter.get_finished_spans()}
-    assert spans["server.request"].attributes.get("user.id") == "analyst123"
-    assert spans["db.query"].attributes.get("user.id") == "analyst123"
+    assert spans["tool:Skill"].attributes.get("user.id") == "alice@example.com"
+    assert spans["tool:Bash"].attributes.get("user.id") == "alice@example.com"
 
 
-def test_user_id_processor_no_op_without_user_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When ``USER`` is unset, spans get no ``user.id`` attribute rather than
-    a stray empty string."""
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+def test_user_id_processor_falls_back_to_process_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On a host/runner (no request scope) the ``OMNIGENT_USER_ID`` owner is used."""
+    from omnigent.debug_logging import USER_ID_ENV_VAR
 
-    monkeypatch.delenv("USER", raising=False)
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(telemetry._make_user_id_processor())
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracer = provider.get_tracer("test")
+    monkeypatch.setenv(USER_ID_ENV_VAR, "bob@example.com")
+    exporter, tracer = _user_id_tracer()
 
-    with tracer.start_as_current_span("server.request"):
+    with tracer.start_as_current_span("tool:load_skill"):
         pass
 
-    spans = exporter.get_finished_spans()
-    assert "user.id" not in (spans[0].attributes or {})
+    assert exporter.get_finished_spans()[0].attributes.get("user.id") == "bob@example.com"
+
+
+def test_user_id_processor_no_op_without_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no authenticated user, spans get no ``user.id`` (never the OS ``USER``)."""
+    from omnigent.debug_logging import USER_ID_ENV_VAR
+
+    monkeypatch.delenv(USER_ID_ENV_VAR, raising=False)
+    monkeypatch.setenv("USER", "os-login")
+    exporter, tracer = _user_id_tracer()
+
+    with tracer.start_as_current_span("tool:Skill"):
+        pass
+
+    assert "user.id" not in (exporter.get_finished_spans()[0].attributes or {})
 
 
 def test_active_skill_processor_stamps_spans_while_active() -> None:
