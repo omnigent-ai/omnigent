@@ -626,3 +626,49 @@ def test_supervise_forwarder_rotation_survives_unsubscribe_failure(
         for record in caplog.records
         if record.levelno == logging.WARNING
     )
+
+
+def test_supervise_forwarder_rotation_survives_callback_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing ownership callback is logged; the retired thread is still released and
+    the replacement thread's events still reach the new session."""
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
+    )
+    fake_client = _RotationFakeClient(
+        events=[_thread_started_event("thread_new"), _started_event("turn_new")]
+    )
+    session_events: list[_CapturedSessionEvent] = []
+
+    def on_session_rotated(old_session_id: str, new_session_id: str) -> None:
+        raise RuntimeError("registry unavailable")
+
+    async def run() -> None:
+        """Run the supervise loop through a native thread switch."""
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=tmp_path,
+            app_server_url="ws://127.0.0.1:9876",
+            thread_id="thread_old",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_rotation_ap_handler(session_events=session_events)),
+            on_session_rotated=on_session_rotated,
+        )
+
+    with caplog.at_level(logging.WARNING, logger=codex_native_forwarder.__name__):
+        asyncio.run(run())
+
+    assert ("thread/unsubscribe", {"threadId": "thread_old"}) in fake_client.requests
+    assert [
+        event.body["data"]["status"]
+        for event in session_events
+        if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
+    ] == ["running"]
+    assert any(
+        "rotation callback failed for conv_old -> conv_new" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )

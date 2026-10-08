@@ -42,6 +42,7 @@ def main() -> None:
         if mid is not None:
             sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
             sys.stdout.flush()
+    # Outlive stdin EOF so a leaked (orphaned) stub stays observable to the test.
     time.sleep(600)
 
 

@@ -26,6 +26,7 @@ These tests are excluded from the default ``pytest`` run via
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import signal
@@ -33,7 +34,7 @@ import subprocess
 import sys
 import tarfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import IO, Any, cast
 
@@ -921,6 +922,36 @@ def restart_live_runner_process(live_server: str, live_runner_id: str) -> None:
             pass
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError("replacement runner did not reconnect before timeout")
+
+
+@contextlib.contextmanager
+def live_runner_env_override(
+    live_server: str, live_runner_id: str, overrides: Mapping[str, str]
+) -> Iterator[None]:
+    """Run the live runner with *overrides* applied to its environment.
+    The runner restarts with the overrides on entry and with its original
+    environment on exit, even when the first restart fails."""
+    runner_env = cast(dict[str, str], _live_runner_state["env"])
+    previous = {key: runner_env.get(key) for key in overrides}
+    try:
+        runner_env.update(overrides)
+        restart_live_runner_process(live_server, live_runner_id)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                runner_env.pop(key, None)
+            else:
+                runner_env[key] = value
+        restart_live_runner_process(live_server, live_runner_id)
+
+
+def live_runner_log_dir() -> Path:
+    """Directory holding the live runner's own ``runner-*.log`` files."""
+    runner_env = cast(dict[str, str], _live_runner_state["env"])
+    data_dir = runner_env.get("OMNIGENT_DATA_DIR")
+    root = Path(data_dir) if data_dir else Path(runner_env.get("HOME", Path.home())) / ".omnigent"
+    return root.expanduser() / "logs" / "runner"
 
 
 @pytest.fixture

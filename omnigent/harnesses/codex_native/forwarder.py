@@ -2206,10 +2206,18 @@ async def supervise_forwarder(
                     )
                     if rotated:
                         forwarder_state.note_parent_rotation(target.session_id)
-                        # Re-key the runner's teardown bookkeeping before any await, so
-                        # teardown by the retired id cannot reach the live rotated session.
+                        # Hand teardown bookkeeping to the new session before awaiting the
+                        # unsubscribe; a bookkeeping failure must not abort the hand-off.
                         if on_session_rotated is not None:
-                            on_session_rotated(retiring_session_id, target.session_id)
+                            try:
+                                on_session_rotated(retiring_session_id, target.session_id)
+                            except Exception:  # noqa: BLE001 - bookkeeping must not abort rotation.
+                                _logger.warning(
+                                    "Codex forwarder rotation callback failed for %s -> %s",
+                                    retiring_session_id,
+                                    target.session_id,
+                                    exc_info=True,
+                                )
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await subscribe_task

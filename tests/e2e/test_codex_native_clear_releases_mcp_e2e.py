@@ -8,7 +8,9 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -35,10 +37,10 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 from tests._helpers.session import bundle_files, post_session_bundle
-from tests.e2e import conftest as e2e_conftest
 from tests.e2e.conftest import (
     configure_mock_llm,
-    restart_live_runner_process,
+    live_runner_env_override,
+    live_runner_log_dir,
     set_fallback_mock_llm,
 )
 from tests.e2e.test_codex_native_terminal_recovery_e2e import _app_server_pid, _tmux, _wait_for
@@ -52,8 +54,11 @@ _SYSTEM_CODEX_CONFIG = Path("/etc/codex/managed_config.toml")
 _STUB_MODULE = Path(__file__).resolve().parent / "_mcp_stub_server.py"
 _STUB_NAME = _STUB_MODULE.name
 _STUB_SERVERS = ("stub_a", "stub_b")
-# Codex unloads an idle, unsubscribed thread about 60s after its last subscriber leaves.
-_RELEASE_WINDOW_S = 120.0
+# Codex unloads an idle thread, and stops its MCP servers, this long after its last
+# subscriber leaves. Configurable since Codex 0.154.0; older releases hard-code 30 minutes.
+_THREAD_UNLOAD_DELAY_S = 5
+_UNLOAD_DELAY_CONFIGURABLE_SINCE = (0, 154, 0)
+_RELEASE_WINDOW_S = 60.0
 _TEARDOWN_WINDOW_S = 30.0
 _TUI_READY_TIMEOUT_S = 120.0
 # Codex renders a randomised placeholder, so readiness is the composer prompt itself.
@@ -74,6 +79,23 @@ def _system_codex_config_in_use() -> bool:
         return True
 
 
+def _codex_release() -> tuple[int, ...] | None:
+    """Release tuple of the ``codex`` binary on PATH, or ``None`` when unavailable."""
+    codex = shutil.which("codex")
+    if codex is None:
+        return None
+    try:
+        output = subprocess.run(
+            [codex, "--version"], capture_output=True, text=True, timeout=30, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", output)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+_CODEX_RELEASE = _codex_release()
+
 pytestmark = [
     pytest.mark.skipif(
         shutil.which("codex") is None or shutil.which("tmux") is None,
@@ -85,13 +107,20 @@ pytestmark = [
     ),
 ]
 
+requires_short_unload_delay = pytest.mark.skipif(
+    _CODEX_RELEASE is None or _CODEX_RELEASE < _UNLOAD_DELAY_CONFIGURABLE_SINCE,
+    reason="Codex before 0.154.0 unloads an idle unsubscribed thread only after a fixed "
+    "30 minutes, so the release is not observable in a test window",
+)
+
 
 def _write_stub_mcp_config(codex_home: Path) -> Path:
     """Write a Codex config launching the stub MCP servers; return their shared log."""
     log = codex_home / "mcp_stub.log"
     log.write_text("")
     python = json.dumps(sys.executable)
-    sections = [
+    sections = [f"thread_unload_delay_secs = {_THREAD_UNLOAD_DELAY_S}\n"]
+    sections += [
         f"[mcp_servers.{name}]\n"
         f"command = {python}\n"
         f"args = [{json.dumps(str(_STUB_MODULE))}, {json.dumps(name)}, {json.dumps(str(log))}]\n"
@@ -110,18 +139,8 @@ def stub_mcp_log(
     with the stub config and restored afterwards to keep the override out of other modules."""
     codex_home = tmp_path_factory.mktemp("codex-home")
     log = _write_stub_mcp_config(codex_home)
-    runner_env = e2e_conftest._live_runner_state["env"]
-    previous = runner_env.get("CODEX_HOME")
-    try:
-        runner_env["CODEX_HOME"] = str(codex_home)
-        restart_live_runner_process(live_server, live_runner_id)
+    with live_runner_env_override(live_server, live_runner_id, {"CODEX_HOME": str(codex_home)}):
         yield log
-    finally:
-        if previous is None:
-            runner_env.pop("CODEX_HOME", None)
-        else:
-            runner_env["CODEX_HOME"] = previous
-        restart_live_runner_process(live_server, live_runner_id)
 
 
 def _alive(identity: _ProcessId) -> bool:
@@ -132,11 +151,23 @@ def _alive(identity: _ProcessId) -> bool:
     return False
 
 
+def _kill(identity: _ProcessId) -> None:
+    """Kill a process only if it is still the one recorded under this identity."""
+    pid, created = identity
+    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        proc = psutil.Process(pid)
+        if proc.create_time() == created:
+            proc.kill()
+
+
 def _mcp_children(app: _ProcessId | None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if app is None or not _alive(app):
         return rows
-    for child in psutil.Process(app[0]).children(recursive=True):
+    children: list[psutil.Process] = []
+    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        children = psutil.Process(app[0]).children(recursive=True)
+    for child in children:
         with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             cmdline = " ".join(child.cmdline())
             if _STUB_NAME in cmdline:
@@ -169,21 +200,35 @@ def _loaded_threads(ws_url: str) -> list[str]:
         finally:
             with contextlib.suppress(Exception):
                 await client.close()
-        return list(response.get("result", {}).get("data", []))
+        return list(response["result"]["data"])
 
     return asyncio.run(probe())
 
 
-def _runner_log_lines(needles: tuple[str, ...]) -> list[str]:
-    handle = e2e_conftest._live_runner_state.get("log_handle")
-    path = Path(getattr(handle, "name", ""))
-    if not path.is_file():
-        return []
-    return [
-        line[:300]
-        for line in path.read_text(errors="replace").splitlines()
-        if any(n in line for n in needles)
-    ]
+def _loaded_threads_diagnostic(ws_url: str) -> Any:
+    """Loaded-thread census for failure messages; never masks the primary assertion."""
+    try:
+        return _loaded_threads(ws_url)
+    except Exception as exc:
+        return f"<unavailable: {exc!r}>"
+
+
+def _runner_log_lines(needles: tuple[str, ...], since: float) -> list[str]:
+    """Matching lines from the live runner's log files written since *since*."""
+    lines: list[str] = []
+    log_dir = live_runner_log_dir()
+    if not log_dir.is_dir():
+        return lines
+    for path in sorted(log_dir.glob("runner-*.log")):
+        with contextlib.suppress(OSError):
+            if path.stat().st_mtime < since:
+                continue
+            lines.extend(
+                f"{path.name}: {line[:300]}"
+                for line in path.read_text(errors="replace").splitlines()
+                if any(n in line for n in needles)
+            )
+    return lines
 
 
 class _Journey:
@@ -204,6 +249,7 @@ class _Journey:
         self.ws_url = ""
         self.socket = ""
         self.target = ""
+        self.started_at = time.time()
 
     def start(self, runner_id: str) -> None:
         spec = yaml.safe_load(
@@ -273,8 +319,7 @@ class _Journey:
     def record(self, step: str, **fields: Any) -> None:
         fields["mcp_children"] = _mcp_children(self.app)
         if self.ws_url:
-            with contextlib.suppress(Exception):
-                fields["loaded_threads"] = _loaded_threads(self.ws_url)
+            fields["loaded_threads"] = _loaded_threads_diagnostic(self.ws_url)
         self.evidence["steps"].append({"step": step, "t": time.time(), **fields})
 
     def pane(self) -> str:
@@ -330,7 +375,10 @@ class _Journey:
             state = read_bridge_state(self.bridge_dir)
             return state if state is not None and state.thread_id != before.thread_id else None
 
-        after = _wait_for(rotated, "forwarder rotation onto the new Codex thread", timeout=60)
+        try:
+            after = _wait_for(rotated, "forwarder rotation onto the new Codex thread", timeout=60)
+        except AssertionError as error:
+            raise AssertionError(f"{error}; pane:\n{self.pane()[-1500:]}") from None
         if after.session_id not in self.session_ids:
             self.session_ids.append(after.session_id)
         _wait_for(
@@ -378,8 +426,11 @@ class _Journey:
                 *self.session_ids,
                 "rotated Omnigent session",
                 "Codex native input stopped",
+                "could not unsubscribe",
+                "rotation callback failed",
                 "did not finish",
-            )
+            ),
+            since=self.started_at,
         )
         with contextlib.suppress(OSError):
             self.evidence["stub_log"] = [
@@ -400,9 +451,7 @@ class _Journey:
         if self.app is not None:
             leftovers.add(self.app)
         for identity in sorted(leftovers, reverse=True):
-            if _alive(identity):
-                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                    psutil.Process(identity[0]).kill()
+            _kill(identity)
 
 
 @pytest.fixture
@@ -427,6 +476,7 @@ def journey(
     started.finish()
 
 
+@requires_short_unload_delay
 def test_clear_releases_previous_thread_mcp_processes(journey: _Journey) -> None:
     """Both retired threads' stub MCP wrappers exit after two ``/clear`` rotations."""
     journey.run_turn()
@@ -436,13 +486,15 @@ def test_clear_releases_previous_thread_mcp_processes(journey: _Journey) -> None
         generations.append(_stubs(journey.app) - set().union(*generations))
     retired = set().union(*generations[:-1])
     remaining = journey.wait_stubs_gone(retired, timeout=_RELEASE_WINDOW_S)
-    assert not remaining, (
-        f"{len(remaining)} stub MCP wrapper(s) from the two retired Codex "
-        f"threads are still running {_RELEASE_WINDOW_S:.0f}s after /clear "
-        f"(pids {sorted(pid for pid, _ in remaining)}; "
-        f"generations {[sorted(pid for pid, _ in g) for g in generations]}; "
-        f"threads still loaded in the app server: {_loaded_threads(journey.ws_url)})"
-    )
+    if remaining:
+        raise AssertionError(
+            f"{len(remaining)} stub MCP wrapper(s) from the two retired Codex "
+            f"threads are still running {_RELEASE_WINDOW_S:.0f}s after /clear "
+            f"(pids {sorted(pid for pid, _ in remaining)}; "
+            f"generations {[sorted(pid for pid, _ in g) for g in generations]}; "
+            "threads still loaded in the app server: "
+            f"{_loaded_threads_diagnostic(journey.ws_url)})"
+        )
 
 
 def test_deleting_rotated_session_closes_app_server(journey: _Journey) -> None:
@@ -458,12 +510,18 @@ def test_deleting_rotated_session_closes_app_server(journey: _Journey) -> None:
     )
 
 
+@requires_short_unload_delay
 def test_clear_before_first_turn_releases_mcp_processes(journey: _Journey) -> None:
-    """Without a prior turn the forwarder never subscribed, so Codex retires the old thread."""
+    """Without a prior turn the forwarder never subscribed, so Codex retires the old thread
+    while the replacement thread's MCP servers keep running."""
     first_generation = _stubs(journey.app)
     journey.clear()
     remaining = journey.wait_stubs_gone(first_generation, timeout=_RELEASE_WINDOW_S)
     assert not remaining, (
         f"stub MCP wrappers {sorted(pid for pid, _ in remaining)} survived a /clear "
         "issued before any turn"
+    )
+    replacement = _stubs(journey.app)
+    assert len(replacement) >= len(_STUB_SERVERS), (
+        f"the replacement thread's stub MCP wrappers must stay alive; found {replacement}"
     )

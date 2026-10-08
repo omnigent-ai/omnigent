@@ -310,9 +310,12 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it; log the exit."""
         # A /clear rotation re-keys the entry, so locate it by identity.
+        owner = session_id
         for key, registered in list(_AUTO_FORWARDER_TASKS.items()):
             if registered is done_task:
                 del _AUTO_FORWARDER_TASKS[key]
+                owner = key
+                break
         # Obituary: a stopped forwarder takes mirroring, status and the busy
         # signal with it, so no exit path may be silent. ``exception()`` also
         # retrieves the failure (no "Task exception was never retrieved").
@@ -320,24 +323,24 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
             _logger.info(
                 "Transcript forwarder task %s cancelled; session=%s",
                 done_task.get_name(),
-                session_id,
-                extra={"session_id": session_id},
+                owner,
+                extra={"session_id": owner},
             )
         elif (exc := done_task.exception()) is not None:
             _logger.error(
                 "Transcript forwarder task %s died; session mirroring is down "
                 "until the terminal is recreated; session=%s",
                 done_task.get_name(),
-                session_id,
+                owner,
                 exc_info=exc,
-                extra={"session_id": session_id},
+                extra={"session_id": owner},
             )
         else:
             _logger.warning(
                 "Transcript forwarder task %s returned; session mirroring has stopped; session=%s",
                 done_task.get_name(),
-                session_id,
-                extra={"session_id": session_id},
+                owner,
+                extra={"session_id": owner},
             )
 
     task.add_done_callback(_evict)
