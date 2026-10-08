@@ -77,6 +77,7 @@ import {
 } from "@/hooks/useAvailableAgents";
 import { installAgentBundle } from "@/lib/agentsApi";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { installEditingCommandStub, removeEditingCommandStub } from "@/test/editingCommandStub";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -8182,6 +8183,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    removeEditingCommandStub();
   });
 
   function input() {
@@ -8327,6 +8329,34 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.getByText("@README.md")).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("Remove README.md"));
     expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
+  });
+
+  it("attaches through the editing command so the draft's undo history survives", async () => {
+    // Same contract as the in-session composer: the token is removed by the
+    // editing command and the launcher's onChange syncs the draft, so React
+    // never reassigns ``.value`` (which would wipe the native undo stack).
+    const execCommand = installEditingCommandStub();
+    const valueSetter = vi.spyOn(HTMLTextAreaElement.prototype, "value", "set");
+    try {
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
+      const ta = input() as HTMLTextAreaElement;
+      ta.focus();
+      fireEvent.change(ta, { target: { value: "alpha bravo @READ", selectionStart: 17 } });
+      expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
+      valueSetter.mockClear();
+
+      fireEvent.keyDown(ta, { key: "Tab" });
+
+      expect(execCommand).toHaveBeenCalledWith("delete");
+      expect(ta.value).toBe("alpha bravo ");
+      expect(screen.getByText("@README.md")).toBeInTheDocument();
+      expect(valueSetter).not.toHaveBeenCalled();
+    } finally {
+      valueSetter.mockRestore();
+    }
   });
 });
 

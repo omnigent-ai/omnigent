@@ -29,6 +29,10 @@ and steers messages while the agent is busy.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `mention-insert`: typing `@` opens the workspace file browser; picking a file
+  inserts an `@path` token and drilling into a folder rewrites it in place. The
+  edit goes through the browser's editing command so it joins the native undo
+  history, and ⌘/Ctrl+Z still reverts composer edits after an insert.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
@@ -135,6 +139,12 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_composer_attachments.py::test_attach_then_remove_file`,
   `tests/e2e_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
   `tests/e2e_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
+- **`mention-insert`, undo after attach:**
+  `tests/e2e_ui/composer/test_mention_insert_undo.py::test_undo_still_works_after_mention_insert`
+  (control: `test_composer_undo_reverts_typed_text` in the same file). Web unit
+  coverage is `web/src/hooks/useMentionBrowser.test.tsx` plus the mention cases
+  in `web/src/pages/ChatPage.mention.test.tsx` and
+  `web/src/shell/NewChatDialog.test.tsx` (`pnpm --dir web test`).
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`

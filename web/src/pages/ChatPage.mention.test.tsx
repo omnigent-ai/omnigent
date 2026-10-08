@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { installEditingCommandStub, removeEditingCommandStub } from "@/test/editingCommandStub";
 
 // Drill-down "@"-mention browses one directory at a time, so the test stubs
 // both sources: the root listing (useWorkspaceAllFiles) and the per-directory
@@ -232,6 +233,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
   });
   afterEach(() => {
     cleanup();
+    removeEditingCommandStub();
     vi.restoreAllMocks();
   });
 
@@ -383,6 +385,27 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     // distinct from Enter's drill-in.
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(screen.getByText("@src/")).toBeInTheDocument();
+  });
+
+  it("attaches through the editing command so the textarea's undo history survives", () => {
+    // Assigning ``.value`` (React's controlled update) clears the browser's undo
+    // stack. The token must go through the editing command; the composer's
+    // onChange then syncs the draft so React never reassigns the value.
+    const execCommand = installEditingCommandStub();
+    const valueSetter = vi.spyOn(HTMLTextAreaElement.prototype, "value", "set");
+    renderWithTooltips(<Composer {...composerProps()} />);
+    textarea().focus();
+    type("alpha bravo @read");
+    expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+    valueSetter.mockClear();
+
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+
+    expect(execCommand).toHaveBeenCalledWith("delete");
+    expect(textarea().value).toBe("alpha bravo ");
+    expect(screen.getByText("@readme.md")).toBeInTheDocument();
+    expect(screen.queryByTitle("Attach readme.md")).not.toBeInTheDocument();
+    expect(valueSetter).not.toHaveBeenCalled();
   });
 
   it("Escape closes the mention menu", () => {
