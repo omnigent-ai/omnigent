@@ -8,8 +8,11 @@ const MAX_NAMESPACE_PREFIX_BYTES = 12;
 const MAX_GENERATED_BYTES = 128;
 const MODEL_RELATIONSHIP = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 export const MAX_SELECTED_BYTES = 128 * 1024 * 1024;
-export const MAX_CONFIG_BYTES = 1024 * 1024;
-export const MAX_CONFIG_XML_MARKUP = 32_000;
+export const MAX_CONFIG_BYTES = 8 * 1024 * 1024;
+export const MAX_XML_MARKUP = 2_600_000;
+export const MAX_CONFIG_XML_MARKUP = 160_000;
+export const MAX_EMITTED_ELEMENTS = MAX_XML_MARKUP;
+export const MAX_EMITTED_ELEMENT_OVERHEAD = 1024;
 const XML_MARKUP_START = "<".charCodeAt(0);
 export const INFLATE_CHUNK_BYTES = 16 * 1024;
 export const MAX_EMITTED_RATIO = 4;
@@ -102,7 +105,7 @@ function utf8Length(text: string): number {
   return bytes;
 }
 
-function serializationBound(source: Element, limit: number): number {
+function serializationBound(source: Element, limit: number, elementLimit: number) {
   const escapedBytes = (text: string, attribute = false) => {
     let size = utf8Length(text);
     for (let index = 0; index < text.length; index++) {
@@ -116,10 +119,12 @@ function serializationBound(source: Element, limit: number): number {
   };
   // Emitted objects can acquire appearance attributes and a new material resource.
   let bound = MAX_GENERATED_BYTES;
+  let elements = 1;
   const walker = source.ownerDocument.createTreeWalker(source, NodeFilter.SHOW_ALL);
   do {
     const node = walker.currentNode;
     if (node instanceof Element) {
+      elements++;
       bound += node.hasChildNodes()
         ? 2 * utf8Length(node.tagName) + 5
         : utf8Length(node.tagName) + 3;
@@ -137,8 +142,9 @@ function serializationBound(source: Element, limit: number): number {
       if (node.nodeType !== Node.TEXT_NODE) bound += utf8Length(node.nodeName) + 16;
     }
     if (bound > limit) throw new Error("3MF serialization byte limit");
+    if (elements > elementLimit) throw new Error("3MF serialization element limit");
   } while (walker.nextNode());
-  return bound;
+  return { bytes: bound, elements };
 }
 
 function xml(bytes: Uint8Array): Document {
@@ -297,11 +303,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         const receive = (data: Uint8Array) => {
           length += data.byteLength;
           extractedBytes += data.byteLength;
-          if (
-            length > declared.originalSize ||
-            length > entryLimit ||
-            extractedBytes > MAX_SELECTED_BYTES
-          )
+          if (length > declared.originalSize || extractedBytes > MAX_SELECTED_BYTES)
             throw new Error("3MF extracted byte limit");
           entry.set(data, length - data.byteLength);
         };
@@ -331,10 +333,6 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     );
     if (!configs["Metadata/model_settings.config"] || !configs["Metadata/project_settings.config"])
       return buffer;
-    // Ignored settings XML can be much denser than mesh data.
-    let configMarkup = 0;
-    for (const byte of configs["Metadata/model_settings.config"])
-      if (byte === XML_MARKUP_START && ++configMarkup > MAX_CONFIG_XML_MARKUP) return buffer;
     const palette: unknown = JSON.parse(
       strFromU8(configs["Metadata/project_settings.config"]),
     ).filament_colour;
@@ -345,6 +343,26 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         ? value.slice(0, 7).toUpperCase()
         : null;
     };
+    const entries = new Map(
+      Object.entries(extract((name) => name.endsWith(".model") || name === "_rels/.rels")),
+    );
+    // Tiny ignored nodes can cost much more DOM memory per byte than mesh data.
+    let parsedMarkup = 0;
+    for (const [name, data] of [
+      ["Metadata/model_settings.config", configs["Metadata/model_settings.config"]] as const,
+      ...entries,
+    ]) {
+      let markup = 0;
+      for (const byte of data) {
+        if (byte !== XML_MARKUP_START) continue;
+        markup++;
+        if (
+          ++parsedMarkup > MAX_XML_MARKUP ||
+          (name.endsWith(".config") && markup > MAX_CONFIG_XML_MARKUP)
+        )
+          return buffer;
+      }
+    }
     const settings = xml(configs["Metadata/model_settings.config"]);
     const slots = new Map<Element, number | null>();
     const cachedSlot = (element: Element | undefined, inherited: number | null) => {
@@ -362,6 +380,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
         object,
       ]),
     );
+    settings.documentElement.replaceChildren();
     const candidateColors = new Set<string>();
     for (const object of objectConfigs.values()) {
       const inherited = cachedSlot(object, 1);
@@ -372,9 +391,6 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     }
     if (candidateColors.size < 2) return buffer;
 
-    const entries = new Map(
-      Object.entries(extract((name) => name.endsWith(".model") || name === "_rels/.rels")),
-    );
     const rootRelationship = Array.from(
       xml(entries.get("_rels/.rels")!).getElementsByTagName("Relationship"),
     ).find((relationship) => relationship.getAttribute("Type") === MODEL_RELATIONSHIP);
@@ -465,24 +481,32 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     const colors: string[] = [];
     let neutralVariant = false;
     const memo = new Map<string, { id: string; height: number }>();
-    const sourceSizes = new Map<string, number>();
+    const sourceSizes = new Map<string, { bytes: number; elements: number }>();
+    const variants = new Map<string, number>();
     const moved = new Set<string>();
+    const variantRatio = () =>
+      Math.min(MAX_EMITTED_RATIO, Math.max(2, colors.length + (neutralVariant ? 1 : 0)));
     const emittedLimit = () =>
-      Math.min(
-        selectedBytes *
-          Math.min(MAX_EMITTED_RATIO, Math.max(2, colors.length + (neutralVariant ? 1 : 0))) +
-          MAX_EMITTED_OVERHEAD,
-        MAX_EMITTED_BYTES,
-      );
-    let emittedBytes = serializationBound(outputModel, emittedLimit());
+      Math.min(selectedBytes * variantRatio() + MAX_EMITTED_OVERHEAD, MAX_EMITTED_BYTES);
+    const emittedElementLimit = () =>
+      Math.min(parsedMarkup * variantRatio() + MAX_EMITTED_ELEMENT_OVERHEAD, MAX_EMITTED_ELEMENTS);
+    const initial = serializationBound(outputModel, emittedLimit(), emittedElementLimit());
+    let emittedBytes = initial.bytes;
+    let emittedElements = initial.elements;
     const reserve = (source: Element, key: string) => {
       let size = sourceSizes.get(key);
       if (size === undefined) {
-        size = serializationBound(source, emittedLimit() - emittedBytes);
+        size = serializationBound(
+          source,
+          emittedLimit() - emittedBytes,
+          emittedElementLimit() - emittedElements,
+        );
         sourceSizes.set(key, size);
       }
-      emittedBytes += size;
+      emittedBytes += size.bytes;
+      emittedElements += size.elements;
       if (emittedBytes > emittedLimit()) throw new Error("3MF emitted byte limit");
+      if (emittedElements > emittedElementLimit()) throw new Error("3MF emitted element limit");
     };
     const visiting = new Set<string>();
     let nextId = 2;
@@ -516,7 +540,11 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
       }
       if (memo.size >= MAX_OBJECTS) throw new Error("3MF emitted object limit");
       if (effectiveColor && !colors.includes(effectiveColor)) colors.push(effectiveColor);
-      if (mesh && !effectiveColor) neutralVariant = true;
+      if (mesh) {
+        const kinds = (variants.get(sourceKey) ?? 0) | (effectiveColor ? 1 : 2);
+        variants.set(sourceKey, kinds);
+        neutralVariant ||= kinds === 3;
+      }
       reserve(source, sourceKey);
       visiting.add(sourceKey);
       const object = moved.has(sourceKey)
@@ -609,6 +637,7 @@ export function applyThreeMfColors(buffer: ArrayBuffer): ArrayBuffer {
     sourceSizes.clear();
     memo.clear();
     moved.clear();
+    variants.clear();
     let serialized = new XMLSerializer().serializeToString(output);
     resources.replaceChildren();
     outputModel.replaceChildren();
