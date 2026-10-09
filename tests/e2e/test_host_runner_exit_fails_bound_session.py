@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.compat import compat_runner_python
 from tests._helpers.host_daemon import (
     await_launched_runner,
     pid_alive,
@@ -19,6 +20,9 @@ from tests._helpers.host_daemon import (
 from tests._helpers.runner_faults import disk_full_spec_cache_pythonpath
 from tests.e2e.conftest import lookup_agent_id, upload_agent
 from tests.e2e.test_host_e2e import _write_smoke_agent_yaml
+
+# The runner is probed with os.kill(pid, 0) and reaped by signal.
+pytestmark = pytest.mark.posix_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOST_ONLINE_TIMEOUT_S = 30.0
@@ -92,8 +96,12 @@ def _create_host_bound_session(
     return create.json()["id"], workspace
 
 
-# The cause line is composed by the host, new in 0.18.0.
-@pytest.mark.min_runner_version("0.18.0")
+# The cause line is composed by the host, new in 0.18.0, and the PYTHONPATH fault
+# needs the runner built from this checkout, so any pinned runner build skips.
+@pytest.mark.skipif(
+    compat_runner_python() is not None,
+    reason="requires the 0.18.0 host built from this checkout",
+)
 @pytest.mark.timeout(300)
 def test_runner_boot_crash_names_the_cause_before_the_log_tail(
     live_server: str,

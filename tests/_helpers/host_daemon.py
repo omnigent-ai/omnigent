@@ -91,11 +91,12 @@ def wait_for_host_online(base_url: str, host_id: str, timeout: float = 45.0) -> 
     """Poll ``GET /v1/hosts`` until *host_id* shows online."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        # The server may still be starting; a transport error is just another poll.
-        with contextlib.suppress(httpx.HTTPError):
+        # The server may still be starting; a transport error, a non-JSON body or a
+        # partial host record is just another poll.
+        with contextlib.suppress(httpx.HTTPError, ValueError, KeyError):
             resp = httpx.get(f"{base_url}/v1/hosts", timeout=5.0)
             if resp.status_code == 200 and any(
-                host["host_id"] == host_id and host["status"] == "online"
+                host.get("host_id") == host_id and host.get("status") == "online"
                 for host in resp.json().get("hosts", [])
             ):
                 return

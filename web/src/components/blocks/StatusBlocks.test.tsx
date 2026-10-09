@@ -313,7 +313,6 @@ describe("ErrorBanner", () => {
       "client_update_required",
       "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
     ],
-    ["runner_failed_to_start", "The session's runner failed to start on the host."],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();

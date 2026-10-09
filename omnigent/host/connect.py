@@ -294,8 +294,9 @@ _RUNNER_EXIT_REASON_LINE = re.compile(
     r"^[A-Z]{4,8}\s+\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} .*? \| runner exiting: (?P<reason>\S.*)$"
 )
 
-# Final line of a Python traceback, e.g. ``OSError: [Errno 28] No space left on
-# device`` or a bare ``KeyboardInterrupt``.
+# A Python traceback opens with this header and closes with a line such as
+# ``OSError: [Errno 28] No space left on device`` or a bare ``KeyboardInterrupt``.
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
 _TRACEBACK_FINAL_LINE = re.compile(
     r"^(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|Exit|Interrupt)(?:: \S.*)?$"
 )
@@ -386,18 +387,29 @@ def _redact_log_tail(tail: str) -> str:
     return redact_log_text(tail, include_whitespace_credentials=True)
 
 
-def _runner_exit_reason(scanned: str, shown_tail: list[str]) -> str | None:
+def _runner_exit_reason(scanned: str) -> str | None:
     """Return the runner's own ``runner exiting: <reason>`` record from *scanned*, else
-    the final ``SomeError: ...`` line of a traceback in *shown_tail*, else ``None``.
-    The result is unredacted and unbounded; the caller does both, in that order."""
-    for line in reversed(scanned.splitlines()):
+    the line closing a traceback inside the shown tail, else ``None``. The result is
+    unredacted and unbounded; the caller does both, in that order."""
+    lines = scanned.strip().splitlines()
+    for line in reversed(lines):
         match = _RUNNER_EXIT_REASON_LINE.match(line.rstrip())
         if match is not None:
             return match.group("reason").strip()
-    for line in reversed(shown_tail):
-        if _TRACEBACK_FINAL_LINE.match(line.strip()):
-            return line.strip()
-    return None
+    # Only a line that closes a traceback counts; a logged "SomeError: ..." summary
+    # elsewhere in the tail does not.
+    tail_start = len(lines) - _LOG_TAIL_MAX_LINES
+    in_traceback = False
+    reason = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == _TRACEBACK_HEADER:
+            in_traceback = True
+        elif in_traceback and _TRACEBACK_FINAL_LINE.match(stripped):
+            in_traceback = False
+            if index >= tail_start:
+                reason = stripped
+    return reason
 
 
 def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
@@ -412,7 +424,7 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     if not scanned.strip():
         return message
     lines = scanned.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
-    reason = _runner_exit_reason(scanned, lines)
+    reason = _runner_exit_reason(scanned)
     if reason is not None:
         message += f"\ncause: {_redact_log_tail(reason)[:_EXIT_REASON_MAX_CHARS]}"
     # Redact whole lines before bounding so the cut cannot leave half a credential,

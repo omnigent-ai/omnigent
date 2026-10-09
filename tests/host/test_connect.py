@@ -81,6 +81,7 @@ from omnigent.host.frames import (
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.process_logging import RedactingLogFormatter
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -1886,6 +1887,55 @@ def test_runner_exit_error_tail_starts_on_a_whole_line_after_the_byte_bound(
     assert tail_lines, error
     assert all(line in lines for line in tail_lines), tail_lines[0][:40]
     assert len(tail.encode("utf-8")) <= 4096
+
+
+def test_runner_exit_error_keeps_the_suffix_of_a_single_oversized_line(tmp_path: Path) -> None:
+    """A lone line longer than the tail budget has no boundary to drop, so its
+    bounded suffix is shown rather than nothing."""
+    log = tmp_path / "runner-x.log"
+    log.write_text("x" * 5000 + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert "\n" not in tail
+    assert len(tail.encode("utf-8")) == 4096
+
+
+def test_runner_exit_error_reads_the_record_the_runner_logger_actually_writes(
+    tmp_path: Path,
+) -> None:
+    """The record match follows the shared log formatter, not a hand-written sample."""
+    record = logging.LogRecord(
+        "omnigent.runner._entry",
+        logging.CRITICAL,
+        __file__,
+        1,
+        "runner exiting: uncaught OSError: [Errno 28] No space left on device",
+        None,
+        None,
+        func="_log_uncaught",
+    )
+    log = tmp_path / "runner-x.log"
+    log.write_text(RedactingLogFormatter(use_colors=False).format(record) + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: uncaught OSError: [Errno 28] No space left on device"
+
+
+def test_runner_exit_error_does_not_promote_a_logged_error_summary(tmp_path: Path) -> None:
+    """A ``SomeError: ...`` line that closes no traceback is output, not the exit cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "ConnectionError: upstream reset; retrying\nConnectionError: upstream reset\nkilled\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(137, log)
+
+    assert "cause:" not in error
+    assert error.splitlines()[1] == "--- runner log tail ---"
 
 
 async def test_watch_runner_silent_on_intentional_stop(
