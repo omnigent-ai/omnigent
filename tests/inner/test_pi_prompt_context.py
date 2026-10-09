@@ -29,6 +29,7 @@ _WORKSPACE_MARKER = "PI_WORKSPACE_CONTEXT_7B21"
 _BUNDLE_MARKER = "PI_BUNDLE_CONTEXT_5F13"
 _GLOBAL_MARKER = "PI_GLOBAL_CONTEXT_8C14"
 _FRAMEWORK_MARKER = "PI_FRAMEWORK_INSTRUCTIONS_6A29"
+_REQUEST_MARKER = "PI_REQUEST_INSTRUCTIONS_21E6"
 
 
 def _uploaded_spec(tmp_path: Path, *, directory: bool) -> tuple[AgentSpec, Path]:
@@ -107,6 +108,7 @@ def captured_llm_requests() -> Iterator[tuple[str, list[dict[str, Any]]]]:
 
 @pytest.mark.timeout(45)
 @pytest.mark.parametrize("context_files", [True, False], ids=["enabled", "disabled"])
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
 @pytest.mark.parametrize(
     ("context_path", "expect_context"),
     [(None, False), ("AGENT.md", False), ("AGENTS.md", True), ("workspace/AGENTS.md", True)],
@@ -119,6 +121,7 @@ async def test_real_pi_adds_workspace_context_after_inline_prompt(
     context_path: str | None,
     expect_context: bool,
     context_files: bool,
+    system_prompt_mode: str,
 ) -> None:
     """Inspect the actual model request after bundling, composition, and Pi startup."""
     pi_path = os.environ.get("OMNIGENT_PI_PATH") or shutil.which("pi")
@@ -171,6 +174,7 @@ async def test_real_pi_adds_workspace_context_after_inline_prompt(
         model="local-probe/probe-model",
         skills_filter=spec.skills_filter,
         context_files=context_files,
+        system_prompt_mode=system_prompt_mode,
     )
     try:
         async with asyncio.timeout(30):
@@ -179,7 +183,9 @@ async def test_real_pi_adds_workspace_context_after_inline_prompt(
                 async for event in executor.run_turn(
                     [{"role": "user", "content": "hello"}],
                     [],
-                    build_instructions(spec, None, [], framework_instructions=[_FRAMEWORK_MARKER]),
+                    build_instructions(
+                        spec, _REQUEST_MARKER, [], framework_instructions=[_FRAMEWORK_MARKER]
+                    ),
                 )
             ]
     finally:
@@ -195,6 +201,14 @@ async def test_real_pi_adds_workspace_context_after_inline_prompt(
     )
     assert _INLINE_MARKER in system
     assert _FRAMEWORK_MARKER in system
+    assert (
+        system.index(_INLINE_MARKER)
+        < system.index(_REQUEST_MARKER)
+        < system.index(_FRAMEWORK_MARKER)
+    )
+    assert ("You are an expert coding assistant operating inside pi" in system) is (
+        system_prompt_mode == "append"
+    )
     assert (_GLOBAL_MARKER in system) is context_files
     assert (_WORKSPACE_MARKER in system) is (expect_context and context_files)
     if expect_context and context_files:

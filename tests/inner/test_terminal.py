@@ -29,6 +29,11 @@ from omnigent.inner.terminal import (
     _is_utf8_locale_value,
     create_terminal_instance,
 )
+from omnigent.inner.terminal_lifecycle import (
+    TERMINAL_INSTANCE_ID_ENV,
+    TERMINAL_LAUNCH_ID_ENV,
+    TERMINAL_LAUNCH_SESSION_ID_ENV,
+)
 from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.resource_registry import trim_terminal_output
@@ -402,6 +407,24 @@ async def test_duplicate_exit_capture_preserves_good_snapshot(
         finish_primary.set()
         finish_duplicate.set()
         await asyncio.gather(primary, *([duplicate] if duplicate is not None else []))
+
+
+def test_client_interaction_within_reports_recency(tmp_path: Path) -> None:
+    """
+    No interaction ever reads False; a fresh stamp reads True only inside the window.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert not instance.client_interaction_within(60.0)
+    instance.note_client_interaction()
+    assert instance.client_interaction_within(60.0)
+    assert not instance.client_interaction_within(0.0)
 
 
 def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
@@ -1286,15 +1309,17 @@ async def test_is_alive_false_when_pane_dead(
 
 @pytest.mark.parametrize("detection", ["is_alive", "async_watcher", "threaded_watcher"])
 @pytest.mark.parametrize(
-    ("final_fields", "expected_status"),
+    ("final_fields", "expected_status", "expected_signal"),
     [
-        ("1|2|", 2),
-        ("1|0|", 0),
-        ("1||TERM", None),
-        ("1||15", None),
-        ("1||", None),
-        ("malformed", None),
-        (None, None),
+        ("1|2|", 2, None),
+        ("1|0|", 0, None),
+        ("1||TERM", None, "SIGTERM"),
+        ("1||15", None, "SIGTERM"),
+        ("1||RTMIN+1", None, "RTMIN+1"),
+        ("1||999", None, "999"),
+        ("1||", None, None),
+        ("malformed", None, None),
+        (None, None, None),
     ],
 )
 async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
@@ -1303,6 +1328,7 @@ async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
     detection: str,
     final_fields: str | None,
     expected_status: int | None,
+    expected_signal: str | None,
 ) -> None:
     """PTY EOF may arrive before tmux has reaped the child and stored its status."""
     instance = TerminalInstance(
@@ -1372,6 +1398,7 @@ async def test_dead_pane_refreshes_pending_wait_status_before_reporting_exit(
 
         assert instance.running is False
         assert instance.last_exit_status() == expected_status
+        assert instance.last_exit_signal() == expected_signal
         assert instance.last_exit_text() == "safe exit diagnostic"
         assert refresh_calls == (1 if final_fields == "1||" else 2)
         assert reap_requests == (0 if final_fields == "1||" else 1)
@@ -1784,6 +1811,59 @@ async def test_is_alive_false_when_probe_communication_fails(
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("start_on_attach", [False, True])
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "test\n",
+        "test\n\n",
+        "first\nsecond",
+        "",
+        "it's a test",
+        "$(printf expanded); $HOME",
+        "test",
+    ],
+)
+async def test_launch_preserves_prompt_and_following_args_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, prompt: str, start_on_attach: bool
+) -> None:
+    """Prompt text must stay one argument without consuming later connection flags."""
+    output = tmp_path / "argv.json"
+    script = (
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+    )
+    expected = [
+        prompt,
+        "-c",
+        'approvals_reviewer="auto_review"',
+        "--remote",
+        "ws://127.0.0.1:12345",
+    ]
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-c", script, str(output), *expected],
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=start_on_attach,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        if start_on_attach:
+            await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(5):
+            while await instance.is_alive():
+                await asyncio.sleep(0.01)
+
+        assert json.loads(output.read_text()) == expected
+        assert instance.last_exit_status() == 0
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
 @pytest.mark.parametrize("exit_status", [0, 255])
 @pytest.mark.asyncio
 async def test_server_survives_inner_process_exit_real_tmux(
@@ -2102,10 +2182,12 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
         private_dir=tmp_path,
     )
     instance._remember_exit_status("1 2")
+    instance._exit_status_is_pending("1||TERM")
     instance._remember_exit_snapshot("0 10000\nprevious startup failure")
 
     async def spawn(*_args: object, **_kwargs: object) -> _ProcessWithStdout:
         assert instance.last_exit_status() is None
+        assert instance.last_exit_signal() is None
         assert instance.last_exit_text() is None
         return _ProcessWithStdout(returncode=1 if launch_fails else 0, stderr=b"launch failed")
 
@@ -2121,7 +2203,89 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
         await instance.launch(cwd=tmp_path)
 
     assert instance.last_exit_status() is None
+    assert instance.last_exit_signal() is None
     assert instance.last_exit_text() is None
+
+
+async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inherited = {
+        TERMINAL_INSTANCE_ID_ENV: "a" * 32,
+        TERMINAL_LAUNCH_ID_ENV: "b" * 32,
+        TERMINAL_LAUNCH_SESSION_ID_ENV: "synthetic-parent",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        env=inherited,
+    )
+    instance.lifecycle_trace.session_id = "synthetic-owner"
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+    )
+
+    await instance.launch()
+    first = spawn.call_args.kwargs["env"]
+    assert first[TERMINAL_INSTANCE_ID_ENV] == instance.diagnostic_id
+    assert first[TERMINAL_LAUNCH_SESSION_ID_ENV] == "synthetic-owner"
+    assert first[TERMINAL_LAUNCH_ID_ENV] == instance.lifecycle_trace.launch_id
+    assert first[TERMINAL_LAUNCH_ID_ENV] != inherited[TERMINAL_LAUNCH_ID_ENV]
+    instance.lifecycle_trace.note_request("stop_session", "runner_request")
+    instance.lifecycle_trace.note_exit()
+    instance.lifecycle_trace.note_cleanup()
+
+    await instance.launch()
+    assert spawn.call_count == 1
+    assert instance.lifecycle_trace.launch_id == first[TERMINAL_LAUNCH_ID_ENV]
+    instance.running = False
+    await instance.launch()
+    second = spawn.call_args.kwargs["env"]
+    assert spawn.call_count == 2
+    assert second[TERMINAL_INSTANCE_ID_ENV] == first[TERMINAL_INSTANCE_ID_ENV]
+    assert second[TERMINAL_LAUNCH_ID_ENV] != first[TERMINAL_LAUNCH_ID_ENV]
+    snapshot = instance.lifecycle_trace.snapshot()
+    assert snapshot["terminal_control_requests"] == []
+    assert snapshot["terminal_exit_observed_at"] is None
+    assert snapshot["terminal_cleanup_started_at"] is None
+
+
+async def test_failed_launch_telemetry_does_not_block_or_reuse_parent_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    for key in (TERMINAL_INSTANCE_ID_ENV, TERMINAL_LAUNCH_ID_ENV, TERMINAL_LAUNCH_SESSION_ID_ENV):
+        monkeypatch.setenv(key, "inherited-parent")
+
+    def fail(_instance_id: str) -> dict[str, str]:
+        raise OSError("diagnostic initialization failed")
+
+    monkeypatch.setattr(instance.lifecycle_trace, "launch_environment", fail)
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+    )
+    await instance.launch()
+    assert instance.running
+    assert not {
+        TERMINAL_INSTANCE_ID_ENV,
+        TERMINAL_LAUNCH_ID_ENV,
+        TERMINAL_LAUNCH_SESSION_ID_ENV,
+    }.intersection(spawn.call_args.kwargs["env"])
 
 
 @pytest.mark.parametrize("version", [(3, 3), (3, 10)])
@@ -3351,3 +3515,34 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+@pytest.mark.asyncio
+async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) -> None:
+    """
+    ``read(join_wrapped=True)`` captures with ``-J`` so a token wider than the
+    80-column pane (a sign-in address) reads back as one line; the default
+    read is unchanged.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def _tmux_output(*args: str) -> str:
+        calls.append(args)
+        return "open https://signin.example.com/device?user_code=ABCDEFGH"
+
+    instance._tmux_output = _tmux_output  # type: ignore[method-assign]
+
+    plain = await instance.read()
+    joined = await instance.read(join_wrapped=True)
+
+    assert calls[0] == ("capture-pane", "-t", instance.tmux_target, "-p")
+    assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
+    assert plain["screen"] == joined["screen"]
+    assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]

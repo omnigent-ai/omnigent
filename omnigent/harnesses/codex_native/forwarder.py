@@ -17,9 +17,13 @@ from pathlib import Path
 import httpx
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
-from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.harnesses.codex_egress import (
+    CERTIFICATE_REMEDIATION,
+    certificate_failure_message,
+    is_connection_retry,
+)
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -35,9 +39,12 @@ from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
     clear_active_turn_id_if_matches,
+    clear_certificate_failure,
+    codex_config_revision,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
     read_bridge_state,
+    read_certificate_failure,
     read_codex_config_developer_instructions_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -66,6 +73,8 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -373,6 +382,8 @@ class _CodexForwarderState:
         the last ``_refresh_effort_from_config`` read, so the refresh can tell
         an unchanged file from a rewritten one (an unchanged file must not roll
         back a live ``thread/settings/updated`` effort).
+    :param last_config_effort_revision: File identity and modification time used
+        to retry mirroring after a same-value config rewrite.
     :param collaboration_mode: Latest known Codex collaboration mode kind, e.g.
         ``"plan"`` or ``"default"``.
     :param posted_collaboration_mode: Last collaboration mode kind already
@@ -446,6 +457,7 @@ class _CodexForwarderState:
     # The config.toml effort as of the last _refresh_effort_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
     last_config_effort: str | None = None
+    last_config_effort_revision: tuple[int, int] | None = None
     collaboration_mode: str | None = None
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -1619,6 +1631,15 @@ class _OutputTextDeltaCoalescer:
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
+# Posted together so each token post is a self-contained cumulative snapshot;
+# older servers read an omitted cache count as zero cached tokens.
+_CUMULATIVE_TOKEN_KEYS = (
+    "cumulative_input_tokens",
+    "cumulative_cache_read_input_tokens",
+    "cumulative_output_tokens",
+)
+
+
 class _SessionUsageCoalescer:
     """
     Coalesce Codex token-usage updates before posting to AP.
@@ -1628,7 +1649,9 @@ class _SessionUsageCoalescer:
     (latest-only, deduped) so repeated frames collapse to one post. The
     caller flushes it per usage frame (so the web UI cost badge updates
     live mid-turn) and again at turn/session boundaries (a no-op when
-    nothing changed).
+    nothing changed). Cumulative token counts are posted as one group, so
+    a cache-miss turn still carries the unchanged cached total alongside
+    its grown input/output totals.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -1695,6 +1718,15 @@ class _SessionUsageCoalescer:
         if not data:
             self._pending.clear()
             return
+        if data.keys() & _CUMULATIVE_TOKEN_KEYS:
+            # Re-attach every cumulative count so the post stays self-contained:
+            # the latest pending value, else the last posted one when this frame
+            # omitted the field (older servers read an omitted count as zero).
+            for key in _CUMULATIVE_TOKEN_KEYS:
+                if key in self._pending:
+                    data[key] = self._pending[key]
+                elif key in self._last_posted:
+                    data[key] = self._last_posted[key]
         # Attach the model to every token-bearing post (not via the
         # changed-keys dedup, so it rides along even when only token
         # counts changed) — the server reprices cumulative tokens into
@@ -2475,17 +2507,6 @@ async def _create_thread_replacement_session(
             # Carry the workspace across the rotation, or the executor
             # falls back to the harness process's own cwd for new turns.
             cwd=state.cwd if state is not None else None,
-        ),
-    )
-
-    _logger.info(
-        "Codex native input ready after thread switch",
-        extra=debug_event(
-            "native_input_ready",
-            session_id=new_session_id,
-            runner_id=runner_id,
-            harness="codex-native",
-            stage="native_input",
         ),
     )
 
@@ -3340,7 +3361,15 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
         updated in place.
     :returns: None.
     """
+    # Stat before reading, so a rewrite that races this read shows on the next pass.
+    revision = codex_config_revision(bridge_dir)
     config_effort = read_codex_config_effort(bridge_dir)
+    if revision is not None:
+        previous_revision = forwarder_state.last_config_effort_revision
+        forwarder_state.last_config_effort_revision = revision
+        if config_effort and previous_revision is not None and previous_revision != revision:
+            # Retry a failed immediate mirror even when the effort is unchanged.
+            forwarder_state.posted_effort_known = False
     if not config_effort:
         return
     # Change is detected by VALUE, not file revision, so an ABA rewrite between
@@ -3511,6 +3540,92 @@ async def _sync_codex_approval_mode_change(
             forwarder_state.posted_approval_preset = preset
 
 
+async def _maybe_fail_turn_on_certificate_failure(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    params: _JsonObject,
+    usage_coalescer: _SessionUsageCoalescer,
+    delta_coalescer: _OutputTextDeltaCoalescer | None,
+    codex_client: CodexAppServerClient | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> bool:
+    """
+    Fail a turn Codex keeps retrying when its launcher reported a bad TLS certificate.
+
+    Codex never ends such a turn on its own, so the forwarder interrupts it and
+    surfaces the launcher's certificate cause and the next step as the failure.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param params: Codex ``error`` notification params carrying ``willRetry``.
+    :param usage_coalescer: Token-usage coalescer flushed with the failure.
+    :param delta_coalescer: Optional text-delta coalescer flushed first.
+    :param codex_client: Optional app-server client used to interrupt the turn.
+    :param forwarder_state: Optional forwarder state for per-turn deduplication.
+    :returns: ``True`` when the turn was failed, or already had been.
+    """
+    if not is_connection_retry(params):
+        return False
+    failure = read_certificate_failure(bridge_dir)
+    if failure is None:
+        return False
+    turn_id = _turn_id_from_payload(params)
+    if forwarder_state is None or turn_id is None:
+        # Without per-turn state the failure could be posted once per retry and
+        # the interrupt's own boundary could flip it back to idle; leave the
+        # retry to Codex.
+        _logger.info(
+            "Codex forwarder cannot fail retrying turn on certificate failure "
+            "without turn state: turn_id=%s",
+            turn_id,
+        )
+        return False
+    if turn_id in forwarder_state.surfaced_terminal_error_turns:
+        return True
+    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    thread_id = _thread_id_from_params(params)
+    if codex_client is not None and thread_id is not None:
+        try:
+            await codex_client.request(
+                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+            )
+        except Exception:  # noqa: BLE001 - the failure is surfaced either way.
+            _logger.warning(
+                "Codex turn interrupt after a certificate failure failed", exc_info=True
+            )
+    clear_active_turn_id_if_matches(bridge_dir, turn_id)
+    _logger.warning(
+        "Codex forwarder failing turn on launcher certificate failure: turn_id=%s evidence=%s",
+        turn_id,
+        failure.evidence,
+    )
+    model = forwarder_state.model
+    async with _conversation_item_delivery_scope(session_id):
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error:certificate",
+                error=_CodexTerminalError(
+                    message=(
+                        f"{certificate_failure_message(failure, model=model)}\n\n"
+                        f"{CERTIFICATE_REMEDIATION}"
+                    ),
+                    kind=_CODEX_ERROR_KIND_GENERIC,
+                ),
+            ),
+        )
+        await usage_coalescer.flush()
+    return True
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -3544,6 +3659,16 @@ async def _maybe_handle_turn_event(
             _logger.info(
                 "Codex forwarder observed retryable turn error: turn_id=%s",
                 _turn_id_from_payload(params),
+            )
+            await _maybe_fail_turn_on_certificate_failure(
+                client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                params=params,
+                usage_coalescer=usage_coalescer,
+                delta_coalescer=delta_coalescer,
+                codex_client=codex_client,
+                forwarder_state=forwarder_state,
             )
             return True
         async with _conversation_item_delivery_scope(session_id):
@@ -4873,13 +4998,18 @@ def _terminal_turn_status_edge(
             turn_id=terminal_turn_id,
             source=f"{source}:turn-failed",
         )
-    if method == "turn/completed" and _turn_items_are_empty(params):
-        _logger.warning(
-            "Codex forwarder observed an empty turn (zero items): "
-            "turn_id=%s method=%s; mapping to idle",
-            terminal_turn_id,
-            method,
-        )
+    if method == "turn/completed":
+        if _turn_items_are_empty(params):
+            _logger.warning(
+                "Codex forwarder observed an empty turn (zero items): "
+                "turn_id=%s method=%s; mapping to idle",
+                terminal_turn_id,
+                method,
+            )
+        if _turn_status_from_params(params) in (None, "completed"):
+            # The model answered, so a certificate failure recorded at launch
+            # no longer describes this app-server's egress.
+            clear_certificate_failure(bridge_dir)
     return _CodexTurnStatusEdge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
@@ -4898,13 +5028,7 @@ def _turn_status_is_failed(params: _JsonObject) -> bool:
     :param params: Codex turn event params.
     :returns: ``True`` when ``params['turn']['status']`` resolves to ``failed``.
     """
-    turn = params.get("turn")
-    if not isinstance(turn, dict):
-        return False
-    status = turn.get("status")
-    if isinstance(status, dict):
-        status = status.get("type") or status.get("status")
-    return status in {"failed", "errored"}
+    return _turn_status_from_params(params) in {"failed", "errored"}
 
 
 def _turn_items_are_empty(params: _JsonObject) -> bool:
@@ -7349,6 +7473,7 @@ def _note_forward_failure(event_type: str, result: _PostResult, session_id: str)
                     if result.response is not None
                     else None,
                     "transport_error": result.transport_error,
+                    "rejection_reason": result.rejection_reason,
                     "delivered_ambiguous": result.delivered_ambiguous,
                 },
             },
@@ -7437,11 +7562,13 @@ class _PostResult:
     :param transport_error: Transport-error class name when a POST raised
         without a response, e.g. ``"ConnectError"``; ``None`` when the server
         responded.
+    :param rejection_reason: Local validation failure before any request was sent.
     """
 
     response: httpx.Response | None
     delivered_ambiguous: bool = False
     transport_error: str | None = None
+    rejection_reason: str | None = None
 
 
 async def _post_session_event(
@@ -7490,7 +7617,9 @@ async def _post_session_event(
         dl_dir = _dead_letter_dir.get()
         if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
             http_status = response.status_code if response is not None else None
-            if response is not None:
+            if result.rejection_reason is not None:
+                reason = result.rejection_reason
+            elif response is not None:
                 reason = f"http {response.status_code}"
             elif result.delivered_ambiguous:
                 reason = "ambiguous transport failure (may already be committed)"
@@ -7544,7 +7673,32 @@ async def _post_session_event_inner(
     if max_attempts is None and not idempotent:
         raise ValueError("unbounded session-event retries require an idempotent source_id")
     url = f"/v1/sessions/{url_component(session_id)}/events"
+    # The server's output cap runs after body validation; cap the mirror before
+    # upload so a large tool result can reach that handler at all.
+    item_data = data.get("item_data")
+    if (
+        event_type == "external_conversation_item"
+        and data.get("item_type") == "function_call_output"
+        and isinstance(item_data, dict)
+        and isinstance(output := item_data.get("output"), str)
+    ):
+        data = {**data, "item_data": {**item_data, "output": cap_tool_output(output)}}
     payload = {"type": event_type, "data": data}
+    # Early body rejection can surface as ReadError instead of HTTP 400 when
+    # the upload is closed. Such an event must not enter the unbounded retry loop.
+    request_bytes = len(httpx.Request("POST", url, json=payload).content)
+    if request_bytes > MAX_SESSION_EVENT_REQUEST_BYTES:
+        reason = (
+            f"session event request exceeds {MAX_SESSION_EVENT_REQUEST_BYTES} byte limit "
+            f"({request_bytes} bytes)"
+        )
+        _logger.warning(
+            "Codex session event rejected before upload: session=%s type=%s reason=%s",
+            session_id,
+            event_type,
+            reason,
+        )
+        return _PostResult(response=None, rejection_reason=reason)
     attempt = 0
     while max_attempts is None or attempt < max_attempts:
         attempt += 1
