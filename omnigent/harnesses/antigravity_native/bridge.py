@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,7 @@ _STATE_FILE = "state.json"
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
@@ -262,16 +264,62 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove antigravity-native bridge dirs whose owner process is provably dead.
+    Remove inactive antigravity-native bridge dirs whose owner is provably dead.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    agy keeps the session's conversation store inside the bridge dir (see
+    :func:`agy_gemini_dir`), and a runner restart is a normal resume boundary,
+    so owner death alone cannot imply that the bridge is disposable. Keep the
+    whole bridge for 7 days after its latest bridge preparation or conversation
+    activity, then remove it intact.
+    Explicit session deletion remains immediate. Global maintenance calls this via
+    ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(),
+        should_prune=_agy_orphan_retention_expired,
+    )
+
+
+def _agy_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner agy bridge has been inactive for 7 days."""
+    activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+    owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+    try:
+        if owner_marker.stat().st_mtime > activity_cutoff:
+            return False
+    except OSError:
+        return False
+
+    conversations_dir = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    try:
+        conversations_mode = conversations_dir.stat().st_mode
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    # A non-directory at the store path holds no conversation history, so treat
+    # it like a missing store rather than leaking the bridge forever.
+    if not stat.S_ISDIR(conversations_mode):
+        return True
+
+    # Each conversation is ``<id>.db`` plus SQLite ``-wal``/``-shm`` sidecars; in
+    # WAL mode the sidecar, not the main file, carries the latest write.
+    try:
+        for filename in os.listdir(conversations_dir):
+            if not filename.endswith((".db", ".db-wal", ".db-shm")):
+                continue
+            try:
+                if (conversations_dir / filename).stat().st_mtime > activity_cutoff:
+                    return False
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+    except OSError:
+        return False
+    return True
 
 
 # ── Omnigent MCP relay wiring (sys_* tools) ──────────────────────────────────
