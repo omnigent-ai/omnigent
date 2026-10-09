@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import json
 import math
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from dev.benchmarks.ui import run as ui_run
 from dev.benchmarks.ui.run import (
     assess_reports,
     budget_failures,
@@ -214,6 +219,57 @@ def test_paired_comparisons_require_repeated_runs(tmp_path: Path) -> None:
     (tmp_path / "index.html").write_text("<html></html>")
     with pytest.raises(SystemExit, match="2"):
         parse_args(["--web-dist", str(tmp_path), "--baseline-dist", str(tmp_path), "--runs", "1"])
+
+
+@pytest.mark.parametrize("regression", [False, True])
+async def test_orchestration_alternates_bundles_and_propagates_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, regression: bool
+) -> None:
+    args = _args()
+    args.output_dir = tmp_path / "results"
+    args.web_dist, args.baseline_dist = Path("candidate"), Path("baseline")
+    args.revision, args.baseline_revision = "candidate-sha", "baseline-sha"
+    browser = SimpleNamespace(version="test-chromium", close=AsyncMock())
+
+    @contextlib.asynccontextmanager
+    async def playwright_context():
+        yield SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)))
+
+    @contextlib.asynccontextmanager
+    async def environment(dist):
+        yield SimpleNamespace(dist=dist)
+
+    calls = []
+    sample = _report()["samples"]["browser"][0]
+
+    async def scenario(_browser, env, _session_id, mode, _args, _evidence):
+        calls.append((env.dist.name, mode))
+        result = copy.deepcopy(sample)
+        if regression and env.dist == args.web_dist:
+            result["style_layout"] = [150.0] * args.iterations
+        return result
+
+    monkeypatch.setattr(ui_run, "async_playwright", playwright_context)
+    monkeypatch.setattr(ui_run, "UIEnvironment", environment)
+    monkeypatch.setattr(ui_run, "seed_conversation", AsyncMock(return_value="session"))
+    monkeypatch.setattr(ui_run, "measure_scenario", scenario)
+    assert await ui_run.run_benchmark(args) is not regression
+    assert calls == [
+        (variant, mode)
+        for variant in ("baseline", "candidate", "candidate", "baseline", "baseline", "candidate")
+        for mode in ("browser", "mac_css")
+    ]
+    comparison = json.loads((args.output_dir / "comparison.json").read_text())
+    assert comparison["passed"] is not regression
+    assert bool(comparison["failures"]) is regression
+    assert (
+        (args.output_dir / "summary.md").read_text().endswith("FAIL\n" if regression else "PASS\n")
+    )
+    for variant in ("candidate", "baseline"):
+        report = json.loads((args.output_dir / f"{variant}.json").read_text())
+        assert report["git_sha"] == f"{variant}-sha"
+        assert not measurement_failures(report, args)
+    browser.close.assert_awaited_once()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal handling")

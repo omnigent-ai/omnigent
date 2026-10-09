@@ -83,10 +83,11 @@ unchanged build on a slow VM must not block a PR. Within-budget increases and
 unconfirmed median differences are also advisory. Individual outliers, small
 absolute changes, and small relative changes remain visible in the reports.
 
-Missing assets, browser errors, lost keystrokes, an undersized fixture,
+Failed required assets (document, scripts, stylesheets, fonts), browser errors,
+lost keystrokes, an undersized fixture,
 missing or invalid measurements on either side, and blocking regressions exit
-nonzero. The benchmark
-never silently skips an unavailable browser or missing baseline.
+nonzero. The benchmark never silently skips an unavailable browser or missing
+baseline.
 
 ## CI and artifacts
 

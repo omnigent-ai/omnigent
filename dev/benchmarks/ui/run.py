@@ -24,7 +24,15 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from playwright.async_api import Browser, CDPSession, Page, async_playwright, expect
+from playwright.async_api import (
+    Browser,
+    CDPSession,
+    Page,
+    Request,
+    Response,
+    async_playwright,
+    expect,
+)
 
 from dev.benchmarks.omnigent.compare import (
     build_markdown,
@@ -154,7 +162,25 @@ async def measure_scenario(
     context = await browser.new_context(viewport={"width": 1440, "height": 900})
     page = await context.new_page()
     errors: list[str] = []
+
+    def check_response(response: Response) -> None:
+        if response.request.resource_type in {"document", "script", "stylesheet", "font"}:
+            if response.status >= 400:
+                errors.append(
+                    f"Required asset ({response.request.resource_type}) returned "
+                    f"HTTP {response.status}: {response.url}"
+                )
+
+    def check_request(request: Request) -> None:
+        if request.resource_type in {"document", "script", "stylesheet", "font"}:
+            errors.append(
+                f"Required asset ({request.resource_type}) failed: "
+                f"{request.url}: {request.failure}"
+            )
+
     page.on("pageerror", lambda error: errors.append(str(error)))
+    page.on("response", check_response)
+    page.on("requestfailed", check_request)
     try:
         cdp = await context.new_cdp_session(page)
         await cdp.send("Performance.enable")
@@ -176,6 +202,8 @@ async def measure_scenario(
             })()""")
         opened = time.perf_counter()
         await page.goto(f"{env.base_url}/c/{session_id}", wait_until="domcontentloaded")
+        if errors:
+            raise RuntimeError(f"Browser errors: {errors}")
         composer = page.get_by_role("textbox", name="Message the agent", exact=True)
         await expect(composer).to_be_editable(timeout=30_000)
         await expect(
@@ -511,7 +539,8 @@ async def _run_until_terminated(args: argparse.Namespace) -> bool:
         return await run_benchmark(args)
     finally:
         loop.remove_signal_handler(signal.SIGTERM)
-        signal.signal(signal.SIGTERM, previous_handler)
+        if previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
 
 
 def main(argv: list[str] | None = None) -> int:

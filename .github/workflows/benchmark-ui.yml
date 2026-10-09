@@ -45,12 +45,12 @@ jobs:
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
+          if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)'); then
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           pattern='^(web/|omnigent/server/|dev/benchmarks/|tests/benchmarks/|\.github/actions/setup-(pnpm|uv)/|\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)'
-          if printf '%s\n' "$files" | grep -qE "$pattern"; then
+          if grep -qE "$pattern" <<< "$files"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
           else
             echo "ui=false" >> "$GITHUB_OUTPUT"
@@ -88,6 +88,12 @@ jobs:
 
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
 
       - name: Install benchmark dependencies
         run: |
