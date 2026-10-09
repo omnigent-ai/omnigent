@@ -869,6 +869,28 @@ def _ensure_sdk() -> ModuleType:
         ) from exc
 
 
+# Prefix of the tools the in-process ``omnigent`` MCP server exposes. Only these
+# calls come back through ``_stable_tool_executor``; every other tool (Claude
+# Code's own ``Skill`` and ``ToolSearch``, or an MCP server from the user's
+# Claude settings) runs inside the CLI.
+_OMNIGENT_MCP_PREFIX = "mcp__omnigent__"
+
+
+def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
+    """Metadata for a ``ToolCallRequest``: its ``call_id``, and whether the CLI runs it.
+
+    A call the CLI runs itself is marked ``internally_executed`` so the
+    executor adapter keeps its id out of the dispatch-correlation queue.
+    Otherwise the id is never consumed, and every later Omnigent tool
+    dispatch in the turn pairs with the previous call's id, which records
+    each call twice under mismatched ids.
+    """
+    return {
+        "call_id": tool_block.id,
+        "internally_executed": not tool_block.name.startswith(_OMNIGENT_MCP_PREFIX),
+    }
+
+
 def _build_mcp_tools(
     tool_schemas: list[ToolSpec],
     tool_executor: ToolExecutor | None,
@@ -3092,7 +3114,7 @@ class ClaudeSDKExecutor(Executor):
                                         # with the matching
                                         # :class:`ToolCallComplete`
                                         # by call_id.
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_call_metadata(tool_block),
                                     )
                         else:
                             # No streaming — emit events from the full message.
@@ -3123,7 +3145,7 @@ class ClaudeSDKExecutor(Executor):
                                     yield ToolCallRequest(
                                         name=tool_block.name,
                                         args=tool_block.input,
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_call_metadata(tool_block),
                                     )
 
                     elif isinstance(message, sdk.UserMessage):

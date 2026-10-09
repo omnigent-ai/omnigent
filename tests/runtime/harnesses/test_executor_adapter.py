@@ -1682,6 +1682,37 @@ def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
     ]
 
 
+def test_claude_native_tool_before_mcp_call_keeps_dispatch_ids_aligned() -> None:
+    """Keep Claude Code's own ``Skill`` call from shifting later dispatch ids.
+
+    claude-sdk's MCP callback carries no call id, so ``_stable_tool_executor``
+    pops the oldest queued id. A ``Skill`` (or ``ToolSearch``) call runs inside
+    the CLI and is never dispatched; queued, its id would be popped by the next
+    Omnigent tool's dispatch, and from then on every call in the turn would pair
+    with the previous call's id and be recorded twice.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.inner.claude_sdk_executor import _tool_call_metadata
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    for name, call_id, args in (
+        ("Skill", "toolu_skill", {"skill": "agent:scout"}),
+        ("mcp__omnigent__sys_os_shell", "toolu_shell", {"command": "pwd"}),
+    ):
+        block = SimpleNamespace(id=call_id, name=name, input=args)
+        adapter._translate_event(
+            ToolCallRequest(name=name, args=args, metadata=_tool_call_metadata(block)),  # type: ignore[arg-type]
+            ctx,  # type: ignore[arg-type]
+        )
+
+    # The shell dispatch pops its own id, not the Skill's.
+    assert list(adapter._pending_mcp_call_ids) == ["toolu_shell"]
+
+
 def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:
     """
     A ``ToolCallRequest`` whose metadata lacks ``call_id``
