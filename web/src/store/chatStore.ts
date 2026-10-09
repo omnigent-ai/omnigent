@@ -1502,28 +1502,20 @@ const sendChains = new Map<string | symbol, SendChain>();
 const inFlightSends = new Map<string, boolean>();
 
 /**
- * Resend a message whose answer an OSS replica handoff lost. The server keeps
- * one item per stable id and an SDK runner answers a repeat as already
- * accepted, so a resend cannot start a second turn.
+ * Wait for evidence that a send whose answer was lost reached the session: its
+ * consumed event, or its item in a reconnect snapshot. Resending instead could
+ * run the turn twice on a runner that cannot recognize a repeat.
  */
-async function postAcrossReplicaHandoff<T>(stableId: string, post: () => Promise<T>): Promise<T> {
+async function waitForSendEvidence(stableId: string, sessionId: string): Promise<void> {
   const deadline = Date.now() + 15_000;
-  for (;;) {
-    try {
-      // oxlint-disable-next-line no-await-in-loop
-      return await post();
-    } catch (err) {
-      const answerLost = !(err instanceof ApiError) || (err.code === null && err.status >= 500);
-      const runnerMoving = err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE;
-      // A consumed event already proved delivery; the caller settles the send.
-      const delivered = () => inFlightSends.get(stableId) === true;
-      if (delivered() || !(answerLost || runnerMoving) || Date.now() + 500 > deadline) throw err;
-      // oxlint-disable-next-line no-await-in-loop
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 500);
-      });
-      if (delivered()) throw err;
-    }
+  const seen = () =>
+    inFlightSends.get(stableId) === true ||
+    hasCommittedItem(setterForState(sessionId)?.blocks ?? [], stableId);
+  while (!seen() && Date.now() < deadline) {
+    // oxlint-disable-next-line no-await-in-loop
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 500);
+    });
   }
 }
 
@@ -2434,6 +2426,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
     let initialDispatched = false;
+    let messageDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
       const state = id === null ? get() : setterForState(id);
@@ -2499,23 +2492,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postMessage = () =>
-        postEvent(sessionId, {
-          type: "message",
-          data: {
-            role: "user",
-            content: serverContent,
-            stable_id: stableId,
-          },
-        });
-      // OSS ingress can lose an SDK send's answer while its host's tunnels move.
-      const resendable =
-        isHostRoutingEnabled() &&
-        !isDatabricksWorkspace() &&
-        setterForState(sessionId)?.isNativeTerminalSession === false;
-      const postResult = await (resendable
-        ? postAcrossReplicaHandoff(stableId, postMessage)
-        : postMessage());
+      messageDispatched = true;
+      const postResult = await postEvent(sessionId, {
+        type: "message",
+        data: {
+          role: "user",
+          content: serverContent,
+          stable_id: stableId,
+        },
+      });
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2572,6 +2557,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
+      const answeredWithRefusal = err instanceof ApiError && err.code !== null;
+      const ossHandoff = isHostRoutingEnabled() && !isDatabricksWorkspace();
+      // Behind OSS ingress this 503 can follow a message saved as its runner moved.
+      const runnerMoving =
+        ossHandoff &&
+        err instanceof ApiError &&
+        err.status === 503 &&
+        err.code === RUNNER_UNAVAILABLE_CODE;
+      if (
+        ossHandoff &&
+        messageDispatched &&
+        postedSessionId !== null &&
+        (!answeredWithRefusal || runnerMoving)
+      ) {
+        await waitForSendEvidence(stableId, postedSessionId);
+      }
       const { message, code } = describeSendFailure(err);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
@@ -2580,10 +2581,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
-      // A coded error confirms refusal; a transport failure leaves delivery
-      // unknown unless this retries a previously refused send.
-      const answeredWithRefusal = err instanceof ApiError && err.code !== null;
-      let serverRefused = answeredWithRefusal || retriesRefusedSend;
+      // A coded error confirms refusal; a transport failure or a moving runner
+      // leaves delivery unknown unless this retries a previously refused send.
+      let serverRefused = (answeredWithRefusal && !runnerMoving) || retriesRefusedSend;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       // A live `session_input_consumed` for this very attempt proves the runner

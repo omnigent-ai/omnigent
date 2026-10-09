@@ -1412,7 +1412,7 @@ def create_runner_app(
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
-    # Persisted input ids this runner has taken. A server resend, a reconnect
+    # Persisted input ids this runner has taken. A repeated forward, a reconnect
     # scan, or a recovery turn may each deliver the same input; only one runs.
     _received_server_item_ids: dict[str, set[str]] = {}
 

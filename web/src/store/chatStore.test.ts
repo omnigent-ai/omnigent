@@ -5383,87 +5383,100 @@ describe("chatStore — delivered-but-unacked send", () => {
         ),
       );
 
-    /** Fail the first `failures` send POSTs; returns the stable id of every attempt. */
-    function failSend(failure: () => Promise<Response>, failures = Infinity): () => string[] {
+    /** Fail every send POST; returns the stable id of each attempt. */
+    function failSend(failure: () => Promise<Response>): () => string[] {
       const attempts: string[] = [];
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input).split("?")[0];
         if (path === "/v1/sessions/conv_existing/events" && init?.method === "POST") {
           const event = JSON.parse(init.body as string) as { data: { stable_id: string } };
           attempts.push(event.data.stable_id);
-          if (attempts.length <= failures) return failure();
+          return failure();
         }
         return defaultFetchHandler(input, init);
       });
       return () => attempts;
     }
 
+    function expectSettledWithoutError(onError: ReturnType<typeof vi.fn>): void {
+      expect(onError).not.toHaveBeenCalled();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
+    }
+
     it.each([
       ["lost response", lostResponse],
       ["runner reconnect", runnerUnavailable],
-    ])("resends the same message after a %s until the server answers", async (_, failure) => {
-      const attempts = failSend(failure, 2);
+    ])("settles a %s from its consumed event without resending", async (_, failure) => {
+      const attempts = failSend(failure);
       const onError = vi.fn();
       const sending = useChatStore
         .getState()
         .send("during rollout", "agent_xyz", undefined, { onError });
       await vi.advanceTimersByTimeAsync(2000);
-      await sending;
-
-      expect(attempts()).toHaveLength(3);
-      expect(new Set(attempts()).size).toBe(1);
-      expect(onError).not.toHaveBeenCalled();
       expect(useChatStore.getState().failedSendDraft).toBeNull();
-      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
-    });
 
-    it("stops resending once the runner's acknowledgement confirms delivery", async () => {
-      const attempts = failSend(lostResponse);
-      const onError = vi.fn();
-      const sending = useChatStore
-        .getState()
-        .send("during rollout", "agent_xyz", undefined, { onError });
-      await vi.advanceTimersByTimeAsync(600);
       handleSessionEvent({
         type: "session_input_consumed",
         itemId: attempts()[0]!,
         itemType: "message",
         data: { role: "user", content: [{ type: "input_text", text: "during rollout" }] },
       });
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(500);
       await sending;
 
-      // The acknowledgement landed during the wait, so no third POST went out.
-      expect(attempts()).toHaveLength(2);
-      expect(onError).not.toHaveBeenCalled();
-      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-      expect(useChatStore.getState().failedSendDraft).toBeNull();
-      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
+      expect(attempts()).toHaveLength(1);
+      expectSettledWithoutError(onError);
+    });
+
+    it("settles a runner reconnect from a snapshot that holds the message", async () => {
+      // The browser can reconnect after the turn ends, past any live acknowledgement.
+      const attempts = failSend(runnerUnavailable);
+      const onError = vi.fn();
+      const sending = useChatStore
+        .getState()
+        .send("during rollout", "agent_xyz", undefined, { onError });
+      await vi.advanceTimersByTimeAsync(2000);
+      const saved: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "turn_saved",
+          itemId: attempts()[0]!,
+        },
+        content: [{ type: "input_text", text: "during rollout" }],
+      };
+      useChatStore.setState({ blocks: [...useChatStore.getState().blocks, saved] });
+      await vi.advanceTimersByTimeAsync(500);
+      await sending;
+
+      expect(attempts()).toHaveLength(1);
+      expectSettledWithoutError(onError);
     });
 
     it.each([
-      ["lost response", lostResponse, false],
-      ["runner reconnect", runnerUnavailable, true],
-    ])(
-      "returns the draft when a %s outlasts the handoff window",
-      async (_, failure, serverRefused) => {
-        const attempts = failSend(failure);
-        const sending = useChatStore.getState().send("during rollout", "agent_xyz");
-        await vi.advanceTimersByTimeAsync(15_000);
-        await sending;
+      ["lost response", lostResponse],
+      ["runner reconnect", runnerUnavailable],
+    ])("returns the draft when a %s leaves no evidence of delivery", async (_, failure) => {
+      const attempts = failSend(failure);
+      const sending = useChatStore.getState().send("during rollout", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(15_000);
+      await sending;
 
-        expect(attempts().length).toBeGreaterThan(1);
-        expect(new Set(attempts()).size).toBe(1);
-        expect(useChatStore.getState().failedSendDraft).toMatchObject({
-          text: "during rollout",
-          stableId: attempts()[0],
-          serverRefused,
-        });
-        expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(true);
-      },
-    );
+      expect(attempts()).toHaveLength(1);
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({
+        text: "during rollout",
+        stableId: attempts()[0],
+        serverRefused: false,
+      });
+      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(true);
+    });
 
-    it("surfaces a confirmed refusal without resending", async () => {
+    it("surfaces a confirmed refusal without waiting", async () => {
       const attempts = failSend(() =>
         Promise.resolve(
           new Response(
@@ -5479,17 +5492,6 @@ describe("chatStore — delivered-but-unacked send", () => {
       expect(attempts()).toHaveLength(1);
       expect(useChatStore.getState().failedSendDraft).toMatchObject({ serverRefused: true });
       expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(true);
-    });
-
-    it("sends a native terminal session's message once", async () => {
-      // The runner's duplicate check covers SDK sessions only.
-      useChatStore.setState({ isNativeTerminalSession: true });
-      const attempts = failSend(lostResponse);
-      const sending = useChatStore.getState().send("during rollout", "agent_xyz");
-      await vi.advanceTimersByTimeAsync(15_000);
-      await sending;
-
-      expect(attempts()).toHaveLength(1);
     });
   });
 

@@ -175,8 +175,9 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   throughout recovery and checks that no delivered prompt returns as a draft.
   `deploy/kubernetes/multi_replica/verify_browser.py` records six real browser
   conversations during a three-pod Kubernetes rollout. See the adjacent README
-  for setup. `web/src/store/chatStore.test.ts` covers resending under the
-  same stable ID, expiry of the resend window, and immediate refusal.
+  for setup. `web/src/store/chatStore.test.ts` covers settling a lost send
+  from its consumed event or a reconnect snapshot, expiry of the wait, and
+  immediate refusal.
   `web/src/lib/identity.test.ts` covers bounded `wrong_replica` retries with
   the same host ID and message.
 - **`new-session-hotkey`:**

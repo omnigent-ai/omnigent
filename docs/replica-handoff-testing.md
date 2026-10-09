@@ -18,12 +18,13 @@ start their own server processes and do not require Kubernetes.
   HTTP deadline.
 - A lost HTTP response leaves delivery uncertain. A `503 runner_unavailable`
   can also mean that a prompt was saved just before its runner tunnel closed.
-  For an SDK session, the browser resends the same message, under the same
-  stable ID, for up to 15 seconds. The server keeps one saved item per stable
-  ID and forwards it again; the runner answers a message it already took as
-  accepted, so a resend cannot start a second turn. A refusal, or a runner
-  that stays unreachable for the whole window, still shows an error and
-  preserves the draft. Native terminal sessions are not resent.
+  The browser does not resend the message, because a runner without
+  duplicate detection would run it twice. It waits up to 15 seconds for
+  evidence of delivery: the message's consumed event, or the message in the
+  session snapshot after the browser reconnects. Saved evidence settles the
+  send without an error unless the server recorded the runner refusing it.
+  With no evidence by the end of the wait, the browser shows the error and
+  preserves the draft.
 - An SDK runner can finish a turn while its server connection is down. It
   remembers which persisted message IDs it accepted, whether through a
   forward, its reconnect scan, or a recovery turn started from saved history,
