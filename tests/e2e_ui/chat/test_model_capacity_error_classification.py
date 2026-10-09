@@ -116,8 +116,9 @@ def test_model_capacity_429_fails_turn_as_rate_limit(
 
     code = str(error.get("code") or "")
     message = str(error.get("message") or "")
-    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
-    last_task_error = session.get("last_task_error") or {}
+    session_resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    session_resp.raise_for_status()
+    last_task_error = session_resp.json().get("last_task_error") or {}
 
     assert _CAPACITY_SIGNATURE in message, (
         f"the failed turn's error lost the upstream capacity reason; "
@@ -130,4 +131,7 @@ def test_model_capacity_429_fails_turn_as_rate_limit(
     )
     assert last_task_error.get("code") == "rate_limit_exceeded", (
         f"the session's last_task_error lost the rate-limit code; got {last_task_error!r}"
+    )
+    assert _CAPACITY_SIGNATURE in str(last_task_error.get("message") or ""), (
+        f"the session's last_task_error lost the upstream capacity reason; got {last_task_error!r}"
     )
