@@ -172,15 +172,16 @@ describe("SessionUpdatesProvider watch-set", () => {
     expect(lastWatched()).toEqual(["conv_b", "conv_open"]);
   });
 
-  it.each(["/c/temp:12345678", "/canvas/c/temp:12345678?canvas=project"])(
-    "does not watch a client-only temp id at %s",
-    (route) => {
-      const client = new QueryClient();
-      seedConversations(client, ["conv_real", "temp:12345678"]);
-      renderProvider(client, [route]);
-      expect(lastWatched()).toEqual(["conv_real"]);
-    },
-  );
+  it.each([
+    "/c/temp:12345678",
+    "/canvas/c/temp:12345678?canvas=project",
+    "/canvas/c/temp%3A12345678?canvas=project",
+  ])("does not watch a client-only temp id at %s", (route) => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_real", "temp:12345678"]);
+    renderProvider(client, [route]);
+    expect(lastWatched()).toEqual(["conv_real"]);
+  });
 
   it.each(["/c", "/canvas/c"])("re-pushes the watch-set when navigating under %s", (prefix) => {
     // Navigating between off-sidebar children doesn't touch the

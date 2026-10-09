@@ -224,6 +224,15 @@ describe("RunnerHealthProvider deduplication", () => {
 });
 
 describe("RunnerHealthProvider open-session-scoped fallback poll", () => {
+  it.each(["/c/temp%3A123", "/canvas/c/temp%3A123?canvas=project"])(
+    "does not fetch or poll an encoded temporary session at %s",
+    (route) => {
+      renderInProvider(<MapKeysProbe />, [route]);
+      expect(useSessionMock).toHaveBeenCalledWith(undefined);
+      expect(useRunnerHealthMock.mock.calls.at(-1)?.[0]).toEqual([]);
+    },
+  );
+
   it.each(["/c/conv_child", "/canvas/c/conv_child?canvas=project"])(
     "polls the open session outside the sidebar at %s",
     (route) => {

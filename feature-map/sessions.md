@@ -92,9 +92,11 @@ you remove them.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
-cards. Drag the divider to resize, focus the session to use the full area, or
-close the session to return to the board. Opening, closing, or maximizing
-Workspace keeps the canvas visible. Session focus is independent: Show canvas
+cards. Drag the divider to resize, or focus it and use Left/Right arrows to
+adjust the split and Home/End to reach its limits. Double-click the divider to
+restore the default split. Focus the session to use the full area; Escape
+restores the board. Close the session to return to the board. Opening, closing,
+or maximizing Workspace keeps the canvas visible. Session focus is independent: Show canvas
 restores the board without closing Workspace. On narrow screens, Back to canvas returns to
 the selected project. A Canvas session link opens the same layout directly.
 The plus button starts a new session in the selected canvas. After sending,
@@ -359,7 +361,8 @@ plain `uv run pytest`, which starts a private server for the test.
   from similarly named routes under standalone and embedded mount paths.
   `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested
   dialog with Escape preserves conversation focus and that resizing respects
-  both panes' minimum widths. `web/src/pages/CanvasPage.test.tsx` checks viewport
+  both panes' minimum widths; double-click restores and saves the default split.
+  `web/src/pages/CanvasPage.test.tsx` checks viewport
   translation across successive resizes, hiding, and restoring the pane.
 - **`canvas-session-health` (card selection and direct session links):** component
   tests in `web/src/hooks/useActiveConversationId.test.tsx` cover standalone and
@@ -367,11 +370,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/hooks/RunnerHealthProvider.test.tsx` and
   `web/src/hooks/SessionUpdatesProvider.test.tsx` verify that a Canvas session
   outside the loaded sidebar pages enters health polling and the live watch
-  set; changing cards updates the watched session and temporary ids are excluded.
+  set; changing cards updates the watched session and encoded temporary ids
+  are excluded.
 - **`canvas-mobile` (deep link, back button, and reload):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
 - **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_rail_matches_expanded_navigation`.
+  `web/src/extensions/ExtensionPrimaryNavigation.test.tsx` verifies compact
+  extension links retain accessible labels and work when activated.
 - **`canvas-create` (Main/project plus button, desktop/mobile):**
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_plus_creates_session_on_the_selected_board`.
   The composer uses a fixture host; session creation, binding to the isolated

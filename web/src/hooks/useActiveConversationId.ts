@@ -17,7 +17,13 @@ export function useActiveConversationId(): string | undefined {
     for (const prefix of [rebasePath("/c/"), rebasePath("/canvas/c/")]) {
       if (!pathname.startsWith(prefix)) continue;
       const match = pathname.slice(prefix.length).match(/^([^/]+)\/?$/);
-      if (match) return match[1];
+      if (match) {
+        try {
+          return decodeURIComponent(match[1]);
+        } catch {
+          return match[1];
+        }
+      }
     }
     return undefined;
   }, [pathname, rebasePath]);

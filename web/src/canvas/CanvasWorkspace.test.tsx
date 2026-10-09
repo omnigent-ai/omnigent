@@ -147,6 +147,16 @@ describe("CanvasWorkspace", () => {
     expect(screen.getByLabelText("Canvas pane")).not.toHaveClass("hidden");
   });
 
+  it("restores and saves the default split on divider double-click", async () => {
+    localStorage.setItem("omnigent:canvas-split-ratio", "0.4");
+    await renderWorkspace("/canvas/c/first?canvas=project");
+    const divider = screen.getByRole("separator");
+    expect(divider).toHaveAttribute("aria-valuenow", "477");
+    fireEvent.doubleClick(divider);
+    expect(divider).toHaveAttribute("aria-valuenow", "644");
+    expect(localStorage.getItem("omnigent:canvas-split-ratio")).toBe("0.54");
+  });
+
   it("switches to a single pane on narrow screens and returns to the same board", async () => {
     const board = await renderWorkspace("/canvas/c/first?canvas=project");
     containerWidth = 600;
