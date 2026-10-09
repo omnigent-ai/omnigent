@@ -13,7 +13,6 @@ delivery restores the bridge before executing.
 
 from __future__ import annotations
 
-import hashlib
 import shutil
 import time
 import uuid
@@ -22,7 +21,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.harnesses.codex_native.bridge import bridge_root
+from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id
 from tests.e2e_ui.conftest import (
     configure_mock_llm,
     reset_mock_llm,
@@ -51,25 +50,14 @@ _TURN_DELIVERY_TIMEOUT_MS = 180_000
 _MISSING_STATE_MESSAGE = "Codex native bridge state is missing"
 
 # Runner-written bridge files; their absence is the production teardown
-# signature. The live CLI may resurrect the dir with codex-home content (no
-# bridge files), which this predicate tolerates.
+# signature (the live CLI may resurrect the dir with codex-home content only).
+# Mirrors bridge_torn_down on purpose: importing it would make a tree without
+# the heal fail on the import instead of on the reported behavior.
 _BRIDGE_FILES = ("state.json", "startup_error.json", "bridge.json")
 
 
 def _bridge_torn_down(bridge_dir: Path) -> bool:
     return not any((bridge_dir / name).is_file() for name in _BRIDGE_FILES)
-
-
-def _codex_bridge_dir(session_id: str) -> Path:
-    """Return the runner's Codex bridge dir for *session_id*.
-
-    The codex-native session carries no explicit bridge-id label, so the bridge
-    id defaults to the conversation id and the dir is
-    ``bridge_root() / sha256(session_id)[:32]``. The shared runner inherits this
-    process's ``HOME``, so ``bridge_root()`` resolves identically here.
-    """
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
-    return bridge_root() / digest
 
 
 def _wait_for_state_file(state_file: Path, timeout_s: float) -> None:
@@ -87,17 +75,22 @@ def _wait_for_state_file(state_file: Path, timeout_s: float) -> None:
 def _tear_down_bridge_dir(bridge_dir: Path, timeout_s: float = 10.0) -> None:
     """Remove the runner-written bridge files even while the TUI writes into the dir."""
     deadline = time.monotonic() + timeout_s
+    last_error: OSError | None = None
     while time.monotonic() < deadline:
         try:
             shutil.rmtree(bridge_dir)
         except FileNotFoundError:
             pass
-        except OSError:
+        except OSError as exc:
+            last_error = exc
             time.sleep(0.25)
             continue
+        last_error = None
         time.sleep(0.5)
         if _bridge_torn_down(bridge_dir):
             return
+    if last_error is not None:
+        raise AssertionError(f"bridge dir could not be removed at {bridge_dir}: {last_error!r}")
     remaining = [name for name in _BRIDGE_FILES if (bridge_dir / name).is_file()]
     raise AssertionError(
         f"bridge files were rewritten faster than they could be removed at "
@@ -145,7 +138,9 @@ def test_codex_native_turn_delivers_after_bridge_dir_teardown(
     _wait_terminal_connected(page)
     _ensure_chat_view(page)
 
-    bridge_dir = _codex_bridge_dir(session_id)
+    # No bridge-id label is set, so the bridge id defaults to the session id;
+    # the runner shares this process's HOME, so the path resolves identically.
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
     _wait_for_state_file(bridge_dir / "state.json", _STATE_WRITE_TIMEOUT_S)
 
     nonce = uuid.uuid4().hex[:8]

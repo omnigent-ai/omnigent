@@ -9352,10 +9352,13 @@ async def _codex_bridge_torn_down_for_live_pane(
     path; the label lookup runs only when that dir is torn down.
 
     :param server_client: Omnigent server client used to resolve a rotated
-        bridge-id label. ``None`` checks only the session-id-keyed dir.
+        bridge-id label. ``None`` cannot rule out a rotated label, so the pane
+        is left alone.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :returns: ``True`` only for a non-forked session whose session-id bridge
         dir was torn down (the case the session-id relaunch can restore).
+        ``False`` when the label lookup is inconclusive: closing a live pane
+        on a guess is worse than leaving one more turn to fail.
     """
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -9365,12 +9368,19 @@ async def _codex_bridge_torn_down_for_live_pane(
 
     if not bridge_torn_down(bridge_dir_for_bridge_id(session_id)):
         return False
-    if server_client is None:
-        return True
-    labels = await _session_labels_for_runner_spawn(
-        server_client=server_client,
-        session_id=session_id,
+    labels = (
+        await _lookup_session_labels(server_client=server_client, session_id=session_id)
+        if server_client is not None
+        else None
     )
+    if labels is None:
+        _logger.info(
+            "codex bridge for conv=%s looks torn down but its labels could not be read; "
+            "leaving the live pane alone",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return False
     bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
     if bridge_id and bridge_id != session_id:
         # A rotated label (a /new fork) points the executor at the rotated dir,
@@ -10235,6 +10245,27 @@ async def _session_labels_for_runner_spawn(
         ``"conv_abc123"``.
     :returns: String label mapping. Empty on lookup failure.
     """
+    labels = await _lookup_session_labels(server_client=server_client, session_id=session_id)
+    return labels if labels is not None else {}
+
+
+async def _lookup_session_labels(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> dict[str, str] | None:
+    """
+    Fetch session labels, or ``None`` when the lookup is inconclusive.
+
+    :param server_client: Omnigent server client used to fetch the session
+        labels endpoint.
+    :param session_id: Omnigent session/conversation id, e.g.
+        ``"conv_abc123"``.
+    :returns: String label mapping (empty when the response carries no labels
+        mapping), or ``None`` on a timeout, transport or auth error, non-200
+        status, or an unparseable body. Callers that must tell "no labels" from
+        "could not read labels" use this directly.
+    """
     from omnigent.inner.databricks_executor import DatabricksAuthError
 
     path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
@@ -10250,7 +10281,7 @@ async def _session_labels_for_runner_spawn(
             type(exc).__name__,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
     except (httpx.HTTPError, DatabricksAuthError) as exc:
         # DatabricksAuthError: the host credential service couldn't sign the
         # request. Like any other lookup failure, that must not fail the turn.
@@ -10260,7 +10291,7 @@ async def _session_labels_for_runner_spawn(
             type(exc).__name__,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
     if resp.status_code != 200:
         _logger.warning(
             "Failed to resolve session labels; session=%s status=%s",
@@ -10268,7 +10299,7 @@ async def _session_labels_for_runner_spawn(
             resp.status_code,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
     try:
         labels = resp.json().get("labels")
     except ValueError:
@@ -10283,7 +10314,7 @@ async def _session_labels_for_runner_spawn(
             resp.status_code,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
     if not isinstance(labels, dict):
         return {}
     return {str(key): str(value) for key, value in labels.items()}

@@ -18,6 +18,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
@@ -127,7 +128,7 @@ def _build_codex_native_app(
     monkeypatch.setattr("omnigent.runner.native._launch_codex", _stub_launch_codex)
     # A native turn also nudges the tool relay, which waits 30s for a bridge
     # server-info file no fake harness ever writes.
-    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda _bridge_dir: None)
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda *_a, **_kw: None)
 
     harness_client = _ScriptedHarnessClient(
         [
@@ -292,8 +293,8 @@ async def test_torn_down_check_does_not_flag_rotated_bridge_id(
     conv_id = "b3c4d5e6f708192a3b4c5d6e7f8091a2"
     client = _LabelServerClient({CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: "rotated-bridge"})
 
-    # No dir under either key: the pre-fix detector flagged this and relaunched
-    # into the wrong (session-id) dir, killing the live pane for nothing.
+    # No dir under either key: a rotated session must not trigger the
+    # session-id relaunch.
     assert not await _codex_bridge_torn_down_for_live_pane(
         server_client=client,  # type: ignore[arg-type]
         session_id=conv_id,
@@ -305,6 +306,58 @@ async def test_torn_down_check_does_not_flag_rotated_bridge_id(
         server_client=client,  # type: ignore[arg-type]
         session_id=conv_id,
     ), "an intact rotated dir is not a teardown the session-id heal handles"
+
+
+class _FailingLabelServerClient:
+    """Server-client stub whose labels lookup times out or returns a non-200."""
+
+    def __init__(self, *, status_code: int | None) -> None:
+        self._status_code = status_code
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Raise a timeout when no status is configured; otherwise serve it."""
+        del url, kwargs
+        if self._status_code is None:
+            raise httpx.ReadTimeout("labels lookup timed out")
+        code = self._status_code
+
+        class _Response:
+            status_code = code
+
+            def json(self) -> dict[str, Any]:
+                return {}
+
+        return _Response()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client",
+    [
+        _FailingLabelServerClient(status_code=None),
+        _FailingLabelServerClient(status_code=503),
+        None,
+    ],
+    ids=["timeout", "non_200", "no_server_client"],
+)
+async def test_torn_down_check_fails_closed_when_labels_are_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    client: Any,
+) -> None:
+    """An inconclusive label lookup must not fire the pane-closing heal.
+
+    The session-id dir is torn down, but without labels a rotated bridge id
+    cannot be ruled out, and relaunching would kill a live forked pane.
+    """
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    conv_id = "d5e6f708192a3b4c5d6e7f8091a2b3c4"
+    assert bridge_torn_down(bridge_dir_for_bridge_id(conv_id))
+
+    assert not await _codex_bridge_torn_down_for_live_pane(
+        server_client=client,
+        session_id=conv_id,
+    ), "unreadable labels must leave the live pane alone"
 
 
 @pytest.mark.asyncio
