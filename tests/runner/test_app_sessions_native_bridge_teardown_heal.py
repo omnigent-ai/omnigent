@@ -309,10 +309,11 @@ async def test_torn_down_check_does_not_flag_rotated_bridge_id(
 
 
 class _FailingLabelServerClient:
-    """Server-client stub whose labels lookup times out or returns a non-200."""
+    """Server-client stub whose labels lookup times out, errors, or returns junk."""
 
-    def __init__(self, *, status_code: int | None) -> None:
+    def __init__(self, *, status_code: int | None, malformed: bool = False) -> None:
         self._status_code = status_code
+        self._malformed = malformed
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         """Raise a timeout when no status is configured; otherwise serve it."""
@@ -320,11 +321,14 @@ class _FailingLabelServerClient:
         if self._status_code is None:
             raise httpx.ReadTimeout("labels lookup timed out")
         code = self._status_code
+        malformed = self._malformed
 
         class _Response:
             status_code = code
 
             def json(self) -> dict[str, Any]:
+                if malformed:
+                    raise ValueError("not JSON")
                 return {}
 
         return _Response()
@@ -336,9 +340,10 @@ class _FailingLabelServerClient:
     [
         _FailingLabelServerClient(status_code=None),
         _FailingLabelServerClient(status_code=503),
+        _FailingLabelServerClient(status_code=200, malformed=True),
         None,
     ],
-    ids=["timeout", "non_200", "no_server_client"],
+    ids=["timeout", "non_200", "malformed_body", "no_server_client"],
 )
 async def test_torn_down_check_fails_closed_when_labels_are_unreadable(
     monkeypatch: pytest.MonkeyPatch,
