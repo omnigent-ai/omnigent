@@ -798,15 +798,17 @@ def test_claude_provider_project_disable_overrides_global_enable(
 def test_claude_provider_install_path_from_later_scope_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """installPath is taken from the first entry that has one, not blindly entries[0]."""
+    """installPath comes from the first entry naming an existing directory, not entries[0]."""
     home = tmp_path / "home"
     install = home / ".claude" / "plugins" / "cache" / "mkt" / "sp" / "1.0.0"
     _write_skill(install / "skills", "using-superpowers")
+    missing = home / ".claude" / "plugins" / "cache" / "mkt" / "sp" / "0.9.0"
     (home / ".claude").mkdir(parents=True, exist_ok=True)
     (home / ".claude" / "settings.json").write_text(
         json.dumps({"enabledPlugins": {"sp@mkt": True}})
     )
-    # First entry lacks installPath; the second carries it.
+    # The first entry lacks installPath and the second names a directory that
+    # is gone; the third carries the real install.
     (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
         json.dumps(
             {
@@ -814,6 +816,7 @@ def test_claude_provider_install_path_from_later_scope_entry(
                 "plugins": {
                     "sp@mkt": [
                         {"scope": "project"},
+                        {"scope": "local", "installPath": str(missing)},
                         {"scope": "user", "installPath": str(install)},
                     ]
                 },
