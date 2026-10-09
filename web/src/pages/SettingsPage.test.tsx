@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   bulkArchiveMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
+  importSessionsPanel: vi.fn(() => null),
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -56,6 +57,9 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
   }),
+}));
+vi.mock("@/shell/ImportSessionsPanel", () => ({
+  ImportSessionsPanel: mocks.importSessionsPanel,
 }));
 vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
@@ -224,6 +228,7 @@ beforeEach(() => {
   mocks.conversationQuery.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
+  mocks.importSessionsPanel.mockClear();
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -247,6 +252,16 @@ afterEach(() => {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+});
+
+describe("Import sessions", () => {
+  it("keeps session imports without the legacy Harness imports section", () => {
+    renderPage("/settings/import");
+
+    expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
+    expect(mocks.importSessionsPanel).toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
 });
 
 const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
@@ -421,7 +436,9 @@ describe("SettingsPage", () => {
     if (description === null) throw new Error("Missing composer shortcut description");
     expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
     expect(
-      within(description).getByText("Off: Enter submits and Shift+Enter inserts a newline."),
+      within(description).getByText(
+        /Off: Enter submits and Shift\+Enter or (?:⌥|Alt)\+Enter inserts a newline\./,
+      ),
     ).toBeInTheDocument();
     expect(
       within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
@@ -556,7 +573,7 @@ describe("SettingsPage", () => {
     const group = screen.getByRole("radiogroup", { name: "Default Workspace tab" });
     const options = within(group).getAllByRole("radio");
     expect(options).toHaveLength(4);
-    ["Files", "Changes", "GitHub", "Agents"].forEach((label, index) => {
+    ["Files", "Changes", "Pull Requests", "Agents"].forEach((label, index) => {
       expect(options[index]).toHaveAccessibleName(label);
     });
     expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(

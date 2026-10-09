@@ -7,6 +7,10 @@ struct WebShellView: View {
   let loadFailed: (URL, String?) -> Void
   let loadSucceeded: () -> Void
   var signedOut: ((DatabricksWebContext, Task<Void, Error>) -> Void)?
+  /// The clean server URL behind `initialURL`, which may carry a conversation path.
+  var serverURL: URL?
+  /// Signed out of a native-OIDC server: the server and the Connect screen message.
+  var serverSignedOut: ((URL, String) -> Void)?
 
   @Environment(\.colorScheme) private var colorScheme
   @EnvironmentObject private var settings: SettingsStore
@@ -20,10 +24,13 @@ struct WebShellView: View {
   @State private var deferredOpenPath: String?
   @State private var deferredNotificationPath: String?
   @State private var connectionID = UUID()
-  @State private var connectionIntent: DatabricksConnectionIntent = .connect
-  @State private var recoveryPageURL: URL?
+  /// Set while recovering; it applies only to the destination it was started for.
+  @State private var recoveryIntent: RecoveryIntent?
+  @State private var recoveryPage: RecoveryPage?
   @State private var recoveryPolicy = DatabricksRecoveryPolicy()
   @State private var needsReauthentication = false
+  /// The "Sign in again?" message; nil uses the workspace wording.
+  @State private var reauthenticationMessage: String?
   @State private var workspacePageLoaded = false
 
   private var isWorkspace: Bool {
@@ -48,26 +55,38 @@ struct WebShellView: View {
           pushServerPicker: pushServerPicker,
           requestSwitchServer: switchServerIfListed,
           openServerSetup: connectToNewServer,
-          connectionIntent: connectionIntent,
-          recoveryPageURL: recoveryPageURL,
+          connectionIntent: recoveryIntent?.intent(for: initialURL) ?? .connect,
+          recoveryPageURL: recoveryPage?.url(for: initialURL),
           recoverWorkspace: recoverWorkspace,
           workspaceReady: { recoveryPolicy.markReady() },
           reauthenticateWorkspace: { page in
-            recoveryPageURL = page
+            recoveryPage = RecoveryPage(url: page, initialURL: initialURL)
+            reauthenticationMessage = nil
             needsReauthentication = true
           },
-          signedOut: signedOut
+          signedOut: signedOut,
+          serverURL: serverURL,
+          requireSignIn: { page, message in
+            recoveryPage = RecoveryPage(url: page, initialURL: initialURL)
+            reauthenticationMessage = message
+            needsReauthentication = true
+          },
+          serverSignedOut: serverSignedOut
         )
         .id(DatabricksWebContext.viewIdentity(for: initialURL) + connectionID.uuidString)
         .ignoresSafeArea()
 
         if model.isAuthenticating {
           VStack(spacing: 16) {
-            ProgressView("Connecting to workspace…")
+            ProgressView(isWorkspace ? "Connecting to workspace…" : "Signing in…")
             Button("Cancel") { model.cancelAuthentication?() }
           }
           .frame(maxWidth: .infinity, maxHeight: .infinity)
           .background(DesignTokens.background(colorScheme))
+        } else if model.hidesPage {
+          ProgressView()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(DesignTokens.background(colorScheme))
         }
 
         ServerSwitcher(
@@ -114,7 +133,15 @@ struct WebShellView: View {
       #if DEBUG
         .overlay(alignment: .bottomLeading) {
           if isWorkspace, !model.isAuthenticating {
-            WorkspaceDebugMenu(inject: { await model.injectDebugFault?($0) })
+            SessionDebugMenu(inject: { (fault: DatabricksDebugFault) in
+              await model.injectDebugFault?(fault)
+            })
+            .padding(.leading, 12)
+            .padding(.bottom, InsetMetrics.bottomBarFootprint + 10)
+          } else if !isWorkspace, !model.isAuthenticating, model.injectOidcDebugFault != nil {
+            SessionDebugMenu(inject: { (fault: OidcDebugFault) in
+              await model.injectOidcDebugFault?(fault)
+            })
             .padding(.leading, 12)
             .padding(.bottom, InsetMetrics.bottomBarFootprint + 10)
           }
@@ -123,13 +150,15 @@ struct WebShellView: View {
     }
     .alert("Sign in again?", isPresented: $needsReauthentication) {
       Button("Sign In") {
-        connectionIntent = .connect
+        recoveryIntent = nil
         workspacePageLoaded = false
         connectionID = UUID()
       }
       Button("Cancel", role: .cancel) { loadFailed(initialURL, nil) }
     } message: {
-      Text(DatabricksSessionError.reauthenticationRequired.localizedDescription)
+      Text(
+        reauthenticationMessage
+          ?? DatabricksSessionError.reauthenticationRequired.localizedDescription)
     }
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {
@@ -147,6 +176,11 @@ struct WebShellView: View {
       flushDeferredNavigation()
     }
     .onChange(of: model.isLoading) { _, _ in flushDeferredNavigation() }
+    // A page recorded for another destination must not resurface on a later load.
+    .onChange(of: initialURL) { _, _ in
+      recoveryPage = nil
+      recoveryIntent = nil
+    }
     .onChange(of: workspacePageLoaded) { _, _ in flushDeferredNavigation() }
     .onChange(of: model.isLoading) { _, loading in
       // Re-push the native bar footprints and the server-picker payload once
@@ -181,8 +215,8 @@ struct WebShellView: View {
       loadFailed(initialURL, DatabricksSessionError.recoveryExhausted.localizedDescription)
       return
     }
-    recoveryPageURL = pageURL
-    connectionIntent = .recover
+    recoveryPage = RecoveryPage(url: pageURL, initialURL: initialURL)
+    recoveryIntent = RecoveryIntent(initialURL: initialURL)
     workspacePageLoaded = false
     connectionID = UUID()
   }
@@ -192,9 +226,9 @@ struct WebShellView: View {
       model.reload()
       return
     }
-    recoveryPageURL = model.currentURL ?? initialURL
+    recoveryPage = RecoveryPage(url: model.currentURL ?? initialURL, initialURL: initialURL)
     recoveryPolicy = DatabricksRecoveryPolicy()
-    connectionIntent = .connect
+    recoveryIntent = nil
     workspacePageLoaded = false
     connectionID = UUID()
   }
@@ -211,7 +245,8 @@ struct WebShellView: View {
       currentOrigin: (model.currentURL ?? initialURL).omnigentOrigin,
       managedServers: managedConfiguration.serverURLs.map(\.absoluteString),
       recentServers: ManagedServers.recents(
-        settings.recentServers, excludingManaged: managedConfiguration.serverURLs)
+        settings.recentServers, excludingManaged: managedConfiguration.serverURLs),
+      canSignOut: model.signOut != nil
     )
   }
 
@@ -226,6 +261,27 @@ struct WebShellView: View {
   private func switchServer(_ urlString: String) {
     guard let url = URL(string: urlString) else { return }
     switchToServer(url)
+  }
+}
+
+/// A page to return to after recovery or "Sign in again?", valid only for the destination it was
+/// recorded under: non-workspace servers share one view, so it must not leak to a later load.
+struct RecoveryPage: Equatable {
+  let url: URL
+  let initialURL: URL
+
+  func url(for currentInitialURL: URL) -> URL? {
+    currentInitialURL == initialURL ? url : nil
+  }
+}
+
+/// A recovery load started for one destination. Any other destination connects normally, so a
+/// later explicit Connect is never treated as a silent recovery.
+struct RecoveryIntent: Equatable {
+  let initialURL: URL
+
+  func intent(for currentInitialURL: URL) -> DatabricksConnectionIntent {
+    currentInitialURL == initialURL ? .recover : .connect
   }
 }
 
@@ -282,7 +338,10 @@ private struct ServerSwitcher: View {
       if let signOut {
         Divider()
         Button(role: .destructive, action: signOut) {
-          Label("Sign Out of Workspace", systemImage: "rectangle.portrait.and.arrow.right")
+          Label(
+            ServerAuthentication(origin: currentURL.omnigentOrigin) == .databricksWorkspace
+              ? "Sign Out of Workspace" : "Sign Out",
+            systemImage: "rectangle.portrait.and.arrow.right")
         }
       }
     } label: {
@@ -326,10 +385,19 @@ private struct ServerSwitcher: View {
 }
 
 #if DEBUG
-  /// Breaks one piece of the live workspace session on demand so recovery, refresh, and the sign-in
+  /// A debug-menu fault: what the menu item says and what to expect after injecting it.
+  protocol SessionDebugFault: CaseIterable, Identifiable, Sendable {
+    var title: String { get }
+    var systemImage: String { get }
+  }
+
+  extension DatabricksDebugFault: SessionDebugFault {}
+  extension OidcDebugFault: SessionDebugFault {}
+
+  /// Breaks one piece of the live session on demand so recovery, refresh, and the sign-in
   /// prompt can be exercised by hand. Compiled out of release builds.
-  private struct WorkspaceDebugMenu: View {
-    let inject: (DatabricksDebugFault) async -> String?
+  private struct SessionDebugMenu<Fault: SessionDebugFault>: View {
+    let inject: (Fault) async -> String?
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var status: String?
@@ -352,7 +420,7 @@ private struct ServerSwitcher: View {
         }
 
         Menu {
-          ForEach(DatabricksDebugFault.allCases) { fault in
+          ForEach(Array(Fault.allCases)) { fault in
             Button(role: .destructive) {
               run(fault)
             } label: {
@@ -383,18 +451,18 @@ private struct ServerSwitcher: View {
             .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
         }
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
-        .accessibilityLabel("Break workspace session for testing")
+        .accessibilityLabel("Break session for testing")
       }
     }
 
-    private func run(_ fault: DatabricksDebugFault) {
+    private func run(_ fault: Fault) {
       guard !busy else { return }
       busy = true
       status = nil
       Task {
         let message = await inject(fault)
         busy = false
-        status = message ?? "The workspace view is not ready yet."
+        status = message ?? "The server view is not ready yet."
       }
     }
   }

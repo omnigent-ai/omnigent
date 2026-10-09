@@ -21,7 +21,7 @@ Env vars read at startup:
   else to Pi's own default.
 - ``HARNESS_PI_GATEWAY``: ``"1"`` / ``"true"`` to write a
   ``models.json`` pointing Pi at a vendor-neutral gateway (base
-  URLs + bearer-token command + model). The Databricks AI gateway
+  URLs + bearer-token command + model). The Databricks Unity Gateway
   is one producer of this transport; generic ``key`` / ``gateway``
   providers are another. Otherwise the executor uses Pi's built-in
   API path.

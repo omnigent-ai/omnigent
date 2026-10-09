@@ -16,12 +16,7 @@
  *   submit handler (the chat store is single-conversation, so the
  *   inbox posts the verdict itself via `approve()` — same endpoint).
  *
- * Only the first (newest) card is expanded by default; the rest
- * collapse to a one-line summary row so a long backlog stays
- * scannable. Clicking a row toggles it; manual toggles stick even
- * as new items arrive (overrides are keyed by elicitation id).
- *
- * Below the approvals, the inbox lists unseen file comments — draft
+ * Alongside approvals the inbox lists unseen file comments — draft
  * comments other users left on session files (`useCommentInbox`),
  * each iconed with the author's avatar pill. A comment clears when
  * it's actually opened in the file browser — the FileViewer records
@@ -29,28 +24,36 @@
  * comments panel is open on its file; the "Open file" link deep-links
  * to exactly that (`?file=` + `?comment=` auto-opens the panel).
  *
- * After those come sessions with unseen agent output — the same
- * read-state behind the sidebar's unread dot — as compact rows previewing
- * the latest reply. Opening the session or "Mark as read" clears a row.
- * Tabs narrow the list to "Unread" (comments + unread sessions) or
- * "Awaiting response" (approvals); the pick persists per device.
+ * It also lists sessions with unseen agent output — the same read-state
+ * behind the sidebar's unread dot — previewing the latest reply. Opening
+ * the session or "Mark as read" clears a row.
+ *
+ * Every kind renders as the same card: a one-line row (kind tile, label,
+ * session title — preview, time, unread dot) that expands in place. All
+ * items sort newest first under recency headers ("Just now", "Earlier
+ * today", …). Only the newest approval starts expanded; manual toggles are
+ * keyed by item, so they stick as new items arrive. Tabs narrow the list
+ * to "Unread" (comments + unread sessions) or "Awaiting response"
+ * (approvals); the pick persists per device.
  *
  * Deliberately NOT here: dismissing approvals and mentions — neither
  * exists as a server concept. Resolving (or the prompt timing out) is
  * what clears an approval.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
   ArrowRightIcon,
   CheckIcon,
-  ChevronDownIcon,
   CircleAlertIcon,
   CircleCheckIcon,
+  HandIcon,
   InboxIcon,
   Loader2Icon,
+  SquarePenIcon,
+  type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
 import { PageScroll } from "@/components/PageScroll";
@@ -66,6 +69,8 @@ import {
 import {
   collectInboxItems,
   collectUnreadInboxItems,
+  groupInboxEntries,
+  type CommentInboxItem,
   type InboxItem,
   type InboxSource,
   type UnreadInboxItem,
@@ -120,6 +125,24 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
 const PREVIEW_SCAN_ITEMS = 12;
 const PREVIEW_MAX_CHARS = 280;
 
+/** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
+type InboxEntry =
+  | { kind: "approval"; key: string; at: number; item: InboxItem }
+  | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
+  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem };
+
+const TILE_TONES = {
+  yellow: "bg-status-yellow/12 text-status-yellow",
+  gray: "bg-status-gray/12 text-status-gray",
+  red: "bg-status-red/12 text-status-red",
+} as const;
+
+// Compact action buttons inside an expanded card.
+const OUTLINE_ACTION =
+  "rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
+const PRIMARY_ACTION =
+  "rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
+
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
@@ -130,13 +153,11 @@ export function InboxPage() {
   } = useSidebarData();
   const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const [responded, setResponded] = useState<RespondedMap>({});
-  // Manual expand/collapse toggles keyed by elicitation id. Anything
-  // not in the map falls back to the default: expanded only for the
-  // first (newest) item. Keying by id (not index) keeps a user's
-  // explicit toggles stable when new items shift positions.
+  // Manual expand/collapse toggles keyed by entry key. Anything not in
+  // the map falls back to the default: expanded only for the newest
+  // approval. Keying by id (not index) keeps a user's explicit toggles
+  // stable when new items shift positions.
   const [expandedOverrides, setExpandedOverrides] = useState<Record<string, boolean>>({});
-  // Unread rows start collapsed; toggles are keyed by session id.
-  const [expandedUnread, setExpandedUnread] = useState<Record<string, boolean>>({});
 
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = conversationsQuery;
   const rows = allRows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);
@@ -191,13 +212,38 @@ export function InboxPage() {
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
   const visibleCount = visibleApprovals.length + visibleComments.length + visibleUnread.length;
+  const totalCount = items.length + commentInbox.items.length + unreadItems.length;
   const summary = [
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
     unreadItems.length > 0 && `${unreadItems.length} unread`,
-  ].filter(Boolean);
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const emptyState = EMPTY_STATES[filter];
+
+  const groups = groupInboxEntries<InboxEntry>([
+    ...visibleApprovals.map((item) => ({
+      kind: "approval" as const,
+      key: `approval:${item.elicitation.elicitationId}`,
+      at: item.row.updated_at,
+      item,
+    })),
+    ...visibleComments.map((item) => ({
+      kind: "comment" as const,
+      key: `comment:${item.comment.id}`,
+      at: item.comment.created_at,
+      item,
+    })),
+    ...visibleUnread.map((item) => ({
+      kind: "unread" as const,
+      key: `unread:${item.row.id}`,
+      at: item.row.updated_at,
+      item,
+    })),
+  ]);
+  const defaultExpandedKey = items[0] && `approval:${items[0].elicitation.elicitationId}`;
 
   // Clear stale optimistic verdicts when snapshot data refreshes.
   // If a hook retry re-parks the same elicitation id after the user
@@ -271,12 +317,199 @@ export function InboxPage() {
     };
   };
 
+  const renderEntry = (entry: InboxEntry) => {
+    const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
+    const onToggle = () => {
+      trackClick(`inbox.${entry.kind}.toggle_expanded`, "button");
+      setExpandedOverrides((prev) => ({ ...prev, [entry.key]: !expanded }));
+    };
+    const title = conversationDisplayLabel(entry.item.row);
+
+    if (entry.kind === "approval") {
+      const { item } = entry;
+      const elicitationId = item.elicitation.elicitationId;
+      const verdict = responded[elicitationId];
+      // Same display mapping the sidebar uses: native-wrapper sessions read
+      // "Claude Code" / "Codex", never the internal agent name. Hidden when
+      // it would just repeat the title (untitled native sessions).
+      const agentLabel = getConversationAgentType(item.row);
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-item"
+          tile={<KindTile icon={HandIcon} tone="yellow" />}
+          kindLabel={item.elicitation.askUserQuestion ? "Question" : "Approval needed"}
+          title={title}
+          preview={item.elicitation.message}
+          at={entry.at}
+          unread={false}
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <SessionLine title={title} detail={agentLabel !== title ? agentLabel : undefined} />
+          <ApprovalCard
+            elicitationId={elicitationId}
+            message={item.elicitation.message}
+            phase={item.elicitation.phase}
+            policyName={item.elicitation.policyName}
+            contentPreview={item.elicitation.contentPreview}
+            requestedSchema={item.elicitation.requestedSchema}
+            url={item.elicitation.url}
+            status={verdict ? "responded" : "pending"}
+            response={verdict ?? null}
+            askUserQuestion={item.elicitation.askUserQuestion}
+            exitPlanMode={item.elicitation.exitPlanMode}
+            codexCommand={item.elicitation.codexCommand}
+            allowAllEdits={item.elicitation.allowAllEdits}
+            allowAutoMode={item.elicitation.allowAutoMode}
+            rememberScope={item.elicitation.rememberScope}
+            codexPersistModes={item.elicitation.codexPersistModes}
+            onSubmit={makeSubmit(item)}
+            className="border-0 bg-transparent p-0"
+          />
+          <InboxActions>
+            <Button asChild variant="outline" size="xs" className={OUTLINE_ACTION}>
+              <Link to={`/c/${item.row.id}`} componentId="inbox.approval.open_session">
+                Open session
+                <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
+
+    if (entry.kind === "comment") {
+      const { comment } = entry.item;
+      // Single-user mode stores no author; mirror CommentsPanel's "You"
+      // fallback (the only human in that mode is the viewer).
+      const author = comment.created_by ?? "You";
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-comment"
+          tile={
+            // The author's avatar pill (same deterministic initials + color
+            // as presence circles) says who left it at a glance.
+            <Avatar>
+              <AvatarFallback
+                className="font-medium text-white"
+                style={{ backgroundColor: userColor(author) }}
+              >
+                {userInitials(author)}
+              </AvatarFallback>
+            </Avatar>
+          }
+          kindLabel="Comment"
+          title={title}
+          preview={`${author}: ${comment.body}`}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <div>
+            <SessionLine title={title} />
+            <p className="mt-2 text-sm text-muted-foreground">
+              <span className="text-foreground">{author}</span> commented on{" "}
+              <span className="font-mono">{comment.path}</span>
+            </p>
+            {comment.anchor_content && (
+              <p className="mt-1 truncate font-mono text-sm text-muted-foreground">
+                {comment.anchor_content.trim()}
+              </p>
+            )}
+            <p className="mt-2 text-ui font-medium break-words whitespace-pre-wrap">
+              {comment.body}
+            </p>
+          </div>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              {/* Deep-link into the file browser with this comment selected —
+                  opening it there marks it seen, which clears this item. */}
+              <Link
+                to={`/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
+                componentId="inbox.comment.open_file"
+              >
+                Open file
+                <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
+
+    const { item } = entry;
+    const sessionId = item.row.id;
+    const isError = item.kind === "error";
+    const preview = previewBySession.get(sessionId);
+    const markRead = () => {
+      // Drop the toggle so a later reply re-surfaces the row collapsed.
+      setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
+      markConversationRead(sessionId, item.row.updated_at);
+    };
+    return (
+      <InboxCard
+        key={entry.key}
+        testId="inbox-unread"
+        dataKind={item.kind}
+        tile={
+          <KindTile
+            icon={isError ? CircleAlertIcon : CircleCheckIcon}
+            tone={isError ? "red" : "gray"}
+          />
+        }
+        kindLabel={isError ? "Error" : "Done"}
+        title={title}
+        preview={preview}
+        at={entry.at}
+        unread
+        expanded={expanded}
+        onToggle={onToggle}
+      >
+        <div>
+          <SessionLine title={title} />
+          {preview && (
+            <p className="mt-2 text-ui font-medium break-words whitespace-pre-wrap">{preview}</p>
+          )}
+        </div>
+        <InboxActions>
+          <Button
+            variant="outline"
+            size="xs"
+            className={OUTLINE_ACTION}
+            onClick={markRead}
+            componentId="inbox.unread.mark_read"
+          >
+            <CheckIcon className="size-3.5" />
+            Mark as read
+          </Button>
+          <Button asChild size="xs" className={PRIMARY_ACTION}>
+            {/* Opening is reading. Mark it here: a freshly mounted chat keeps an
+                explicit "Mark as unread" override, so it wouldn't clear this row. */}
+            <Link to={`/c/${sessionId}`} onClick={markRead} componentId="inbox.unread.open_session">
+              Open session
+              <ArrowRightIcon className="size-3.5" />
+            </Link>
+          </Button>
+        </InboxActions>
+      </InboxCard>
+    );
+  };
+
   return (
-    <PageScroll contentClassName="px-4 md:px-6">
-      <div className="mb-4 flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Inbox</h1>
-        {summary.length > 0 && (
-          <span className="text-ui text-muted-foreground">{summary.join(" · ")}</span>
+    <PageScroll maxWidthClassName="max-w-[960px]" contentClassName="px-4 md:px-10">
+      <div className="mb-4 flex items-center gap-3">
+        <h1 className="text-2xl font-normal">Inbox</h1>
+        {totalCount > 0 && (
+          <span
+            title={summary}
+            className="rounded-full bg-foreground px-2 py-0.5 text-sm font-medium text-card"
+          >
+            <span aria-hidden>{totalCount}</span>
+            <span className="sr-only">{summary}</span>
+          </span>
         )}
       </div>
 
@@ -292,7 +525,7 @@ export function InboxPage() {
       >
         <TabsList variant="pill" aria-label="Inbox filter" className="gap-1">
           {INBOX_TABS.map(({ value, label }) => (
-            <TabsTrigger key={value} value={value} className="h-7 flex-none px-2.5">
+            <TabsTrigger key={value} value={value} className="h-7 flex-none px-3">
               {label}
             </TabsTrigger>
           ))}
@@ -342,176 +575,12 @@ export function InboxPage() {
       )}
 
       <div className="flex flex-col gap-4">
-        {visibleApprovals.map((item, index) => {
-          const elicitationId = item.elicitation.elicitationId;
-          const verdict = responded[elicitationId];
-          const expanded = expandedOverrides[elicitationId] ?? index === 0;
-          // Same display mapping the sidebar uses: native-wrapper
-          // sessions read "Claude Code" / "Codex", never the internal
-          // agent name ("claude-native-ui"). The agent chip is hidden
-          // when it would just repeat the title (untitled native
-          // sessions, where the wrapper label IS the display label).
-          const title = conversationDisplayLabel(item.row);
-          const agentLabel = getConversationAgentType(item.row);
-          return (
-            <div
-              key={elicitationId}
-              data-testid="inbox-item"
-              data-expanded={expanded}
-              className="flex flex-col gap-2 rounded-xl border border-border bg-card p-4"
-            >
-              <div className="flex items-center gap-2">
-                {/* The toggle is a sibling of the Open-session link (not a
-                    parent) — nesting a link inside a button is invalid HTML
-                    and breaks middle-click/new-tab behavior. */}
-                <button
-                  type="button"
-                  aria-expanded={expanded}
-                  onClick={() => {
-                    trackClick("inbox.approval.toggle_expanded", "button");
-                    setExpandedOverrides((prev) => ({ ...prev, [elicitationId]: !expanded }));
-                  }}
-                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-                >
-                  <ChevronDownIcon
-                    className={cn(
-                      "size-4 shrink-0 text-muted-foreground transition-transform",
-                      !expanded && "-rotate-90",
-                    )}
-                  />
-                  <span className="min-w-0 shrink-0 truncate text-ui font-medium">
-                    {title}
-                    {agentLabel !== title && (
-                      <span className="ml-2 text-sm font-normal text-muted-foreground">
-                        {agentLabel}
-                      </span>
-                    )}
-                  </span>
-                  {!expanded && (
-                    <span className="min-w-0 truncate text-sm text-muted-foreground">
-                      {item.elicitation.message}
-                    </span>
-                  )}
-                </button>
-                <span className="flex shrink-0 items-center gap-2">
-                  <span className="text-sm text-muted-foreground">
-                    {/* Server timestamps are epoch seconds; relativeTime takes ms. */}
-                    {relativeTime(item.row.updated_at * 1000)}
-                  </span>
-                  <Button asChild variant="ghost" size="sm" className="text-sm">
-                    <Link to={`/c/${item.row.id}`} componentId="inbox.approval.open_session">
-                      Open session
-                      <ArrowRightIcon className="ml-1 size-3.5" />
-                    </Link>
-                  </Button>
-                </span>
-              </div>
-              {expanded && (
-                <ApprovalCard
-                  elicitationId={elicitationId}
-                  message={item.elicitation.message}
-                  phase={item.elicitation.phase}
-                  policyName={item.elicitation.policyName}
-                  contentPreview={item.elicitation.contentPreview}
-                  requestedSchema={item.elicitation.requestedSchema}
-                  url={item.elicitation.url}
-                  status={verdict ? "responded" : "pending"}
-                  response={verdict ?? null}
-                  askUserQuestion={item.elicitation.askUserQuestion}
-                  exitPlanMode={item.elicitation.exitPlanMode}
-                  codexCommand={item.elicitation.codexCommand}
-                  allowAllEdits={item.elicitation.allowAllEdits}
-                  allowAutoMode={item.elicitation.allowAutoMode}
-                  rememberScope={item.elicitation.rememberScope}
-                  codexPersistModes={item.elicitation.codexPersistModes}
-                  onSubmit={makeSubmit(item)}
-                />
-              )}
-            </div>
-          );
-        })}
-        {visibleComments.map((item) => {
-          const comment = item.comment;
-          // Single-user mode stores no author; mirror CommentsPanel's
-          // "You" fallback (the only human in that mode is the viewer).
-          const author = comment.created_by ?? "You";
-          const sessionTitle = conversationDisplayLabel(item.row);
-          return (
-            <div
-              key={comment.id}
-              data-testid="inbox-comment"
-              className="flex gap-3 rounded-xl border border-border bg-card p-4"
-            >
-              {/* The item's icon: the author's avatar pill (same
-                  deterministic initials + color as presence circles). */}
-              <Avatar size="sm" className="mt-0.5">
-                <AvatarFallback
-                  className="font-medium text-white"
-                  style={{ backgroundColor: userColor(author) }}
-                >
-                  {userInitials(author)}
-                </AvatarFallback>
-              </Avatar>
-              <div className="flex min-w-0 flex-1 flex-col gap-1">
-                <div className="flex items-center gap-2">
-                  <span className="min-w-0 truncate text-ui">
-                    <span className="font-medium">{author}</span>
-                    <span className="text-muted-foreground"> commented on </span>
-                    <span className="font-mono text-sm">{comment.path}</span>
-                  </span>
-                  <span className="ml-auto flex shrink-0 items-center gap-2">
-                    <span className="text-sm text-muted-foreground">
-                      {/* created_at is epoch seconds; relativeTime takes ms. */}
-                      {relativeTime(comment.created_at * 1000)}
-                    </span>
-                    <Button asChild variant="ghost" size="sm" className="text-sm">
-                      {/* Deep-link into the file browser with this comment
-                          selected — opening it there marks it seen, which
-                          is what clears this inbox item. */}
-                      <Link
-                        to={`/c/${item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
-                        componentId="inbox.comment.open_file"
-                      >
-                        Open file
-                        <ArrowRightIcon className="ml-1 size-3.5" />
-                      </Link>
-                    </Button>
-                  </span>
-                </div>
-                {comment.anchor_content && (
-                  <p className="truncate font-mono text-sm text-muted-foreground">
-                    {comment.anchor_content.trim()}
-                  </p>
-                )}
-                <p className="line-clamp-3 text-ui break-words whitespace-pre-wrap">
-                  {comment.body}
-                </p>
-                <span className="text-sm text-muted-foreground">{sessionTitle}</span>
-              </div>
-            </div>
-          );
-        })}
-        {visibleUnread.map((item) => {
-          const sessionId = item.row.id;
-          const expanded = expandedUnread[sessionId] ?? false;
-          return (
-            <UnreadInboxRow
-              key={sessionId}
-              item={item}
-              preview={previewBySession.get(sessionId)}
-              expanded={expanded}
-              onToggle={() => {
-                trackClick("inbox.unread.toggle_expanded", "button");
-                setExpandedUnread((prev) => ({ ...prev, [sessionId]: !expanded }));
-              }}
-              onMarkRead={() => {
-                // Drop the toggle so a later reply re-surfaces the row collapsed.
-                setExpandedUnread(({ [sessionId]: _cleared, ...rest }) => rest);
-                markConversationRead(sessionId, item.row.updated_at);
-              }}
-            />
-          );
-        })}
+        {groups.map((group) => (
+          <section key={group.label} aria-label={group.label} className="flex flex-col gap-2">
+            <h2 className="px-3 py-1.5 text-sm font-normal text-muted-foreground">{group.label}</h2>
+            {group.entries.map(renderEntry)}
+          </section>
+        ))}
         {assembling && visibleCount > 0 && (
           <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" />
@@ -525,6 +594,7 @@ export function InboxPage() {
           disabled={conversationsQuery.isFetching}
           onClick={() => void fetchNextPage()}
           componentId="inbox.load_more"
+          className="mt-4"
         >
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
         </Button>
@@ -534,93 +604,112 @@ export function InboxPage() {
 }
 
 /**
- * One session with unseen agent output: a compact row (kind, title, a
- * one-line preview of the latest reply) that expands to the fuller
- * preview plus "Mark as read" / "Open session" — both mark the session read.
+ * The shared inbox card. Collapsed, it is one row: kind tile, kind label,
+ * session title — preview, time, and the unread dot. The row toggles an
+ * expanded card that drops the inline title and shows `children` below.
  */
-function UnreadInboxRow({
-  item,
+function InboxCard({
+  testId,
+  dataKind,
+  tile,
+  kindLabel,
+  title,
   preview,
+  at,
+  unread,
   expanded,
   onToggle,
-  onMarkRead,
+  children,
 }: {
-  item: UnreadInboxItem;
+  testId: string;
+  dataKind?: string;
+  tile: ReactNode;
+  kindLabel: string;
+  title: string;
   preview: string | undefined;
+  /** Epoch seconds. */
+  at: number;
+  unread: boolean;
   expanded: boolean;
   onToggle: () => void;
-  onMarkRead: () => void;
+  children: ReactNode;
 }) {
-  const isError = item.kind === "error";
-  const KindIcon = isError ? CircleAlertIcon : CircleCheckIcon;
   return (
     <div
-      data-testid="inbox-unread"
-      data-kind={item.kind}
+      data-testid={testId}
+      data-kind={dataKind}
       data-expanded={expanded}
-      className="flex flex-col gap-3 rounded-xl border border-border bg-card px-4 py-3"
-    >
-      <div className="flex items-center gap-3">
-        <button
-          type="button"
-          aria-expanded={expanded}
-          onClick={onToggle}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 text-left"
-        >
-          <span
-            aria-hidden
-            className={cn(
-              "flex size-7 shrink-0 items-center justify-center rounded-md",
-              isError ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground",
-            )}
-          >
-            <KindIcon className="size-4" />
-          </span>
-          <span className="w-12 shrink-0 text-sm text-muted-foreground">
-            {isError ? "Error" : "Done"}
-          </span>
-          <span className="min-w-0 truncate text-ui">
-            <span className="font-medium">{conversationDisplayLabel(item.row)}</span>
-            {!expanded && preview && <span className="text-muted-foreground"> — {preview}</span>}
-          </span>
-        </button>
-        <span className="flex shrink-0 items-center gap-3">
-          <span className="text-sm text-muted-foreground">
-            {/* Server timestamps are epoch seconds; relativeTime takes ms. */}
-            {relativeTime(item.row.updated_at * 1000)}
-          </span>
-          {/* Same brand-pink dot as the sidebar's unread indicator. */}
-          <span role="img" aria-label="Unread" className="size-1.5 rounded-full bg-brand-accent" />
-        </span>
-      </div>
-      {expanded && (
-        <div className="flex flex-col gap-3 pl-10">
-          {preview && <p className="text-ui break-words whitespace-pre-wrap">{preview}</p>}
-          <div className="flex justify-end gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onMarkRead}
-              componentId="inbox.unread.mark_read"
-            >
-              <CheckIcon className="mr-1 size-3.5" />
-              Mark as read
-            </Button>
-            <Button asChild variant="outline" size="sm">
-              {/* Opening is reading. Mark it here: a freshly mounted chat keeps an
-                  explicit "Mark as unread" override, so it wouldn't clear this row. */}
-              <Link
-                to={`/c/${item.row.id}`}
-                onClick={onMarkRead}
-                componentId="inbox.unread.open_session"
-              >
-                Open session
-                <ArrowRightIcon className="ml-1 size-3.5" />
-              </Link>
-            </Button>
-          </div>
-        </div>
+      className={cn(
+        "overflow-hidden border border-border transition-[border-radius]",
+        expanded
+          ? "rounded-2xl bg-card shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)]"
+          : "rounded-xl bg-transparent",
       )}
+    >
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-label={`${kindLabel}: ${title}`}
+        onClick={onToggle}
+        className="flex w-full cursor-pointer items-center gap-3.5 p-2 text-left"
+      >
+        <span className="shrink-0">{tile}</span>
+        <span
+          className={cn(
+            // The tile already signals the kind, so narrow screens drop the
+            // label column to keep room for the title.
+            "hidden w-[140px] shrink-0 truncate text-ui sm:block",
+            expanded ? "text-foreground" : "text-muted-foreground",
+          )}
+        >
+          {kindLabel}
+        </span>
+        {expanded ? (
+          <span className="flex-1" />
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-ui">
+            <span className="font-medium">{title}</span>
+            {preview && <span className="text-muted-foreground"> — {preview}</span>}
+          </span>
+        )}
+        <span className="min-w-8 shrink-0 text-right text-sm text-muted-foreground">
+          {/* Server timestamps are epoch seconds; relativeTime takes ms. */}
+          {relativeTime(at * 1000)}
+        </span>
+        {unread ? (
+          <span
+            role="img"
+            aria-label="Unread"
+            className="size-1.5 shrink-0 rounded-full bg-foreground"
+          />
+        ) : (
+          <span aria-hidden className="w-1.5 shrink-0" />
+        )}
+      </button>
+      {expanded && <div className="flex flex-col gap-3 pr-4 pb-4 pl-[58px]">{children}</div>}
     </div>
   );
+}
+
+function KindTile({ icon: Icon, tone }: { icon: LucideIcon; tone: keyof typeof TILE_TONES }) {
+  return (
+    <span className={cn("flex size-8 items-center justify-center rounded-lg", TILE_TONES[tone])}>
+      <Icon aria-hidden className="size-4" />
+    </span>
+  );
+}
+
+/** The expanded card's "which session" line. */
+function SessionLine({ title, detail }: { title: string; detail?: string }) {
+  return (
+    <p className="flex items-center gap-1.5 text-sm text-muted-foreground">
+      <SquarePenIcon aria-hidden className="size-3 shrink-0" />
+      <span className="truncate">{title}</span>
+      {detail && <span className="shrink-0">· {detail}</span>}
+    </p>
+  );
+}
+
+function InboxActions({ children }: { children: ReactNode }) {
+  return <div className="flex items-center justify-end gap-1 pt-0.5">{children}</div>;
 }
