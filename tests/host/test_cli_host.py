@@ -331,6 +331,10 @@ def test_host_enable_subcommand_installs_user_service(
         return HostService(kind="systemd_user", path=service_path, label=service_path.name)
 
     monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
+    monkeypatch.setenv("OMNIGENT_INDEX_URL", "https://packages.example.com/simple")
+    monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "tools"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_BIN_HOME", str(tmp_path / "bin"))
     monkeypatch.setattr(
         "omnigent.cli._build_host_daemon_env",
         lambda *, server_url: {"HOME": str(tmp_path)},
@@ -340,8 +344,16 @@ def test_host_enable_subcommand_installs_user_service(
     result = CliRunner().invoke(cli, ["host", "enable", "--server", ""])
 
     assert result.exit_code == 0, result.output
-    assert captured == [(None, {"HOME": str(tmp_path)})]
+    assert len(captured) == 1
+    server, environment = captured[0]
+    assert server is None
+    assert environment["HOME"] == str(tmp_path)
+    assert environment["OMNIGENT_INDEX_URL"] == "https://packages.example.com/simple"
+    assert environment["UV_TOOL_DIR"] == str(tmp_path / "tools")
+    assert environment["XDG_DATA_HOME"] == str(tmp_path / "data")
+    assert environment["XDG_BIN_HOME"] == str(tmp_path / "bin")
     assert "Enabled the Omnigent host user service for local" in result.output
+    assert "between 3 and 6 a.m. local time" in result.output
 
 
 def test_host_disable_subcommand_removes_user_service(

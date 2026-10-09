@@ -10345,7 +10345,7 @@ def host_enable(
     server: str | None,
     non_interactive: bool,
 ) -> None:
-    """Install and start the host as a per-user system service.
+    """Install a host service with daily upgrades between 3 and 6 a.m. local time.
 
     :param ctx: Click context carrying group-level options.
     :param server: Optional server target; empty selects local mode.
@@ -10369,15 +10369,34 @@ def host_enable(
 
     from omnigent.host.service import HostServiceError, enable_user_host_service
 
+    environment = _build_host_daemon_env(server_url=resolved_server)
+    # The overnight updater must use the same package index and tool install.
+    for name in (
+        "OMNIGENT_INDEX_URL",
+        "UV_DEFAULT_INDEX",
+        "UV_INDEX_URL",
+        "UV_TOOL_DIR",
+        "UV_TOOL_BIN_DIR",
+        "XDG_DATA_HOME",
+        "XDG_BIN_HOME",
+        "PIP_INDEX_URL",
+        "PIP_CONFIG_FILE",
+        "PIPX_HOME",
+        "PIPX_BIN_DIR",
+    ):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+
     try:
         service = enable_user_host_service(
             resolved_server,
-            environment=_build_host_daemon_env(server_url=resolved_server),
+            environment=environment,
         )
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
 
     click.echo(f"Enabled the Omnigent host user service for {_host_display_url(target)}.")
+    click.echo("The service upgrades and restarts daily between 3 and 6 a.m. local time.")
     click.echo(f"Service definition: {_display_path(service.path)}")
     if service.log_path is not None:
         click.echo(f"Service output: {_display_path(service.log_path)}")

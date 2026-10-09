@@ -378,6 +378,32 @@ To suppress the automatic browser tab, use `omni host --no-open` or set
 --background` and `omni start`. Sign-in may still open a browser; use
 `--non-interactive` in scripts to fail if sign-in is required.
 
+For a persistent host on macOS or Linux, enable the per-user service:
+
+```bash
+omni host enable                         # uses your configured server, or local mode
+omni host enable --server https://your-server.example.com
+omni host status
+```
+
+The service's supervisor stops the host, runs `omni upgrade --force`, and
+restarts the host daily at
+**4 a.m. in the host machine's local timezone** (within the 3–6 a.m. maintenance
+window). If the machine wakes after 4 a.m., it catches up before 6 a.m.
+Restarting loads the updated package and refreshes the version reported to the
+server. Active sessions may be interrupted
+during this scheduled restart. If the machine sleeps through the window, it
+waits until the next day; restarting the service does not repeat that day's
+upgrade attempt.
+
+Automatic upgrades use the existing install's package index, extras, and release
+source through `omni upgrade` (supported for `uv tool` and `pipx` installs).
+Source checkouts and installs that require manual upgrades keep that requirement.
+Upgrade failures are logged, and the supervisor attempts to restart the installed
+host. View service output with `journalctl --user -u omnigent-host.service` on
+Linux, or at the log path printed by `host enable` on macOS. Use `omni host
+disable` to stop and remove the service.
+
 A session can also start itself: the **Automations** page runs an agent on a
 recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)
 for the schedule format, the REST API, and the current limits.

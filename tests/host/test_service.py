@@ -216,14 +216,39 @@ def test_host_service_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPat
 
 
 def test_service_entry_maps_fatal_host_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.cli import cli
     from omnigent.host import HOST_FATAL_EXIT_CODE, service_entry
 
     monkeypatch.setattr(sys, "argv", ["service-entry", "--local"])
 
-    def _fatal(**kwargs: object) -> None:
-        raise SystemExit(HOST_FATAL_EXIT_CODE)
+    def _fatal(_server: str) -> int:
+        return HOST_FATAL_EXIT_CODE
 
-    monkeypatch.setattr(cli, "main", _fatal)
+    monkeypatch.setattr(service_entry, "run_supervisor", _fatal)
 
     assert service_entry.main() == 0
+
+
+@pytest.mark.parametrize("exit_code", [130, 143])
+def test_service_entry_maps_deliberate_signal_exit(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    from omnigent.host import service_entry
+
+    monkeypatch.setattr(sys, "argv", ["service-entry", "--local"])
+    monkeypatch.setattr(service_entry, "run_supervisor", lambda _server: exit_code)
+
+    assert service_entry.main() == 0
+
+
+def test_service_entry_delegates_server_and_local_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.host import service_entry
+
+    calls: list[str] = []
+    monkeypatch.setattr(service_entry, "run_supervisor", lambda server: calls.append(server) or 0)
+
+    monkeypatch.setattr(sys, "argv", ["service-entry", "--server", "https://example.com"])
+    assert service_entry.main() == 0
+    monkeypatch.setattr(sys, "argv", ["service-entry", "--local"])
+    assert service_entry.main() == 0
+
+    assert calls == ["https://example.com", ""]
