@@ -2273,6 +2273,7 @@ def build_hook_settings(
     }
     hooks: dict[str, list[_JsonObject]] = {
         "SessionStart": [{"hooks": [session_start_hook]}],
+        "ConfigChange": [{"matcher": "skills", "hooks": [hook]}],
         "SessionEnd": [{"hooks": [hook]}],
         "Stop": [{"hooks": [hook]}],
         "StopFailure": [{"hooks": [hook]}],

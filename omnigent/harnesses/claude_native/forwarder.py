@@ -3960,6 +3960,10 @@ async def _forward_available_status_events(
             await _write_hook_state_async(bridge_dir, durable)
             continue
         if status is None:
+            if record.event_name == "ConfigChange" and record.source == "skills":
+                from omnigent.harnesses.skill_refresh import refresh_host_skills
+
+                await refresh_host_skills(client, session_id)
             if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
                 record, parent_claude_session_ids=parent_claude_session_ids
             ):

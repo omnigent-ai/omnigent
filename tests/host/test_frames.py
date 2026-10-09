@@ -171,6 +171,7 @@ def test_import_local_frames_round_trip() -> None:
     "frame",
     [
         HostSkillsFrame(request_id="req_skills", harness="claude-native", path="~/my project"),
+        HostSkillsFrame(request_id="refresh", harness="codex-native", path="/work", refresh=True),
         HostSkillsFrame(
             request_id="filtered", harness="claude-sdk", path="/repo", skills_filter=["review"]
         ),

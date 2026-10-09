@@ -1020,6 +1020,7 @@ class HostSkillsFrame:
     agent_version: str | None = None
     sub_agent_name: str | None = None
     skills_filter: str | list[str] = "all"
+    refresh: bool = False
 
 
 @dataclass
@@ -1693,6 +1694,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_version": frame.agent_version,
                 "sub_agent_name": frame.sub_agent_name,
                 "skills_filter": frame.skills_filter,
+                "refresh": frame.refresh,
             }
         )
     if isinstance(frame, HostSkillsResultFrame):
@@ -2147,6 +2149,9 @@ def _decode_known_host_frame(
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
         case HostFrameKind.SKILLS:
+            refresh = msg.get("refresh", False)
+            if not isinstance(refresh, bool):
+                raise ValueError("refresh must be a boolean")
             raw_filter = msg.get("skills_filter", "all")
             skills_filter: str | list[str]
             if isinstance(raw_filter, list):
@@ -2164,6 +2169,7 @@ def _decode_known_host_frame(
                 agent_version=_optional_nullable_str(msg, "agent_version"),
                 sub_agent_name=_optional_nullable_str(msg, "sub_agent_name"),
                 skills_filter=skills_filter,
+                refresh=refresh,
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)
