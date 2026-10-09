@@ -145,22 +145,6 @@ class _AgentContentsAlways503Client:
         return _Error503Response()
 
 
-@pytest.fixture(autouse=True)
-def _stub_harness_cli_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Report every harness CLI as installed for dispatch preflights.
-
-    The dispatched harness's CLI may be absent in CI; without this stub the
-    transient-recovery turn would fail at the preflight instead of proving
-    the spec-fetch behavior under test.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    monkeypatch.setattr(
-        "omnigent.onboarding.harness_install.missing_harness_cli",
-        lambda harness: None,
-    )
-
-
 class _FakeHarnessStream:
     """Empty SSE stream so a dispatched background turn completes at once."""
 
