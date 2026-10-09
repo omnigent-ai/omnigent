@@ -704,6 +704,44 @@ async def test_executor_delivery_evidence_survives_without_an_error_code(
         await adapter.on_shutdown()
 
 
+@pytest.mark.asyncio
+async def test_undelivered_executor_error_classifies_by_its_sdk_cause() -> None:
+    """An uncoded undelivered failure still classifies by the SDK exception it carries."""
+    import asyncio
+
+    import openai
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    rate = openai.RateLimitError(
+        "Selected model is at capacity. Please try a different model.",
+        response=httpx.Response(429, request=request),
+        body=None,
+    )
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message=f"SDK error: {rate}", undelivered=True, exception=rate)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_undelivered_429", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        assert raised.value.__cause__ is rate
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.code == "rate_limit_exceeded"
+        assert detail.undelivered is True
+        assert "Selected model is at capacity" in detail.message
+    finally:
+        await adapter.on_shutdown()
+
+
 def test_build_error_detail_uses_omnigent_error_code() -> None:
     """
     :class:`OmnigentError` (and its

@@ -1185,7 +1185,9 @@ class ExecutorAdapter(HarnessApp):
             )
         if isinstance(exception, InnerExecutorError):
             if not exception.code:
-                detail = self._build_error_detail(RuntimeError(str(exception)))
+                uncoded = RuntimeError(str(exception))
+                uncoded.__cause__ = exception.__cause__
+                detail = self._build_error_detail(uncoded)
                 return detail.model_copy(
                     update={"undelivered": True if exception.undelivered else None}
                 )
@@ -1304,9 +1306,11 @@ def _classify_anthropic_exception(exception: BaseException) -> str | None:
 
 
 def classify_inner_exception(exception: BaseException) -> str | None:
-    """Classify the exception and its explicit causes, returning the first SDK match.
+    """Classify the exception and its explicit causes; the first SDK match wins.
 
-    Unrecognized or cyclic chains return None. Keep specific classifiers first."""
+    Walks ``__cause__`` so a wrapper raised ``from`` an SDK error classifies by that
+    error. Unrecognized or cyclic chains return ``None``. Keep specific classifiers first.
+    """
     from omnigent.llms.errors import is_context_length_exceeded
 
     seen: set[int] = set()
