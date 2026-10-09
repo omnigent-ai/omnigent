@@ -704,24 +704,25 @@ async def test_executor_delivery_evidence_survives_without_an_error_code(
         await adapter.on_shutdown()
 
 
+def _rate_limit_error(message: str) -> Exception:
+    """Build the ``openai.RateLimitError`` the SDK raises for an HTTP 429."""
+    import openai
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    return openai.RateLimitError(message, response=httpx.Response(429, request=request), body=None)
+
+
 @pytest.mark.asyncio
 async def test_undelivered_executor_error_classifies_by_its_sdk_cause() -> None:
     """An uncoded undelivered failure still classifies by the SDK exception it carries."""
     import asyncio
-
-    import openai
 
     from omnigent.inner.executor import ExecutorError, MockExecutor
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
-    rate = openai.RateLimitError(
-        "Selected model is at capacity. Please try a different model.",
-        response=httpx.Response(429, request=request),
-        body=None,
-    )
+    rate = _rate_limit_error("Selected model is at capacity. Please try a different model.")
     executor = MockExecutor()
     executor.enqueue_events(
         [ExecutorError(message=f"SDK error: {rate}", undelivered=True, exception=rate)]
@@ -1190,18 +1191,11 @@ def test_classify_inner_exception_walks_cause_chain() -> None:
     unclassified ``code="RuntimeError"`` — the upstream capacity outage
     gets attributed to Omnigent and the retry allowlist never matches.
     """
-    import openai
-
     from omnigent.runtime.harnesses._executor_adapter import (
         classify_inner_exception,
     )
 
-    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
-    rate = openai.RateLimitError(
-        "Selected model is at capacity. Please try a different model.",
-        response=httpx.Response(429, request=request),
-        body=None,
-    )
+    rate = _rate_limit_error("Selected model is at capacity. Please try a different model.")
     wrapper = RuntimeError("inner executor error: OpenAI Agents SDK error: …")
     wrapper.__cause__ = rate
     assert classify_inner_exception(wrapper) == "rate_limit_exceeded"

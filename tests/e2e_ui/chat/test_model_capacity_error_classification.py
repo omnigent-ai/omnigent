@@ -5,8 +5,9 @@ capacity. Please try a different model.`` — an upstream model-serving
 throttle (HTTP 429), not an Omnigent defect. The failed turn has to keep that
 structured reason: the chat pill names the rate limit and the persisted
 ``error`` item carries ``rate_limit_exceeded``, so the failure is not counted
-as an unexplained Omnigent error. A harness that retries through the outage
-and completes the turn also satisfies the journey.
+as an unexplained Omnigent error. The mock endpoint refuses every call, so a
+turn that completes anyway means the scripted refusals ran out before the
+harness gave up; the test fails instead of skipping its assertions.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import time
 from typing import Any
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
@@ -26,7 +28,6 @@ _TRIGGER = "Summarize the release notes for me"
 # text; queue enough refusals that every attempt of this turn sees the outage.
 _CAPACITY_RESPONSES = 16
 _RATE_LIMIT_HEADLINE = "The model's rate limit was reached. You can retry this turn."
-_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _TURN_SETTLE_TIMEOUT_S = 90.0
 
 
@@ -98,8 +99,11 @@ def test_model_capacity_429_fails_turn_as_rate_limit(
 
     error = _settled_turn_error(base_url, session_id)
     if error is None:
-        expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=15_000)
-        return
+        pytest.fail(
+            "the turn completed instead of failing: the mock endpoint's "
+            f"{_CAPACITY_RESPONSES} scripted refusals ran out before the harness gave up; "
+            "raise _CAPACITY_RESPONSES"
+        )
 
     pill = page.get_by_test_id("error-pill").first
     expect(pill).to_be_visible(timeout=15_000)
@@ -113,11 +117,7 @@ def test_model_capacity_429_fails_turn_as_rate_limit(
     code = str(error.get("code") or "")
     message = str(error.get("message") or "")
     session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
-    print(
-        f"observed session={session_id} headline={headline.inner_text()!r} "
-        f"code={code!r} message={message!r} "
-        f"last_task_error={session.get('last_task_error')!r}"
-    )
+    last_task_error = session.get("last_task_error") or {}
 
     assert _CAPACITY_SIGNATURE in message, (
         f"the failed turn's error lost the upstream capacity reason; "
@@ -127,4 +127,7 @@ def test_model_capacity_429_fails_turn_as_rate_limit(
     assert code == "rate_limit_exceeded", (
         "a model-capacity 429 must fail the turn with the structured code "
         f"'rate_limit_exceeded'; got unclassified code={code!r}"
+    )
+    assert last_task_error.get("code") == "rate_limit_exceeded", (
+        f"the session's last_task_error lost the rate-limit code; got {last_task_error!r}"
     )
