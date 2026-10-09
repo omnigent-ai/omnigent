@@ -34,7 +34,7 @@ import {
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
-import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import { CHAT_COLUMN_WIDTH, COMPOSER_POPOVER_Z } from "./chatLayout";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -837,6 +837,7 @@ describe("Composer slash-command menu", () => {
     // Built-ins are inserted first, so "/compact" tops the list and is the
     // default highlight — the crux of the fix (was -1 / nothing selected).
     expect(activeRow()?.textContent).toContain("/compact");
+    expect(activeRow()?.closest(".absolute")).toHaveClass(COMPOSER_POPOVER_Z);
   });
 
   it("Tab completes the highlighted skill into the textarea", () => {
@@ -1230,6 +1231,84 @@ describe("Composer slash-command submit routing", () => {
 
     expect(onSendSlashCommand).not.toHaveBeenCalled();
     expect(onSend).toHaveBeenCalledWith("/not-a-real-skill", undefined);
+  });
+
+  it("floats /help output above the composer in a capped scroll panel", () => {
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("/help — Show available slash commands");
+    expect(output).toHaveTextContent("/deslop — Remove AI slop");
+    expect(output).toHaveClass("absolute", COMPOSER_POPOVER_Z, "overflow-y-auto");
+    expect(ta.value).toBe("");
+    expect(output.parentElement).toHaveAttribute("data-composer-card");
+  });
+
+  it("floats the bare /model hint in the popover band and clears the draft", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // Trailing space closes the slash menu so Enter submits (see /model tests).
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("Usage: /model <name> | default");
+    expect(output).toHaveClass("absolute", COMPOSER_POPOVER_Z);
+    expect(ta.value).toBe("");
+  });
+
+  it("floats /context output in the popover band and clears the draft", () => {
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/context" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("Items in context:");
+    expect(output).toHaveClass("absolute", COMPOSER_POPOVER_Z);
+    expect(ta.value).toBe("");
+  });
+
+  it("dismisses floating command output on Escape without stopping an in-flight turn", () => {
+    const onStop = vi.fn();
+    render(
+      <Composer {...composerProps({ onSendSlashCommand: vi.fn(), isWorking: true, onStop })} />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(screen.getByTestId("composer-command-output")).toBeInTheDocument();
+
+    // Escape dismisses the overlay and must not reach the turn-stop branch.
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(screen.queryByTestId("composer-command-output")).not.toBeInTheDocument();
+    expect(onStop).not.toHaveBeenCalled();
+
+    // With the overlay gone, Escape resumes interrupting the running turn.
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("dismisses floating command output when Escape fires inside the focused panel", () => {
+    const onStop = vi.fn();
+    render(
+      <Composer {...composerProps({ onSendSlashCommand: vi.fn(), isWorking: true, onStop })} />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    const panel = screen.getByTestId("composer-command-output");
+
+    // A keyboard user can focus the scrollable panel; Escape there dismisses it
+    // and returns focus to the composer without stopping the running turn.
+    panel.focus();
+    fireEvent.keyDown(panel, { key: "Escape" });
+    expect(screen.queryByTestId("composer-command-output")).not.toBeInTheDocument();
+    expect(onStop).not.toHaveBeenCalled();
+    expect(ta).toHaveFocus();
   });
 
   it("treats /effort as plaintext when effort controls are hidden", () => {
