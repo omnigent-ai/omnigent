@@ -84,7 +84,11 @@ def policy(monkeypatch, call_action=PolicyAction.ALLOW, result_action=PolicyActi
 
 
 @pytest.mark.parametrize("backend", ["default", "custom"], indirect=True)
-async def test_gateway_discovery_and_request_result_transforms(client, backend, monkeypatch):
+@pytest.mark.parametrize("upstream_error", [False, True])
+async def test_gateway_discovery_and_request_result_transforms(
+    client, backend, monkeypatch, upstream_error
+):
+    backend.call_tool.return_value.isError = upstream_error
     session_id = await selected_session(client)
     initialized = await rpc(client, session_id, "initialize", {})
     assert initialized.json()["result"]["serverInfo"]["name"] == "tracker"
@@ -92,7 +96,10 @@ async def test_gateway_discovery_and_request_result_transforms(client, backend, 
     assert [t["name"] for t in listed.json()["result"]["tools"]] == ["read_ticket"]
     seen = policy(monkeypatch)
     called = await rpc(client, session_id)
-    assert called.json()["result"]["content"][0]["text"] == "redacted ticket"
+    assert called.json()["result"] == {
+        "content": [{"type": "text", "text": "redacted ticket"}],
+        "isError": upstream_error,
+    }
     assert backend.call_tool.await_args.args[2:] == ("read_ticket", {"ticket_id": "approved"})
     assert [ctx.phase for ctx in seen] == [Phase.TOOL_CALL, Phase.TOOL_RESULT]
     assert all(ctx.tool_name == "tracker__read_ticket" for ctx in seen)
