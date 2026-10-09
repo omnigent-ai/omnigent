@@ -3764,30 +3764,14 @@ def test_placeholder_recovery_requires_the_advertised_socket_on_this_host(
     assert state.conversation_id == "agy_conv_placeholder"
 
 
-def test_placeholder_recovery_refuses_a_foreign_cascade(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A typed cascade whose db is not in this session's Gemini dir is refused:
-    adopting a foreign agy's cascade would durably cross-bind the session."""
-    bridge_dir = _placeholder_bridge_dir(tmp_path)
-    # No conversation db is written: the scan answer came from a foreign agy.
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
-    monkeypatch.setattr(
-        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
-    )
-
-    assert reader._recover_placeholder_cascade(bridge_dir) is None
-    state = read_bridge_state(bridge_dir)
-    assert state is not None
-    assert state.conversation_id == "agy_conv_placeholder"
-
-
-def test_placeholder_recovery_reports_a_foreign_cascade_once(
+def test_placeholder_recovery_refuses_a_foreign_cascade_and_reports_it_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The same foreign candidate is refused on every scan but warned about once;
-    repeats within a discovery run log at DEBUG."""
+    """A typed cascade whose db is not in this session's Gemini dir is refused on
+    every scan (adopting a foreign agy's cascade would durably cross-bind the
+    session) but warned about once; repeats within a discovery run log at DEBUG."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
+    # No conversation db is written: the scan answer came from a foreign agy.
     monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
     monkeypatch.setattr(
         reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
@@ -3805,6 +3789,39 @@ def test_placeholder_recovery_reports_a_foreign_cascade_once(
     ]
     assert levels == ["WARNING", "DEBUG", "DEBUG"]
     assert scan_log.foreign_reported == {_CASCADE_ID}
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+
+def test_placeholder_recovery_retries_after_a_failed_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed ``GetAllCascadeTrajectories`` leaves the placeholder untouched and
+    the next round adopts the typed cascade."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    scans = 0
+
+    def _flaky_scan(_port: int) -> dict[str, Any]:
+        nonlocal scans
+        scans += 1
+        if scans == 1:
+            raise httpx.ConnectError("agy not answering yet")
+        return _typed_body(_CASCADE_ID)
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _flaky_scan)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+    assert reader._recover_placeholder_cascade(bridge_dir) == _CASCADE_ID
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
 
 
 def test_placeholder_recovery_noop_when_id_is_already_real(
