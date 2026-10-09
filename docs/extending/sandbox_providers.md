@@ -247,6 +247,16 @@ Once renewal stops, expiry suspends compute while retaining storage. Other
 providers have different lifetime behavior, so enabling managed sandboxes alone
 does not guarantee a short shutdown time.
 
+Managed refreshes are submitted to a small bounded worker pool and are
+single-flight per runner, so one slow provider request does not serialize the
+refreshes for unrelated active runners. The server records the runner, host,
+provider, queue delay, provider duration, and a bounded outcome for each
+provider attempt in the `managed_keepalive` diagnostic event. A live runner
+tunnel remains the only signal that permits these refreshes; this does not
+change idle or provider lifetime policy. If all eight workers are blocked in
+provider calls, later refreshes can remain queued until capacity returns; the
+pool does not promise refresh completion under that failure mode.
+
 `sandbox.reaper` is deployment-wide: configure it next to `provider` or
 `providers`, never inside one provider entry. One configurable loop covers every
 configured provider and dispatches termination through the provider recorded on
