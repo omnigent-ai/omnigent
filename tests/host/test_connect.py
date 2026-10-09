@@ -8176,6 +8176,12 @@ async def test_handle_import_local_recovered_skip_logs_below_error(
     assert [r.levelno for r in skip_records] == [logging.WARNING, logging.DEBUG], caplog.text
     diagnostic, traceback_record = skip_records
     assert f"({type(error).__name__}: {error})" in diagnostic.getMessage()
+    assert getattr(diagnostic, "event_name", None) == "import_local_session_skipped"
+    assert getattr(diagnostic, "attributes", None) == {
+        "source": "claude",
+        "error_category": "unknown",
+        "error_impact": "benign",
+    }
     assert traceback_record.exc_info is not None and traceback_record.exc_info[1] is error
 
 
