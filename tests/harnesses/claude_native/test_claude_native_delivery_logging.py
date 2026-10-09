@@ -10,6 +10,7 @@ import pytest
 
 from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
+from omnigent.native.input_diagnostics import input_delivery_scope
 
 
 @pytest.mark.parametrize(
@@ -118,6 +119,15 @@ def test_delivery_diagnostics(
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
         current_session_id_scope(None if scenario == "session_fallback" else "child-session"),
+        input_delivery_scope(
+            {
+                "input_stable_id": "a" * 32,
+                "pending_id": "pending_" + "b" * 32,
+                "delivery_attempt_id": "c" * 32,
+                "input_enqueued_at_ms": 12345,
+            },
+            response_id="resp_delivery",
+        ),
     ):
         if outcome == "returned":
             bridge.inject_user_message(tmp_path, content=content)
@@ -137,6 +147,14 @@ def test_delivery_diagnostics(
     attrs = record.attributes
     assert attrs["verification"] == verification
     assert attrs["outcome"] == outcome
+    assert attrs["input_stable_id"] == "a" * 32
+    assert attrs["pending_id"] == "pending_" + "b" * 32
+    assert attrs["delivery_attempt_id"] == "c" * 32
+    assert attrs["input_enqueued_at_ms"] == 12345
+    assert attrs["response_id"] == "resp_delivery"
+    assert attrs["delivery_outcome"] == (
+        "draft_cleared" if outcome == "returned" and verification == "draft_absent" else "unknown"
+    )
     assert record.levelname == (
         "INFO" if verification == "draft_absent" and outcome == "returned" else "WARNING"
     )

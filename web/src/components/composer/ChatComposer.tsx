@@ -12,7 +12,11 @@ import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { isComposerSendKey, isComposerSteerAllKey } from "@/lib/composerSendShortcutPreferences";
+import {
+  isComposerAltNewlineKey,
+  isComposerSendKey,
+  isComposerSteerAllKey,
+} from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
@@ -227,6 +231,19 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
   }, [barRef]);
 }
 
+/**
+ * Insert a line break at the caret as typed input, so onChange sees it. The
+ * ``insertText`` command also keeps it on the undo stack; the fallback covers
+ * environments without it.
+ */
+function insertLineBreak(textarea: HTMLTextAreaElement) {
+  const inserted =
+    typeof document.execCommand === "function" && document.execCommand("insertText", false, "\n");
+  if (inserted) return;
+  textarea.setRangeText("\n", textarea.selectionStart, textarea.selectionEnd, "end");
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 export function ComposerTextInput({
   input,
   keyboard,
@@ -235,6 +252,12 @@ export function ComposerTextInput({
     <ComposerTextarea
       {...input}
       onKeyDown={(event) => {
+        // A newline in every mode and on touch devices; completion menus never see it.
+        if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
+          event.preventDefault();
+          insertLineBreak(event.currentTarget);
+          return;
+        }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
         const shouldSubmitFromKeyboard = isComposerSendKey(
           { ...event, isComposing: event.nativeEvent.isComposing },

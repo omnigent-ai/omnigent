@@ -62,11 +62,16 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
 }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof workspaceChangedFiles>();
+  return { ...actual, useSessionActive: vi.fn() };
+});
 
 import * as permissions from "@/hooks/usePermissions";
 import * as syncHook from "./useMarkdownEditorSync";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
+import * as workspaceChangedFiles from "@/hooks/useWorkspaceChangedFiles";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -96,10 +101,12 @@ function setupReadOnlyHooks() {
     mutateAsync: vi.fn(),
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
+  vi.mocked(workspaceChangedFiles.useSessionActive).mockReturnValue(false);
 }
 
 function setupEditHooks(
   syncOverrides: Partial<ReturnType<typeof syncHook.useMarkdownEditorSync>> = {},
+  sessionActive = false,
 ) {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
   vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue(makeSyncResult(syncOverrides));
@@ -110,6 +117,7 @@ function setupEditHooks(
     mutateAsync: vi.fn(),
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
+  vi.mocked(workspaceChangedFiles.useSessionActive).mockReturnValue(sessionActive);
 }
 
 function renderViewer(content: string, truncated = false) {
@@ -280,6 +288,59 @@ describe("MarkdownRichTextViewer dirty banners", () => {
     expect(screen.queryByText(/modified externally/)).toBeNull();
     expect(screen.queryByText(/Runner offline/)).toBeNull();
     expect(screen.queryByText(/commenting is available once saved/)).toBeNull();
+  });
+});
+
+// ── Agent-running warning ─────────────────────────────────────────────────────
+
+describe("MarkdownRichTextViewer agent-running warning", () => {
+  it("shows the warning when the session is active and the editor is clean", () => {
+    // Agent turn in flight + editable + not yet dirty → warn before the user edits.
+    setupEditHooks({ isDirty: false, hasExternalUpdate: false }, true);
+    renderViewer("content");
+    expect(screen.getByText(/Omnigent is still working/)).toBeDefined();
+  });
+
+  it("hides the warning when the session is idle", () => {
+    // Turn finished — no need to warn any longer.
+    setupEditHooks({ isDirty: false, hasExternalUpdate: false }, false);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+  });
+
+  it("hides the warning in read-only mode even when session is active", () => {
+    // Read-only viewers can't edit, so the warning is irrelevant.
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue(makeSyncResult());
+    vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
+      isPending: false,
+      isError: false,
+      reset: vi.fn(),
+      mutateAsync: vi.fn(),
+    } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
+    vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(undefined);
+    vi.mocked(workspaceChangedFiles.useSessionActive).mockReturnValue(true);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+  });
+
+  it("hides the warning once the user starts editing (isDirty=true)", () => {
+    // User has already started editing — don't stack a pre-edit warning on top
+    // of the unsaved-changes banner.
+    setupEditHooks({ isDirty: true, hasExternalUpdate: false }, true);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+    // The normal dirty banner is still visible instead.
+    expect(screen.getByText(/commenting is available once saved/)).toBeDefined();
+  });
+
+  it("hides the warning when a conflict banner has taken over", () => {
+    // Conflict banner takes priority — both would be at the same position,
+    // so only the conflict (more actionable) should show.
+    setupEditHooks({ isDirty: true, hasExternalUpdate: true }, true);
+    renderViewer("content");
+    expect(screen.queryByText(/Omnigent is still working/)).toBeNull();
+    expect(screen.getByText(/modified externally/)).toBeDefined();
   });
 });
 

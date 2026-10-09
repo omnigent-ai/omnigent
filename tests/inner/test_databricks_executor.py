@@ -1,6 +1,7 @@
 """Tests for DatabricksExecutor with a mock OpenAI client."""
 
 import asyncio
+import datetime as dt
 import json
 import sys
 import threading
@@ -1895,6 +1896,155 @@ def test_profile_cli_auth_config_caches_until_token_nears_expiry(
     assert cfg.authenticate() == {"Authorization": "Bearer token-1"}
     assert cfg.authenticate() == {"Authorization": "Bearer token-2"}
     assert calls == 2
+
+
+_CLI_NOW = dt.datetime(2026, 10, 8, 12, 0, tzinfo=dt.UTC).timestamp()
+
+
+def _cli_expiry(timestamp: float) -> str:
+    """Format *timestamp* like the Databricks CLI's ``expiry``: RFC 3339, nanoseconds, ``Z``."""
+    return dt.datetime.fromtimestamp(timestamp, dt.UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
+
+
+def test_profile_cli_auth_config_refreshes_at_absolute_expiry_not_stale_expires_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI's ``expires_in`` stays at the original TTL, so it must not outlive ``expiry``.
+
+    A host that cached such a token for a day kept presenting an expired bearer.
+    """
+    from omnigent.inner import databricks_executor
+
+    clock = _CLI_NOW
+    calls = 0
+
+    def _run_databricks(args: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        payload = {
+            "access_token": f"token-{calls}",
+            "token_type": "Bearer",
+            "expiry": _cli_expiry(clock + 3600),
+            "expires_in": 86400,
+        }
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(databricks_executor.time, "time", lambda: clock)
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _run_databricks)
+
+    cfg = databricks_executor._DatabricksCliProfileAuthConfig(
+        profile="fresh",
+        host="https://example.databricks.com",
+    )
+
+    assert cfg.authenticate() == {"Authorization": "Bearer token-1"}
+    clock = _CLI_NOW + 1800
+    assert cfg.authenticate() == {"Authorization": "Bearer token-1"}
+    assert calls == 1
+    # Past the real expiry, expires_in alone would still call the token valid for ~23 h.
+    clock = _CLI_NOW + 3600 + 1
+    assert cfg.authenticate() == {"Authorization": "Bearer token-2"}
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_ttl"),
+    [
+        pytest.param(
+            {"expiry": _cli_expiry(_CLI_NOW + 3600), "expires_in": 86400},
+            3600.0,
+            id="absolute-expiry-beats-stale-expires-in",
+        ),
+        pytest.param(
+            {"expiry": _cli_expiry(_CLI_NOW + 86400), "expires_in": 600},
+            600.0,
+            id="shorter-expires-in-still-shortens",
+        ),
+        pytest.param({"expiry": _cli_expiry(_CLI_NOW + 3600)}, 3600.0, id="expiry-only"),
+        pytest.param({"expires_in": 100}, 100.0, id="expires-in-only"),
+        pytest.param({"expires_in": "100"}, 100.0, id="expires-in-only-numeric-string"),
+        pytest.param(
+            {"expiry": "not-a-timestamp", "expires_in": 100},
+            100.0,
+            id="unparseable-expiry-falls-back-to-expires-in",
+        ),
+        pytest.param(
+            {"expiry": _cli_expiry(_CLI_NOW + 3600), "expires_in": "soon"},
+            3600.0,
+            id="unparseable-expires-in-falls-back-to-expiry",
+        ),
+    ],
+)
+def test_cli_token_expires_at_uses_earliest_usable_expiry(
+    payload: dict[str, object], expected_ttl: float
+) -> None:
+    """``expiry`` wins over a stale ``expires_in``; either one alone is still honoured."""
+    from omnigent.inner import databricks_executor
+
+    expires_at = databricks_executor._databricks_cli_token_expires_at(payload, now=_CLI_NOW)
+
+    assert expires_at == pytest.approx(_CLI_NOW + expected_ttl, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"expiry": "not-a-timestamp"}, {"expires_in": "soon"}],
+    ids=["empty", "unparseable-expiry", "unparseable-expires-in"],
+)
+def test_cli_token_expires_at_defaults_without_a_usable_expiry(
+    payload: dict[str, object],
+) -> None:
+    """With neither field usable, the token is cached for the conservative default TTL."""
+    from omnigent.inner import databricks_executor
+
+    expires_at = databricks_executor._databricks_cli_token_expires_at(payload, now=_CLI_NOW)
+
+    assert expires_at == _CLI_NOW + databricks_executor._CLI_TOKEN_DEFAULT_TTL_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("expiry", "expected"),
+    [
+        pytest.param(
+            "2026-10-09T06:42:32.629044447Z",
+            dt.datetime(2026, 10, 9, 6, 42, 32, 629044, tzinfo=dt.UTC),
+            id="cli-nanoseconds-zulu",
+        ),
+        pytest.param(
+            "2026-10-09T06:42:32.5Z",
+            dt.datetime(2026, 10, 9, 6, 42, 32, 500000, tzinfo=dt.UTC),
+            id="trimmed-fraction",
+        ),
+        pytest.param(
+            "2026-10-09T06:42:32Z",
+            dt.datetime(2026, 10, 9, 6, 42, 32, tzinfo=dt.UTC),
+            id="whole-seconds",
+        ),
+        pytest.param(
+            "2026-10-08T23:42:32.629044447-07:00",
+            dt.datetime(2026, 10, 9, 6, 42, 32, 629044, tzinfo=dt.UTC),
+            id="non-utc-offset",
+        ),
+        pytest.param(
+            "2026-10-09T06:42:32",
+            dt.datetime(2026, 10, 9, 6, 42, 32, tzinfo=dt.UTC),
+            id="naive-is-utc",
+        ),
+    ],
+)
+def test_cli_token_expires_at_parses_cli_expiry_formats(
+    expiry: str, expected: dt.datetime
+) -> None:
+    """The CLI's nanosecond ``Z`` timestamps parse instead of silently hitting a fallback."""
+    from omnigent.inner import databricks_executor
+
+    # No expires_in, so a failed parse would surface as the default TTL, not the expiry.
+    expires_at = databricks_executor._databricks_cli_token_expires_at(
+        {"expiry": expiry}, now=_CLI_NOW
+    )
+
+    assert expires_at == pytest.approx(expected.timestamp(), abs=1e-6)
 
 
 def test_profile_cli_token_error_does_not_include_stdout_token(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,13 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import get_or_create_engine
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.entities import Agent, PagedList
+from omnigent.errors import StaleCursorError
+from omnigent.stores.agent_store import AgentStore
+from omnigent.stores.agent_store.sqlalchemy_store import (
+    _USER_AGENT_READ_CAP,
+    SqlAlchemyAgentStore,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -256,17 +263,27 @@ def test_update_increments_version(agent_store: SqlAlchemyAgentStore) -> None:
 
 
 def test_update_stamps_created_by_when_null(agent_store: SqlAlchemyAgentStore) -> None:
-    """update() claims an unowned agent on first authorized write."""
-    agent = agent_store.create(
-        agent_id="c0000000000000000000000000000001",
-        name="claimable",
-        bundle_location="ag_claim/h1",
+    """update() claims an unowned (legacy) user agent on first authorized write."""
+    agent = agent_store.create_user_agent(
+        "c0000000000000000000000000000001", "claimable", "ag_claim/h1", owner=None
     )
     assert agent.created_by is None
 
     updated = agent_store.update(agent.id, "ag_claim/h2", "alice@example.com")
     assert updated is not None
     assert updated.created_by == "alice@example.com"
+
+
+def test_update_never_gives_a_server_agent_an_owner(agent_store: SqlAlchemyAgentStore) -> None:
+    """The server listing requires created_by IS NULL, so an owner would hide it."""
+    agent = agent_store.create(
+        agent_id="c0000000000000000000000000000003", name="shared", bundle_location="ag_s/h1"
+    )
+
+    updated = agent_store.update(agent.id, "ag_s/h2", "alice@example.com")
+
+    assert updated is not None and updated.created_by is None
+    assert [a.id for a in agent_store.list().data] == [agent.id]
 
 
 def test_update_does_not_overwrite_existing_created_by(
@@ -569,3 +586,158 @@ def test_session_scoped_agent_resolves_to_root_split_db(tmp_path: Path) -> None:
     fetched = agent_store.get(created.agent.id)
     assert fetched is not None
     assert fetched.session_id == mint_id
+
+
+# ── User agents ─────────────────────────────────────────────────
+
+_OWNER = "alice@example.com"
+_SHA = "0" * 64
+
+
+@pytest.fixture()
+def clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each new row its own created_at so "newest first" is deterministic."""
+    ticks = iter(range(1_000, 100_000))
+    monkeypatch.setattr(
+        "omnigent.stores.agent_store.sqlalchemy_store.now_epoch", lambda: next(ticks)
+    )
+
+
+def _user_agent(
+    store: SqlAlchemyAgentStore,
+    name: str,
+    *,
+    owner: str | None = _OWNER,
+    copy_of: str | None = None,
+    location_prefix: str | None = None,
+) -> Agent:
+    """Insert a user agent; ``copy_of`` makes it a fork/switch copy sharing that blob."""
+    agent_id = uuid.uuid4().hex
+    prefix = copy_of or location_prefix or agent_id
+    return store.create_user_agent(agent_id, name, f"{prefix}/{_SHA}", owner=owner)
+
+
+def _names(page: PagedList[Agent]) -> list[str]:
+    return [agent.name for agent in page.data]
+
+
+def test_create_user_agent_is_owned_and_not_a_server_agent(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    agent = _user_agent(agent_store, "orion")
+
+    fetched = agent_store.get(agent.id)
+    assert fetched is not None
+    assert (fetched.created_by, fetched.session_id) == (_OWNER, None)
+    # Unused installs are tenant input: no ${VAR} expansion against the server env.
+    assert not fetched.operator_authored
+    # Server-agent reads never return user agents.
+    assert agent_store.get_by_name("orion") is None
+    assert agent_store.list().data == []
+    with pytest.raises(IntegrityError):
+        agent_store.create_user_agent(agent.id, "orion", agent.bundle_location, owner=_OWNER)
+
+
+def test_list_user_agents_is_newest_first_and_owner_only(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    first = _user_agent(agent_store, "first")
+    _user_agent(agent_store, "second")
+    _user_agent(agent_store, "bobs", owner="bob@example.com")
+    agent_store.create(uuid.uuid4().hex, "server-agent", "x/y")
+
+    page = agent_store.list_user_agents(_OWNER)
+
+    assert _names(page) == ["second", "first"]
+    assert (page.has_more, page.last_id) == (False, first.id)
+    assert _names(agent_store.list_user_agents("bob@example.com")) == ["bobs"]
+
+
+def test_list_user_agents_skips_copies_and_keeps_legacy_originals(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    orion = _user_agent(agent_store, "orion")
+    # A fork/switch copy stores the source's bundle_location verbatim.
+    _user_agent(agent_store, "orion (fork 1a2b)", copy_of=orion.id)
+    legacy = agent_store.create_user_agent(
+        "c4ac1f3bb01e4fd6a6e4b50b8b1f2f2a",
+        "atlas",
+        f"ag_c4ac1f3bb01e4fd6a6e4b50b8b1f2f2a/{_SHA}",
+        owner=_OWNER,
+    )
+
+    assert {a.id for a in agent_store.list_user_agents(_OWNER).data} == {orion.id, legacy.id}
+
+
+def test_list_user_agents_lists_every_original_by_id_even_when_names_repeat(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    """Nothing is hidden by name, so every agent stays manageable by its id."""
+    agent_store.create(uuid.uuid4().hex, "polly", "x/y")
+    uploaded = _user_agent(agent_store, "orion")
+    installed = _user_agent(agent_store, "orion")
+    edited_fork = _user_agent(agent_store, "orion (fork 1a2b)")
+    polly = _user_agent(agent_store, "polly")
+
+    assert [a.id for a in agent_store.list_user_agents(_OWNER).data] == [
+        polly.id,
+        edited_fork.id,
+        installed.id,
+        uploaded.id,
+    ]
+
+
+def test_list_user_agents_reads_a_bounded_window(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    orion = _user_agent(agent_store, "orion")
+    copies = [
+        _user_agent(agent_store, f"orion (fork {i})", copy_of=orion.id)
+        for i in range(_USER_AGENT_READ_CAP)
+    ]
+
+    # The 50 newest rows are all copies: nothing to show, but the cursor moves.
+    page = agent_store.list_user_agents(_OWNER)
+    assert (page.data, page.has_more, page.last_id) == ([], True, copies[0].id)
+
+    rest = agent_store.list_user_agents(_OWNER, after=page.last_id)
+    assert ([a.id for a in rest.data], rest.has_more) == ([orion.id], False)
+
+
+def test_list_user_agents_pages_by_limit(agent_store: SqlAlchemyAgentStore, clock: None) -> None:
+    for name in ("a", "b", "c"):
+        _user_agent(agent_store, name)
+
+    page = agent_store.list_user_agents(_OWNER, limit=2)
+    assert (_names(page), page.has_more) == (["c", "b"], True)
+    rest = agent_store.list_user_agents(_OWNER, limit=2, after=page.last_id)
+    assert (_names(rest), rest.has_more) == (["a"], False)
+
+
+def test_list_user_agents_rejects_a_vanished_or_foreign_cursor(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    bobs = _user_agent(agent_store, "bobs", owner="bob@example.com")
+    with pytest.raises(StaleCursorError):
+        agent_store.list_user_agents(_OWNER, after=uuid.uuid4().hex)
+    with pytest.raises(StaleCursorError):
+        agent_store.list_user_agents(_OWNER, after=bobs.id)
+
+
+def test_list_user_agents_without_auth_lists_unowned_rows(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    _user_agent(agent_store, "local-agent", owner=None)
+    assert _names(agent_store.list_user_agents(None)) == ["local-agent"]
+    assert agent_store.list_user_agents(_OWNER).data == []
+
+
+def test_agent_store_defaults_report_user_agents_unsupported(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A store that doesn't override the user-agent methods keeps working."""
+    assert agent_store.supports_user_agents is True
+    assert AgentStore.supports_user_agents.fget(agent_store) is False  # type: ignore[attr-defined]
+    assert AgentStore.list_user_agents(agent_store, _OWNER).data == []
+    with pytest.raises(NotImplementedError):
+        AgentStore.create_user_agent(agent_store, "x", "n", "x/y", owner=_OWNER)

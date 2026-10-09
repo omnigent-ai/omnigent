@@ -16,6 +16,7 @@ import { Input } from "@/components/ui/input";
 import { normalizeServerUrl } from "@/pages/onboarding/ServerSelectStep";
 import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
 import { ConnectStatus } from "@/pages/onboarding/primitives";
+import { ownServerName } from "@/lib/serverNames";
 
 /** Team name for a preset server URL: the host's first label, capitalized
  *  ("https://team.example.com/x" → "Team"). */
@@ -32,6 +33,7 @@ function displayUrl(url: string): string {
 export function LandingStep({
   managedServers,
   managedServerNames,
+  serverNames,
   recentServers,
   error,
   connection = null,
@@ -44,6 +46,8 @@ export function LandingStep({
   managedServers: string[];
   /** Display names for preset servers, server URL → name. */
   managedServerNames?: Record<string, string>;
+  /** Names servers gave themselves, origin → name. */
+  serverNames?: Record<string, string>;
   /** Recent non-preset servers, listed in the preset dropdown. */
   recentServers: string[];
   /** Connect error to show above the CTA (MDM landing only). */
@@ -79,6 +83,10 @@ export function LandingStep({
   const otherServers = [...managedServers.slice(1), ...recentServers];
   const nameOf = (url: string) =>
     managedServerNames && Object.hasOwn(managedServerNames, url) ? managedServerNames[url] : null;
+  const listedName = (url: string) => {
+    const own = ownServerName(serverNames, url);
+    return nameOf(url) ?? (own ? `${own} (${displayUrl(url)})` : displayUrl(url));
+  };
 
   return (
     <div className="flex flex-1 flex-col gap-2 px-2 pb-1">
@@ -140,7 +148,7 @@ export function LandingStep({
                   }
                 >
                   <span className="truncate" title={url}>
-                    {nameOf(url) ?? displayUrl(url)}
+                    {listedName(url)}
                   </span>
                 </DropdownMenuItem>
               ))}

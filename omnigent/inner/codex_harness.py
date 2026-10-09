@@ -20,7 +20,7 @@ Env vars read at startup:
   own default.
 - ``HARNESS_CODEX_GATEWAY``: ``"1"`` / ``"true"`` to route
   through a vendor-neutral gateway (base URL + bearer-token
-  command + model). The Databricks AI gateway (Codex Responses
+  command + model). The Databricks Unity Gateway (Codex Responses
   API at ``/ai-gateway/codex/v1``) is one producer of this
   transport; generic ``key`` / ``gateway`` providers are another.
   Otherwise the executor uses Codex's built-in API path.

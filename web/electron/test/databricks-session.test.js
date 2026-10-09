@@ -178,15 +178,39 @@ describe("Databricks session preparation", () => {
       { stored: [account], browser: 1 },
     ],
     [
+      "uses the stored credentials of the workspace an account URL reached before",
+      { origin: account, connect: { storedOrigin: ORIGIN } },
+      { resolves: ORIGIN, stored: [ORIGIN], browser: 0 },
+    ],
+    [
+      "signs in to an account URL whose workspace's credentials are unusable",
+      { origin: account, connect: { storedOrigin: ORIGIN }, stored: noToken },
+      { stored: [ORIGIN], browser: 1 },
+    ],
+    [
       "reports an unreachable workspace without opening the browser",
       { respond: (req) => req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED")) },
       { rejects: /ERR_NAME_NOT_RESOLVED/, stored: [ORIGIN], browser: 0 },
+    ],
+    [
+      "names the account URL's workspace when it is unreachable",
+      {
+        origin: account,
+        connect: { storedOrigin: ORIGIN },
+        respond: (req) => req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED")),
+      },
+      {
+        rejects: (error) => error.storedOrigin === ORIGIN,
+        stored: [ORIGIN],
+        browser: 0,
+      },
     ],
   ]) {
     it(`on connect, ${label}`, async () => {
       const h = harness(options);
       const connect = h.ensureDatabricksSession(h.ses, options.origin ?? ORIGIN, options.connect);
       if (expected.rejects) await assert.rejects(connect, expected.rejects);
+      else if (expected.resolves) assert.equal(await connect, expected.resolves);
       else await connect;
       assert.deepEqual(h.calls.storedOrigins, expected.stored);
       assert.equal(h.calls.browser, expected.browser);

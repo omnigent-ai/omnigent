@@ -134,7 +134,7 @@ export const SettingsHarnessesSection = () => {
       ) : (
         <>
           <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
-            <h1 className="text-2xl font-semibold">Harnesses</h1>
+            <h1 className="settings-page-title text-2xl font-semibold">Harnesses</h1>
             <HostSelect hosts={sortedHosts} selected={host} onSelect={setSelectedHostId} />
           </div>
           <div className="mb-6 flex items-center gap-2">
@@ -293,9 +293,11 @@ function HarnessStatusText({ status }: { status: ReturnType<typeof harnessStatus
     return <span className="text-xs text-green-600 dark:text-green-400">Configured</span>;
   }
   if (status.needsSetup) {
+    // Sentence case to match "Configured"; the picker keeps the shared lowercase badge.
+    const text = harnessWarningBadgeText(status.reason);
     return (
       <span className="text-xs text-amber-600 dark:text-amber-500">
-        {harnessWarningBadgeText(status.reason)}
+        {text.charAt(0).toUpperCase() + text.slice(1)}
       </span>
     );
   }
@@ -373,11 +375,15 @@ function HarnessCard({
     </>
   );
   const className =
-    "flex flex-col gap-2 rounded-[20px] border border-border bg-card p-4 transition-colors hover:border-foreground/20";
+    "flex flex-col gap-2 rounded-[20px] border border-border bg-card p-4 transition-colors";
   return status.ready ? (
     <Link
       to={`/settings/harnesses/${entry.harness}`}
-      className={className}
+      // Only cards that open a details page get the hover, so it reads as clickable.
+      className={cn(
+        className,
+        "hover:border-foreground/20 hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
+      )}
       data-testid={`harness-card-${entry.harness}`}
       componentId="settings.harnesses.open"
     >
@@ -410,7 +416,7 @@ function HarnessDetail({
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-2xl font-semibold">{entry.name}</h1>
+            <h1 className="settings-page-title truncate text-2xl font-semibold">{entry.name}</h1>
             <HarnessStatusText status={status} />
           </div>
         </div>
@@ -474,40 +480,94 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
   }
   const source = {
     env: `From OMNIGENT_${harness.replace(/-native$/, "").toUpperCase()}_PATH on ${host.name}.`,
-    config: `From harness.${harness}.command in ~/.omnigent/config.yaml.`,
+    config: `From harness.${harness} in ~/.omnigent/config.yaml on ${host.name}.`,
     default: `Default command on ${host.name}.`,
   }[data.command_source];
   return (
-    <div className="flex flex-col gap-6">
-      <section className="flex flex-col gap-2">
+    <section className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Path to binary
+          Startup configuration
         </h2>
+        <p className="text-xs text-muted-foreground">
+          {source} Read-only host defaults, not a running session's full command or environment.
+          Sessions and workspaces may override these.
+        </p>
+      </div>
+      <div className="flex flex-col gap-2">
+        <h3 className="text-ui font-medium">Command</h3>
         <code className="rounded-xl border border-border p-3 text-ui break-all">
           {data.resolved_path ?? data.command}
         </code>
-        <p className="text-xs text-muted-foreground">
-          {source}
-          {!data.resolved_path && " Executable not found."}
-        </p>
-      </section>
-      <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Startup arguments
-        </h2>
-        <p className="rounded-xl border border-border p-3 text-ui">
-          {data.arg_count === 0
-            ? "None configured"
-            : `${data.arg_count} configured argument${data.arg_count === 1 ? "" : "s"} (values hidden)`}
-        </p>
-        <p className="text-xs text-muted-foreground">
-          From harness.{harness}.args in ~/.omnigent/config.yaml.
-        </p>
-      </section>
-      <p className="text-xs text-muted-foreground">
-        Host defaults, read-only. A workspace's .omnigent/config.yaml can override these.
-      </p>
-    </div>
+        {!data.resolved_path && (
+          <p className="text-xs text-muted-foreground">Executable not found.</p>
+        )}
+      </div>
+      <div className="flex flex-col gap-2">
+        <h3 className="text-ui font-medium">Environment</h3>
+        {data.environment ? (
+          <>
+            {Object.keys(data.environment.variables).length > 0 ? (
+              <dl className="flex flex-col gap-2 rounded-xl border border-border p-3 text-ui">
+                {Object.entries(data.environment.variables).map(([name, value]) => (
+                  <div key={name} className="flex flex-wrap items-baseline gap-x-3">
+                    <dt className="font-mono break-all">{name}</dt>
+                    <dd>
+                      <code className="whitespace-pre-wrap break-all">{value || '""'}</code>
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            ) : (
+              <p className="rounded-xl border border-border p-3 text-ui">None configured</p>
+            )}
+            <p className="text-xs text-muted-foreground">
+              {data.environment.inherit
+                ? "Inherited values are not listed."
+                : "Inherited environment cleared."}
+            </p>
+            {data.environment.unset.length > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Removed before applying overrides: <code>{data.environment.unset.join(", ")}</code>.
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="text-ui text-muted-foreground">
+            {data.configured_args == null
+              ? `Update ${host.name} to see environment settings.`
+              : "Cannot separate environment values for this env wrapper. Command and arguments are shown unchanged."}
+          </p>
+        )}
+      </div>
+      <div className="flex flex-col gap-2">
+        <h3 className="text-ui font-medium">Arguments</h3>
+        {data.args == null ? (
+          <p className="rounded-xl border border-border p-3 text-ui">
+            {data.arg_count === 0
+              ? "None configured"
+              : `${data.arg_count} configured argument${data.arg_count === 1 ? "" : "s"}. Update ${host.name} to view values.`}
+          </p>
+        ) : (
+          <StartupArguments args={data.args} />
+        )}
+      </div>
+    </section>
+  );
+}
+
+function StartupArguments({ args }: { args: string[] }) {
+  if (args.length === 0)
+    return <p className="rounded-xl border border-border p-3 text-ui">None configured</p>;
+  return (
+    <ol className="flex list-decimal flex-col gap-1 rounded-xl border border-border py-3 pr-3 pl-9 text-ui">
+      {args.map((arg, index) => (
+        // eslint-disable-next-line react/no-array-index-key
+        <li key={index}>
+          <code className="whitespace-pre-wrap break-all">{arg || '""'}</code>
+        </li>
+      ))}
+    </ol>
   );
 }
 
@@ -523,10 +583,10 @@ function CredentialCard({ gateway }: { gateway: boolean }) {
           <KeyRoundIcon className="size-4 text-muted-foreground" />
         </span>
         <span className="flex min-w-0 flex-col">
-          <span className="text-ui font-medium">{gateway ? "AI Gateway" : "Signed in"}</span>
+          <span className="text-ui font-medium">{gateway ? "Unity Gateway" : "Signed in"}</span>
           <span className="text-xs text-muted-foreground">
             {gateway
-              ? "Managed credential via the Databricks AI Gateway"
+              ? "Managed credential via the Databricks Unity Gateway"
               : "Uses the harness's own login on this host"}
           </span>
         </span>
