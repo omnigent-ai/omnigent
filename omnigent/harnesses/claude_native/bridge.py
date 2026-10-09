@@ -51,6 +51,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
@@ -1771,23 +1772,101 @@ def prune_orphaned_bridge_dirs() -> int:
     return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
 
 
-def ensure_claude_workspace_trusted(workspace: Path) -> None:
+def claude_global_config_path(
+    cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """
+    Return Claude's global config path for its launch env and working directory.
+
+    Claude prefers an existing legacy ``.config.json`` in its config dir
+    (``$CLAUDE_CONFIG_DIR``, else ``~/.claude``), then ``.claude.json`` (or
+    ``.claude-custom-oauth.json`` with ``CLAUDE_CODE_CUSTOM_OAUTH_URL``) under
+    ``$CLAUDE_CONFIG_DIR``, else ``$HOME``. A relative ``CLAUDE_CONFIG_DIR`` is
+    relative to its working directory; an empty one moves only the legacy
+    lookup there.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+        ``None`` uses this process's environment.
+    :returns: The config file path, e.g. ``Path("/home/user/.claude.json")``.
+    """
+    env = os.environ if env is None else env
+    base = cwd if cwd is not None else Path.cwd()
+    # Claude builds these with ``path.join``: no ``~`` expansion, ``..`` removed
+    # lexically, and relative results resolved against its cwd.
+    home_value = env.get("HOME") or str(_account_home_dir())
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    # Claude NFC-normalizes the config dir for the legacy lookup only.
+    if config_dir is None:
+        legacy_dir = unicodedata.normalize("NFC", os.path.join(home_value, ".claude"))
+        legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
+    elif not config_dir:
+        legacy_path = base / ".config.json"
+    else:
+        legacy_dir = unicodedata.normalize("NFC", config_dir)
+        legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
+    if legacy_path.exists():
+        return legacy_path
+    suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
+    return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
+
+
+def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
+    """
+    Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
+
+    ``path.join`` removes ``.`` and ``..`` lexically, without following
+    symlinks, before the filesystem resolves a relative result against
+    Claude's working directory.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+    :param directory: The joined directory value, e.g. ``"x/../cfg"``.
+    :param name: The config file name, e.g. ``".claude.json"``.
+    :returns: The file path, e.g. ``Path("/home/user/repo/cfg/.claude.json")``.
+    """
+    joined = os.path.normpath(os.path.join(directory, name))
+    return Path(joined) if os.path.isabs(joined) else cwd / joined
+
+
+def _account_home_dir() -> Path:
+    """
+    Return the account's home directory, as Claude's runtime does without ``HOME``.
+
+    Claude Code's runtime ignores an unset or empty ``HOME`` and reads the
+    password database, so the runner's own ``HOME`` is not a substitute.
+
+    :returns: The passwd home directory, e.g. ``Path("/home/user")``, or
+        :meth:`Path.home` where no password database exists.
+    """
+    try:
+        import pwd  # noqa: FlagLocalImports - POSIX-only module
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return Path.home()
+
+
+def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
     """
     Pre-accept Claude Code's first-run trust + onboarding prompts.
 
     Claude Code blocks on two TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
-    top-level ``hasCompletedOnboarding`` key in ``~/.claude.json``, and a
+    top-level ``hasCompletedOnboarding`` key in its global config
+    (:func:`claude_global_config_path`, usually ``~/.claude.json``), and a
     per-directory "Do you trust the files in this folder?" dialog gated
     by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
-    therefore untrusted — directory on every session.
+    therefore untrusted — directory on every session, and for sessions
+    rooted at the home directory, whose interactively accepted trust
+    Claude keeps for that session only.
 
     Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other ``~/.claude.json`` state (the
+    those two keys are written; all other global config state (the
     user's own onboarding choices, project history, MCP config, OAuth
     account) is preserved, and the file is left untouched when both keys
     are already set. This deliberately does NOT skip per-tool permission
@@ -1805,17 +1884,31 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     :param workspace: The runner workspace Claude will launch in, e.g.
         ``Path("/home/user/repo-worktrees/feature-x")``. Resolved to an
         absolute path to match Claude's ``projects`` key convention.
+    :param env: Environment the Claude terminal is launched with, used to
+        find the config file Claude will load. ``None`` uses this process's
+        environment.
     :returns: None.
-    :raises ValueError: If an existing ``~/.claude.json`` (or its
-        ``projects`` map / target project entry) is not a JSON object.
+    :raises ValueError: If the existing global config is not a regular
+        file or is a broken or looping symlink, or it (or its ``projects`` map /
+        target project entry) is not a JSON object. A symlinked config is
+        updated at its target.
         Surfaced rather than silently overwritten so a corrupt or
         unexpected user config is never clobbered (fail loud).
-    :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is
+    :raises json.JSONDecodeError: If the existing global config is
         not valid JSON, for the same reason.
     """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_path = (Path(config_dir).expanduser() if config_dir else Path.home()) / ".claude.json"
+    config_path = claude_global_config_path(workspace, env)
+    if config_path.is_symlink():
+        # Keep a symlinked (e.g. dotfile-managed) config; update its target.
+        try:
+            config_path = config_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"{config_path} is a broken or looping symlink; refusing to overwrite."
+            ) from exc
     if config_path.exists():
+        if not config_path.is_file():
+            raise ValueError(f"{config_path} is not a regular file; refusing to overwrite.")
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError(f"{config_path} is not a JSON object; refusing to overwrite.")
@@ -1856,7 +1949,7 @@ def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
 
     Unlike :func:`_write_json_file` (which targets the owner-only bridge
     tree under ``/tmp`` and enforces secure-directory ownership on the
-    parent), this writes the user's own ``~/.claude.json`` in their home
+    parent), this writes the user's own Claude global config in their home
     directory: it must not re-permission the home directory, but it does
     pin the result to owner-only ``0o600`` because the file holds the
     Claude OAuth account block.

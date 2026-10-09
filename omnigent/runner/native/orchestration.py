@@ -21,7 +21,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
@@ -64,6 +64,8 @@ from omnigent.errors import (
     OmnigentError,
 )
 from omnigent.harness_plugins import native_provider_for_key
+from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -7491,6 +7493,86 @@ def _claude_terminal_env_unset(
     return env_unset
 
 
+def _claude_terminal_launch_cwd(spec: TerminalEnvSpec, parent_os_env: OSEnvSpec | None) -> Path:
+    """
+    Return the directory the native Claude terminal pane starts in.
+
+    Resolves the spec's os_env the same way terminal creation does for this
+    launch, which passes no cwd or sandbox override and does not fork, then
+    applies an ``env -C``/``--chdir`` wrapper the way ``chdir(2)`` does.
+
+    :param spec: The Claude terminal launch spec.
+    :param parent_os_env: The agent's os_env the terminal inherits from, or
+        ``None``.
+    :returns: The resolved Claude cwd, e.g. ``Path("/home/user/repo")``.
+    :raises OmnigentError: If an ``env --chdir`` target is not an existing
+        directory the runner can enter; the real ``env`` would refuse to
+        launch, and seeding must not create it.
+    """
+    effective = build_terminal_os_env_spec(spec, parent_os_env_spec=parent_os_env)
+    cwd = Path(effective.cwd or os.getcwd()).resolve()
+    chdir = env_wrapper_chdir(
+        spec.command or "", list(spec.args), _claude_terminal_pre_wrapper_env(spec)
+    )
+    if chdir is None:
+        return cwd
+    target = (cwd / chdir).resolve()
+    # ``env`` refuses an empty, missing, or unsearchable target, so the launch would fail.
+    if not chdir or not target.is_dir() or not os.access(target, os.X_OK):
+        raise OmnigentError(
+            "The Claude terminal's env --chdir directory does not exist or cannot be entered.",
+            code=ErrorCode.WORKSPACE_MISSING,
+        )
+    return target
+
+
+def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
+    """
+    Return the environment a Claude launch command starts with.
+
+    The pane environment the terminal builds (runner environment when
+    inherited, the spec's overrides and removals, runner-auth secrets removed,
+    and a UTF-8 locale default) before an ``env`` wrapper applies its own
+    changes; ``env -S`` expands ``${NAME}`` from it.
+
+    :param spec: The Claude terminal launch spec.
+    :returns: The pre-wrapper environment, e.g. ``{"HOME": "/home/user"}``.
+    """
+    return terminal_pane_environment(
+        inherit_env=spec.inherit_env, env=spec.env, env_unset=spec.env_unset
+    )
+
+
+def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
+    """
+    Return the environment the native Claude terminal process starts with.
+
+    Mirrors the pane launch: the runner environment (when inherited), the
+    spec's overrides and removals, then the options and assignments of an
+    ``env`` wrapper command. Trust seeding uses it so the runner writes the
+    global config file this Claude process will read.
+
+    :param spec: The Claude terminal launch spec, e.g. one with
+        ``command="env"`` and ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
+    :returns: The effective environment, e.g.
+        ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
+    """
+    env = _claude_terminal_pre_wrapper_env(spec)
+    wrapper = env_wrapper_environment(spec.command or "", list(spec.args), env)
+    if wrapper is None and Path(spec.command or "").name == "env":
+        _logger.info(
+            "Claude terminal env wrapper form is not modeled; trust seeding uses the "
+            "pre-wrapper environment"
+        )
+    if wrapper is not None:
+        if not wrapper.inherit:
+            env = {}
+        for key in wrapper.unset:
+            env.pop(key, None)
+        env.update(wrapper.variables)
+    return env
+
+
 def _publish_terminal_pending(
     publish_event: Callable[[str, _JsonObject], None],
     session_id: str,
@@ -8308,13 +8390,6 @@ async def _auto_create_claude_terminal(
         session_id,
         extra={"session_id": session_id},
     )
-    # Pre-accept Claude's first-run trust + onboarding TUI prompts for this
-    # workspace. They have no PermissionRequest hook, so on a host-spawned
-    # (web-UI-driven) session they would hang Claude in its terminal with
-    # nothing shown in the UI. Acute with per-session worktrees,
-    # which launch Claude in a brand-new, untrusted directory.
-    ensure_claude_workspace_trusted(Path(workspace))
-
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     # The Omnigent server URL + auth are needed in two places below: the
@@ -8941,6 +9016,37 @@ async def _auto_create_claude_terminal(
         # the watcher reports the exit deterministically via `#{pane_dead}`.
         keep_alive_after_exit=True,
     )
+    # Seed trust and onboarding in the config selected by the terminal's launch environment.
+    try:
+        ensure_claude_workspace_trusted(
+            _claude_terminal_launch_cwd(env_spec, agent_os_env),
+            env=_claude_terminal_launch_env(env_spec),
+        )
+    except BaseException as seed_error:
+        # No forwarder owns the routers yet, so release the ones this launch started.
+        # A ``None`` handle would shut down whichever router is registered now.
+        cleanups: list[Coroutine[Any, Any, None]] = []
+        if _subagent_router is not None:
+            cleanups.append(_shutdown_session_router_async(session_id, _subagent_router))
+        if _claude_turn_router is not None:
+            cleanups.append(_shutdown_session_turn_router_async(session_id, _claude_turn_router))
+        cancelled: asyncio.CancelledError | None = None
+        for cleanup in cleanups:
+            try:
+                await cleanup
+            except asyncio.CancelledError as exc:
+                # Release the other router before honoring the cancellation.
+                cancelled = exc
+            except Exception:  # noqa: BLE001 - keep the seeding failure as the error.
+                _logger.warning(
+                    "Router cleanup failed after Claude trust seeding failed: session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+        if cancelled is not None:
+            raise cancelled from seed_error
+        raise
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "
         "env_keys=%s cwd=%s scrollback=%d",

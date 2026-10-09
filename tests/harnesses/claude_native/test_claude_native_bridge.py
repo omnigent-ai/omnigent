@@ -43,6 +43,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _JsonlRecord,
     _occupying_surface,
     augment_claude_args,
+    claude_global_config_path,
     count_hook_events,
     display_cost_approval_popup,
     ensure_claude_workspace_trusted,
@@ -8135,6 +8136,9 @@ def _redirect_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
     """
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+    # Inherited selectors would move Claude's global config elsewhere.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
     assert Path.home() == home  # guards against env-resolution surprises
     return home / ".claude.json"
 
@@ -8273,6 +8277,261 @@ def test_ensure_trusted_refuses_malformed_config(
 
     # The original (malformed) bytes are preserved — no clobber occurred.
     assert config_path.read_text() == raw
+
+
+def test_ensure_trusted_seeds_legacy_config_when_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A host with a legacy ``~/.claude/.config.json`` gets the gates seeded there.
+
+    Claude Code loads that legacy file instead of ``~/.claude.json`` whenever
+    it exists, so a seed in ``~/.claude.json`` is ignored and the trust
+    dialog blocks every session rooted at the home directory.
+    """
+    home = tmp_path / "home"
+    home_config_path = _redirect_home(monkeypatch, home)
+    legacy_path = home / ".claude" / ".config.json"
+    legacy_path.parent.mkdir()
+    legacy_path.write_text(json.dumps({"oauthAccount": {"emailAddress": "user@example.com"}}))
+
+    ensure_claude_workspace_trusted(home)
+
+    data = json.loads(legacy_path.read_text())
+    assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
+    assert data["hasCompletedOnboarding"] is True
+    assert data["projects"][str(home.resolve())]["hasTrustDialogAccepted"] is True
+    # Writing the file Claude ignores would leave the prompt in place.
+    assert not home_config_path.exists()
+
+
+@pytest.mark.parametrize(
+    "config_dir,legacy_in,custom_oauth,expected",
+    [
+        (None, None, False, "home/.claude.json"),
+        (None, "home/.claude", False, "home/.claude/.config.json"),
+        ("selected", None, False, "selected/.claude.json"),
+        ("selected", "selected", False, "selected/.config.json"),
+        # The legacy lookup follows the selected config dir, not ~/.claude.
+        ("selected", "home/.claude", False, "selected/.claude.json"),
+        (None, None, True, "home/.claude-custom-oauth.json"),
+        ("selected", None, True, "selected/.claude-custom-oauth.json"),
+        (None, "home/.claude", True, "home/.claude/.config.json"),
+        # An empty selector moves only the legacy lookup, to Claude's cwd.
+        ("", "home/.claude", False, "home/.claude.json"),
+        ("", "workspace", False, "workspace/.config.json"),
+        ("", None, True, "home/.claude-custom-oauth.json"),
+    ],
+)
+def test_claude_global_config_path_matches_claude_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_dir: str | None,
+    legacy_in: str | None,
+    custom_oauth: bool,
+    expected: str,
+) -> None:
+    """
+    The resolved path follows Claude Code's own global-config lookup order.
+
+    :param config_dir: ``CLAUDE_CONFIG_DIR`` as a directory under
+        ``tmp_path`` (e.g. ``"selected"``), ``""`` for an explicitly empty
+        value, or ``None`` to leave it unset.
+    :param legacy_in: Directory under ``tmp_path`` holding a legacy
+        ``.config.json``, or ``None`` for no legacy file.
+    :param custom_oauth: Whether ``CLAUDE_CODE_CUSTOM_OAUTH_URL`` is set.
+    :param expected: Expected path relative to ``tmp_path``.
+    """
+    _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if config_dir:
+        (tmp_path / config_dir).mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / config_dir))
+    elif config_dir == "":
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
+    if legacy_in is not None:
+        (tmp_path / legacy_in).mkdir(parents=True, exist_ok=True)
+        (tmp_path / legacy_in / ".config.json").write_text("{}")
+    if custom_oauth:
+        monkeypatch.setenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", "https://oauth.example.test")
+
+    assert claude_global_config_path(workspace) == tmp_path / expected
+
+
+def test_claude_global_config_path_uses_launch_env_and_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Selectors come from Claude's launch env, and a relative dir from its cwd.
+
+    The runner's own ``HOME`` and ``CLAUDE_CONFIG_DIR`` must not decide the
+    file when the terminal is launched with different values.
+    """
+    _redirect_home(monkeypatch, tmp_path / "runner-home")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "runner-config"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    launch_env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": "relcfg"}
+
+    assert (
+        claude_global_config_path(workspace, launch_env) == workspace / "relcfg" / ".claude.json"
+    )
+    (workspace / "relcfg").mkdir()
+    (workspace / "relcfg" / ".config.json").write_text("{}")
+    assert (
+        claude_global_config_path(workspace, launch_env) == workspace / "relcfg" / ".config.json"
+    )
+    home_only = {"HOME": str(tmp_path / "home")}
+    assert claude_global_config_path(workspace, home_only) == tmp_path / "home" / ".claude.json"
+    # Claude joins both values verbatim: a relative HOME and a literal ``~``
+    # resolve against its working directory, not the runner's home or cwd.
+    assert claude_global_config_path(workspace, {"HOME": "relhome"}) == (
+        workspace / "relhome" / ".claude.json"
+    )
+    # Without a usable HOME, Claude uses the account home, not the runner's.
+    account_home = tmp_path / "account-home"
+    monkeypatch.setattr(claude_native_bridge, "_account_home_dir", lambda: account_home)
+    assert claude_global_config_path(workspace, {}) == account_home / ".claude.json"
+    assert claude_global_config_path(workspace, {"HOME": ""}) == account_home / ".claude.json"
+    tilde_env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": "~/cfg"}
+    assert (
+        claude_global_config_path(workspace, tilde_env) == workspace / "~" / "cfg" / ".claude.json"
+    )
+
+
+def test_claude_global_config_path_removes_dot_dot_like_path_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``..`` segments are removed lexically, as Claude's ``path.join`` does.
+
+    A missing intermediate directory or a symlink before ``..`` must not change
+    the selected file, and the legacy lookup follows the same rule. Seeding
+    writes the launch env's file and leaves the runner's ``~/.claude.json``.
+    """
+    runner_config = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    (workspace / "selected").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere" / "deep"
+    elsewhere.mkdir(parents=True)
+    (workspace / "link").symlink_to(elsewhere)
+    home = {"HOME": str(tmp_path / "home")}
+
+    for config_dir in ("x/../selected", "link/../selected", str(workspace / "x/../selected")):
+        env = {**home, "CLAUDE_CONFIG_DIR": config_dir}
+        assert claude_global_config_path(workspace, env) == workspace / "selected" / ".claude.json"
+    # Seeding through the selector updates the existing file without creating ``x``.
+    env = {**home, "CLAUDE_CONFIG_DIR": "x/../selected"}
+    ensure_claude_workspace_trusted(workspace, env=env)
+    data = json.loads((workspace / "selected" / ".claude.json").read_text())
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    assert not (workspace / "x").exists()
+    assert not runner_config.exists()
+    (workspace / "selected" / ".config.json").write_text("{}")
+    assert claude_global_config_path(workspace, env) == workspace / "selected" / ".config.json"
+    assert not (workspace / "x").exists()
+
+
+def test_ensure_trusted_updates_a_symlinked_config_in_place(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A symlinked legacy config stays a symlink; its target receives the seed.
+
+    Dotfile managers often link ``~/.claude/.config.json`` into a repository,
+    so the atomic replace must not swap the link for a standalone file.
+    """
+    home = tmp_path / "home"
+    _redirect_home(monkeypatch, home)
+    target = tmp_path / "dotfiles" / "claude-config.json"
+    target.parent.mkdir()
+    target.write_text(json.dumps({"oauthAccount": {"emailAddress": "user@example.com"}}))
+    link = home / ".claude" / ".config.json"
+    link.parent.mkdir()
+    link.symlink_to(target)
+
+    ensure_claude_workspace_trusted(home)
+
+    assert link.is_symlink()
+    data = json.loads(target.read_text())
+    assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
+    assert data["projects"][str(home.resolve())]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_trusted_refuses_broken_or_looping_config_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dangling or looping config symlink is refused rather than written through.
+
+    Writing through a dangling link would create a new config at an arbitrary
+    target; a loop cannot be resolved at all.
+    """
+    home = tmp_path / "home"
+    _redirect_home(monkeypatch, home)
+    link = home / ".claude.json"
+    missing_target = tmp_path / "elsewhere" / "claude.json"
+    link.symlink_to(missing_target)
+
+    with pytest.raises(ValueError, match="broken or looping symlink"):
+        ensure_claude_workspace_trusted(home)
+    assert not missing_target.parent.exists()
+
+    link.unlink()
+    loop = home / "loop.json"
+    loop.symlink_to(link)
+    link.symlink_to(loop)
+    with pytest.raises(ValueError, match="broken or looping symlink"):
+        ensure_claude_workspace_trusted(home)
+
+
+def test_ensure_trusted_refuses_a_non_file_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config path that exists but is not a regular file is refused, not replaced."""
+    home = tmp_path / "home"
+    _redirect_home(monkeypatch, home)
+    (home / ".claude" / ".config.json").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        ensure_claude_workspace_trusted(home)
+
+    assert (home / ".claude" / ".config.json").is_dir()
+
+
+def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The legacy lookup uses the NFC config dir; the modern path keeps its spelling.
+
+    Claude Code normalizes its config dir to NFC before checking for a legacy
+    ``.config.json`` but joins ``.claude.json`` onto the raw value, which
+    differ on a byte-sensitive filesystem.
+    """
+    import unicodedata
+
+    _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    decomposed = str(tmp_path / unicodedata.normalize("NFD", "caf\u00e9"))
+    composed = unicodedata.normalize("NFC", decomposed)
+    env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": decomposed}
+
+    assert claude_global_config_path(workspace, env) == Path(decomposed) / ".claude.json"
+    Path(composed).mkdir()
+    (Path(composed) / ".config.json").write_text("{}")
+    if (Path(decomposed) / ".config.json").exists():
+        pytest.skip("filesystem treats NFC and NFD names as the same file")
+    assert claude_global_config_path(workspace, env) == Path(composed) / ".config.json"
 
 
 def test_display_cost_approval_popup_builds_detached_tmux_command(
