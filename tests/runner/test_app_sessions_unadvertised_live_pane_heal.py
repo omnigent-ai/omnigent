@@ -144,6 +144,14 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     )
 
 
+def _browser_test_module():
+    """Import the browser regression lazily; its module needs Playwright."""
+    pytest.importorskip("playwright.sync_api")
+    from tests.e2e_ui.chat import test_web_turn_unadvertised_tmux_target as browser_test
+
+    return browser_test
+
+
 def _advertised_bridge(root: Path, name: str, session_id: str) -> Path:
     directory = root / name
     directory.mkdir(parents=True)
@@ -158,7 +166,7 @@ def _advertised_bridge(root: Path, name: str, session_id: str) -> Path:
 def test_browser_fault_injection_only_removes_its_session_advertisement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from tests.e2e_ui.chat import test_web_turn_unadvertised_tmux_target as browser_test
+    browser_test = _browser_test_module()
 
     own = _advertised_bridge(tmp_path, "own", "fixture-session")
     other = _advertised_bridge(tmp_path, "other", "unrelated-session")
@@ -175,7 +183,7 @@ def test_browser_fault_injection_only_removes_its_session_advertisement(
 def test_browser_fault_injection_requires_one_owned_advertisement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, own_advertisements: int
 ) -> None:
-    from tests.e2e_ui.chat import test_web_turn_unadvertised_tmux_target as browser_test
+    browser_test = _browser_test_module()
 
     targets = [_advertised_bridge(tmp_path, "other", "unrelated-session")]
     targets.extend(

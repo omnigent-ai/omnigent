@@ -6,6 +6,7 @@ import logging
 import time
 
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 
 from omnigent.harnesses.claude_native.bridge import (
@@ -27,9 +28,8 @@ _ECHO_TOKEN = "advertok"
 # The pane's tmux target must advertise within this long after connect. A
 # healthy runner writes tmux.json within ~1s of the pane launching.
 _TERMINAL_READY_TIMEOUT_MS = 120_000
-# Generous ceiling for the turn to be delivered post-fix: the pane is alive, so
-# once the target is re-advertised Claude injects and replies. Well past the
-# 30s inject wait that gates the buggy hard-fail.
+# Ceiling for delivery: the pane is alive, so once the target is
+# re-advertised Claude injects and replies.
 _DELIVERY_TIMEOUT_S = 200.0
 
 
@@ -71,30 +71,27 @@ def _remove_tmux_advertisement(session_id: str) -> str:
     return str(target)
 
 
-def _not_advertised_error_text(page: Page) -> str | None:
-    """Return the error-pill's message if it is the tmux-not-advertised failure.
-
-    The pill renders its detailed message only when expanded, so this expands it
-    before reading ``error-message-content``.
+def _error_pill_text(page: Page) -> str | None:
+    """Return the first error pill's message, expanding the pill when collapsed.
 
     :param page: The Playwright page on the session surface.
-    :returns: The message text if it names the not-advertised failure, else None.
+    :returns: The pill's message text, or None when no pill is readable yet.
     """
     pill = page.locator(_ERROR_PILL).first
     if pill.count() == 0:
         return None
-    content = page.get_by_test_id("error-message-content").first
+    content = pill.get_by_test_id("error-message-content")
     if not content.is_visible():
         pill.click()  # a click toggles the pill, so expand only a collapsed one
     try:
         content.wait_for(state="visible", timeout=10_000)
-        text = content.inner_text()
-    except Exception:  # an unreadable body means the pill isn't ready yet
+        return content.inner_text()
+    except PlaywrightError as exc:  # pill not expanded/ready yet
+        _log.debug("error pill not readable yet: %s", exc)
         return None
-    return text if _NOT_ADVERTISED in text.lower() else None
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(420)
 def test_web_turn_survives_unadvertised_tmux_target(
     page: Page,
     native_claude_mock_session: tuple[str, str],
@@ -139,18 +136,19 @@ def test_web_turn_survives_unadvertised_tmux_target(
     t_send = time.monotonic()
     _log.info("sent web-chat turn")
 
-    # The turn must be delivered (assistant reply) and must NOT hard-fail with
-    # the tmux-not-advertised error. On the buggy build the error pill appears
-    # ~30s after send (the inject wait) -> we fail here specifically on it.
+    # Fail fast on the not-advertised error pill; otherwise wait for delivery.
     deadline = time.monotonic() + _DELIVERY_TIMEOUT_S
+    last_pill_text: str | None = None
     while time.monotonic() < deadline:
-        message = _not_advertised_error_text(page)
+        message = _error_pill_text(page)
         if message is not None:
-            pytest.fail(
-                "web-chat turn hard-failed "
-                f"{time.monotonic() - t_send:.0f}s after send because the tmux "
-                f"target was not advertised -- {message!r}"
-            )
+            last_pill_text = message
+            if _NOT_ADVERTISED in message.lower():
+                pytest.fail(
+                    "web-chat turn hard-failed "
+                    f"{time.monotonic() - t_send:.0f}s after send because the tmux "
+                    f"target was not advertised -- {message!r}"
+                )
         if page.locator(_ASSISTANT).filter(has_text=_ECHO_TOKEN).count() > 0:
             _log.info("turn delivered %.0fs after send", time.monotonic() - t_send)
             return
@@ -158,4 +156,5 @@ def test_web_turn_survives_unadvertised_tmux_target(
 
     raise AssertionError(
         f"web-chat turn was neither delivered nor failed within {_DELIVERY_TIMEOUT_S:.0f}s"
+        f" (last error pill text: {last_pill_text!r})"
     )

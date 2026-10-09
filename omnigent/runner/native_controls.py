@@ -966,7 +966,9 @@ def build_native_controls(
         if instance is not None and await instance.is_alive():
             # A live pane can still lack its tmux advertisement; restore it so
             # the inject below does not time out against an absent target.
-            _readvertise_live_claude_tmux_target(bridge_dir, instance, session_id=conv_id)
+            await asyncio.to_thread(
+                _readvertise_live_claude_tmux_target, bridge_dir, instance, session_id=conv_id
+            )
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")
         if terminal_registry.get(conv_id, terminal_name, "main") is None:

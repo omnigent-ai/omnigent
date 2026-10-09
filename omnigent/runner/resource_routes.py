@@ -652,7 +652,9 @@ def register_resource_routes(
                 )
                 return
             bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        _readvertise_live_claude_tmux_target(bridge_dir, instance, session_id=conv_id)
+        await asyncio.to_thread(
+            _readvertise_live_claude_tmux_target, bridge_dir, instance, session_id=conv_id
+        )
 
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
