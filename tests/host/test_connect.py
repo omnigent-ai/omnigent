@@ -1854,6 +1854,39 @@ def test_runner_exit_error_ignores_an_exit_phrase_outside_a_log_record(tmp_path:
     assert error.splitlines()[1] == "cause: ModuleNotFoundError: No module named 'websockets'"
 
 
+def test_runner_exit_error_promotes_a_bare_traceback_final_line(tmp_path: Path) -> None:
+    """A final traceback line without a message (``KeyboardInterrupt``) still names the cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 2133, in main\n'
+        "    asyncio.run(_run_tunnel_from_env())\n"
+        "KeyboardInterrupt\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: KeyboardInterrupt"
+
+
+def test_runner_exit_error_tail_starts_on_a_whole_line_after_the_byte_bound(
+    tmp_path: Path,
+) -> None:
+    """When the last lines exceed the tail budget, the cut drops its partial leading line."""
+    log = tmp_path / "runner-x.log"
+    lines = [f"line {n:02d} " + "x" * 400 for n in range(20)]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    tail_lines = tail.splitlines()
+    assert tail_lines, error
+    assert all(line in lines for line in tail_lines), tail_lines[0][:40]
+    assert len(tail) <= 4096
+
+
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -7,55 +7,29 @@ exit reason instead of a generic headline over a raw log tail.
 
 from __future__ import annotations
 
+import functools
+import os
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import TypeVar
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.runner_faults import (
+    disk_full_spec_cache_pythonpath,
+    tunnel_rejection_spec_cache_pythonpath,
+)
 from tests._helpers.server_runner import server_runner
 from tests.e2e_ui.conftest import _register_extra_agent
 
-# Each body raises at the reported crash site —
-# ``tempfile.mkdtemp(prefix="runner-specs-...")`` inside the runner's
-# ``create_app`` — so the real crash hook, watcher and server run unmodified.
-_ENOSPC_SITECUSTOMIZE = """\
-import errno
-import tempfile
-
-_real_mkdtemp = tempfile.mkdtemp
-
-
-def _mkdtemp(suffix=None, prefix=None, dir=None):
-    if prefix is not None and prefix.startswith("runner-specs-"):
-        raise OSError(errno.ENOSPC, "No space left on device")
-    return _real_mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
-
-
-tempfile.mkdtemp = _mkdtemp
-"""
-
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 _REJECT_REASON = (
     "runner tunnel rejected by server (HTTP 403 persisted across 3 attempts); "
     "run omnigent login http://127.0.0.1 to re-authenticate"
 )
-_REJECT_SITECUSTOMIZE = f"""\
-import tempfile
-
-_real_mkdtemp = tempfile.mkdtemp
-_REASON = {_REJECT_REASON!r}
-
-
-def _mkdtemp(suffix=None, prefix=None, dir=None):
-    if prefix is not None and prefix.startswith("runner-specs-"):
-        raise RuntimeError(_REASON)
-    return _real_mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
-
-
-tempfile.mkdtemp = _mkdtemp
-"""
 
 _T = TypeVar("_T")
 
@@ -72,26 +46,28 @@ def _wait_until(predicate: Callable[[], _T | None], *, timeout: float = 90.0) ->
 
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
-    ("fault", "sitecustomize", "cause_substring"),
+    ("fault", "inject", "cause_substring"),
     [
-        ("enospc", _ENOSPC_SITECUSTOMIZE, "No space left on device"),
-        ("reject403", _REJECT_SITECUSTOMIZE, "run omnigent login"),
+        ("enospc", disk_full_spec_cache_pythonpath, "No space left on device"),
+        (
+            "reject403",
+            functools.partial(tunnel_rejection_spec_cache_pythonpath, reason=_REJECT_REASON),
+            "run omnigent login",
+        ),
     ],
     ids=["enospc", "reject403"],
 )
 def test_runner_boot_crash_names_the_cause(
     built_spa: None,
     mock_llm_server_url: str,
-    tmp_path,
+    tmp_path: Path,
     request: pytest.FixtureRequest,
     fault: str,
-    sitecustomize: str,
+    inject: Callable[..., str],
     cause_substring: str,
 ) -> None:
     """A boot-crashing runner fails the session with its reason named up front."""
-    inject_dir = tmp_path / f"inject-{fault}"
-    inject_dir.mkdir()
-    (inject_dir / "sitecustomize.py").write_text(sitecustomize)
+    pythonpath = inject(tmp_path / f"inject-{fault}", _REPO_ROOT, os.environ.get("PYTHONPATH"))
 
     with (
         server_runner(tmp_path / f"stack-{fault}") as stack,
@@ -100,7 +76,7 @@ def test_runner_boot_crash_names_the_cause(
         stack.start_host(
             env={
                 "OMNIGENT_RUNNER_ZYGOTE": "0",
-                "PYTHONPATH": str(inject_dir),
+                "PYTHONPATH": pythonpath,
                 "OPENAI_API_KEY": "mock-key",
                 "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
                 "ANTHROPIC_API_KEY": "mock-key",
@@ -125,13 +101,16 @@ def test_runner_boot_crash_names_the_cause(
         create.raise_for_status()
         session_id = create.json()["id"]
 
-        client.post(
+        # The first message makes the host launch the runner. The server either
+        # queues it (202) or, once the boot crash is reported, refuses it (503).
+        send = client.post(
             f"/v1/sessions/{session_id}/events",
             json={
                 "type": "message",
                 "data": {"role": "user", "content": [{"type": "input_text", "text": "hello?"}]},
             },
         )
+        assert send.status_code in {202, 503}, (send.status_code, send.text)
 
         def failed_error() -> dict | None:
             snap = client.get(f"/v1/sessions/{session_id}").json()

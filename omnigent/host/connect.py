@@ -294,9 +294,10 @@ _RUNNER_EXIT_REASON_LINE = re.compile(
     r"^[A-Z]{4,8}\s+\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} .*? \| runner exiting: (?P<reason>\S.*)$"
 )
 
-# Final line of a Python traceback, e.g. ``OSError: [Errno 28] No space left on device``.
+# Final line of a Python traceback, e.g. ``OSError: [Errno 28] No space left on
+# device`` or a bare ``KeyboardInterrupt``.
 _TRACEBACK_FINAL_LINE = re.compile(
-    r"^(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|Exit|Interrupt): \S.*$"
+    r"^(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|Exit|Interrupt)(?:: \S.*)?$"
 )
 
 # Bound on the stated cause, applied after redaction so the cut cannot split a
@@ -414,8 +415,11 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     reason = _runner_exit_reason(scanned, lines)
     if reason is not None:
         message += f"\ncause: {_redact_log_tail(reason)[:_EXIT_REASON_MAX_CHARS]}"
-    # Redact whole lines before bounding so the cut cannot leave half a credential.
-    tail = _redact_log_tail("\n".join(lines))[-_LOG_TAIL_MAX_BYTES:]
+    # Redact whole lines before bounding so the cut cannot leave half a credential,
+    # then drop the partial line the cut leaves at the front.
+    tail = _redact_log_tail("\n".join(lines))
+    if len(tail) > _LOG_TAIL_MAX_BYTES:
+        tail = tail[-_LOG_TAIL_MAX_BYTES:].split("\n", 1)[-1]
     message += "\n--- runner log tail ---\n" + tail
     return message
 

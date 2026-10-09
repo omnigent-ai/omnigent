@@ -7,94 +7,26 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import time
-import uuid
 from pathlib import Path
 
 import httpx
 import pytest
-import yaml
 from playwright.sync_api import Page, expect
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from tests._helpers.host_daemon import (
+    launched_runners,
+    spawn_host_daemon,
+    terminate_host_daemon,
+    wait_for_host_online,
+)
 from tests._helpers.runner_faults import disk_full_spec_cache_pythonpath
 from tests.e2e_ui.conftest import _register_extra_agent
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_LAUNCH_LINE = re.compile(r"Launched runner (\S+) for workspace .*?\(pid=(\d+)\)")
 _RUNNER_EXIT_TEXT = re.compile(r"runner process exited")
 # The error code determines the banner headline.
 _EXPECTED_HEADLINE = "The session's runner failed to start on the host."
-
-
-def _launches(log_path: Path) -> list[tuple[str, int]]:
-    """Parse every runner the host daemon spawned, in launch order."""
-    if not log_path.exists():
-        return []
-    return [
-        (rid, int(pid)) for rid, pid in _LAUNCH_LINE.findall(log_path.read_text(errors="replace"))
-    ]
-
-
-def _spawn_host_daemon(
-    tmp_path: Path, base_url: str, mock_llm_url: str, *, pythonpath: str | None = None
-) -> tuple[subprocess.Popen[bytes], str, Path]:
-    """Start an isolated host; direct spawn so the logged PID is the runner."""
-    omni_dir = tmp_path / ".omnigent"
-    omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = uuid.uuid4().hex
-    (omni_dir / "config.yaml").write_text(
-        yaml.safe_dump(
-            {"host": {"host_id": host_id, "name": f"runner-exit-{host_id[:8]}"}},
-            default_flow_style=False,
-            sort_keys=True,
-        )
-    )
-    daemon_log = tmp_path / "host-daemon.log"
-    if pythonpath is None:
-        pythonpath = os.pathsep.join([str(_REPO_ROOT), os.environ.get("PYTHONPATH", "")]).rstrip(
-            os.pathsep
-        )
-    env = {
-        **os.environ,
-        "HOME": str(tmp_path),
-        "OMNIGENT_RUNNER_ZYGOTE": "0",
-        "OPENAI_BASE_URL": f"{mock_llm_url}/v1",
-        "OPENAI_API_KEY": "mock-key",
-        "PYTHONPATH": pythonpath,
-        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
-    }
-    with open(daemon_log, "w") as log_fh:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.host._daemon_entry",
-                "--server",
-                base_url,
-            ],
-            env=env,
-            cwd=str(_REPO_ROOT),
-            stdout=subprocess.DEVNULL,
-            stderr=log_fh,
-        )
-    return proc, host_id, daemon_log
-
-
-def _wait_for_host_online(base_url: str, host_id: str, timeout: float = 45.0) -> None:
-    """Poll ``GET /v1/hosts`` until *host_id* shows online."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        # The server may still be starting; a transport error is just another poll.
-        with contextlib.suppress(httpx.HTTPError):
-            resp = httpx.get(f"{base_url}/v1/hosts", timeout=5.0)
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
-        time.sleep(0.25)
-    raise AssertionError(f"host {host_id!r} never came online at {base_url}")
 
 
 def _runner_online(base_url: str, runner_id: str) -> bool:
@@ -140,17 +72,6 @@ def _wait_for_failed(base_url: str, session_id: str, *, timeout: float = 60.0) -
     )
 
 
-def _stop_daemon(daemon: subprocess.Popen[bytes] | None) -> None:
-    if daemon is None:
-        return
-    daemon.send_signal(signal.SIGTERM)
-    try:
-        daemon.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        daemon.kill()
-        daemon.wait()
-
-
 @pytest.mark.timeout(300)
 def test_host_runner_exit_fails_open_session(
     page: Page,
@@ -162,34 +83,33 @@ def test_host_runner_exit_fails_open_session(
     daemon: subprocess.Popen[bytes] | None = None
     killed_pids: list[int] = []
     try:
-        daemon, host_id, daemon_log = _spawn_host_daemon(
-            tmp_path, live_server, mock_llm_server_url
+        # Direct spawn so the logged PID is the runner itself.
+        daemon, host_id, daemon_log = spawn_host_daemon(
+            tmp_path, live_server, mock_llm_server_url, zygote=False
         )
-        _wait_for_host_online(live_server, host_id)
+        wait_for_host_online(live_server, host_id)
         session_id = _create_host_session(
             live_server, host_id, "runner-exit-agent", tmp_path / "project"
         )
 
-        # Wait for the launched runner to connect its tunnel.
+        # Wait for the launched runner to connect its tunnel, keeping the PID from
+        # the same launch record so a later relaunch cannot be killed by mistake.
         deadline = time.monotonic() + 60.0
-        runner_id: str | None = None
+        connected: tuple[str, int] | None = None
         while time.monotonic() < deadline:
-            launches = _launches(daemon_log)
-            if launches:
-                runner_id = launches[-1][0]
-                if _runner_online(live_server, runner_id):
-                    break
+            launches = launched_runners(daemon_log)
+            if launches and _runner_online(live_server, launches[-1][0]):
+                connected = launches[-1]
+                break
             time.sleep(0.25)
-        assert runner_id is not None and _runner_online(live_server, runner_id), (
-            "runner never connected its tunnel"
-        )
+        assert connected is not None, "runner never connected its tunnel"
+        _runner_id, pid = connected
 
         page.goto(f"{live_server}/c/{session_id}")
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=30_000)
 
         # Kill the connected runner process: a stand-in for any non-zero exit.
-        pid = _launches(daemon_log)[-1][1]
         os.kill(pid, signal.SIGKILL)
         killed_pids.append(pid)
 
@@ -204,7 +124,7 @@ def test_host_runner_exit_fails_open_session(
         expect(message).to_contain_text(_RUNNER_EXIT_TEXT, timeout=15_000)
         page.wait_for_timeout(2_500)
     finally:
-        _stop_daemon(daemon)
+        terminate_host_daemon(daemon)
         for extra_pid in killed_pids:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.kill(extra_pid, signal.SIGKILL)
@@ -221,7 +141,7 @@ def test_runner_boot_crash_banner_names_the_cause(
     """The failed-session banner states why the runner died, above its log."""
     daemon: subprocess.Popen[bytes] | None = None
     try:
-        daemon, host_id, _daemon_log = _spawn_host_daemon(
+        daemon, host_id, _daemon_log = spawn_host_daemon(
             tmp_path,
             live_server,
             mock_llm_server_url,
@@ -229,7 +149,7 @@ def test_runner_boot_crash_banner_names_the_cause(
                 tmp_path / "fault", _REPO_ROOT, os.environ.get("PYTHONPATH")
             ),
         )
-        _wait_for_host_online(live_server, host_id)
+        wait_for_host_online(live_server, host_id)
         session_id = _create_host_session(
             live_server, host_id, "runner-boot-crash-agent", tmp_path / "project"
         )
@@ -257,4 +177,4 @@ def test_runner_boot_crash_banner_names_the_cause(
         )
         page.wait_for_timeout(2_500)
     finally:
-        _stop_daemon(daemon)
+        terminate_host_daemon(daemon)
