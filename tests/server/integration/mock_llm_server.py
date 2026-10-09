@@ -456,9 +456,8 @@ def anthropic_sse_text_response(
         ``{"input_tokens": 50000}``), so tests can script the observed
         context size. Defaults keep the historical fixed values.
     :param stop_reason: Terminal ``stop_reason`` for the ``message_delta``
-        event. ``"max_tokens"`` scripts a response that hit the model's
-        output-token limit — Claude Code reacts by failing the turn with
-        its "response exceeded the ... output token maximum" API error.
+        event. ``"max_tokens"`` scripts a reply that hit the model's
+        output-token limit.
     """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     output_tokens = max(5, len(text.split()))
@@ -1238,6 +1237,7 @@ async def create_message(
                     {"type": "thinking", "thinking": qr.thinking, "signature": "mock-signature"}
                 )
             content.append({"type": "text", "text": qr.text})
+            stop_reason = qr.stop_reason or stop_reason
         return JSONResponse(
             {
                 "id": f"msg_{_uuid_mod.uuid4().hex[:12]}",

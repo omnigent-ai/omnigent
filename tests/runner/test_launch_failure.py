@@ -294,6 +294,9 @@ _REWRITTEN_OUTPUT_LIMIT_ERROR = (
         # The constant without its "API Error: " prefix, at a raised limit.
         "Claude’s response exceeded the 64,000 output token maximum.",
         _REWRITTEN_OUTPUT_LIMIT_ERROR,
+        # The forwarder's category-only fallback when the StopFailure hook
+        # carries no error_details.
+        "Claude Code ended the turn with an API error (max_output_tokens).",
     ],
 )
 def test_classifies_output_limit_exceeded(code: str, message: str) -> None:
@@ -306,6 +309,8 @@ def test_classifies_output_limit_exceeded(code: str, message: str) -> None:
         # Mentions the cap without a response having exceeded it.
         "The model supports a 32000 output token maximum.",
         "Output tokens: 32000",
+        # A request-parameter complaint names the field, not a cut-off reply.
+        "API Error: 400 max_output_tokens must be at most 32000",
     ],
 )
 def test_output_limit_wording_alone_is_not_the_limit_error(message: str) -> None:

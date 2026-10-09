@@ -224,11 +224,9 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
-# Claude Code's output-token-limit error, raw ("Claude's response exceeded the
-# 32000 output token maximum..."), as the claude-native bridge rewrites it
-# ("Output limit reached — ..."), or as the forwarder's category-only fallback
-# names it when the StopFailure hook carries no error_details ("... API error
-# (max_output_tokens)."): the model's output cap, not an Omnigent fault.
+# Claude Code's output-token-limit error: the raw constant ("...exceeded the 32000 output
+# token maximum"), the bridge's "Output limit reached" rewrite, or the forwarder's
+# category-only fallback "...API error (max_output_tokens)". The model's cap, not our fault.
 _OUTPUT_LIMIT_ERROR = re.compile(
     r"response exceeded the [\d,]+ output token maximum|\boutput limit reached\b"
     r"|\bAPI error \(max_output_tokens\)",

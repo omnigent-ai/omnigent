@@ -1,7 +1,7 @@
-"""E2E: Claude's output-token limit must not dead-end a claude-native turn.
+"""E2E: a claude-native turn that hits Claude's output-token limit must not dead-end.
 
-Claude Code fails a turn whose reply ends with ``stop_reason: "max_tokens"`` using its
-CLAUDE_CODE_MAX_OUTPUT_TOKENS error, a remedy the web user cannot apply.
+Claude Code fails a turn whose reply ends with ``stop_reason: "max_tokens"`` using
+its CLAUDE_CODE_MAX_OUTPUT_TOKENS error, a remedy the web user cannot apply.
 """
 
 from __future__ import annotations
@@ -10,17 +10,21 @@ import contextlib
 import json
 import re
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.messages.test_message_render_parity import (
+    _ASSISTANT,
+    _USER,
+    _WORKING,
+    _select_view_mode,
+    _send,
+)
 
-_COMPOSER = "Send a message…"
-_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
-_USER = '[data-testid="message-bubble"][data-role="user"]'
-_WORKING = '[data-testid="working-indicator"]'
 _ERROR_PILL = '[data-testid="error-pill"]'
 
 # Must match the mock anthropic provider model the native_claude_mock_session
@@ -30,6 +34,9 @@ _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 # Only requests carrying this token draw from the max_tokens fault queue.
 _FAULT_TOKEN = "overlong-report-fault"
 _SANITY_LINE = "MOCK TURN OK output-limit-sanity"
+
+# The generic code the server stamps on an unrecognized native turn failure.
+_GENERIC_TURN_ERROR = "native_turn_error"
 
 # Claude Code's constant for a response that ended with stop_reason "max_tokens".
 _RAW_LIMIT_ERROR_RE = re.compile(
@@ -46,21 +53,17 @@ _FAULT_SETTLE_S = 150.0
 _MIRROR_GRACE_S = 8.0
 
 
-def _send(page: Page, text: str) -> None:
-    """Type *text* into the web composer and click Send."""
-    composer = page.get_by_placeholder(_COMPOSER)
-    expect(composer).to_be_visible(timeout=30_000)
-    composer.fill(text)
-    page.get_by_role("button", name="Send", exact=True).click()
-
-
 def _ensure_chat_view(page: Page) -> None:
     """Switch the terminal-first native session to its chat bubble view."""
-    toggle = page.get_by_test_id("view-mode-toggle")
-    expect(toggle).to_be_visible(timeout=_FIRST_TURN_TIMEOUT_MS)
-    segment = page.get_by_test_id("view-mode-chat")
-    expect(segment).to_be_enabled(timeout=30_000)
-    segment.click()
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=_FIRST_TURN_TIMEOUT_MS)
+    _select_view_mode(page, "Chat")
+
+
+def _session_snapshot(base_url: str, session_id: str) -> dict:
+    """Return the session's ``GET /v1/sessions/{id}`` body."""
+    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15.0)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _transcript_blob(base_url: str, session_id: str) -> str:
@@ -72,15 +75,6 @@ def _transcript_blob(base_url: str, session_id: str) -> str:
     )
     resp.raise_for_status()
     return json.dumps(resp.json().get("data", []), ensure_ascii=False)
-
-
-def _session_snapshot(base_url: str, session_id: str) -> tuple[str, str]:
-    """Return the session status and its ``last_task_error`` message (``""`` when none)."""
-    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15.0)
-    resp.raise_for_status()
-    body = resp.json()
-    error = body.get("last_task_error") or {}
-    return str(body.get("status") or ""), str(error.get("message") or "")
 
 
 def _error_pill_text(page: Page) -> str:
@@ -106,9 +100,11 @@ def _assistant_bubble_text(page: Page) -> str:
     return ""
 
 
-def _raw_constant_surfaces(page: Page, base_url: str, session_id: str) -> list[tuple[str, str]]:
+def _raw_constant_surfaces(
+    page: Page, base_url: str, session_id: str, snapshot: dict
+) -> list[tuple[str, str]]:
     """Return ``(surface, matched_text)`` for each web-visible surface carrying the constant."""
-    _, failure_reason = _session_snapshot(base_url, session_id)
+    failure_reason = str((snapshot.get("last_task_error") or {}).get("message") or "")
     surfaces = (
         ("the chat view's assistant bubbles", _assistant_bubble_text(page)),
         ("the failed turn's error pill", _error_pill_text(page)),
@@ -138,21 +134,50 @@ def _expand_error_pill(page: Page) -> None:
     """Best-effort: open the error pill so its full message is on screen."""
     with contextlib.suppress(Exception):
         pill = page.locator(_ERROR_PILL).first
+        pill.scroll_into_view_if_needed(timeout=5_000)
         pill.locator('button[aria-expanded="false"]').first.click(timeout=5_000)
         expect(pill.get_by_test_id("error-message-content")).to_be_visible(timeout=5_000)
-        page.wait_for_timeout(2_000)
+
+
+def _turn_failure_log_lines(
+    tmp_path_factory: pytest.TempPathFactory, session_id: str
+) -> list[str]:
+    """Return the fixture-spawned server's 'session turn failed' lines for *session_id*.
+
+    Reads the server's stdout capture and the log file it announces at startup.
+    Empty when the server log is not local (a workflow-owned server).
+    """
+    needle = f"session turn failed for {session_id}"
+    logs = list(tmp_path_factory.getbasetemp().glob("e2e_ui_server*/server.log"))
+    for stdout_log in list(logs):
+        with contextlib.suppress(OSError):
+            logs.extend(
+                Path(match.group(1))
+                for match in re.finditer(r"^\s*log:\s+(\S+)", stdout_log.read_text(), re.M)
+            )
+    lines: list[str] = []
+    for log in dict.fromkeys(logs):
+        with contextlib.suppress(OSError):
+            lines.extend(
+                line.rstrip()
+                for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
+                if needle in line
+            )
+    return lines
 
 
 @pytest.mark.nightly
 @pytest.mark.timeout(600)
 def test_output_token_limit_turn_is_not_a_raw_dead_end(
-    page: Page,
+    request: pytest.FixtureRequest,
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     """A turn that hits Claude's output-token max must not strand the user on the raw CLI error.
 
-    After a sanity turn, the fault turn must settle with no raw constant on any web surface.
+    After a sanity turn, the fault turn must settle with no raw constant on any web
+    surface, and a failed turn must not be attributed to the generic turn-error code.
     """
     base_url, session_id = native_claude_mock_session
 
@@ -174,7 +199,10 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
         key="output-token-limit-fault",
         match=_FAULT_TOKEN,
     )
+    print(f"product session: {base_url}/c/{session_id}")
 
+    # Non-browser setup is complete; the recorded page starts at the first navigation.
+    page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
 
@@ -192,36 +220,66 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     _send(page, f"please write the full 50-page report now ({_FAULT_TOKEN})")
     expect(page.locator(_USER, has_text=_FAULT_TOKEN).first).to_be_visible(timeout=60_000)
 
-    hits: list[tuple[str, str]] = []
     settled_at: float | None = None
     deadline = time.monotonic() + _FAULT_SETTLE_S
     while time.monotonic() < deadline:
-        hits = _raw_constant_surfaces(page, base_url, session_id)
+        snapshot = _session_snapshot(base_url, session_id)
+        hits = _raw_constant_surfaces(page, base_url, session_id, snapshot)
         if hits:
             # Let the mirror and the pill catch up so every affected surface is named.
             time.sleep(_MIRROR_GRACE_S)
-            hits = _raw_constant_surfaces(page, base_url, session_id)
             break
-        status, _ = _session_snapshot(base_url, session_id)
-        if settled_at is None and _turn_settled(page, status):
+        if settled_at is None and _turn_settled(page, str(snapshot.get("status") or "")):
             settled_at = time.monotonic()
         if settled_at is not None and time.monotonic() - settled_at >= _MIRROR_GRACE_S:
             break
         time.sleep(2.0)
 
+    snapshot = _session_snapshot(base_url, session_id)
+    hits = _raw_constant_surfaces(page, base_url, session_id, snapshot)
+    status = str(snapshot.get("status") or "")
+    last_task_error = snapshot.get("last_task_error") or {}
+    log_lines = _turn_failure_log_lines(tmp_path_factory, session_id)
+    _expand_error_pill(page)
+    print(
+        "fault turn outcome:",
+        json.dumps(
+            {
+                "status": status,
+                "last_task_error": last_task_error,
+                "raw_constant_surfaces": hits,
+                "assistant_bubbles": _assistant_bubble_text(page),
+                "error_pill": _error_pill_text(page),
+                "server_turn_failure_log": log_lines,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    output_dir = Path(str(request.config.getoption("--output")))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output_dir / "output-token-limit-chat.png"))
+
+    problems: list[str] = []
     if hits:
-        _expand_error_pill(page)
         where = "; ".join(f"{surface} carried {text!r}" for surface, text in hits)
+        problems.append(
+            "the turn dead-ended on the raw CLI constant — "
+            f"{where}. Setting CLAUDE_CODE_MAX_OUTPUT_TOKENS on the running CLI is "
+            "not available from the Omnigent web chat."
+        )
+    if status == "failed" and last_task_error.get("code") == _GENERIC_TURN_ERROR:
+        problems.append(
+            "the failed turn was attributed to the generic "
+            f"{_GENERIC_TURN_ERROR!r} code (last_task_error={last_task_error!r}; "
+            f"server log={log_lines!r}), so the model's output cap is counted as an "
+            "Omnigent turn failure instead of an upstream limit."
+        )
+    if problems:
+        # Hold the failure state on screen so the recording ends on it.
+        page.wait_for_timeout(3_000)
         pytest.fail(
-            "a claude-native turn that hit Claude's output-token maximum "
-            f"dead-ended on the raw CLI constant — {where}. "
-            "The named remedy (setting CLAUDE_CODE_MAX_OUTPUT_TOKENS on the "
-            "running CLI) is not available from the Omnigent web chat, and the "
-            "server counts the turn as an Omnigent failure ('session turn "
-            "failed for <id>: API Error: ...', the turn-failure KPI "
-            "signature). Handle the upstream limit the way the "
-            "context-overflow constant is handled instead of relaying the raw "
-            "dead end."
+            "a claude-native turn that hit Claude's output-token maximum: "
+            + " Also, ".join(problems)
         )
     if settled_at is None:
         pytest.fail(
@@ -230,12 +288,3 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
             "reply) — the claude-native pipeline did not finish the turn, so "
             "its output-token handling could not be judged."
         )
-    # Evidence of how the settled turn was attributed (status + last_task_error).
-    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15.0).json()
-    print(
-        "fault turn settled:",
-        json.dumps(
-            {"status": snapshot.get("status"), "last_task_error": snapshot.get("last_task_error")},
-            ensure_ascii=False,
-        ),
-    )
