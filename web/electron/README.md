@@ -753,6 +753,15 @@ name; output lands in `electron/dist-dev/` (the DMG is named
 install production desktop updates. `build:mac:release` retains
 `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
 
+The `.deb` runs `build/deb-after-install.sh` as its post-install script: a copy
+of electron-builder's default that always installs `/opt/Omnigent/chrome-sandbox`
+setuid root (`4755`). Chromium uses that helper only where the desktop user
+cannot create user namespaces (Ubuntu 24.04+ with
+`kernel.apparmor_restrict_unprivileged_userns=1`); electron-builder's default
+probes that as the root installer, leaves the helper `0755`, and the app then
+aborts at launch unless started with `--no-sandbox`. Re-sync the script with the
+upstream template when upgrading electron-builder.
+
 macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
 `databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
 Public macOS users and Windows/Linux keep the legacy
