@@ -9474,9 +9474,16 @@ async def _resolve_native_spawn_env(
                 session_id=session_id,
             )
         )
-        return _typed_spawn_env(
+        env = _typed_spawn_env(
             builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
         )
+        if agent.key == "codex" and provider.bridge_id_label_key not in labels:
+            from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_DIR_ENV_VAR
+
+            # A label read that timed out must not point the executor away from
+            # the directory this runner launched the terminal into.
+            env[CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] = str(codex_native_bridge_dir(session_id))
+        return env
 
     return _typed_spawn_env(builder(session_id))
 
