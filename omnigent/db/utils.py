@@ -1114,6 +1114,7 @@ def run_write_transaction(
                 extra={
                     "db_operation": qualified_name,
                     "retry_count": attempt + 1,
+                    "retry_reason": retry_reason,
                     "retry_delay_seconds": delay,
                 },
             )

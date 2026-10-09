@@ -128,16 +128,26 @@ class _MySQLServer:
             ],
         )
         deadline = time.monotonic() + 60
+        last_err: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                probe = socket.create_connection(("127.0.0.1", self.port), timeout=1)
-                probe.close()
-                time.sleep(1.0)  # let --init-file finish creating the user/DB
+                # Authenticating as the init-file user also proves the --init-file
+                # has finished creating the omni user and omnigent database.
+                conn = pymysql.connect(
+                    host="127.0.0.1",
+                    port=self.port,
+                    user="omni",
+                    password="omni",
+                    database="omnigent",
+                    connect_timeout=2,
+                )
+                conn.close()
                 return
-            except OSError:
+            except Exception as exc:
+                last_err = exc
                 time.sleep(0.3)
         log = Path(self._log).read_text() if os.path.exists(self._log) else "(no log)"
-        raise RuntimeError(f"mysqld did not start:\n{log}")
+        raise RuntimeError(f"mysqld did not start (last error: {last_err}):\n{log}")
 
     def stop(self) -> None:
         if self._proc is not None:
@@ -159,19 +169,24 @@ class _DropRelay:
 
     def __init__(self, upstream_port: int) -> None:
         self._upstream_port = upstream_port
-        self.listen_port = _free_port()
+        self.listen_port = 0  # assigned when start() binds port 0
         self._trigger: bytes | None = None
         self.drops = 0
+        self._lock = threading.Lock()
         self._srv: socket.socket | None = None
         self._stop = False
 
     def arm(self, trigger: bytes) -> None:
-        self._trigger = trigger
+        with self._lock:
+            self._trigger = trigger
 
     def start(self) -> None:
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._srv.bind(("127.0.0.1", self.listen_port))
+        # Bind port 0 and read the kernel-assigned port to avoid the
+        # pick-then-bind race of handing out a port that another process grabs.
+        self._srv.bind(("127.0.0.1", 0))
+        self.listen_port = self._srv.getsockname()[1]
         self._srv.listen(16)
         threading.Thread(target=self._accept_loop, daemon=True).start()
 
@@ -202,6 +217,7 @@ class _DropRelay:
             return
 
         def pump(src: socket.socket, dst: socket.socket, inspect: bool) -> None:
+            tail = b""
             while not self._stop:
                 try:
                     data = src.recv(65536)
@@ -209,12 +225,22 @@ class _DropRelay:
                     break
                 if not data:
                     break
-                if inspect and self._trigger and self._trigger in data:
-                    self._trigger = None
-                    self.drops += 1
-                    self._rst_close(upstream)
-                    self._rst_close(client)
-                    return
+                if inspect:
+                    with self._lock:
+                        trigger = self._trigger
+                        hit = trigger is not None and trigger in tail + data
+                        if hit:
+                            self._trigger = None
+                            self.drops += 1
+                    if hit:
+                        self._rst_close(upstream)
+                        self._rst_close(client)
+                        return
+                    # Retain enough trailing bytes to catch a trigger split
+                    # across recv() boundaries.
+                    if trigger is not None:
+                        keep = len(trigger) - 1
+                        tail = (tail + data)[-keep:] if keep > 0 else b""
                 try:
                     dst.sendall(data)
                 except OSError:
@@ -240,9 +266,11 @@ def _reap_orphaned_transaction(
     A failover, restart, or ``wait_timeout`` kill terminates the dead session
     and releases its row locks. Severing only the TCP path leaves the orphaned
     transaction holding the ``conversations`` row lock, so once the disconnect
-    has fired, kill the idle in-flight transaction (``RUNNING`` with no active
-    query) so the replay is not blocked on a lock the real causes would have
-    released. Connects straight to the server, bypassing the relay.
+    has fired, kill the oldest idle in-flight transaction (``RUNNING`` with no
+    active query). The orphan began before the disconnect, so it is strictly
+    older than any replay transaction; killing the oldest never targets the
+    replay, and the replay is then no longer blocked on a lock the real causes
+    would have released. Connects straight to the server, bypassing the relay.
     """
     while not stop.is_set() and drops() == 0:
         time.sleep(0.05)
@@ -264,12 +292,14 @@ def _reap_orphaned_transaction(
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT trx_mysql_thread_id FROM information_schema.innodb_trx "
-                    "WHERE trx_state = 'RUNNING' AND trx_query IS NULL"
+                    "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
+                    "ORDER BY trx_started ASC LIMIT 1"
                 )
-                for (thread_id,) in cur.fetchall():
+                row = cur.fetchone()
+                if row is not None:
                     # The orphan may vanish on its own between SELECT and KILL.
                     with contextlib.suppress(Exception):
-                        cur.execute(f"KILL {int(thread_id)}")
+                        cur.execute(f"KILL {int(row[0])}")
                         killed = True
         finally:
             conn.close()

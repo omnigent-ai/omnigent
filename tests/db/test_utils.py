@@ -232,31 +232,9 @@ def test_run_write_transaction_retries_transient_disconnect(
     """A mid-statement MySQL disconnect invalidates the connection; the write
     transaction must replay like a deadlock victim so the item persists,
     instead of propagating the OperationalError and losing the write."""
-    from collections.abc import Iterator
-    from contextlib import contextmanager
-
-    import pymysql
     from sqlalchemy.exc import DBAPIError
 
-    class NamedMaker:
-        def __init__(self) -> None:
-            self.engine = MagicMock()
-            self.engine.dialect.name = "mysql"
-            self.query_name_prefix = "omnigent.test"
-            self.sessions: list[MagicMock] = []
-
-        @contextmanager
-        def __call__(self, query_name: str) -> Iterator[MagicMock]:
-            session = MagicMock()
-            self.sessions.append(session)
-            try:
-                yield session
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-
-    maker = NamedMaker()
+    maker = _make_write_maker("mysql")
     monkeypatch.setattr(
         "omnigent.db.utils.record_transaction_retry",
         lambda operation, outcome: None,
@@ -268,9 +246,9 @@ def test_run_write_transaction_retries_transient_disconnect(
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            orig = pymysql.err.OperationalError(
-                errno, "Lost connection to MySQL server during query"
-            )
+            # Only connection_invalidated/statement are inspected, not the DBAPI
+            # error type, so a plain Exception reproduces the 2013/2006 disconnect.
+            orig = Exception(f"({errno}, 'Lost connection to MySQL server during query')")
             raise DBAPIError(
                 "UPDATE conversations SET next_position=%(next_position)s",
                 {},
