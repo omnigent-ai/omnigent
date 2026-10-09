@@ -9,18 +9,16 @@ import io
 import os
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 import pytest
 
 from tests.e2e._harness_probes import cli_unavailable_reason
+from tests.e2e._native_resume_helpers import cli_env, omnigent_console_script
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 pexpect = pytest.importorskip("pexpect")
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _TMUX_DIAG_MARKER = "failing-tmux-shim-diagnostic: new-session refused by shim"
 _TMUX_VERSION_LINE = "tmux 3.4"
@@ -34,17 +32,10 @@ _LOG_SETTLE_TIMEOUT_S = 30
 
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 
-# Ambient credentials, runner identity, proxies and HOME-derived XDG dirs would
-# route the auto-spawned local stack away from the isolated per-test dirs.
-_STALE_ENV_VARS = (
-    "DATABRICKS_TOKEN",
-    "ANTHROPIC_API_KEY",
+# Beyond cli_env()'s strip list: provider keys, proxies and HOME-derived XDG dirs
+# would route the auto-spawned local stack away from the isolated per-test dirs.
+_EXTRA_STALE_ENV_VARS = (
     "OPENAI_API_KEY",
-    "OMNIGENT_RUNNER_ID",
-    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
-    "RUNNER_SERVER_URL",
-    "OMNIGENT_RUNNER_WORKSPACE",
-    "TMUX",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
@@ -86,19 +77,15 @@ def _journey_env(
     shim_dir: Path, config_home: Path, data_dir: Path, home_dir: Path
 ) -> dict[str, str]:
     """Isolated environment for the ``omnigent pi`` subprocess and everything it spawns."""
-    env = dict(os.environ)
-    for stale in _STALE_ENV_VARS:
+    env = cli_env()
+    for stale in _EXTRA_STALE_ENV_VARS:
         env.pop(stale, None)
     env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
     env["OMNIGENT_DATA_DIR"] = str(data_dir)
     env["HOME"] = str(home_dir)
-    env["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
-    env["TERM"] = "xterm-256color"
     env["LINES"] = str(_PTY_ROWS)
     env["COLUMNS"] = str(_PTY_COLS)
-    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
-    env["OMNIGENT_SKIP_ONBOARD"] = "1"
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
     env["PI_TEST_API_KEY"] = "mock-key"
@@ -148,8 +135,7 @@ def test_pi_terminal_ensure_failure_keeps_tmux_diagnostic(tmp_path: Path) -> Non
     home_dir.mkdir()
     env = _journey_env(shim_dir, config_home, data_dir, home_dir)
 
-    omnigent = Path(sys.executable).parent / "omnigent"
-    assert omnigent.is_file(), f"omnigent console script not found at {omnigent}"
+    omnigent = omnigent_console_script()
 
     captured = io.BytesIO()
     child = pexpect.spawn(

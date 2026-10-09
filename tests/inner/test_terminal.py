@@ -2185,8 +2185,10 @@ async def _failed_launch_error(
         stderr: object,
         env: dict[str, str],
     ) -> _ProcessWithStdout:
-        """Ignore the argv and hand back the configured failing process."""
-        del cmd, stdout, stderr, env
+        """Check both streams are captured, then hand back the failing process."""
+        del cmd, env
+        assert stdout is asyncio.subprocess.PIPE
+        assert stderr is asyncio.subprocess.PIPE
         return process
 
     monkeypatch.setattr(
@@ -2270,7 +2272,15 @@ async def test_launch_failure_names_silent_exit_real_tmux(
     async def spawn(*cmd: str, **kwargs: object) -> asyncio.subprocess.Process:
         return await real_create_subprocess_exec(*cmd, preexec_fn=forbid_child_processes, **kwargs)
 
-    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=terminal_mod.asyncio.subprocess,
+            to_thread=terminal_mod.asyncio.to_thread,
+        ),
+    )
     instance = TerminalInstance(
         name="pi",
         session_key="main",
@@ -2279,8 +2289,11 @@ async def test_launch_failure_names_silent_exit_real_tmux(
         command=sys.executable,
     )
 
-    with pytest.raises(RuntimeError) as excinfo:
-        await instance.launch(cwd=tmp_path)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await instance.launch(cwd=tmp_path)
+    finally:
+        await instance.close()
 
     message = str(excinfo.value)
     assert message.startswith("tmux launch failed (rc=1): ")
