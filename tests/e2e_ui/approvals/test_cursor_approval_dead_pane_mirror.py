@@ -1,44 +1,13 @@
-"""E2E: a cursor-native web approval on a dead pane must not vanish as a raw ERROR.
+"""E2E (UI): approving a Cursor card after its pane died settles it and shows a notice.
 
-The runner-side cursor-native mirror parks a gated tool call on the
-``cursor-permission-request`` hook and, on the web verdict, delivers a ``y``
-keystroke into the cursor TUI's tmux pane
-(``omnigent.harnesses.cursor_native.permissions._send_cursor_keys`` →
-``bridge.send_cursor_pane_keys`` → ``tmux -S <socket> send-keys``). The parked
-hook waits on the human for up to a day, and nothing re-checks the pane in the
-meantime — so when the tmux server backing the pane dies while the card is
-parked (terminal teardown, temp-dir cleanup, machine sleep), the Approve click
-drives ``send-keys`` at a stale ``tmux.json`` advert and fails with
-``RuntimeError: tmux command failed (rc=1): error connecting to …/tmux.sock
-(No such file or directory)``. On the buggy build ``_send_cursor_keys``
-swallows that into a raw ``logger.exception("failed to send cursor keystroke
-…")`` ERROR — the fleet-scraped delivery-failure signature — and returns
-``False``, which ``_run_one_approval`` ignores entirely.
-
-The user-observable failure: the card flips to its "Approved" responded state
-as if the verdict landed, but cursor never received the keystroke — the
-approval is silently dropped, with no user-facing feedback and no structured
-error reason, only the unhandled-looking ERROR + traceback in the runner log.
-
-This test drives the REAL production path end-to-end minus the Cursor TUI
-itself (CI has no Cursor login, so a live ``cursor-agent`` turn cannot run —
-the same gap that makes ``test_cursor_native_approval.py`` skip, and the same
-stand-in lane as ``test_cursor_multiselect_question.py``): a background thread
-runs the actual runner mirror coroutine ``_run_one_approval`` with a
-transcript-shaped pending Shell call, pointed at the live spawned server; a
-REAL tmux server backs the pane and is advertised via the real
-``write_tmux_target``. The server parks the elicitation, the SPA renders the
-card in a real browser, the tmux server is killed (and its socket removed —
-the reported ENOENT state) while the card is parked, and the user clicks
-Approve.
-
-The regression contract asserted: delivering a web approval verdict to a pane
-whose tmux server is gone must be *handled* — a pane-liveness check, a
-structured/attributed reason, and user-facing feedback in the chat — not
-swallowed as the raw ``failed to send cursor keystroke`` ERROR with the
-tmux-connect traceback. On the buggy build exactly that record is emitted when
-Approve is clicked (and no feedback is shown), and the assertions fail —
-exactly this bug.
+Mirror lane: a background thread runs the real ``_run_one_approval`` coroutine
+against the live spawned server with a transcript-shaped pending Shell call,
+while a real tmux server backs the pane via ``write_tmux_target``. The tmux
+server is killed and its socket removed while the card is parked, then the
+user clicks Approve. Asserts the card settles, the chat shows an undelivered-
+response notice, and the mirror records no raw keystroke ERROR. Needs tmux but
+no Cursor login; ``test_cursor_approval_dead_pane.py`` covers the same journey
+through the real runner-launched ``cursor-agent`` pane.
 """
 
 from __future__ import annotations
@@ -67,9 +36,7 @@ _APPROVAL_CARD = '[data-testid="approval-card"]'
 
 _MOCK_ELICITATION_TIMEOUT_MS = 15_000
 
-# The exact message prefix of the raw delivery-failure ERROR record
-# (omnigent.harnesses.cursor_native.permissions._send_cursor_keys) that the
-# buggy build emits when the verdict keystroke hits a dead tmux socket.
+# Message prefix of the raw delivery-failure ERROR this test must not observe.
 _KEYSTROKE_ERROR_PREFIX = "failed to send cursor keystroke"
 
 # The gated call the mirror detects in cursor's store.db — shaped exactly like
@@ -218,11 +185,7 @@ def test_cursor_approval_on_dead_pane_is_not_silently_dropped(
             f"cursor approval mirror failed: {mirror_result['error']}"
         ) from mirror_result["error"]  # type: ignore[misc]
 
-    # THE BUG: the web verdict's keystroke hit the dead socket and was swallowed
-    # as a raw `failed to send cursor keystroke` ERROR — the approval silently
-    # went nowhere while the card claims "Approved". A fixed build handles
-    # dead-pane delivery (liveness check, structured/attributed reason) instead
-    # of emitting this exact unhandled-exception signature.
+    # A fixed build attributes dead-pane delivery instead of emitting this raw ERROR.
     dropped = [
         record
         for record in recorder.records

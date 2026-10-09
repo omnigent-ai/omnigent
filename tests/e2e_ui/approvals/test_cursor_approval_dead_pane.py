@@ -199,13 +199,13 @@ def test_cursor_approval_after_pane_socket_vanishes_notifies_user(
         expect(notice).to_be_visible(timeout=_VERDICT_TIMEOUT_MS)
 
         runner_log = _runner_log_text(session_id)
-        if runner_log is not None:
-            errors = [
-                line
-                for line in runner_log.splitlines()
-                if _KEYSTROKE_FAILURE in line and "ERROR" in line
-            ]
-            assert not errors, f"dead-pane keystroke failure logged as ERROR: {errors[0]}"
+        assert runner_log is not None, f"no runner process log mentions session {session_id}"
+        errors = [
+            line
+            for line in runner_log.splitlines()
+            if _KEYSTROKE_FAILURE in line and "ERROR" in line
+        ]
+        assert not errors, f"dead-pane keystroke failure logged as ERROR: {errors[0]}"
     finally:
         runner_log = _runner_log_text(session_id)
         if runner_log is not None:

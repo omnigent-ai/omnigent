@@ -1316,22 +1316,18 @@ async def test_run_one_question_dead_pane_notifies_user_instead_of_typing(
     monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: None)
     sent_keys: list[tuple[str, ...]] = []
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda _d, *keys: sent_keys.append(keys))
-    posts: list[tuple[str, dict]] = []
-
-    class _Resp:
-        status_code = 200
-        content = b"x"
-
-        def json(self) -> dict:
-            return {"action": "accept", "content": {"demo_topic": "A fun preference question"}}
-
-    class _Client:
-        async def post(self, url: str, json: dict | None = None, **_k):
-            posts.append((url, json or {}))
-            return _Resp()
+    client = _QueueClient(
+        [
+            httpx.Response(
+                200,
+                json={"action": "accept", "content": {"demo_topic": "A fun preference question"}},
+            ),
+            httpx.Response(200),
+        ]
+    )
 
     await cnp._run_one_question(
-        _Client(),
+        client,  # type: ignore[arg-type]
         session_id="conv_q_dead",
         bridge_dir=tmp_path,
         call=CursorPendingToolCall("tc", "AskQuestion", _ASKQUESTION_ARGS),
@@ -1339,8 +1335,8 @@ async def test_run_one_question_dead_pane_notifies_user_instead_of_typing(
     )
 
     assert sent_keys == []
-    notices = [(u, j) for u, j in posts if j.get("type") == "external_assistant_message"]
-    assert notices, f"no chat notice posted; posts={posts!r}"
+    notices = [(u, j) for u, j in client.posts if j.get("type") == "external_assistant_message"]
+    assert notices, f"no chat notice posted; posts={client.posts!r}"
     assert "could not be delivered" in notices[0][1]["data"]["text"]
 
 
