@@ -462,6 +462,13 @@ def _plugin_install_paths(
                     ", ".join(str(root) for root in plugin_roots),
                 )
                 continue
+            # Python 3.13+ returns a dead path for a symlink loop instead of
+            # raising; only an existing directory can be the plugin's install.
+            if not resolved.is_dir():
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is not a directory", key, path
+                )
+                continue
             out[key] = resolved
             break
     return out
