@@ -364,8 +364,8 @@ async def verify(
                                 snapshot.raise_for_status()
                                 backfills.append(snapshot.text)
                                 stream_ready.set()
-                except httpx.HTTPError:
-                    pass
+                except httpx.HTTPError as exc:
+                    report["last_stream_error"] = f"{type(exc).__name__}: {exc}"
                 finally:
                     stream_ready.clear()
                 await asyncio.sleep(0.2)

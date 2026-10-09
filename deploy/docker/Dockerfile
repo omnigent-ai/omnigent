@@ -75,6 +75,7 @@ ARG NODE_VERSION=22
 FROM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
+ENV PNPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 WORKDIR /web
 
 # Workspace manifests + lockfile first so the install layer caches across pure
