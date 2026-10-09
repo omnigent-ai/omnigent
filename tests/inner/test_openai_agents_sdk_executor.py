@@ -2638,10 +2638,8 @@ async def test_connection_error_keeps_connection_error_classification() -> None:
         "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
         return_value=_fake_agents_sdk(),
     ):
-        # Accept either shape the adapter can classify: the executor re-raising the
-        # typed exception (current behavior) or yielding a coded ExecutorError. Only
-        # the SDK's own exception is caught, so an unrelated setup failure still fails
-        # the test instead of being misread as the connection error.
+        # Catch only the SDK's own exception so an unrelated setup failure fails
+        # loudly; accept either shape the adapter classifies (re-raise or coded event).
         try:
             events = await _collect(
                 executor.run_turn(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -154,6 +155,6 @@ def test_refused_model_connection_keeps_connection_error_code(
                 respawned.terminate()
                 try:
                     respawned.wait(timeout=5)
-                except Exception:
+                except subprocess.TimeoutExpired:
                     respawned.kill()
                     respawned.wait(timeout=5)
