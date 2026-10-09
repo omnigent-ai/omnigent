@@ -200,6 +200,47 @@ async def test_create_with_empty_metadata_sends_json_object() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_forwards_terminal_launch_args_and_host_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            captured["body"] = request.content
+            return httpx.Response(201, json={"session_id": "conv_abc"})
+        return httpx.Response(200, json=_session_response_body(items=[]))
+
+    launch_args = [
+        "--disallowedTools",
+        "AskUserQuestion",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create(
+            b"bundle-bytes",
+            workspace="/tmp/proj",
+            host_id="host_abc",
+            terminal_launch_args=launch_args,
+        )
+    finally:
+        await client.aclose()
+
+    body = bytes(captured["body"])
+    assert b'name="metadata"' in body
+    assert (
+        json.dumps(
+            {
+                "workspace": "/tmp/proj",
+                "terminal_launch_args": launch_args,
+                "host_id": "host_abc",
+            }
+        ).encode()
+        in body
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_404_raises_omnigent_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
