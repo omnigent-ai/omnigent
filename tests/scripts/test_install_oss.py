@@ -326,3 +326,163 @@ def test_check_bubblewrap_missing_no_pkg_manager_warns_generically(
     assert "Install it with your package manager" in r.stderr, (
         f"With no package manager the warning should be generic, got {r.stderr!r}."
     )
+
+
+# ── Shared-install upgrade safety ────────────────────────────────────────────
+#
+# Hosts sharing one uv tool install can run the installer at the same moment,
+# while other processes keep executing from (and writing __pycache__ into) the
+# env being replaced. ``install_omnigent`` must serialize concurrent runs,
+# hand uv a fresh env path instead of an in-place delete of the live one, and
+# keep the previous env when the install fails. Driven with a fake ``uv``.
+
+_FAKE_UV_PRELUDE = """\
+#!/bin/sh
+if [ "$1" = tool ] && [ "$2" = dir ]; then
+  printf '%s\\n' "$UV_TOOL_DIR"
+  exit 0
+fi
+"""
+
+
+def _write_fake_uv(bindir: Path, install_body: str) -> None:
+    """Drop a fake ``uv`` into ``bindir`` that runs ``install_body`` for installs."""
+    bindir.mkdir(parents=True, exist_ok=True)
+    uv = bindir / "uv"
+    uv.write_text(_FAKE_UV_PRELUDE + install_body)
+    uv.chmod(0o755)
+
+
+def _uv_env(tmp_path: Path) -> dict[str, str]:
+    return {
+        "PATH": f"{tmp_path / 'bin'}:{os.environ.get('PATH', '')}",
+        "UV_TOOL_DIR": str(tmp_path / "uv-tools"),
+    }
+
+
+def test_concurrent_installer_runs_serialize(lib: Path, tmp_path: Path) -> None:
+    """Two installer runs never execute ``uv tool install`` at the same time.
+
+    Overlapping installs into one shared tool dir are what corrupt the env
+    when two auto-upgrading hosts fire the installer on the same poll.
+    """
+    log = tmp_path / "uv-invocations.log"
+    _write_fake_uv(
+        tmp_path / "bin",
+        f"printf 'start\\n' >>{shlex.quote(str(log))}\n"
+        "sleep 1\n"
+        f"printf 'end\\n' >>{shlex.quote(str(log))}\n"
+        'mkdir -p "$UV_TOOL_DIR/omnigent"\n'
+        "exit 0\n",
+    )
+    env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
+    env.update(_uv_env(tmp_path))
+    program = f". {shlex.quote(str(lib))}\ninstall_omnigent\nrelease_install_lock\n"
+    procs = [
+        subprocess.Popen(
+            [SH, "-c", program],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    for p in procs:
+        _out, err = p.communicate(timeout=60)
+        assert p.returncode == 0, f"installer run failed: rc={p.returncode}, stderr={err!r}"
+    events = log.read_text().split()
+    assert events == ["start", "end", "start", "end"], (
+        f"uv tool install invocations overlapped (event order {events}); both "
+        "hosts were inside the install of the shared env at once."
+    )
+
+
+def test_lock_is_held_until_released_after_verification(lib: Path, tmp_path: Path) -> None:
+    """``install_omnigent`` returns with the lock still held.
+
+    ``main`` releases it only after ``verify_omnigent``; a lock dropped at the
+    end of the install lets a second host park the fresh env mid-verify.
+    """
+    _write_fake_uv(tmp_path / "bin", 'mkdir -p "$UV_TOOL_DIR/omnigent"\nexit 0\n')
+    r = run(
+        lib,
+        "install_omnigent\n"
+        '[ -d "$UV_TOOL_DIR/.omnigent-installer.lock" ] || exit 9\n'
+        "release_install_lock\n"
+        '[ ! -e "$UV_TOOL_DIR/.omnigent-installer.lock" ] || exit 8\n',
+        env=_uv_env(tmp_path),
+    )
+    assert r.returncode == 0, (
+        f"rc={r.returncode} (9 = lock already gone after install_omnigent, "
+        f"8 = lock survived release): {r.stderr}"
+    )
+
+
+def test_upgrade_hands_uv_a_fresh_env_path(lib: Path, tmp_path: Path) -> None:
+    """Upgrading parks the previous env aside; uv never sees the live one.
+
+    An in-place ``--force`` reinstall makes uv delete the live env while host
+    processes still write into it, which can abort half-way (ENOTEMPTY).
+    """
+    tools = tmp_path / "uv-tools"
+    env_dir = tools / "omnigent"
+    env_dir.mkdir(parents=True)
+    (env_dir / "previous-build").write_text("old\n")
+    seen = tmp_path / "env-state-at-install.txt"
+    _write_fake_uv(
+        tmp_path / "bin",
+        f'if [ -e "$UV_TOOL_DIR/omnigent" ]; then printf present >{shlex.quote(str(seen))}; '
+        f"else printf absent >{shlex.quote(str(seen))}; fi\n"
+        'mkdir -p "$UV_TOOL_DIR/omnigent"\n'
+        "exit 0\n",
+    )
+    r = run(lib, "install_omnigent; release_install_lock", env=_uv_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert seen.read_text() == "absent", (
+        "the previous tool env was still at the live path when uv ran, so uv "
+        "would delete a directory that running hosts execute from."
+    )
+    assert env_dir.is_dir() and not (env_dir / "previous-build").exists(), (
+        "the fresh env should have replaced the parked previous one."
+    )
+    leftovers = [p.name for p in tools.iterdir() if p.name.startswith(".omnigent-old.")]
+    assert leftovers == [], f"the parked previous env was not removed: {leftovers}"
+
+
+def test_failed_install_keeps_previous_env(lib: Path, tmp_path: Path) -> None:
+    """A failed ``uv tool install`` leaves the previous working install in place."""
+    env_dir = tmp_path / "uv-tools" / "omnigent"
+    env_dir.mkdir(parents=True)
+    (env_dir / "previous-build").write_text("old\n")
+    _write_fake_uv(tmp_path / "bin", "exit 7\n")
+    r = run(lib, "install_omnigent", env=_uv_env(tmp_path))  # exits; EXIT trap frees the lock
+    assert r.returncode == 7, f"uv's failure status should propagate, got {r.returncode}."
+    assert (env_dir / "previous-build").exists(), (
+        "the previous install must survive a failed upgrade; hosts would not "
+        "start again from a half-installed env."
+    )
+
+
+def test_stale_installer_lock_is_reclaimed(lib: Path, tmp_path: Path) -> None:
+    """A lock left behind by a crashed installer (dead owner pid) does not block."""
+    lock = tmp_path / "uv-tools" / ".omnigent-installer.lock"
+    lock.mkdir(parents=True)
+    dead = subprocess.Popen([SH, "-c", "exit 0"])
+    dead.wait(timeout=10)
+    (lock / "pid").write_text(f"{dead.pid}\n")
+    _write_fake_uv(tmp_path / "bin", 'mkdir -p "$UV_TOOL_DIR/omnigent"\nexit 0\n')
+    r = run(lib, "install_omnigent; release_install_lock", env=_uv_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert not lock.exists(), "the reclaimed lock should be released after the install."
+
+
+def test_leftover_parked_env_is_reaped(lib: Path, tmp_path: Path) -> None:
+    """A parked env orphaned by an earlier run is removed by the next install."""
+    leftover = tmp_path / "uv-tools" / ".omnigent-old.99999"
+    leftover.mkdir(parents=True)
+    (leftover / "stale").write_text("stale\n")
+    _write_fake_uv(tmp_path / "bin", 'mkdir -p "$UV_TOOL_DIR/omnigent"\nexit 0\n')
+    r = run(lib, "install_omnigent; release_install_lock", env=_uv_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert not leftover.exists(), "stale parked envs should be reaped under the lock."
