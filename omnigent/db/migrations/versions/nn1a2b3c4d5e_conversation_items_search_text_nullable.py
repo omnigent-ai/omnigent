@@ -114,7 +114,10 @@ def _backfill_null_search_text() -> None:
             .values(search_text="")
         )
         if len(rows) < _BACKFILL_BATCH:
-            # The bounded final partial page commits together with the ALTER.
+            # The bounded final partial page commits with the ALTER, except on
+            # CockroachDB 23.2, which rejects DDL after writes in one transaction.
+            if dialect == "cockroachdb":
+                _commit_page(bind)
             break
         _commit_page(bind)
 
