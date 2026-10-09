@@ -6321,7 +6321,7 @@ export function NewChatLandingScreen() {
                             id="landing-branch-name"
                             type="text"
                             value={branchName}
-                            onChange={(e) => setBranchName(e.target.value)}
+                            onChange={(e) => setBranchName(e.target.value.replaceAll(" ", "-"))}
                             placeholder="feature/my-branch"
                             // Suppress the browser's native autofill dropdown so it
                             // doesn't overlay our worktree combobox. `off` alone is
