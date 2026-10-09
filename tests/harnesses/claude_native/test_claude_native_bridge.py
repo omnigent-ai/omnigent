@@ -1615,6 +1615,7 @@ def test_read_transcript_rewrites_output_token_limit(tmp_path: Path, raw_text: s
 
     assert text.startswith("Output limit reached")
     assert "shorter" in text
+    assert "smaller pieces" in text
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in text
     assert "output token maximum" not in text
 

@@ -272,17 +272,11 @@ def test_classifies_budget_exhausted(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "budget_exhausted"
 
 
-# Claude Code's constant for a response that ended with stop_reason "max_tokens",
-# and the guidance the claude-native bridge rewrites it into.
+# Claude Code's constant for a response that ended with stop_reason "max_tokens".
 _RAW_OUTPUT_LIMIT_ERROR = (
     "API Error: Claude's response exceeded the 32000 output token maximum. "
     "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
     "environment variable."
-)
-_REWRITTEN_OUTPUT_LIMIT_ERROR = (
-    "Output limit reached — the response exceeded the model’s maximum output "
-    "length and was cut off. Ask for a shorter answer, or break the request "
-    "into smaller pieces and continue step by step."
 )
 
 
@@ -293,7 +287,6 @@ _REWRITTEN_OUTPUT_LIMIT_ERROR = (
         _RAW_OUTPUT_LIMIT_ERROR,
         # The constant without its "API Error: " prefix, at a raised limit.
         "Claude’s response exceeded the 64,000 output token maximum.",
-        _REWRITTEN_OUTPUT_LIMIT_ERROR,
         # The forwarder's category-only fallback when the StopFailure hook
         # carries no error_details.
         "Claude Code ended the turn with an API error (max_output_tokens).",
@@ -324,15 +317,31 @@ def test_output_limit_text_does_not_override_specific_failure_codes(code: str) -
     assert classify_native_turn_error(code, _RAW_OUTPUT_LIMIT_ERROR) == code
 
 
-def test_bridge_output_limit_guidance_is_classified() -> None:
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+def test_bridge_output_limit_guidance_is_classified(code: str) -> None:
     """The classifier keys on the bridge's rewrite, so the two must move together."""
     from omnigent.harnesses.claude_native.bridge import _OUTPUT_TOKEN_LIMIT_REPLACEMENT
 
-    assert _REWRITTEN_OUTPUT_LIMIT_ERROR == _OUTPUT_TOKEN_LIMIT_REPLACEMENT
-    assert (
-        classify_native_turn_error("native_turn_error", _OUTPUT_TOKEN_LIMIT_REPLACEMENT)
-        == "output_limit_exceeded"
+    assert classify_native_turn_error(code, _OUTPUT_TOKEN_LIMIT_REPLACEMENT) == (
+        "output_limit_exceeded"
     )
+
+
+def test_forwarder_output_limit_fallback_is_classified() -> None:
+    """The forwarder's category-only StopFailure detail must stay classifiable."""
+    from omnigent.harnesses.claude_native import forwarder
+    from omnigent.harnesses.claude_native.bridge import ClaudeHookRecord
+
+    record = ClaudeHookRecord(
+        event_cursor=5,
+        byte_offset=100,
+        event_name="StopFailure",
+        failure_category="max_output_tokens",
+    )
+    detail = forwarder._stop_failure_detail(record, session_id="conv_test")
+
+    assert detail is not None
+    assert classify_native_turn_error("native_turn_error", detail) == "output_limit_exceeded"
 
 
 def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:

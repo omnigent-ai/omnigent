@@ -120,6 +120,28 @@ def test_unattributed_failure_is_labelled_not_blank(
     assert record.attributes["origin"] == "unattributed"
 
 
+def test_output_limit_failure_logs_its_specific_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A relayed output-limit failure is logged under its own code, not the generic one."""
+    from omnigent.runner.launch_failure import classify_native_turn_error
+
+    detail = "Claude Code ended the turn with an API error (max_output_tokens)."
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(
+            code=classify_native_turn_error("native_turn_error", detail), message=detail
+        ),
+        origin="external_session_status",
+        previous="idle",
+    )
+    message = record.getMessage()
+    assert "code=output_limit_exceeded" in message
+    assert "code=native_turn_error" not in message
+    assert message.endswith(f": {detail}")
+    assert record.attributes["code"] == "output_limit_exceeded"
+
+
 def _failure_publish_calls(source: str) -> list[ast.Call]:
     """Return ``_publish_status`` calls that can publish a failure."""
     calls: list[ast.Call] = []

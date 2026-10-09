@@ -14,6 +14,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import (
@@ -96,7 +97,7 @@ def _error_pill_text(page: Page) -> str:
         return ""
     parts: list[str] = []
     # Pill may detach mid-read; its headline and text are best-effort.
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(PlaywrightError):
         headline = pill.first.locator('[data-testid="error-headline"]')
         if headline.count() > 0:
             parts.append(headline.first.get_attribute("title") or "")
@@ -107,7 +108,7 @@ def _error_pill_text(page: Page) -> str:
 def _assistant_bubble_text(page: Page) -> str:
     """Return every assistant bubble's visible text, newline-joined (``""`` when none)."""
     # Bubbles can re-render mid-read; their text is best-effort.
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(PlaywrightError):
         return "\n".join(page.locator(_ASSISTANT).all_inner_texts())
     return ""
 
@@ -144,38 +145,11 @@ def _turn_settled(page: Page, status: str) -> bool:
 
 def _expand_error_pill(page: Page) -> None:
     """Best-effort: open the error pill so its full message is on screen."""
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(PlaywrightError):
         pill = page.locator(_ERROR_PILL).first
         pill.scroll_into_view_if_needed(timeout=5_000)
         pill.locator('button[aria-expanded="false"]').first.click(timeout=5_000)
         expect(pill.get_by_test_id("error-message-content")).to_be_visible(timeout=5_000)
-
-
-def _turn_failure_log_lines(
-    tmp_path_factory: pytest.TempPathFactory, session_id: str
-) -> list[str]:
-    """Return the fixture-spawned server's 'session turn failed' lines for *session_id*.
-
-    Reads the server's stdout capture and the log file it announces at startup.
-    Empty when the server log is not local (a workflow-owned server).
-    """
-    needle = f"session turn failed for {session_id}"
-    logs = list(tmp_path_factory.getbasetemp().glob("e2e_ui_server*/server.log"))
-    for stdout_log in list(logs):
-        with contextlib.suppress(OSError):
-            logs.extend(
-                Path(match.group(1))
-                for match in re.finditer(r"^\s*log:\s+(\S+)", stdout_log.read_text(), re.M)
-            )
-    lines: list[str] = []
-    for log in dict.fromkeys(logs):
-        with contextlib.suppress(OSError):
-            lines.extend(
-                line.rstrip()
-                for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
-                if needle in line
-            )
-    return lines
 
 
 @pytest.mark.nightly
@@ -184,7 +158,6 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     request: pytest.FixtureRequest,
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
-    tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     """A turn that hits Claude's output-token max must not strand the user on the raw CLI error.
 
@@ -261,10 +234,10 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     # transient API error here must not discard the diagnostics.
     with contextlib.suppress(httpx.HTTPError):
         snapshot = _session_snapshot(base_url, session_id)
-        hits = hits or _raw_constant_surfaces(page, base_url, session_id, snapshot)
+        fresh = _raw_constant_surfaces(page, base_url, session_id, snapshot)
+        hits = fresh or hits
     status = str(snapshot.get("status") or "")
     last_task_error = snapshot.get("last_task_error") or {}
-    log_lines = _turn_failure_log_lines(tmp_path_factory, session_id)
     _expand_error_pill(page)
     print(
         "fault turn outcome:",
@@ -275,7 +248,6 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
                 "raw_constant_surfaces": hits,
                 "assistant_bubbles": _assistant_bubble_text(page),
                 "error_pill": _error_pill_text(page),
-                "server_turn_failure_log": log_lines,
             },
             ensure_ascii=False,
         ),
@@ -310,7 +282,7 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     elif last_task_error.get("code") != _OUTPUT_LIMIT_CODE:
         problems.append(
             f"the failed turn was not attributed to {_OUTPUT_LIMIT_CODE!r} "
-            f"(last_task_error={last_task_error!r}; server log={log_lines!r}), so the "
+            f"(last_task_error={last_task_error!r}), so the "
             "model's output cap is counted as an Omnigent turn failure instead of an "
             "upstream limit."
         )
@@ -318,13 +290,6 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
         problems.append(
             f"the chat does not show the {_OUTPUT_LIMIT_GUIDANCE!r} guidance for the "
             "failed turn, so the user has nothing to act on."
-        )
-    # The log is only readable for the fixture-spawned server; an external
-    # --ui-base-url server yields no lines and skips this check.
-    if log_lines and not any(f"code={_OUTPUT_LIMIT_CODE}" in line for line in log_lines):
-        problems.append(
-            f"the server's turn-failure log does not attribute the turn to "
-            f"{_OUTPUT_LIMIT_CODE!r}: {log_lines!r}"
         )
     if problems:
         # Hold the failure state on screen so the recording ends on it.

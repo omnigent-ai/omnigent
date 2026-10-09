@@ -116,13 +116,17 @@ async def test_streamed_stop_reason_override_reaches_message_delta(thinking: str
             },
         )
         assert response.status_code == 200
-        deltas = [
+        events = [
             json.loads(line.removeprefix("data: "))
             for line in response.text.splitlines()
-            if line.startswith("data: ") and '"message_delta"' in line
+            if line.startswith("data: ")
         ]
+        deltas = [event for event in events if event.get("type") == "message_delta"]
         assert [delta["delta"]["stop_reason"] for delta in deltas] == ["max_tokens"]
-        assert ('"type": "thinking"' in response.text) == (thinking is not None)
+        has_thinking = any(
+            event.get("content_block", {}).get("type") == "thinking" for event in events
+        )
+        assert has_thinking == (thinking is not None)
 
 
 async def test_nonstream_stop_reason_override_reaches_message() -> None:

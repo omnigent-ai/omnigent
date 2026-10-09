@@ -818,8 +818,9 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
-    # Overrides the terminal ``stop_reason`` of a ``/v1/messages`` text reply;
-    # ``"max_tokens"`` scripts a reply cut off by the model's output-token limit.
+    # Overrides the terminal ``stop_reason`` of a ``/v1/messages`` text reply (plain or
+    # thinking); ``"max_tokens"`` scripts a reply cut off by the model's output-token
+    # limit. Tool-call and refusal replies keep their own reason and ignore it.
     stop_reason: str | None = None
     # Seconds to sleep between SSE events on ``/v1/messages`` and
     # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
