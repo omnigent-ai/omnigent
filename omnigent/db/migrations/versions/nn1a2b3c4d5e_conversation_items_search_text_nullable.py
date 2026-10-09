@@ -1,7 +1,7 @@
 """Make conversation_items.search_text nullable.
 
-Revision ID: mm1a2b3c4d5e
-Revises: ll1a2b3c4d5e
+Revision ID: nn1a2b3c4d5e
+Revises: mm1a2b3c4d5e
 Create Date: 2026-09-25 00:00:00.000000
 
 Opaque-data stores return None from _item_search_text and omit the column
@@ -14,8 +14,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "mm1a2b3c4d5e"
-down_revision: str | None = "ll1a2b3c4d5e"
+revision: str = "nn1a2b3c4d5e"
+down_revision: str | None = "mm1a2b3c4d5e"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -1,19 +1,15 @@
 """Conversation items must persist when the store's search-text seam returns None.
 
-On the reported build the conversation store holds item ``data`` opaquely, so
-``SqlAlchemyConversationStore._item_search_text`` returns ``None`` (its documented
-seam) and ``append()`` drops ``search_text`` from the INSERT. The mainline schema
-declares that column NOT NULL, so every persist aborts with
-``NOT NULL constraint failed: conversation_items.search_text``: the first user
-message posted to ``POST /v1/sessions/{id}/events`` returns HTTP 500 and the runner
+A deployment whose conversation store holds item ``data`` opaquely cannot extract
+plaintext for FTS, so ``SqlAlchemyConversationStore._item_search_text`` returns
+``None`` (its documented seam) and ``append()`` drops ``search_text`` from the
+INSERT. The mainline schema declares that column NOT NULL, so every persist aborts
+with ``NOT NULL constraint failed: conversation_items.search_text``: the first user
+message posted to ``POST /v1/sessions/{id}/events`` returns HTTP 500, and the runner
 relay silently loses a ``session.resource.deleted`` terminal teardown event.
 
 The default store never returns ``None`` from the seam, so a minimal subclass stands
 in for the deployed store, wired into the real app and the real relay loop.
-
-Usage::
-
-    pytest tests/e2e/test_opaque_store_route_persistence_e2e.py -v
 """
 
 from __future__ import annotations
