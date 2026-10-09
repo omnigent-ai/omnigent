@@ -2,7 +2,7 @@
 #
 # Debby never answers from a single model. Every question she receives is
 # fanned out to BOTH a Claude sub-agent and a GPT sub-agent — two plain
-# (non-coding) responders running on the claude-sdk and codex
+# (non-coding) responders running on the claude-sdk and codex-native
 # harnesses — and she shows you what each one thinks, side by side.
 #
 # Load the `debate` skill (highlighted as a chip on her empty surface) to

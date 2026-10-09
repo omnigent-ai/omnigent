@@ -4,9 +4,9 @@ description: >-
   Plain GPT brainstorming responder — answers a question on its own merits,
   and (during a debate) critiques the other partner's answer.
 
-# Native Codex harness (like Polly's codex worker) with no model pinned.
-# codex-native authenticates to a managed Databricks host through the credential
-# broker, without the SDK codex harness's os_env sandbox and model-egress grant.
+# Native Codex harness (like Polly's codex worker), no model pinned. The GPT
+# head uses the configured OpenAI provider, or the credential broker on a
+# managed Databricks host, without the SDK codex harness's os_env sandbox.
 executor:
   type: omnigent
   config:
