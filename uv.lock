@@ -3443,7 +3443,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14,<15" },
     { name = "sherpa-onnx", marker = "extra == 'dictation'", specifier = ">=1.13,<2" },
     { name = "sherpa-onnx-core", marker = "extra == 'dictation'", specifier = ">=1.13,<2" },
-    { name = "sqlalchemy", specifier = ">=2.0,<3" },
+    { name = "sqlalchemy", specifier = ">=2.0,<2.1" },
     { name = "sqlalchemy-cockroachdb", marker = "extra == 'cockroachdb'", specifier = ">=2.0,<3" },
     { name = "starlette", specifier = ">=1.0.1,<2" },
     { name = "tiktoken", specifier = ">=0.7,<1" },
