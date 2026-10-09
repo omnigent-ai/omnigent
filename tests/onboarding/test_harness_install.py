@@ -696,6 +696,91 @@ def test_try_install_harness_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -
     assert reason is not None and "code 1" in reason
 
 
+@pytest.mark.parametrize("returncode", [1, -15])
+def test_try_install_rejects_nonzero_exit_with_resolved_binary(
+    monkeypatch: pytest.MonkeyPatch, returncode: int
+) -> None:
+    """A failed installer cannot be successful just because a binary remains."""
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: "/usr/bin/npm" if name == "npm" else None,
+    )
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(args=argv, returncode=returncode),
+    )
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason == f"installer exited with code {returncode}"
+
+
+@pytest.mark.parametrize("version", ["0.0.1", "dev-SNAPSHOT"])
+def test_try_install_rejects_incompatible_or_unparseable_version(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    """A successful command still fails when the resulting CLI is unusable."""
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: "/usr/bin/npm" if name == "npm" else None,
+    )
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: "/usr/bin/codex")
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+
+    assert installed is False
+    assert reason is not None and "unsupported" in reason
+
+
+def test_try_install_invalidates_cached_version_after_an_upgrade(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unchanged launcher signature cannot preserve a pre-install version."""
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    signature = hi._binary_signature(str(binary))
+    assert signature is not None
+    monkeypatch.setattr(hi, "_VERSION_PROBE_CACHE", {signature: "0.0.1"})
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: "/usr/bin/npm" if name == "npm" else None,
+    )
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    probe_kinds: list[str] = []
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            probe_kinds.append("version")
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="codex-cli 0.137.0\n", stderr=""
+            )
+        probe_kinds.append("install")
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    assert probe_kinds == ["install", "version"]
+    assert hi._VERSION_PROBE_CACHE[signature] == "0.137.0"
+
+
 def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful install → ``(True, None)``; the bool wrapper agrees."""
     state = {"installed": False}
@@ -708,6 +793,10 @@ def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> Non
         return None
 
     def _run(argv: list[str], **k: object):
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="codex-cli 0.137.0\n", stderr=""
+            )
         state["installed"] = True
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
@@ -778,11 +867,15 @@ def test_try_install_prepends_resolved_dir_so_login_can_find_binary(
     (npm_dir / "npm").chmod(0o755)
     monkeypatch.setenv("PATH", str(npm_dir))
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
-    )
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="codex-cli 0.137.0\n", stderr=""
+            )
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
 
     # Before: a bare PATH lookup (what harness_login uses) can't find codex.
     assert shutil.which("codex") is None
@@ -807,7 +900,11 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
             return "/usr/bin/codex" if state["installed"] else None
         return None
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+    def _run(argv: list[str], **kwargs: object):
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="codex-cli 0.137.0\n", stderr=""
+            )
         calls.append(argv)
         state["installed"] = True
         return subprocess.CompletedProcess(args=argv, returncode=0)
@@ -833,7 +930,14 @@ def test_install_harness_cli_runs_hermes_installer_then_rechecks(
             return "/usr/local/bin/hermes"
         return None
 
-    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+    def _run(argv: list[str], **kwargs: object):
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="Hermes Agent v0.19.1 (2026.7.30)\n",
+                stderr="",
+            )
         calls.append(argv)
         state["installed"] = True
         return subprocess.CompletedProcess(args=argv, returncode=0)
@@ -871,11 +975,18 @@ def test_install_harness_cli_refreshes_user_local_bin(
     (bin_dir / "bash").chmod(0o755)
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (user_bin,))
-    monkeypatch.setattr(
-        hi.subprocess,
-        "run",
-        lambda argv, *, check=False, timeout=None: subprocess.CompletedProcess(argv, 0),
-    )
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="Hermes Agent v0.19.1 (2026.7.30)\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
 
     assert hi.install_harness_cli(hi.HERMES_KEY) is True
     # The resolving dir (~/.local/bin) is now first on PATH, so a bare

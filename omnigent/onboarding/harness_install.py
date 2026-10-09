@@ -814,6 +814,18 @@ def _binary_signature(binary: str) -> tuple[str, int, int] | None:
     return (binary, stat.st_mtime_ns, stat.st_size)
 
 
+def _invalidate_version_probe_cache(binary: str) -> None:
+    """Forget cached versions for *binary* after an install attempt.
+
+    Package managers can replace dependencies behind a stable launcher without
+    changing that launcher's path, mtime, or size. The next post-install probe
+    must therefore run even when the cached signature still matches.
+    """
+    with _PROBE_CACHE_LOCK:
+        for cache_key in [key for key in _VERSION_PROBE_CACHE if key[0] == binary]:
+            _VERSION_PROBE_CACHE.pop(cache_key, None)
+
+
 def _harness_cli_version_satisfies(
     spec: HarnessInstallSpec,
     binary: str,
@@ -1104,22 +1116,26 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # via the ladder — the spurious "failed" toast next to a green "ready" tick.
     resolved = resolve_cli_binary(spec.binary)
     if resolved is not None:
-        # Put the resolving dir on ``PATH`` for this process so the setup
-        # wizard's *later* steps — harness_login / harness_cli_logged_in /
-        # harness_logout — which shell out with the bare binary name and only
-        # bare ``shutil.which``, can find it too. Without this, an install that
-        # succeeded via a fallback dir (nvm/homebrew/…) would be followed by a
-        # login step that can't locate the very binary just installed.
-        resolved_dir = str(Path(resolved).resolve().parent)
-        path_entries = os.environ.get("PATH", "").split(os.pathsep)
-        if resolved_dir not in path_entries:
-            os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
-        return HarnessInstallResult(True, None)
+        _invalidate_version_probe_cache(resolved)
     if result.returncode != 0:
         return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
-    return HarnessInstallResult(
-        False, f"installer completed but {spec.binary!r} could not be found"
-    )
+    if resolved is None:
+        return HarnessInstallResult(
+            False, f"installer completed but {spec.binary!r} could not be found"
+        )
+    if not _harness_cli_version_satisfies(spec, resolved):
+        return HarnessInstallResult(
+            False,
+            f"installed {spec.binary!r}, but its version is unsupported or could not be verified",
+        )
+    # Put the resolving dir on ``PATH`` for this process so the setup wizard's
+    # later login steps, which shell out with the bare binary name, can find the
+    # binary just installed via a fallback dir (nvm/homebrew/…).
+    resolved_dir = str(Path(resolved).resolve().parent)
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if resolved_dir not in path_entries:
+        os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
+    return HarnessInstallResult(True, None)
 
 
 def install_harness_cli(key: str) -> bool:
