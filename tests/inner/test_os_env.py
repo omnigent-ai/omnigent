@@ -519,8 +519,7 @@ def test_shell_command_does_not_see_omnigent_project_root(
     assert str(_project_root()) not in out
 
 
-# Helper-spawn failures (e.g. fork EAGAIN) must surface a structured error
-# dict from request(), never raise the bare OS errno to the caller.
+# Helper-spawn failures (e.g. fork EAGAIN) must surface as structured error dicts.
 
 
 _RAW_FORK_EAGAIN = str(BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN)))
@@ -690,3 +689,39 @@ def test_helper_spawn_failure_releases_partial_state(
     assert client._egress_handle is None and egress.stopped
     assert client._egress_auth_token is None and client._egress_relay_port is None
     client.close()
+
+
+class _LostCopyOnWrite:
+    """Copy-on-write environment stand-in whose keeper has already died."""
+
+    def prepare(self, sandbox: object) -> None:
+        raise RuntimeError("Copy-on-write environment was lost; start a new environment")
+
+
+def test_helper_start_keeps_raising_non_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost copy-on-write environment still raises instead of becoming a result.
+
+    Only OS-level launch failures are turned into error dicts; callers of a
+    lost environment must keep failing closed.
+
+    :param tmp_path: Helper workspace.
+    :param monkeypatch: Guards ``subprocess.Popen``, which must not be reached.
+    """
+
+    def _unexpected_spawn(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the helper must not be spawned after prepare() fails")
+
+    monkeypatch.setattr("omnigent.inner.os_env.subprocess.Popen", _unexpected_spawn)
+    client = _HelperProcessClient(
+        cwd=tmp_path,
+        shell_path="/bin/sh",
+        sandbox=_inactive_policy(),
+        copy_on_write_environment=_LostCopyOnWrite(),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="lost"):
+            client.request({"op": "read", "path": "README.md", "offset": 1})
+    finally:
+        client.close()

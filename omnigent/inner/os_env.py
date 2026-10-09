@@ -440,10 +440,10 @@ class _HelperProcessClient:
 
         try:
             self._ensure_started_locked()
-        except Exception as exc:  # noqa: BLE001 — spawn failures (e.g. fork EAGAIN) are surfaced via error dict
-            # A helper that never started (fork EAGAIN under host process
-            # pressure, missing launcher, …) must surface a structured
-            # reason, not the bare OS errno.
+        except OSError as exc:
+            # Only OS-level launch failures (fork EAGAIN, missing launcher) become
+            # results; other startup errors, such as a lost copy-on-write
+            # environment, keep raising.
             self._stop_locked()
             return {"error": f"os_env helper failed to start: {exc}"}
         assert self._proc is not None
