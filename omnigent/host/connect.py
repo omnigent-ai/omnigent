@@ -4103,7 +4103,7 @@ class HostProcess:
                                 "connections but never responded on any of them."
                             )
                             # Log retryable silent-server outages as WARNING
-                            # with server attribution; ERROR means terminal.
+                            # with server attribution.
                             _logger.warning(
                                 "%s Treating the endpoint as unhealthy; "
                                 "reconnecting on slow backoff until it responds.",
