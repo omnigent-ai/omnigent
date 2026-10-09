@@ -337,10 +337,16 @@ def test_handoff_spells_out_footage_or_a_reason_on_every_handoff() -> None:
     assert "`recordings` and `recording_unavailable_reason` are a required pair" in rules
     assert "including one written after an interruption, salvage prompt, or retry" in rules
     assert (
+        "declare every selected clip — your after-clips and any recovered before-clips — "
+        "in `recordings`" in rules
+    )
+    assert (
         "A handoff with neither key, or with `[]` and an empty reason, drops the footage silently"
         in rules
     )
+    assert "inventory the `.webm` and `.mp4` files this session produced" in rules
     assert "including any under `.omnigent/repro-evidence/`" in rules
+    assert "discarded takes and raw recorder output are not declared" in rules
     assert (
         "A clip named only in `test_audit`, the PR Demo section, or an evidence directory "
         "is undeclared" in rules

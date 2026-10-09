@@ -21,14 +21,15 @@ the message. Same discipline as repro-agent:
   a value is empty (`""`, `[]`).
 - `recordings` and `recording_unavailable_reason` are a required pair on every
   handoff in every mode, including one written after an interruption, salvage
-  prompt, or retry. Spell the footage out: list every clip you produced or
-  recovered in `recordings`, or set `recordings: []` and give the concrete
-  reason. A handoff with neither key, or with `[]` and an empty reason, drops
-  the footage silently — the workflow attaches only declared entries and reports
-  the omission as unexplained. Before writing the handoff, list the `.webm` and
-  `.mp4` files this session produced, including any under
-  `.omnigent/repro-evidence/`, move each selected clip to
-  `recordings/<slug>/<kind>-<facet>.<ext>`, and declare it there. A clip named
+  prompt, or retry. Spell the footage out: declare every selected clip — your
+  after-clips and any recovered before-clips — in `recordings`, or set
+  `recordings: []` and give the concrete reason. A handoff with neither key, or
+  with `[]` and an empty reason, drops the footage silently — the workflow
+  attaches only declared entries and reports the omission as unexplained.
+  Before writing the handoff, inventory the `.webm` and `.mp4` files this
+  session produced, including any under `.omnigent/repro-evidence/`, move each
+  selected clip to `recordings/<slug>/<kind>-<facet>.<ext>`, and declare it
+  there; discarded takes and raw recorder output are not declared. A clip named
   only in `test_audit`, the PR Demo section, or an evidence directory is
   undeclared.
 - `mode` must be exactly `"reviewed_existing_pr"`, `"authored_fix"`, or
