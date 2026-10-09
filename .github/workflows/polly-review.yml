@@ -1,4 +1,5 @@
 name: Polly AI Review
+run-name: "Polly #${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }} @${{ inputs.expected_head || 'current' }}"
 
 # Spins up a local Omnigent server + runner inside the CI runner, starts a
 # Polly session with the PR diff, waits for the cross-vendor review to
@@ -7,7 +8,7 @@ name: Polly AI Review
 # Draft PRs are skipped (ready_for_review re-fires).
 #
 # Triggers:
-#   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
+#   - pull_request_target opened/reopened/ready_for_review (same-repo PRs)
 #   - `/review` comment on a PR (manual retrigger by write-access users, or
 #     any login in the REVIEW_ALLOWLIST repo variable, a JSON array of strings)
 #   - workflow_dispatch with a PR number (manual retrigger from Actions tab,
@@ -18,7 +19,7 @@ name: Polly AI Review
 # review. `/review force` or the manual force input overrides that.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
@@ -27,6 +28,10 @@ on:
       pr:
         description: PR number to review.
         required: true
+        type: string
+      expected_head:
+        description: Optional commit expected by the requesting Resolve session.
+        required: false
         type: string
       force:
         description: Review even if this PR commit already has a review.
@@ -43,14 +48,11 @@ env:
   PIP_INDEX_URL: https://pypi.org/simple
 
 jobs:
-  # Security precondition gate (security-gate.yml): untrusted PRs wait for
-  # the scan; trusted authors pass through. Only runs on pull_request events.
-  # issue_comment and workflow_dispatch are gated by write-access or the
-  # REVIEW_ALLOWLIST (author_association / login check, plus GitHub's dispatch
-  # auth). Manual runs use the selected workflow commit; the target PR is
-  # fetched only as a diff, so the scan is not applicable.
+  # Automatic runs use trusted base code and exclude forks. Manual runs require
+  # write access or REVIEW_ALLOWLIST membership; forks retain the approval relay.
+  # PR changes are fetched only as a diff, never executed here.
   gate:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/security-gate.yml
 
   trigger:
@@ -99,7 +101,8 @@ jobs:
     if: >-
       !cancelled() && (
         (
-          github.event_name == 'pull_request' &&
+          github.event_name == 'pull_request_target' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
           !github.event.pull_request.draft &&
           needs.gate.result == 'success'
         ) ||
@@ -339,6 +342,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
         run: |
           set -euo pipefail
 
@@ -348,6 +352,10 @@ jobs:
             > /tmp/pr_meta.json
           base_sha="$(jq -r .baseRefOid /tmp/pr_meta.json)"
           head_sha="$(jq -r .headRefOid /tmp/pr_meta.json)"
+          if [ -n "${EXPECTED_HEAD:-}" ] && [ "$EXPECTED_HEAD" != "$head_sha" ]; then
+            echo "::error::PR moved before review started (expected $EXPECTED_HEAD, found $head_sha); request the new commit."
+            exit 1
+          fi
           gh api "repos/${REPO}/compare/${base_sha}...${head_sha}" \
             -H "Accept: application/vnd.github.v3.diff" \
             > /tmp/pr_diff.txt
@@ -565,7 +573,11 @@ jobs:
           ### Tests
           Include a compact table with columns: Test / case, Behavior protected,
           Layer, Needed?, and Action / rationale. Use exact file paths and test/case
-          names. Account for every added, modified, or removed test; parameterized
+          names in the table. When only one test/support file changed, you may
+          name its exact path in the Tests subsection above the table and use
+          case names alone in the rows; otherwise include the file path in the
+          rows for each changed file.
+          Account for every added, modified, or removed test; parameterized
           cases may share a row only when their purpose and recommendation match.
           Use one of keep, consolidate, move layer, remove, or uncertain in Needed?,
           and explain each one. All five fields are required for each assessment row.
@@ -724,6 +736,14 @@ jobs:
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
+      # Resolve reads these runner-generated headers even if review later times out.
+      - name: Record review target
+        if: steps.ctx.outcome == 'success'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+        run: ':'
+
       - name: Mint App token
         id: app-token
         if: steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
@@ -875,7 +895,7 @@ jobs:
           echo "Created new comment"
 
       - name: Upload Polly completion receipt
-        if: steps.publish.outcome == 'success' && github.event_name != 'pull_request'
+        if: steps.publish.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}

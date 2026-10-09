@@ -151,7 +151,7 @@ def create_session_mcp_servers_router(
             agent_cache.load,
             agent.id,
             agent.bundle_location,
-            expand_env=agent.session_id is None,
+            expand_env=agent.operator_authored,
         )
         return {
             "object": "list",
@@ -330,7 +330,7 @@ def create_session_mcp_servers_router(
                 agent.id,
                 new_location,
                 new_bundle,
-                expand_env=agent.session_id is None,
+                expand_env=agent.operator_authored,
             )
         return new_spec
 

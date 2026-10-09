@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
@@ -48,10 +49,13 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentResultFrame,
     HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
@@ -80,6 +84,7 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
+_HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
@@ -375,8 +380,17 @@ def create_host_tunnel_router(
                 _sender_loop(ws, conn),
                 name=f"host-sender:{host_id}",
             )
+            heartbeat_requested = asyncio.Event()
+            heartbeat_task = asyncio.create_task(
+                _heartbeat_loop(
+                    heartbeat_requested,
+                    host_id=host_id,
+                    host_store=host_store,
+                ),
+                name=f"host-heartbeat:{host_id}",
+            )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
+                _ping_loop(ws, conn, host_id, heartbeat_requested),
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
@@ -393,24 +407,24 @@ def create_host_tunnel_router(
                 name=f"host-receive:{host_id}",
             )
 
-            if on_host_connect is not None:
-                try:
-                    await asyncio.wait_for(
-                        on_host_connect(host_id, tunnel_owner),
-                        timeout=30.0,
-                    )
-                except asyncio.TimeoutError:
-                    _logger.warning(
-                        "on_host_connect callback timed out for %s",
-                        host_id,
-                    )
-                except Exception:
-                    _logger.exception(
-                        "on_host_connect callback failed for %s",
-                        host_id,
-                    )
-
             try:
+                if on_host_connect is not None:
+                    try:
+                        await asyncio.wait_for(
+                            on_host_connect(host_id, tunnel_owner),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        _logger.warning(
+                            "on_host_connect callback timed out for %s",
+                            host_id,
+                        )
+                    except Exception:
+                        _logger.exception(
+                            "on_host_connect callback failed for %s",
+                            host_id,
+                        )
+
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -420,12 +434,13 @@ def create_host_tunnel_router(
                     if exc is not None:
                         raise exc
             finally:
-                for task in (sender_task, ping_task, receive_task):
+                for task in (sender_task, ping_task, receive_task, heartbeat_task):
                     task.cancel()
                 await asyncio.gather(
                     sender_task,
                     ping_task,
                     receive_task,
+                    heartbeat_task,
                     return_exceptions=True,
                 )
                 # If the host already reconnected, this handler's connection
@@ -857,10 +872,30 @@ async def _receive_loop(
             if skills_future is not None and not skills_future.done():
                 skills_future.set_result(frame)
             continue
+        if isinstance(frame, HostHarnessStartupResultFrame):
+            startup_future = conn.pending_harness_startup.pop(frame.request_id, None)
+            if startup_future is not None and not startup_future.done():
+                startup_future.set_result(frame.startup)
+            continue
         if isinstance(frame, HostMcpServersResultFrame):
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostPluginsResultFrame):
+            plugins_future = conn.pending_plugins.pop(frame.request_id, None)
+            if plugins_future is not None and not plugins_future.done():
+                plugins_future.set_result(frame)
+            continue
+        if isinstance(frame, HostSkillContentResultFrame):
+            content_future = conn.pending_skill_content.pop(frame.request_id, None)
+            if content_future is not None and not content_future.done():
+                content_future.set_result(frame)
+            continue
+        if isinstance(frame, HostMcpToolsResultFrame):
+            tools_future = conn.pending_mcp_tools.pop(frame.request_id, None)
+            if tools_future is not None and not tools_future.done():
+                tools_future.set_result(frame)
             continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
@@ -946,26 +981,87 @@ async def _receive_loop(
         )
 
 
+async def _heartbeat_loop(
+    requested: asyncio.Event,
+    *,
+    host_id: str,
+    host_store: HostStore,
+) -> None:
+    """Serialize host-liveness writes independently of socket pings."""
+    failure_count = 0
+    last_failure_log_at = 0.0
+    while True:
+        await requested.wait()
+        requested.clear()
+        started_at = time.monotonic()
+        try:
+            # Cancellation cannot stop the thread, but heartbeat only updates
+            # last-seen; a late write cannot change an offline host's status.
+            await asyncio.to_thread(host_store.heartbeat, host_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
+            failure_count += 1
+            now = time.monotonic()
+            if (
+                failure_count == 1
+                or now - last_failure_log_at >= _HEARTBEAT_FAILURE_LOG_INTERVAL_S
+            ):
+                _logger.warning(
+                    "Host %s heartbeat persistence failed (%s; failure %d)",
+                    host_id,
+                    type(exc).__name__,
+                    failure_count,
+                    extra=debug_event(
+                        "host_heartbeat_failed",
+                        host_id=host_id,
+                        failure_count=failure_count,
+                        error_type=type(exc).__name__,
+                        duration_s=round(time.monotonic() - started_at, 3),
+                        error_category=ErrorCategory.SERVER.value,
+                        error_impact=ErrorImpact.TRANSIENT.value,
+                        error_phase=ErrorPhase.UNKNOWN.value,
+                    ),
+                )
+                last_failure_log_at = now
+            continue
+
+        if failure_count:
+            _logger.info(
+                "Host %s heartbeat persistence recovered after %d failure(s)",
+                host_id,
+                failure_count,
+                extra=debug_event(
+                    "host_heartbeat_recovered",
+                    host_id=host_id,
+                    failure_count=failure_count,
+                    duration_s=round(time.monotonic() - started_at, 3),
+                    error_category=ErrorCategory.SERVER.value,
+                    error_impact=ErrorImpact.TRANSIENT.value,
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
+            )
+            failure_count = 0
+            last_failure_log_at = 0.0
+
+
 async def _ping_loop(
     ws: WebSocket,
     conn: HostConnection,
     host_id: str,
-    host_store: HostStore,
+    heartbeat_requested: asyncio.Event,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
-    Each tick that the host is still alive also persists a heartbeat
-    (``host_store.heartbeat``) so the host's last-seen timestamp stays
-    fresh in the DB. That timestamp is the liveness freshness gate
-    (:data:`omnigent.stores.host_store.HOST_LIVENESS_TTL_S`): when a
-    host dies without a graceful disconnect, the heartbeat stops, the
-    timestamp goes stale, and the host's sessions correctly drop out of
-    the connected set even though ``set_offline`` never ran.
+    Heartbeat persistence is signalled to a separate connection-owned worker,
+    so a slow or failing store cannot delay application pings or tear down the
+    socket route. The host's last-seen timestamp remains the liveness gate:
+    when a dead host stops responding, the ping timeout still closes it.
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection for timing checks.
     :param host_id: Host id for logging.
-    :param host_store: Persistent host store the heartbeat is written to.
+    :param heartbeat_requested: Event consumed by the heartbeat writer.
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
@@ -980,9 +1076,9 @@ async def _ping_loop(
             with contextlib.suppress(RuntimeError):
                 await ws.close(code=4003, reason="ping timeout")
             return
-        # The host is still within the liveness window — refresh its
-        # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        # Keep persistence off this task: a slow/failing store must not delay
+        # the application ping or terminate the socket route.
+        heartbeat_requested.set()
         try:
             ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
             conn.outbound_queue.put_nowait(ping_text)

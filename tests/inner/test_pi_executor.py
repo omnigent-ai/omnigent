@@ -3535,7 +3535,7 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     the shared Databricks default instead of ``None``.
 
     Failure means pi falls back to its own host default — an
-    Anthropic-direct id the Databricks AI gateway rejects, surfacing as a
+    Anthropic-direct id the Databricks Unity Gateway rejects, surfacing as a
     model error on the agent's first turn.
 
     Live discovery is stubbed unavailable so the resolver drops to the bundled
@@ -5240,3 +5240,502 @@ def test_run_turn_prompt_command_includes_streaming_behavior():
         "residual race against a still-alive Pi process queues instead of "
         f"surfacing the raw protocol error; got {cmd!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Settled turn boundary (pi >= 0.80.4): only ``agent_settled`` ends the turn.
+# ---------------------------------------------------------------------------
+
+_SETTLED_PI_VERSION = (0, 85, 1)
+_SESSION_KEY = "s1"
+_RETRYABLE_503 = "503 Service Unavailable: upstream overloaded, please retry"
+
+
+def _rpc_frame(**event) -> str:
+    return json.dumps(event)
+
+
+def _text_delta_frame(text: str) -> str:
+    return _rpc_frame(
+        type="message_update",
+        assistantMessageEvent={"type": "text_delta", "delta": text},
+    )
+
+
+def _assistant_message(
+    text: str = "", *, stop_reason: str = "stop", error_message: str | None = None
+) -> dict:
+    message: dict = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}] if text else [],
+        "stopReason": stop_reason,
+    }
+    if error_message is not None:
+        message["errorMessage"] = error_message
+    return message
+
+
+def _session_executor(
+    lines: list[str], *, pi_version: tuple[int, int, int] | None = _SETTLED_PI_VERSION
+) -> tuple[PiExecutor, _PiRpcSession]:
+    """Executor with one live RPC session whose fake pi replays *lines*; the
+    *pi_version* probe result selects the turn boundary."""
+    from omnigent.inner.pi_executor import _PiSessionState
+
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi_native.main.pi_version", return_value=pi_version),
+    ):
+        executor = PiExecutor()
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc.process = _FakeProcess()
+    rpc._stderr_lines = []
+    for line in lines:
+        rpc._line_queue.put_nowait(line)
+    executor._session_states[_SESSION_KEY] = _PiSessionState(
+        rpc=rpc, system_prompt="system", model=None
+    )
+    return executor, rpc
+
+
+async def _run_session_turn(executor: PiExecutor, prompt: str) -> list:
+    messages = [{"role": "user", "content": prompt, "session_id": _SESSION_KEY}]
+    return [event async for event in executor.run_turn(messages, [], "system")]
+
+
+def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
+    assert _SESSION_KEY not in executor._session_states, "the RPC session was kept"
+    # ``_PiRpcSession.close`` terminates the process and then clears it.
+    assert rpc.process is None, "the pi process was not closed"
+
+
+def _retry_recovery_frames(recovered: str) -> list[str]:
+    """pi's frame sequence for a 503 that its automatic retry recovers from."""
+    errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=errored),
+        _rpc_frame(type="agent_end", messages=[errored], willRetry=True),
+        _rpc_frame(
+            type="auto_retry_start",
+            attempt=1,
+            maxAttempts=3,
+            delayMs=2000,
+            errorMessage=_RETRYABLE_503,
+        ),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _text_delta_frame(recovered),
+        _rpc_frame(type="message_end", message=_assistant_message(recovered)),
+        _rpc_frame(type="auto_retry_end", success=True, attempt=1),
+        _rpc_frame(type="agent_end", messages=[_assistant_message(recovered)], willRetry=False),
+        _rpc_frame(type="agent_settled"),
+    ]
+
+
+def _plain_answer_frames(answer: str) -> list[str]:
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _text_delta_frame(answer),
+        _rpc_frame(type="message_end", message=_assistant_message(answer)),
+        _rpc_frame(type="agent_end", messages=[_assistant_message(answer)], willRetry=False),
+        _rpc_frame(type="agent_settled"),
+    ]
+
+
+def test_constructor_probes_pi_version_once() -> None:
+    """The version gate reuses the single ``pi --version`` probe."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.harnesses.pi_native.main.pi_version", return_value=_SETTLED_PI_VERSION
+        ) as probe,
+    ):
+        executor = PiExecutor()
+    assert probe.call_count == 1
+    assert "--approve" in executor._extra_args
+
+
+def test_settled_turn_returns_recovered_answer_after_auto_retry() -> None:
+    """A retryable provider error followed by pi's own recovery completes
+    the turn with the recovered answer instead of the abandoned error."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(_retry_recovery_frames("RECOVERED"))
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["RECOVERED"]
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+        assert rpc._line_queue.empty(), "recovery frames were left for the next turn"
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_next_turn_reads_only_its_own_frames() -> None:
+    """On a persistent session the turn after a retry-recovered one must
+    not consume the earlier turn's leftover recovery frames."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            _retry_recovery_frames("FIRST") + _plain_answer_frames("SECOND")
+        )
+
+        first_events = await _run_session_turn(executor, "first")
+        second_events = await _run_session_turn(executor, "second")
+
+        assert not any(isinstance(e, ExecutorError) for e in first_events + second_events)
+        first_complete = [e for e in first_events if isinstance(e, TurnComplete)]
+        assert [t.response for t in first_complete] == ["FIRST"]
+        assert [e.text for e in second_events if isinstance(e, TextChunk)] == ["SECOND"]
+        second_complete = [e for e in second_events if isinstance(e, TurnComplete)]
+        assert [t.response for t in second_complete] == ["SECOND"]
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_error_without_retry_fails_after_settlement() -> None:
+    """A provider error pi does not retry is reported once every terminal
+    frame, including ``agent_settled``, has been consumed."""
+
+    async def _test() -> None:
+        errored = _assistant_message(stop_reason="error", error_message="Rate limited")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=errored),
+                _rpc_frame(type="agent_end", messages=[errored], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events] == [ExecutorError]
+        assert events[0].message == "Rate limited"
+        assert rpc._line_queue.empty(), "agent_settled was left for the next turn"
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_failed_message_with_streamed_text_stops_and_evicts() -> None:
+    """When the failed message already streamed text, the turn stops with
+    the error and drops the session instead of appending pi's regenerated
+    answer after the partial one."""
+
+    async def _test() -> None:
+        partial = _assistant_message("partial ", stop_reason="error", error_message=_RETRYABLE_503)
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial "),
+                _rpc_frame(type="message_end", message=partial),
+                _rpc_frame(type="agent_end", messages=[partial], willRetry=True),
+                _rpc_frame(
+                    type="auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    delayMs=2000,
+                    errorMessage=_RETRYABLE_503,
+                ),
+                *_plain_answer_frames("REGENERATED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial "]
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [_RETRYABLE_503]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_eof_before_settlement_is_an_error() -> None:
+    """pi exiting after ``agent_end`` but before ``agent_settled`` fails the
+    turn; a partial run is not reported as a completed one."""
+
+    async def _test() -> None:
+        answer = _assistant_message("Done")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("Done"),
+                _rpc_frame(type="message_end", message=answer),
+                _rpc_frame(type="agent_end", messages=[answer], willRetry=False),
+            ]
+        )
+        rpc._stderr_lines = ["pi: fatal"]
+        rpc._line_queue.put_nowait(None)  # stdout EOF: the process died.
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["Done"]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        (error,) = [e for e in events if isinstance(e, ExecutorError)]
+        assert "settled" in error.message
+        assert "pi: fatal" in error.message
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_overflow_compaction_retry_returns_recovered_answer() -> None:
+    """A context-overflow error that pi repairs by compacting and re-running
+    the prompt completes with the recovered answer."""
+
+    async def _test() -> None:
+        overflow = _assistant_message(
+            stop_reason="error", error_message="Context overflow: prompt is too long"
+        )
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=overflow),
+                _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
+                _rpc_frame(type="compaction_start", reason="overflow"),
+                _rpc_frame(
+                    type="compaction_end",
+                    reason="overflow",
+                    result={"summary": "..."},
+                    aborted=False,
+                    willRetry=True,
+                ),
+                *_plain_answer_frames("RECOVERED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -> None:
+    """A truncated answer that already streamed is not followed by the
+    regenerated one pi produces after overflow compaction."""
+
+    async def _test() -> None:
+        truncated = _assistant_message("partial", stop_reason="length")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+                _rpc_frame(type="message_end", message=truncated),
+                _rpc_frame(type="agent_end", messages=[truncated], willRetry=False),
+                _rpc_frame(type="compaction_start", reason="overflow"),
+                _rpc_frame(
+                    type="compaction_end",
+                    reason="overflow",
+                    result={"summary": "..."},
+                    aborted=False,
+                    willRetry=True,
+                ),
+                *_plain_answer_frames("REGENERATED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        assert len([e for e in events if isinstance(e, ExecutorError)]) == 1
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_retry_backoff_longer_than_error_drain_budget_keeps_waiting() -> None:
+    """After ``agent_end(willRetry=true)`` pi is silent during its retry
+    backoff; the short post-error drain budget must not end the turn."""
+
+    async def _test() -> None:
+        errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=errored),
+                _rpc_frame(type="agent_end", messages=[errored], willRetry=True),
+                _rpc_frame(
+                    type="auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    delayMs=300,
+                    errorMessage=_RETRYABLE_503,
+                ),
+            ]
+        )
+        # A live reader: pi is running, just silent during the backoff.
+        reader = asyncio.create_task(asyncio.sleep(30))
+        rpc._read_task = reader
+
+        async def recover_after_backoff() -> None:
+            await asyncio.sleep(0.3)
+            for line in _plain_answer_frames("RECOVERED")[2:]:
+                rpc._line_queue.put_nowait(line)
+
+        feeder = asyncio.create_task(recover_after_backoff())
+        try:
+            with (
+                patch("omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S", 0.05),
+                patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05),
+            ):
+                events = await _run_session_turn(executor, "hello")
+        finally:
+            feeder.cancel()
+            reader.cancel()
+            await asyncio.gather(feeder, reader, return_exceptions=True)
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+
+    _run(_test())
+
+
+def test_settled_missing_agent_end_after_error_evicts_session() -> None:
+    """pi always follows an errored call with ``agent_end``; when it does not
+    arrive within the drain budget the session is dropped, not reused."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(
+                    type="message_end",
+                    message=_assistant_message(stop_reason="error", error_message="boom"),
+                ),
+            ]
+        )
+        reader = asyncio.create_task(asyncio.sleep(30))
+        rpc._read_task = reader
+        try:
+            with patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05):
+                events = await _run_session_turn(executor, "hello")
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == ["boom"]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_aborted_message_evicts_session() -> None:
+    """An aborted message ends the turn and drops the session so the
+    ``agent_end``/``agent_settled`` frames still coming cannot be misread
+    by the next turn."""
+
+    async def _test() -> None:
+        aborted = _assistant_message(stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events] == [ExecutorError]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_rejected_prompt_evicts_session() -> None:
+    """A prompt pi refuses leaves the session in an unknown state; drop it."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [_rpc_frame(type="response", success=False, error="Agent is already processing")]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [
+            "Agent is already processing"
+        ]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+@pytest.mark.parametrize("pi_version", [(0, 80, 3), None])
+def test_older_or_unknown_pi_keeps_agent_end_boundary(
+    pi_version: tuple[int, int, int] | None,
+) -> None:
+    """Without ``agent_settled`` support the turn still ends at ``agent_end``."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _text_delta_frame("Hi"),
+                _rpc_frame(type="agent_end", messages=[_assistant_message("Hi")]),
+            ],
+            pi_version=pi_version,
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "Hi"
+        assert rpc._line_queue.empty()
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_queued_continuation_stays_in_the_turn() -> None:
+    """A follow-up pi queued behind the run continues the same turn: its
+    answer streams after the first one and the turn ends at ``agent_settled``."""
+
+    async def _test() -> None:
+        first = _assistant_message("First. ")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="agent_start"),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("First. "),
+                _rpc_frame(type="message_end", message=first),
+                _rpc_frame(type="agent_end", messages=[first], willRetry=False),
+                *_plain_answer_frames("Second.")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["First. ", "Second."]
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "First. Second."
+        assert rpc._line_queue.empty()
+
+    _run(_test())
