@@ -2752,14 +2752,9 @@ class _CodexRequestError(RuntimeError):
 
 
 def _input_too_large_error(error: object) -> ExecutorError | None:
-    """
-    Translate an ``input_too_large`` rejection into a user-facing turn error.
+    """Translate an ``input_too_large`` rejection into a coded turn error.
 
-    :param error: The JSON-RPC ``error`` payload, e.g. ``{"code": -32602,
-        "data": {"input_error_code": "input_too_large", "max_chars": 1048576,
-        "actual_chars": 1449987}, "message": "..."}``.
-    :returns: A coded :class:`ExecutorError` naming the limit, or ``None`` when
-        *error* is some other rejection.
+    Returns ``None`` for any other JSON-RPC error payload.
     """
     if not isinstance(error, dict):
         return None
@@ -2775,6 +2770,8 @@ def _input_too_large_error(error: object) -> ExecutorError | None:
     return ExecutorError(
         message=message,
         retryable=False,
+        # Refused before any turn started, so the thread stays idle and reusable.
+        preserve_session=True,
         code=INPUT_TOO_LARGE_CODE,
         title=_INPUT_TOO_LARGE_TITLE,
         remediation=_INPUT_TOO_LARGE_REMEDIATION,

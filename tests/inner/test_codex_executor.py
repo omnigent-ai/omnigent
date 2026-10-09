@@ -536,6 +536,7 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIn("1,048,576", error.message)
             self.assertIn("Shorten the message", error.remediation)
             self.assertFalse(error.retryable)
+            self.assertTrue(error.preserve_session)
             surfaced = f"{error.title} {error.message} {error.remediation}"
             for fragment in ("-32602", "input_error_code", "Codex executor error"):
                 self.assertNotIn(fragment, surfaced)
