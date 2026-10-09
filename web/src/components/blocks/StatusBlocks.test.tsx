@@ -259,6 +259,36 @@ describe("ErrorBanner", () => {
     expect(screen.getByRole("button", { name: "Copy runner log" })).toBeInTheDocument();
   });
 
+  it("leaves a runner-log marker inside captured terminal output where it is", () => {
+    const message = [
+      "Required terminal exited unexpectedly; the session runtime is no longer available.",
+      "",
+      "Last captured terminal output:",
+      "--- runner log tail ---",
+      "nested error printed by the pane",
+    ].join("\n");
+    render(<ErrorBanner message={message} source="execution" code="required_terminal_exited" />);
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const output = screen.getByTestId("error-diagnostics-content");
+    expect(output).toHaveTextContent("--- runner log tail ---");
+    expect(output).toHaveTextContent("nested error printed by the pane");
+    expect(screen.queryByText("Runner log")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy runner log" })).toBeNull();
+  });
+
+  it("folds a runner log only for a runner exit report", () => {
+    const message = ["The agent runtime hit an error.", "--- runner log tail ---", "noise"].join(
+      "\n",
+    );
+    render(<ErrorBanner message={message} source="execution" code="executor_error" />);
+    fireEvent.click(screen.getByRole("button", { name: /agent runtime hit an error/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(
+      "--- runner log tail ---",
+    );
+    expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
+  });
+
   it("preserves classified title, cause, and remediation semantics", () => {
     render(
       <ErrorBanner

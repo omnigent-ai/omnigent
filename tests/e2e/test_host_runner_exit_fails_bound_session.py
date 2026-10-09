@@ -96,11 +96,11 @@ def _create_host_bound_session(
     return create.json()["id"], workspace
 
 
-# The cause line is composed by the host, new in 0.18.0, and the PYTHONPATH fault
-# needs the runner built from this checkout, so any pinned runner build skips.
+# The cause line and the PYTHONPATH fault require the host and runner built from
+# this checkout, so any pinned runner build skips.
 @pytest.mark.skipif(
     compat_runner_python() is not None,
-    reason="requires the 0.18.0 host built from this checkout",
+    reason="requires the host and runner built from this checkout",
 )
 @pytest.mark.timeout(300)
 def test_runner_boot_crash_names_the_cause_before_the_log_tail(

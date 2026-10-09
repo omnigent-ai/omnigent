@@ -7,6 +7,7 @@ exit reason instead of a generic headline over a raw log tail.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import time
@@ -26,12 +27,11 @@ from tests._helpers.runner_faults import (
 from tests._helpers.server_runner import server_runner
 from tests.e2e_ui.conftest import _register_extra_agent
 
-# The cause line comes from the host and the headline from the SPA, both new in
-# 0.18.0; the stack here is built from this checkout, so a pinned older server
-# or runner build cannot show them (and would also strip the PYTHONPATH fault).
+# The host's cause line, the SPA headline and the PYTHONPATH fault all require
+# the stack built from this checkout, so pinned server or runner builds skip.
 pytestmark = pytest.mark.skipif(
     compat_runner_python() is not None or compat_server_python() is not None,
-    reason="requires the 0.18.0 host report and SPA card",
+    reason="requires the host report and SPA card built from this checkout",
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -100,9 +100,12 @@ def test_runner_boot_crash_names_the_cause(
         )
 
         def online_host() -> dict | None:
-            resp = client.get("/v1/hosts")
-            resp.raise_for_status()
-            return next((h for h in resp.json()["hosts"] if h["status"] == "online"), None)
+            # A transport error or a partial reply while the stack starts is another poll.
+            with contextlib.suppress(httpx.HTTPError, ValueError, KeyError):
+                resp = client.get("/v1/hosts")
+                resp.raise_for_status()
+                return next((h for h in resp.json()["hosts"] if h["status"] == "online"), None)
+            return None
 
         host_id = _wait_until(online_host, timeout=60.0)["host_id"]
         agent_id = _register_extra_agent(stack.base_url, f"boot-crash-{fault}", "terse")
@@ -128,9 +131,10 @@ def test_runner_boot_crash_names_the_cause(
         assert send.status_code in {202, 503}, (send.status_code, send.text)
 
         def failed_error() -> dict | None:
-            snap = client.get(f"/v1/sessions/{session_id}").json()
-            if snap.get("status") == "failed" and snap.get("last_task_error"):
-                return snap["last_task_error"]
+            with contextlib.suppress(httpx.HTTPError, ValueError):
+                snap = client.get(f"/v1/sessions/{session_id}").json()
+                if snap.get("status") == "failed" and snap.get("last_task_error"):
+                    return snap["last_task_error"]
             return None
 
         error = _wait_until(failed_error, timeout=120.0)

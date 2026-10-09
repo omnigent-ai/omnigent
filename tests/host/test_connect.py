@@ -1938,6 +1938,61 @@ def test_runner_exit_error_does_not_promote_a_logged_error_summary(tmp_path: Pat
     assert error.splitlines()[1] == "--- runner log tail ---"
 
 
+def test_runner_exit_error_closes_a_traceback_whose_final_line_is_not_recognized(
+    tmp_path: Path,
+) -> None:
+    """An unrecognized closing line (``StopIteration``) still ends the traceback, so a
+    later logged ``SomeError: ...`` summary is not promoted in its place."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 10, in main\n'
+        "    next(iterator)\n"
+        "StopIteration\n"
+        "ConnectionError: upstream reset; retrying\n"
+        "killed\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert "cause:" not in error
+
+
+def test_runner_exit_error_fallback_needs_the_closing_line_in_the_shown_tail(
+    tmp_path: Path,
+) -> None:
+    """A traceback closed above the byte-bounded tail is not named as the cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 10, in main\n'
+        "    boom()\n"
+        "OSError: boom\n" + "x" * 5000 + "\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert "OSError: boom" not in tail
+    assert "cause:" not in error
+
+
+def test_runner_exit_error_keeps_a_whole_leading_line_when_the_cut_lands_on_a_boundary(
+    tmp_path: Path,
+) -> None:
+    """A cut that starts exactly at a line boundary drops nothing."""
+    log = tmp_path / "runner-x.log"
+    kept = "b" * 2047 + "\n" + "c" * 2048
+    log.write_text("a" * 100 + "\n" + kept + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert tail == kept
+
+
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

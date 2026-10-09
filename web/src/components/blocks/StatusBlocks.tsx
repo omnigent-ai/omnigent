@@ -199,9 +199,20 @@ function trimBlankBoundaryLines(lines: string[]): string | null {
   return start < end ? lines.slice(start, end).join("\n") : null;
 }
 
-function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
+function parseErrorMessage(rawMessage: string, code: string): ParsedErrorMessage {
   const allLines = rawMessage.replace(/\r\n?/g, "\n").split("\n");
-  const runnerLogIndex = allLines.findIndex((line) => RUNNER_LOG_HEADING.test(line.trim()));
+  // The host appends the runner log only to runner exit reports, which carry no
+  // terminal sections; elsewhere the marker is just text.
+  const sectionStart = allLines.findIndex(
+    (line) => DIAGNOSTICS_HEADING.test(line.trim()) || LAST_OUTPUT_HEADING.test(line.trim()),
+  );
+  const runnerLogIndex =
+    code === "runner_failed_to_start"
+      ? allLines.findIndex(
+          (line, index) =>
+            (sectionStart < 0 || index < sectionStart) && RUNNER_LOG_HEADING.test(line.trim()),
+        )
+      : -1;
   const runnerLog =
     runnerLogIndex >= 0 ? trimBlankBoundaryLines(allLines.slice(runnerLogIndex + 1)) : null;
   const lines = runnerLogIndex >= 0 ? allLines.slice(0, runnerLogIndex) : allLines;
@@ -269,7 +280,7 @@ export function ErrorBanner({
       })),
     [relatedErrors],
   );
-  const parsed = useMemo(() => parseErrorMessage(message), [message]);
+  const parsed = useMemo(() => parseErrorMessage(message, code), [code, message]);
   const messageText = useMemo(() => {
     const parts: string[] = [];
     if (cause) parts.push(cause);
