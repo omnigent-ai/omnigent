@@ -23,9 +23,10 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
-from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities import Agent, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.bundles import agent_for_user
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -38,6 +39,7 @@ from omnigent.server.routes._session_create_validation import (
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -225,12 +227,14 @@ def create_scheduled_tasks_router(
     permission_store: PermissionStore | None = None,
     agent_cache: Any | None = None,
     auth_provider: AuthProvider | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
     Mounted with ``prefix="/v1"`` so paths are ``/v1/scheduled-tasks[/{id}]``.
 
     :param store: The shared :class:`ScheduledTaskStore`.
+    :param artifact_store: Holds the copy a task gets of another user's agent.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
     :returns: A configured :class:`APIRouter`.
@@ -258,7 +262,7 @@ def create_scheduled_tasks_router(
         reasoning_effort: str | None,
         permission_mode: str | None,
         execution_target: str = "connected_host",
-    ) -> tuple[str | None, str | None, str | None]:
+    ) -> tuple[Agent, str | None, str | None, str | None]:
         """Validate inputs that scheduled tasks persist into future sessions.
 
         Workspace is always optional. When it is unset the canonical workspace
@@ -301,7 +305,7 @@ def create_scheduled_tasks_router(
                     "managed sandboxes are not configured on this server",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            return None, validated_model, validated_effort
+            return agent, None, validated_model, validated_effort
         if host_id is not None:
             host_store = getattr(request.app.state, "host_store", None)
             if host_store is not None:
@@ -319,7 +323,7 @@ def create_scheduled_tasks_router(
                     )
         if workspace is None:
             # The fire resolves an omitted workspace to the authorized host's HOME.
-            return None, validated_model, validated_effort
+            return agent, None, validated_model, validated_effort
         if host_id is None:
             raise OmnigentError(
                 "host_id required when workspace is set",
@@ -334,7 +338,13 @@ def create_scheduled_tasks_router(
             host_store=getattr(request.app.state, "host_store", None),
             host_registry=getattr(request.app.state, "host_registry", None),
         )
-        return canonical_workspace, validated_model, validated_effort
+        return agent, canonical_workspace, validated_model, validated_effort
+
+    async def _bind_agent(agent: Agent, owner_id: str | None) -> Agent:
+        """A task runs another user's agent from its owner's own copy, taken now."""
+        return await asyncio.to_thread(
+            agent_for_user, agent_store, artifact_store, agent, owner_id
+        )
 
     def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
         return task.user_id == owner and (
@@ -363,7 +373,7 @@ def create_scheduled_tasks_router(
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
-        workspace, model_override, reasoning_effort = await _validate_launch_inputs(
+        agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
             owner=owner,
             agent_id=body.agent_id,
@@ -374,22 +384,29 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
-        task = store.create(
-            scheduled_task_id=uuid.uuid4().hex,
-            name=body.name,
-            prompt=body.prompt,
-            rrule=body.rrule,
-            user_id=None if owner == RESERVED_USER_LOCAL else owner,
-            agent_id=body.agent_id,
-            timezone=body.timezone,
-            model_override=model_override,
-            reasoning_effort=reasoning_effort,
-            permission_mode=permission_mode,
-            max_cost_usd=body.max_cost_usd,
-            workspace=workspace,
-            host_id=body.host_id,
-            execution_target=body.execution_target,
-        )
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        bound = await _bind_agent(agent, owner_id)
+        try:
+            task = store.create(
+                scheduled_task_id=uuid.uuid4().hex,
+                name=body.name,
+                prompt=body.prompt,
+                rrule=body.rrule,
+                user_id=owner_id,
+                agent_id=bound.id,
+                timezone=body.timezone,
+                model_override=model_override,
+                reasoning_effort=reasoning_effort,
+                permission_mode=permission_mode,
+                max_cost_usd=body.max_cost_usd,
+                workspace=workspace,
+                host_id=body.host_id,
+                execution_target=body.execution_target,
+            )
+        except Exception:
+            if bound.id != agent.id:
+                agent_store.delete(bound.id)
+            raise
         scheduler = _scheduler(request)
         if scheduler is not None:
             scheduler.add(task)
@@ -551,6 +568,7 @@ def create_scheduled_tasks_router(
         fields = body.model_dump(exclude_unset=True)
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
+        new_copy: Agent | None = None
         if agent_changed:
             # A harness switch invalidates the per-agent settings stored beside
             # it: a model id is provider-bound and permission_mode is Claude-only.
@@ -606,7 +624,7 @@ def create_scheduled_tasks_router(
             # a workspace valid for the old harness need not be valid here). A
             # managed_sandbox target validates against no host/workspace (the fire
             # provisions a fresh sandbox) and checks the server can launch one.
-            workspace, _, _ = await _validate_launch_inputs(
+            agent, workspace, _, _ = await _validate_launch_inputs(
                 request,
                 owner=owner,
                 agent_id=target_agent_id,
@@ -628,9 +646,19 @@ def create_scheduled_tasks_router(
                 fields["workspace"] = None
             elif "workspace" in fields:
                 fields["workspace"] = workspace
-        updated = store.update(scheduled_task_id, **fields)
-        if updated is None:
-            raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+            if agent_changed:
+                bound = await _bind_agent(agent, owner_id)
+                fields["agent_id"] = bound.id
+                new_copy = bound if bound.id != agent.id else None
+        try:
+            updated = store.update(scheduled_task_id, **fields)
+            if updated is None:
+                raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+        except Exception:
+            # The task never bound the copy, so nothing else uses it.
+            if new_copy is not None:
+                agent_store.delete(new_copy.id)
+            raise
         scheduler = _scheduler(request)
         if scheduler is not None:
             scheduler.update(updated)

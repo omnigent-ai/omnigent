@@ -109,6 +109,9 @@ Copyright (c) 2015 Hynek Schlawack and the argon2-cffi contributors.
 tomlkit - https://pypi.org/project/tomlkit/
 Copyright (c) 2018 Sébastien Eustace.
 
+@xterm/addon-web-links - https://www.npmjs.com/package/@xterm/addon-web-links
+Copyright (c) 2017-2019, The xterm.js authors (https://github.com/xtermjs/xterm.js).
+
 ________________
 
 This Software contains code from the following open source projects, licensed under the BSD-3 license (https://opensource.org/license/bsd-3-clause):

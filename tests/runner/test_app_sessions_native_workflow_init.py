@@ -15,7 +15,9 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
@@ -331,7 +333,14 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "codex-native",
             "_auto_create_codex_terminal",
-            {"bundle_dir", "skills_filter", "agent_spec", "server_client", "ensure_comment_relay"},
+            {
+                "bundle_dir",
+                "skills_filter",
+                "agent_spec",
+                "server_client",
+                "session_init",
+                "ensure_comment_relay",
+            },
         ),
     ],
 )
@@ -750,6 +759,36 @@ async def test_ensure_native_terminal_builder_error_returns_500(
 
 
 @pytest.mark.asyncio
+async def test_ensure_native_terminal_missing_workspace_returns_410_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A removed workspace is an expected lifecycle failure, not a startup defect."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _workspace_missing(ctx: NativeLaunchContext) -> object:
+        raise OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING)
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _workspace_missing)
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        resp = await _ensure_native_terminal(
+            "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+        )
+
+    assert resp is not None and resp.status_code == 410
+    assert json.loads(bytes(resp.body))["error"]["code"] == ErrorCode.WORKSPACE_MISSING
+    failure_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "terminal_start_failed"
+    ]
+    assert failure_records == []
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "resource unavailable" in caplog.text
+    assert "agent unavailable" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_ensure_native_terminal_non_native_returns_none() -> None:
     """A non-native terminal name returns None so the caller uses the generic path."""
     from omnigent.runner.native import _ensure_native_terminal
@@ -1112,7 +1151,7 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
     )
 
     async with _runner_client(app) as client:
-        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        with caplog.at_level(logging.WARNING, logger="omnigent.inner.native_attachments"):
             resp = await client.post(
                 "/v1/sessions/conv_hist_fail/events",
                 json={
@@ -1125,7 +1164,15 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
             )
 
     assert resp.status_code == 202
-    assert "failed to resolve file_id" in caplog.text
+    failures = [
+        record_to_row(record, source="runner")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_attachment_read_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["session_id"] == "conv_hist_fail"
+    assert failures[0]["attributes"]["stage"] == "metadata"
+    assert failures[0]["attributes"]["exception_type"] == "ConnectError"
     for _ in range(20):
         if harness_client.posted_bodies:
             break
@@ -2483,6 +2530,47 @@ async def test_delete_session_with_active_turn() -> None:
     assert resp.status_code == 200
     assert "8e32600337d08f59ad381caf96a90659" in pm.cancelled
     assert "8e32600337d08f59ad381caf96a90659" in pm.released
+
+
+@pytest.mark.asyncio
+async def test_stop_then_release_side_chat_preserves_other_runner_sessions() -> None:
+    """Closing one shared-runner chat leaves the parent and sibling turns alive."""
+    app, pm, _hc = _build_lifecycle_app()
+    parent_id, side_id, sibling_id = (uuid.uuid4().hex for _ in range(3))
+    tasks: dict[str, asyncio.Task[bool]] = {}
+    async with _runner_client(app) as client:
+        try:
+            for session_id in (parent_id, side_id, sibling_id):
+                created = await client.post(
+                    "/v1/sessions",
+                    json={
+                        "session_id": session_id,
+                        "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                    },
+                )
+                assert created.status_code == 201, created.text
+                pm._sessions.add(session_id)
+                tasks[session_id] = asyncio.create_task(asyncio.Event().wait())
+                app.state.active_turns[session_id] = tasks[session_id]
+            await asyncio.sleep(0)
+
+            stopped = await client.post(
+                f"/v1/sessions/{side_id}/events", json={"type": "stop_session"}
+            )
+            assert stopped.status_code == 204, stopped.text
+            released = await client.delete(f"/v1/sessions/{side_id}")
+            assert released.status_code == 200, released.text
+            assert tasks[side_id].cancelled()
+            assert pm.released == [side_id]
+            assert not pm.has_session(side_id)
+            for session_id in (parent_id, sibling_id):
+                assert not tasks[session_id].done()
+                assert pm.has_session(session_id)
+                assert session_id not in pm.cancelled
+                assert app.state.active_turns[session_id] is tasks[session_id]
+        finally:
+            for session_id in (parent_id, side_id, sibling_id):
+                await client.delete(f"/v1/sessions/{session_id}")
 
 
 @pytest.mark.asyncio

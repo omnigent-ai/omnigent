@@ -107,6 +107,9 @@ class _StubResourceRegistry:
         """
         self._terminal_exit_publisher = publisher
 
+    def note_terminal_control_request(self, session_id: str, action: str) -> None:
+        """No terminal is running, so control requests have no lifecycle evidence."""
+
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
         """
         Return a fixed env root for the launched terminal.
