@@ -35,7 +35,6 @@ from omnigent.entities.pagination import PagedList
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.inner.os_env import (
-    _DEFAULT_READ_LIMIT,
     _edit_impl,
     _read_impl,
     _write_impl,
@@ -598,10 +597,17 @@ class CallerProcessFilesystem:
     path validation (traversal checks), not for direct I/O.
 
     :param os_env: The backing OSEnvironment instance.
+    :param follow_outward_links: Admit a relative path whose real target
+        lies outside the root when the environment's reach covers it,
+        exactly as an absolute browse of that target would. Off by
+        default: the server enables it only for a caller who may browse
+        the target by absolute path, since this process cannot see who
+        is asking.
     """
 
-    def __init__(self, os_env: OSEnvironment) -> None:
+    def __init__(self, os_env: OSEnvironment, *, follow_outward_links: bool = False) -> None:
         self._os_env = os_env
+        self._follow_outward_links = follow_outward_links
         self._root = Path(os_env.cwd).resolve()
         self._root_prefix = containment_prefix(self._root)
         policy = getattr(os_env, "sandbox", None)
@@ -629,14 +635,17 @@ class CallerProcessFilesystem:
 
         Relative paths keep the historical contract: normalized, traversal
         rejected, and confined under the environment root. Absolute paths
-        take the browse-authorization route instead.
+        take the browse-authorization route instead, and so does the target
+        of a symlink leading out of the root when outward links are admitted.
 
         :param path: Relative path within the environment, or an absolute
             path elsewhere on the filesystem.
         :param need_write: ``True`` for mutating operations.
         :returns: Resolved absolute path.
-        :raises InvalidPath: If a relative path escapes the root.
-        :raises PathUnreachable: If an absolute path is out of reach.
+        :raises InvalidPath: If a relative path escapes the root and outward
+            links are not admitted.
+        :raises PathUnreachable: If an absolute path, or an admitted outward
+            link's target, is out of reach.
         """
         if self._absolute(path):
             return resolve_browse_target(
@@ -648,10 +657,17 @@ class CallerProcessFilesystem:
         # `_validate_path` rejects absolute paths and "..", but that is a check
         # on the string; this re-checks the RESOLVED path, which is what stops
         # an in-workspace symlink pointing outward.
-        contained = contained_realpath(os.path.join(str(self._root), validated), self._root_prefix)
-        if contained is None:
+        full = os.path.join(str(self._root), validated)
+        contained = contained_realpath(full, self._root_prefix)
+        if contained is not None:
+            return Path(contained)
+        if not self._follow_outward_links:
             raise InvalidPath(f"Path {path!r} escapes the environment root")
-        return Path(contained)
+        # The link's target is authorized like the absolute path it is, so a
+        # confined environment still needs a grant covering it.
+        return resolve_browse_target(
+            os.path.realpath(full), self._roots, unconfined=self._unconfined, need_write=need_write
+        )
 
     def _absolute(self, path: str) -> bool:
         """Whether this request should be handled as an absolute path.
@@ -1060,31 +1076,37 @@ print(json.dumps({'r': results, 't': truncated}))
         path: str,
         *,
         max_bytes: int | None = None,
-        limit: int | None = _DEFAULT_READ_LIMIT,
+        limit: int | None = None,
     ) -> FileContent:
         """Read file content via the sandboxed helper.
 
-        Uses ``os_env.read()`` so the sandbox enforces read access.
+        Uses ``os_env.read()`` so the sandbox enforces read access. A path
+        admitted only because the environment is unconfined is read
+        in-process instead.
 
-        :param path: Relative file path.
+        :param path: Relative file path, or an absolute path elsewhere on
+            the filesystem.
         :param max_bytes: Maximum bytes to read. Defaults to
             ``_MAX_READ_BYTES`` (10 MiB).
-        :param limit: Maximum number of lines to return.  Defaults to
-            ``_DEFAULT_READ_LIMIT`` (2 000 lines) — appropriate for agent
-            tool calls.  Pass ``None`` for no line cap (e.g. the diff
-            endpoint needs the full file to render a correct before/after
-            view).
+        :param limit: Optional line cap within the byte-limited prefix.
+            Defaults to all lines within the byte cap for file previews
+            and diffs.
         :returns: The file content.
         :raises FilesystemPathNotFound: If the file does not exist.
-        :raises FileTooLarge: If the file exceeds the size limit.
         """
         byte_cap = max_bytes or _MAX_READ_BYTES
 
-        if self._absolute(path):
+        absolute = self._absolute(path)
+        validated = "" if absolute else _validate_path(path)
+        if not absolute and not validated:
+            raise InvalidPath("Cannot read the environment root")
+        # A workspace path keeps its relative form: the helper runs with cwd at
+        # the root and enforces the environment's reach itself, so a symlink
+        # into a declared grant reads as it always has.
+        target = validated
+        if absolute or self._follow_outward_links:
             resolved = self._resolve(path)
-            if self._within_grants(resolved):
-                target = str(resolved)
-            else:
+            if not self._within_grants(resolved):
                 # Only reachable when the environment is unconfined —
                 # ``_resolve`` rejects out-of-grant paths otherwise — so there
                 # is no sandbox to route around. Runs the same implementation
@@ -1092,19 +1114,15 @@ print(json.dumps({'r': results, 't': truncated}))
                 # agent-tool policy rather than a browsing boundary.
                 direct = await _run_impl_direct(_read_impl, resolved, 1, limit, byte_cap)
                 return self._file_content(path, direct, byte_cap)
-        else:
-            target = _validate_path(path) if path else ""
-            if not target:
-                raise InvalidPath("Cannot read the environment root")
+            if absolute:
+                target = str(resolved)
 
         result = await _run_os_env_async(
             self._os_env.read,
             target,
             limit=limit,
-            # Inline binary content up to the byte cap so it can be served to
-            # the viewer / download. (The agent read path omits this and gets a
-            # descriptor only — see ``_read_impl``.)
-            max_binary_bytes=byte_cap,
+            # Bound text and binary reads before content crosses the helper IPC.
+            max_bytes=byte_cap,
         )
         return self._file_content(path, result, byte_cap)
 
@@ -1160,7 +1178,7 @@ print(json.dumps({'r': results, 't': truncated}))
             data=data,
             bytes=len(data),
             encoding="utf-8",
-            truncated=byte_truncated or line_truncated,
+            truncated=bool(result.get("truncated")) or byte_truncated or line_truncated,
         )
 
     async def write(

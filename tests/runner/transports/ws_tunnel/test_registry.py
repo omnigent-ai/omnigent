@@ -11,6 +11,7 @@ Pinning:
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -24,6 +25,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     ResponseHeadFrame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from tests.budgets import budget
 
 
 class _NoopWS:
@@ -37,6 +39,20 @@ class _NoopWS:
         # path; this fake exists so the registry has something to
         # hold.
         return await asyncio.Future()
+
+
+class _ClosingWS(_NoopWS):
+    """WebSocket fake that records its ``close()`` call.
+
+    :ivar closed: ``None`` until ``close()`` runs, then the
+        ``(code, reason)`` it was called with.
+    """
+
+    def __init__(self) -> None:
+        self.closed: tuple[int, str] | None = None
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.closed = (code, reason)
 
 
 def _hello() -> HelloFrame:
@@ -150,36 +166,53 @@ async def test_wait_for_runner_resolves_multiple_waiters() -> None:
 async def test_wait_for_runner_cap_bounds_waiter_growth() -> None:
     """The per-runner cap prevents unbounded waiter accumulation."""
     reg = TunnelRegistry(max_connect_waiters_per_runner=1)
-    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.2))
-    await _wait_until(lambda: reg.connect_waiter_count("r1") == 1)
+    # Registration ends the admitted wait; scheduling delays must not expire it.
+    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=math.inf))
+    tasks = [first]
+    try:
+        await _wait_until(lambda: reg.connect_waiter_count("r1") == 1, timeout_s=budget(1.0))
 
-    second = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.01))
-    await asyncio.sleep(0)
-    assert reg.connect_waiter_count("r1") == 1
+        second = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.01))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        assert reg.connect_waiter_count("r1") == 1
 
-    assert await second is None
-    assert reg.connect_waiter_count("r1") == 1
-    assert await first is None
-    assert reg.connect_waiter_count("r1") == 0
+        assert await second is None
+        assert reg.connect_waiter_count("r1") == 1
+        session = reg.register("r1", _NoopWS(), _hello())
+        assert await asyncio.wait_for(first, timeout=budget(1.0)) is session
+        assert reg.connect_waiter_count("r1") == 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
 async def test_wait_for_runner_global_cap_bounds_waiter_growth() -> None:
     """The global cap prevents unbounded waiter accumulation across runner ids."""
     reg = TunnelRegistry(max_connect_waiters_total=1)
-    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.2))
-    await _wait_until(lambda: reg.connect_waiter_count() == 1)
+    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=math.inf))
+    tasks = [first]
+    try:
+        await _wait_until(lambda: reg.connect_waiter_count() == 1, timeout_s=budget(1.0))
 
-    second = asyncio.create_task(reg.wait_for_runner("r2", timeout_s=0.01))
-    await asyncio.sleep(0)
-    assert reg.connect_waiter_count() == 1
-    assert reg.connect_waiter_count("r2") == 0
-    assert reg.connect_wait_started_at("r2") is None
+        second = asyncio.create_task(reg.wait_for_runner("r2", timeout_s=0.01))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        assert reg.connect_waiter_count() == 1
+        assert reg.connect_waiter_count("r2") == 0
+        assert reg.connect_wait_started_at("r2") is None
 
-    assert await second is None
-    assert reg.connect_waiter_count() == 1
-    assert await first is None
-    assert reg.connect_waiter_count() == 0
+        assert await second is None
+        assert reg.connect_waiter_count() == 1
+        session = reg.register("r1", _NoopWS(), _hello())
+        assert await asyncio.wait_for(first, timeout=budget(1.0)) is session
+        assert reg.connect_waiter_count() == 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def test_wait_for_runner_rejects_invalid_waiter_caps() -> None:
@@ -235,6 +268,42 @@ async def test_deregister_aborts_inflight() -> None:
     assert state.head_future.done()
     with pytest.raises(ConnectionError, match="tunnel closed"):
         state.head_future.result()
+
+
+@pytest.mark.asyncio
+async def test_deregister_closes_socket_with_recycle_code() -> None:
+    """Deregistering a live session closes with 1001, not 4003.
+
+    1001 ("going away") lands in the runner's existing tunnel-recycle path
+    (serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES``), so a server-initiated
+    retire (rollout, slice rehoming) gets a prompt, spread reconnect
+    instead of the runner's escalating backoff.
+    """
+    reg = TunnelRegistry()
+    ws = _ClosingWS()
+    reg.register("r1", ws, _hello())
+
+    reg.deregister("r1")
+    await _wait_until(lambda: ws.closed is not None)
+
+    assert ws.closed == (1001, "tunnel retired by server; reconnect")
+
+
+@pytest.mark.asyncio
+async def test_register_replacing_session_still_closes_old_socket_with_4000() -> None:
+    """Newest-wins keeps closing the replaced socket with 4000 'tunnel replaced'.
+
+    Confirms the deregister retire-code change (4003 -> 1001) left
+    register()'s own retire call untouched.
+    """
+    reg = TunnelRegistry()
+    old_ws = _ClosingWS()
+    reg.register("r1", old_ws, _hello())
+
+    reg.register("r1", _ClosingWS(), _hello())
+    await _wait_until(lambda: old_ws.closed is not None)
+
+    assert old_ws.closed == (4000, "tunnel replaced")
 
 
 @pytest.mark.asyncio

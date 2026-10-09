@@ -37,7 +37,6 @@ from omnigent.db.compression import CompressedText
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
-
 # Hex length of a bare uuid4 id, the canonical Python-side form.
 _UUID_HEX_LEN = 32
 
@@ -239,8 +238,8 @@ def workspace_scope(workspace_id: int) -> Iterator[None]:
         _current_workspace_id.reset(token)
 
 
-AGENT_KIND_TEMPLATE = "template"
-AGENT_KIND_SESSION = "session"
+AGENT_KIND_SERVER = "server"
+AGENT_KIND_USER = "user"
 
 POLICY_SCOPE_DEFAULT = "default"
 POLICY_SCOPE_SESSION = "session"
@@ -262,8 +261,8 @@ class SqlAgent(OmnigentBase):
         ``"ag_abc123/a1b2c3d4e5f6..."``.
     :param version: Monotonic version counter. Starts at 1, incremented
         on each update via ``PUT /api/agents/{id}``.
-    :param kind: ``"template"`` for server-wide registered agents;
-        ``"session"`` for per-conversation copies.
+    :param kind: ``"server"`` for server-wide agents (built-ins, ``--agent``);
+        ``"user"`` for agents users upload or install.
     :param description: Optional free-text description of the agent's
         purpose. ``None`` when not provided.
     :param updated_at: Unix epoch seconds of the last update, or
@@ -291,14 +290,14 @@ class SqlAgent(OmnigentBase):
     bundle_location: Mapped[str] = mapped_column(String(512))
     version: Mapped[int] = mapped_column(Integer, default=1)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # AGENT_KIND: template=1, session=2). The store converts to/from the
+    # AGENT_KIND: server=1, user=2). The store converts to/from the
     # string name at the row↔entity boundary.
     kind: Mapped[int] = mapped_column(SmallInteger)
     description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Owner of a session-scoped agent (the creating user). Gates agent-code
-    # mutation to the owner; NULL for template agents, single-user mode, and
-    # pre-migration rows (an unowned session-scoped agent is admin-only).
+    # Owner of a user agent (the creating user). Gates agent-code mutation to
+    # the owner; NULL for server agents and pre-migration rows (an unowned
+    # user agent is admin-only).
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
@@ -312,6 +311,16 @@ class SqlAgent(OmnigentBase):
         # do — kind is included so the seek skips same-named session copies
         # straight to the template row.
         Index("ix_agents_name", "workspace_id", "name", "kind", "id"),
+        # Keyset listing of one user's own agents, newest first: equality on
+        # kind and created_by, order on created_at, primary-key tie-break.
+        Index(
+            "ix_agents_kind_owner_created",
+            "workspace_id",
+            "kind",
+            "created_by",
+            "created_at",
+            "id",
+        ),
     )
 
 
@@ -1447,7 +1456,7 @@ class SqlUserDailyCost(OmnigentBase):
     aggregating the per-session ``conversations.session_usage`` blobs
     on every policy evaluation.
 
-    One row per ``(user_id, day_utc)``. Incremented (UPSERT
+    One row per ``(workspace_id, user_id, day_utc)``. Incremented (UPSERT
     ``cost_usd = cost_usd + delta``) at each turn boundary from the
     cost write sites — but only when the session runs under at least
     one policy, so the table is never touched in deployments that

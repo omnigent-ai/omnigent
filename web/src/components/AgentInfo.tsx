@@ -34,7 +34,7 @@ import {
   type PolicyRegistryEntry,
 } from "@/hooks/usePolicies";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
-import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
+import { isOwnerLevel, isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import { getCurrentUserId } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -1226,6 +1226,8 @@ interface AgentInfoProps {
   agent: Agent | undefined;
   /** Session ID — needed to manage user policies. */
   sessionId?: string | null;
+  /** Effective session access; null preserves single-user access. */
+  permissionLevel?: number | null;
   /**
    * Called when a sub-dialog (e.g. the MCP server manager) opens or closes.
    * The parent popover uses this to suppress its own outside-click dismiss
@@ -1255,12 +1257,13 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
 export function AgentInfoContent({
   agent,
   sessionId,
+  permissionLevel = null,
   onSubdialogOpenChange,
   mcpDirty,
   onMcpDirtyChange,
 }: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
-  const mcpEditable = agent?.mcp_servers_editable === true;
+  const mcpEditable = agent?.mcp_servers_editable === true && isOwnerLevel(permissionLevel);
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
   const [sessionIdCopied, setSessionIdCopied] = useState(false);
   const copyResetTimeoutRef = useRef<number | null>(null);
@@ -1448,7 +1451,7 @@ export const HOVER_CLICK_GRACE_MS = 30;
  * which opens {@link AgentInfoContent} in a dialog. Self-hides when the agent has
  * neither tools nor policies.
  */
-export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+export function AgentInfoButton({ agent, sessionId, permissionLevel }: AgentInfoProps) {
   const [open, setOpen] = useState(false);
   const [mcpDirty, setMcpDirty] = useState(false);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
@@ -1584,6 +1587,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         <AgentInfoContent
           agent={agent}
           sessionId={sessionId}
+          permissionLevel={permissionLevel}
           mcpDirty={mcpDirty}
           onMcpDirtyChange={setMcpDirty}
           onSubdialogOpenChange={(isOpen) => {

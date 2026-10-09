@@ -1,9 +1,12 @@
 import type { FilePosition } from "./FileViewerContext";
 import {
   BotIcon,
+  CheckIcon,
+  ChevronDownIcon,
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
+  GitPullRequestIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
@@ -16,7 +19,9 @@ import {
 import { toast } from "sonner";
 import {
   type CSSProperties,
+  type KeyboardEvent,
   type ReactElement,
+  type RefObject,
   lazy,
   memo,
   Suspense,
@@ -26,6 +31,7 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { ALT_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 import { defaultWorkspaceTabs, readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -43,7 +49,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
@@ -52,11 +61,11 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
+import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -66,6 +75,19 @@ import { Button } from "../components/ui/button";
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
+const WORKSPACE_OPEN_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
+const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
+const NEW_SHELL_KEYS = [MOD_KEY, ALT_KEY, "T"] as const;
+
+function WorkspaceMenuShortcut({
+  keys,
+  className,
+}: {
+  keys: readonly string[];
+  className?: string;
+}) {
+  return <CompactShortcutKeys keys={keys} className={className} />;
+}
 
 // Side-chat child ids opened in THIS app session. Module scope, so it resets on
 // reload/restart. A Codex side chat is an ephemeral thread-fork of the parent's
@@ -76,10 +98,12 @@ const sideChatsStartedThisSession = new Set<string>();
 
 function WorkspaceTabTooltip({
   label,
+  shortcut,
   className,
   children,
 }: {
   label: string;
+  shortcut?: string;
   className?: string;
   children: ReactElement;
 }) {
@@ -88,7 +112,12 @@ function WorkspaceTabTooltip({
       <TooltipTrigger asChild>
         <span className={cn("inline-flex shrink-0", className)}>{children}</span>
       </TooltipTrigger>
-      <TooltipContent side="bottom">{label}</TooltipContent>
+      <TooltipContent
+        side="bottom"
+        shortcut={shortcut ? [WORKSPACE_OPEN_KEYS, [shortcut]] : undefined}
+      >
+        <span>{label}</span>
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -228,9 +257,12 @@ function NewTabMenu({
       <span className="whitespace-nowrap">
         {isReconnecting ? "Reconnecting…" : `Shell (${defaultShell})`}
       </span>
-      {connectState === "offline" && (
-        <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
-      )}
+      <span className="ml-auto flex items-center gap-2 pl-4">
+        {connectState === "offline" && (
+          <span className="text-sm text-muted-foreground">Offline</span>
+        )}
+        <WorkspaceMenuShortcut keys={NEW_SHELL_KEYS} />
+      </span>
     </>
   );
 
@@ -253,7 +285,7 @@ function NewTabMenu({
           default min-w-32 tracks the 32px "+" trigger and clips it. */}
       <DropdownMenuContent
         align="start"
-        className="min-w-44"
+        className="min-w-56"
         // On close, Radix restores focus to the "+" trigger, which re-opens its
         // tooltip for a frame before blur dismisses it — a visible flash after a
         // shell launch. Suppress the focus restore to keep the tooltip closed.
@@ -267,6 +299,7 @@ function NewTabMenu({
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
+            <WorkspaceMenuShortcut keys={NEW_BROWSER_KEYS} className="ml-auto pl-4" />
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -330,7 +363,7 @@ function NewTabMenu({
 // of the fixed Files/Terminals/Agents tabs. Each tab is a cell with the
 // file's basename and an "x" close button. Clicking the cell activates the
 // tab (opening its viewer); clicking the x closes it. No own scroll container
-// or flex-1: the parent strip's overflow-x-auto scrolls the whole row.
+// or flex-1: the parent viewport scrolls the open tabs.
 // ---------------------------------------------------------------------------
 
 function FileTabsStrip({
@@ -596,8 +629,10 @@ interface WorkspacePanelProps {
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
   inert?: boolean;
-  /** Visual presence state; false runs the 300ms exit transition. */
+  /** Visual presence state; false collapses the panel. */
   open?: boolean;
+  /** Animate this open/close transition; false keeps width changes immediate. */
+  animateVisibility?: boolean;
   /** Suppress motion while the resize handle is actively dragging. */
   resizing?: boolean;
   /**
@@ -607,6 +642,8 @@ interface WorkspacePanelProps {
   handleProps: React.HTMLAttributes<HTMLDivElement> & { tabIndex: number };
   /** Selected rail tab, e.g. ``"files"``. */
   rightRailTab: RightRailTab;
+  /** Tab-strip ref used to move focus into a keyboard-opened rail. */
+  tabListRef?: RefObject<HTMLDivElement | null>;
   /**
    * Switch rail tabs. AppShell owns the side effects (clearing any open
    * file + its comments + URL) so they can't drift from the tab state.
@@ -614,11 +651,12 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
-  /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
+  /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
-  /** Whether the Browser tab is available — Electron shell only (hidden in a
-   *  plain web build, which has no embedded WebContentsView). */
+  /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
+  /** Reveal the workspace after a Browser tab is opened by a global shortcut. */
+  onBrowserTabOpened?: () => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -690,6 +728,11 @@ interface WorkspacePanelProps {
   /** Called when the shell create POST fails, so the focus snapshot armed by
    *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
   onShellCreateFailed?: () => void;
+  /** Whether the mobile side-chats drawer is open. The rail is hidden on
+   *  phones, so side chats render in this drawer instead. */
+  mobileSideChatsOpen?: boolean;
+  /** Open or close the mobile side-chats drawer. */
+  onMobileSideChatsOpenChange?: (open: boolean) => void;
 }
 
 /**
@@ -714,12 +757,15 @@ function WorkspacePanelImpl({
   handleProps,
   inert,
   open = true,
+  animateVisibility = false,
   resizing = false,
   rightRailTab,
+  tabListRef,
   onRightRailTabChange,
   showFilesPanel,
   showGithubTab,
   showBrowserTab,
+  onBrowserTabOpened,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -747,6 +793,8 @@ function WorkspacePanelImpl({
   liveness,
   onShellCreateStart,
   onShellCreateFailed,
+  mobileSideChatsOpen = false,
+  onMobileSideChatsOpenChange,
 }: WorkspacePanelProps) {
   const browsers = useBrowserTabs(conversationId);
   const closeBrowserTab = async (tabId: string) => {
@@ -758,13 +806,16 @@ function WorkspacePanelImpl({
     activeBrowserRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [browsers.selected, rightRailTab]);
   const browserSelected =
-    rightRailTab === "browser" && selectedFilePath === null && selectedTerminalKey === null;
-  const addBrowser = showBrowserTab
-    ? () => {
-        browsers.add();
-        onRightRailTabChange("browser");
-      }
-    : undefined;
+    rightRailTab === "browser" &&
+    browsers.selected !== null &&
+    selectedFilePath === null &&
+    selectedTerminalKey === null;
+  const addBrowser = () => {
+    browsers.add();
+    onRightRailTabChange("browser");
+    onBrowserTabOpened?.();
+  };
+  useNewBrowserHotkey(addBrowser, showBrowserTab && !pending);
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
@@ -792,14 +843,20 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
-    // Started this session → live (not a dead restored Codex fork).
-    sideChatsStartedThisSession.add(childId);
-    const awaiting = awaitingPendingIdsRef.current.shift();
-    if (awaiting !== undefined) {
-      sideChats.rekey(awaiting, childId);
-    } else {
-      // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+    if (childId.startsWith("pending:")) {
+      // "Ask in side chat": a not-yet-forked tab, so it must not take a slot in
+      // the Codex awaiting queue. Its first send creates the fork.
       sideChats.open(childId);
+    } else {
+      // Started this session → live (not a dead restored Codex fork).
+      sideChatsStartedThisSession.add(childId);
+      const awaiting = awaitingPendingIdsRef.current.shift();
+      if (awaiting !== undefined) {
+        sideChats.rekey(awaiting, childId);
+      } else {
+        // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+        sideChats.open(childId);
+      }
     }
     onRightRailTabChange("sidechat");
     clearSideChatToOpen();
@@ -823,8 +880,8 @@ function WorkspacePanelImpl({
   // pending tab stays put and is rekeyed to the real child once it arrives (via
   // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
   // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side + launches a
-  // runner on the parent's host. Rejects so the composer re-enables and keeps
+  // kept prompt-cache-warm); every other harness forks server-side and reuses
+  // the parent's live runner. Rejects so the composer re-enables and keeps
   // the typed text for a retry.
   const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
     if (usesNativeSideChatFork(sideChatHarness)) {
@@ -860,6 +917,10 @@ function WorkspacePanelImpl({
         // shared queue, so overlapping launches can't cross-assign. Seeding the
         // draft fires sideChatToOpen, which then just re-selects + reveals.
         sideChats.rekey(pendingId, childSessionId);
+        // The pending id is gone; drop its composer entry (and its File refs)
+        // now that the text has moved to the real child. Only on success — a
+        // failed create keeps it so the user can retry.
+        useChatStore.getState().clearSideChatComposer(pendingId);
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
       },
       (err) => {
@@ -870,10 +931,39 @@ function WorkspacePanelImpl({
       },
     );
   };
-  // Close a side-chat tab: stop the child's runner (real children only) so its
-  // compute is freed, then drop the browser-local tab.
-  const closeSideChat = (childId: string) => {
-    if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
+  // The selected side chat's pane, shown in the rail or the mobile drawer. A
+  // `pending:` tab has no child yet; its first send creates the fork.
+  const isMobile = useIsMobileViewport();
+  const selectedSideChat = sideChats.selected;
+  const selectedSideChatPane =
+    selectedSideChat === null ? null : (
+      <SideChatPane
+        key={selectedSideChat}
+        childId={selectedSideChat}
+        onStart={(text) => startPendingSideChat(selectedSideChat, text)}
+        // A Codex side chat restored after a restart is a dead ephemeral
+        // fork: show it read-only rather than let the user
+        // send into a thread that no longer exists.
+        readOnly={
+          usesNativeSideChatFork(sideChatHarness) &&
+          !selectedSideChat.startsWith("pending:") &&
+          !sideChatsStartedThisSession.has(selectedSideChat)
+        }
+      />
+    );
+  const closeSideChat = async (childId: string) => {
+    if (!childId.startsWith("pending:")) {
+      try {
+        await stopSession(childId);
+      } catch {
+        toast.error("Couldn't close side chat. Try again.");
+        return;
+      }
+    }
+    // The tab is gone, so its unsent text/attachments and any seeded question
+    // that never got to send have nowhere to return to.
+    useChatStore.getState().clearSideChatComposer(childId);
+    useChatStore.getState().clearSideChatDraft(childId);
     sideChats.close(childId);
   };
 
@@ -917,12 +1007,122 @@ function WorkspacePanelImpl({
     : handleProps;
   const defaultTab = readDefaultWorkspaceTab();
   const tabOrder = [defaultTab, ...defaultWorkspaceTabs.filter((tab) => tab !== defaultTab)];
+  const visiblePermanentTabs = tabOrder.filter((tab) => {
+    if (tab === "subagents") return true;
+    if (tab === "github") return pending || showGithubTab;
+    return pending || showFilesPanel;
+  });
+  const shortcutFor = (tab: RightRailTab) => {
+    const index = visiblePermanentTabs.findIndex((candidate) => candidate === tab);
+    return index === -1 ? undefined : String(index + 1);
+  };
+  const selectPermanentTab = (tab: RightRailTab) => {
+    onRightRailTabChange(tab);
+  };
+  const handlePermanentTabNumber = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (
+      !event.currentTarget.contains(event.target as Node) ||
+      pending ||
+      event.repeat ||
+      event.shiftKey ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      !/^[1-9]$/.test(event.key)
+    ) {
+      return;
+    }
+    const tab = visiblePermanentTabs[Number(event.key) - 1];
+    if (!tab) return;
+    event.preventDefault();
+    event.stopPropagation();
+    selectPermanentTab(tab);
+  };
+  const browserFallbackTab =
+    tabOrder.find((tab) => {
+      if (tab === "subagents") return true;
+      if (tab === "github") return showGithubTab;
+      return showFilesPanel;
+    }) ?? "subagents";
+  useEffect(() => {
+    if (
+      rightRailTab === "browser" &&
+      browsers.selected === null &&
+      selectedFilePath === null &&
+      selectedTerminalKey === null
+    ) {
+      onRightRailTabChange(browserFallbackTab);
+    }
+  }, [
+    rightRailTab,
+    browsers.selected,
+    selectedFilePath,
+    selectedTerminalKey,
+    browserFallbackTab,
+    onRightRailTabChange,
+  ]);
+  const panelLabels = {
+    files: "Files",
+    changes: "Changes",
+    github: "Pull Requests",
+    subagents: "Agents",
+  };
+  const panelOptions = [
+    ...visiblePermanentTabs.map((tab) => ({
+      key: tab,
+      label: panelLabels[tab],
+      active:
+        selectedFilePath === null &&
+        selectedTerminalKey === null &&
+        !browserSelected &&
+        !sideChatSelected &&
+        rightRailTab === tab,
+      select: () => selectPermanentTab(tab),
+      disabled: false,
+    })),
+    ...openFiles.map((path) => ({
+      key: `file:${path}`,
+      label: path,
+      active: selectedFilePath === path,
+      select: () => openFileViewer(path),
+      disabled: false,
+    })),
+    ...openTerminals.map((key) => ({
+      key,
+      label: terminalLabelFor(key),
+      active: selectedTerminalKey === key,
+      select: () => openTerminalTab(key),
+      disabled: closingTerminalKey === key,
+    })),
+    ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
+      key: `browser:${tabId}`,
+      label: `Browser ${index + 1}`,
+      active: browserSelected && browsers.selected === tabId,
+      select: () => {
+        browsers.select(tabId);
+        onRightRailTabChange("browser");
+      },
+      disabled: false,
+    })),
+    ...sideChats.tabs.map((childId, index) => ({
+      key: `sidechat:${childId}`,
+      label: `Side chat ${index + 1}`,
+      active: sideChatSelected && sideChats.selected === childId,
+      select: () => {
+        sideChats.select(childId);
+        onRightRailTabChange("sidechat");
+      },
+      disabled: false,
+    })),
+  ];
   const tabTriggers = {
     files: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="files" label="Files">
+      <WorkspaceTabTooltip key="files" label="Files" shortcut={shortcutFor("files")}>
         <TabsTrigger
           value="files"
           aria-label="Files"
+          aria-keyshortcuts={shortcutFor("files")}
+          data-workspace-tab="files"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
@@ -932,10 +1132,12 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     changes: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="changes" label="Changes">
+      <WorkspaceTabTooltip key="changes" label="Changes" shortcut={shortcutFor("changes")}>
         <TabsTrigger
           value="changes"
           aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+          aria-keyshortcuts={shortcutFor("changes")}
+          data-workspace-tab="changes"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
@@ -946,23 +1148,27 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     github: (pending || showGithubTab) && (
-      <WorkspaceTabTooltip key="github" label="GitHub">
+      <WorkspaceTabTooltip key="github" label="Pull Requests" shortcut={shortcutFor("github")}>
         <TabsTrigger
           value="github"
-          aria-label="GitHub"
+          aria-label="Pull Requests"
+          aria-keyshortcuts={shortcutFor("github")}
+          data-workspace-tab="github"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
-          <GithubMono size={16} />
-          <span className="sr-only">GitHub</span>
+          <GitPullRequestIcon />
+          <span className="sr-only">Pull Requests</span>
         </TabsTrigger>
       </WorkspaceTabTooltip>
     ),
     subagents: (
-      <WorkspaceTabTooltip key="subagents" label="Agents">
+      <WorkspaceTabTooltip key="subagents" label="Agents" shortcut={shortcutFor("subagents")}>
         <TabsTrigger
           value="subagents"
           disabled={pending}
+          aria-keyshortcuts={shortcutFor("subagents")}
+          data-workspace-tab="subagents"
           aria-label={
             subagentsWorking > 0
               ? `Agents ${subagentsWorking}/${agentCount}`
@@ -985,7 +1191,7 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
-  return (
+  const rail = (
     <aside
       aria-label="Workspace"
       aria-hidden={!open}
@@ -1010,6 +1216,7 @@ function WorkspacePanelImpl({
       // against.
       data-maximized={maximized || undefined}
       data-state={open ? "open" : "closed"}
+      data-animate-visibility={animateVisibility || undefined}
       data-resizing={resizing || undefined}
       className={cn(
         "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
@@ -1043,18 +1250,17 @@ function WorkspacePanelImpl({
           />
         )}
         {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
-        {/* Tab strip: the static nav tabs + divider stay pinned on the left at
-          every rail width, and ONLY the file-tabs region scrolls (it owns the
-          horizontal scroller — see below). The outer row never scrolls
-          (overflow-x-hidden), so the divider is a fixed boundary that doesn't
-          drift when the tabs scroll. */}
-        <div className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3">
+        {/* Narrow rails use the picker for fixed panels, leaving room for open tabs. */}
+        <div
+          ref={tabListRef}
+          role="toolbar"
+          aria-label="Workspace tabs"
+          tabIndex={-1}
+          onKeyDown={handlePermanentTabNumber}
+          className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
+        >
           <Tabs
-            // Static group — never compresses (shrink-0) and stays anchored on
-            // the LEFT whether or not tabs are open. The open tabs render to its
-            // right; the maximize button owns the row's single ml-auto and pins
-            // to the right edge.
-            className="shrink-0"
+            className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
             // When a file or shell tab is active no fixed trigger should
             // highlight, so feed the radix group a sentinel that matches none of
             // them. The active file/shell tab carries its own highlight. Gate the
@@ -1065,51 +1271,31 @@ function WorkspacePanelImpl({
               pending
                 ? "__pending__"
                 : selectedFilePath !== null ||
-                    (browserSelected && browsers.selected !== null) ||
+                    browserSelected ||
                     sideChatSelected ||
                     (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
                   ? "__tab__"
                   : rightRailTab
             }
-            onValueChange={(value) => {
-              if (value === "browser") browsers.select(null);
-              onRightRailTabChange(value as RightRailTab);
-            }}
+            onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
             componentId="chat.right_rail.tabs"
           >
             <TabsList variant="pill" className="gap-1">
               {tabOrder.map((tab) => tabTriggers[tab])}
-              {showBrowserTab && (
-                <WorkspaceTabTooltip label="Browser">
-                  <TabsTrigger
-                    value="browser"
-                    aria-label="Browser"
-                    disabled={pending}
-                    className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                  >
-                    <GlobeIcon />
-                    <span className="sr-only">Browser</span>
-                  </TabsTrigger>
-                </WorkspaceTabTooltip>
-              )}
             </TabsList>
           </Tabs>
-          {/* 1px divider separating the static nav tabs from the open tabs.
-                Pinned (outside the scrolling file-tabs region), so it stays put
-                at every rail width while the tabs scroll past it. */}
+          {/* The divider follows the fixed panel icons' visibility. */}
           <div
             aria-hidden
-            className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong"
+            className={cn(
+              "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
+              showOpenTabs && "@max-[400px]/rail:hidden",
+            )}
           />
           {showOpenTabs && (
             <>
-              {/* Open-tabs region (file tabs + shell tabs) — the horizontal
-                scroller. It sizes to its content and shrinks+scrolls only when
-                the tabs would overflow (min-w-0, no flex-1), so the "+" outside
-                it hugs the last tab when they fit and stays pinned when they
-                don't. overflow-y-hidden stops overflow-x:auto from spawning a
-                vertical scrollbar that eats horizontal space. */}
-              <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              {/* Open tabs fill the space before the pinned trailing controls. */}
+              <WorkspaceTabsScroller>
                 <FileTabsStrip
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
@@ -1210,19 +1396,16 @@ function WorkspacePanelImpl({
                     </div>
                   );
                 })}
-              </div>
-              {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
-                stays pinned (never scrolls under / overlaps the tabs) when they
-                overflow, and hugs the last tab when they fit. ml-[2px] keeps the
-                same gap the scroller's gap-0.5 gives between tabs. */}
+              </WorkspaceTabsScroller>
+              {/* Keep new-panel actions outside the scrolling viewport. */}
               <NewTabMenu
                 conversationId={conversationId}
-                onOpenBrowser={addBrowser}
+                onOpenBrowser={showBrowserTab ? addBrowser : undefined}
                 onOpenSideChat={onNewSideChat}
                 onCreateError={onShellCreateFailed}
                 onOpenTerminal={openTerminalTab}
                 onCreateStart={onShellCreateStart}
-                triggerClassName="ml-[2px]"
+                triggerClassName="ml-1"
                 liveness={liveness}
               />
             </>
@@ -1234,7 +1417,7 @@ function WorkspacePanelImpl({
           {showEmptyNewTab && (
             <NewTabMenu
               conversationId={conversationId}
-              onOpenBrowser={addBrowser}
+              onOpenBrowser={showBrowserTab ? addBrowser : undefined}
               onOpenSideChat={onNewSideChat}
               onOpenTerminal={openTerminalTab}
               onCreateStart={onShellCreateStart}
@@ -1242,16 +1425,45 @@ function WorkspacePanelImpl({
               liveness={liveness}
             />
           )}
-          {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
-            which absorbs the free space before it. When open tabs exist their
-            ≥500px flex-1 region absorbs the space instead, so the button still
-            hugs the right. */}
+          {/* The picker and fullscreen toggle form the trailing control group. */}
+          <DropdownMenu>
+            <WorkspaceTabTooltip label="Select panel" className="ml-auto pl-1">
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className="size-6 shrink-0"
+                  aria-label="Select panel"
+                  disabled={pending}
+                >
+                  <ChevronDownIcon className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+            </WorkspaceTabTooltip>
+            <DropdownMenuContent align="end" className="max-w-[min(32rem,calc(100vw-2rem))]">
+              <SuppressBrowserView />
+              <DropdownMenuLabel>Panels</DropdownMenuLabel>
+              {panelOptions.map((option) => (
+                <DropdownMenuItem
+                  key={option.key}
+                  onSelect={option.select}
+                  disabled={option.disabled}
+                  title={option.label}
+                  aria-current={option.active ? "true" : undefined}
+                >
+                  <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                  {option.active && <CheckIcon className="size-4" aria-hidden />}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
           <WorkspaceTabTooltip
             label={maximized ? "Exit full screen" : "Full screen"}
-            className="ml-auto"
+            className="ml-1"
           >
             <Button
-              // type="button"
+              type="button"
               variant="ghost"
               aria-label={maximized ? "Exit full screen" : "Full screen"}
               aria-pressed={maximized}
@@ -1304,35 +1516,23 @@ function WorkspacePanelImpl({
               onCommentsOpenChange={onCommentsOpenChange}
               sort={filesPanelSort}
             />
-          ) : sideChatSelected && sideChats.selected !== null ? (
+          ) : sideChatSelected && !isMobile ? (
             // A side chat: a forked child conversation streamed here in its own
-            // scoped surface, beside the still-active main chat. A `pending:` tab
-            // has no child yet — its first send creates the fork.
-            <SideChatPane
-              key={sideChats.selected}
-              childId={sideChats.selected}
-              onStart={(text) => startPendingSideChat(sideChats.selected!, text)}
-              // A Codex side chat restored after a restart is a dead ephemeral
-              // fork — show it read-only (and kill it) rather than let the user
-              // send into a thread that no longer exists.
-              readOnly={
-                usesNativeSideChatFork(sideChatHarness) &&
-                !sideChats.selected.startsWith("pending:") &&
-                !sideChatsStartedThisSession.has(sideChats.selected)
-              }
-            />
-          ) : rightRailTab === "browser" && showBrowserTab ? (
-            // Embedded browser (Electron only) — BrowserPane self-gates and
-            // measures this rail slot to position the native view over it.
+            // scoped surface, beside the still-active main chat. Phones show it
+            // in the side-chats drawer instead, so it never mounts twice.
+            selectedSideChatPane
+          ) : browserSelected && showBrowserTab ? (
+            // Browser soft tab — BrowserPane self-gates and measures this rail
+            // slot to position the native view over it.
             <BrowserPane
               key={browsers.viewId}
-              conversationId={browsers.viewId}
-              agentBrowser={browsers.selected === null}
+              conversationId={browsers.viewId!}
+              agentBrowser={browsers.agentBrowser}
               active={open}
               className="min-h-0 flex-1"
             />
           ) : rightRailTab === "github" && showGithubTab ? (
-            <GithubPanel conversationId={conversationId} />
+            <PullRequestPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : (
@@ -1351,6 +1551,79 @@ function WorkspacePanelImpl({
         </div>
       </div>
     </aside>
+  );
+  return (
+    <>
+      {rail}
+      {/* The rail is `hidden` on phones, so the drawer renders beside it. A
+        portal to the body would escape the embed's scoped styles. */}
+      {isMobile && (
+        <MobilePanelDrawer
+          open={mobileSideChatsOpen}
+          title="Side chats"
+          onClose={() => onMobileSideChatsOpenChange?.(false)}
+          testId="side-chats-panel-drawer"
+          // Keep live side-chat work mounted while the drawer is closed.
+          keepMounted
+        >
+          <div
+            role="tablist"
+            aria-label="Side chats"
+            className="flex shrink-0 items-center gap-1 overflow-x-auto border-border border-b px-2 py-1.5"
+          >
+            {sideChats.tabs.map((childId, index) => {
+              const active = sideChats.selected === childId;
+              const label = `Side chat ${index + 1}`;
+              return (
+                <div
+                  key={childId}
+                  className={cn(
+                    "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
+                    active ? "bg-muted text-foreground" : "text-muted-foreground",
+                  )}
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => sideChats.select(childId)}
+                  >
+                    {label}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Close ${label}`}
+                    className="flex size-6 items-center justify-center rounded"
+                    onClick={() => closeSideChat(childId)}
+                  >
+                    <XIcon className="size-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+            {onNewSideChat && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="New side chat"
+                onClick={onNewSideChat}
+              >
+                <PlusIcon className="size-4" />
+              </Button>
+            )}
+          </div>
+          {selectedSideChatPane ?? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+              <MessagesSquareIcon className="size-6 text-muted-foreground" />
+              <p className="max-w-[36ch] text-sm text-muted-foreground">
+                Tap + to ask a question without affecting the main conversation.
+              </p>
+            </div>
+          )}
+        </MobilePanelDrawer>
+      )}
+    </>
   );
 }
 
