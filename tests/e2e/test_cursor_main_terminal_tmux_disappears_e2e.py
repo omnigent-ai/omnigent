@@ -55,6 +55,10 @@ _TMUX_UNAVAILABLE_RE = re.compile(
     r"tmux unavailable after \d+ consecutive probes for terminal cursor:main"
 )
 
+# The runner emits this once it diagnoses the pane-dead exit. Its presence
+# distinguishes a handled exit from a terminal removed by some other path.
+_TERMINAL_EXIT_OBSERVED_RE = re.compile(r"Terminal exit observed:.*terminal=cursor:main")
+
 pytestmark = [
     pytest.mark.skipif(
         shutil.which("cursor-agent") is None,
@@ -273,8 +277,11 @@ def test_cursor_main_terminal_survives_cursor_agent_exit_without_tmux_unavailabl
         os.kill(pid, signal.SIGKILL)
 
         # A regression logs the signature within a second of the exit; the
-        # window is generous so a slow box cannot mask it.
+        # window is generous so a slow box cannot mask it. The exit-observation
+        # line is collected alongside it so a green reflects the handled
+        # pane-dead exit rather than an unrelated resource removal.
         signature_line: str | None = None
+        exit_observed_line: str | None = None
         terminal_gone = False
         scan_deadline = time.monotonic() + 25.0
         while time.monotonic() < scan_deadline:
@@ -282,8 +289,14 @@ def test_cursor_main_terminal_survives_cursor_agent_exit_without_tmux_unavailabl
             if hit is not None:
                 signature_line = hit
                 break
+            if exit_observed_line is None:
+                exit_observed_line = _scan_home_logs_for(
+                    host.home, _TERMINAL_EXIT_OBSERVED_RE, session_id=session_id
+                )
             if not _terminal_resource_present(http_client, session_id):
                 terminal_gone = True
+            if exit_observed_line is not None and terminal_gone:
+                break
             time.sleep(POLL_INTERVAL_S)
         if signature_line is None and not terminal_gone:
             terminal_gone = not _terminal_resource_present(http_client, session_id)
@@ -299,6 +312,12 @@ def test_cursor_main_terminal_survives_cursor_agent_exit_without_tmux_unavailabl
             "signature instead of a diagnosable pane-dead exit:\n"
             f"    {signature_line}\n"
             f"tmux has-session rc={has_session.returncode}: {has_session.stderr.strip()}"
+        )
+        assert exit_observed_line is not None, (
+            "cursor:main was removed without a diagnosable terminal-exit record -- a green "
+            "result must reflect the handled pane-dead exit, not an unrelated resource "
+            f"removal.\n    tmux has-session rc={has_session.returncode}: "
+            f"{has_session.stderr.strip()}"
         )
     finally:
         with contextlib.suppress(httpx.HTTPError):
