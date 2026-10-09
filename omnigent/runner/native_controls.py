@@ -37,6 +37,7 @@ from omnigent.runner.native import (
     _claude_native_bridge_id_for_session,
     _codex_native_model_from_spec,
     _CodexNativeModelOptionsNotReady,
+    _readvertise_live_claude_tmux_target,
     _resolve_opencode_compact_model,
 )
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -963,6 +964,9 @@ def build_native_controls(
         # only job is to decide whether the readiness poll below runs at all.
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
+            # A live pane can still lack its tmux advertisement; restore it so
+            # the inject below does not time out against an absent target.
+            _readvertise_live_claude_tmux_target(bridge_dir, instance, session_id=conv_id)
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")
         if terminal_registry.get(conv_id, terminal_name, "main") is None:

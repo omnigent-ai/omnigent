@@ -171,6 +171,50 @@ def _publish_tmux_target_for_bridge(
     )
 
 
+def _readvertise_live_claude_tmux_target(
+    bridge_dir: Path,
+    instance: TerminalInstance,
+    *,
+    session_id: str,
+) -> None:
+    """
+    Restore a live Claude pane's tmux advertisement when it is missing.
+
+    Pane liveness does not imply deliverability: ``tmux.json`` can lag behind
+    the launch or be lost while the pane stays alive, and message injection
+    hard-fails once its advertisement wait expires. The registry instance
+    still knows the socket and target, so rewrite the advertisement instead.
+    Best-effort: on failure the injection falls back to its own wait.
+
+    :param bridge_dir: The session's claude-native bridge directory.
+    :param instance: The registered, alive ``claude`` pane instance.
+    :param session_id: Owning session/conversation id, for logging.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native.bridge import tmux_target_advertised, write_tmux_target
+
+    try:
+        if tmux_target_advertised(bridge_dir):
+            return
+        _logger.warning(
+            "live claude pane has no tmux advertisement for conv=%s; re-advertising",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        write_tmux_target(
+            bridge_dir,
+            socket_path=instance.socket_path,
+            tmux_target=instance.tmux_target,
+        )
+    except Exception:  # noqa: BLE001 — heal is best-effort
+        _logger.warning(
+            "failed to re-advertise claude tmux target for conv=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+
+
 # Background transcript-forwarder tasks for host-spawned claude-native and
 # codex-native runners, keyed by session id: strong references so they aren't
 # garbage-collected mid-run, and the handle for cancelling a session's previous

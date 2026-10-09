@@ -18,8 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
     tmux_target_advertised,
 )
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.runner import app as runner_app_module
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -119,14 +118,16 @@ async def _open_claude_native_session(
         _stub_launch_claude,
     )
     monkeypatch.setattr("omnigent.runner.native._launch_claude", _stub_launch_claude)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_POLL_S", 0.01)
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
         lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
     )
-    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda _bridge_dir: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "post_tools_changed", lambda _bridge_dir, **kwargs: None
+    )
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
