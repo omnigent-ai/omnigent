@@ -31,6 +31,7 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.util.open_file_limit import raise_soft_open_file_limit
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -2129,6 +2130,9 @@ def main() -> None:
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
+    # launchd starts desktop-launched runners with a soft limit of 256 open
+    # files; raise it before the tunnel, terminals and sub-agents need them.
+    raise_soft_open_file_limit()
     _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())

@@ -5011,8 +5011,10 @@ def run_host_process(
         log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
     )
     from omnigent.host import crash_reporting
+    from omnigent.util.open_file_limit import raise_soft_open_file_limit
 
     crash_reporting.install_host_crash_hooks()
+    raise_soft_open_file_limit()
     crash_reporting.set_host_exit_context(daemon_target=daemon_target)
     # Installed before any startup work, so a stop signal during e.g. the git
     # credential setup is still reported and drained.

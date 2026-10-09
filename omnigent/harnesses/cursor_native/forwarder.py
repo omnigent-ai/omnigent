@@ -53,6 +53,7 @@ from omnigent.harnesses.cursor_native import status as cursor_native_status
 from omnigent.harnesses.cursor_native.bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native._native_post_delivery import post_may_have_been_delivered
+from omnigent.native.fd_exhaustion import fd_exhaustion_errno
 
 _logger = logging.getLogger(__name__)
 
@@ -294,23 +295,6 @@ def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int
         if other.launch_epoch_ms == my_launch_ms and sibling.name < me:
             return True
     return False
-
-
-def _fd_exhaustion_errno(exc: BaseException) -> int | None:
-    """Return EMFILE/ENFILE if *exc* (or its cause chain) is fd exhaustion.
-
-    Walks explicit causes only (``raise … from exc``, e.g. httpx wrapping the
-    socket error), not implicit context, so an unrelated error raised while
-    handling an fd failure is not misclassified.
-    """
-    current: BaseException | None = exc
-    for _ in range(10):  # bound the walk against pathological cause cycles
-        if current is None:
-            return None
-        if isinstance(current, OSError) and current.errno in (errno.EMFILE, errno.ENFILE):
-            return current.errno
-        current = current.__cause__
-    return None
 
 
 def _get_current_rowid(store_path: Path) -> int:
@@ -1256,7 +1240,7 @@ async def forward_cursor_store_to_session(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                fd_errno = _fd_exhaustion_errno(exc)
+                fd_errno = fd_exhaustion_errno(exc)
                 if fd_errno is not None:
                     now = time.monotonic()
                     if (

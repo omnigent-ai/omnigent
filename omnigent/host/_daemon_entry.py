@@ -58,6 +58,12 @@ def main() -> None:
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
 
+    from omnigent.util.open_file_limit import raise_soft_open_file_limit
+
+    # Raise the launchd-inherited soft open-file limit before the local server
+    # and the runner zygote are spawned, so they inherit the headroom too.
+    raise_soft_open_file_limit()
+
     from omnigent.host.daemon_lifecycle import (
         DAEMON_CONFIG_SIG_ENV_VAR,
         DaemonLifecycleLock,

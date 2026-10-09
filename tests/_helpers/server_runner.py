@@ -202,14 +202,16 @@ class ServerRunner:
     def start_host(
         self,
         *,
+        bootstrap: str | None = None,
         env: Mapping[str, str | None] | None = None,
         cwd: Path | None = None,
     ) -> None:
         """Start a host daemon that launches runners through the server's host API."""
         assert self.host is None, "host already started"
+        args = ["-c", bootstrap] if bootstrap else ["-m", "omnigent.host._daemon_entry"]
         self.host = self._spawn(
             "host",
-            ["-m", "omnigent.host._daemon_entry", "--server", self.base_url],
+            [*args, "--server", self.base_url],
             self.runner_home,
             env or {},
             cwd=cwd,
