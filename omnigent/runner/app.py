@@ -1620,19 +1620,13 @@ def create_runner_app(
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
     def _note_subagent_child_activity(child_id: str) -> None:
-        """
-        Track a child's ``running``/``waiting`` edge as a new turn when its
-        last dispatch was already finished, and show an idle parent waiting.
-
-        Only a parent that is idle with no turn in flight is moved: a parent
-        mid-turn computes ``waiting`` itself at its turn end, and a native
-        parent's status is owned by its own terminal (``_publish_turn_status``
-        skips it).
-        """
+        """Re-arm a finished dispatch on new child activity and show an idle parent waiting."""
         entry = note_subagent_child_activity(child_id)
         if entry is None:
             return
         parent_id = entry.parent_session_id
+        # A parent mid-turn derives ``waiting`` at its own turn end; a native
+        # parent's status is owned by its terminal (``_publish_turn_status`` skips it).
         if parent_id in _active_turns or _native_pane_status.get(parent_id) != "idle":
             return
         _publish_turn_status(parent_id, "waiting")
