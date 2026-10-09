@@ -82,6 +82,7 @@
   --color-secondary: var(--secondary);
   --color-primary-foreground: var(--primary-foreground);
   --color-primary: var(--primary);
+  --color-link: var(--link);
   --color-popover-foreground: var(--popover-foreground);
   --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
@@ -1417,6 +1418,24 @@ html[data-electron-mac]
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
   cursor: pointer;
+  color: var(--link);
+  text-underline-offset: 0.18em;
+  text-decoration-color: color-mix(in srgb, currentColor 55%, transparent);
+}
+
+[data-streamdown="link"]:hover {
+  text-decoration-color: currentColor;
+}
+
+[data-streamdown="link"]:focus-visible,
+[data-streamdown="inline-code"][role="button"]:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+[data-streamdown="inline-code"][role="button"] {
+  color: var(--link);
 }
 
 /* Streamdown renders links with `wrap-anywhere` (overflow-wrap: anywhere),
@@ -1451,18 +1470,53 @@ html[data-electron-mac]
   max-width: 100%;
 }
 
-/* Flatten Streamdown's loud heading ramp (text-3xl..xl) to em sizes proportional to body. */
+/* Keep the heading hierarchy proportional to the user's body-text setting. */
 [data-streamdown="heading-1"] {
-  font-size: 1.4em;
+  font-size: 1.65em;
 }
 [data-streamdown="heading-2"] {
-  font-size: 1.2em;
+  font-size: 1.4em;
 }
 [data-streamdown="heading-3"] {
-  font-size: 1.05em;
+  font-size: 1.2em;
 }
 [data-streamdown="heading-4"] {
-  font-size: 1em;
+  font-size: 1.05em;
+}
+
+.message-markdown :is(h1, h2, h3, h4, h5, h6) {
+  line-height: 1.35;
+  margin-block: 1.6em 0.6em;
+}
+
+.message-markdown > :first-child {
+  margin-top: 0;
+}
+
+.message-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+/* Prose stays readable on wide screens; tables and code use the full column. */
+.chat-markdown > :is(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
+  max-width: 80ch;
+}
+
+.chat-markdown :is(ul, ol) {
+  list-style-position: outside;
+  padding-inline-start: 1.5em;
+}
+
+.chat-markdown li {
+  padding-block: 0.2em;
+}
+
+.chat-markdown li::marker {
+  color: var(--muted-foreground);
+}
+
+.chat-markdown li > :is(ul, ol) {
+  margin-block: 0.35em;
 }
 
 /* GitHub task lists in chat messages (Streamdown + remark-gfm). remark-gfm tags
