@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import time
 import uuid
@@ -75,7 +76,8 @@ def slow_agy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     shim_dir.mkdir()
     shim = shim_dir / "agy"
     shim.write_text(
-        f'#!/bin/sh\nsleep {_AGY_START_DELAY_S:g}\nexec "{real_agy}" "$@"\n', encoding="utf-8"
+        f'#!/bin/sh\nsleep {_AGY_START_DELAY_S:g}\nexec {shlex.quote(real_agy)} "$@"\n',
+        encoding="utf-8",
     )
     shim.chmod(0o700)
     monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
@@ -127,8 +129,12 @@ def _snapshot(session: AntigravitySession, name: str, **facts: object) -> None:
     """Record evidence best-effort: a vanished pane or server must not mask the assertion."""
     evidence = session.directory / "evidence"
     evidence.mkdir(exist_ok=True)
-    state = read_bridge_state(session.bridge_dir)
-    log = _runner_log(session)
+    state = None
+    log = ""
+    with contextlib.suppress(Exception):
+        state = read_bridge_state(session.bridge_dir)
+    with contextlib.suppress(Exception):
+        log = _runner_log(session)
     record: dict[str, object] = {
         "at": time.time(),
         "session_id": session.session_id,
@@ -153,8 +159,9 @@ def _snapshot(session: AntigravitySession, name: str, **facts: object) -> None:
     bridge_copy = evidence / f"{name}.bridge"
     bridge_copy.mkdir(exist_ok=True)
     for path in session.bridge_dir.glob("*"):
-        if path.is_file() and (path.suffix in {".json", ".log"}):
-            shutil.copy2(path, bridge_copy / path.name)
+        with contextlib.suppress(Exception):
+            if path.is_file() and (path.suffix in {".json", ".log"}):
+                shutil.copy2(path, bridge_copy / path.name)
 
 
 def test_turn_is_mirrored_after_cold_start_misses_catalog_deadline(

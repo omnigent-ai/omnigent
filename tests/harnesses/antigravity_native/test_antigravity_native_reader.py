@@ -3769,7 +3769,8 @@ def test_placeholder_recovery_refuses_a_foreign_cascade_and_reports_it_once(
 ) -> None:
     """A typed cascade whose db is not in this session's Gemini dir is refused on
     every scan (adopting a foreign agy's cascade would durably cross-bind the
-    session) but warned about once; repeats within a discovery run log at DEBUG."""
+    session). The first miss is logged at DEBUG (usually agy's write lag), the
+    second at WARNING (a foreign agy), and later repeats at DEBUG again."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     # No conversation db is written: the scan answer came from a foreign agy.
     monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
@@ -3785,10 +3786,10 @@ def test_placeholder_recovery_refuses_a_foreign_cascade_and_reports_it_once(
     levels = [
         record.levelname
         for record in caplog.records
-        if "NOT in this session's Gemini dir" in record.getMessage()
+        if "in this session's Gemini dir" in record.getMessage()
     ]
-    assert levels == ["WARNING", "DEBUG", "DEBUG"]
-    assert scan_log.foreign_reported == {_CASCADE_ID}
+    assert levels == ["DEBUG", "WARNING", "DEBUG"]
+    assert scan_log.foreign_misses == {_CASCADE_ID: 3}
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == "agy_conv_placeholder"
