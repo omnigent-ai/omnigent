@@ -440,12 +440,14 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
     ),
+    # agy's catalog is the signed-in account's (Gemini plus Claude/GPT), so the
+    # model family is multi; the effort vocabulary is still Gemini's.
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
         _EL.NONE,
         _RS.WARM_REATTACH,
         _EF.GEMINI,
-        _MF.GEMINI,
+        _MF.MULTI,
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,

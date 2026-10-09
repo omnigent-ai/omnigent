@@ -2,12 +2,9 @@ spec_version: 1
 name: agy
 description: Google Antigravity CLI coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
 
-# Native Google Antigravity (`agy`) TUI/CLI harness: drives the `agy` binary
-# in its own terminal the human can open in the UI's Subagents panel and TAKE
-# OVER. Antigravity's in-terminal approval prompt still fires for dangerous
-# commands and is mirrored to the web UI, so risky actions surface as approval
-# cards rather than being auto-bypassed. agy is Gemini-native (own Google
-# account auth via ~/.gemini) and does not run Claude/GPT-family models.
+# Native agy TUI harness: its own takeover-capable terminal (Subagents panel);
+# agy's approval prompt still fires for risky commands, mirrored to the web UI.
+# Runs whatever the signed-in account's `agy models` lists, incl. Claude/GPT.
 executor:
   type: omnigent
   config:

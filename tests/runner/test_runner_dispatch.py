@@ -3950,6 +3950,7 @@ def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
         pytest.param("claude-native", "databricks-claude-sonnet-4-6", id="claude-native"),
         pytest.param("codex-native", "databricks-gpt-5-4", id="codex-native"),
         pytest.param("claude-sdk", "databricks-claude-sonnet-4-6", id="claude-sdk"),
+        pytest.param("antigravity-native", "claude-sonnet-4-6", id="antigravity-native-claude"),
     ],
 )
 async def test_sys_session_send_model_lands_in_child_create_body(
@@ -4019,6 +4020,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
             subagent_work.unregister_subagent_work("conv_child_model")
             subagent_work._session_inboxes_ref.pop("conv_parent_model", None)
 
+    assert not output.startswith("Error:"), output
     payload = json.loads(output)
     assert payload["status"] == "launching"
     # Exactly one create, carrying the override verbatim — the value the
@@ -4596,6 +4598,12 @@ async def _dispatch_model_send(
             "us.anthropic.claude-sonnet-4-6",
             id="non-mechanical-passthrough",
         ),
+        pytest.param(
+            "antigravity-native",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            id="agy-cli-owns-its-catalog",
+        ),
     ],
 )
 async def test_sys_session_send_localizes_canonical_model_for_gateway_child(
@@ -4612,7 +4620,9 @@ async def test_sys_session_send_localizes_canonical_model_for_gateway_child(
     (``claude-sonnet-4-6``) would die at the gateway ("model not
     found"); the gate must persist the ``databricks-``-prefixed
     spelling as ``model_override`` — and ONLY for mechanical ids:
-    already-local and vendor-prefixed shapes pass through verbatim.
+    already-local and vendor-prefixed shapes pass through verbatim. A
+    native agy worker resolves the same Databricks default, but the CLI
+    owns its catalog and has no gateway path, so its id is never localized.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.

@@ -2370,8 +2370,10 @@ def _normalize_subagent_model(
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
     from omnigent.models.model_catalog import resolve_model_provider
 
-    # ACP commands own their model namespace, even when provider credentials are shared.
-    if canonicalize_harness(harness) == "acp" or (
+    # ACP commands and the native agy CLI own their model namespaces (agy has no
+    # gateway path, so a gateway spelling never launches), even when provider
+    # credentials are shared.
+    if canonicalize_harness(harness) in ("acp", "antigravity-native") or (
         harness is not None
         and binding_for_harness(load_runtime_inference_config(), harness) is not None
     ):
