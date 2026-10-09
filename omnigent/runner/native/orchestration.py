@@ -2465,6 +2465,35 @@ async def _resolve_pi_resume_session(
     return None
 
 
+def _check_pi_cli_version_floor(version: tuple[int, int, int]) -> None:
+    """Fail the launch when the installed Pi CLI is below Omnigent's floor.
+
+    A Pi older than the installer's ``min_version`` rejects ``--provider
+    omnigent`` and exits 1, which otherwise surfaces as a generic
+    terminal-start failure the person retries unchanged.
+
+    :param version: Probed Pi CLI version, e.g. ``(0, 84, 2)``.
+    :raises PiNativeCliOutdatedError: When *version* is below the floor.
+    """
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
+    from omnigent.onboarding.harness_install import (
+        PI_KEY,
+        harness_install_display,
+        harness_install_spec,
+    )
+
+    spec = harness_install_spec(PI_KEY)
+    floor = spec.min_version if spec is not None else None
+    if floor is None or version >= tuple(int(part) for part in floor.split(".")):
+        return
+    installed = ".".join(str(part) for part in version)
+    raise PiNativeCliOutdatedError(
+        f"The installed Pi CLI ({installed}) is older than the minimum Omnigent "
+        f"supports ({floor}). Upgrade with: {harness_install_display(PI_KEY)}, "
+        "then start the session again."
+    )
+
+
 async def _auto_create_pi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2563,6 +2592,13 @@ async def _auto_create_pi_terminal(
         tools=pi_tools,
     )
     pi_command = resolve_pi_executable()
+    # One ``pi --version`` probe feeds both the floor gate and the --approve
+    # feature check below. An unknown version fails open, as before.
+    from omnigent.harnesses.pi_native.main import PI_APPROVE_MIN_VERSION, pi_version
+
+    pi_cli_version = await asyncio.to_thread(pi_version, pi_command)
+    if pi_cli_version is not None:
+        _check_pi_cli_version_floor(pi_cli_version)
     # Rebuild the local Pi session JSONL from committed Omnigent items so a
     # cold-resume or fork opens with prior conversation context (parity with
     # claude-native / codex-native). Returns the id to launch with via
@@ -2574,14 +2610,12 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
-    from omnigent.harnesses.pi_native.main import pi_supports_approve
-
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,
         session_dir=session_dir,
         external_session_id=resume_session_id,
-        approve=await asyncio.to_thread(pi_supports_approve, pi_command),
+        approve=pi_cli_version is not None and pi_cli_version >= PI_APPROVE_MIN_VERSION,
     )
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
@@ -7676,6 +7710,7 @@ def _native_terminal_start_error_payload(
         extra=extra,
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     if runtime_name == "Codex" and isinstance(exc, TerminalExitedDuringLaunch):
@@ -7690,6 +7725,10 @@ def _native_terminal_start_error_payload(
             "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
             "binary wins PATH resolution, then retry."
         )
+    elif isinstance(exc, PiNativeCliOutdatedError):
+        # The raise site composes a client-safe message (versions + upgrade
+        # command), so it can be shown verbatim.
+        message = str(exc)
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.

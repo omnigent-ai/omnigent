@@ -64,6 +64,14 @@ _SESSION_LABELS = {
 }
 
 
+class PiNativeCliOutdatedError(RuntimeError):
+    """The installed Pi CLI is below Omnigent's supported floor.
+
+    The message names the installed version, the floor, and the upgrade
+    command, so the native-terminal-start error path can show it verbatim.
+    """
+
+
 @dataclass(frozen=True)
 class NativePiLaunch:
     """Resolved native Pi process launch."""
