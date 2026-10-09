@@ -180,9 +180,11 @@ def test_shell_launcher_reporting_a_stray_token_is_not_missing_binary(command: s
         ("claude", "zsh: no such file or directory: /opt/claude/bin/claude"),
         ("claude", "'claude' is not recognized as an internal or external command,"),
         ("claude", 'exec: "claude": executable file not found in $PATH'),
-        # env blames the CLI it could not exec (GNU quotes the name, BSD does not).
+        # env blames the CLI it could not exec (GNU quotes the name, BSD does not),
+        # and prefixes the line with however it was invoked.
         ("env", "env: ‘claude’: No such file or directory"),
         ("env", "env: claude: No such file or directory"),
+        ("env", "/usr/bin/env: ‘claude’: No such file or directory"),
     ],
 )
 def test_not_found_line_blaming_launched_command_is_missing_binary(

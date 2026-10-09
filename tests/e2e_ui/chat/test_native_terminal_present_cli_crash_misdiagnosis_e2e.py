@@ -1,31 +1,9 @@
-"""E2E: a present Claude Code CLI that crashes with exit 127 must not be diagnosed as missing.
+"""E2E: a present Claude Code CLI that runs and then exits 127 must get the generic
+terminal-exit card, not "Agent command not found" with an install hint.
 
-Reported failure: a claude-native session's required terminal ran Claude Code (it
-self-updated and printed its ``Resume this session with:`` banner), then a stray
-``--model`` token reached the shell (``zsh:2: command not found: --model``) and the
-pane died with status 127. The session's failure card then read::
-
-    Agent command not found
-    The host couldn't find the agent's CLI on its PATH, so the terminal exited
-    before the session could start.
-    Try this: Install the harness on the host (e.g. run `omnigent setup`).
-
-contradicting the pane output that proves the CLI was present and running. The
-honest diagnosis for such an exit is the generic terminal-exit message with the
-captured pane output under the diagnostics.
-
-The rig stands a scripted ``claude`` stub in for the crashing CLI through the
-documented ``harness.claude-native.command`` override in the session workspace's
-``.omnigent/config.yaml`` (resolved on every launch), so it runs against the shared
-``live_server`` runner — including the workflow-prepared one — without a dedicated
-server. The stub prints the reported pane lines, keeps the pane active briefly so
-the terminal registers as a running required terminal, then exits 127.
-
-Journey (the reported one): open a fresh Claude Code (claude-native) session whose
-required terminal auto-launches on bind, switch to the Chat view, and read the
-failure card. Buggy build: the card reads "Agent command not found" and tells the
-user to run ``omnigent setup`` (this test FAILS). Fixed build: the card reads the
-generic "The agent's terminal exited unexpectedly…" (this test PASSES).
+The crashing CLI is a scripted ``claude`` stub selected through the workspace's
+``harness.claude-native.command`` override, so the journey runs against the shared
+``live_server`` runner, including a workflow-prepared one.
 """
 
 from __future__ import annotations
@@ -236,8 +214,6 @@ def test_present_cli_crash_is_not_misdiagnosed_as_missing(
     if record_dir:
         with contextlib.suppress(Exception):
             page.screenshot(path=str(Path(record_dir) / "failure-card.png"))
-    page.wait_for_timeout(3_000)
-    card_text = pill.inner_text()
 
     # Precondition the misdiagnosis ignores: the present CLI ran through its
     # resume banner and the stray `--model` line, then the registered terminal
@@ -245,6 +221,14 @@ def test_present_cli_crash_is_not_misdiagnosed_as_missing(
     error = _await_required_terminal_exit(base_url, session_id)
     assert (scratch / _RAN_MARKER).exists(), "the stub CLI never ran to its exit"
     assert error.get("code") == "required_terminal_exited", error
+
+    # Read the card only after that failure is persisted, so this is its final text.
+    page.wait_for_timeout(3_000)
+    card_text = pill.inner_text()
+    assert _RESUME_MARKER in card_text and _STRAY_ARG_LINE in card_text, (
+        f"The card's captured output lacks the pane lines proving the CLI ran.\n"
+        f"Card text:\n{card_text}"
+    )
 
     assert _MISDIAGNOSIS_HEADLINE not in card_text, (
         f"Misdiagnosis: the card reads {_MISDIAGNOSIS_HEADLINE!r} for a present Claude Code CLI "

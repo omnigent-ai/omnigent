@@ -119,7 +119,7 @@ _BLAMED_BEFORE_PHRASE = re.compile(
     r"|executable file not found)"
 )
 _BLAMED_NOT_RECOGNIZED = re.compile(r"(\S+) is not recognized as an internal or external command")
-_REPORTER = re.compile(r"^-?([a-z0-9_.+-]+?)(?::\d+)?:")
+_REPORTER = re.compile(r"^-?([a-z0-9_./+-]+?)(?::\d+)?:")
 _BLAME_QUOTES = "'\"`‘’,;"
 # Launchers whose own not-found line blames the program they failed to exec.
 # claude-native runs ``env -u … claude …``, so an ``env:`` error means the CLI.
@@ -156,7 +156,7 @@ def _missing_binary(s: _Signal) -> bool:
         reporter, token = blame
         if token == s.command or token.rsplit("/", 1)[-1] == s.command:
             return True
-        if reporter == s.command and reporter in _EXEC_WRAPPERS:
+        if reporter.rsplit("/", 1)[-1] == s.command and s.command in _EXEC_WRAPPERS:
             return True
     return s.exit_code == 127 and not s.output.strip()
 
