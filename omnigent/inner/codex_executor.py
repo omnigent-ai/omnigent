@@ -2738,6 +2738,49 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
+INPUT_TOO_LARGE_CODE = "input_too_large"
+_INPUT_TOO_LARGE_TITLE = "Message is too large for Codex"
+_INPUT_TOO_LARGE_REMEDIATION = "Shorten the message or split large pasted content across turns."
+
+
+class _CodexRequestError(RuntimeError):
+    """A JSON-RPC request the Codex app-server rejected; ``error`` is its payload."""
+
+    def __init__(self, error: object) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _input_too_large_error(error: object) -> ExecutorError | None:
+    """
+    Translate an ``input_too_large`` rejection into a user-facing turn error.
+
+    :param error: The JSON-RPC ``error`` payload, e.g. ``{"code": -32602,
+        "data": {"input_error_code": "input_too_large", "max_chars": 1048576,
+        "actual_chars": 1449987}, "message": "..."}``.
+    :returns: A coded :class:`ExecutorError` naming the limit, or ``None`` when
+        *error* is some other rejection.
+    """
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual = data.get("actual_chars")
+    limit = data.get("max_chars")
+    if isinstance(actual, int) and isinstance(limit, int):
+        message = f"This turn's input is {actual:,} characters; Codex accepts at most {limit:,}."
+    else:
+        message = "This turn's input is too large for Codex."
+    return ExecutorError(
+        message=message,
+        retryable=False,
+        code=INPUT_TOO_LARGE_CODE,
+        title=_INPUT_TOO_LARGE_TITLE,
+        remediation=_INPUT_TOO_LARGE_REMEDIATION,
+    )
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -3690,10 +3733,19 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = reasoning_effort
             turn_params["summary"] = "detailed"
-        start_response = await self._request(
-            "turn/start",
-            turn_params,
-        )
+        try:
+            start_response = await self._request(
+                "turn/start",
+                turn_params,
+            )
+        except _CodexRequestError as exc:
+            # Refused before any turn exists, so name the limit instead of
+            # leaking the app-server's raw JSON-RPC error to the user.
+            too_large = _input_too_large_error(exc.error)
+            if too_large is None:
+                raise
+            yield too_large
+            return
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -4255,7 +4307,7 @@ class _CodexAppServerSession:
                 future.exception()
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise _CodexRequestError(error)
         return response
 
     async def _send_response(self, request_id: int, result: CodexParams) -> None:
