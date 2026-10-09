@@ -3,8 +3,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import omnigent_slack.service as service_module
 import pytest
+import respx
 from omnigent_slack.approvals import Verdict, parse_action_value
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
@@ -147,6 +149,9 @@ class FakeStream:
 
 class FakeSlackClient:
     def __init__(self) -> None:
+        # The bot token the CDN attachment fetch authorizes with (the real
+        # Bolt AsyncClient carries it; the fake mirrors it for relay tests).
+        self.token: str | None = "xoxb-test"
         # Live (not-yet-deleted) posts. The immediate "Working on it…" ack is
         # posted then deleted, so it lands here transiently and is removed by
         # chat_delete — leaving posts to reflect only durable replies.
@@ -236,6 +241,11 @@ class FakeSlackClient:
 class FakeOmnigentClient:
     def __init__(self, final_text: str = "hello final") -> None:
         self.created: list[tuple[str, str]] = []
+        # Inbound-attachment relay recording: (session, filename, content_type,
+        # data) per upload, and per-turn (text, attachments) with attachments
+        # forwarded through run_turn.
+        self.uploads: list[tuple[str, str, str | None, bytes]] = []
+        self.turn_attachments: list[list[dict[str, Any]] | None] = []
         # host_type each create_session / run_turn was asked for, so a test can
         # prove a managed session never reaches the runner-launch path.
         self.created_host_types: list[str] = []
@@ -298,6 +308,17 @@ class FakeOmnigentClient:
     async def delete_session(self, session_id: str) -> None:
         self.deleted.append(session_id)
 
+    async def upload_session_file(
+        self,
+        session_id: str,
+        *,
+        filename: str,
+        content_type: str | None,
+        data: bytes,
+    ) -> dict[str, Any]:
+        self.uploads.append((session_id, filename, content_type, data))
+        return {"id": "file_1", "filename": filename}
+
     async def run_turn(
         self,
         session_id: str,
@@ -306,8 +327,10 @@ class FakeOmnigentClient:
         workspace: str | None = None,
         host_id: str | None = None,
         host_type: str = "external",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self.turns.append((session_id, text))
+        self.turn_attachments.append(attachments)
         self.turn_host_types.append(host_type)
         yield {"type": "response.output_text.delta", "delta": "hel"}
         yield {"type": "response.output_text.delta", "delta": "lo"}
@@ -3562,3 +3585,148 @@ async def test_interruption_preserves_chronological_order(tmp_path: Path) -> Non
     deny = next(p for p in slack.posts if "Blocked by policy" in str(p.get("text")))
     # Chronological: segment-1 opened, then the deny posted, then segment-2 opened.
     assert slack.streams[0].open_order < deny["order"] < slack.streams[1].open_order
+
+
+async def _wait_for_turns(omnigent: FakeOmnigentClient, count: int = 1) -> None:
+    for _ in range(50):
+        if len(omnigent.turns) >= count:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"Timed out waiting for {count} turns")
+
+
+# ── inbound attachments ───────────────────────────────────────────────────
+
+
+@respx.mock
+async def test_dm_with_file_uploads_and_references_attachment(tmp_path: Path) -> None:
+    # A DM carrying a file (and no text): the file is downloaded from Slack's
+    # CDN with the bot token, uploaded to the session, and referenced as an
+    # input_image block appended to a placeholder text block.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+    cdn = respx.get("https://files.slack.test/f1").mock(
+        return_value=httpx.Response(200, content=b"\x89PNGdata")
+    )
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "100.1",
+            "user": "U1",
+            "text": "",
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "shot.png",
+                    "mimetype": "image/png",
+                    "size": 9,
+                    "url_private_download": "https://files.slack.test/f1",
+                }
+            ],
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_turns(omnigent)
+    await service.shutdown()
+
+    assert cdn.calls.call_count == 1
+    assert cdn.calls.last.request.headers["authorization"] == "Bearer xoxb-test"
+    assert omnigent.uploads == [("conv_1", "shot.png", "image/png", b"\x89PNGdata")]
+    assert omnigent.turns == [("conv_1", "(file attached)")]
+    assert omnigent.turn_attachments == [
+        [{"type": "input_image", "file_id": "file_1", "filename": "shot.png"}]
+    ]
+
+
+@respx.mock
+async def test_dm_attachment_failure_becomes_visible_note(tmp_path: Path) -> None:
+    # One relayable file plus one with no download URL: the turn still runs,
+    # and the failed name is surfaced in the submitted text instead of being
+    # silently dropped.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+    respx.get("https://files.slack.test/f1").mock(
+        return_value=httpx.Response(200, content=b"data")
+    )
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "100.1",
+            "user": "U1",
+            "text": "look at these",
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "a.txt",
+                    "mimetype": "text/plain",
+                    "size": 4,
+                    "url_private_download": "https://files.slack.test/f1",
+                },
+                {"id": "F2", "name": "b.txt", "mimetype": "text/plain", "size": 4},
+            ],
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_turns(omnigent)
+    await service.shutdown()
+
+    assert len(omnigent.uploads) == 1
+    assert omnigent.turn_attachments == [
+        [{"type": "input_file", "file_id": "file_1", "filename": "a.txt"}]
+    ]
+    session_id, text = omnigent.turns[0]
+    assert session_id == "conv_1"
+    assert text.startswith("look at these")
+    assert ":warning: I couldn't attach: b.txt" in text
+
+
+async def test_dm_attachment_over_size_cap_is_skipped_with_note(tmp_path: Path) -> None:
+    # Over the 25MB cap the file is never fetched from Slack; the note says
+    # why. No network mock needed — the download must not happen at all.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "100.1",
+            "user": "U1",
+            "text": "huge file",
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "big.bin",
+                    "mimetype": "application/octet-stream",
+                    "size": 26 * 1024 * 1024,
+                    "url_private_download": "https://files.slack.test/big",
+                }
+            ],
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_turns(omnigent)
+    await service.shutdown()
+
+    assert omnigent.uploads == []
+    assert omnigent.turn_attachments == [None]
+    assert "big.bin (too large)" in omnigent.turns[0][1]
