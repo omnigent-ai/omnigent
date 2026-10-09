@@ -1,31 +1,24 @@
-"""Regression against a real MySQL server: a transient mid-transaction disconnect
-must not silently drop a session-persistence write.
+"""Regression against a real MySQL server: a transient statement disconnect
+must be retried so a session-persistence write persists exactly once.
 
 :func:`omnigent.db.utils.run_write_transaction` replays CockroachDB
 serialization failures (40001) and MySQL deadlock victims (1213). A
 statement-phase connection loss -- pymysql 2013 ("Lost connection to MySQL
-server during query") or 2006 ("MySQL server has gone away") -- must replay
-too, or the append re-raises it and the write is lost. The reported signatures
-both come from a session append: the 2013 case on the
-``UPDATE conversations SET next_position=...`` write, the 2006 case as a broken
-pipe while the aborted transaction rolls back. Both escape the store as a
-SQLAlchemy ``OperationalError`` (a ``StatementError``), which the server's
-``_handle_statement_error`` maps to an HTTP 500 with a ``Database error:`` log
--- the KPI signature this guards against.
+server during query") or 2006 ("MySQL server has gone away") on the
+``UPDATE conversations`` write -- must replay too, or the append re-raises a
+SQLAlchemy ``OperationalError`` that the server maps to an HTTP 500 with a
+``Database error:`` log, the KPI signature this guards against.
 
 This test drives the real ``SqlAlchemyConversationStore.append()`` against a
-real MySQL 8.0 server (matching the reported ``mysql+pymysql://`` deployment),
-fronting it with a TCP relay that severs the connection mid-statement on the
-reported ``UPDATE conversations`` write, and asserts the item still persists
-exactly once.
+real MySQL 8.0 server (the reported ``mysql+pymysql://`` deployment), fronts it
+with a TCP relay that severs the connection mid-statement on that write, and
+asserts the item still persists exactly once.
 
-The reported disconnects (failover, restart, a ``wait_timeout`` kill) are
-server-side events: MySQL tears the dead session down and releases its row
-locks, so the replay runs cleanly. Severing only the TCP path would leave the
+A real disconnect (failover, restart, a ``wait_timeout`` kill) also releases
+the dead session's row locks. Severing only the TCP path would leave the
 orphaned transaction holding the ``conversations`` row lock until InnoDB's
-lock-wait timeout, so a background reaper kills that idle transaction once the
-disconnect has fired -- mimicking the server-side teardown the real causes
-perform.
+lock-wait timeout, so a background reaper kills that transaction once the
+disconnect has fired, mimicking that server-side teardown.
 """
 
 from __future__ import annotations
@@ -129,6 +122,10 @@ class _MySQLServer:
         deadline = time.monotonic() + 60
         last_err: Exception | None = None
         while time.monotonic() < deadline:
+            if self._proc.poll() is not None:
+                # mysqld exited (bad datadir, port clash, init-file error); stop
+                # waiting and surface the log instead of polling for 60s.
+                break
             try:
                 # Authenticating as the init-file user also proves the --init-file
                 # has finished creating the omni user and omnigent database.
@@ -267,14 +264,14 @@ def _reap_orphaned_transaction(
     transaction holding the ``conversations`` row lock. While the write is in
     flight (before the drop), record the thread id of the oldest ``RUNNING``
     transaction -- the orphan-to-be; once the disconnect has fired, kill that
-    exact thread so the reaper targets the orphan rather than the replay, which
-    reconnects on a new thread. If the orphan was never observed before the
-    drop, fall back to the oldest idle ``RUNNING`` transaction (no active
-    query), which the orphan becomes once its client disappears. The reaper's
-    own connection is excluded, and it connects straight to the server,
-    bypassing the relay.
+    exact thread. The replay reconnects on a new thread, so it is never the
+    target. The cold fallback, used only if the orphan was never observed, is
+    bounded to transactions that started no later than the drop, so it cannot
+    hit the replay either. The reaper's own connection is excluded, and it
+    connects straight to the server, bypassing the relay.
     """
     orphan_thread_id: int | None = None
+    drop_time: Any = None
     conn: Any = None
     try:
         while not stop.is_set():
@@ -309,14 +306,19 @@ def _reap_orphaned_transaction(
                         if row is not None:
                             orphan_thread_id = int(row[0])
                     else:
+                        if drop_time is None:
+                            cur.execute("SELECT NOW(6)")
+                            drop_time = cur.fetchone()[0]
                         target = orphan_thread_id
                         if target is None:
                             cur.execute(
                                 "SELECT trx_mysql_thread_id "
                                 "FROM information_schema.innodb_trx "
                                 "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
+                                "AND trx_started <= %s "
                                 "AND trx_mysql_thread_id <> CONNECTION_ID() "
-                                "ORDER BY trx_started ASC LIMIT 1"
+                                "ORDER BY trx_started ASC LIMIT 1",
+                                (drop_time,),
                             )
                             row = cur.fetchone()
                             target = int(row[0]) if row is not None else None
