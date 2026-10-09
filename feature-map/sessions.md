@@ -62,6 +62,8 @@ the header menu), and each place is a separate entry point.
   destinations, including Usage when enabled.
 - `canvas-create`: the plus button on Main or a project opens the new-session
   composer; sending returns to that board with the new session selected.
+- `canvas-session-health`: an opened Canvas session receives host health and
+  live updates even before it appears in the loaded sidebar pages.
 
 ## How to get to it (user POV)
 
@@ -99,6 +101,8 @@ The plus button starts a new session in the selected canvas. After sending,
 the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. The collapsed sidebar keeps its expand button first, followed by
 Search, Settings, and the same primary destinations as the expanded sidebar.
+Open a Canvas session outside the loaded sidebar pages to see its current host
+status and live session updates, including when the app is embedded.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
@@ -354,7 +358,16 @@ plain `uv run pytest`, which starts a private server for the test.
   Unit tests in `web/src/canvas/canvasNavigation.test.ts` distinguish Canvas
   from similarly named routes under standalone and embedded mount paths.
   `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested
-  dialog with Escape preserves conversation focus.
+  dialog with Escape preserves conversation focus and that resizing respects
+  both panes' minimum widths. `web/src/pages/CanvasPage.test.tsx` checks viewport
+  translation across successive resizes, hiding, and restoring the pane.
+- **`canvas-session-health` (card selection and direct session links):** component
+  tests in `web/src/hooks/useActiveConversationId.test.tsx` cover standalone and
+  embedded session routes, switching cards, and returning to the board.
+  `web/src/hooks/RunnerHealthProvider.test.tsx` and
+  `web/src/hooks/SessionUpdatesProvider.test.tsx` verify that a Canvas session
+  outside the loaded sidebar pages enters health polling and the live watch
+  set; changing cards updates the watched session and temporary ids are excluded.
 - **`canvas-mobile` (deep link, back button, and reload):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
 - **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**

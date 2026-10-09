@@ -126,10 +126,12 @@ describe("CanvasWorkspace", () => {
     fireEvent.keyDown(divider, { key: "ArrowRight" });
     expect(Number(divider.getAttribute("aria-valuenow"))).toBe(originalWidth + 24);
     fireEvent.keyDown(divider, { key: "End" });
-    expect(divider.getAttribute("aria-valuenow")).toBe(divider.getAttribute("aria-valuemax"));
+    expect(divider).toHaveAttribute("aria-valuenow", "812");
+    expect(divider).toHaveAttribute("aria-valuemax", "812");
     expect(localStorage.getItem("omnigent:canvas-split-ratio")).not.toBeNull();
     fireEvent.keyDown(divider, { key: "Home" });
-    expect(divider.getAttribute("aria-valuenow")).toBe(divider.getAttribute("aria-valuemin"));
+    expect(divider).toHaveAttribute("aria-valuenow", "320");
+    expect(divider).toHaveAttribute("aria-valuemin", "320");
   });
 
   it("lets a nested dialog consume Escape before restoring the canvas", async () => {

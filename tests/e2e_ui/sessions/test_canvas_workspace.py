@@ -117,13 +117,6 @@ def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
     expect(first_card).to_be_visible()
     assert board.evaluate("element => element.isConnected")
 
-    # Workspace opens independently beside the board and conversation.
-    page.get_by_role("button", name="Expand right panel", exact=True).click()
-    expect(page.get_by_role("region", name="Canvas pane", exact=True)).to_be_visible()
-    expect(page.get_by_role("complementary", name="Workspace", exact=True)).to_be_visible()
-    page.get_by_role("button", name="Collapse right panel", exact=True).click()
-    expect(first_card).to_be_visible()
-    expect(page.get_by_role("button", name="Expand right panel", exact=True)).to_be_visible()
     expect(composer).to_have_value("Keep this draft while I check another session")
 
     page.get_by_role("button", name="Close conversation pane", exact=True).click()

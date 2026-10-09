@@ -79,6 +79,7 @@ def test_canvas_plus_creates_session_on_the_selected_board(
                         "name": "Canvas test host",
                         "status": "online",
                         "owner": "e2e",
+                        "configured_harnesses": {source["harness"]: True},
                     }
                 ]
             }
@@ -93,6 +94,7 @@ def test_canvas_plus_creates_session_on_the_selected_board(
                         "id": agent_id,
                         "name": "hello_world",
                         "display_name": "Canvas test agent",
+                        "harness": source["harness"],
                         "skills": [],
                     }
                 ],

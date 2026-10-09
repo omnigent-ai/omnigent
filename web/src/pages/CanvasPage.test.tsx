@@ -23,7 +23,7 @@ import { CanvasPage } from "./CanvasPage";
 
 const { flowProps, flowFitView, flowSetViewport, flowApi, viewerIdRef } = vi.hoisted(() => {
   const fitViewMock = vi.fn();
-  const setViewportMock = vi.fn(async () => true);
+  const setViewportMock = vi.fn<(viewport: xyflow.Viewport) => Promise<boolean>>(async () => true);
   return {
     flowProps: { current: null as Record<string, unknown> | null },
     flowFitView: fitViewMock,
@@ -200,7 +200,7 @@ beforeEach(() => {
   viewerIdRef.current = null;
   flowProps.current = null;
   flowFitView.mockClear();
-  flowSetViewport.mockClear();
+  flowSetViewport.mockReset().mockResolvedValue(true);
   flowApi.getViewport.mockReturnValue({ x: 0, y: 0, zoom: 1 });
   vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub([]));
   vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub([]));
@@ -208,6 +208,9 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("CanvasPage", () => {
@@ -465,6 +468,57 @@ describe("CanvasPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Main" }));
     await waitFor(() => expect(flowSetViewport).toHaveBeenLastCalledWith(viewport));
     expect(flowFitView).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the panned center through successive resizes and hiding the pane", async () => {
+    let notifyResize: () => void = () => {};
+    let width = 1000;
+    let height = 800;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      () => new DOMRect(0, 0, width, height),
+    );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: () => void) {
+          notifyResize = callback;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("first", 1)]),
+    );
+    render(pageTree("/canvas", true));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
+    let viewport = { x: -80, y: 24, zoom: 0.75 };
+    flowApi.getViewport.mockImplementation(() => viewport);
+    flowSetViewport.mockImplementation(async (next: typeof viewport) => {
+      viewport = next;
+      return true;
+    });
+    fireEvent.click(screen.getByTestId("flow-node-first"));
+    vi.useFakeTimers();
+
+    const resize = (nextWidth: number, nextHeight: number) => {
+      width = nextWidth;
+      height = nextHeight;
+      act(() => {
+        notifyResize();
+        vi.advanceTimersByTime(100);
+      });
+    };
+
+    resize(600, 600);
+    expect(flowSetViewport).toHaveBeenLastCalledWith({ x: -280, y: -76, zoom: 0.75 });
+    resize(800, 700);
+    expect(flowSetViewport).toHaveBeenLastCalledWith({ x: -180, y: -26, zoom: 0.75 });
+    resize(0, 0);
+    expect(flowSetViewport).toHaveBeenCalledTimes(2);
+    resize(1000, 800);
+    expect(flowSetViewport).toHaveBeenLastCalledWith({ x: -80, y: 24, zoom: 0.75 });
+    expect(flowFitView).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the clicked card's selection while the session list churns", () => {
