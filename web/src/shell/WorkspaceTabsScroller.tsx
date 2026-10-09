@@ -4,19 +4,25 @@ import { Button } from "@/components/ui/button";
 
 /** Scroll open tabs while keeping navigation controls outside the viewport. */
 export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const [edges, setEdges] = useState({ left: false, right: false });
+  const [edges, setEdges] = useState({ arrows: false, left: false, right: false });
 
   useEffect(() => {
+    const container = containerRef.current;
     const viewport = viewportRef.current;
     const content = contentRef.current;
-    if (!viewport || !content) return;
+    if (!container || !viewport || !content) return;
     const measure = () => {
+      // Compare with the full slot so the arrows cannot sustain overflow.
+      const arrows = content.clientWidth > container.clientWidth + 1 && container.clientWidth >= 80;
       const left = viewport.scrollLeft > 1;
       const right = viewport.scrollWidth - viewport.clientWidth - viewport.scrollLeft > 1;
       setEdges((previous) =>
-        previous.left === left && previous.right === right ? previous : { left, right },
+        previous.arrows === arrows && previous.left === left && previous.right === right
+          ? previous
+          : { arrows, left, right },
       );
     };
     const wheel = (event: WheelEvent) => {
@@ -37,6 +43,7 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
         ?.scrollIntoView({ block: "nearest", inline: "nearest" });
       measure();
     });
+    observer.observe(container);
     observer.observe(viewport);
     observer.observe(content);
     viewport.addEventListener("scroll", measure);
@@ -54,10 +61,9 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
     if (!viewport) return;
     viewport.scrollBy({ left: direction * Math.max(80, viewport.clientWidth * 0.8) });
   };
-  const overflowing = edges.left || edges.right;
   return (
-    <div className="no-drag flex min-w-0 items-center">
-      {overflowing && (
+    <div ref={containerRef} className="no-drag flex min-w-0 flex-1 items-center">
+      {edges.arrows && (
         <Button
           type="button"
           variant="ghost"
@@ -73,13 +79,13 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
       <div
         ref={viewportRef}
         data-workspace-tabs-viewport
-        className="no-drag min-w-0 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="no-drag min-w-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         <div ref={contentRef} className="flex w-max items-center gap-0.5">
           {children}
         </div>
       </div>
-      {overflowing && (
+      {edges.arrows && (
         <Button
           type="button"
           variant="ghost"

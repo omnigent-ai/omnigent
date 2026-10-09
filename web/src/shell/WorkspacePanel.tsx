@@ -1251,11 +1251,7 @@ function WorkspacePanelImpl({
           />
         )}
         {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
-        {/* Tab strip: the static nav tabs + divider stay pinned on the left at
-          every rail width, and ONLY the file-tabs region scrolls (it owns the
-          horizontal scroller — see below). The outer row never scrolls
-          (overflow-x-hidden), so the divider is a fixed boundary that doesn't
-          drift when the tabs scroll. */}
+        {/* Narrow rails use the picker for fixed panels, leaving room for open tabs. */}
         <div
           ref={tabListRef}
           role="toolbar"
@@ -1265,11 +1261,7 @@ function WorkspacePanelImpl({
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
           <Tabs
-            // Static group — never compresses (shrink-0) and stays anchored on
-            // the LEFT whether or not tabs are open. The open tabs render to its
-            // right; the maximize button owns the row's single ml-auto and pins
-            // to the right edge.
-            className="shrink-0"
+            className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
             // When a file or shell tab is active no fixed trigger should
             // highlight, so feed the radix group a sentinel that matches none of
             // them. The active file/shell tab carries its own highlight. Gate the
@@ -1293,21 +1285,17 @@ function WorkspacePanelImpl({
               {tabOrder.map((tab) => tabTriggers[tab])}
             </TabsList>
           </Tabs>
-          {/* 1px divider separating the static nav tabs from the open tabs.
-                Pinned (outside the scrolling file-tabs region), so it stays put
-                at every rail width while the tabs scroll past it. */}
+          {/* The divider follows the fixed panel icons' visibility. */}
           <div
             aria-hidden
-            className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong"
+            className={cn(
+              "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
+              showOpenTabs && "@max-[400px]/rail:hidden",
+            )}
           />
           {showOpenTabs && (
             <>
-              {/* Open-tabs region (file tabs + shell tabs) — the horizontal
-                scroller. It sizes to its content and shrinks+scrolls only when
-                the tabs would overflow (min-w-0, no flex-1), so the "+" outside
-                it hugs the last tab when they fit and stays pinned when they
-                don't. overflow-y-hidden stops overflow-x:auto from spawning a
-                vertical scrollbar that eats horizontal space. */}
+              {/* Open tabs fill the space before the pinned trailing controls. */}
               <WorkspaceTabsScroller>
                 <FileTabsStrip
                   openFiles={openFiles}
@@ -1410,10 +1398,7 @@ function WorkspacePanelImpl({
                   );
                 })}
               </WorkspaceTabsScroller>
-              {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
-                stays pinned (never scrolls under / overlaps the tabs) when they
-                overflow, and hugs the last tab when they fit. ml-[2px] keeps the
-                same gap the scroller's gap-0.5 gives between tabs. */}
+              {/* Keep new-panel actions outside the scrolling viewport. */}
               <NewTabMenu
                 conversationId={conversationId}
                 onOpenBrowser={showBrowserTab ? addBrowser : undefined}
@@ -1421,7 +1406,7 @@ function WorkspacePanelImpl({
                 onCreateError={onShellCreateFailed}
                 onOpenTerminal={openTerminalTab}
                 onCreateStart={onShellCreateStart}
-                triggerClassName="ml-[2px]"
+                triggerClassName="ml-1"
                 liveness={liveness}
               />
             </>
@@ -1441,12 +1426,9 @@ function WorkspacePanelImpl({
               liveness={liveness}
             />
           )}
-          {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
-            which absorbs the free space before it. When open tabs exist their
-            ≥500px flex-1 region absorbs the space instead, so the button still
-            hugs the right. */}
+          {/* The picker and fullscreen toggle form the trailing control group. */}
           <DropdownMenu>
-            <WorkspaceTabTooltip label="Select panel">
+            <WorkspaceTabTooltip label="Select panel" className="ml-auto pl-1">
               <DropdownMenuTrigger asChild>
                 <Button
                   type="button"
@@ -1479,10 +1461,10 @@ function WorkspacePanelImpl({
           </DropdownMenu>
           <WorkspaceTabTooltip
             label={maximized ? "Exit full screen" : "Full screen"}
-            className="ml-auto"
+            className="ml-1"
           >
             <Button
-              // type="button"
+              type="button"
               variant="ghost"
               aria-label={maximized ? "Exit full screen" : "Full screen"}
               aria-pressed={maximized}
