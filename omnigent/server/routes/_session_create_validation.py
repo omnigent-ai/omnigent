@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,26 +27,13 @@ from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
 
 _logger = logging.getLogger(__name__)
 
-_STRICT_PROJECT_CREATE_ENV = "OMNIGENT_STRICT_PROJECT_SESSION_CREATE"
-
 
 @dataclass(frozen=True)
 class ProjectCreateResolution:
-    """Project-aware request values and any non-fatal consistency warnings."""
+    """Project-aware request values after defaulting."""
 
     body: Any
     project_id: str | None = None
-    warnings: tuple[dict[str, str], ...] = ()
-
-
-def _strict_project_create_enabled() -> bool:
-    """Return strict mismatch mode for direct creates and inherited fork filing."""
-    return os.environ.get(_STRICT_PROJECT_CREATE_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
 
 
 async def resolve_project_session_create(
@@ -55,18 +41,12 @@ async def resolve_project_session_create(
     body: Any,
     user_id: str | None,
     project_store: ProjectStore | None,
-    warn_on_mismatch: bool = True,
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
     hint.  Unknown and foreign projects deliberately share one 404 response.
-
-    ``warn_on_mismatch=False`` skips the consistency warnings (and their
-    strict-mode escalation) for callers whose project is inherited rather than
-    requested — e.g. a fork filing into its source's project, where a mismatch
-    belongs to the source session, not this request.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
@@ -110,33 +90,7 @@ async def resolve_project_session_create(
             code=ErrorCode.INVALID_INPUT,
         )
 
-    if not warn_on_mismatch:
-        return ProjectCreateResolution(body=resolved, project_id=project_id)
-
-    warnings: list[dict[str, str]] = []
-    explicit_agent_id = getattr(body, "agent_id", None) if "agent_id" in fields_set else None
-    pinned_agent_id = config.get("agent_id")
-    if explicit_agent_id and pinned_agent_id and explicit_agent_id != pinned_agent_id:
-        warnings.append(
-            {
-                "code": "project_agent_mismatch",
-                "message": "Explicit agent_id differs from the project's pinned agent",
-            }
-        )
-
-    for warning in warnings:
-        _logger.warning(
-            "project-aware session create warning project_id=%s code=%s: %s",
-            project_id,
-            warning["code"],
-            warning["message"],
-        )
-    if warnings and _strict_project_create_enabled():
-        raise OmnigentError(
-            "Project session create mismatch: " + "; ".join(w["message"] for w in warnings),
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return ProjectCreateResolution(body=resolved, project_id=project_id, warnings=tuple(warnings))
+    return ProjectCreateResolution(body=resolved, project_id=project_id)
 
 
 # Claude Code's ``--permission-mode`` launch vocabulary — every value the CLI
@@ -264,6 +218,22 @@ def validate_session_model_metadata(
     return validated_model, validated_effort
 
 
+def require_user_agent_visible(agent: Any, user_id: str | None) -> None:
+    """404 a user agent no session uses (an install, or one whose sessions were
+    deleted) for anyone but its owner.
+
+    Mirrors the ``GET /v1/agents?scope=user`` owner filter, so an agent id
+    guessed or copied from another user cannot be bound either; an unowned one
+    binds for no one. Server agents pass through, and so do agents a session
+    uses: those are authorized against that session instead.
+    """
+    # Single-user schedules store the local owner as None; installs stamp "local".
+    if user_id is None and local_single_user_enabled():
+        user_id = RESERVED_USER_LOCAL
+    if not agent.operator_authored and agent.session_id is None and agent.created_by != user_id:
+        raise OmnigentError(f"Agent not found: {agent.id!r}", code=ErrorCode.NOT_FOUND)
+
+
 async def validate_session_agent(
     *,
     user_id: str | None,
@@ -279,6 +249,7 @@ async def validate_session_agent(
             f"Agent not found: {agent_id!r}",
             code=ErrorCode.NOT_FOUND,
         )
+    require_user_agent_visible(agent, user_id)
 
     # Session-scoped agents belong to a specific session. The caller must have
     # at least READ access to that owning session — otherwise they can execute
@@ -293,14 +264,52 @@ async def validate_session_agent(
         access_user = user_id
         if access_user is None and local_single_user_enabled():
             access_user = RESERVED_USER_LOCAL
-        await require_access(
-            access_user,
-            agent.session_id,
-            LEVEL_READ,
-            permission_store,
-            conversation_store,
-        )
+        if agent.created_by is not None and agent.created_by == access_user:
+            return agent  # Its owner can always use it.
+        try:
+            await require_access(
+                access_user,
+                agent.session_id,
+                LEVEL_READ,
+                permission_store,
+                conversation_store,
+            )
+        except OmnigentError as denied:
+            if denied.code not in (ErrorCode.FORBIDDEN, ErrorCode.NOT_FOUND):
+                raise
+            # Forks of the owner's sessions share the row, so the lookup above
+            # picked one of several roots; READ on any of them is enough.
+            if not await _can_read_another_root(
+                agent, access_user, permission_store, conversation_store
+            ):
+                raise
     return agent
+
+
+# ponytail: checks the first 50 roots using the agent; a caller who can read only a
+# later one is refused (forking that session still works).
+_SHARED_AGENT_ROOT_SCAN = 50
+
+
+async def _can_read_another_root(
+    agent: Any,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Whether *user_id* has READ on a session other than ``agent.session_id`` using it."""
+    roots = await asyncio.to_thread(
+        conversation_store.list_session_roots_for_agent, agent.id, _SHARED_AGENT_ROOT_SCAN
+    )
+    for root in roots:
+        if root == agent.session_id:
+            continue
+        try:
+            await require_access(user_id, root, LEVEL_READ, permission_store, conversation_store)
+        except OmnigentError:
+            continue
+        return True
+    return False
 
 
 def _require_absolute_host_workspace(workspace: str | None) -> str:

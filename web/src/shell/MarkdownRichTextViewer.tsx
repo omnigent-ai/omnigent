@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
+import type { Transaction } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
@@ -26,6 +27,7 @@ import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -43,6 +45,8 @@ import {
   type SearchDecorationState,
 } from "./TipTapSearchExtension";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
+import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
+import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import {
@@ -121,6 +125,10 @@ export function MarkdownRichTextViewer({
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
 
+  // True while the owning session's agent turn is in flight — used to warn
+  // before edits that would be overwritten by the agent's next write.
+  const sessionActive = useSessionActive(conversationId);
+
   // Callback registered by the inner component once its TipTap editor is ready.
   // The sync hook calls this instead of remounting (setEditorKey) when an
   // external content update arrives on a clean editor — scroll and cursor are
@@ -160,6 +168,7 @@ export function MarkdownRichTextViewer({
       conversationId={conversationId}
       path={path}
       canEdit={canEdit}
+      sessionActive={sessionActive}
       truncated={truncated}
       isDirty={isDirty}
       setDirty={setDirty}
@@ -191,6 +200,8 @@ interface InnerProps {
   conversationId: string;
   path: string;
   canEdit: boolean;
+  /** True while the owning session's agent turn is in flight. */
+  sessionActive: boolean;
   truncated: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
@@ -216,6 +227,7 @@ function MarkdownRichTextViewerInner({
   conversationId,
   path,
   canEdit,
+  sessionActive,
   truncated,
   isDirty,
   setDirty,
@@ -331,8 +343,16 @@ function MarkdownRichTextViewerInner({
       // listItem: false — replaced by SafeListItem (content: block+) so a list
       // item whose first child is a non-paragraph block doesn't build a
       // schema-invalid doc that crashes the panel. See SafeListItem above.
-      StarterKit.configure({ link: false, blockquote: false, listItem: false }),
+      // codeBlock: false — replaced by CodeBlockWithLanguage, which adds a
+      // language picker and a live mermaid preview via a React node view.
+      StarterKit.configure({
+        link: false,
+        blockquote: false,
+        listItem: false,
+        codeBlock: false,
+      }),
       SafeListItem,
+      CodeBlockWithLanguage,
       // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
       // BulletList/OrderedList/ListItem but NOT TaskList/TaskItem, so without
       // these two the markdown parser drops the checkbox and renders a plain
@@ -368,14 +388,20 @@ function MarkdownRichTextViewerInner({
     content,
     contentType: "markdown",
     editable: canEdit,
-    onUpdate: ({ editor: ed }) => {
+    onUpdate: ({ editor: ed, transaction }) => {
+      // A transaction that changed no document is a no-op for our purposes (e.g.
+      // setEditable's synthetic update). It can't have altered the markdown, so
+      // re-baselining on it would only clobber an unsaved edit — skip entirely.
+      if (transaction && !transaction.docChanged) return;
       const markdown = ed.getMarkdown();
-      // Only a focused editor reflects a user edit. The first update, or any
+      // Only a genuine user edit should flag dirty. The first update, or any
       // update before the user focuses, is TipTap re-serialising the freshly
       // loaded doc — its markdown round-trip isn't byte-stable, so getMarkdown()
       // drifts from the on-disk bytes. Re-baseline instead of flagging dirty so
-      // merely opening a file never autosaves a normalised rewrite.
-      if (baselineRef.current === null || !ed.isFocused) {
+      // merely opening a file never autosaves a normalised rewrite. A code-block
+      // language change is a user edit even though it arrives blurred (the
+      // picker holds focus), so isUserEditUpdate also honours its flag.
+      if (baselineRef.current === null || !isUserEditUpdate(ed.isFocused, transaction)) {
         baselineRef.current = markdown;
         setDirty(false);
         return;
@@ -396,10 +422,15 @@ function MarkdownRichTextViewerInner({
   // our own injected content.
   useEffect(() => {
     if (!editor) return;
-    // Schedule only on focused (user) edits; a pre-focus normalisation update
-    // re-baselines in onUpdate above and must not trigger a write.
-    const onUpdate = () => {
-      if (editor.isFocused) autoSave.schedule();
+    // Schedule only on user edits; a pre-focus normalisation update re-baselines
+    // in onUpdate above and must not trigger a write. A blurred code-block
+    // language change is a user edit (flagged on its transaction), so schedule
+    // it too — otherwise the picker's change never persists.
+    const onUpdate = (props?: { transaction?: Transaction }) => {
+      // Mirror the onUpdate-config guard: a no-op transaction changed no markdown,
+      // so there is nothing to save — never schedule a write for it.
+      if (props?.transaction && !props.transaction.docChanged) return;
+      if (isUserEditUpdate(editor.isFocused, props?.transaction)) autoSave.schedule();
     };
     const onBlur = () => autoSave.flush();
     editor.on("update", onUpdate);
@@ -440,9 +471,11 @@ function MarkdownRichTextViewerInner({
     };
   }, [editor, setContentRef, setDirty, path]);
 
-  // Keep editor editable flag in sync with canEdit changes.
+  // Keep editor editable flag in sync with canEdit changes. Pass emitUpdate:
+  // false so toggling editability doesn't fire a doc-less "update" (which the
+  // onUpdate guard also ignores, but there's no reason to emit it at all).
   useEffect(() => {
-    editor?.setEditable(canEdit);
+    editor?.setEditable(canEdit, false);
   }, [editor, canEdit]);
 
   return (
@@ -506,6 +539,13 @@ function MarkdownRichTextViewerInner({
       </div>
       {canEdit && editor && (
         <TableHandles editor={editor} scrollContainerRef={scrollContainerRef} />
+      )}
+      {canEdit && sessionActive && !isDirty && !hasExternalUpdate && (
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          Omnigent is still working — edits you make now may be overwritten when it saves this file.
+          Wait for it to finish, or copy your changes first.
+        </div>
       )}
       {canEdit && isDirty && hasExternalUpdate && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">

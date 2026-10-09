@@ -7,9 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
 from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
@@ -395,6 +397,37 @@ def test_pr_changes_still_use_command_targets(command: str) -> None:
     assert not created
 
 
+@pytest.mark.parametrize("redirection", ["2>errors.log", "2>>errors.log", "2>&1", "3<input.txt"])
+@pytest.mark.parametrize("target", ["", "2", "42"])
+def test_shell_redirection_descriptors_are_not_pr_targets(redirection: str, target: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"gh pr merge {target} -R example/one --squash {redirection}"},
+        {"exit_code": 0, "stdout": "Done."},
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command,target",
+    [
+        ("gh pr ready -R example/one 2>&1", None),
+        ("gh pr edit -R example/one 2 >out", "2"),
+    ],
+)
+def test_shell_redirections_preserve_positional_arguments(
+    command: str, target: str | None
+) -> None:
+    refs, created = extract_prs(
+        "Bash", {"command": command}, {"exit_code": 0, "stdout": "Updated"}
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
+    assert not created
+
+
 @pytest.mark.parametrize("repo", ["comments", "reviews"])
 def test_repository_name_does_not_classify_rest_operation(repo: str) -> None:
     url = f"https://github.com/example/{repo}/pull/42"
@@ -479,7 +512,152 @@ def test_removal_survives_replay_and_inference(tmp_path: Path) -> None:
     assert [entry.url for entry in store.list()] == [A]
 
 
-def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "cached_title",
+    [{}, {"title": "Last known title", "title_checked_at": 20}],
+)
+def test_title_cache_is_backward_compatible(
+    tmp_path: Path, cached_title: dict[str, object]
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "prs": [
+                    {
+                        **PullRequestRef.from_url(A).model_dump(),
+                        "relationship": "created",
+                        "source": "test",
+                        "first_seen_at": 10,
+                        "last_seen_at": 10,
+                        **cached_title,
+                    }
+                ],
+            }
+        )
+    )
+    entry = store.list()[0]
+    assert entry.title == cached_title.get("title")
+    assert entry.title_checked_at == cached_title.get("title_checked_at", 0)
+    assert entry.title_lookup_timed_out is False
+
+
+def test_title_cache_preserves_order_and_survives_new_observations(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
+    store.update_titles({A: "First", B: "Second"}, timestamp=30)
+    assert [entry.url for entry in store.list()] == [B, A]
+    assert [entry.last_seen_at for entry in store.list()] == [20, 10]
+    store.record(
+        [PullRequestRef.from_url(A)], relationship="worked_on", source="test", timestamp=40
+    )
+    entry = store.list()[0]
+    assert entry.url == A
+    assert entry.title == "First"
+    assert entry.title_checked_at == 30
+    assert entry.first_seen_at == 10
+    assert entry.relationship == "created"
+
+
+def test_title_cache_preserves_newer_updates_and_removed_prs(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record(
+        [PullRequestRef.from_url(A), PullRequestRef.from_url(B)],
+        relationship="created",
+        source="test",
+    )
+    store.update_titles({A: "New title", B: "Second"}, timestamp=30)
+    store.remove(B)
+    store.update_titles({A: "Old title", B: "Removed title"}, timestamp=20)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    store.update_titles({A: None, B: "Removed title"}, timestamp=40)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    assert store.list()[0].title_checked_at == 40
+    store.record([PullRequestRef.from_url(B)], relationship="inferred", source="branch")
+    assert [entry.url for entry in store.list()] == [A]
+
+
+def test_title_timeout_preserves_cached_title_and_survives_observations(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    reference = PullRequestRef.from_url(A)
+    store.record([reference], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: None}, timestamp=30, timed_out_urls={A})
+
+    restored = SessionPrRegistry("conv_a", root=tmp_path)
+    entry = restored.list()[0]
+    assert entry.title == "Last known title"
+    assert entry.title_checked_at == 30
+    assert entry.title_lookup_timed_out is True
+
+    restored.record([reference], relationship="worked_on", source="test", timestamp=40)
+    entry = restored.list()[0]
+    assert entry.title == "Last known title"
+    assert entry.title_checked_at == 30
+    assert entry.title_lookup_timed_out is True
+    assert entry.last_seen_at == 40
+
+
+@pytest.mark.parametrize(
+    "title,timed_out_urls,expected_title",
+    [
+        ("Fetched title", (), "Fetched title"),
+        (None, (), "Last known title"),
+        ("Fetched title", (A,), "Fetched title"),
+    ],
+)
+def test_completed_title_lookup_clears_timeout_marker(
+    tmp_path: Path, title: str | None, timed_out_urls: tuple[str, ...], expected_title: str
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: None}, timestamp=30, timed_out_urls={A})
+
+    store.update_titles({A: title}, timestamp=40, timed_out_urls=timed_out_urls)
+
+    entry = store.list()[0]
+    assert entry.title == expected_title
+    assert entry.title_checked_at == 40
+    assert entry.title_lookup_timed_out is False
+
+
+@pytest.mark.parametrize(
+    "newer_title,newer_timeouts,older_title,older_timeouts",
+    [
+        ("Newest title", (), None, (A,)),
+        (None, (A,), "Older title", ()),
+    ],
+)
+def test_title_cache_preserves_newer_timeout_marker(
+    tmp_path: Path,
+    newer_title: str | None,
+    newer_timeouts: tuple[str, ...],
+    older_title: str | None,
+    older_timeouts: tuple[str, ...],
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: newer_title}, timestamp=40, timed_out_urls=newer_timeouts)
+    latest = store.list()
+
+    store.update_titles({A: older_title}, timestamp=30, timed_out_urls=older_timeouts)
+
+    assert store.list() == latest
+
+
+def test_concurrent_writers_preserve_all_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Allow serialized durable writes to finish even on a busy CI filesystem.
+    monkeypatch.setattr(
+        "omnigent.runner.session_prs.FileLock",
+        lambda path, **_kwargs: FileLock(path, timeout=budget(10)),
+    )
+
     def write(number: int) -> None:
         store = SessionPrRegistry("conv_a", root=tmp_path)
         store.record(
@@ -490,7 +668,11 @@ def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(write, range(1, 17)))
-    assert len(SessionPrRegistry("conv_a", root=tmp_path).list()) == 16
+    prs = SessionPrRegistry("conv_a", root=tmp_path).list()
+    assert len(prs) == 16
+    assert {pr.url for pr in prs} == {
+        f"https://github.com/example/one/pull/{number}" for number in range(1, 17)
+    }
 
 
 def test_corruption_is_not_overwritten(tmp_path: Path) -> None:
@@ -873,10 +1055,27 @@ def test_gh_subcommand_and_host(command: str, urls: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    "result", [{"backgroundTaskId": "job-1"}, {"status": "running"}, {"interrupted": True}]
+    "result,graphql",
+    [
+        ({"backgroundTaskId": "job-1"}, False),
+        ({"status": "running"}, False),
+        ({"interrupted": True}, False),
+        ({"exit_code": 1}, False),
+        ({"exit_code": None, "session_id": "still-running"}, False),
+        ({"exit_code": 1}, True),
+    ],
 )
-def test_background_or_interrupted_shell_does_not_attach_target(result: dict) -> None:
-    refs, _ = extract_prs("Bash", {"command": f"gh pr edit {A} --title new"}, result)
+def test_unsuccessful_shell_does_not_attach_target(result: dict, graphql: bool) -> None:
+    command, output = (
+        (
+            "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+            "{ pullRequest { url } } }'",
+            json.dumps({"data": {"createPullRequest": {"pullRequest": {"url": A}}}}),
+        )
+        if graphql
+        else (f"gh pr edit {A} --title new", A)
+    )
+    refs, _ = extract_prs("exec_command", {"cmd": command}, {**result, "stdout": output})
     assert refs == []
 
 
@@ -897,6 +1096,7 @@ def test_background_or_interrupted_shell_does_not_attach_target(result: dict) ->
             True,
         ),
         (["gh api repos/example/one/pulls -X POST", "gh pr create"], [A, B], True),
+        (["gh api repos/example/one/pulls -X POST --jq .body", "gh pr create"], [], True),
     ],
 )
 @pytest.mark.parametrize("reverse", [False, True])
@@ -909,6 +1109,66 @@ def test_combined_operations_keep_prs_without_misattributing_creation(
         A + "\n" + B,
     )
     assert {ref.url for ref in refs} == set(urls)
+    assert was_created is created
+
+
+def test_gitlab_identity_jq_compound_output_remains_unattributed() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {
+            "command": "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .web_url; gh pr create"
+        },
+        "https://gitlab.com/example/one/-/merge_requests/7\n" + A,
+    )
+    assert refs == []
+    assert created
+
+
+@pytest.mark.parametrize(
+    "content_command,target,created",
+    [
+        (
+            "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .description",
+            None,
+            True,
+        ),
+        (
+            "glab api projects/example%2Fone/merge_requests/7 -X PUT "
+            "--hostname gitlab.com --jq .description",
+            "https://gitlab.com/example/one/-/merge_requests/7",
+            False,
+        ),
+        (
+            "az repos pr create --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            None,
+            True,
+        ),
+        (
+            "az repos pr update --id 7 --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            "https://dev.azure.com/example/project/_git/repo/pullrequest/7",
+            False,
+        ),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_graphql_with_other_providers_content_preserves_only_explicit_targets(
+    content_command: str, target: str | None, created: bool, reverse: bool
+) -> None:
+    graphql = (
+        "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+        "{ pullRequest { url } } }' --jq .data.createPullRequest.pullRequest.url"
+    )
+    commands = [graphql, content_command]
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        A + "\n" + B,
+    )
+    assert [ref.url for ref in refs] == ([target] if target else [])
     assert was_created is created
 
 

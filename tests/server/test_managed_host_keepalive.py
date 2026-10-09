@@ -8,6 +8,7 @@ few attributes off each, so a real store would add setup without adding cover.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -17,14 +18,16 @@ from omnigent.server import managed_host_keepalive
 
 
 class _Launcher:
-    def __init__(self, raises: BaseException | None = None) -> None:
+    def __init__(self, raises: BaseException | None = None, returns: object = None) -> None:
         self.calls: list[str] = []
         self._raises = raises
+        self._returns = returns
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> object:
         self.calls.append(sandbox_id)
         if self._raises is not None:
             raise self._raises
+        return self._returns
 
 
 def _wire(
@@ -230,3 +233,83 @@ def test_inflight_is_released_even_when_the_provider_raises(
     monkeypatch.setattr(managed_host_keepalive, "_inflight", {"r1"})
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert "r1" not in managed_host_keepalive._inflight
+
+
+def test_keepalive_interval_is_provider_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    agent_sandbox refreshes fast (its window is short); other providers keep the
+    cheap default so lowering agent_sandbox's cadence does not multiply their
+    write load. An explicit env override wins for both.
+    """
+    from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
+
+    monkeypatch.delenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", raising=False)
+    assert resolve_managed_keepalive_interval_s("agent_sandbox") == 60.0
+    assert resolve_managed_keepalive_interval_s("modal") == 600.0
+    assert resolve_managed_keepalive_interval_s() == 600.0
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "15")
+    assert resolve_managed_keepalive_interval_s("agent_sandbox") == 15.0
+    assert resolve_managed_keepalive_interval_s("modal") == 15.0
+    # A finite-but-huge override is clamped to the max, not passed through where
+    # it would overflow the window-floor math (ceil(2 * interval)).
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "1e308")
+    assert resolve_managed_keepalive_interval_s("agent_sandbox") == 3600.0
+
+
+def test_successful_keepalive_logs_at_info_on_the_server_logger(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The keepalive INFO is emitted from the server layer (this module), whose
+    logger surfaces in the server log — unlike the onboarding-layer launcher.
+    """
+    launcher = _Launcher()
+    _wire(
+        monkeypatch,
+        launcher=launcher,
+        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
+    assert any("kept managed sandbox sbx1 alive" in r.getMessage() for r in caplog.records)
+
+
+def test_soft_failed_keepalive_suppresses_the_success_info(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    When keep_alive returns False (attempted but not confirmed; the provider
+    logged its own warning), the server loop must NOT log a success line, so the
+    observability signal is never self-contradictory.
+    """
+    launcher = _Launcher(returns=False)
+    _wire(
+        monkeypatch,
+        launcher=launcher,
+        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
+    assert launcher.calls == ["sbx1"]  # attempted
+    assert not any("kept managed sandbox" in r.getMessage() for r in caplog.records)
+
+
+def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Before the runner's provider is known, the loop/throttle use the fast
+    agent_sandbox cadence (never under-refresh a short window); once
+    _keep_alive_for_runner resolves the provider, the runner's own cadence is
+    cached and returned.
+    """
+    monkeypatch.delenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", raising=False)
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    # unknown runner -> fast agent_sandbox default, so a short window is safe
+    assert managed_host_keepalive.keepalive_interval_s("r1") == 60.0
+    _wire(
+        monkeypatch,
+        launcher=_Launcher(),
+        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="modal"),
+    )
+    managed_host_keepalive._keep_alive_for_runner("r1")
+    # now cached at modal's slower cadence
+    assert managed_host_keepalive.keepalive_interval_s("r1") == 600.0

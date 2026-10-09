@@ -1,0 +1,586 @@
+"""Generic side-chat entry points and real fork/send journeys.
+
+The fixture's openai-agents runner answers through the mock LLM. Host-launch
+tests replace only host provisioning, while fork, runner binding, message
+dispatch, streaming, and transcript persistence use the real backend.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from collections.abc import Iterator
+
+import httpx
+import pytest
+from playwright.sync_api import Page, Route, expect
+
+from tests.e2e.conftest import get_mock_requests
+from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
+
+_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
+
+
+@pytest.fixture
+def side_chat_forks(page: Page, seeded_session: tuple[str, str]) -> Iterator[list[str]]:
+    """Track real forks and remove them from the fixture-owned server afterward."""
+    base_url, session_id = seeded_session
+    child_ids: list[str] = []
+    pattern = f"**/v1/sessions/{session_id}/fork"
+
+    def track_fork(route: Route) -> None:
+        assert route.request.post_data_json["side_chat"] is True
+        response = route.fetch()
+        if response.ok:
+            child_ids.append(response.json()["id"])
+        route.fulfill(response=response)
+
+    page.route(pattern, track_fork)
+    try:
+        yield child_ids
+    finally:
+        # A recording run closes the page when the test body ends.
+        if not page.is_closed():
+            page.unroute(pattern, track_fork)
+        for child_id in child_ids:
+            httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0).raise_for_status()
+
+
+def _items(base_url: str, session_id: str) -> list[dict[str, object]]:
+    """Read the persisted transcript independently of the browser's local state."""
+    response = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/items",
+        params={"limit": 100, "order": "asc"},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    return response.json()["data"]
+
+
+def _send_parent(page: Page, question: str, reply: str) -> None:
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_visible()
+    composer.fill(question)
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_ASSISTANT).filter(has_text=reply)).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+
+
+def _start_side_chat(page: Page, entrypoint: str, question: str) -> None:
+    if entrypoint == "slash":
+        page.get_by_placeholder("Send a message…").fill(f"/side {question}")
+        page.get_by_role("button", name="Send", exact=True).click()
+    else:
+        open_right_rail(page)
+        rail = page.get_by_role("complementary", name="Workspace")
+        rail.get_by_role("button", name="Open new", exact=True).click()
+        page.get_by_role("menuitem", name="Side chat", exact=True).click()
+        page.get_by_test_id("side-chat-input").fill(question)
+        page.get_by_test_id("side-chat-send").click()
+
+
+def test_slash_menu_lists_side_command(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Typing ``/side`` surfaces the ``/side`` row in the composer command menu."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_visible()
+
+    composer.fill("/side")
+    # The restyled slash menu renders a row per matching command; /side is the
+    # generic panel side chat, offered on every harness.
+    expect(page.get_by_test_id("slash-menu-item-side")).to_be_visible()
+
+
+def test_composer_add_tray_offers_a_side_chat(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """The composer ``+`` tray starts a working chat on the parent's runner."""
+    base_url, session_id = seeded_session
+    question = f"tray-side-{session_id}: answer in the side chat"
+    reply = "The add tray started a side chat."
+    configure_mock_llm(mock_llm_server_url, [{"text": reply}], match=question)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+
+    page.get_by_test_id("composer-attach").click()
+    page.get_by_role("menuitem", name="Start a new side chat").click()
+    page.get_by_test_id("side-chat-input").fill(question)
+    page.get_by_test_id("side-chat-send").click()
+    expect(page.locator(".side-chat-backdrop").get_by_text(reply, exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    assert len(side_chat_forks) == 1
+    response = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
+    response.raise_for_status()
+    assert response.json()["runner_id"] == runner_id
+
+
+def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
+    """The Workspace rail's "Open new" (``+``) menu lists "Side chat"."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("button", name="Open new", exact=True).click()
+    expect(page.get_by_role("menuitem", name="Side chat", exact=True)).to_be_visible()
+
+
+@pytest.mark.parametrize("entrypoint", ["slash", "panel"])
+def test_side_chat_sends_with_stale_branch_metadata(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    runner_id: str,
+    mock_llm_server_url: str,
+    entrypoint: str,
+) -> None:
+    """A stopped parent restarts before a chat even if its saved branch is stale."""
+    base_url, session_id = seeded_session
+    host_id = "side-chat-test-host"
+    workspace = "/workspace/existing-checkout"
+    stale_branch = "worktree-from-another-machine"
+    retry_posts: list[dict[str, object]] = []
+    parent_stopped = True
+
+    def source_snapshot(route: Route) -> None:
+        response = fetch_with_retry(route)
+        snapshot = response.json()
+        snapshot.update(
+            host_id=host_id,
+            host_online=True,
+            runner_online=not parent_stopped,
+            workspace=workspace,
+            git_branch=stale_branch,
+        )
+        route.fulfill(response=response, json=snapshot)
+
+    def recover_parent(route: Route) -> None:
+        nonlocal parent_stopped
+        body = route.request.post_data_json
+        if body.get("type") != "retry_session":
+            route.fallback()
+            return
+        retry_posts.append(body)
+        response = fetch_with_retry(route)
+        parent_stopped = False
+        route.fulfill(response=response)
+
+    page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), source_snapshot)
+    page.route(f"**/v1/sessions/{session_id}/events", recover_parent)
+    parent_question = f"main-{session_id}: remember our main conversation"
+    parent_reply = "The parent conversation is ready."
+    question = f"side-{session_id}: answer this side question"
+    followup = f"side-{session_id}: answer a follow-up"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply}],
+        key=f"main-{session_id}",
+        match=f"main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "First side answer."}, {"text": "Second side answer."}],
+        key=f"side-{session_id}",
+        match=f"side-{session_id}",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, parent_question, parent_reply)
+    parent_items = _items(base_url, session_id)
+    _start_side_chat(page, entrypoint, question)
+
+    pane = page.locator(".side-chat-backdrop")
+    expect(pane.locator(_ASSISTANT).filter(has_text="First side answer.")).to_be_visible(
+        timeout=30_000
+    )
+    assert len(side_chat_forks) == 1
+    assert retry_posts == [{"type": "retry_session", "data": {}}]
+    child = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
+    child.raise_for_status()
+    assert child.json()["runner_id"] == runner_id
+    expect(pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
+
+    page.get_by_test_id("side-chat-input").fill(followup)
+    expect(page.get_by_test_id("side-chat-send")).to_be_enabled(timeout=30_000)
+    page.get_by_test_id("side-chat-send").click()
+    expect(pane.locator(_ASSISTANT).filter(has_text="Second side answer.")).to_be_visible(
+        timeout=30_000
+    )
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+    assert _items(base_url, session_id) == parent_items
+    child_items = _items(base_url, side_chat_forks[0])
+    child_text = str(child_items)
+    assert question in child_text
+    assert followup in child_text
+    assert "First side answer." in child_text
+    assert "Second side answer." in child_text
+    model_inputs = [
+        json.dumps(request.get("input", []))
+        for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
+    ]
+    first_input = next(text for text in model_inputs if question in text and followup not in text)
+    followup_input = next(text for text in model_inputs if followup in text)
+    assert parent_question in first_input
+    assert parent_reply in first_input
+    assert parent_reply in followup_input
+    assert question in followup_input
+    assert "First side answer." in followup_input
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+
+
+def test_runner_bound_side_chat_closes_without_stopping_parent(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """A hostless session's real runner serves the side chat and survives its closure."""
+    base_url, session_id = seeded_session
+    response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    response.raise_for_status()
+    assert response.json()["host_id"] is None
+    assert response.json()["runner_id"] == runner_id
+    question = f"runner-side-{session_id}: answer in the side chat"
+    parent_question = f"runner-parent-{session_id}: keep chatting after the side chat closes"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The runner answered the side chat."}],
+        key=f"runner-side-{session_id}",
+        match=f"runner-side-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The parent still works."}],
+        key=f"runner-parent-{session_id}",
+        match=f"runner-parent-{session_id}",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+    _start_side_chat(page, "slash", question)
+    pane = page.locator(".side-chat-backdrop")
+    expect(
+        pane.locator(_ASSISTANT).filter(has_text="The runner answered the side chat.")
+    ).to_be_visible(timeout=30_000)
+    assert len(side_chat_forks) == 1
+    child_id = side_chat_forks[0]
+    response = httpx.get(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
+    response.raise_for_status()
+    assert response.json()["runner_id"] == runner_id
+    assert response.json()["host_id"] is None
+    assert not any(item.get("type") == "message" for item in _items(base_url, session_id))
+
+    with page.expect_response(f"**/v1/sessions/{child_id}/events") as stopped:
+        page.get_by_role("button", name="Close Side chat 1", exact=True).click()
+    assert stopped.value.ok
+    expect(page.get_by_test_id("side-chat-input")).to_have_count(0)
+    _send_parent(page, parent_question, "The parent still works.")
+    parent_items = str(_items(base_url, session_id))
+    assert parent_question in parent_items
+    assert question not in parent_items
+
+
+def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """The selection's side-chat action opens a tab at once, quoting the selection there."""
+    base_url, session_id = seeded_session
+    parent_reply = "Retry the upload with exponential backoff."
+    side_reply = "Backoff spreads the retries out so the server can recover."
+    question = f"quote-side-{session_id}: why backoff?"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply}],
+        key=f"quote-main-{session_id}",
+        match=f"quote-main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": side_reply}],
+        key=f"quote-side-{session_id}",
+        match=f"quote-side-{session_id}",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, f"quote-main-{session_id}: how should I retry?", parent_reply)
+    page.locator(_ASSISTANT).get_by_text(parent_reply).select_text()
+    page.get_by_role("button", name="Ask in side chat", exact=True).click()
+
+    # The tab opens before any fork exists, with the quote in its own composer.
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_role("tab", name="Side chat 1", exact=True)).to_be_visible()
+    pane = page.locator(".side-chat-backdrop")
+    expect(pane.get_by_test_id("composer-reply-quote")).to_contain_text(parent_reply)
+    expect(page.get_by_test_id("composer-reply-quote")).to_have_count(1)
+    expect(page.get_by_test_id("side-chat-input")).to_be_focused()
+    assert side_chat_forks == []
+
+    page.get_by_test_id("side-chat-input").fill(question)
+    page.get_by_test_id("side-chat-send").click()
+    expect(pane.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+    assert len(side_chat_forks) == 1
+    child_text = str(_items(base_url, side_chat_forks[0]))
+    assert f"> {parent_reply}" in child_text
+    assert question in child_text
+    assert question not in str(_items(base_url, session_id))
+
+
+def test_side_chat_opens_in_a_drawer_on_mobile(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """Phones hide the Workspace rail, so a side chat opens in a full-screen drawer."""
+    base_url, session_id = seeded_session
+    parent_reply = "Retry the upload with exponential backoff."
+    side_reply = "Backoff spreads the retries out so the server can recover."
+    question = f"mobile-side-{session_id}: why backoff?"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply}],
+        key=f"mobile-main-{session_id}",
+        match=f"mobile-main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": side_reply}],
+        key=f"mobile-side-{session_id}",
+        match=f"mobile-side-{session_id}",
+    )
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, f"mobile-main-{session_id}: how should I retry?", parent_reply)
+    page.locator(_ASSISTANT).get_by_text(parent_reply).select_text()
+    page.get_by_role("button", name="Ask in side chat", exact=True).click()
+
+    drawer = page.get_by_test_id("side-chats-panel-drawer")
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer.get_by_test_id("composer-reply-quote")).to_contain_text(parent_reply)
+    drawer.get_by_test_id("side-chat-input").fill(question)
+    drawer.get_by_test_id("side-chat-send").click()
+    expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+    assert len(side_chat_forks) == 1
+
+    # Closing the drawer keeps the side chat; the header menu brings it back.
+    drawer.get_by_role("button", name="Close", exact=True).click()
+    expect(drawer).to_have_attribute("data-state", "closed")
+    page.get_by_role("button", name="Conversation actions").click()
+    page.get_by_role("menuitem", name="Side chats").click()
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible()
+
+
+def test_running_empty_side_chat_shows_working(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+) -> None:
+    """Native status can arrive before the side chat's first conversation item."""
+    base_url, session_id = seeded_session
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/fork",
+        json={"title": "Side chat", "side_chat": True},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    child_id = response.json()["id"]
+    side_chat_forks.append(child_id)
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{child_id}/events",
+        json={"type": "external_session_status", "data": {"status": "running"}},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+    page.evaluate(
+        """({ parentId, childId }) => localStorage.setItem(
+            "omnigent:session-workspace-state",
+            JSON.stringify([{ id: parentId, state: {
+                open: true, rightRailTab: "sidechat",
+                openSideChats: [childId], selectedSideChatId: childId,
+            } }]),
+        )""",
+        {"parentId": session_id, "childId": child_id},
+    )
+    page.reload()
+    page.get_by_role("tab", name="Side chat 1", exact=True).click()
+
+    pane = page.locator(".side-chat-backdrop")
+    expect(pane.get_by_test_id("working-indicator")).to_be_visible()
+    expect(pane.get_by_test_id("message-bubble")).to_have_count(0)
+    expect(
+        pane.get_by_text("Ask a question here without affecting the main conversation.")
+    ).to_have_count(0)
+    expect(pane.get_by_role("button", name="Interrupt side chat", exact=True)).to_be_enabled()
+
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{child_id}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0)
+    expect(pane.get_by_test_id("side-chat-interrupt")).to_have_count(0)
+    expect(
+        pane.get_by_text("Ask a question here without affecting the main conversation.")
+    ).to_be_visible()
+
+
+def test_side_chat_interrupt_allows_followup_without_stopping_parent(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """Interrupt cancels the child's real turn and keeps both conversations usable."""
+    base_url, session_id = seeded_session
+    question = f"interrupt-side-{session_id}: wait for me to stop this answer"
+    followup = f"interrupt-side-{session_id}: answer this follow-up instead"
+    parent_question = f"interrupt-parent-{session_id}: check the main conversation"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "This answer should be interrupted.", "block": True},
+            {"text": "The side chat continued."},
+        ],
+        key=f"interrupt-side-{session_id}",
+        match=f"interrupt-side-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The main conversation still works."}],
+        key=f"interrupt-parent-{session_id}",
+        match=f"interrupt-parent-{session_id}",
+    )
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+        _start_side_chat(page, "slash", question)
+        pane = page.locator(".side-chat-backdrop")
+        expect(pane.get_by_test_id("working-indicator")).to_be_visible(timeout=30_000)
+        interrupt = pane.get_by_role("button", name="Interrupt side chat", exact=True)
+        expect(interrupt).to_be_enabled()
+        assert len(side_chat_forks) == 1
+        child_id = side_chat_forks[0]
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            response = httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0)
+            response.raise_for_status()
+            if response.json()["pending"]:
+                break
+            page.wait_for_timeout(50)
+        else:
+            pytest.fail("The side chat never reached the blocked LLM response")
+
+        parent_items = _items(base_url, session_id)
+        page.get_by_test_id("side-chat-input").fill(followup)
+        with page.expect_response(f"**/v1/sessions/{child_id}/events") as interrupted:
+            interrupt.click()
+        assert interrupted.value.ok
+        assert interrupted.value.request.post_data_json["type"] == "interrupt"
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        expect(interrupt).to_have_count(0)
+        expect(page.get_by_test_id("side-chat-input")).to_have_value(followup)
+        assert _items(base_url, session_id) == parent_items
+
+        expect(page.get_by_test_id("side-chat-send")).to_be_enabled()
+        page.get_by_test_id("side-chat-send").click()
+        expect(pane.locator(_ASSISTANT).filter(has_text="The side chat continued.")).to_be_visible(
+            timeout=30_000
+        )
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        expect(pane.get_by_text("This answer should be interrupted.", exact=True)).to_have_count(0)
+        assert _items(base_url, session_id) == parent_items
+
+        _send_parent(page, parent_question, "The main conversation still works.")
+        assert followup in str(_items(base_url, child_id))
+        assert question not in str(_items(base_url, session_id))
+        expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+
+
+def test_fork_from_side_chat_uses_child_and_creates_visible_session(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """Fork a side-chat reply from the child and surface the promoted session."""
+    base_url, parent_id = seeded_session
+    question = f"fork-side-{parent_id}: answer in the side chat"
+    reply = "This reply belongs only to the side chat."
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": reply}],
+        key=f"fork-side-{parent_id}",
+        match=f"fork-side-{parent_id}",
+    )
+
+    page.goto(f"{base_url}/c/{parent_id}")
+    with page.expect_response(f"**/v1/sessions/{parent_id}/fork") as side_chat_response:
+        _start_side_chat(page, "panel", question)
+    assert side_chat_response.value.ok
+    child_id = str(side_chat_response.value.json()["id"])
+    assert side_chat_forks == [child_id]
+
+    # The reply must come through the child's own turn: the pane treats what it
+    # sees on its first load as inherited history, so a turn seeded behind its
+    # back and surfaced by a reload can be hidden along with it.
+    pane = page.locator(".side-chat-backdrop")
+    assistant = pane.locator(_ASSISTANT).filter(has_text=reply)
+    expect(assistant).to_be_visible(timeout=30_000)
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+    reply_items = [
+        item
+        for item in _items(base_url, child_id)
+        if item.get("type") == "message" and reply in str(item)
+    ]
+    assert len(reply_items) == 1, reply_items
+    response_id = str(reply_items[0]["response_id"])
+
+    assistant.hover()
+    assistant.get_by_test_id("fork-from-response").click()
+    dialog = page.get_by_test_id("fork-session-dialog")
+    expect(dialog).to_be_visible()
+
+    fork_id: str | None = None
+    try:
+        fork_pattern = re.compile(r"/v1/sessions/[^/]+/fork$")
+        # Check the target before awaiting the reply, so a fork aimed at the
+        # parent fails on the URL rather than on a response timeout.
+        with page.expect_request(fork_pattern) as fork_request:
+            page.get_by_test_id("fork-session-submit").click()
+        request = fork_request.value
+        assert request.url == f"{base_url}/v1/sessions/{child_id}/fork", request.url
+        assert request.post_data_json["up_to_response_id"] == response_id
+        response = request.response()
+        assert response is not None and response.status == 201, response
+
+        expect(page).to_have_url(
+            re.compile(rf"/c/(?!{re.escape(parent_id)}|{re.escape(child_id)})[0-9a-f]{{32}}"),
+            timeout=30_000,
+        )
+        fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+        expect(page.locator(f'a[href="/c/{fork_id}"]')).to_be_visible(timeout=20_000)
+        expect(page.locator(_ASSISTANT).filter(has_text=reply)).to_be_visible(timeout=30_000)
+    finally:
+        if fork_id is not None:
+            httpx.delete(f"{base_url}/v1/sessions/{fork_id}", timeout=10.0).raise_for_status()

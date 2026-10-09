@@ -457,6 +457,36 @@ def test_get_runner_ids_reads_from_omnigent_db(store: SqlAlchemyConversationStor
     assert ids[b.id] is None
 
 
+@pytest.mark.parametrize(
+    ("runner_id", "stamp"), [("runner_a", 1_000_000), ("runner_a", None), (None, None)]
+)
+def test_get_runner_liveness_reads_only_metadata(
+    store: SqlAlchemyConversationStore, runner_id: str | None, stamp: int | None
+) -> None:
+    """Liveness survives an AP database outage and stays scoped to the workspace."""
+    from sqlalchemy import event
+
+    from omnigent.db.db_models import workspace_scope
+
+    conversation = store.create_conversation(runner_id=runner_id)
+    if runner_id is not None and stamp is not None:
+        store.touch_runner_liveness([runner_id], stamp)
+
+    def unavailable(*_args: Any) -> None:
+        raise ConnectionError("conversation database unavailable")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        with pytest.raises(ConnectionError, match="conversation database unavailable"):
+            store.get_session_connectivity([conversation.id])
+        assert store.get_runner_liveness(conversation.id) == (runner_id, stamp)
+        assert store.get_runner_liveness("0" * 32) is None
+        with workspace_scope(42):
+            assert store.get_runner_liveness(conversation.id) is None
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+
+
 def test_list_conversations_by_runner_id(store: SqlAlchemyConversationStore) -> None:
     a = store.create_conversation(title="a", runner_id="runner_x")
     store.create_conversation(title="b", runner_id="runner_y")
@@ -464,6 +494,51 @@ def test_list_conversations_by_runner_id(store: SqlAlchemyConversationStore) -> 
     assert len(results) == 1
     assert results[0].id == a.id
     assert results[0].title == "a"
+
+
+def test_runner_session_status_pages_do_not_read_conversation_db(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    a = store.create_conversation(runner_id="runner_x")
+    b = store.create_conversation(runner_id="runner_x")
+    store.set_session_live_status(a.id, "running")
+    store.set_session_live_status(b.id, "waiting")
+
+    def unavailable(*_args):
+        pytest.fail("runner teardown must not hydrate data from the conversation database")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        first = store.list_runner_session_statuses("runner_x", limit=1)
+        second = store.list_runner_session_statuses("runner_x", after=first[-1][0], limit=1)
+        assert first + second == sorted([(a.id, "running"), (b.id, "waiting")])
+        assert store.list_runner_session_statuses("runner_x", after=second[-1][0], limit=1) == []
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+
+
+def test_intentional_stop_settlement_uses_only_metadata(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    conv = store.create_conversation(runner_id="runner-stopped")
+    store.set_session_live_status(conv.id, "running")
+    store.set_labels(conv.id, {"omnigent.last_task_error_code": "preserved"})
+
+    def unavailable(*_args):
+        pytest.fail("Stop settlement must not read or write the conversation database")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        assert store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+    after = store.get_conversation(conv.id)
+    assert after.live_status == "idle"
+    assert after.labels["omnigent.last_task_error_code"] == "preserved"
 
 
 # ── fork_conversation ──────────────────────────────────
@@ -593,12 +668,13 @@ def test_update_conversation_archives_without_metadata_row(
 # ── Session-scoped agent cleanup on conversation delete ───────────────
 
 
-def test_delete_conversation_deletes_session_scoped_agent(
+def test_delete_conversation_keeps_its_user_agent(
     omnigent_db: Path,
     conv_db: Path,
     store: SqlAlchemyConversationStore,
 ) -> None:
-    """Deleting a session deletes the session-scoped agent row backing it."""
+    """Deleting a session never deletes the agent it used: agents outlive their
+    sessions and only an explicit agent removal deletes one."""
     created = store.create_session_with_agent(
         agent_id="d6f21846ee961735d477aae06247b99c",
         agent_name="del-agent",
@@ -609,7 +685,7 @@ def test_delete_conversation_deletes_session_scoped_agent(
     assert _count(omnigent_db, "agents") == 1
 
     asyncio.run(store.delete_conversation(created.conversation.id))
-    assert _count(omnigent_db, "agents") == 0
+    assert _col(omnigent_db, "agents", "id") == ["d6f21846ee961735d477aae06247b99c"]
     assert _count(conv_db, "conversations") == 0
 
 
@@ -634,6 +710,125 @@ def test_delete_conversation_keeps_template_agent(
 
     asyncio.run(store.delete_conversation(conv.id))
     assert _col(omnigent_db, "agents", "id") == ["191cbf904e3223e9e00ac9a1abfe79a5"]
+
+
+# ── ACL filters (split-DB prefetch fallback) ───────────
+#
+# In split-DB mode the session_permissions table lives on a different bind
+# than conversations, so the EXISTS pushdown is impossible; these verify the
+# id-prefetch fallback keeps ACL semantics identical.
+
+
+def _perms(omnigent_db: Path):
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    perms = SqlAlchemyPermissionStore(f"sqlite:///{omnigent_db}")
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    return perms
+
+
+def test_split_db_acl_filters_over_one_grant_graph(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """
+    Split binds: every ACL filter, plus the statement shape, on one graph.
+
+    Four tests shared this setup and one of them could not observe its own
+    contract: using the same user for ``accessible_by`` and ``owned_by``
+    makes ownership imply accessibility, so the intersection is whatever
+    ``owned_by`` alone returns. The graph below gives the two operands
+    DIFFERENT users, so an intersection that ignored one of them changes the
+    answer.
+    """
+    from sqlalchemy import event
+
+    owned_by_alice = store.create_conversation(title="owned-by-alice")
+    shared_with_alice = store.create_conversation(title="shared-with-alice")
+    owned_by_bob = store.create_conversation(title="owned-by-bob")
+    # Alice can read it, Bob owns it — the only row in the intersection below.
+    alice_reads_bob_owns = store.create_conversation(title="alice-reads-bob-owns")
+
+    perms = _perms(omnigent_db)
+    perms.grant("alice@example.com", owned_by_alice.id, 4)
+    perms.grant("alice@example.com", shared_with_alice.id, 1)
+    perms.grant("bob@example.com", owned_by_bob.id, 4)
+    perms.grant("alice@example.com", alice_reads_bob_owns.id, 1)
+    perms.grant("bob@example.com", alice_reads_bob_owns.id, 4)
+
+    def _ids(**kwargs: object) -> set[str]:
+        return {c.id for c in store.list_conversations(**kwargs).data}  # type: ignore[arg-type]
+
+    # accessible_by: any grant level.
+    assert _ids(accessible_by="alice@example.com") == {
+        owned_by_alice.id,
+        shared_with_alice.id,
+        alice_reads_bob_owns.id,
+    }
+    # owned_by: owner level only — a read grant is not enough.
+    assert _ids(owned_by="alice@example.com") == {owned_by_alice.id}
+    # Both, with DIFFERENT users: alice can see it and bob owns it.
+    assert _ids(accessible_by="alice@example.com", owned_by="bob@example.com") == {
+        alice_reads_bob_owns.id
+    }
+    assert not _ids(accessible_by="nobody@example.com")
+
+    # Statement shape: split binds take the prefetch path, so a standalone
+    # session_permissions SELECT runs on the Omnigent engine and the AP
+    # conversations query carries no cross-bind EXISTS.
+    captured: dict[str, list[str]] = {"omnigent": [], "conv": []}
+
+    def _capture(key: str):
+        def _on_execute(conn, cursor, statement, parameters, context, executemany):
+            captured[key].append(statement)
+
+        return _on_execute
+
+    omni_listener = _capture("omnigent")
+    conv_listener = _capture("conv")
+    event.listen(store._engine, "before_cursor_execute", omni_listener)
+    event.listen(store._conv_engine, "before_cursor_execute", conv_listener)
+    try:
+        result = store.list_conversations(accessible_by="alice@example.com")
+    finally:
+        event.remove(store._engine, "before_cursor_execute", omni_listener)
+        event.remove(store._conv_engine, "before_cursor_execute", conv_listener)
+
+    assert len(result.data) == 3
+    prefetch = [
+        s
+        for s in captured["omnigent"]
+        if "session_permissions" in s and "FROM conversations" not in s
+    ]
+    assert prefetch, "expected a standalone session_permissions prefetch"
+    assert not any("session_permissions" in s for s in captured["conv"])
+
+
+def test_list_projects_acl_split_db_prefetch_fallback(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """Split binds: list_projects keeps the id-prefetch ACL and scopes
+    projects to the caller's grants."""
+    mine = store.create_conversation(title="mine")
+    other = store.create_conversation(title="other")
+    read_only = store.create_conversation(title="read-only")
+    store.set_labels(mine.id, {"omni_project": "Mine"})
+    store.set_labels(other.id, {"omni_project": "Other"})
+    store.set_labels(read_only.id, {"omni_project": "ReadOnly"})
+    perms = _perms(omnigent_db)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", other.id, 4)
+    # Alice can read this project's session but does not own it.
+    perms.grant("alice@example.com", read_only.id, 1)
+
+    assert store.list_projects(accessible_by="alice@example.com") == ["Mine", "ReadOnly"]
+    assert store.list_projects(owned_by="bob@example.com") == ["Other"]
+    # owned_by must require owner level, not merely a grant: lowering the
+    # threshold here would add "ReadOnly".
+    assert store.list_projects(owned_by="alice@example.com") == ["Mine"]
+    assert store.list_projects(accessible_by="nobody@example.com") == []
 
 
 # ── Connection-checkout budget ─────────────────────────

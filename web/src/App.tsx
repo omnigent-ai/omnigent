@@ -3,7 +3,9 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
+import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
+import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
@@ -50,10 +52,8 @@ const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
 );
-const CanvasPage = withPageView(
-  "canvas",
-  lazy(() => import("@/pages/CanvasPage").then((m) => ({ default: m.CanvasPage }))),
-);
+// The shell owns the board so selecting a conversation never unmounts it.
+const CanvasLandingPage = withPageView("canvas", () => null);
 const TasksPage = withPageView(
   "tasks",
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
@@ -132,7 +132,7 @@ interface AppProps {
  * to the SPA, so unmatched paths land here after the bundle boots
  * rather than a server 404.
  */
-function App({ basename }: AppProps = {}) {
+function AppRoutes({ basename }: AppProps) {
   // Embedded: match the absolute pathname (`${basename}/...`). Standalone
   // (no basename): `prefix` is empty, so every `path` below is identical to
   // the original relative route table.
@@ -147,7 +147,7 @@ function App({ basename }: AppProps = {}) {
   // after the first admin exists.
   if (info !== "loading" && info.accounts_enabled && info.needs_setup) {
     return (
-      <Suspense fallback={null}>
+      <Suspense fallback={<PageLoading />}>
         <Routes>
           <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
         </Routes>
@@ -156,7 +156,7 @@ function App({ basename }: AppProps = {}) {
   }
 
   return (
-    <Suspense fallback={null}>
+    <Suspense fallback={<PageLoading />}>
       <Routes>
         {info !== "loading" && info.accounts_enabled && (
           <>
@@ -173,7 +173,15 @@ function App({ basename }: AppProps = {}) {
             path={`${prefix}/canvas`}
             element={
               <FeatureGatedPage feature="canvas">
-                <CanvasPage />
+                <CanvasLandingPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/canvas/c/:conversationId`}
+            element={
+              <FeatureGatedPage feature="canvas">
+                <ChatPage />
               </FeatureGatedPage>
             }
           />
@@ -195,7 +203,7 @@ function App({ basename }: AppProps = {}) {
             path={`${prefix}/settings`}
             element={<Navigate to={`${prefix}/settings/general`} replace />}
           />
-          <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+          <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
@@ -219,4 +227,10 @@ function App({ basename }: AppProps = {}) {
   );
 }
 
-export default App;
+export default function App(props: AppProps = {}) {
+  return (
+    <ChunkLoadErrorBoundary>
+      <AppRoutes {...props} />
+    </ChunkLoadErrorBoundary>
+  );
+}

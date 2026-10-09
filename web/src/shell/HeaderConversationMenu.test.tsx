@@ -5,8 +5,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
@@ -18,12 +24,16 @@ const mocks = vi.hoisted(() => ({
     icon?: string | null;
   }[],
   togglePinned: vi.fn(),
+  togglePinnedAsync: vi.fn(() => Promise.resolve({})),
   rename: vi.fn(),
   moveToProject: vi.fn(),
   archive: vi.fn(),
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
   fork: vi.fn(),
+  exportTranscript: vi.fn(),
+  triggerDownload: vi.fn(),
+  toastError: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -35,7 +45,10 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
   return {
     ...actual,
     useProjects: () => ({ data: mocks.projects }),
-    useTogglePinnedConversation: () => ({ mutate: mocks.togglePinned }),
+    useTogglePinnedConversation: () => ({
+      mutate: mocks.togglePinned,
+      mutateAsync: mocks.togglePinnedAsync,
+    }),
     useRenameConversation: () => ({ mutate: mocks.rename, isPending: false }),
     useMoveToProject: () => ({ mutate: mocks.moveToProject }),
     useArchiveConversation: () => ({ mutate: mocks.archive }),
@@ -50,6 +63,21 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
   const actual = await importOriginal<typeof UnseenConversationsModule>();
   return { ...actual, markConversationUnread: mocks.markUnread };
 });
+
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApiModule>();
+  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+});
+
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return { ...actual, triggerBrowserDownload: mocks.triggerDownload };
+});
+
+// `toast` is callable too: archiving shows the Undo pill via `toast(...)`.
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() }),
+}));
 
 const CONVERSATION: Conversation = {
   id: "conv-1",
@@ -76,17 +104,19 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
   const queryClient = new QueryClient();
   return (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
-        <HeaderConversationMenu
-          conversation={CONVERSATION}
-          currentProject={null}
-          canShare
-          canFork
-          onShare={() => {}}
-          onFork={mocks.fork}
-          {...overrides}
-        />
-      </MemoryRouter>
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true }}>
+        <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
+          <HeaderConversationMenu
+            conversation={CONVERSATION}
+            currentProject={null}
+            canShare
+            canFork
+            onShare={() => {}}
+            onFork={mocks.fork}
+            {...overrides}
+          />
+        </MemoryRouter>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
@@ -111,6 +141,19 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("HeaderConversationMenu", () => {
+  it("keeps an unsupported Fork visible without opening its dialog", () => {
+    renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
+    openMenu();
+    const fork = screen.getByTestId("header-fork-conversation");
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    expect(fork).toHaveAttribute("aria-describedby");
+    expect(fork).toHaveAccessibleDescription("Forking this sandbox session is not supported yet.");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(mocks.fork).not.toHaveBeenCalled();
+    expect(fork).toBeInTheDocument();
+  });
+
   it("exposes an accessible trigger and the established action order", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
@@ -128,6 +171,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -159,6 +203,59 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
   });
 
+  it("unpins with an Undo that re-pins at the previous pin value", async () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, labels: { [PINNED_LABEL_KEY]: "1700000000123" } },
+    });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unpin" }));
+    expect(mocks.togglePinnedAsync).toHaveBeenCalledWith({ id: "conv-1", pinned: false });
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        "Unpinned session",
+        expect.objectContaining({ description: "Quarterly planning" }),
+      ),
+    );
+
+    const action = vi.mocked(toast).mock.calls.at(-1)?.[1]?.action as unknown as {
+      onClick: () => void;
+    };
+    action.onClick();
+    expect(mocks.togglePinnedAsync).toHaveBeenLastCalledWith({
+      id: "conv-1",
+      pinned: true,
+      pinnedAt: 1700000000123,
+    });
+  });
+
+  it("downloads the transcript as <session-id>.jsonl from Export", async () => {
+    const jsonl = '{"record_type":"session_meta","id":"conv-1"}\n';
+    mocks.exportTranscript.mockResolvedValueOnce(jsonl);
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.triggerDownload).toHaveBeenCalledTimes(1));
+    expect(mocks.exportTranscript).toHaveBeenCalledWith("conv-1");
+    const [blob, filename] = mocks.triggerDownload.mock.calls[0]! as [Blob, string];
+    expect(filename).toBe("conv-1.jsonl");
+    expect(await blob.text()).toBe(jsonl);
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an export failure as a toast and downloads nothing", async () => {
+    mocks.exportTranscript.mockRejectedValueOnce(new Error("boom"));
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
+    expect(mocks.triggerDownload).not.toHaveBeenCalled();
+  });
+
   it("opens a full-history fork from the session menu", () => {
     renderMenu();
 
@@ -188,10 +285,17 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // Just the flag: the optimistic overlay lives in the hook, and the Undo
-    // toast fires synchronously (navigating away unmounts this menu, so a
-    // mutate onSuccess callback wouldn't fire).
-    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
+    // A worktree session asks whether to delete the worktree first.
+    expect(mocks.archive).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
+    // The optimistic overlay lives in the hook, and the Undo toast fires
+    // synchronously (navigating away unmounts this menu, so a mutate onSuccess
+    // callback wouldn't fire).
+    expect(mocks.archive).toHaveBeenCalledWith({
+      id: "conv-1",
+      archived: true,
+      deleteWorktree: true,
+    });
 
     view.unmount();
     renderMenu();
@@ -203,6 +307,22 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  it("offers Unarchive on an archived session and unarchives in place", () => {
+    // An archived session reopened by URL must not be re-offered the action
+    // that was already taken; the item flips like the sidebar row's menu.
+    renderMenu({ conversation: { ...CONVERSATION, archived: true } });
+
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    const item = screen.getByRole("menuitem", { name: "Unarchive" });
+    expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
+
+    fireEvent.click(item);
+    // Just the flag flip: unarchiving keeps the user on the session, so no
+    // redirect home and no Undo toast.
+    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: false });
   });
 
   it("labels project actions for filed and unfiled sessions", () => {
@@ -372,7 +492,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     openMenu();
     const label = screen.getByText("Quarterly planning");
-    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+    expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
@@ -414,6 +534,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -435,6 +556,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -479,13 +601,11 @@ describe("HeaderConversationMenu", () => {
     expect(document.body.style.pointerEvents).toBe("none");
   });
 
-  it("wears the mobile glass surface and a round trigger", () => {
-    // The trigger sits inside the header's round floating pill; a rounded-lg
-    // open-state background showed through it as a square.
+  it("keeps the trigger flat while retaining a legible mobile menu surface", () => {
     mocks.isMobile = true;
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(trigger).toHaveClass("max-md:rounded-full");
+    expect(trigger).not.toHaveClass("max-md:rounded-full");
 
     openMenu();
     expect(screen.getByRole("menu")).toHaveClass(

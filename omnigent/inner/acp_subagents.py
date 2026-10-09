@@ -18,7 +18,7 @@ an Omnigent child session and its transcript so the web "Subagents" panel lists
 one row per child with the work it did.
 
 A vendor's dialect lives with that vendor — see
-:class:`omnigent.inner.devin.subagents.DevinSubAgentSource` for the worked
+a vendor source implements this protocol for the worked
 example — so supporting another agent means adding one source in that agent's
 own package, with nothing here or downstream to change. When ACP standardizes
 the convention, a single source keyed on the standard fields covers every

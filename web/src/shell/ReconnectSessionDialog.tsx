@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   Dialog,
@@ -8,20 +8,28 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { quoteShellArgument } from "@/lib/shell";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { ForkSessionForm } from "./ForkSessionDialog";
 import { SwitchHostDialog } from "./SwitchHostDialog";
 
-const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
+import { nativeCodingAgentForHarness, nativeCodingAgentForWrapper } from "@/lib/nativeCodingAgents";
 
 const HOST_OWNER_DESCRIPTION =
   "This session's host is offline. Run the command below from the host machine to reconnect.";
 
+const HOST_OWNER_THIS_MACHINE_DESCRIPTION =
+  "This session's host is this machine. Reconnect it below, or run the command from a terminal.";
+
+const HOST_OWNER_ARCA_DESCRIPTION =
+  "This session's Arca host is offline. Reconnect it below, or run the command from a terminal.";
+
 const HOST_VIEWER_DESCRIPTION =
-  "This session's host machine is offline and only its owner can reconnect it. " +
-  "Clone the session to continue in a copy you own.";
+  "This session's host machine is offline and only its owner can reconnect it.";
 
 const RUN_DESCRIPTION =
   "Run the command below from the machine where you started this session to reconnect.";
@@ -53,6 +61,11 @@ export type ReconnectState = "host_offline" | "local_stranded";
  *    --resume <id>`; everything else uses the generic `omnigent run
  *    path/to/agent.yaml --resume <id>`.
  *
+ * The native wrapper is resolved from the `omnigent.wrapper` label, then
+ * the canonical `harness` — a pre-native session (e.g. a legacy `devin-acp`
+ * row) can carry no wrapper label yet still be a native harness, and the
+ * generic `omnigent run` form cannot resume it.
+ *
  * The Databricks profile stays a placeholder in every form — it's
  * per-deployment and not knowable from the browser.
  */
@@ -60,11 +73,13 @@ export function buildReconnectCommand({
   conversationId,
   serverUrl,
   wrapper,
+  harness,
   state,
 }: {
   conversationId: string;
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   state: ReconnectState;
 }): string {
   // Backslash-continued so the command stays readable inside a narrow
@@ -73,9 +88,15 @@ export function buildReconnectCommand({
   if (state === "host_offline") {
     return ["omnigent host \\", `  --server ${quotedServerUrl}`].join("\n");
   }
-  if (wrapper === CLAUDE_NATIVE_WRAPPER) {
+  // Every native TUI wrapper resumes through its own verb (`omnigent devin
+  // --resume …`), and the verb is the registry key — the generic
+  // `omnigent run <agent.yaml>` below cannot resume one at all, so it was wrong
+  // for every native harness except claude. Fall back to the canonical harness
+  // when there's no wrapper label (a label-less pre-native session).
+  const nativeAgent = nativeCodingAgentForWrapper(wrapper) ?? nativeCodingAgentForHarness(harness);
+  if (nativeAgent !== undefined) {
     return [
-      "omnigent claude \\",
+      `omnigent ${nativeAgent.key} \\`,
       `  --resume ${conversationId} \\`,
       `  --server ${quotedServerUrl}`,
     ].join("\n");
@@ -98,7 +119,8 @@ export function buildReconnectCommand({
  * - **Reconnect** — a one-line instruction plus the CLI command. For a
  *   non-owner of a `host_offline` session — who can't reach the host
  *   machine — the command is dropped and the text explains that only
- *   the owner can reconnect.
+ *   the owner can reconnect. If an in-app reconnect failed, the owner
+ *   can retry it here or use the terminal command.
  * - **Clone** — the same {@link ForkSessionForm} the header-menu Clone
  *   dialog uses (one fork implementation, two entry points), so the
  *   user can continue in a copy they own without leaving the dialog.
@@ -109,6 +131,8 @@ export function buildReconnectCommand({
  * @param wrapper - The conversation's `omnigent.wrapper` label
  *   (`"claude-code-native-ui"` for `omnigent claude` sessions). Picks
  *   the `local_stranded` command form.
+ * @param harness - The conversation's canonical harness, used to pick the
+ *   `local_stranded` command form when no wrapper label is present.
  * @param state - Which unreachable state we're reconnecting from.
  * @param isOwner - Whether the viewer owns the session. Gates the
  *   reconnect command for `host_offline`.
@@ -125,39 +149,78 @@ export function ReconnectSessionDialog({
   conversationId,
   serverUrl,
   wrapper,
+  harness,
   state,
   isOwner,
   sourceTitle,
   sourceWorkspace,
   sourceHostId,
   sourceGitBranch,
+  localReconnect,
+  arcaReconnect,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   conversationId: string;
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   state: ReconnectState;
   isOwner: boolean;
   sourceTitle?: string | null;
   sourceWorkspace?: string | null;
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
+  localReconnect?: {
+    reconnecting: boolean;
+    error: string | null;
+    onReconnect: () => void;
+  };
+  arcaReconnect?: {
+    reconnecting: boolean;
+    error: string | null;
+    onReconnect: () => void;
+  };
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
+  const [selectedTab, setSelectedTab] = useState<string>();
+  const { forkDisabledReason, switchHostDisabledReason } = useSessionActionRestrictions(
+    conversationId,
+    { hostId: sourceHostId },
+  );
+  // Loading never disables Clone: a disabled trigger would hand initial focus
+  // to Reconnect and activate it before the capability check finishes.
+  const forkRestriction =
+    forkDisabledReason === SESSION_ACTIONS_LOADING ? undefined : forkDisabledReason;
+  useEffect(() => {
+    if (!open) setSelectedTab(undefined);
+    else if (forkRestriction) setSelectedTab("reconnect");
+  }, [open, forkRestriction]);
+  // Loading stays out of the guidance, but the disabled action's tooltip explains the wait.
+  const switchHostRestriction =
+    switchHostDisabledReason === SESSION_ACTIONS_LOADING ? undefined : switchHostDisabledReason;
   const isHostReconnect = state === "host_offline";
+  const canReconnectThisMachine = isHostReconnect && isOwner && localReconnect != null;
+  const canReconnectArca = isHostReconnect && isOwner && arcaReconnect != null;
+
   // A non-owner can't reach the host machine to reconnect it, so the
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
   const showCommand = isOwner || !isHostReconnect;
-  const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, state });
+  const defaultTab = showCommand ? "reconnect" : "clone";
+  const resolvedTab = forkRestriction ? "reconnect" : (selectedTab ?? defaultTab);
+  const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, harness, state });
   // Titles mirror the unreachable banner's wording ("Host is offline —
   // click to reconnect" / "Agent disconnected — click to reconnect").
   const title = isHostReconnect ? "Host is offline" : "Agent disconnected";
   const description = isHostReconnect
     ? isOwner
-      ? HOST_OWNER_DESCRIPTION
-      : HOST_VIEWER_DESCRIPTION
+      ? canReconnectArca
+        ? HOST_OWNER_ARCA_DESCRIPTION
+        : canReconnectThisMachine
+          ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
+          : HOST_OWNER_DESCRIPTION
+      : `${HOST_VIEWER_DESCRIPTION} ${forkRestriction ?? "Clone the session to continue in a copy you own."}`
     : RUN_DESCRIPTION;
   return (
     <>
@@ -172,10 +235,11 @@ export function ReconnectSessionDialog({
               keeps the dialog described for screen readers. */}
             <DialogDescription className="sr-only">{description}</DialogDescription>
           </DialogHeader>
-          {/* Uncontrolled tabs: DialogContent unmounts on close, so the
-            default re-applies on every open. */}
+          {/* Restrictions can arrive after opening Clone; preserve the form
+            while moving the user to Reconnect. Closing resets the selection. */}
           <Tabs
-            defaultValue={showCommand ? "reconnect" : "clone"}
+            value={resolvedTab}
+            onValueChange={setSelectedTab}
             className="flex min-h-0 flex-1 flex-col gap-4"
             componentId="reconnect.tabs"
           >
@@ -183,9 +247,19 @@ export function ReconnectSessionDialog({
               <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">
                 Reconnect
               </TabsTrigger>
-              <TabsTrigger value="clone" data-testid="reconnect-session-tab-clone">
-                Clone
-              </TabsTrigger>
+              <DisabledActionTooltip
+                reason={forkRestriction}
+                label="Clone session"
+                className="h-full flex-1 items-center"
+              >
+                <TabsTrigger
+                  value="clone"
+                  data-testid="reconnect-session-tab-clone"
+                  disabled={!!forkRestriction}
+                >
+                  Clone
+                </TabsTrigger>
+              </DisabledActionTooltip>
             </TabsList>
             <TabsContent value="reconnect" className="flex flex-col gap-4">
               <p
@@ -194,6 +268,50 @@ export function ReconnectSessionDialog({
               >
                 {description}
               </p>
+              {canReconnectThisMachine && localReconnect && (
+                <div className="flex flex-col gap-2">
+                  <Button
+                    className="self-start"
+                    data-testid="reconnect-session-this-machine"
+                    disabled={localReconnect.reconnecting}
+                    aria-busy={localReconnect.reconnecting}
+                    onClick={localReconnect.onReconnect}
+                  >
+                    {localReconnect.reconnecting ? "Reconnecting this machine…" : "Retry reconnect"}
+                  </Button>
+                  {localReconnect.error && (
+                    <p
+                      className="text-sm text-destructive select-text"
+                      role="alert"
+                      data-testid="reconnect-session-reconnect-error"
+                    >
+                      {localReconnect.error}
+                    </p>
+                  )}
+                </div>
+              )}
+              {canReconnectArca && arcaReconnect && (
+                <div className="flex flex-col gap-2">
+                  <Button
+                    className="self-start"
+                    data-testid="reconnect-session-arca"
+                    disabled={arcaReconnect.reconnecting}
+                    aria-busy={arcaReconnect.reconnecting}
+                    onClick={arcaReconnect.onReconnect}
+                  >
+                    {arcaReconnect.reconnecting ? "Reconnecting Arca…" : "Reconnect Arca"}
+                  </Button>
+                  {arcaReconnect.error && (
+                    <p
+                      className="text-sm text-destructive select-text"
+                      role="alert"
+                      data-testid="reconnect-session-arca-error"
+                    >
+                      {arcaReconnect.error}
+                    </p>
+                  )}
+                </div>
+              )}
               {showCommand && (
                 <CliCommandBlock command={command} testIdPrefix="reconnect-session" />
               )}
@@ -203,19 +321,27 @@ export function ReconnectSessionDialog({
               {isHostReconnect && isOwner && (
                 <div className="flex flex-col gap-2 border-t pt-4">
                   <p className="text-ui text-muted-foreground">
-                    Can't bring that machine back? Move the session to another one instead.
+                    {switchHostRestriction ??
+                      "Can't bring that machine back? Move the session to another one instead."}
                   </p>
-                  <Button
-                    variant="outline"
+                  <DisabledActionTooltip
+                    reason={switchHostDisabledReason}
+                    label="Switch host"
                     className="self-start"
-                    data-testid="reconnect-session-switch-host"
-                    onClick={() => {
-                      setSwitchOpen(true);
-                      onOpenChange(false);
-                    }}
                   >
-                    Switch host
-                  </Button>
+                    <Button
+                      variant="outline"
+                      className="self-start"
+                      data-testid="reconnect-session-switch-host"
+                      disabled={!!switchHostDisabledReason}
+                      onClick={() => {
+                        setSwitchOpen(true);
+                        onOpenChange(false);
+                      }}
+                    >
+                      Switch host
+                    </Button>
+                  </DisabledActionTooltip>
                 </div>
               )}
             </TabsContent>

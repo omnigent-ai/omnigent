@@ -57,7 +57,9 @@ from omnigent.models.claude_model_vocabulary import (
     served_canonical_overrides,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
@@ -81,7 +83,7 @@ from .executor import (
     classify_tool_result,
     describe_exception,
 )
-from .native_attachments import unresolved_attachment_marker
+from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
     create_exec_launcher,
     get_backend,
@@ -96,12 +98,12 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is
 # unset. Not Databricks-specific: the same fallback applies to any gateway
-# producer (Databricks AI gateway or a generic key/gateway provider).
+# producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
-# request headers. The Databricks AI gateway only serves Claude requests
+# request headers. The Databricks Unity Gateway only serves Claude requests
 # in coding-agent mode when this header is present, so the Databricks
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
@@ -898,7 +900,7 @@ def _build_mcp_tools(
                         "content": [
                             {
                                 "type": "text",
-                                "text": json.dumps(
+                                "text": json_dumps_transport_safe(
                                     {"error": f"No tool executor for '{tool_name}'"}
                                 ),
                             }
@@ -911,8 +913,14 @@ def _build_mcp_tools(
                     # runtime returns without confusing the type checker.
                     raw = await tool_executor(tool_name, args)
                     result: ToolResult = raw if isinstance(raw, dict) else {"result": raw}
-                    response: McpResponse = {
-                        "content": [{"type": "text", "text": json.dumps(result)}],
+                    image_result = decode_mcp_image_result(result)
+                    if image_result is not None:
+                        response: McpResponse = image_result.to_mcp()
+                        # The SDK server reads snake_case; native MCP clients use isError.
+                        response["is_error"] = image_result.is_error
+                        return response
+                    response = {
+                        "content": [{"type": "text", "text": json_dumps_transport_safe(result)}],
                     }
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
@@ -921,7 +929,12 @@ def _build_mcp_tools(
                     return response
                 except Exception as exc:  # noqa: BLE001 — tool handler converts any error to MCP error response
                     return {
-                        "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json_dumps_transport_safe({"error": str(exc)}),
+                            }
+                        ],
                         "isError": True,
                     }
 
@@ -1012,6 +1025,15 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
         for tier in ("opus", "sonnet", "haiku", "fable"):
             servable = families.get(tier)
             if servable:
+                logger.warning(
+                    "claude-sdk: no model pinned for this session; resolved %r "
+                    "from the %r workspace catalog (%s precedence). Pin a model "
+                    "in the agent spec or dispatch to control which endpoint "
+                    "is billed.",
+                    servable,
+                    profile or "DEFAULT",
+                    " > ".join(("opus", "sonnet", "haiku", "fable")),
+                )
                 return servable
     except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
         logger.warning(
@@ -1020,7 +1042,14 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
             profile,
             exc_info=True,
         )
-    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    resolved = model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    logger.warning(
+        "claude-sdk: no model pinned for this session; resolved %r from the "
+        "bundled catalog. Pin a model in the agent spec or dispatch to "
+        "control which endpoint is billed.",
+        resolved,
+    )
+    return resolved
 
 
 class _GatewayModelVocabulary(NamedTuple):
@@ -1127,11 +1156,13 @@ def _resolve_gateway_env(
     command + a refresh TTL. When the gateway base URL and auth command are
     supplied directly (the generic-provider producer, or ucode), they are
     used verbatim. When only a Databricks profile is supplied (no override
-    values), the Databricks-specific fallback derives both from
-    ``~/.databrickscfg``:
-      1. ~/.databrickscfg profile credentials
-      2. ~/.databrickscfg (explicit profile, DEFAULT, or first valid section)
-    Returns an empty dict if no credentials are available.
+    values), the Databricks-specific fallback derives both from the profile's
+    workspace **host** (see
+    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`).
+    Only the host is needed: the bearer token is minted at request time by
+    the generated auth command, so OAuth U2M profiles (``auth_type =
+    databricks-cli``, no static ``token`` field) resolve too. Returns an
+    empty dict if no workspace host can be resolved.
 
     The bearer token itself is not returned. Claude Code receives an
     invocation-local ``apiKeyHelper`` setting and refresh TTL instead, so
@@ -1171,16 +1202,22 @@ def _resolve_gateway_env(
             _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
         }
     if host is None:
+        # Only the workspace host is needed here: the auth command mints the
+        # bearer at request time. Resolving the host (rather than a static
+        # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
+        # — they carry a ``host`` but no ``token`` field, so a token-requiring
+        # lookup would fail even though ``databricks auth token`` succeeds.
+        # Same derivation the codex gateway path uses.
         try:
-            from .databricks_executor import _read_databrickscfg
+            from .databricks_executor import _databricks_gateway_host
 
-            creds = _read_databrickscfg(profile)
+            host = _databricks_gateway_host(profile)
         except ImportError:
-            creds = None
+            host = None
 
-        if creds is None:
+        if not host:
             return {}
-        host = creds.host.rstrip("/")
+        host = host.rstrip("/")
         base_url = (
             base_url_override if base_url_override is not None else f"{host}/ai-gateway/anthropic"
         )
@@ -1218,7 +1255,7 @@ def _resolve_gateway_env(
     # already fixed this by negotiating betas with the gateway instead
     # (`claude_native.py` CLAUDE_CODE_USE_GATEWAY=1); claude-sdk — the harness
     # behind Polly and Debby — never got that change. Scope it to a real
-    # Databricks AI Gateway base URL so a generic gateway (or a mock server)
+    # Databricks Unity Gateway base URL so a generic gateway (or a mock server)
     # that cannot negotiate betas keeps the original workaround.
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
@@ -1577,7 +1614,7 @@ class ClaudeSDKExecutor(Executor):
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
-                Databricks AI gateway or a generic provider).
+                Databricks Unity Gateway or a generic provider).
             databricks_profile: Databricks-specific config profile from
                 ~/.databrickscfg, e.g. ``"<your-profile>"``.  Only used by the
                 Databricks producer path (deriving base URL / auth command
@@ -1681,6 +1718,7 @@ class ClaudeSDKExecutor(Executor):
         self._elicitation_handler: ElicitationHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
+        self._pending_framework_context: dict[str, str] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
         # Force-close tasks for clients evicted on turn cancellation, kept
@@ -1724,6 +1762,7 @@ class ClaudeSDKExecutor(Executor):
         self._gateway_uses_databricks_profile = bool(
             gateway and self._gateway_host is None and base_url_override is None
         )
+        self._resolved_default_model: str | None = None
 
         # Lazily-started local proxy that restores request fields the
         # Claude CLI strips on the gateway path (thinking.display).
@@ -1756,6 +1795,8 @@ class ClaudeSDKExecutor(Executor):
                 )
             self._extra_env.update(gateway_env)
         self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
+        if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
+            self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -1973,6 +2014,27 @@ class ClaudeSDKExecutor(Executor):
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
 
+    async def _evict_terminated_client(self, session_key: str) -> None:
+        """Discard a cached client after its CLI child exits."""
+        state = self._clients.get(session_key)
+        if state is None:
+            return
+        transport = getattr(state.client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        # A non-None returncode is exactly the reaped-corpse state the SDK's
+        # write() refuses; a missing transport/process reads as alive and is skipped.
+        returncode = getattr(process, "returncode", None)
+        if returncode is None:
+            return
+        logger.warning(
+            "Claude SDK CLI for session %s terminated between turns "
+            "(exit code: %s); discarding the dead client so this turn "
+            "rebuilds a fresh one.",
+            session_key,
+            returncode,
+        )
+        await self._close_live_client(session_key)
+
     async def close(self) -> None:
         session_keys = list(self._clients)
         for session_key in session_keys:
@@ -2160,6 +2222,31 @@ class ClaudeSDKExecutor(Executor):
         for var, model_id in self._gateway_vocabulary.alias_pins.items():
             env.setdefault(var, model_id)
         return self._gateway_vocabulary.model_overrides
+
+    def _install_framework_context_hook(
+        self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str
+    ) -> None:
+        """Read current-turn context even when the SDK reuses its original hooks."""
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None:
+            return
+
+        async def add_context(
+            _payload: object, _tool_use_id: str | None, _context: object
+        ) -> _JsonObject:
+            text = self._pending_framework_context.pop(session_key, "")
+            if not text:
+                return {}
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": text,
+                }
+            }
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        hooks.setdefault("UserPromptSubmit", []).append(hook_matcher(hooks=[add_context]))
+        options.hooks = hooks
 
     def _install_subagent_router_hook(
         self,
@@ -2431,9 +2518,11 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        await self._evict_terminated_client(session_key)
+        resume_session = session_key in self._clients
         prompt = self._build_prompt(
             messages,
-            resume_session=session_key in self._clients,
+            resume_session=resume_session,
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -2497,9 +2586,11 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = await run_sync_on_thread(
-                _resolve_databricks_claude_model, self._databricks_profile
-            )
+            if self._resolved_default_model is None:
+                self._resolved_default_model = await run_sync_on_thread(
+                    _resolve_databricks_claude_model, self._databricks_profile
+                )
+            model = self._resolved_default_model
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
@@ -2653,6 +2744,7 @@ class ClaudeSDKExecutor(Executor):
             options.can_use_tool = self._can_use_tool_gate
 
         self._install_subagent_router_hook(sdk, options, model)
+        self._install_framework_context_hook(sdk, options, session_key)
 
         # Log the full configuration for debugging
         logger.info(
@@ -2837,6 +2929,19 @@ class ClaudeSDKExecutor(Executor):
                 yield ExecutorError(message=f"LLM call denied by policy: {_deny_reason}")
                 return
 
+        notice_messages = messages
+        if resume_session:
+            notice_messages = []
+            for message in reversed(messages):
+                if message.get("role") != "user":
+                    break
+                notice_messages.insert(0, message)
+        self._pending_framework_context[session_key] = "\n\n".join(
+            notice
+            for message in notice_messages
+            if message.get("role") == "user"
+            for notice in framework_notices(message.get("content"))
+        )
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3216,6 +3321,7 @@ class ClaudeSDKExecutor(Executor):
             self._evict_client_on_cancel(session_key)
             raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
+            self._pending_framework_context.pop(session_key, None)
             self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
             stderr_text = "\n".join(stderr_lines) if stderr_lines else "(no stderr captured)"
@@ -3247,6 +3353,8 @@ class ClaudeSDKExecutor(Executor):
                 else _usage_from_observed_call(last_call_usage, observed_model or model),
             )
             return
+        finally:
+            self._pending_framework_context.pop(session_key, None)
         # A turn can end without ``ResultMessage`` usage — the CLI can close
         # the stream early, fail terminally (auth failure, rejected retries),
         # or be cut short before its final usage is reported. In all of those
@@ -3433,6 +3541,19 @@ class ClaudeSDKExecutor(Executor):
         trailing: list[Message] = []
         for msg in reversed(messages):
             if msg.get("role") == "user":
+                content = msg.get("content")
+                if content == "/compact" or (
+                    isinstance(content, list)
+                    and len(content) == 1
+                    and isinstance(content[0], dict)
+                    and content[0].get("type") in {"text", "input_text"}
+                    and content[0].get("text") == "/compact"
+                ):
+                    # The runner dispatches earlier input before a compact control.
+                    # Compaction may emit no assistant text; keep it out of later prompts.
+                    if not trailing:
+                        return "/compact"
+                    break
                 trailing.append(msg)
             else:
                 break

@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { extractAssistantText, fetchLastAssistantText, previewText } from "./lastAssistantText";
+import {
+  extractAssistantText,
+  extractErrorText,
+  fetchLastAssistantText,
+  latestOutputPreview,
+  previewText,
+} from "./lastAssistantText";
 
 describe("extractAssistantText", () => {
   it("joins output_text blocks from an assistant message", () => {
@@ -37,6 +43,51 @@ describe("extractAssistantText", () => {
     expect(extractAssistantText(undefined)).toBeUndefined();
     expect(extractAssistantText("nope")).toBeUndefined();
     expect(extractAssistantText({ type: "message", role: "assistant" })).toBeUndefined();
+  });
+});
+
+describe("extractErrorText", () => {
+  it("prefers the classified title over the raw message", () => {
+    const item = { type: "error", title: "Rate limited", message: "429 Too Many Requests" };
+    expect(extractErrorText(item)).toBe("Rate limited");
+  });
+
+  it("falls back to the raw message", () => {
+    expect(extractErrorText({ type: "error", message: " boom " })).toBe("boom");
+  });
+
+  it("ignores info-level notices and non-error items", () => {
+    // An info notice renders as a neutral pill; it doesn't mean the turn failed.
+    expect(extractErrorText({ type: "error", level: "info", message: "fyi" })).toBeUndefined();
+    expect(extractErrorText({ type: "message", role: "assistant" })).toBeUndefined();
+    expect(extractErrorText(null)).toBeUndefined();
+  });
+});
+
+describe("latestOutputPreview", () => {
+  const reply = (text: string) => ({
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text }],
+  });
+
+  it("returns the newest assistant reply, stepping past trailing tool items", () => {
+    const items = [
+      reply("First answer."),
+      { type: "message", role: "user", content: [{ type: "input_text", text: "more" }] },
+      reply("Second answer."),
+      { type: "function_call_output", output: "tool result" },
+    ];
+    expect(latestOutputPreview(items)).toBe("Second answer.");
+  });
+
+  it("surfaces a failed turn's error when it is newer than the last reply", () => {
+    const items = [reply("Earlier answer."), { type: "error", message: "Model overloaded" }];
+    expect(latestOutputPreview(items)).toBe("Model overloaded");
+  });
+
+  it("returns undefined when nothing carries output text", () => {
+    expect(latestOutputPreview([{ type: "function_call", name: "edit" }])).toBeUndefined();
   });
 });
 
@@ -105,5 +156,17 @@ describe("fetchLastAssistantText", () => {
   it("returns undefined when fetch throws", async () => {
     fetchMock.mockRejectedValue(new Error("network"));
     expect(await fetchLastAssistantText("conv_a")).toBeUndefined();
+  });
+
+  it("prefixes the items endpoint with the configured base path", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    try {
+      fetchMock.mockResolvedValue(okResponse([]));
+      await fetchLastAssistantText("conv_a");
+      const url = fetchMock.mock.calls[0][0] as string;
+      expect(url).toContain("/proxy/6767/v1/sessions/conv_a/items");
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
   });
 });

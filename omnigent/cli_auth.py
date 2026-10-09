@@ -33,10 +33,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent.process_logging import data_dir
 from omnigent.util.server_url import is_workspace_hosted_url
 
 if TYPE_CHECKING:
     import httpx
+
+    from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
 _logger = logging.getLogger(__name__)
 _TOKEN_FILE_NAME = "auth_tokens.json"
@@ -58,9 +61,7 @@ def _token_file_path() -> Path:
 
     :returns: Path to ``<data-dir>/auth_tokens.json``.
     """
-    from omnigent_ui_sdk.terminal._config import state_dir
-
-    return Path(state_dir()) / _TOKEN_FILE_NAME
+    return data_dir() / _TOKEN_FILE_NAME
 
 
 def _normalize_server_url(server_url: str) -> str:
@@ -680,6 +681,10 @@ def databricks_request_headers(
     Both values are omitted when absent, so single-workspace and
     local-unauthenticated callers get ``{}`` and are unaffected.
 
+    Also folds in this machine's telemetry installation ID (omitted when
+    telemetry is opted out of), so a server-side emitter can attribute an event
+    to the machine that produced it without a lookup.
+
     Also folds in any opaque dev/test headers from
     :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR` (request-routing selectors set by
     some Databricks deployments) so every chokepoint that builds headers through
@@ -701,10 +706,15 @@ def databricks_request_headers(
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
     :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
-        ``X-Databricks-Omnigent-Slice-Key``, and/or the configured extra headers
-        as available, possibly empty.
+        ``X-Databricks-Omnigent-Slice-Key``, ``X-Omnigent-Installation-Id``,
+        and/or the configured extra headers as available, possibly empty.
     """
-    headers: dict[str, str] = {}
+    from omnigent.telemetry.request_headers import telemetry_request_headers
+
+    # This machine's installation ID, so a server-side telemetry emitter can
+    # name the machine an event came from without a lookup. Empty when
+    # telemetry is opted out of.
+    headers: dict[str, str] = telemetry_request_headers()
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
     org_id = org_id or load_databricks_org_id(server_url)
@@ -772,6 +782,7 @@ def open_server_client(
     follow_redirects: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
     host_id: str | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> httpx.AsyncClient:
     """Open an :class:`httpx.AsyncClient` to an Omnigent server, keyed for routing.
 
@@ -824,6 +835,18 @@ def open_server_client(
         kwargs["timeout"] = timeout
     if transport is not None:
         kwargs["transport"] = transport
+    if event_dispatcher is not None:
+        from omnigent.runner.transports.ws_tunnel.event_delivery import TunnelEventClient
+
+        return TunnelEventClient(
+            event_dispatcher=event_dispatcher,
+            base_url=server_url,
+            headers=pinned,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            trust_env=not is_loopback_url(server_url),
+            **kwargs,
+        )
     return httpx.AsyncClient(
         base_url=server_url,
         headers=pinned,

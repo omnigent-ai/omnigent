@@ -44,15 +44,18 @@ class LoadSkillTool(Tool):
             the agent spec.
         """
         all_skills = list(skills)
-        # Discover host-scope skills. Use agent_root when provided,
-        # but fall back to cwd — in production the server process
-        # runs from the user's project, so cwd finds .claude/skills/
-        # even when agent_root is a cache dir.
-        discovery_root = agent_root or Path.cwd()
         from omnigent.spec.parser import discover_host_skills
 
+        try:
+            discovery_root = agent_root or Path.cwd()
+        except OSError:
+            # A runner can outlive its working directory; bundled skills still work.
+            host_skills = []
+        else:
+            host_skills = discover_host_skills(discovery_root, skills_filter)
+
         bundled_names = {s.name for s in skills}
-        for hs in discover_host_skills(discovery_root, skills_filter):
+        for hs in host_skills:
             if hs.name not in bundled_names:
                 all_skills.append(hs)
         self._skills = all_skills
@@ -234,21 +237,35 @@ def _has_plugin_provenance(skill: SkillSpec, plugin: str) -> bool:
     )
 
 
+def _label_alias(skill: SkillSpec) -> str:
+    """
+    The name a skill had before directory-name invocation.
+
+    :param skill: Skill with a frontmatter label, e.g. ``plugin:review``
+        labelled ``code-review``.
+    :returns: The label, keeping any namespace, e.g. ``"plugin:code-review"``.
+    """
+    namespace, sep, _ = skill.name.rpartition(":")
+    return f"{namespace}{sep}{skill.display_name}"
+
+
 def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
     """
     Return the skill with the requested name, accepting namespace aliases.
 
-    An exact match always wins. When none exists, plugin-namespace aliases
-    are tried: the same installed plugin skill is surfaced as
-    ``<plugin>:<skill>`` by claude-family discovery but as the bare
+    An exact match always wins. Otherwise two kinds of alias are tried, and
+    a name that more than one skill answers to stays unresolved rather than
+    guessing. A frontmatter label is an alias, so a name from an older
+    server (``code-review`` for directory ``review``) still works. Plugin
+    namespaces are aliases too: the same installed plugin skill is surfaced
+    as ``<plugin>:<skill>`` by claude-family discovery but as the bare
     ``<skill>`` by codex-family discovery, so a name carried from one
     context into the other would otherwise fail to resolve. A namespaced
     request falls back to the bare skill name only when that skill's
     on-disk provenance shows it belongs to the named plugin (so
     ``pluginb:deploy`` cannot hijack an unrelated ``deploy``); a bare
     request falls back to a namespaced entry only when exactly one plugin
-    exposes that skill (an ambiguous bare name stays unresolved rather
-    than guessing).
+    exposes that skill.
 
     :param skills: Discovered skills for an agent (bundled + host),
         e.g. the merged list from :attr:`LoadSkillTool.skills`.
@@ -260,16 +277,17 @@ def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
     for skill in skills:
         if skill.name == name:
             return skill
+    # Older servers name a skill by its frontmatter label.
+    aliases = [s for s in skills if s.display_name is not None and _label_alias(s) == name]
     if ":" in name:
         plugin, bare = name.split(":", 1)
-        for skill in skills:
-            if skill.name == bare and _has_plugin_provenance(skill, plugin):
-                return skill
-        return None
-    namespaced = [s for s in skills if ":" in s.name and s.name.split(":", 1)[1] == name]
-    if len(namespaced) == 1:
-        return namespaced[0]
-    return None
+        provenanced = [s for s in skills if s.name == bare and _has_plugin_provenance(s, plugin)]
+        aliases += provenanced[:1]
+    else:
+        aliases += [s for s in skills if ":" in s.name and s.name.split(":", 1)[1] == name]
+    # One skill reachable through both alias kinds is still a single match.
+    matches = list({id(s): s for s in aliases}.values())
+    return matches[0] if len(matches) == 1 else None
 
 
 def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:

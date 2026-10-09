@@ -220,9 +220,8 @@ OMNIGENT_OIDC_ALLOWED_DOMAINS=example.com,subsidiary.example.com
 
 ### Generic OIDC (Okta, Auth0, Keycloak, Entra ID)
 
-Any IdP that publishes `/.well-known/openid-configuration` works.
-Set `OMNIGENT_OIDC_ISSUER` to the base URL; the server fetches
-discovery at startup.
+For standard discovery, set `OMNIGENT_OIDC_ISSUER` to your provider's issuer;
+the server fetches `/.well-known/openid-configuration` at startup.
 
 ```bash
 OMNIGENT_AUTH_PROVIDER=oidc
@@ -232,6 +231,62 @@ OMNIGENT_OIDC_CLIENT_SECRET=…
 OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
 OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
 ```
+
+#### Public PKCE clients and explicit endpoints
+
+For an IdP application registered as a **public client**, set
+`OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none` and **unset**
+`OMNIGENT_OIDC_CLIENT_SECRET`. Omnigent still sends its client ID, redirect URI,
+and PKCE verifier, but omits the client-secret field entirely. This is an
+explicit opt-in: the default `client_secret_post` continues to require a secret,
+including for GitHub login. PKCE S256 is used in both modes.
+
+If discovery is unavailable or advertises endpoints unsuitable for your
+deployment, configure **all three** endpoint overrides:
+
+```dotenv
+OMNIGENT_OIDC_ISSUER=https://identity.example.com
+OMNIGENT_OIDC_CLIENT_ID=omnigent
+OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none
+OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT=https://login.example.com/authorize
+OMNIGENT_OIDC_TOKEN_ENDPOINT=https://tokens.example.com/token
+OMNIGENT_OIDC_JWKS_URI=https://keys.example.com/jwks
+OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
+OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
+```
+
+With all three overrides, discovery is skipped. Partial overrides fail at
+startup rather than mixing endpoint sources. Leave all three unset to retain
+discovery. Overrides also work with confidential clients; public-client mode
+also works with discovery. Overrides do not apply to GitHub's special OAuth
+login flow.
+
+Authorization URL query parameters (for example, `?p=policy`) are preserved.
+Omnigent-generated OAuth parameters take precedence on name collisions.
+
+Only trusted operators should configure these addresses: the token endpoint
+receives authorization codes and, for confidential clients, the client secret;
+the JWKS endpoint determines which signing keys are trusted. Overrides must
+use HTTPS without embedded credentials or fragments. HTTP is allowed only for
+`localhost`, `127.0.0.1`, or `[::1]` for local testing. Endpoint hosts may differ
+from the issuer, but the token's issuer must still match
+`OMNIGENT_OIDC_ISSUER` exactly, and its audience must match the client ID.
+
+PS256-signed identity tokens are supported alongside the existing RSA and EC
+algorithms. These options do not disable signature, expiration, email
+verification, admission, or reauthentication checks. They configure **Omnigent
+login**, not upstream MCP credentials or shared-session credential ownership.
+
+When migrating from a custom integration that inferred public-client mode from
+an absent secret, explicitly add `OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none`.
+If your trusted enterprise directory omits `email_verified`, the existing
+`OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1` remains a separate operator choice;
+these compatibility options never enable it automatically.
+
+To verify a deployment, restart with the settings above, sign in from a private
+browser window, then run `omnigent login <server-url>` and finish the browser
+flow. Confirm both identify the expected account. The identity provider must
+enforce PKCE and one-time authorization codes; Omnigent supplies the verifier.
 
 ### HTTPS for the callback URL
 
@@ -260,6 +315,41 @@ accept over HTTPS. Three options:
    `omnigent:8000` over the docker network (or `127.0.0.1:8000`
    from the host). Examples: AWS ALB with ACM cert, Cloudflare in
    "Full" SSL mode, Fly.io / Cloud Run / Render platform certs.
+
+## Serving under a subpath (`OMNIGENT_WEB_BASE_PATH`)
+
+By default the Web UI is served from the origin root (`/`). To serve it
+under a path prefix instead — e.g. behind code-server's port proxy at
+`https://<host>/proxy/6767/`, or an nginx/Traefik `location /omnigent/`
+block — set the base path:
+
+```bash
+OMNIGENT_WEB_BASE_PATH=/proxy/6767 omnigent server
+# or, equivalently:
+omnigent server --base-path /proxy/6767
+```
+
+The Web UI then prefixes its API, SSE, WebSocket, and asset URLs with that
+path, and the server accepts requests **whether or not** the proxy forwards
+the prefix. That covers both code-server modes from one value:
+
+- **`/proxy/<port>/`** strips the prefix before forwarding — the server sees
+  `/v1/...` and serves it.
+- **`/absproxy/<port>/`** (and plain non-rewriting proxies) forward the full
+  `/proxy/6767/v1/...` — the server strips the configured prefix before
+  routing.
+
+Notes:
+
+- Leading slash, no trailing slash (`/proxy/6767`). Empty/unset = root
+  deployment (unchanged).
+- The root deployment (`http://localhost:6767/`) is unaffected.
+- For accounts login behind a subpath, also set `OMNIGENT_ACCOUNTS_BASE_URL`
+  to the full public URL including the prefix (e.g.
+  `https://<host>/proxy/6767`) so login/invite redirects and cookies resolve
+  correctly. For OIDC login, set `OMNIGENT_OIDC_REDIRECT_URI` to the full
+  public callback URL including the prefix (e.g.
+  `https://<host>/proxy/6767/auth/callback`).
 
 ## Header-proxy mode (for deploys behind an existing SSO proxy)
 

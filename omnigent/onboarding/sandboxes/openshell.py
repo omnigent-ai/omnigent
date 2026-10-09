@@ -27,9 +27,8 @@ Notes that shape this launcher:
   protobufs, so the spec is built from the generated ``openshell._proto``
   module — the only path to a non-default image.
 - **No file-transfer RPC.** OpenShell exposes command execution but no
-  upload primitive, so :meth:`put` streams the file's bytes to ``cat``
-  over the exec channel's stdin — the same approach NVIDIA's own
-  LangChain backend uses.
+  upload primitive, so :meth:`put` sends a snapshot of the file to ``cat``
+  in bounded exec stdin chunks to stay under the gateway's message cap.
 - **No local port forwarding.** OpenShell has no local→sandbox port
   forward for the in-sandbox App OAuth callback, so the CLI skips that
   auth step automatically (``supports_local_port_forward = False``).
@@ -43,13 +42,14 @@ import shlex
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, ClassVar, TypeVar
+from typing import TYPE_CHECKING, ClassVar, TypeVar, cast
 
 import click
 
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
+    SandboxGoneError,
     SandboxLauncher,
     foreground_kill_command,
     foreground_pidfile,
@@ -84,6 +84,10 @@ WORKSPACE_ENV_VAR: str = "OMNIGENT_OPENSHELL_WORKSPACE"
 operations (create, get, delete, wait_ready). Defaults to ``"default"``."""
 
 _DEFAULT_WORKSPACE: str = "default"
+
+# Upload chunk size. The gateway rejects a gRPC message whose decoded size
+# exceeds 1 MiB; stay well under it to leave room for framing overhead.
+_PUT_CHUNK_BYTES = 512 * 1024
 
 _READY_TIMEOUT_S = 300
 _EXEC_TIMEOUT_S = 300
@@ -318,10 +322,12 @@ class _OpenShellClient:
         self._guard(
             f"Could not resume OpenShell sandbox '{name}'",
             lambda: start(name, workspace=ws),
+            gone_on_not_found=True,
         )
         ready = self._guard(
             f"OpenShell sandbox '{name}' did not become ready after resume",
             lambda: self._client.wait_ready(name, workspace=ws, timeout_seconds=_READY_TIMEOUT_S),
+            gone_on_not_found=True,
         )
         # The resumed instance may carry a fresh opaque id; recache it so
         # subsequent execs reach the live instance.
@@ -371,7 +377,13 @@ class _OpenShellClient:
             self._ids[name] = cached
         return cached
 
-    def _guard(self, message: str, call: Callable[[], _T]) -> _T:
+    def _guard(
+        self,
+        message: str,
+        call: Callable[[], _T],
+        *,
+        gone_on_not_found: bool = False,
+    ) -> _T:
         """Run an SDK *call*, surfacing gRPC / SandboxError as ClickException."""
         import grpc
         from openshell import SandboxError
@@ -379,6 +391,13 @@ class _OpenShellClient:
         try:
             return call()
         except (grpc.RpcError, SandboxError) as exc:
+            not_found = (
+                isinstance(exc, grpc.Call) and exc.code() == grpc.StatusCode.NOT_FOUND
+            ) or (isinstance(exc, SandboxError) and "not found" in str(exc).lower())
+            if gone_on_not_found and not_found:
+                raise SandboxGoneError(f"{message}: sandbox no longer exists") from cast(
+                    BaseException, exc
+                )
             raise click.ClickException(f"{message}: {exc}") from exc
 
 
@@ -501,20 +520,29 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         return RemoteCommandResult(returncode=0, stdout="launched\n", stderr="")
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
-        """Copy a local file into the sandbox by piping its bytes to ``cat``."""
+        """Copy a local file into the sandbox by piping its bytes to ``cat``.
+
+        Snapshot before sending: another bootstrap may rebuild the source.
+        Each exec's stdin is one gRPC message, capped at 1 MiB by the gateway.
+        The first chunk truncates the destination; later chunks append. Empty
+        files still make one request, and retrying the whole upload starts clean.
+        """
         content = local_path.read_bytes()
         parent = shlex.quote(str(PurePosixPath(remote_path).parent))
         dest = shlex.quote(remote_path)
-        result = self._openshell().execute(
-            sandbox_id,
-            ["bash", "-c", f"mkdir -p {parent} && cat > {dest}"],
-            stdin=content,
-        )
-        if result.exit_code != 0:
-            raise click.ClickException(
-                f"File upload to OpenShell sandbox '{sandbox_id}' failed "
-                f"(exit {result.exit_code}): {result.stderr.strip()}"
+        client = self._openshell()
+        for offset in range(0, max(len(content), 1), _PUT_CHUNK_BYTES):
+            redirect = ">" if offset == 0 else ">>"
+            result = client.execute(
+                sandbox_id,
+                ["bash", "-c", f"mkdir -p {parent} && cat {redirect} {dest}"],
+                stdin=content[offset : offset + _PUT_CHUNK_BYTES],
             )
+            if result.exit_code != 0:
+                raise click.ClickException(
+                    f"File upload to OpenShell sandbox '{sandbox_id}' failed "
+                    f"(exit {result.exit_code}): {result.stderr.strip()}"
+                )
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """

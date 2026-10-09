@@ -781,6 +781,28 @@ async def test_task_name_is_capped_at_parse_time() -> None:
     assert len(req.task_name) == 200
 
 
+def test_task_description_is_parsed_and_capped() -> None:
+    """The spawn's human label is agent-authored, so it is bounded like ``task_name``."""
+    parsed = SubagentRouteRequest.from_payload(
+        {"harness": "claude-native", "task_description": "  Research auth flows\n"}
+    )
+    assert parsed.task_description == "Research auth flows"
+    capped = SubagentRouteRequest.from_payload(
+        {"harness": "claude-native", "task_description": "x" * 5000}
+    )
+    assert capped.task_description is not None
+    assert len(capped.task_description) == 200
+    assert SubagentRouteRequest.from_payload({"harness": "codex"}).task_description is None
+
+
+@pytest.mark.parametrize("description", ["", " \t\n", None, 7])
+def test_invalid_task_description_keeps_the_unlabeled_fallback(description: Any) -> None:
+    req = SubagentRouteRequest.from_payload(
+        {"harness": "claude-native", "task_description": description}
+    )
+    assert req.task_description is None
+
+
 # ── Decision persistence ────────────────────────────────────────────
 
 
@@ -982,13 +1004,17 @@ async def test_server_relay_resolver_forwards_and_parses() -> None:
             return _Resp()
 
     resolver = make_server_relay_resolver(_Client())
-    decision = await resolver("conv_1", _request(requested_model=GLM_SERVABLE))
+    decision = await resolver(
+        "conv_1",
+        _request(requested_model=GLM_SERVABLE, task_description="Review auth.py"),
+    )
     assert posted[0][0] == "/v1/sessions/conv_1/hooks/route-subagent"
     assert posted[0][1]["harness"] == "claude-native"
     # Every routing input survives the hop — dropping one here silently
     # changes the server's verdict (requested_model was once lost this way).
     assert posted[0][1]["requested_model"] == GLM_SERVABLE
     assert posted[0][1]["prompt"] == "review the diff"
+    assert posted[0][1]["task_description"] == "Review auth.py"
     assert decision.action == "redirect"
     assert decision.harness == "codex-native"
     assert decision.decision_id == "dec_9"
@@ -1443,3 +1469,15 @@ def test_decision_record_copies_the_router_source() -> None:
     # A fail-open allow routed nothing, so it names no source.
     unrouted = SubagentRouteDecision(action="allow", rationale="Routing unavailable")
     assert decision_record(req, unrouted).router_source is None
+
+
+def test_decision_record_names_the_task_it_governed() -> None:
+    """The persisted item carries the spawn's label, so a fan-out's chips
+    can each be tied to the sub-agent/task their decision governed."""
+    decision = SubagentRouteDecision(
+        action="rewrite", rationale="deep reasoning", model=CLAUDE_MODEL
+    )
+    record = decision_record(_request(task_description="Implement token refresh"), decision)
+    assert record.task_description == "Implement token refresh"
+    # A spawn that carried no label records none.
+    assert decision_record(_request(), decision).task_description is None

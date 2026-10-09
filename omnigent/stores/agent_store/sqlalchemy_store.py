@@ -23,7 +23,19 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Agent, PagedList
+from omnigent.errors import StaleCursorError
 from omnigent.stores.agent_store import AgentStore
+
+# ponytail: fixed read cap per "my agents" call. A user with more fork/switch
+# copies than this newer than an original sees that original only on a later
+# page; upgrade path is a column marking copies.
+_USER_AGENT_READ_CAP = 50
+
+
+def _is_original(row: SqlAgent) -> bool:
+    """Whether the row's bundle is stored under its own id (not a fork/switch copy)."""
+    location = row.bundle_location
+    return location.startswith((f"{row.id}/", f"ag_{row.id}/"))
 
 
 class SqlAlchemyAgentStore(AgentStore):
@@ -86,16 +98,18 @@ class SqlAlchemyAgentStore(AgentStore):
         and grants on the root's ACL — so any conversation in the tree
         authorizes identically.
 
-        That is what makes this a single bounded query. Named ``sys_session_send``
-        children are created bound to the *same* ``agent_id`` as their mint, so
-        several conversation rows can share it — but they all carry the SAME
-        ``root_conversation_id`` (children inherit their parent's root, and the
-        mint's own root when it is itself a child). So selecting the root from
-        *any one* of them (an unordered ``LIMIT 1``) is unambiguous and O(1):
-        there is no "wrong row" to return. It also sidesteps read-replica lag —
-        the root is the oldest node in the tree, never a just-written child that
-        a replica has not caught up to. ``conversations`` lives on the AP DB, so
-        this runs on the conversation engine.
+        A single bounded query: an unordered ``LIMIT 1``. Named
+        ``sys_session_send`` children share their tree's root, but forks of the
+        owner's sessions share the agent row too, so several roots can use it and
+        this returns any one of them. ``validate_session_agent`` therefore accepts
+        READ on any root using the agent (``list_session_roots_for_agent``).
+        ``conversations`` lives on the AP DB, so this runs on the conversation
+        engine.
+
+        This lookup is NOT used to authorize agent-code mutation: a legacy
+        (``created_by`` NULL) agent may be referenced by several unrelated roots
+        after reuse, so agent mutation gates on ``created_by`` and admin status
+        only (see ``require_agent_owner``), never on this reverse lookup.
 
         :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
         :returns: The agent's spawn-tree root conversation id, or ``None`` when
@@ -139,7 +153,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 select(SqlAgent.id).where(
                     SqlAgent.workspace_id == current_workspace_id(),
                     SqlAgent.name == name,
-                    SqlAgent.kind == encode_agent_kind("template"),
+                    SqlAgent.kind == encode_agent_kind("server"),
                 )
             ).first()
             if conflict is not None:
@@ -154,7 +168,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 name=name,
                 bundle_location=bundle_location,
                 version=1,
-                kind=encode_agent_kind("template"),
+                kind=encode_agent_kind("server"),
                 description=description,
             )
             session.add(row)
@@ -178,7 +192,7 @@ class SqlAlchemyAgentStore(AgentStore):
         # from the forward pointer so callers can use agent.session_id.
         # Runs outside the Omnigent session: the lookup targets the AP DB.
         session_id: str | None = None
-        if row.kind == encode_agent_kind("session"):
+        if row.kind == encode_agent_kind("user"):
             session_id = self._session_id_for_agent(agent_id)
         return sql_agent_to_entity(row, session_id=session_id)
 
@@ -198,7 +212,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 select(SqlAgent).where(
                     SqlAgent.workspace_id == current_workspace_id(),
                     SqlAgent.name == name,
-                    SqlAgent.kind == encode_agent_kind("template"),
+                    SqlAgent.kind == encode_agent_kind("server"),
                 )
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
@@ -211,10 +225,10 @@ class SqlAlchemyAgentStore(AgentStore):
         order: str = "desc",
     ) -> PagedList[Agent]:
         """
-        List registered template agents with cursor-based pagination.
+        List server agents with cursor-based pagination.
 
-        Only agents with ``kind = 'template'`` are returned; session-scoped
-        copies are excluded.
+        Only server agents (``kind`` server, no owner) are returned, so the walk
+        seeks ``ix_agents_kind_owner_created``; user agents are excluded.
 
         :param limit: Maximum number of agents to return.
         :param after: Cursor agent ID; return agents appearing
@@ -228,7 +242,11 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session("list_agents") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            is_template = SqlAgent.kind == encode_agent_kind("template")
+            # Server agents never have an owner; fixing created_by lets the walk use
+            # ix_agents_kind_owner_created in created_at order.
+            is_template = and_(
+                SqlAgent.kind == encode_agent_kind("server"), SqlAgent.created_by.is_(None)
+            )
             in_workspace = SqlAgent.workspace_id == current_workspace_id()
             stmt = select(SqlAgent).where(in_workspace, is_template)
             if after:
@@ -239,7 +257,9 @@ class SqlAlchemyAgentStore(AgentStore):
                 )
                 ts_cmp = SqlAgent.created_at < sub if is_desc else SqlAgent.created_at > sub
                 id_cmp = SqlAgent.id < after if is_desc else SqlAgent.id > after
-                stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
+                # The non-strict bound makes the index seek start at the cursor.
+                bound = SqlAgent.created_at <= sub if is_desc else SqlAgent.created_at >= sub
+                stmt = stmt.where(bound, or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
             if before:
                 sub = (
                     select(SqlAgent.created_at)
@@ -248,7 +268,8 @@ class SqlAlchemyAgentStore(AgentStore):
                 )
                 ts_cmp = SqlAgent.created_at > sub if is_desc else SqlAgent.created_at < sub
                 id_cmp = SqlAgent.id > before if is_desc else SqlAgent.id < before
-                stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
+                bound = SqlAgent.created_at >= sub if is_desc else SqlAgent.created_at <= sub
+                stmt = stmt.where(bound, or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
             stmt = stmt.order_by(sort_fn(SqlAgent.created_at), sort_fn(SqlAgent.id)).limit(
                 limit + 1
             )
@@ -291,6 +312,7 @@ class SqlAlchemyAgentStore(AgentStore):
         self,
         agent_id: str,
         bundle_location: str,
+        created_by: str | None = None,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump version, and set
@@ -300,6 +322,10 @@ class SqlAlchemyAgentStore(AgentStore):
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param created_by: When set, records the owner only if the row
+            is a user agent without one (claim-on-write). Heals
+            pre-migration session-scoped rows on their first authorized
+            mutation; ``None`` leaves any existing owner untouched.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
@@ -312,6 +338,11 @@ class SqlAlchemyAgentStore(AgentStore):
             row.bundle_location = bundle_location
             row.version = row.version + 1
             row.updated_at = updated_at
+            # Claim-on-write: only fill an empty owner, never overwrite one. Server
+            # agents never get one (their listing requires created_by IS NULL).
+            is_user = row.kind == encode_agent_kind("user")
+            if created_by is not None and row.created_by is None and is_user:
+                row.created_by = created_by
             session.flush()
             return row
 
@@ -320,7 +351,7 @@ class SqlAlchemyAgentStore(AgentStore):
             return None
         # Reverse lookup targets the AP DB — see _session_id_for_agent.
         session_id: str | None = None
-        if row.kind == encode_agent_kind("session"):
+        if row.kind == encode_agent_kind("user"):
             session_id = self._session_id_for_agent(agent_id)
         return sql_agent_to_entity(row, session_id=session_id)
 
@@ -342,3 +373,103 @@ class SqlAlchemyAgentStore(AgentStore):
             return True
 
         return run_write_transaction(self._session_immediate, "delete_agent", write)
+
+    @property
+    def supports_user_agents(self) -> bool:
+        """User agents are stored as ``kind = user`` rows owned via ``created_by``."""
+        return True
+
+    def create_user_agent(
+        self,
+        agent_id: str,
+        name: str,
+        bundle_location: str,
+        owner: str | None,
+        description: str | None = None,
+    ) -> Agent:
+        """
+        Insert a user agent owned by *owner*.
+
+        :param agent_id: Id for the new row, e.g. ``"0f1a2b3c..."``.
+        :param name: Agent name, e.g. ``"orion"``.
+        :param bundle_location: Artifact key, ``"<agent_id>/<sha256>"``.
+        :param owner: Owning user id, or ``None`` on an auth-less server.
+        :param description: Optional description.
+        :returns: The created :class:`Agent`.
+        :raises IntegrityError: When a row with *agent_id* already exists.
+        """
+        created_at = now_epoch()
+
+        def write(session: Session) -> Agent:
+            row = SqlAgent(
+                id=agent_id,
+                created_at=created_at,
+                name=name,
+                bundle_location=bundle_location,
+                version=1,
+                kind=encode_agent_kind("user"),
+                description=description,
+                created_by=owner,
+            )
+            session.add(row)
+            return sql_agent_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "create_user_agent", write)
+
+    def list_user_agents(
+        self,
+        owner: str | None,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> PagedList[Agent]:
+        """
+        List *owner*'s own agents, newest first (see :meth:`AgentStore.list_user_agents`).
+
+        One keyset seek on ``ix_agents_kind_owner_created`` reading at most
+        ``_USER_AGENT_READ_CAP`` rows.
+
+        :param owner: Owning user id, or ``None`` on an auth-less server.
+        :param limit: Maximum agents to return, e.g. ``50``.
+        :param after: ``last_id`` of the previous page.
+        :returns: The page; ``last_id`` is the last row read.
+        :raises StaleCursorError: When the *after* row no longer exists.
+        """
+        mine = (
+            SqlAgent.workspace_id == current_workspace_id(),
+            SqlAgent.kind == encode_agent_kind("user"),
+            SqlAgent.created_by == owner,
+        )
+        with self._session("list_user_agents") as session:
+            stmt = select(SqlAgent).where(*mine)
+            if after:
+                cursor_at = session.execute(
+                    select(SqlAgent.created_at).where(*mine, SqlAgent.id == after)
+                ).scalar_one_or_none()
+                if cursor_at is None:
+                    raise StaleCursorError(after)
+                # The non-strict bound makes the index seek start at the cursor.
+                stmt = stmt.where(
+                    SqlAgent.created_at <= cursor_at,
+                    or_(
+                        SqlAgent.created_at < cursor_at,
+                        and_(SqlAgent.created_at == cursor_at, SqlAgent.id < after),
+                    ),
+                )
+            stmt = stmt.order_by(desc(SqlAgent.created_at), desc(SqlAgent.id))
+            rows = list(session.execute(stmt.limit(_USER_AGENT_READ_CAP + 1)).scalars())
+            read = rows[:_USER_AGENT_READ_CAP]
+            kept: builtins.list[Agent] = []
+            consumed = 0
+            for row in read:
+                if len(kept) >= limit:
+                    break
+                consumed += 1
+                if _is_original(row):
+                    kept.append(sql_agent_to_entity(row))
+            last_read = read[consumed - 1].id if consumed else None
+        return PagedList(
+            data=kept,
+            first_id=kept[0].id if kept else None,
+            last_id=last_read,
+            has_more=len(rows) > consumed,
+        )

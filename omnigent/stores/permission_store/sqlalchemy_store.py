@@ -17,6 +17,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
+from omnigent.db.account_authority import account_generation, require_active_account
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -29,6 +30,7 @@ from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
 )
+from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import PermissionStore
 
 # Sentinel rows excluded from list_users() — never real, actionable
@@ -105,6 +107,7 @@ def _to_account(row: SqlUser) -> Account:
         created_at=row.created_at,
         last_login_at=row.last_login_at,
         has_password=row.password_hash is not None,
+        account_generation=row.account_generation,
     )
 
 
@@ -148,7 +151,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             immediate=True,
         )
         # resolve_access cache (see _RESOLVE_ACCESS_CACHE_TTL_ENV). An LRU keyed
-        # (conversation_id, user_id) -> (expiry, access). conversation ids are
+        # (conversation_id, user_id, account_generation) -> (expiry, access). IDs are
         # globally unique, so grant/revoke can drop a whole session's entries —
         # including the shared __public__ grant, which affects every user of
         # that session — without depending on the ambient workspace context.
@@ -159,7 +162,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         self._resolve_cache_ttl_s = _resolve_access_cache_ttl_s()
         self._resolve_cache_max_entries = _resolve_access_cache_max_entries()
         self._resolve_cache: collections.OrderedDict[
-            tuple[str, str], tuple[float, ResolvedAccess]
+            tuple[str, str, str | None], tuple[float, ResolvedAccess]
         ] = collections.OrderedDict()
         self._resolve_cache_lock = threading.Lock()
         self._resolve_cache_clock: Callable[[], float] = time.monotonic
@@ -178,6 +181,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Upsert a permission grant. See base class for contract."""
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
@@ -279,6 +283,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """
 
         def write(session: Session) -> tuple[int, bool]:
+            require_active_account(session, to_user_id)
             # FK target: ensure the destination users.id row exists. Don't
             # downgrade an existing admin flag; only create it if missing.
             if session.get(SqlUser, (current_workspace_id(), to_user_id)) is None:
@@ -418,6 +423,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Upsert a user row. See base class for contract."""
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
             stmt: Insert
@@ -444,6 +450,18 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         run_write_transaction(self._session_immediate, "ensure_user", write)
 
+    def get_user(self, user_id: str) -> Account | None:
+        """Read the target identity without creating it. See base class."""
+        with self._session("read_target_account") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            return _to_account(row) if row is not None and row.deleted_at is None else None
+
+    def user_exists(self, user_id: str) -> bool:
+        """Check for a user row. See base class for contract."""
+        with self._session("select_user_exists") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            return row is not None and row.deleted_at is None
+
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session("list_users") as session:
@@ -456,18 +474,23 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 .scalars()
                 .all()
             )
-            return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
+            return [
+                _to_account(r)
+                for r in rows
+                if r.id not in _HIDDEN_LIST_USERS and r.deleted_at is None
+            ]
 
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""
         with self._session("select_user_admin_status") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
-            return row is not None and row.is_admin
+            return row is not None and row.deleted_at is None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user. See base class for contract."""
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             session.execute(
                 update(SqlUser)
                 .where(
@@ -497,7 +520,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return True
 
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
+        public_level = effective_public_level(public_grant.level if public_grant else None)
+        if public_level is not None and public_level >= required_level:
             return True
 
         return False
@@ -513,17 +537,21 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if self.is_admin(user_id):
             return LEVEL_OWNER
         grant = self.get(user_id, conversation_id)
-        if grant is not None:
-            return grant.level
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None:
-            return public_grant.level
-        return None
+        levels = [
+            level
+            for level in (
+                grant.level if grant is not None else None,
+                effective_public_level(public_grant.level if public_grant else None),
+            )
+            if level is not None
+        ]
+        return max(levels) if levels else None
 
     def _resolve_cache_lookup(self, conversation_id: str, user_id: str) -> ResolvedAccess | None:
         """Return a live cached resolve_access result, or ``None`` on miss/expiry."""
         now = self._resolve_cache_clock()
-        key = (conversation_id, user_id)
+        key = (conversation_id, user_id, account_generation(user_id))
         with self._resolve_cache_lock:
             entry = self._resolve_cache.get(key)
             if entry is None:
@@ -554,7 +582,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         be stored on top of the eviction it already performed. Enforces the LRU
         entry cap so the cache cannot grow without bound on a long-lived replica.
         """
-        key = (conversation_id, user_id)
+        key = (conversation_id, user_id, account_generation(user_id))
         expiry = self._resolve_cache_clock() + self._resolve_cache_ttl_s
         with self._resolve_cache_lock:
             if generation != self._resolve_cache_generation:
@@ -619,7 +647,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
             )
             access = ResolvedAccess(
-                is_admin=user_row is not None and user_row.is_admin,
+                is_admin=user_row is not None
+                and user_row.deleted_at is None
+                and user_row.is_admin,
                 user_grant_level=user_grant.level if user_grant is not None else None,
                 public_grant_level=public_grant.level if public_grant is not None else None,
             )

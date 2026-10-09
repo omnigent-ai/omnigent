@@ -51,7 +51,7 @@ adds native niceties:
   native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
   focused connected window through the SPA without reloading it. On macOS,
   **About Omnigent** opens a shell-owned modal showing the platform app and
-  detected CLI versions; the CLI section points users to `omni upgrade`.
+  detected CLI versions; the CLI section points users to `omni update`.
   **Check for Updates…** in
   the Server menu opens the same modal and starts a check. **Update now** in the
   shell update prompt opens the modal, hides the prompt, and starts the download;
@@ -126,6 +126,204 @@ Open another view with **Server → New Window** (`Cmd/Ctrl+N`). It clones the
 focused window's current URL onto a new window against the same server, so two
 conversations can be watched at once.
 
+## Databricks sign-in and embedded-auth rollback
+
+HTTPS Databricks workspace and account URLs use **system-browser OAuth** by
+default. Databricks Apps (`*.databricksapps.com`), localhost, and other servers
+keep their existing authentication behavior; the workspace session bridge is
+not used for them.
+
+The desktop completes browser sign-in and creates a DBAUTH cookie before loading
+the workspace. It renews the cookie before its known expiry and on cookie removal.
+If the workspace rejects the session, login requests are blocked while the shell
+tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
+and cancellation lead to the shell's connect/retry screen—not embedded workspace
+SSO. Failed connections stay blocked through the selector handoff so a late login
+redirect cannot replace it. Connect reuses stored credentials and opens the
+system browser only when they can't sign in. Credentials are stored per
+workspace, so an account URL that names its workspace (`?o=<workspace id>`)
+reuses the credentials of the workspace it reached last time; without `?o=` it
+runs the account sign-in and workspace picker. To use another account, choose
+**Server → Sign Out of Server** (or **Sign out of <workspace>** in the server
+picker at the bottom of the sidebar, on servers whose web app includes it): it
+forgets the stored OAuth token, clears DBAUTH, and returns every window on that
+workspace to the connect screen, so the next Connect signs in through the
+browser. Saved-server launches, additional windows, server switches, and deep
+links use stored credentials without opening a browser automatically.
+
+When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
+access list refusing this network, or HTTP 5xx/429), the window keeps its page
+under a **Reconnecting to Databricks…** overlay and retries every 5s for a minute,
+then every 10s for another. After that, an unreachable or IP-blocked workspace
+keeps retrying every minute until it answers; HTTP 5xx/429 stops there. Attempts
+wait while the Mac is offline without counting, and waking or unlocking the Mac
+starts the 5s retries over. Cancel, or running out of retries, returns to the
+setup page with the reason.
+
+For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:
+
+```bash
+# Quit Omnigent first, then set the preference and reopen it.
+defaults write ai.omnigent.desktop DatabricksBrowserAuthEnabled -bool false
+```
+
+This selects the entire legacy lifecycle: no browser OAuth, no OAuth-based cookie
+renewal, and the existing embedded login/return-banner behavior. It is not a
+fallback after a browser-auth failure. The preference is read once per process;
+restart the app after changing it. It does not delete saved credentials.
+
+To restore browser authentication, quit Omnigent and remove the override:
+
+```bash
+defaults delete ai.omnigent.desktop DatabricksBrowserAuthEnabled
+```
+
+An explicit `-bool true` also enables browser authentication. Unset defaults and
+non-macOS platforms use browser mode. Development Electron uses its own bundle's
+NSUserDefaults domain, not the packaged app's `ai.omnigent.desktop` domain.
+
+### Manual verification
+
+The classic Connect screen shows a spinner with **Connecting…**, then
+**Authenticating…** during browser OAuth. Its trailing **×** button cancels the
+window's current attempt, closes the local callback listener/picker, and stops
+pending authentication requests. The URL stays entered for retry; late responses
+cannot navigate the window. The external browser tab may remain open—Cancel does
+not sign you out of that browser. The experimental React selector is unchanged.
+
+You can exercise the classic button states, cancel, and retry without Databricks
+configuration:
+
+```bash
+node --test web/electron/test/setup_connect.test.js
+node --test --test-name-pattern='interactive OAuth cancellation' web/electron/test/databricks-oauth.test.js
+```
+
+- Run `just electron-dev`, use **Server → Change Server…**, and connect to an
+  OAuth-enabled Databricks test workspace. Complete system-browser sign-in and
+  confirm the desktop opens Omnigent. Terminal output must include
+  `databricks session: signed in to ...`; merely reaching a login page is not success.
+- Before completing browser sign-in, click the trailing **×** beside
+  **Authenticating…**. The form should immediately return to Connect with the
+  same URL. Retry once and confirm that an old attempt cannot change the new
+  attempt's loading state or navigate the window.
+- Under **Debug → Authentication**, use **Simulate Session Expiry** to
+  clear DBAUTH without forcing a page reload. The existing cookie lifecycle
+  handles normal recovery in the background; it must not display workspace/IdP
+  login or the return banner. Removal affects windows sharing that session.
+- **Simulate OAuth Token Expiry** only marks the focused workspace's cached
+  access token expired. It does not request a refresh or reload the page.
+- **Invalidate Cached Refresh Token** removes the refresh token from that
+  workspace's local cache. It leaves the access token intact, makes no request,
+  and does not revoke the grant at Databricks.
+- To exercise the sign-in-required path, invalidate the cached refresh token,
+  expire the access token, then simulate session expiry. The first two actions
+  do not force renewal; the last triggers normal recovery, which should return
+  to the shell's Connect screen because no usable OAuth grant remains locally.
+  Normal runtime renewal is unchanged. All three actions are dev-build-only;
+  token actions require a connected Databricks workspace in browser-auth mode.
+- Test unavailable OAuth and cancel the account workspace picker: the shell
+  should offer Connect/retry without loading embedded SSO.
+- Build with `just electron-build` and open the packaged app. Verify account-first
+  sign-in shows a working workspace picker. Apply the macOS rollback preference,
+  restart, and verify embedded sign-in works without opening the browser. Remove
+  the preference and restart to verify browser-only behavior returns.
+
+### Databricks authentication diagnostics
+
+Run `just electron-dev` from a terminal and retain the `[omnigent] databricks`
+lines. For a packaged build, launch the app's executable from a terminal to see
+its stdout/stderr. No extra logging flag is required.
+
+The logs identify the selected mode, public OAuth client ID, requested scopes,
+whether a client secret is configured (not its value), token-exchange status,
+account/workspace routing, bridge redirects, final response phase/status, and
+cookie counts. Backend error codes and request IDs are included when available.
+Tokens, cookie values, client secrets, authorization codes, PKCE verifiers, full
+callback URLs, and raw response bodies are not logged. Token and account-API
+requests never follow redirects, so a 3xx from those endpoints is reported as a
+failure rather than carrying the grant or bearer to another destination. Workspace and client IDs
+are still deployment metadata; redact those before sharing logs publicly.
+
+- `bridge response` with `phase: 'session-create'` means the status came from
+  `/auth/session/create` itself, before following a redirect.
+- `phase: 'workspace landing'` means the bridge redirected and the status came
+  from the destination page; it is not a rejection from the session-create endpoint.
+- For a direct `403 PERMISSION_DENIED`, give the request ID and custom client ID
+  to the Databricks platform owner to check the denial reason (client enablement,
+  token scope, or workspace permissions). Do not infer the cause from status alone.
+
+## OIDC sign-in through the system browser
+
+Omnigent servers that sign in with OIDC (`OMNIGENT_AUTH_PROVIDER=oidc`) open
+their identity provider in your **system browser**, not inside the app window.
+Google sign-in (which rejects embedded browsers), passkeys, password managers,
+and the browser's existing IdP session all work there.
+
+Before loading a server, the shell reads its unauthenticated
+`/.well-known/omnigent.json` manifest. Only `auth.mode: "oidc"` switches to
+browser sign-in:
+
+| Server                                                     | Sign-in                                         |
+| ---------------------------------------------------------- | ----------------------------------------------- |
+| OIDC                                                       | System browser (below)                          |
+| Accounts (username + password)                             | Unchanged: the server's own form, in the window |
+| Header mode, custom providers, no auth                     | Unchanged                                       |
+| No `auth` in the manifest (older servers, subpath proxies) | Unchanged: in the window                        |
+| Databricks workspaces, accounts, and Apps                  | Unchanged: detected by URL, manifest not read   |
+
+- **Connect** opens the browser at the server's `/auth/login` with an RFC 8252
+  loopback redirect (`http://127.0.0.1:<random port>/callback`) and a PKCE
+  challenge. After you sign in, the server sends the browser back to that
+  loopback with a one-time code, and the shell exchanges the code and its
+  verifier at `POST /auth/native-token`. The code only reaches this machine and
+  is useless without the verifier. The shell installs the returned session as
+  the server's own session cookie, confirms `/v1/me` accepts it, and brings the
+  window to the front. If the existing session is still valid, or the stored
+  refresh grant renews it, Connect doesn't open the browser at all.
+- **Launch, New Window, deep links, and server switches** reuse the session or
+  renew it silently from the refresh grant (`POST /oauth/token`). They never
+  open the browser. If nothing can renew it, the window returns to the connect
+  screen with the reason (session expired, ended by the server, sign-in
+  required).
+- **While connected,** the shell renews the cookie before it expires and when it
+  is removed. The web app's own redirect to `/auth/login` is stopped before it
+  can reach the IdP; the shell renews and reloads the page you were on.
+- **Sign out** (the web app's `/auth/logout`, **Server → Sign Out of Server**,
+  or **Sign out of <server>** in the sidebar server picker) is handled by the shell: it revokes the refresh
+  grant, clears the session cookie, and shows the connect screen for every
+  window on that server. Your browser stays signed in to the
+  IdP, so the next Connect may finish without a prompt.
+- **Cancel** (the × beside **Authenticating…**) stops the attempt and the
+  loopback listener. A browser tab that finishes later reaches nothing.
+
+The refresh grant is stored per server in `~/.omnigent/oidc_tokens.json`,
+encrypted with the OS keychain (`safeStorage`). Development builds also offer
+**Debug → Authentication → Simulate Session Expiry** (clears the session cookie;
+the lifecycle renews it) and **Invalidate Cached Refresh Token** for OIDC
+windows.
+
+### Manual verification
+
+Run an OIDC server (for example `deploy/docker` with Keycloak, or any IdP whose
+sign-in has a passkey step), then `just electron-dev`:
+
+1. **Server → Change Server…**, enter the server URL, and select **Connect**.
+   The setup page shows **Authenticating…**, your browser opens the IdP, and
+   after sign-in the browser tab says "Return to Omnigent". The app comes to the
+   front, signed in. The IdP page never appears inside the app.
+2. Select the × during **Authenticating…**: the form returns to Connect. Retry
+   works.
+3. Quit and relaunch: the app opens signed in without a browser.
+4. **Debug → Authentication → Simulate Session Expiry**: the app keeps working
+   (the cookie is renewed silently).
+5. **Invalidate Cached Refresh Token**, then **Simulate Session Expiry**, then
+   reload: the connect screen says "Sign in to <host> to continue."
+6. Sign out from the app's settings: the connect screen says "You're signed out
+   of <host>." Relaunching doesn't sign you back in.
+7. An accounts-mode server and `http://localhost:6767` (header mode) still sign
+   in exactly as before.
+
 ## Debugging a packaged macOS build
 
 Developer Tools are disabled by default in the production app. To opt in, quit
@@ -135,8 +333,9 @@ Omnigent, set its macOS user default, and reopen it:
 defaults write ai.omnigent.desktop DeveloperMode -bool true
 ```
 
-The **Debug → Developer Tools** menu is then available in the packaged app. To
-turn production debugging off again, quit Omnigent and remove the override:
+The packaged app then exposes **Debug → Authentication** session/token
+simulations and **Debug → Developer Tools**. To turn production debugging off
+again, quit Omnigent and remove the override:
 
 ```bash
 defaults delete ai.omnigent.desktop DeveloperMode
@@ -167,6 +366,9 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
+  src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
+  src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
+  src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
   setup/index.html         # the bundled "connect to server" setup page
   about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
@@ -273,6 +475,111 @@ sequenceDiagram
     S-->>A: result JSON (or clean timeout)
 ```
 
+### Manual previews with Companion
+
+To preview an app running on a remote development host (such as Arca), use
+Companion or another external forwarding tool to make its port available on
+your desktop machine. Companion is an external prerequisite for the Arca-to-Mac
+workflow; Omnigent does not establish or verify forwarding or resolve local
+port collisions.
+
+1. Ask the agent to start the app on the remote host and report its URL.
+2. Use Companion to forward the app's port to your Mac. Check the actual
+   forwarded address: the local port may differ from the remote port.
+3. In the Omnigent desktop app, open the session's Workspace **+** menu and
+   choose **Browser**. Type the forwarded URL, for example
+   `http://localhost:5273/`, in the address bar and press Enter. Here
+   `localhost` is the desktop machine, not the agent's remote host.
+4. Hide and reopen the Workspace, or switch tabs or sessions and return.
+   The existing page is retained without navigating or reloading it. Closing
+   the Browser tab destroys that view; opening a new tab does not restore it.
+
+If the page is unreachable, check that the app is still running and that the
+forwarded URL reaches the intended app in your Mac's regular browser. Check
+Companion's forwarding and local port selection separately. Normal TLS, CORS,
+authentication, and local-network permission rules still apply. This pane is
+desktop-only; it is not available in the plain web UI.
+
+For local or unrecognized hosts, `browser_navigate` keeps its restrictions on
+localhost and private addresses, even after you open a page manually.
+A manually opened page in the session's
+agent browser view remains available to existing agent inspection and
+interaction, including navigation caused by interacting with the page. Manual
+opening is therefore not a read-only boundary for that view. The user-created
+Browser tab opened through **+** > **Browser** is separate from the agent relay
+and is not targeted by the session's agent browser actions.
+
+### Agent previews on Arca
+
+On a Databricks-managed server with internal desktop features enabled, an
+Arca session's agent can open and inspect an app through Companion forwarding
+using the existing browser tools and tool approval or autoapproval policy.
+Provide the actual forwarded URL to the agent; its local port may differ from
+the app's remote port. Omnigent does not establish or verify forwarding or
+prove that the local endpoint belongs to the Arca host.
+
+The desktop captures the remote daemon's exact host ID during its existing
+Arca connect flow, including when the daemon is already running. Only a
+source session on that host, or a subagent inheriting that host, is eligible.
+An older CLI or an unrecognized, failed, or missing identity leaves localhost
+navigation denied; the remembered host-picker label alone does not grant it.
+Eligibility is scoped to the selected server/workspace, not all sessions on
+a Databricks server.
+
+After restarting the desktop, or if automatic connect fails, open **New
+session** > **Host** > **Reconnect to Arca** (or **Run on Arca** if the host
+is not remembered). Complete the existing connect console, then select your
+original session in the sidebar and retry the browser tool. Reconnecting can
+capture identity from an already-running daemon; it does not create a new
+session or change automatic-connect preferences. Failed or unrecognized
+capture keeps localhost denied, and the connect action remains available.
+
+The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
+redirects and links that would open a new window (which stay in the same pane).
+Other loopback addresses, private-network and metadata destinations, and
+non-web schemes remain restricted. Existing tool approvals are unchanged;
+whether a tool call asks for approval depends on the harness and its policy.
+
+### Local network permission
+
+Sites in the embedded pane can ask for **local network access**, including
+loopback services such as Okta Verify. A compact, Chrome-style popover beneath
+the browser toolbar names the requesting origin and offers three choices:
+
+- **Allow once** — for this site visit in this browser. Survives reloads and
+  same-origin navigation; expires on leaving the site or closing the pane.
+- **Always allow** — remembers this exact origin across all conversations and
+  app restarts.
+- **Deny** — blocks this permission for the origin across conversation browsers
+  and app restarts.
+
+Closing the popover, pressing Escape, or clicking outside dismisses the request
+without saving a decision. The UI is a bundled, sandboxed child window, not
+part of the visited page or server SPA; only its own main frame can submit a
+choice. Only the visible, active pane can open a new prompt. Existing **Allow
+once** and **Always allow** grants remain effective while the site is
+backgrounded, matching Chrome's permission behavior. HTTPS sites and HTTP
+loopback pages can request access; subframes cannot independently request it.
+
+Electron's permission-check API returns only allowed/denied, not Chrome's
+"prompt" state. For query-first sign-in flows, the popover includes a short
+reload hint and either allow button reloads the page to retry. If a background
+page already stopped its sign-in flow, bring its pane into view and reload.
+
+Saved choices live in `settings.json` under `browser_local_network_permissions`
+(origin → boolean). To reset a saved choice, quit the app, remove that origin's
+entry, and reopen it. These choices do not change cookie/storage isolation or
+the shell's own sign-in window policy. Camera, microphone, notifications, and
+other browser permissions remain denied.
+
+This controls Chromium's local-network permission answers, **not a network
+firewall**: Electron versions may not gate every local-network fetch on this
+permission. Approval does not bypass CORS, TLS certificate validation, or the
+agent navigation policy. A helper that rejects this origin through its own CORS
+policy must be configured to allow it; the pane does not rewrite those headers.
+
+### Browser implementation
+
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
 which may run on a different host — drives it purely by messages: an action
 request fans out over the session stream, the renderer claims and executes it
@@ -338,7 +645,7 @@ bounds sync. Without this signal the pane would gate itself off forever and the
 embedded browser would stay invisible. (`browserViewRegistry.test.js` locks the
 create-signal → setActive → attached transition.)
 
-**Toolbar.** When a view is attached, `BrowserPane` renders a user-facing
+**Toolbar.** Even before a page is opened, `BrowserPane` renders a user-facing
 toolbar above the page: back / forward / reload, a DevTools toggle, and an
 editable URL bar (Enter navigates; the typed value is normalized to add a
 scheme — a dotless host like `localhost` gets `http://`, everything else
@@ -440,8 +747,23 @@ pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
 
-Output lands in `electron/dist/` (the DMG is named
-`Omnigent-<version>-<arch>.dmg`).
+Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
+name; output lands in `electron/dist-dev/` (the DMG is named
+`Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
+install production desktop updates. `build:mac:release` retains
+`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+
+macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
+`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
+Public macOS users and Windows/Linux keep the legacy
+default. The setup-page switch still persists an explicit choice on every
+platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
+choice. A saved server still reconnects on launch.
+
+Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
+bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
+and stores settings in **Omnigent Dev** app data. To try a managed preference,
+use the packaged local build instead (see `docs/managed-preferences.md`).
 
 ## macOS code signing & notarization
 

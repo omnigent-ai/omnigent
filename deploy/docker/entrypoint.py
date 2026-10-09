@@ -539,16 +539,17 @@ def main() -> None:
 
         import uvicorn
 
-        from omnigent.runner.transports.ws_tunnel.limits import (
-            RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        )
+        from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
         uvicorn.run(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # This image serves external runners only, so every session rides a
+            # tunnel: without the keepalive budget uvicorn's 20 s default closes
+            # a busy-but-healthy one with 1011 after a client-path stall.
+            **uvicorn_tunnel_kwargs(),
         )
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())

@@ -331,7 +331,7 @@ export function BlockRenderer({
           {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
         {exempt.map(({ item, index }) =>
-          renderItem(item, index, false, false, false, onRetryError),
+          renderItem(item, index, false, false, false, false, onRetryError),
         )}
         {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
       </>
@@ -409,11 +409,13 @@ function renderSequence(
     }
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
+    const isTextStreaming = liveEdge && i === lastIdx && item.kind === "text";
     rendered.push(
       renderItem(
         item,
         indexBase + i,
         i === reasoningStreamingIdx,
+        isTextStreaming,
         suppressReasoningDuration,
         followsText,
         onRetryError,
@@ -717,7 +719,7 @@ function renderToolRunFragment(
       <ToolGroupSummary key={`tool-group:${runStart}:${fragmentIndex}`} tools={fragment.tools} />
     );
   }
-  return renderItem(fragment.tool, runStart + fragment.index, false);
+  return renderItem(fragment.tool, runStart + fragment.index, false, false);
 }
 
 const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
@@ -762,6 +764,7 @@ function renderItem(
   item: RenderItem,
   index: number,
   isReasoningStreaming: boolean,
+  isTextStreaming: boolean,
   suppressReasoningDuration = false,
   followsText = false,
   onRetryError?: BlockRendererProps["onRetryError"],
@@ -775,7 +778,22 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse>{item.text}</FilePathAwareMessageResponse>
+          <FilePathAwareMessageResponse
+            className="chat-markdown"
+            mode={isTextStreaming ? "streaming" : "static"}
+          >
+            {item.text}
+          </FilePathAwareMessageResponse>
+          {item.previewInterrupted && item.itemId?.startsWith("live:") && (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="stream-interruption-notice"
+              className="mt-1 select-none text-xs text-muted-foreground"
+            >
+              Live output interrupted. Full response will appear when complete.
+            </div>
+          )}
         </div>
       );
     case "reasoning":
@@ -850,6 +868,7 @@ function renderItem(
       return (
         <ErrorBanner
           key={key}
+          itemId={item.itemId}
           message={item.message}
           source={item.source}
           code={item.code}
@@ -857,7 +876,17 @@ function renderItem(
           cause={item.cause}
           remediation={item.remediation}
           level={item.level}
-          onRetry={onRetryError ? () => onRetryError(item) : undefined}
+          relatedErrors={item.relatedErrors}
+          onRetry={
+            onRetryError
+              ? (actionableError) =>
+                  onRetryError(
+                    actionableError.itemId === item.itemId && actionableError.code === item.code
+                      ? item
+                      : { kind: "error", ...actionableError },
+                  )
+              : undefined
+          }
         />
       );
     case "policy_denied":

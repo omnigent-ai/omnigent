@@ -1,0 +1,727 @@
+"""Subagent inactivity publishes idle status without delivering runner completion."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any
+from unittest.mock import Mock
+from uuid import uuid4
+
+import httpx
+import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
+from omnigent.errors import OmnigentError
+from omnigent.runtime import session_stream
+from omnigent.server import session_live_state, session_metadata_logging
+from omnigent.server.routes import sessions
+from omnigent.server.routes._sessions import common
+from omnigent.server.routes.sessions import routes_events
+from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests.debug_log_helpers import capture_debug_rows
+from tests.server.routes.test_sessions_runner_relay import _ScriptedRunnerClient
+
+_BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
+
+
+async def _flush_live_state() -> None:
+    """Wait for ordered persistence and parent fanout before inspecting their effects."""
+    done = threading.Event()
+    session_live_state.submit("test_barrier", done.set)
+    assert await asyncio.to_thread(done.wait, 10)
+
+
+@dataclass
+class _StatusRoute:
+    client: httpx.AsyncClient
+    store: SqlAlchemyConversationStore
+    scheduled: SqlAlchemyScheduledTaskStore
+    task_id: str
+    parent_id: str
+    child_id: str
+    published: Mock
+    telemetry: Mock
+    forwarded: list[tuple[str, dict[str, Any]]]
+
+
+@pytest.fixture
+async def status_route(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_StatusRoute]:
+    store = SqlAlchemyConversationStore(db_uri)
+    scheduled = SqlAlchemyScheduledTaskStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    task_id = uuid4().hex
+    scheduled.create(
+        scheduled_task_id=task_id,
+        name="inactivity",
+        prompt="test",
+        rrule="FREQ=HOURLY;BYMINUTE=0",
+        user_id=None,
+        agent_id=uuid4().hex,
+        timezone="UTC",
+    )
+    for conv in (parent, child):
+        store.set_session_live_status(conv.id, "running")
+        common._session_status_cache[conv.id] = "running"
+        common._session_active_response_cache[conv.id] = "resp_active"
+        common._session_background_task_count_cache[conv.id] = 2
+        common._session_background_tasks_cache[conv.id] = [_BACKGROUND_TASK]
+        scheduled.create_run(
+            run_id=uuid4().hex,
+            scheduled_task_id=task_id,
+            status="running",
+            scheduled_at=1000,
+            conversation_id=conv.id,
+            fired_at=1001,
+        )
+
+    app = FastAPI()
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    app.include_router(
+        sessions.create_sessions_router(store, SqlAlchemyAgentStore(db_uri)), prefix="/v1"
+    )
+    published = Mock()
+    telemetry = Mock()
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_forward(request: httpx.Request) -> httpx.Response:
+        forwarded.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(capture_forward), base_url="http://runner"
+        ) as runner,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
+
+        async def get_runner_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+            return runner
+
+        monkeypatch.setattr(sessions, "_get_runner_client", get_runner_client)
+        monkeypatch.setattr(session_stream, "publish", published)
+        monkeypatch.setattr(routes_events, "_tel_emit", telemetry)
+        session_live_state.configure(store, scheduled)
+        try:
+            yield _StatusRoute(
+                client,
+                store,
+                scheduled,
+                task_id,
+                parent.id,
+                child.id,
+                published,
+                telemetry,
+                forwarded,
+            )
+        finally:
+            await _flush_live_state()
+            session_live_state.configure(None)
+            for conv in (parent, child):
+                for cache in (
+                    common._session_status_cache,
+                    common._session_active_response_cache,
+                    common._session_background_task_count_cache,
+                    common._session_background_tasks_cache,
+                ):
+                    cache.pop(conv.id, None)
+
+
+@pytest.mark.parametrize("is_child", [True, False], ids=["child", "top-level"])
+@pytest.mark.parametrize(
+    ("optional", "wire_fields", "count", "tasks"),
+    [
+        pytest.param({}, {}, 2, [_BACKGROUND_TASK], id="bare"),
+        pytest.param(
+            {
+                "response_id": "resp_turn",
+                "background_task_count": 1,
+                "background_tasks": [_BACKGROUND_TASK.model_dump()],
+                "blocked_on": "permission",
+            },
+            {
+                "response_id": "resp_turn",
+                "background_task_count": 1,
+                "background_tasks": [_BACKGROUND_TASK.model_dump()],
+                "blocked_on": "permission",
+            },
+            1,
+            [_BACKGROUND_TASK],
+            id="optional-fields",
+        ),
+        pytest.param(
+            {"response_id": None, "background_task_count": 0},
+            {"background_task_count": 0},
+            None,
+            None,
+            id="clear-background",
+        ),
+        pytest.param(
+            {"background_task_count": True, "background_tasks": "invalid", "blocked_on": 1},
+            {},
+            2,
+            [_BACKGROUND_TASK],
+            id="best-effort-fields",
+        ),
+    ],
+)
+async def test_subagent_idle_publishes_status_without_completion(
+    status_route: _StatusRoute,
+    is_child: bool,
+    optional: dict[str, Any],
+    wire_fields: dict[str, Any],
+    count: int | None,
+    tasks: list[BackgroundTaskInfo] | None,
+) -> None:
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    response = await route.client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "subagent.status", "data": {"idle": True, **optional}},
+    )
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": False}
+    await _flush_live_state()
+
+    assert common._session_status_cache[sid] == "idle"
+    assert sid not in common._session_active_response_cache
+    assert common._session_background_task_count_cache.get(sid) == count
+    assert common._session_background_tasks_cache.get(sid) == tasks
+    conv = route.store.get_conversation(sid)
+    assert conv is not None and conv.live_status == "idle"
+    assert route.store.list_items(sid).data == []
+    runs, _ = route.scheduled.list_runs(route.task_id)
+    run = next(run for run in runs if run.conversation_id == sid)
+    assert run.status == "succeeded"
+    assert run.finished_at is not None
+
+    events = [(call.args[0], call.args[1]) for call in route.published.call_args_list]
+    assert [event for target, event in events if target == sid] == [
+        {
+            "sequence_number": None,
+            "type": "session.status",
+            "conversation_id": sid,
+            "status": "idle",
+            "error": None,
+            **wire_fields,
+        }
+    ]
+    if is_child:
+        parent_events = [event for target, event in events if target == route.parent_id]
+        assert len(parent_events) == 1
+        assert parent_events[0]["type"] == "session.child_session.updated"
+        assert parent_events[0]["child_session_id"] == sid
+        assert parent_events[0]["child"]["busy"] is False
+        assert common._session_status_cache[route.parent_id] == "running"
+        assert common._session_active_response_cache[route.parent_id] == "resp_active"
+        assert (
+            next(run for run in runs if run.conversation_id == route.parent_id).status == "running"
+        )
+    else:
+        assert len(events) == 1
+    assert route.forwarded == []
+    route.telemetry.assert_not_called()
+
+
+@pytest.mark.parametrize("fail_idle_top_level", [False, True])
+async def test_offline_sweep_refreshes_child_status_after_idle_observation(
+    status_route: _StatusRoute, fail_idle_top_level: bool
+) -> None:
+    route = status_route
+    snapshot = route.store.get_conversation(route.child_id)
+    assert snapshot is not None and snapshot.live_status == "running"
+
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "subagent.status", "data": {"idle": True}},
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    # Another replica's sweep has an older row and no local turn edges.
+    common._session_status_cache.pop(route.child_id)
+    route.published.reset_mock()
+
+    with capture_debug_rows("server") as rows:
+        await sessions._mark_runner_sessions_offline(
+            [snapshot],
+            ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+            route.store,
+            fail_idle_top_level=fail_idle_top_level,
+        )
+        await _flush_live_state()
+
+    child = route.store.get_conversation(route.child_id)
+    assert child is not None and child.live_status == "idle"
+    assert sessions._last_task_error_from_labels(child.labels) is None
+    assert route.store.list_items(route.parent_id).data == []
+    route.published.assert_not_called()
+    assert route.forwarded == []
+
+    decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+    assert decision["session_id"] == route.child_id
+    assert decision["level"] == "WARNING"
+    assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+    assert (
+        decision["attributes"].items()
+        >= {
+            "origin": "runner_offline_sweep",
+            "decision": "idle_no_failure",
+            "status_source": "persisted",
+            "persisted_session_status": "idle",
+            "snapshot_session_status": "running",
+            "parent_session_id": route.parent_id,
+            "session_kind": "sub_agent",
+            "status_lookup": "found",
+        }.items()
+    )
+
+
+async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute) -> None:
+    route = status_route
+    sid = route.child_id
+    common._session_status_cache[sid] = "failed"
+    route.store.set_session_live_status(sid, "failed")
+    response = await route.client.post(
+        f"/v1/sessions/{sid}/events", json={"type": "subagent.status", "data": {"idle": True}}
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    assert common._session_status_cache[sid] == "failed"
+    assert sid not in common._session_active_response_cache
+    conv = route.store.get_conversation(sid)
+    assert conv is not None and conv.live_status == "failed"
+    assert route.scheduled.get_running_run_by_conversation(sid) is not None
+    route.published.assert_not_called()
+    route.telemetry.assert_not_called()
+    assert route.forwarded == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"idle": False},
+        {"idle": None},
+        {"idle": 0},
+        {"idle": 1},
+        {"idle": 1.0},
+        {"idle": "true"},
+        {"idle": []},
+        {"idle": {}},
+    ],
+)
+async def test_subagent_status_requires_literal_true(
+    status_route: _StatusRoute, data: dict[str, Any]
+) -> None:
+    route = status_route
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events", json={"type": "subagent.status", "data": data}
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_input"
+    assert "data.idle" in response.json()["error"]["message"]
+    assert common._session_status_cache[route.child_id] == "running"
+    assert common._session_active_response_cache[route.child_id] == "resp_active"
+    route.published.assert_not_called()
+    route.telemetry.assert_not_called()
+    assert route.forwarded == []
+
+
+async def test_subagent_idle_validates_optional_response_id(
+    status_route: _StatusRoute,
+) -> None:
+    route = status_route
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "subagent.status", "data": {"idle": True, "response_id": 123}},
+    )
+    assert response.status_code == 400, response.text
+    assert "data.response_id" in response.json()["error"]["message"]
+    route.published.assert_not_called()
+    route.telemetry.assert_not_called()
+    assert route.forwarded == []
+
+
+@pytest.mark.parametrize(
+    ("status", "turn_outcome"),
+    [("idle", None), ("running", None), ("failed", None), ("idle", "cancelled")],
+)
+async def test_external_session_status_still_forwards_to_runner(
+    status_route: _StatusRoute, status: str, turn_outcome: str | None
+) -> None:
+    route = status_route
+    sid = route.child_id
+    data = {"status": status, "output": "authoritative result"}
+    if turn_outcome is not None:
+        data["turn_outcome"] = turn_outcome
+    response = await route.client.post(
+        f"/v1/sessions/{sid}/events", json={"type": "external_session_status", "data": data}
+    )
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": False}
+    assert len(route.forwarded) == 1
+    path, body = route.forwarded[0]
+    assert path == f"/v1/sessions/{sid}/events"
+    assert body["type"] == "external_session_status"
+    expected_data: dict[str, object] = dict(data)
+    if status == "failed":
+        expected_data["failure_context"] = {
+            "failure_source": "external_status",
+            "detail_source": "external_status_output",
+        }
+    assert body["data"] == expected_data
+    assert route.telemetry.call_count == (0 if status == "running" else 1)
+
+
+@pytest.mark.parametrize("is_child", [False, True], ids=["main", "native-child"])
+@pytest.mark.parametrize(
+    ("event_type", "data"),
+    [
+        ("external_session_status", {"status": "running"}),
+        ("external_session_status", {"status": "failed"}),
+        ("subagent.status", {"idle": True}),
+    ],
+)
+async def test_status_observes_existing_session_metadata_off_event_loop(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    is_child: bool,
+    event_type: str,
+    data: dict[str, Any],
+) -> None:
+    route = status_route
+    sid = route.child_id if is_child else route.parent_id
+    if is_child:
+        route.store.set_labels(sid, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
+    monkeypatch.setattr(routes_events, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_metadata_logging, "debug_sink_enabled", lambda: True)
+    event_loop_thread = threading.get_ident()
+    observe = routes_events.log_session_metadata
+
+    def observe_in_worker(*args: Any, **kwargs: Any) -> None:
+        assert threading.get_ident() != event_loop_thread
+        observe(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events, "log_session_metadata", observe_in_worker)
+    with capture_debug_rows("server") as rows:
+        response = await route.client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": event_type, "data": data},
+        )
+
+    assert response.status_code == 202, response.text
+    observations = [row for row in rows if row["event_name"] == "session_metadata"]
+    assert len(observations) == 1
+    assert observations[0]["session_id"] == sid
+    attrs = observations[0]["attributes"]
+    assert attrs["observation"] == event_type
+    assert attrs["root_session_id"] == route.parent_id
+    if is_child:
+        assert attrs["session_kind"] == "sub_agent"
+        assert attrs["parent_session_id"] == route.parent_id
+        assert attrs["harness"] == "claude-native"
+    else:
+        assert attrs["session_kind"] == "default"
+        assert "parent_session_id" not in attrs
+        assert "harness" not in attrs
+        assert attrs["harness_source"] == "missing_agent"
+        assert attrs["harness_resolution"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("harness", "status", "confirmation", "wrapper", "expected"),
+    [
+        ("claude-native", "idle", {}, None, None),
+        ("auto", "idle", {}, None, None),
+        ("any", "idle", {}, None, None),
+        ("claude-native", "idle", {"turn_completed": True}, None, "completed"),
+        ("cursor-native", "idle", {"turn_outcome": "cancelled"}, None, "cancelled"),
+        ("cursor-native", "idle", {"turn_outcome": "failed"}, None, "failed"),
+        ("codex-native", "idle", {}, None, "completed"),
+        ("claude-sdk", "idle", {}, "claude-code-native-ui", "completed"),
+        ("claude-native", "failed", {}, None, "failed"),
+        (
+            "claude-native",
+            "idle",
+            {"turn_completed": True},
+            "claude-code-native-ui-subagent",
+            None,
+        ),
+        ("claude-native", "failed", {}, "claude-code-native-ui-subagent", None),
+    ],
+)
+async def test_external_child_activity_uses_confirmed_outcome(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    status: str,
+    confirmation: dict[str, Any],
+    wrapper: str | None,
+    expected: str | None,
+) -> None:
+    route = status_route
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: harness)
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": status, "response_id": "child-turn", **confirmation},
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = route.store.list_items(route.parent_id).data
+    if expected is None:
+        assert items == []
+    else:
+        assert len(items) == 1
+        assert items[0].data.event_type == "session.subagent.returned"
+        assert items[0].data.resource["status"] == expected
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "auto"])
+async def test_claude_child_idle_observations_do_not_complete_new_response_ids(
+    status_route: _StatusRoute, harness: str
+) -> None:
+    route = status_route
+    route.store.update_conversation(route.child_id, harness_override=harness)
+    route.store.set_labels(route.child_id, {"omnigent.wrapper": "claude-code-native-ui"})
+
+    for turn in range(2):
+        for observation in range(3):
+            response_id = f"claude-turn-{turn}-observation-{observation}"
+            route.store.append(
+                route.child_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id=response_id,
+                        data=MessageData(
+                            role="assistant",
+                            agent="claude-native",
+                            content=[
+                                {"type": "output_text", "text": "Still working on the task."}
+                            ],
+                        ),
+                    )
+                ],
+            )
+            response = await route.client.post(
+                f"/v1/sessions/{route.child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "response_id": response_id},
+                },
+            )
+            assert response.status_code == 202, response.text
+            assert len(route.store.list_items(route.parent_id).data) == turn
+
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": response_id,
+                    "turn_completed": True,
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        notices = route.store.list_items(route.parent_id).data
+        assert len(notices) == turn + 1
+        assert all(item.data.event_type == "session.subagent.returned" for item in notices)
+        assert all(item.data.resource_id == route.child_id for item in notices)
+        assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+@pytest.mark.parametrize(
+    ("harness", "wrapper"),
+    [
+        ("claude-native", None),
+        ("codex-native", None),
+        ("auto", "claude-code-native-ui"),
+    ],
+)
+@pytest.mark.parametrize("request_type", ["message", "slash_command"])
+async def test_native_completion_notices_share_the_initiating_request(
+    status_route: _StatusRoute, harness: str, wrapper: str | None, request_type: str
+) -> None:
+    """Native notification turns finish the same request; a real follow-up starts another."""
+    route = status_route
+    route.store.update_conversation(route.child_id, harness_override=harness)
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
+
+    def append_turn(response_id: str, *, is_meta: bool = False) -> None:
+        request = NewConversationItem(
+            type="message",
+            response_id=f"input-{response_id}",
+            data=MessageData(
+                role="user",
+                is_meta=is_meta,
+                content=[
+                    {
+                        "type": "input_text",
+                        "text": "Native task update" if is_meta else "Audit this change",
+                    }
+                ],
+            ),
+        )
+        if request_type == "slash_command" and not is_meta:
+            request = NewConversationItem(
+                type="slash_command",
+                response_id=f"input-{response_id}",
+                data=SlashCommandData(
+                    agent="native", kind="skill", name="review", arguments="Audit this change"
+                ),
+            )
+        route.store.append(
+            route.child_id,
+            [
+                request,
+                NewConversationItem(
+                    type="message",
+                    response_id=response_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent="native",
+                        content=[{"type": "output_text", "text": "Done"}],
+                    ),
+                ),
+            ],
+        )
+
+    async def complete(response_id: str) -> None:
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": response_id,
+                    "turn_completed": True,
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+
+    append_turn("native-first")
+    await complete("native-first")
+    first_notice = route.store.list_items(route.parent_id).data[0]
+    for index in range(112):
+        response_id = f"native-notification-{index}"
+        append_turn(response_id, is_meta=True)
+        if index in (0, 1, 111):
+            await complete(response_id)
+            assert [item.id for item in route.store.list_items(route.parent_id).data] == [
+                first_notice.id
+            ]
+
+    append_turn("native-follow-up")
+    # A delayed status retry must still belong to the earlier request.
+    await complete("native-first")
+    assert len(route.store.list_items(route.parent_id).data) == 1
+    await complete("native-follow-up")
+    await complete("native-follow-up")
+    notices = route.store.list_items(route.parent_id).data
+    assert len(notices) == 2
+    assert notices[0].id == first_notice.id
+    assert all(item.data.event_type == "session.subagent.returned" for item in notices)
+    assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+@pytest.mark.parametrize(
+    ("harness", "wrapper", "native_harness"),
+    [
+        ("claude-native", None, "claude-native"),
+        ("codex-native", None, "codex-native"),
+        ("auto", "claude-code-native-ui", "claude-native"),
+        ("auto", "codex-native-ui", "codex-native"),
+    ],
+)
+async def test_native_child_completes_once_per_confirmed_turn(
+    status_route: _StatusRoute, harness: str, wrapper: str | None, native_harness: str
+) -> None:
+    """Delivery acknowledgments and repeated status posts do not duplicate actual results."""
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    route = status_route
+    route.store.update_conversation(route.child_id, harness_override=harness)
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
+    release = asyncio.Event()
+    release.set()
+    for index in range(2):
+        submission_id = f"submission-{index}"
+        await _relay_runner_stream_once(
+            route.child_id,
+            _ScriptedRunnerClient(
+                release,
+                [
+                    {"type": "response.in_progress", "response": {"id": submission_id}},
+                    {"type": "response.completed", "response": {"id": submission_id}},
+                    {"type": "session.status", "status": "idle"},
+                    {"type": "session.status", "status": "idle"},
+                ],
+            ),
+            route.store,
+        )
+        assert len(route.store.list_items(route.parent_id).data) == index
+        if index == 0:
+            assert route.store.list_items(route.child_id).data == []
+
+        native_turn_id = f"native-turn-{index}"
+        route.store.append(
+            route.child_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=native_turn_id,
+                    data=MessageData(
+                        role="assistant",
+                        agent=native_harness,
+                        content=[{"type": "output_text", "text": "Finished the child task."}],
+                    ),
+                )
+            ],
+        )
+        for _ in range(2):
+            response = await route.client.post(
+                f"/v1/sessions/{route.child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "idle",
+                        "response_id": native_turn_id,
+                        **({"turn_completed": True} if native_harness == "claude-native" else {}),
+                    },
+                },
+            )
+            assert response.status_code == 202, response.text
+        notices = route.store.list_items(route.parent_id).data
+        assert len(notices) == index + 1
+        assert all(item.data.event_type == "session.subagent.returned" for item in notices)
+        assert all(item.data.resource_id == route.child_id for item in notices)
+        assert all(item.data.resource["status"] == "completed" for item in notices)

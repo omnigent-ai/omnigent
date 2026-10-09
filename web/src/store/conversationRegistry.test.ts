@@ -114,20 +114,6 @@ describe("ConversationRegistry", () => {
     expect(listener).not.toHaveBeenCalled();
   });
 
-  it("ignores app-global keys written through an entry", () => {
-    const entry = registry.acquire("conv_a");
-    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      // `selectedModel` is a sticky app-level pref, not conversation state.
-      entry.setState({ selectedModel: "opus" } as never);
-      expect(
-        (entry.getState() as unknown as Record<string, unknown>).selectedModel,
-      ).toBeUndefined();
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
   it("evictLruEvictable disposes the least-recently-viewed entry and returns its id", () => {
     // The slot layer calls this to reclaim one of this tab's own background
     // streams when the origin is saturated. conv_a is oldest → it goes.

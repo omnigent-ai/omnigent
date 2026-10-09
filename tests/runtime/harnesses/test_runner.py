@@ -9,6 +9,8 @@ ground here would just duplicate.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi import FastAPI
 
@@ -173,6 +175,39 @@ def test_create_uvicorn_config_requires_endpoint() -> None:
         _runner._create_uvicorn_config(FastAPI(), None, None)
 
 
+@pytest.mark.parametrize(
+    ("socket_path", "bind"), [("/tmp/runner.sock", None), (None, "127.0.0.1:8765")]
+)
+def test_create_uvicorn_config_preserves_existing_log_handlers(
+    socket_path: str | None, bind: str | None
+) -> None:
+    class TrackingHandler(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.was_closed = False
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.messages.append(record.getMessage())
+
+        def close(self) -> None:
+            self.was_closed = True
+            super().close()
+
+    handler = TrackingHandler()
+    logger = logging.getLogger("omnigent.harness_logging_test")
+    logger.addHandler(handler)
+    try:
+        _runner._create_uvicorn_config(FastAPI(), socket_path, bind)
+
+        assert not handler.was_closed
+        logger.warning("harness ready")
+        assert handler.messages == ["harness ready"]
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+
 # ---------------------------------------------------------------------------
 # Log destination: a harness child's logs must land in a readable file
 # ---------------------------------------------------------------------------
@@ -245,3 +280,39 @@ def _reset_omnigent_log_handlers() -> None:
         for handler in list(logger.handlers):
             logger.removeHandler(handler)
             handler.close()
+
+
+def test_main_freezes_gc_and_arms_first_turn_freeze_before_serving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The harness freezes its import graph and arms the first-turn freeze before serving."""
+    from omnigent.runtime.harnesses import _scaffold
+
+    calls: list[str] = []
+    monkeypatch.setattr(_runner, "_configure_logging", lambda *_a: None)
+    monkeypatch.setattr(_runner, "_load_harness_app", lambda *_a: FastAPI())
+    monkeypatch.setattr(_runner.gc, "freeze", lambda: calls.append("freeze"))
+    monkeypatch.setattr(_scaffold, "_freeze_gc_after_first_turn", False)
+
+    class _Server:
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def run(self) -> None:
+            calls.append(f"serve armed={_scaffold._freeze_gc_after_first_turn}")
+
+    monkeypatch.setattr(_runner, "_HardExitServer", _Server)
+    _runner.main(
+        [
+            "--harness",
+            "test",
+            "--module",
+            "tests.runtime.harnesses._test_harness",
+            "--socket",
+            "/tmp/example.sock",
+            "--conversation-id",
+            "conv_abc",
+        ]
+    )
+
+    assert calls == ["freeze", "serve armed=True"]

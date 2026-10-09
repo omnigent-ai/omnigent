@@ -1,3 +1,8 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Regression test for: toggling "Select sessions" left the currently-viewed
 // session's row highlighted. In selection mode the active-route highlight must
 // be suppressed — a row should carry a background only when it's explicitly
@@ -9,42 +14,15 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { forwardRef } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 import { type OmnigentLinkProps, reactRouterRouting, RoutingProvider } from "@/lib/routing";
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useProjectSessions: () => ({ data: undefined, isLoading: false, isError: false, error: null }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return conversationHooksMock();
+});
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -73,18 +51,7 @@ function topLevelConv(id: string): Conversation {
 }
 
 function mockConversations(convs: Conversation[]) {
-  useConvMock.mockReturnValue({
-    data: {
-      pages: [{ data: convs, first_id: null, last_id: null, has_more: false }],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>);
+  useConvMock.mockReturnValue(conversationPage(convs, { first_id: null, last_id: null }));
 }
 
 function snapshot(id: string, parentSessionId: string | null): Session {
@@ -127,17 +94,19 @@ function renderAt(initialEntry: string, holdRoute = false) {
   );
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          {holdRoute ? (
-            <RoutingProvider value={{ ...reactRouterRouting, Link: StaticLink }}>
-              {routes}
-            </RoutingProvider>
-          ) : (
-            routes
-          )}
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            {holdRoute ? (
+              <RoutingProvider value={{ ...reactRouterRouting, Link: StaticLink }}>
+                {routes}
+              </RoutingProvider>
+            ) : (
+              routes
+            )}
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

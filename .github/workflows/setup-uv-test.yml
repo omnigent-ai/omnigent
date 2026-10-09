@@ -1,0 +1,90 @@
+name: Setup uv action tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/actions/setup-uv/**"
+      - ".github/workflows/setup-uv-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retry:
+    name: Retry (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: failure then success
+            failures: 2
+            outcome: success
+          - name: exhausted
+            failures: 3
+            outcome: failure
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Prepare action under test
+        shell: bash
+        run: |
+          mkdir .setup-uv-under-test
+          cp .github/actions/setup-uv/action.yml .setup-uv-under-test/action.yml
+          node <<'NODE'
+          const fs = require("node:fs");
+          const actionPath = ".setup-uv-under-test/action.yml";
+          const source = fs.readFileSync(actionPath, "utf8");
+          const installer = "uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0";
+          const replacement = "uses: ./.github/actions/setup-uv/test-installer";
+          const matches = source.split(installer).length - 1;
+          if (matches !== 3) throw new Error(`Expected three installer steps, found ${matches}`);
+          fs.writeFileSync(actionPath, source.replaceAll(installer, replacement));
+          NODE
+          printf '{"attempts":[],"posts":[]}' > "$RUNNER_TEMP/setup-uv-test-state.json"
+
+      - name: Exercise setup
+        id: setup
+        continue-on-error: ${{ matrix.outcome == 'failure' }}
+        uses: ./.setup-uv-under-test
+        with:
+          version: test
+          enable-cache: false
+        env:
+          SETUP_UV_TEST_FAILURES: ${{ matrix.failures }}
+          SETUP_UV_TEST_STATE: ${{ runner.temp }}/setup-uv-test-state.json
+
+      - name: Run workload after successful setup
+        if: steps.setup.outcome == 'success'
+        shell: bash
+        run: |
+          uv --version | grep -Fx 'uv test'
+          touch "$RUNNER_TEMP/setup-uv-test-workload"
+
+      - name: Verify retries and final status
+        if: always()
+        shell: bash
+        env:
+          EXPECTED_OUTCOME: ${{ matrix.outcome }}
+          SETUP_OUTCOME: ${{ steps.setup.outcome }}
+          SETUP_UV_TEST_STATE: ${{ runner.temp }}/setup-uv-test-state.json
+        run: |
+          node <<'NODE'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const state = JSON.parse(fs.readFileSync(process.env.SETUP_UV_TEST_STATE, "utf8"));
+          assert.equal(state.attempts.length, 3);
+          assert.ok(state.attempts[1].time - state.attempts[0].time >= 1900, "missing 2-second backoff");
+          assert.ok(state.attempts[2].time - state.attempts[1].time >= 4900, "missing 5-second backoff");
+          assert.equal(process.env.SETUP_OUTCOME, process.env.EXPECTED_OUTCOME);
+          const workloadRan = fs.existsSync(`${process.env.RUNNER_TEMP}/setup-uv-test-workload`);
+          assert.equal(workloadRan, process.env.EXPECTED_OUTCOME === "success");
+          NODE
+
+  cache-authentication:
+    name: Cache authentication
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - run: node --test .github/actions/setup-uv/verify-cache.test.mjs

@@ -3,12 +3,13 @@
  * (``/v1/connections/databricks/*``).
  *
  * Lets a signed-in user connect their Databricks workspace so their managed
- * sandboxes reach the Databricks AI Gateway (MCP + model serving) as them. The
+ * sandboxes reach the Databricks Unity Gateway (MCP + model serving) as them. The
  * connect flow is a full-page redirect to the workspace's OAuth endpoint (the
  * server owns the U2M + PKCE handshake); status and disconnect are JSON.
  * Mirrors ``githubIntegration.ts``.
  */
 
+import { withBasePath } from "./basePath";
 import { authenticatedFetch } from "./identity";
 
 /** Shape of ``GET /v1/connections/databricks/status``. */
@@ -42,7 +43,7 @@ export async function fetchDatabricksStatus(): Promise<DatabricksConnectionStatu
  */
 export function beginDatabricksConnect(workspace: string, returnTo: string): void {
   const params = new URLSearchParams({ workspace, return_to: returnTo });
-  window.location.href = `/v1/connections/databricks/connect?${params.toString()}`;
+  window.location.href = withBasePath(`/v1/connections/databricks/connect?${params.toString()}`);
 }
 
 /** Disconnect the current user's Databricks workspace. */

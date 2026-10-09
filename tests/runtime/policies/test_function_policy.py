@@ -35,6 +35,7 @@ import pytest
 
 from omnigent.policies.function import (
     FunctionPolicy,
+    _build_event,
     resolve_function_policy,
 )
 from omnigent.policies.types import EvaluationContext, PolicyResult
@@ -1189,3 +1190,95 @@ def test_resolve_function_policy_modern_callable_not_wrapped(tmp_path: Path) -> 
     # The shim produces an inner function named "_sync_shim" or
     # "_async_shim"; the original function is named "modern_allow".
     assert policy._callable.__name__ == "modern_allow"
+
+
+# --- _build_event forwards conversation_id ----------
+
+
+def test_build_event_includes_conversation_id_none() -> None:
+    """
+    ``_build_event`` includes ``conversation_id: None`` when the
+    context has none set (e.g. a hand-built test context with no
+    owning engine).
+
+    What breaks if this fails: the key is missing from the event
+    dict, causing ``KeyError`` in policy callables that check
+    ``event["context"]["conversation_id"]``.
+    """
+    ctx = EvaluationContext(phase=Phase.REQUEST, content="hello")
+    event = _build_event(ctx)
+    assert "conversation_id" in event["context"]
+    assert event["context"]["conversation_id"] is None
+
+
+def test_build_event_passes_through_conversation_id() -> None:
+    """
+    ``_build_event`` forwards ``EvaluationContext.conversation_id``
+    into ``event["context"]["conversation_id"]`` unchanged.
+
+    What breaks if this fails: a policy callable correlating an
+    event with its sessions (e.g. for a session-scoped file path or
+    log line) would see the wrong conversation, or none at all.
+    """
+    ctx = EvaluationContext(
+        phase=Phase.REQUEST,
+        content="hello",
+        conversation_id="conv_abc123",
+    )
+    event = _build_event(ctx)
+    assert event["context"]["conversation_id"] == "conv_abc123"
+
+
+# --- PolicyEngine injects conversation_id ----------
+
+
+@pytest.mark.asyncio
+async def test_engine_injects_conversation_id_matching_engine_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``PolicyEngine.evaluate`` injects its own ``conversation_id``
+    into every event, even when the caller's ``EvaluationContext``
+    doesn't set one.
+
+    What breaks if this fails: policy callables would see
+    ``conversation_id: None`` for real evaluations, unable to
+    correlate the event with the session it belongs to.
+    """
+    captured: dict[str, Any] = {}
+
+    def fn(event: dict) -> PolicyResult:
+        captured["conversation_id"] = event["context"]["conversation_id"]
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    policy = FunctionPolicy(_spec(), fn)
+    engine = _build_engine(conversation_store, [policy])
+    await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
+    assert captured["conversation_id"] == engine._conversation_id
+    assert captured["conversation_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_engine_conversation_id_distinct_per_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two engines built for two different conversations inject two
+    different ``conversation_id`` values.
+
+    What breaks if this fails: policy callables scoping side
+    effects or logs by ``conversation_id`` would scope two
+    unrelated sessions together instead of keeping them distinct.
+    """
+    captured: list[str | None] = []
+
+    def fn(event: dict) -> PolicyResult:
+        captured.append(event["context"]["conversation_id"])
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    engine_a = _build_engine(conversation_store, [FunctionPolicy(_spec(), fn)])
+    engine_b = _build_engine(conversation_store, [FunctionPolicy(_spec(), fn)])
+    await engine_a.evaluate(EvaluationContext(phase=Phase.REQUEST, content="a"))
+    await engine_b.evaluate(EvaluationContext(phase=Phase.REQUEST, content="b"))
+    assert captured[0] != captured[1]
+    assert None not in captured

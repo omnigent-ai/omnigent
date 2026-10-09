@@ -370,3 +370,43 @@ def test_sanitize_replayed_image_blocks_preserves_url_source() -> None:
     sanitized = trc.sanitize_replayed_image_blocks(content)
 
     assert sanitized[0] == content[0]
+
+
+def test_sanitize_replayed_image_blocks_downgrades_responses_compaction_marker() -> None:
+    """Only a stripped Responses image URL is replaced; other references survive."""
+    marker = "[image/png content omitted from the compaction snapshot]"
+    content = [
+        {"type": "input_text", "text": "before"},
+        {"type": "input_image", "image_url": marker, "detail": "high"},
+        {"type": "input_image", "image_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"},
+        {"type": "input_image", "image_url": "https://example.com/a.png"},
+        {"type": "input_image", "file_id": "file_image"},
+        {"type": "input_image", "image_url": f"{marker} trailing text"},
+    ]
+    original = json.loads(json.dumps(content))
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0] == content[0]
+    assert sanitized[1]["type"] == "input_text"
+    assert "image/png" in sanitized[1]["text"]
+    assert marker not in sanitized[1]["text"]
+    assert sanitized[2:] == content[2:]
+    assert content == original
+    assert trc.sanitize_replayed_image_blocks(sanitized) == sanitized
+
+
+def test_sanitize_replayed_image_blocks_downgrades_typeless_compaction_marker() -> None:
+    """A marker stripped from a data URI with no declared media type still downgrades."""
+    content = [
+        {
+            "type": "input_image",
+            "image_url": "[binary content omitted from the compaction snapshot]",
+        }
+    ]
+
+    sanitized = trc.sanitize_replayed_image_blocks(content)
+
+    assert sanitized[0]["type"] == "input_text"
+    assert "image omitted" in sanitized[0]["text"]
+    assert "binary" not in sanitized[0]["text"]

@@ -3,7 +3,7 @@
 Unlike codex/claude/pi — which consume ``HARNESS_*_GATEWAY_*`` env vars that
 their CLIs translate into provider config — OpenCode reads its provider/auth
 from its own config file under the per-session ``XDG_CONFIG_HOME``. So routing
-opencode-native through the Databricks AI gateway (or any OpenAI-compatible
+opencode-native through the Databricks Unity Gateway (or any OpenAI-compatible
 endpoint) means writing an ``opencode.json`` into the runner-owned
 ``opencode serve``'s config dir at spawn, declaring a custom
 ``@ai-sdk/openai-compatible`` provider pointed at ``{host}/serving-endpoints``.
@@ -41,7 +41,7 @@ _logger = logging.getLogger(__name__)
 # Provider id used in the synthesized opencode.json for the Databricks gateway.
 # The per-prompt model is pinned as ``{DATABRICKS_GATEWAY_PROVIDER_ID}/<endpoint>``.
 DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
-DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
+DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks Unity Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
 # Optional deployment default: a ``databricks-*`` serving-endpoint id used when a
@@ -77,6 +77,44 @@ class OpenCodeGatewayResolution:
     def qualified_model(self) -> str:
         """:returns: The per-prompt ``provider/model`` id opencode expects."""
         return f"{self.provider_id}/{self.model_id}"
+
+
+def resolve_bound_opencode_gateway(
+    *, model: str | None = None, auth: object = None
+) -> OpenCodeGatewayResolution | None:
+    """Resolve an explicit session binding without consulting Connect fallbacks."""
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
+    from omnigent.onboarding.provider_config import OPENAI_FAMILY
+
+    config = load_runtime_inference_config()
+    entry = resolve_bound_provider(config, "opencode-native", auth)
+    if entry is None:
+        return None
+    family = entry.family(OPENAI_FAMILY)
+    selected = resolve_bound_model(config, "opencode-native", model)
+    if family is None or not selected:
+        raise ValueError("OpenCode requires an OpenAI-compatible provider and a default model.")
+    if family.wire_api == "responses":
+        raise ValueError("OpenCode's configured gateway must support the chat wire API.")
+    token = model_catalog._resolve_bearer_token(
+        model_catalog.ResolvedModelProvider(
+            kind=entry.kind, api_key=family.api_key, auth_command=family.auth_command
+        )
+    )
+    binding = binding_for_harness(config, "opencode-native")
+    return OpenCodeGatewayResolution(
+        base_url=family.base_url,
+        api_key=token,
+        model_id=selected,
+        model_ids=binding.model_allowlist or () if binding is not None else (),
+        provider_id="omnigent",
+        provider_name=entry.name,
+    )
 
 
 def build_opencode_model_default_config(model: str) -> dict[str, object]:
@@ -294,7 +332,7 @@ def resolve_databricks_gateway(
     model_id: str | None = None,
 ) -> OpenCodeGatewayResolution | None:
     """
-    Resolve a Databricks AI gateway for opencode from a ``~/.databrickscfg`` profile.
+    Resolve a Databricks Unity Gateway for opencode from a ``~/.databrickscfg`` profile.
 
     Uses ``databricks-sdk`` (the ``databricks`` extra) to obtain the workspace
     host + a bearer token for *profile*, then targets the workspace's

@@ -149,12 +149,12 @@ export function TasksPage() {
   const hasAnyTasks = (tasks ?? []).length > 0;
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-4 md:px-6">
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold">Automations</h1>
           <p className="text-ui text-muted-foreground">
-            Run agent sessions on a recurring schedule. Tasks fire on a connected host.
+            Run agent sessions on a recurring schedule.
           </p>
         </div>
         <Button

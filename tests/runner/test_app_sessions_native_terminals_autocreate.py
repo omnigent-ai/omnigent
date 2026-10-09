@@ -6,14 +6,17 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
@@ -44,8 +47,9 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.app import (
     ResolvedSpec,
     _agent_os_env_from_spec,
@@ -53,6 +57,7 @@ from omnigent.runner.app import (
     _auto_create_cursor_terminal,
     _auto_create_kiro_terminal,
     _auto_create_pi_terminal,
+    _codex_native_launch_config,
     _KiroNativeLaunchConfig,
     _load_claude_launch_metadata,
     _log_terminal_lookup_miss,
@@ -76,6 +81,40 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+
+async def _no_op_forwarder(**kwargs: Any) -> None:
+    del kwargs
+
+
+class _RecordingClaudeRegistry:
+    """Captures the launched terminal spec."""
+
+    terminal_registry = None
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self.captured = captured
+
+    async def launch_required_terminal(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: Any,
+        resource_role: str | None = None,
+        parent_os_env: Any = None,
+    ) -> SessionResourceView:
+        """Record the spec and return a terminal resource view."""
+        del terminal_name, session_key
+        self.captured["spec"] = spec
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
 
 
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
@@ -120,9 +159,21 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("env_denylist", "expected_env_unset"),
+    [
+        (None, []),
+        (
+            " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
+            ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+        ),
+    ],
+)
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    env_denylist: str | None,
+    expected_env_unset: list[str],
 ) -> None:
     """
     Pi-native auto-create must launch a *required* terminal.
@@ -138,21 +189,32 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param env_denylist: Optional operator-supplied credential variable names.
+    :param expected_env_unset: Variables the terminal must remove before launch.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    if env_denylist is None:
+        monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", env_denylist)
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     # The lifecycle of the launch — not the binary or credentials — is under
     # test, so neither a real Pi install nor a configured provider is needed.
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-    # Accept the ``model`` kwarg the runner now threads through (the spec model
-    # → models.json path); None still skips provider injection here.
-    monkeypatch.setattr(
-        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
-    )
+    loop = asyncio.get_running_loop()
+    provider_waits: list[bool] = []
+
+    def _slow_provider(**_kwargs: Any) -> None:
+        # Credential discovery must let the runner service its stream heartbeat.
+        serviced = threading.Event()
+        loop.call_soon_threadsafe(serviced.set)
+        provider_waits.append(serviced.wait(timeout=2))
+
+    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", _slow_provider)
 
     # Skip the GET /v1/sessions round-trip: hand the flow a ready launch
     # config pointing at the tmp workspace.
@@ -210,6 +272,10 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
     assert captured["spec"].command == "pi"
+    # Preserve the exited pane so the idle watcher can report its output.
+    assert captured["spec"].keep_alive_after_exit is True
+    assert captured["spec"].env_unset == expected_env_unset
+    assert provider_waits == [True], "Fresh Pi startup must resolve once without blocking"
     config = json.loads(
         Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
     )
@@ -310,6 +376,105 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     assert data["item_type"] == "error"
     assert data["item_data"]["code"] == "pi_credentials_unresolved"
     assert "databricks auth login" in data["item_data"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ignored effort setting posts a neutral info-level notice, not an error.
+
+    When a gateway-routed model disables thinking to keep text surfacing, the
+    effort setting is silently dropped. This is informational (the session still
+    works), so it must arrive as level=info with its own code, not as the
+    destructive pi_credentials_unresolved banner.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+
+    provider = pi_native_credentials.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://wkspc.example.com/ai-gateway/responses",
+        api="openai-responses",
+        model="system.ai.placeholder-model-xyz",
+        api_key="managed-token",
+        auth_header=True,
+    )
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
+    )
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_provider_launch",
+        lambda _agent_dir, _provider, _effort=None, **_kwargs: (
+            pi_native_credentials.PiNativeLaunch(
+                env={},
+                args=[],
+                effort_warning=(
+                    "effort ignored for gateway-routed model system.ai.placeholder-model-xyz: "
+                    "thinking disabled to keep text surfacing"
+                ),
+            )
+        ),
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, terminal_name: str, **_kwargs: Any
+        ) -> SessionResourceView:
+            del terminal_name, _kwargs
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            posts.append((url, kwargs.get("json") or {}))
+            return self._Response()
+
+    await _auto_create_pi_terminal(
+        "5e3a1b2c4d6f7e8091a2b3c4d5e6f708",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+
+    notice_posts = [
+        body
+        for url, body in posts
+        if "/events" in url and body.get("type") == "external_conversation_item"
+    ]
+    assert len(notice_posts) == 1
+    data = notice_posts[0]["data"]
+    assert data["item_type"] == "error"
+    assert data["item_data"]["code"] == "pi_native_effort_ignored"
+    assert data["item_data"]["level"] == "info"
+    # The credential error code must not appear on a notice-only post.
+    assert data["item_data"]["code"] != "pi_credentials_unresolved"
 
 
 @pytest.mark.asyncio
@@ -799,8 +964,19 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: workspace-claude\n"
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -808,32 +984,6 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     )
 
     captured: dict[str, Any] = {}
-
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
 
     # Fake Omnigent server client that returns a session with reasoning_effort.
     def _handle_request(_request: httpx.Request) -> httpx.Response:
@@ -860,7 +1010,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
                 "snapshot": {
                     "created_at": 10,
                     "updated_at": 11,
-                    "workspace": str(tmp_path),
+                    "workspace": str(workspace),
                     "reasoning_effort": "high",
                     "labels": {},
                 },
@@ -873,13 +1023,15 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
         await _auto_create_claude_terminal(
             session_id,
-            _FakeResourceRegistry(),
+            _RecordingClaudeRegistry(captured),
             lambda _sid, _evt: None,
             server_client=fake_client,
             session_init=session_init,
         )
 
     args = captured["spec"].args
+    assert captured["spec"].os_env.cwd == str(workspace)
+    assert captured["spec"].command == "workspace-claude"
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
@@ -892,6 +1044,47 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     assert str(bridge_dir_for_bridge_id(session_id)) not in messages[0]
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_rejects_missing_recorded_workspace_before_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing recorded workspace stops startup before bridge or terminal setup."""
+    missing_workspace = tmp_path / "removed-workspace"
+    session_id = "f89fd41f6eefee45b2117ac0fcbc73fa"
+    session_init = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": "agent",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(missing_workspace),
+                "labels": {},
+            },
+        }
+    )
+
+    def unexpected_bridge_setup(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("bridge setup must not run for a missing workspace")
+
+    monkeypatch.setattr(claude_native_bridge, "prepare_bridge_dir", unexpected_bridge_setup)
+
+    with pytest.raises(OmnigentError) as failure:
+        await _auto_create_claude_terminal(
+            session_id,
+            object(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+            session_init=session_init,
+        )
+
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
 
 
 @pytest.mark.asyncio
@@ -924,9 +1117,6 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_under_w
         "omnigent._platform.shutil.which",
         lambda name: windows_claude if name == "claude" else None,
     )
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -990,9 +1180,6 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_env_ove
         "omnigent._platform.shutil.which",
         lambda name: windows_claude if name == windows_claude else None,
     )
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -1062,41 +1249,12 @@ async def test_auto_create_claude_terminal_honors_compatible_claude_env_override
         ),
     )
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
 
     captured: dict[str, Any] = {}
-
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
 
     def _handle_request(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"labels": {}})
@@ -1108,7 +1266,7 @@ async def test_auto_create_claude_terminal_honors_compatible_claude_env_override
 
     await _auto_create_claude_terminal(
         "conv_wsl_good_override",
-        _FakeResourceRegistry(),
+        _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
         server_client=fake_client,
     )
@@ -1213,9 +1371,6 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -1306,9 +1461,6 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -1425,9 +1577,6 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -1458,32 +1607,6 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
         transport=httpx.MockTransport(
@@ -1494,7 +1617,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
 
     await _auto_create_claude_terminal(
         "13efa494411f3ae60211e6be5635062a",
-        _FakeResourceRegistry(),
+        _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
         server_client=fake_client,
         record_launch_config=recorded_configs.__setitem__,
@@ -1653,9 +1776,6 @@ async def _run_auto_create_cursor_terminal(
         "omnigent.harnesses.cursor_native.main.resolve_cursor_executable", lambda: "cursor-agent"
     )
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.cursor_native.forwarder.supervise_cursor_forwarder",
         _no_op_forwarder,
@@ -1696,7 +1816,8 @@ async def _run_auto_create_cursor_terminal(
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key, resource_role, parent_os_env
+            del terminal_name, session_key, resource_role
+            captured["parent_os_env"] = parent_os_env
             captured["spec"] = spec
             return SessionResourceView(
                 id="terminal_cursor_main",
@@ -1752,6 +1873,24 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
     assert spec.command == "cursor-agent"
     assert "--model" in spec.args
     assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_inherits_agent_os_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor launches with the sandbox and environment declared by its agent."""
+    agent_os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(spec_version=1, name="cursor", os_env=agent_os_env),
+        terminal_launch_args=None,
+    )
+
+    assert captured["parent_os_env"] is agent_os_env
+    assert captured["spec"].os_env.sandbox is agent_os_env.sandbox
 
 
 @pytest.mark.parametrize(
@@ -1891,6 +2030,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
     # Pin the launch config to Claude's native auth so the test does not
     # depend on the runner process's ambient Databricks profile.
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -1919,8 +2059,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        bridge_dir: Path,
     ) -> Path:
         """Record the resume id and return a transcript path."""
+        assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -2047,6 +2189,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
     # Write the previous claude_session_id into the bridge state.json *before*
@@ -2067,7 +2210,9 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        bridge_dir: Path,
     ) -> Path:
+        assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -2182,9 +2327,6 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -2323,7 +2465,7 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
         "code": "native_terminal_start_failed",
         "error_id": error_id,
         "message": (
-            "Native Codex terminal failed to start; "
+            "Native Codex terminal failed to start (ImportError); "
             f"see the runner log for details: {pinned_runner_log} "
             f"Error ID: {error_id}."
         ),
@@ -2332,6 +2474,9 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     # logged for operators. If this fails, the redaction regressed (raw
     # text back in the payload) or the server-side log was dropped.
     assert "requires the 'codex' CLI" not in error["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in error["message"]
     assert "requires the 'codex' CLI on PATH." in caplog.text
     assert error_id in caplog.text
     assert [p.event for p in published] == [
@@ -2461,9 +2606,6 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -2572,9 +2714,6 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -3277,6 +3416,128 @@ class _CodexSnapshotServerClient:
         return _Response({"id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d", "labels": labels})
 
 
+class _BlockingCodexRecoveryServerClient:
+    """Block durable inbox recovery while rejecting redundant init reads."""
+
+    def __init__(self) -> None:
+        self.recovery_started = asyncio.Event()
+        self.release_recovery = asyncio.Event()
+        self.recovery_completed = asyncio.Event()
+        self.requests: list[str] = []
+        self.launch_snapshot: dict[str, Any] | None = None
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Serve recovery/history; metadata reads must be explicitly enabled."""
+        del kwargs
+        self.requests.append(url)
+        if url.endswith("/child_sessions"):
+            self.recovery_started.set()
+            await self.release_recovery.wait()
+            self.recovery_completed.set()
+            return httpx.Response(
+                200,
+                json={"data": [], "has_more": False},
+                request=httpx.Request("GET", url),
+            )
+        if url.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={"data": [], "has_more": False},
+                request=httpx.Request("GET", url),
+            )
+        if (
+            self.launch_snapshot is not None
+            and url == f"/v1/sessions/{self.launch_snapshot['id']}"
+        ):
+            return httpx.Response(
+                200, json=self.launch_snapshot, request=httpx.Request("GET", url)
+            )
+        raise AssertionError(f"unexpected runner-init GET: {url}")
+
+
+class _DeletingCodexRecoveryServerClient:
+    """Pause the first recovery after one child is delivered."""
+
+    def __init__(self, parent_id: str, first_child_id: str, second_child_id: str) -> None:
+        self.parent_id = parent_id
+        self.first_child_id = first_child_id
+        self.second_child_id = second_child_id
+        self.scan_count = 0
+        self.second_child_read_started = asyncio.Event()
+        self.first_recovery_cancelled = asyncio.Event()
+
+    def _child_summary(self, child_id: str, dispatch_id: str) -> dict[str, Any]:
+        return {
+            "id": child_id,
+            "tool": "reviewer",
+            "session_name": child_id,
+            "current_task_status": "completed",
+            "labels": {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: dispatch_id},
+        }
+
+    @staticmethod
+    def _response(payload: dict[str, Any]) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=payload,
+            request=httpx.Request("GET", "http://test-server"),
+        )
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        del kwargs
+        if url.endswith(f"/{self.parent_id}/child_sessions"):
+            self.scan_count += 1
+            return self._response(
+                {
+                    "data": [
+                        self._child_summary(self.first_child_id, "dispatch-first"),
+                        self._child_summary(self.second_child_id, "dispatch-second"),
+                    ],
+                    "has_more": False,
+                }
+            )
+        if url.endswith(f"/{self.first_child_id}/items"):
+            return self._response(
+                {
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "first result"}],
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        if url.endswith(f"/{self.second_child_id}/items"):
+            if self.scan_count == 1:
+                self.second_child_read_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.first_recovery_cancelled.set()
+                    raise
+            return self._response(
+                {
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "second result"}],
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+        if url.endswith(f"/{self.parent_id}/items"):
+            return self._response({"data": [], "has_more": False})
+        raise AssertionError(f"unexpected runner-init GET: {url}")
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        del kwargs
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+
 _CODEX_AUTO_CREATE_SCENARIOS = [
     # Rotation target: the bridge's active session still owns the live codex
     # terminal that is about to be transferred onto the new session.
@@ -3453,6 +3714,392 @@ async def test_create_session_codex_auto_create_guard_skips_rotation_targets(
 
 
 @pytest.mark.asyncio
+async def test_create_session_codex_envelope_avoids_reads_and_overlaps_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Init avoids metadata reads; a later terminal ensure reads changed config."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://test-server")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
+        tmp_path / "codex-native",
+    )
+    terminal_started = asyncio.Event()
+    launch_configs: list[Any] = []
+
+    async def _recording_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        launch_configs.append(
+            await _codex_native_launch_config(
+                session_id=session_id,
+                server_client=kwargs["server_client"],
+                session_init=kwargs.get("session_init"),
+            )
+        )
+        terminal_started.set()
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _recording_auto_create,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    session_id = "f1a92609dd7840ae9f2c4c29127c2a61"
+    agent_id = "7d594e9075c74249a846df420dfa7fcb"
+    server_client = _BlockingCodexRecoveryServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        request_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "session_init": {
+                        "protocol_version": 2,
+                        "server_version": "0.13.0.dev5",
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "snapshot": {
+                            "created_at": 10,
+                            "updated_at": 11,
+                            "workspace": str(tmp_path),
+                            "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+                            "model_override": "gpt-5.4-mini",
+                            "reasoning_effort": "high",
+                            "external_session_id": None,
+                            "terminal_launch_args": ["--config", "approval_policy=on-request"],
+                            "harness_override": "codex-native",
+                            "cost_control_mode_override": None,
+                        },
+                    },
+                },
+            )
+        )
+        recovery_wait = asyncio.create_task(server_client.recovery_started.wait())
+        done, _ = await asyncio.wait(
+            {request_task, recovery_wait},
+            timeout=1.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert recovery_wait in done, (
+            f"session init finished before recovery started: "
+            f"{request_task.result().status_code} {request_task.result().text}"
+        )
+        await asyncio.wait_for(terminal_started.wait(), timeout=1.0)
+        assert not request_task.done()
+        server_client.release_recovery.set()
+        resp = await request_task
+
+        assert resp.status_code == 201, resp.text
+        assert len(launch_configs) == 1
+        assert launch_configs[0].model_override == "gpt-5.4-mini"
+        assert launch_configs[0].external_session_id is None
+        assert server_client.requests == [
+            f"/v1/sessions/{session_id}/child_sessions",
+            f"/v1/sessions/{session_id}/items",
+        ]
+
+        server_client.launch_snapshot = {
+            "id": session_id,
+            "workspace": str(tmp_path),
+            "model_override": "gpt-5.4",
+            "external_session_id": "thread_current",
+            "terminal_launch_args": ["--config", "approval_policy=never"],
+        }
+        ensured = await client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+        )
+
+    assert ensured.status_code == 200, ensured.text
+    assert len(launch_configs) == 2
+    assert launch_configs[1].model_override == "gpt-5.4"
+    assert launch_configs[1].external_session_id == "thread_current"
+    assert launch_configs[1].terminal_launch_args == ["--config", "approval_policy=never"]
+    assert server_client.requests[-1] == f"/v1/sessions/{session_id}"
+
+
+@pytest.mark.asyncio
+async def test_create_session_keeps_recovery_alive_when_pre_launch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal pre-launch failure must not orphan concurrent inbox recovery."""
+
+    async def _raise_pre_launch_error(**_kwargs: Any) -> bool:
+        raise RuntimeError("pre-launch failed")
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._codex_native_terminal_arrives_via_transfer",
+        _raise_pre_launch_error,
+    )
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    session_id = "c46cf86fc9674eac9097e3fb260ce85f"
+    agent_id = "5b491851c683439981e6c2188929fcc0"
+    server_client = _BlockingCodexRecoveryServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        with pytest.raises(RuntimeError, match="pre-launch failed"):
+            await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "session_init": {
+                        "protocol_version": 2,
+                        "server_version": "0.13.0.dev5",
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "snapshot": {
+                            "created_at": 10,
+                            "updated_at": 11,
+                            "workspace": str(tmp_path),
+                            "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+                        },
+                    },
+                },
+            )
+        await asyncio.wait_for(server_client.recovery_started.wait(), timeout=1.0)
+        server_client.release_recovery.set()
+        await asyncio.wait_for(server_client.recovery_completed.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_delete_cancels_recovery_before_same_session_reinitializes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deletion must stop stale recovery before a same-id session is recreated."""
+    pre_launch_calls = 0
+
+    async def _fail_first_pre_launch(**_kwargs: Any) -> bool:
+        nonlocal pre_launch_calls
+        pre_launch_calls += 1
+        if pre_launch_calls == 1:
+            raise RuntimeError("pre-launch failed")
+        return False
+
+    async def _skip_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **_kwargs: Any,
+    ) -> None:
+        del session_id, resource_registry, publish_event
+
+    async def _skip_bridge_cleanup(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._codex_native_terminal_arrives_via_transfer",
+        _fail_first_pre_launch,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _skip_auto_create,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.app._delete_native_bridge_dirs",
+        _skip_bridge_cleanup,
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    session_id = "97a1ce7a249c4f64aacb9064f690e639"
+    agent_id = "fe373ed32ac948d599d50b52680d1c62"
+    first_child_id = "4f214b07944c436ea21c47eec87ecbb2"
+    second_child_id = "053550e3650144248e99f77995976377"
+    server_client = _DeletingCodexRecoveryServerClient(
+        session_id,
+        first_child_id,
+        second_child_id,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    body = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.13.0.dev5",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(tmp_path),
+                "labels": {CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: session_id},
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        with pytest.raises(RuntimeError, match="pre-launch failed"):
+            await client.post("/v1/sessions", json=body)
+        await asyncio.wait_for(server_client.second_child_read_started.wait(), timeout=1.0)
+        first_entry = subagent_work.get_subagent_work(first_child_id)
+        assert first_entry is not None and first_entry.delivered
+        assert subagent_work._session_inboxes_ref[session_id].qsize() == 1
+
+        delete_resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert delete_resp.status_code == 200, delete_resp.text
+        assert server_client.first_recovery_cancelled.is_set()
+        assert subagent_work.get_subagent_work(first_child_id) is None
+        assert session_id not in subagent_work._session_inboxes_ref
+
+        recreate_resp = await client.post("/v1/sessions", json=body)
+        assert recreate_resp.status_code == 201, recreate_resp.text
+        recovered = []
+        inbox = subagent_work._session_inboxes_ref[session_id]
+        while not inbox.empty():
+            recovered.append(inbox.get_nowait())
+        assert any(
+            payload.get("task_id") == first_child_id and payload.get("output") == "first result"
+            for payload in recovered
+        )
+        assert server_client.scan_count == 2
+
+        cleanup_resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert cleanup_resp.status_code == 200, cleanup_resp.text
+
+
+class _RecordingCodexRegistry:
+    """Captures the launched Codex terminal spec."""
+
+    terminal_registry = None
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self.captured = captured
+
+    async def launch_auxiliary_terminal(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: Any,
+        resource_role: str | None = None,
+        parent_os_env: Any = None,
+    ) -> SessionResourceView:
+        """Record the spec and return a terminal resource view."""
+        del terminal_name, session_key, resource_role, parent_os_env
+        self.captured["spec"] = spec
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="codex:main"
+        )
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_launch_reads_project_config_from_session_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex TUI relaunch reads the session workspace's config after the runner cwd is gone."""
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _launch_codex_native_tui,
+    )
+
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+
+    captured: dict[str, Any] = {}
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=None,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    await _launch_codex_native_tui(
+        "conv_codex_cwd_gone",
+        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        app_server=app_server,  # type: ignore[arg-type]
+        launch_config=_CodexNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+        ),
+        bridge_dir=tmp_path / "bridge",
+        thread_id=None,
+        agent_spec=None,
+    )
+
+    spec = captured["spec"]
+    assert spec.command == "workspace-codex"
+    assert spec.args[0] == "--workspace-arg"
+    assert spec.os_env.cwd == str(workspace)
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_registers_permission_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3617,9 +4264,6 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -3711,6 +4355,29 @@ def _claude_hook_commands(spec: Any) -> list[str]:
     ]
 
 
+async def test_auto_create_claude_terminal_loads_workspace_agents_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    skill = workspace / ".agents" / "skills" / "portable" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: portable\ndescription: Portable skill\n---\nUse this skill.\n")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f604",
+        routed=False,
+    )
+
+    overlay = Path(spec.args[spec.args.index("--add-dir") + 1])
+    exposed = list((overlay / ".claude" / "skills").glob("*/SKILL.md"))
+    assert [path.parent.name for path in exposed] == ["portable"]
+    assert [path.read_text() for path in exposed] == [skill.read_text()]
+
+
 async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3788,7 +4455,7 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
+@pytest.mark.parametrize("endpoint", ["subscription", "gateway", "bound"])
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
     tmp_path: Path,
@@ -3804,13 +4471,11 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     spellings, launches on its own default instead and resets the pick to Default.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inference_config import inference_config_scope
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -3835,38 +4500,13 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
     patches: list[dict[str, Any]] = []
+    selected_model = "private/model-b[large]" if endpoint == "bound" else "claude-opus-4-8"
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
-        return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
+        return httpx.Response(200, json={"model_override": selected_model, "labels": {}})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -3886,17 +4526,34 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        resolve_launch_config=_resolve,
+    inference = (
+        {
+            "providers": {"gateway": {"kind": "gateway"}},
+            "inference": {
+                "harnesses": {
+                    "claude-native": {
+                        "provider": "gateway",
+                        "default_model": "private/model-a",
+                        "model_allowlist": ["private/model-a", selected_model],
+                    }
+                }
+            },
+        }
+        if endpoint == "bound"
+        else {}
     )
+    with inference_config_scope(inference):
+        await _auto_create_claude_terminal(
+            session_id,
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
     args = captured["spec"].args
     pick_resets = [body for body in patches if "model_override" in body]
-    if endpoint == "subscription":
-        assert args[args.index("--model") + 1] == "claude-opus-4-8"
+    if endpoint in ("subscription", "bound"):
+        assert args[args.index("--model") + 1] == selected_model
         assert pick_resets == []
     else:
         assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"
@@ -3921,9 +4578,6 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -3951,32 +4605,6 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
     patches: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -3994,7 +4622,7 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
 
     await _auto_create_claude_terminal(
         "1a2b3c4d5e6f47a8b9c0d1e2f3a4b5c6",
-        _FakeResourceRegistry(),
+        _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
         server_client=fake_client,
         resolve_launch_config=_resolve,
@@ -4104,9 +4732,6 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -4148,32 +4773,6 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
     patches: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -4191,7 +4790,7 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
 
     await _auto_create_claude_terminal(
         "2b3c4d5e6f7a48b9c0d1e2f3a4b5c6d7",
-        _FakeResourceRegistry(),
+        _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
         server_client=fake_client,
         resolve_launch_config=_resolve,
@@ -4251,9 +4850,6 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
-
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -4270,32 +4866,6 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
     monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
 
     captured: dict[str, Any] = {}
-
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
 
     patches: list[dict[str, Any]] = []
 
@@ -4322,7 +4892,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
 
     await _auto_create_claude_terminal(
         "1a2b3c4d5e6f47899a0b1c2d3e4f5061",
-        _FakeResourceRegistry(),
+        _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
         server_client=fake_client,
         resolve_launch_config=_resolve,
@@ -4333,6 +4903,81 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
     )
     assert [body for body in patches if "model_override" in body] == [], (
         "a foldable pin must survive the launch un-reset"
+    )
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pick", "expected_model", "reset_pick"),
+    [
+        ("claude-opus-4-8", "system.ai.claude-opus-5-5[1m]", True),
+        ("claude-sonnet-5-5[1m]", "system.ai.claude-sonnet-5-5[1m]", False),
+        ("system.ai.claude-sonnet-5-5[1m]", "system.ai.claude-sonnet-5-5[1m]", False),
+    ],
+)
+async def test_auto_create_claude_terminal_validates_managed_gateway_pick(
+    pick: str,
+    expected_model: str,
+    reset_pick: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}})
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_settings,),
+    )
+    catalog = [
+        {"id": "opus", "model": "system.ai.claude-opus-5-5[1m]", "isDefault": True},
+        {"id": "sonnet", "model": "system.ai.claude-sonnet-5-5[1m]"},
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        assert config is None
+        return catalog
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog_is_stale",
+        lambda config: False,
+    )
+    captured: dict[str, Any] = {}
+    patches: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+        return httpx.Response(200, json={"model_override": pick, "labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+
+    async def _resolve() -> None:
+        return None
+
+    await _auto_create_claude_terminal(
+        "1a2b3c4d5e6f47899a0b1c2d3e4f5061",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    assert args[args.index("--model") + 1] == expected_model
+    assert [body for body in patches if "model_override" in body] == (
+        [{"model_override": "default"}] if reset_pick else []
     )
     await fake_client.aclose()
 
@@ -4363,9 +5008,6 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-
-    async def _no_op_forwarder(**kwargs: Any) -> None:
-        del kwargs
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -4406,32 +5048,6 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
-        """Captures the launched terminal spec."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key
-            captured["spec"] = spec
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
     def _handle_request(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"labels": {}})
 
@@ -4445,7 +5061,7 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
 
     await _auto_create_claude_terminal(
         "9b1d2c3e4f5a6b7c8d9e0f1a2b3c4d5e",
-        _FakeResourceRegistry(),
+        _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
         server_client=fake_client,
         resolve_launch_config=_resolve,

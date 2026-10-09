@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import hmac
 import logging
 import os
@@ -50,7 +51,7 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -141,6 +142,41 @@ _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S
 # Retry only pre-output wedges after confirmed teardown. Replaying a turn
 # with progress can duplicate tool effects; retries never extend the hard cap.
 _WEDGED_TURN_RECOVERY_RETRIES = 1
+
+# Set by the harness subprocess entrypoint. Executors import their SDKs lazily
+# on the first turn, so that graph is only static once a turn has completed.
+_freeze_gc_after_first_turn = False
+
+
+def arm_gc_freeze_after_first_turn() -> None:
+    """Collect and freeze GC-tracked objects once, after this process's first completed turn.
+
+    Only the harness subprocess arms this; an embedding process keeps normal
+    GC. A failed or cancelled turn leaves the freeze armed, so a later turn
+    still freezes the lazily imported SDK.
+    """
+    global _freeze_gc_after_first_turn
+    _freeze_gc_after_first_turn = True
+
+
+def _freeze_gc_if_armed(run_task: asyncio.Task[None], ctx: TurnContext) -> None:
+    """Run the armed freeze once *run_task* has completed without error.
+
+    Called after the turn's terminal event is sent and its state torn down, so
+    the one-time collection (~25 ms) is off the turn's path and frees the
+    turn's cycles instead of pinning them. A harness that observes
+    ``ctx.cancelled`` and returns normally ended a cancelled turn, not a completed one.
+    """
+    global _freeze_gc_after_first_turn
+    if not _freeze_gc_after_first_turn or not run_task.done() or run_task.cancelled():
+        return
+    if ctx.cancelled.is_set():
+        return
+    if run_task.exception() is not None:
+        return
+    _freeze_gc_after_first_turn = False
+    gc.collect()
+    gc.freeze()
 
 
 @dataclass(frozen=True)
@@ -1426,6 +1462,7 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
+            _freeze_gc_if_armed(run_task, ctx)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int
@@ -1538,8 +1575,8 @@ class HarnessApp:
           the idle watchdog; only with the idle watchdog disabled does
           this act as a strict wall-clock cap.
 
-        Retry a wedged invocation only before output or side-effectful work
-        has begun, and only after the subclass confirms executor cleanup.
+        Retry a wedged invocation or confirmed transport loss only before
+        progress and after the subclass confirms executor cleanup.
         Replaying the original request after progress would duplicate output
         and tool effects. Recovery is bounded by the retry count and the
         remaining absolute budget; it never extends that budget.
@@ -1603,8 +1640,11 @@ class HarnessApp:
                         async with idle_wd:
                             await self.run_turn(request, ctx)
                         return
-                    except TimeoutError as exc:
-                        if not idle_wd.expired():
+                    except (TimeoutError, HarnessTransportClosedError) as exc:
+                        transport_closed = isinstance(exc, HarnessTransportClosedError)
+                        if transport_closed and not exc.replay_safe:
+                            raise
+                        if not transport_closed and not idle_wd.expired():
                             # An inner ``run_turn`` TimeoutError (not the
                             # watchdog); pass it through unchanged.
                             raise
@@ -1625,6 +1665,8 @@ class HarnessApp:
                             or ctx.cancelled.is_set()
                             or ctx._has_progress
                         ):
+                            if transport_closed:
+                                raise
                             raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
                         # Cleanup and retry notices must not extend the absolute ceiling.
                         ctx._reset_idle_watchdog = None
@@ -1641,13 +1683,24 @@ class HarnessApp:
                                 and absolute_deadline - loop.time() < idle_timeout
                             )
                         ):
+                            if transport_closed:
+                                raise
                             raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
+                        if transport_closed:
+                            retry_message = (
+                                f"native harness transport closed before progress ({exc}); "
+                                "the stopped invocation is being retried"
+                            )
+                        else:
+                            retry_message = (
+                                f"turn made no progress for {idle_timeout:.0f}s "
+                                "(likely a wedged LLM or tool call); the wedged call "
+                                "was abandoned and the turn is being retried"
+                            )
                         _logger.warning(
-                            "run_turn for %s made no progress for %.0fs (idle turn "
-                            "watchdog); abandoning the wedged call and retrying the "
-                            "turn (attempt %d/%d)",
+                            "%s for %s (attempt %d/%d)",
+                            retry_message,
                             ctx.response_id,
-                            idle_timeout,
                             attempt + 2,
                             attempts,
                         )
@@ -1659,13 +1712,8 @@ class HarnessApp:
                                 max_attempts=attempts,
                                 delay_seconds=0.0,
                                 error=RetryErrorDetail(
-                                    code="timeout",
-                                    message=(
-                                        f"turn made no progress for "
-                                        f"{idle_timeout:.0f}s (likely a wedged LLM or "
-                                        f"tool call); the wedged call was abandoned "
-                                        f"and the turn is being retried"
-                                    ),
+                                    code="connection_error" if transport_closed else "timeout",
+                                    message=retry_message,
                                 ),
                             )
                         )

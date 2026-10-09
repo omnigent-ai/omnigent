@@ -656,7 +656,7 @@ def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
     monkeypatch.undo()
     options = add_menu_options()
     databricks = next(o for o in options if o.label.endswith("Databricks — workspace"))
-    assert "Unity AI Gateway" in databricks.description
+    assert "Unity Gateway" in databricks.description
 
 
 def test_configure_models_add_databricks_aborts_without_extra(
@@ -1744,8 +1744,11 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Antigravity",
         "Qwen Code",
         "Goose",
-        # Builtin ACP CLI rows (ACP_CLI_HARNESSES) render after Goose, the other
-        # ACP-family builtin, sorted by id, before the non-ACP harnesses.
+        # Devin's NATIVE row (devin-native) renders in the slot its former builtin
+        # ACP row held. The ACP harness is deprecated: it stays resolvable via
+        # `--harness devin-acp` but is no longer offered here, so native Devin is
+        # the sole "Devin" row. The remaining builtin ACP CLI rows follow, sorted
+        # by id, before the non-ACP harnesses.
         "Devin",
         "Grok Build",
         "Jcode",
@@ -1811,35 +1814,41 @@ def test_overview_shows_one_row_when_acp_agent_shadows_builtin(
 ) -> None:
     """A configured agent named after a builtin ACP row replaces it, not doubles it.
 
-    "Devin" slugifies to ``devin``, which is also an ``ACP_CLI_HARNESSES`` id, so
+    "Grok" slugifies to ``grok``, which is also an ``ACP_CLI_HARNESSES`` id, so
     both sources want a row. The configured one wins — it names the exact command,
     which the fixed row argv cannot express — and the builtin is dropped so the
-    list never shows two identically labeled "Devin" rows from different sources.
+    list never shows two identically labeled rows from different sources.
+
+    Devin is the contrast: its ACP row is keyed ``devin-acp`` and the bare
+    ``devin`` spelling belongs to the native wrap, so a configured ``acp:devin``
+    agent adds its own row rather than shadowing either.
     """
     from rich.text import Text
 
     config_path = os.path.join(isolated_config, "config.yaml")
     with open(config_path, "w") as f:
         yaml.safe_dump(
-            {
-                "acp": {
-                    "agents": [{"name": "Devin", "command": "devin acp --model swe-1-7-medium"}]
-                }
-            },
+            {"acp": {"agents": [{"name": "Grok", "command": "grok agent stdio --verbose"}]}},
             f,
         )
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
     names = _overview_row_names(options, selectable)
-    assert names.count("Devin") == 1, f"expected exactly one Devin row, got {names}"
-    # A non-colliding builtin row is untouched.
-    assert "Grok Build" in names
+    assert names.count("Grok") == 1, f"expected exactly one Grok row, got {names}"
+    # The builtin row it shadowed is gone: the ``grok`` row's own label is
+    # "Grok Build", so its absence proves the row was dropped rather than
+    # rendered alongside the user's.
+    assert "Grok Build" not in names, f"builtin grok row should be shadowed, got {names}"
+    # Devin is unaffected by a collision elsewhere: its native row stays. The ACP
+    # row is deprecated, so it is not offered here regardless of this collision.
+    assert names.count("Devin") == 1, f"expected the native Devin row, got {names}"
+    assert "Devin (ACP)" not in names
     # The surviving row is the user's: its status carries the configured command,
     # not the builtin's "own auth" label.
     # (the status is width-capped, so match its head rather than the full command)
-    devin_row = next(o for o in options if Text.from_markup(o).plain.startswith("Devin "))
-    assert "ACP · devin acp" in Text.from_markup(devin_row).plain
+    grok_row = next(o for o in options if Text.from_markup(o).plain.startswith("Grok "))
+    assert "ACP · grok agent" in Text.from_markup(grok_row).plain
 
 
 def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
@@ -1912,6 +1921,8 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
+    # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
+    # row after it one lower (see the dispatch table's note).
     stdin = "\n".join(["16", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
@@ -2142,10 +2153,11 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        # 10-12 are the builtin ACP CLI rows (Devin, Grok Build, Jcode;
-        # sorted by id) every row after them shifted down by three when the
-        # jcode row landed.
-        ("10", "_show_acp_cli_harness"),
+        # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
+        # row used to hold. The ACP path is deprecated (not offered), so 11-12
+        # are the remaining builtin ACP CLI rows (Grok Build, Jcode; sorted by
+        # id); every row after them sits one lower.
+        ("10", "_manage_devin_harness"),
         ("11", "_show_acp_cli_harness"),
         ("12", "_show_acp_cli_harness"),
         ("13", "_manage_copilot_harness"),
@@ -2619,7 +2631,7 @@ def test_credential_label_cli_config_uses_provider_name() -> None:
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "isaac-databricks-codex", display_name="Databricks AI Gateway"
+        "cli-config", "isaac-databricks-codex", display_name="Databricks Unity Gateway"
     )
     assert label == "Isaac-Databricks-Codex"
 
@@ -2642,11 +2654,11 @@ def test_build_cli_config_provider_entry_shapes() -> None:
     """
     from omnigent.onboarding.configure_models import build_cli_config_provider_entry
 
-    assert build_cli_config_provider_entry("codex", "Databricks", "Databricks AI Gateway") == {
+    assert build_cli_config_provider_entry("codex", "Databricks", "Databricks Unity Gateway") == {
         "kind": "cli-config",
         "cli": "codex",
         "model_provider": "Databricks",
-        "display_name": "Databricks AI Gateway",
+        "display_name": "Databricks Unity Gateway",
     }
     # No display name → key omitted entirely (labels fall back to the
     # entry name), not written as None/empty.
@@ -2665,7 +2677,7 @@ _CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]
@@ -2749,7 +2761,7 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
     # the friendly display name for labels.
     assert entry["kind"] == "cli-config"
     assert entry["model_provider"] == "Databricks"
-    assert entry["display_name"] == "Databricks AI Gateway"
+    assert entry["display_name"] == "Databricks Unity Gateway"
     # Re-claims the codex (openai) default — there is no other credential.
     assert entry["default"] is True or entry.get("default") == "true"
     # The dismissal is cleared, so the credential behaves like an ordinary
@@ -3506,8 +3518,8 @@ def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch)
         )
     )
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
-    assert _credential_label("claude", entry) == "Databricks AI Gateway"
-    assert _compact_credential_label(det) == "Databricks AI Gateway"
+    assert _credential_label("claude", entry) == "Databricks Unity Gateway"
+    assert _compact_credential_label(det) == "Databricks Unity Gateway"
 
 
 def _cp1252_console():

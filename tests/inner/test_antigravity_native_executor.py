@@ -25,6 +25,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 )
 from omnigent.inner.antigravity_native_executor import AntigravityNativeExecutor
 from omnigent.inner.executor import ExecutorError, ExecutorEvent, TurnComplete
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 _CONVERSATION_ID = "90468e33-38c3-4e48-ae9f-03c843196227"
 _PLACEHOLDER_ID = "agy_conv_placeholder123"
@@ -277,7 +278,7 @@ _PNG_DATA_URI = (
 def test_run_turn_image_attachment_materialized(
     tmp_path: Path, injected: dict[str, object]
 ) -> None:
-    """An image block is written to the bridge dir and referenced by path."""
+    """An image block is written to the session cache and referenced by path."""
     _seed_state(tmp_path)
 
     async def _drive() -> list[ExecutorEvent]:
@@ -303,7 +304,7 @@ def test_run_turn_image_attachment_materialized(
     assert isinstance(content, str)
     # attachment marker is prepended ahead of the typed text
     assert content.startswith("[Attached: ")
-    assert str(tmp_path) in content
+    assert str(attachment_cache_dir(tmp_path)) in content
     assert content.endswith("describe this")
     assert isinstance(events[0], TurnComplete)
 

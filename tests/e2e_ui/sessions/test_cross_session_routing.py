@@ -42,11 +42,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright
+
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
 # Unique sentinels so each POST body is unambiguously identifiable.
@@ -55,35 +55,6 @@ _MSG2 = "sentinel-xsess-msg2-9c2e second message into B"
 _MSG3 = "sentinel-xsess-msg3-5d1b message into A while B is stalled"
 
 _EVENTS_RE = re.compile(r"/v1/sessions/([^/]+)/events$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    This file is a sync test that drives async Playwright. The e2e_ui suite
-    runs many pytest-playwright **sync** tests in the same session; once one
-    has run, pytest-asyncio can't start a loop on the main thread
-    ("Runner.run() cannot be called from a running event loop"). Running the
-    coroutine from a fresh thread via :func:`asyncio.run` sidesteps that
-    entirely. Any exception — including assertion failures — is captured and
-    re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises BaseException: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, BaseException] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except BaseException as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:

@@ -107,6 +107,9 @@ class _StubResourceRegistry:
         """
         self._terminal_exit_publisher = publisher
 
+    def note_terminal_control_request(self, session_id: str, action: str) -> None:
+        """No terminal is running, so control requests have no lifecycle evidence."""
+
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
         """
         Return a fixed env root for the launched terminal.
@@ -482,7 +485,9 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
         closure so the test can assert on what was sent to the Omnigent server.
         """
 
-        async def get(self, url: str, *, timeout: float = 10.0) -> httpx.Response:
+        async def get(
+            self, url: str, *, timeout: float = 10.0, params: dict[str, str] | None = None
+        ) -> httpx.Response:
             """Return a session snapshot with no labels so bridge_id falls back to session_id.
 
             :param url: Request URL (unused beyond the response).

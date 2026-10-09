@@ -114,8 +114,8 @@ describe("customTheme", () => {
     expect(deriveCustomTheme({ ...theme, contrast: 50 })).toEqual(palette.tokens);
   });
 
-  it.each(PALETTES)("preserves $label selection contrast when customizing accents", (palette) => {
-    for (const accent of ["#000000", "#777777", "#ffffff"]) {
+  it.each(PALETTES)("tints $label's selection with a custom accent", (palette) => {
+    for (const accent of ["#2563eb", "#777777", "#f59e0b"]) {
       const variants = deriveCustomTheme({
         ...createCustomThemeFromPalette(palette),
         accent,
@@ -123,12 +123,37 @@ describe("customTheme", () => {
         contrast: 100,
         translucentSidebar: true,
       });
+      const [r, g, b] = [1, 3, 5].map((offset) =>
+        Number.parseInt(accent.slice(offset, offset + 2), 16),
+      );
 
       for (const mode of ["light", "dark"] as const) {
-        expect(variants[mode].selectionBackground).toBe(palette.tokens[mode].selectionBackground);
-        expect(variants[mode].selectionForeground).toBe(palette.tokens[mode].selectionForeground);
+        // The wash keeps the stock alpha for this palette and mode.
+        const alpha = /, ([\d.]+)\)$/.exec(palette.tokens[mode].selectionBackground)?.[1] ?? "0.12";
+        expect(variants[mode].selectionBackground).toBe(`rgba(${r}, ${g}, ${b}, ${alpha})`);
+        expect(variants[mode].selectionForeground).toBe(variants[mode].foreground);
       }
     }
+  });
+
+  it("keeps Omnigent's selection tint after contrast changes", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({ ...theme, contrast: 53 });
+
+    expect(variants.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
+    expect(variants.light.selectionForeground).toBe("#651249");
+    expect(variants.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.15)");
+    expect(variants.dark.selectionForeground).toBe("#f9a8d4");
+  });
+
+  it("tints the text selection with a custom accent, like the sidebar's active row", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const variants = deriveCustomTheme({ ...theme, accent: "#2563eb", darkAccent: "#f59e0b" });
+
+    expect(variants.light.selectionBackground).toBe("rgba(37, 99, 235, 0.1)");
+    expect(variants.dark.selectionBackground).toBe("rgba(245, 158, 11, 0.15)");
+    expect(variants.light.selectionForeground).toBe(variants.light.foreground);
+    expect(variants.dark.selectionForeground).toBe(variants.dark.foreground);
   });
 
   it("keeps Omnigent's selected-session colors after contrast changes", () => {
@@ -201,7 +226,7 @@ describe("customTheme", () => {
     expect(variants.dark.shellBackground).toBe(PALETTES[0].tokens.dark.shellBackground);
   });
 
-  it("keeps muted helper text at WCAG AA contrast for every allowed contrast setting", () => {
+  it("keeps helper text and links readable across custom contrast settings", () => {
     const channel = (hex: string, offset: number) => {
       const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
       return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
@@ -230,6 +255,7 @@ describe("customTheme", () => {
         variants.light.muted,
       ]) {
         expect(ratio(variants.light.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
+        expect(ratio(variants.light.link, surface)).toBeGreaterThanOrEqual(4.5);
       }
       for (const surface of [
         variants.dark.background,
@@ -237,6 +263,7 @@ describe("customTheme", () => {
         variants.dark.muted,
       ]) {
         expect(ratio(variants.dark.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
+        expect(ratio(variants.dark.link, surface)).toBeGreaterThanOrEqual(4.5);
       }
     }
   });

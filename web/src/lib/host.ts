@@ -1,4 +1,6 @@
-import type { ReactNode } from "react";
+import type { ComponentType, ReactNode, Ref } from "react";
+
+import { getBasePath, withBasePath } from "./basePath.ts";
 
 /**
  * Embed host integration seam.
@@ -92,7 +94,24 @@ export type OmnigentAnalyticsEvent =
       durationMs?: number;
     };
 
+/**
+ * Trusted host renderer for untrusted HTML. Before executing any supplied HTML,
+ * enforce sandboxing and an opaque or separate, unprivileged origin that prevents
+ * access to the host app. Expose the content iframe before forwarding every load.
+ */
+export interface HtmlPreviewFrameProps {
+  /** Prepared HTML includes an inline comment bridge; the frame's CSP must allow it. */
+  htmlContent: string;
+  iframeRef: Ref<HTMLIFrameElement>;
+  onLoad: () => void;
+}
+
 export interface OmnigentHostConfig {
+  /**
+   * Install before the app mounts and keep the component identity stable for that
+   * mount. Omitted by older hosts, which retain the sandboxed srcdoc preview.
+   */
+  htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
   /** Stable server/workspace identity used to scope browser-local extension storage. */
   serverIdentity?: string;
   /**
@@ -171,6 +190,10 @@ let hostConfig: OmnigentHostConfig = {};
 let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 let embedScopeRoot: HTMLElement | null = null;
+
+export function getOmnigentHtmlPreviewFrame(): OmnigentHostConfig["htmlPreviewFrame"] {
+  return hostConfig.htmlPreviewFrame;
+}
 
 export function getOmnigentServerIdentity(): string | null {
   if (hostConfig.serverIdentity?.trim()) return hostConfig.serverIdentity.trim();
@@ -304,9 +327,11 @@ export function getThemeRoots(): HTMLElement[] {
  */
 export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
   if (hostConfig.fetcher) {
+    // The host owns path rebasing (it proxies onto its own API surface), so
+    // the path is passed through untouched — `withBasePath` is standalone-only.
     return hostConfig.fetcher(path, init);
   }
-  return fetch(path, init);
+  return fetch(withBasePath(path), init);
 }
 
 export function resolveWebSocketUrl(path: string): string {
@@ -314,15 +339,15 @@ export function resolveWebSocketUrl(path: string): string {
     return hostConfig.resolveWebSocketUrl(path);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${path}`;
+  return `${scheme}//${window.location.host}${withBasePath(path)}`;
 }
 
 /**
  * Full server URL for CLI `--server` flags shown in in-product docs.
- * Returns `window.location.origin` plus the optional
- * {@link OmnigentHostConfig.cliServerUrlSuffix}.
+ * Returns `window.location.origin` plus the configured base path plus the
+ * optional {@link OmnigentHostConfig.cliServerUrlSuffix}.
  */
 export function getCliServerUrl(): string {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  return origin + (hostConfig.cliServerUrlSuffix ?? "");
+  return origin + getBasePath() + (hostConfig.cliServerUrlSuffix ?? "");
 }

@@ -40,9 +40,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnigent._platform import stable_user_id
 from omnigent.util.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_QWEN_NATIVE_BRIDGE_DIR"
@@ -786,3 +790,20 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: qwen's input-file watcher is running.
+
+    Same boot signal as :func:`wait_for_ready`; the events file is truncated per
+    launch, so a ``system`` event always belongs to the current process.
+
+    :param session_id: Omnigent conversation id (unused).
+    :param instance: The live qwen terminal; ``--json-file`` names its events file.
+    """
+    del session_id
+    args = instance.args
+    for index, arg in enumerate(args[:-1]):
+        if arg == "--json-file":
+            return _events_file_has_system_event(Path(args[index + 1]))
+    return False

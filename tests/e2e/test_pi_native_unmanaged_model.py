@@ -59,6 +59,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
+import psutil
 import pytest
 import yaml
 
@@ -152,17 +153,7 @@ def _bridge_dir(home: Path, session_id: str) -> Path:
 
 
 def _bridge_marker(session_id: str) -> str:
-    """Return the bridge-dir path segment used as a ``/proc`` sweep needle.
-
-    The tmux launcher embeds the whole pi command -- including this segment
-    via ``--extension`` / ``--session-dir`` -- as one argv element and never
-    rewrites it, so the segment stays a reliable needle for the cleanup
-    sweep. It is NOT usable to find the pi CLI itself: Pi's ``process.title``
-    rewrite erases it from that process's cmdline.
-
-    :param session_id: The session/conversation id.
-    :returns: ``"pi-native/<32-hex>"``.
-    """
+    """Return the session's hashed bridge-dir path segment."""
     return f"pi-native/{_bridge_digest(session_id)}"
 
 
@@ -185,9 +176,9 @@ def _read_argv_observation(bridge_dir: Path) -> dict | None:
 def _live_observed_pid(observation: dict, *, marker: str, workspace: Path) -> int | None:
     """Return the recorded pid when the live process is still that session's Pi.
 
-    A recorded pid alone is not safe to signal: it could have exited and been
-    recycled by an unrelated process. The pid is trusted only when the live
-    process's cwd is the session workspace and its cmdline is either the
+    A recorded pid could have exited and been recycled by an unrelated
+    process. The pid is trusted only when its cwd is the session workspace
+    and its cmdline is either the
     pre-rewrite launch argv (bridge marker present) or the post-rewrite bare
     ``pi`` title.
 
@@ -199,60 +190,17 @@ def _live_observed_pid(observation: dict, *, marker: str, workspace: Path) -> in
     pid = observation.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
-    proc_dir = Path("/proc") / str(pid)
     try:
-        cmdline = (proc_dir / "cmdline").read_bytes()
-        cwd = os.path.realpath(proc_dir / "cwd")
-    except OSError:
+        process = psutil.Process(pid)
+        cmdline = [token for token in process.cmdline() if token]
+        cwd = os.path.realpath(process.cwd())
+    except (psutil.Error, OSError):
         return None
     if cwd != os.path.realpath(workspace):
         return None
-    if marker.encode() not in cmdline and cmdline.rstrip(b"\x00") != b"pi":
+    if not any(marker in token for token in cmdline) and cmdline != ["pi"]:
         return None
     return pid
-
-
-def _kill_pi_processes(marker: str) -> None:
-    """Best-effort SIGKILL of any process still naming *marker*.
-
-    This sweep catches the tmux launcher, whose cmdline embeds the pi
-    command string and is never rewritten. The pi CLI itself erases the
-    marker through its ``process.title`` rewrite and is killed via the
-    verified observer pid in :func:`_cleanup_pi_session` instead.
-
-    :param marker: The bridge segment from :func:`_bridge_marker`.
-    """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle in raw:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(int(pid_dir.name), signal.SIGKILL)
-
-
-def _cleanup_pi_session(*, marker: str, observation: dict | None, workspace: Path) -> None:
-    """Best-effort teardown of one session's launched Pi tree.
-
-    Primary path: SIGKILL the pid the observer recorded, but only after the
-    live process is re-verified as that session's Pi -- a bare recorded pid
-    is never signaled, since it could have exited and been recycled.
-    Secondary: the marker sweep for the tmux launcher.
-
-    :param marker: The session's bridge marker from :func:`_bridge_marker`.
-    :param observation: The observer record, or ``None`` when none was written.
-    :param workspace: The session workspace the pane launched in.
-    """
-    if observation is not None:
-        pid = _live_observed_pid(observation, marker=marker, workspace=workspace)
-        if pid is not None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
-    _kill_pi_processes(marker)
 
 
 def _capture_pane_diagnostics(marker: str, out_path: Path) -> None:
@@ -431,6 +379,7 @@ def unmanaged_pi_host(
         **os.environ,
         "HOME": str(home),
         "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
+        "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
     # Prepend ABSOLUTE worktree roots to PYTHONPATH. The runner the daemon
@@ -563,12 +512,17 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
     bridge_dir = _bridge_dir(host.home, session_id)
 
     observation: dict | None = None
+    pi_started = False
     deadline = time.monotonic() + 150.0
     try:
         while time.monotonic() < deadline:
             observation = _read_argv_observation(bridge_dir)
             if observation is not None:
-                break
+                session = http_client.get(f"/v1/sessions/{session_id}", timeout=10.0)
+                session.raise_for_status()
+                if session.json().get("external_session_id"):
+                    pi_started = True
+                    break
             if host.proc.poll() is not None:
                 raise AssertionError(
                     f"host daemon exited (rc={host.proc.returncode}) before pi launched; "
@@ -591,6 +545,13 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
             "entry point to resolve to .../pi-coding-agent/dist/cli.js, got "
             f"argv: {pi_argv} (resolved: {resolved_entry})"
         )
+        assert pi_started, (
+            f"Pi never reported its native session ID for {session_id!r}; "
+            f"argv: {pi_argv}; daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
+        )
+        assert "--extension" in pi_argv, pi_argv
+        extension_idx = pi_argv.index("--extension")
+        assert marker in pi_argv[extension_idx + 1], pi_argv
         assert "--model" in pi_argv, (
             "the spec-pinned model was silently DROPPED: the launched pi argv "
             f"carries no --model flag. _auto_create_pi_terminal appends --model "
@@ -610,21 +571,47 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
         assert _live_observed_pid(observation, marker=marker, workspace=workspace) is not None, (
             "the recorded Pi process is not verifiably alive for session "
             f"{session_id!r}: a persisted observation alone does not prove a "
-            "running Pi (its /proc entry is gone or no longer matches this "
+            "running Pi (it has exited or no longer matches this "
             "session's workspace/cmdline)"
         )
     except Exception:
         _capture_pane_diagnostics(marker, host.home / "pi-pane-diagnostics.txt")
         raise
     finally:
-        _cleanup_pi_session(marker=marker, observation=observation, workspace=workspace)
+        with contextlib.suppress(httpx.HTTPError):
+            http_client.delete(f"/v1/sessions/{session_id}", timeout=10.0).raise_for_status()
+
+
+@pytest.mark.parametrize("rewrite_title", [False, True])
+def test_live_observed_pid_accepts_launch_argv_or_pi_title(
+    tmp_path: Path, rewrite_title: bool
+) -> None:
+    """Verify a live process before and after Node rewrites its argv."""
+    marker = _bridge_marker("conv_title_change_control")
+    script = (
+        "process.title = 'pi';" if rewrite_title else ""
+    ) + "console.log('ready'); setTimeout(() => {}, 30000);"
+    process = subprocess.Popen(
+        ["node", "-e", script, marker],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+        observation = {"pid": process.pid}
+        assert _live_observed_pid(observation, marker=marker, workspace=tmp_path) == process.pid
+        assert _live_observed_pid(observation, marker=marker, workspace=tmp_path.parent) is None
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
 
 
 def test_live_observed_pid_rejects_stale_or_recycled_pids(tmp_path: Path) -> None:
     """Negative control: stale or recycled recorded pids must never verify.
 
-    Cleanup signals only a pid verified against the live process; these
-    controls pin that a persisted record alone -- a dead pid, or a live but
+    These controls pin that a persisted record alone -- a dead pid, or a live but
     unrelated process that recycled it -- cannot satisfy the verification.
 
     :param tmp_path: Stand-in session workspace.
@@ -644,9 +631,9 @@ def test_live_observed_pid_rejects_stale_or_recycled_pids(tmp_path: Path) -> Non
     )
     assert (
         _live_observed_pid(
-            {"pid": os.getpid(), "argv": [], "cwd": os.path.realpath(workspace)},
+            {"pid": os.getpid(), "argv": [], "cwd": os.path.realpath(Path.cwd())},
             marker=marker,
-            workspace=workspace,
+            workspace=Path.cwd(),
         )
         is None
     )

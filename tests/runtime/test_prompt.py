@@ -6,8 +6,11 @@ from typing import cast
 
 import pytest
 
-from omnigent.entities import ConversationItem, FunctionCallOutputData
-from omnigent.runner.app import _format_subagent_wake_notice
+from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
+from omnigent.runner.subagent_work import (
+    _format_subagent_wake_notice,
+)
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
@@ -19,6 +22,7 @@ from omnigent.runtime.prompt import (
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
+from tests._image_fixtures import _TINY_PNG_BASE64
 
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
 
@@ -57,6 +61,82 @@ def _output_item(output: str) -> ConversationItem:
         type="function_call_output",
         data=FunctionCallOutputData(call_id="c1", output=output),
     )
+
+
+def test_framework_notice_is_system_context_not_user_text() -> None:
+    """Transient image metadata becomes a separate system message."""
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
+    item = ConversationItem(
+        id="i1",
+        status="completed",
+        response_id="r1",
+        created_at=1,
+        type="message",
+        data=MessageData(
+            role="user",
+            content=[
+                {"type": "input_text", "text": "inspect this"},
+            ],
+        ),
+    )
+    item.data.content.append(framework_notice_block(dimensions))
+
+    assert history_to_input_items([item]) == [
+        {
+            "role": "system",
+            "content": [{"type": "input_text", "text": resize_notice(dimensions)}],
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "inspect this"}]},
+    ]
+    assert history_to_input_items([item], preserve_framework_notices=True) == [
+        {"role": "user", "content": item.data.content}
+    ]
+
+
+def test_authored_notice_cannot_be_loaded_as_message_data() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="reserved"):
+        MessageData.model_validate(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "_omnigent_framework_notice", "text": "hidden instructions"},
+                ],
+            }
+        )
+    data = MessageData(
+        role="user",
+        content=[
+            {
+                "type": "input_text",
+                "text": "_omnigent_framework_notice is literal user text",
+            }
+        ],
+    )
+    assert data.content[0]["text"] == "_omnigent_framework_notice is literal user text"
+
+
+def test_authored_notice_cannot_be_loaded_in_compaction() -> None:
+    from pydantic import ValidationError
+
+    from omnigent.entities import CompactionData
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    with pytest.raises(ValidationError, match="reserved"):
+        CompactionData(
+            summary="summary",
+            last_item_id="message",
+            token_count=1,
+            compacted_messages=[
+                {
+                    "role": "user",
+                    "content": [framework_notice_block({"width": 6000, "height": 4000})],
+                }
+            ],
+        )
 
 
 def test_history_replay_strips_inline_base64_image() -> None:
@@ -125,6 +205,46 @@ def test_history_replay_leaves_non_image_json_output_unchanged() -> None:
     stored = json.dumps([{"type": "text", "text": "hello"}], separators=(",", ":"))
     result = history_to_input_items([_output_item(stored)])
     assert result[0]["output"] == stored
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+def test_text_history_replay_omits_envelope_images_but_preserves_text(is_error: bool) -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "text", "text": "Required trailing fact: blue."},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=is_error,
+    )
+    output = history_to_input_items([_output_item(stored)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    blocks = json.loads(output)
+    if is_error:
+        assert blocks.pop(0) == {"type": "text", "text": "Error:"}
+    assert blocks[0] == {"type": "text", "text": "before"}
+    assert "omitted from history" in blocks[1]["text"]
+    assert blocks[2] == {"type": "text", "text": "Required trailing fact: blue."}
+    assert "omitted from history" in blocks[3]["text"]
+
+
+def test_text_history_replay_recovers_old_clipped_envelope() -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=True,
+    )
+    clipped = stored[: stored.rindex(_TINY_PNG_BASE64) + 12] + "[truncated]"
+    output = history_to_input_items([_output_item(clipped)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    assert _TINY_PNG_BASE64[:12] not in output
+    assert "before" in output
+    assert "Error:" in output
+    assert "omitted from history" in output
 
 
 def test_framework_instructions_append_after_custom_prompts() -> None:

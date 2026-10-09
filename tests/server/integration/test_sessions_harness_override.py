@@ -9,6 +9,7 @@ harness process spawns on the session's first turn.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -32,6 +33,7 @@ class _CaptureClient:
         """Record the path + body and return a fake 202 response."""
         self._captured["path"] = path
         self._captured["body"] = json
+        self._captured.setdefault("posts", []).append((path, json))
 
         class _Resp:
             status_code = 202
@@ -49,7 +51,8 @@ def _stub_runner_client(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: A dict the test inspects after the runner POST runs;
-        contains ``path`` and ``body`` keys once the route fires.
+        contains ``path`` and ``body`` for the last POST plus a ``posts``
+        list of every ``(path, body)`` pair, once the route fires.
     """
     from omnigent.server.routes import sessions as sessions_mod
 
@@ -62,33 +65,35 @@ def _stub_runner_client(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return captured
 
 
+@pytest.mark.parametrize("override", ["pi", "acp:goose"])
 async def test_create_with_harness_override_persists_and_snapshot_reflects(
     client: httpx.AsyncClient,
+    override: str,
 ) -> None:
     """Create-time ``harness_override`` makes the snapshot report it.
 
     The test bundle declares ``executor.config.harness: claude-sdk``;
-    after creating with ``harness_override: "pi"`` the snapshot's
-    ``harness`` must be ``"pi"`` — what the runner will actually spawn —
+    after creating with an override the snapshot's
+    ``harness`` must match it — what the runner will actually spawn —
     not the spec's declared value. This is the contract the new-chat
     composer and the attach banner rely on.
     """
     agent = await create_test_agent(client)
     resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "initial_items": [], "harness_override": "pi"},
+        json={"agent_id": agent["id"], "initial_items": [], "harness_override": override},
     )
     assert resp.status_code == 201, resp.text
     body = resp.json()
-    assert body.get("harness") == "pi", (
-        f"Create response harness is {body.get('harness')!r}, expected 'pi'. "
+    assert body.get("harness") == override, (
+        f"Create response harness is {body.get('harness')!r}, expected {override!r}. "
         f"If this is 'claude-sdk', _resolve_harness ignored the persisted "
         f"override and reported the spec default."
     )
 
     get = await client.get(f"/v1/sessions/{body['id']}")
     assert get.status_code == 200
-    assert get.json().get("harness") == "pi", (
+    assert get.json().get("harness") == override, (
         "GET snapshot lost the harness override — the column did not "
         "persist or _resolve_harness stopped preferring it."
     )
@@ -148,8 +153,10 @@ async def test_create_rejects_unknown_harness_override(
     assert "bogus" in resp.text
 
 
+@pytest.mark.parametrize("override", ["pi", "acp:goose"])
 async def test_create_rejects_harness_override_for_non_omnigent_agent(
     client: httpx.AsyncClient,
+    override: str,
 ) -> None:
     """Non-omnigent executor types reject the override instead of no-opping.
 
@@ -168,7 +175,7 @@ async def test_create_rejects_harness_override_for_non_omnigent_agent(
     )
     resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "initial_items": [], "harness_override": "pi"},
+        json={"agent_id": agent["id"], "initial_items": [], "harness_override": override},
     )
     assert resp.status_code == 400, (
         f"harness_override on an agents_sdk-typed agent should 400, got "
@@ -177,8 +184,10 @@ async def test_create_rejects_harness_override_for_non_omnigent_agent(
     assert "agents_sdk" in resp.text
 
 
+@pytest.mark.parametrize("override", ["pi", "acp:goose"])
 async def test_runner_first_event_forwards_harness_override(
     client: httpx.AsyncClient,
+    override: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A create-time override reaches the runner body on the first event.
@@ -193,7 +202,7 @@ async def test_runner_first_event_forwards_harness_override(
     agent = await create_test_agent(client)
     resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "initial_items": [], "harness_override": "pi"},
+        json={"agent_id": agent["id"], "initial_items": [], "harness_override": override},
     )
     assert resp.status_code == 201, resp.text
     sid = resp.json()["id"]
@@ -214,11 +223,126 @@ async def test_runner_first_event_forwards_harness_override(
         "Runner client was never POSTed to — _forward_event_to_runner "
         "did not run. Check the runner-stub wiring."
     )
-    assert captured["body"].get("harness_override") == "pi", (
+    assert captured["body"].get("harness_override") == override, (
         f"First-event runner body missing the create-time harness "
         f"override; got {captured['body'].get('harness_override')!r}. The "
         f"create route did not persist harness_override before the first "
         f"turn, or the forwarding site dropped it."
+    )
+
+
+@pytest.mark.parametrize("override", ["pi", "acp:goose"])
+async def test_create_session_init_carries_harness_override(
+    client: httpx.AsyncClient,
+    override: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create route's runner notification must carry the override.
+
+    With ``initial_items`` the kickoff turn is forwarded before this
+    notification lands. A notification that omits the session-init envelope
+    leaves the runner resolving the harness from the spec, so init evicts the
+    override harness the kickoff turn is already streaming through.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+
+    captured = _stub_runner_client(monkeypatch)
+
+    async def _skip_relay_readiness(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _skip_relay_readiness)
+
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": override,
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "kickoff"}],
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    init_posts = [body for path, body in captured.get("posts", []) if path == "/v1/sessions"]
+    assert init_posts, (
+        "The create route never notified the runner about the new session — "
+        "check the runner-stub wiring."
+    )
+    snapshot = init_posts[-1].get("session_init", {}).get("snapshot", {})
+    assert snapshot.get("harness_override") == override, (
+        f"Session-init notification lost the create-time harness override; "
+        f"got {init_posts[-1]!r}. The runner then resolves the harness from "
+        f"the spec and spawns that one instead."
+    )
+    assert init_posts[-1].get("session_init", {}).get("suppress_recovery_turn") is True, (
+        f"The create-time init must suppress the runner's recovery turn — the "
+        f"kickoff was already forwarded, so recovery would run it twice; got "
+        f"{init_posts[-1]!r}."
+    )
+
+
+@pytest.mark.parametrize("override", ["pi", "acp:goose"])
+async def test_patch_rebind_init_carries_harness_override(
+    client: httpx.AsyncClient,
+    override: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PATCH rebind's runner notification must carry the override.
+
+    The external-host launch binds a runner after create via
+    ``PATCH {runner_id}``; the recovery turn that then executes any seeded
+    ``initial_items`` resolves its harness from session init. A bare legacy
+    body loses the override, so the kickoff runs on the spec's harness.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+
+    captured = _stub_runner_client(monkeypatch)
+
+    async def _skip_relay_readiness(*_: Any, **__: Any) -> None:
+        return None
+
+    def _accept_runner_id(_router: Any, raw: str, *, user_id: Any = None) -> str:
+        del user_id
+        return raw.strip()
+
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _skip_relay_readiness)
+    monkeypatch.setattr(sessions_mod, "_registered_runner_id", _accept_runner_id)
+
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": override},
+    )
+    assert resp.status_code == 201, resp.text
+    sid = resp.json()["id"]
+    captured.pop("posts", None)
+
+    patch = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_bound_late"})
+    assert patch.status_code == 200, patch.text
+
+    init_posts = [body for path, body in captured.get("posts", []) if path == "/v1/sessions"]
+    assert init_posts, (
+        "The PATCH rebind never notified the runner about the session — "
+        "check the runner-stub wiring."
+    )
+    snapshot = init_posts[-1].get("session_init", {}).get("snapshot", {})
+    assert snapshot.get("harness_override") == override, (
+        f"Rebind session-init notification lost the harness override; got "
+        f"{init_posts[-1]!r}. The runner then resolves the harness from the "
+        f"spec, and the kickoff recovery turn runs on the wrong harness."
+    )
+    assert not init_posts[-1].get("session_init", {}).get("suppress_recovery_turn"), (
+        f"The rebind init must keep recovery enabled — on rebind the recovery "
+        f"turn is what runs the pending seeded kickoff; got {init_posts[-1]!r}."
     )
 
 
@@ -255,3 +379,101 @@ async def test_runner_body_omits_harness_override_when_unset(
     assert event.status_code == 202, event.text
     assert captured.get("body") is not None
     assert "harness_override" not in captured["body"]
+
+
+async def test_acp_selection_does_not_require_server_configuration(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("{}\n")
+    agent = await create_test_agent(client)
+    response = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": "acp:runner-only"}
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["harness"] == "acp:runner-only"
+
+
+@pytest.mark.parametrize("override", ["acp:", "acp:Goose", "acp:goose/other", "acp: goose"])
+async def test_rejects_malformed_acp_selection(client: httpx.AsyncClient, override: str) -> None:
+    agent = await create_test_agent(client)
+    response = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": override}
+    )
+    assert response.status_code == 400, response.text
+    assert "invalid ACP agent identifier" in response.text
+
+
+@pytest.mark.parametrize("extra", [0, 1, 100])
+@pytest.mark.parametrize("with_other_overrides", [False, True])
+@pytest.mark.parametrize("seed_effort", [False, True])
+async def test_override_storage_limit_is_checked_before_create(
+    client: httpx.AsyncClient, extra: int, with_other_overrides: bool, seed_effort: bool
+) -> None:
+    import json
+
+    from omnigent.db.db_models import SqlConversation
+    from omnigent.runtime import get_conversation_store
+
+    executor = {"type": "omnigent", "config": {"harness": "claude-sdk"}}
+    if seed_effort:
+        executor["reasoning_effort"] = "high"
+    agent = await create_test_agent(client, executor=executor)
+    overrides = {"harness_override": "acp:"}
+    if seed_effort:
+        overrides["reasoning_effort"] = "high"
+    if with_other_overrides:
+        overrides.update(
+            {
+                "model_override": "model-" + "a" * 120,
+                "reasoning_effort": "high",
+                "cost_control_mode_override": "off",
+                "subagent_routing_override": "on",
+            }
+        )
+    limit = SqlConversation.__table__.c.session_overrides.type.length
+    overhead = len(json.dumps(overrides, separators=(",", ":")))
+    overrides["harness_override"] += "a" * (limit - overhead + extra)
+    store = get_conversation_store()
+    before = {conv.id for conv in store.list_conversations().data}
+    requested = dict(overrides)
+    if seed_effort:
+        requested.pop("reasoning_effort", None)
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"], **requested})
+    after = {conv.id for conv in store.list_conversations().data}
+    if extra:
+        assert after == before, "Oversized input left a persisted session"
+        assert response.status_code == 400, response.text
+        assert "session overrides" in response.text.lower()
+    else:
+        assert response.status_code == 201, response.text
+        assert after - before == {response.json()["id"]}
+        assert response.json()["harness"] == overrides["harness_override"]
+
+
+async def test_override_growth_rejects_patch_without_mutation(client: httpx.AsyncClient) -> None:
+    import json
+
+    from omnigent.db.db_models import SqlConversation
+    from omnigent.runtime import get_conversation_store
+
+    agent = await create_test_agent(client)
+    limit = SqlConversation.__table__.c.session_overrides.type.length
+    harness = "acp:" + "a" * (
+        limit - len(json.dumps({"harness_override": "acp:"}, separators=(",", ":")))
+    )
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": harness}
+    )
+    assert created.status_code == 201, created.text
+    session = created.json()["id"]
+    response = await client.patch(
+        f"/v1/sessions/{session}",
+        json={"model_override": "another-model", "title": "must not persist"},
+    )
+    assert response.status_code == 400, response.text
+    assert "session overrides" in response.text.lower()
+    conv = get_conversation_store().get_conversation(session)
+    assert conv.harness_override == harness
+    assert conv.model_override is None
+    assert conv.title != "must not persist"

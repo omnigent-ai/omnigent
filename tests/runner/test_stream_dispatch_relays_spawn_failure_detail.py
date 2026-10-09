@@ -35,7 +35,8 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.runner.app_support import _client_safe_error_detail
+from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, HarnessSpawnError
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
 
@@ -258,9 +259,6 @@ def test_client_safe_detail_redacts_raw_errors_but_preserves_spawn_reasons() -> 
     log-pointer detail. ``HarnessSpawnError`` messages are written to the
     client-safe contract, so theirs are preserved.
     """
-    from omnigent.runner.app import _client_safe_error_detail
-    from omnigent.runtime.harnesses.process_manager import HarnessSpawnError
-
     raw = _client_safe_error_detail(
         RuntimeError("/home/someone/.secret/harness exploded"), context="harness spawn"
     )

@@ -3,6 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   BookOpenIcon,
+  BotIcon,
   Code2Icon,
   CompassIcon,
   FileTextIcon,
@@ -12,7 +13,6 @@ import {
 } from "lucide-react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
@@ -47,11 +47,7 @@ vi.mock("@/components/icons/KiroIcon", () => ({
 vi.mock("@/components/icons/PiIcon", () => ({
   PiIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="pi" />,
 }));
-// And for the Otto mascot — the generic sub-agent fallback icon.
-vi.mock("@/components/icons/OttoIcon", () => ({
-  OttoIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="otto" />,
-}));
-
+// Brand icon modules are stubbed below; generic sub-agents use Lucide's bot.
 const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
 
@@ -132,8 +128,8 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
   // dropped without a test failing.
   ["documentation", FileTextIcon],
   ["technical-writer", FileTextIcon],
-  ["general-purpose", OttoIcon],
-  [null, OttoIcon],
+  ["general-purpose", BotIcon],
+  [null, BotIcon],
 ];
 
 beforeEach(() => {
@@ -172,10 +168,18 @@ describe("SubagentsPanel", () => {
 
     renderPanel({ rootSessionId: "conv_root" });
 
+    const heading = screen.getByRole("heading", { name: "Agents" });
+    expect(heading).toHaveClass("pl-1", "font-medium", "text-ui");
+    expect(heading.parentElement).toHaveClass("h-11");
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveAttribute("href", "/c/conv_root");
     expect(main).toHaveAttribute("data-root-session-id", "conv_root");
     expect(main).toHaveTextContent(/main/i);
+    expect(within(main).getByTestId("subagent-main-harness-icon")).toHaveClass(
+      "size-8",
+      "rounded-xl",
+      "border",
+    );
     expect(screen.queryByTestId("subagent-row")).toBeNull();
   });
 
@@ -236,6 +240,7 @@ describe("SubagentsPanel", () => {
     const main = screen.getByTestId("subagent-main-row");
     expect(main).toHaveTextContent("Claude Code");
     expect(main).not.toHaveTextContent("claude-native-ui");
+    expect(main.querySelector('[data-harness-icon="claude"]')).toHaveClass("size-5");
   });
 
   it("labels Pi native-wrapper main rows with the product name", () => {
@@ -601,26 +606,26 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const codexRow = childRow(container, "conv_codex");
-    expect(codexRow.querySelector('[data-icon="codex"]')).not.toBeNull();
+    expect(codexRow.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
     expect(codexRow.querySelector(".lucide-code-2")).toBeNull();
 
     const opencodeRow = childRow(container, "conv_opencode");
-    expect(opencodeRow.querySelector('[data-icon="opencode"]')).not.toBeNull();
+    expect(opencodeRow.querySelector('[data-harness-icon="opencode"]')).not.toBeNull();
     expect(opencodeRow.querySelector(".lucide-code-2")).toBeNull();
 
     const claudeRow = childRow(container, "conv_claude");
-    expect(claudeRow.querySelector('[data-icon="claude"]')).not.toBeNull();
+    expect(claudeRow.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
     expect(claudeRow.querySelector(".lucide-code-2")).toBeNull();
 
     // Kiro renders its own glyph now, not the borrowed Cursor mark (#1137).
     const kiroRow = childRow(container, "conv_kiro");
-    expect(kiroRow.querySelector('[data-icon="kiro"]')).not.toBeNull();
+    expect(kiroRow.querySelector('[data-harness-icon="kiro"]')).not.toBeNull();
   });
 
-  it("gives native sub-agent children role/Otto icons, not the brand logo", () => {
+  it("gives native sub-agent children role/bot icons, not the brand logo", () => {
     // A native session's sub-agents are all the same brand, so the logo
     // is reserved for full native sessions; sub-agent rows read by role,
-    // with the Otto mascot as the generic fallback.
+    // with the generic bot as the fallback.
     mockChildTree({
       conv_root: [
         childInfo({
@@ -641,12 +646,36 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const genericRow = childRow(container, "conv_generic");
-    expect(genericRow.querySelector('[data-icon="otto"]')).not.toBeNull();
-    expect(genericRow.querySelector('[data-icon="claude"]')).toBeNull();
+    expect(genericRow.querySelector(".lucide-bot")).not.toBeNull();
+    expect(genericRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
 
     const exploreRow = childRow(container, "conv_explore");
     expect(exploreRow.querySelector(".lucide-search")).not.toBeNull();
-    expect(exploreRow.querySelector('[data-icon="claude"]')).toBeNull();
+    expect(exploreRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
+  });
+
+  it("uses a native sub-agent's role for its icon while keeping its nickname as the label", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "conv_codex_researcher",
+          title: "codex-native-ui-subagent:thread-1",
+          tool: "Archimedes",
+          labels: {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_role": "researcher",
+          },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const row = childRow(container, "conv_codex_researcher");
+    expect(row).toHaveTextContent("Archimedes");
+    expect(row.querySelector(".lucide-book-open")).not.toBeNull();
+    expect(row.querySelector(".lucide-bot")).toBeNull();
+    expect(row.querySelector('[data-harness-icon="codex"]')).toBeNull();
   });
 
   it("does not infer native logos from child title or tool names alone", () => {
@@ -665,8 +694,8 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const row = childRow(container, "conv_custom");
-    expect(row.querySelector('[data-icon="codex"]')).toBeNull();
-    expect(row.querySelector("svg:not([data-icon]):not(.lucide-corner-down-right)")).not.toBeNull();
+    expect(row.querySelector('[data-harness-icon="codex"]')).toBeNull();
+    expect(row.querySelector('[data-testid="subagent-agent-avatar"] svg')).not.toBeNull();
   });
 
   it("uses the pi glyph for pi child rows, matched by exact tool name", () => {
@@ -697,13 +726,13 @@ describe("SubagentsPanel", () => {
     // The pi glyph proves the row matched the scaffold child by agent name;
     // a generic bot icon here means the pi branch was dropped or mis-keyed.
     const piRow = childRow(container, "conv_pi");
-    expect(piRow.querySelector('[data-icon="pi"]')).not.toBeNull();
+    expect(piRow.querySelector('[data-harness-icon="pi"]')).not.toBeNull();
 
     // A substring match (e.g. tool.includes("pi")) would wrongly brand this
-    // row; it must fall back to the generic Otto icon.
+    // row; it must fall back to the generic bot icon.
     const pipelineRow = childRow(container, "conv_pipeline");
-    expect(pipelineRow.querySelector('[data-icon="pi"]')).toBeNull();
-    expect(pipelineRow.querySelector('[data-icon="otto"]')).not.toBeNull();
+    expect(pipelineRow.querySelector('[data-harness-icon="pi"]')).toBeNull();
+    expect(pipelineRow.querySelector(".lucide-bot")).not.toBeNull();
   });
 
   it("native wrapper labels outrank the pi tool-name match", () => {
@@ -725,8 +754,8 @@ describe("SubagentsPanel", () => {
     // The wrapper label is authoritative identity: a native child keeps its
     // native glyph even when its tool name collides with "pi".
     const row = childRow(container, "conv_native_pi");
-    expect(row.querySelector('[data-icon="claude"]')).not.toBeNull();
-    expect(row.querySelector('[data-icon="pi"]')).toBeNull();
+    expect(row.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
+    expect(row.querySelector('[data-harness-icon="pi"]')).toBeNull();
   });
 
   it("fetches child sessions without polling (push-driven via watch-set)", () => {
@@ -788,9 +817,7 @@ describe("SubagentsPanel", () => {
     expect(rows[1].className.split(/\s+/)).not.toContain("bg-accent");
   });
 
-  it("renders 'Failed' for a child whose latest task ended in failure", () => {
-    // Failed keeps the label in destructive text, with a trailing dot
-    // matching the rest of the rail's compact status markers.
+  it("renders a destructive status avatar for a failed child", () => {
     mockChildTree({
       conv_parent: [
         {
@@ -810,9 +837,12 @@ describe("SubagentsPanel", () => {
     renderPanel();
 
     const row = screen.getByTestId("subagent-row");
-    expect(row).toHaveTextContent(/Failed/);
-    // Should not lowercase-bleed the raw status into the label.
-    expect(row.textContent).not.toMatch(/failed[^F]/);
+    const avatar = within(row).getByTestId("subagent-status-avatar");
+    expect(row).not.toHaveTextContent(/Failed/);
+    expect(avatar).toHaveAttribute("aria-label", "Failed");
+    expect(avatar).toHaveAttribute("data-activity", "failed");
+    expect(avatar).toHaveClass("bg-destructive/10", "text-destructive");
+    expect(avatar.querySelector(".lucide-circle-alert")).not.toBeNull();
   });
 
   it("renders a child with last_task_error as failed and exposes the error detail", () => {
@@ -836,9 +866,9 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel();
 
     const row = childRow(container, "conv_child");
-    const indicator = within(row).getByTestId("subagent-status-dot");
-    expect(row).toHaveTextContent(/Failed/);
-    expect(indicator).toHaveAttribute(
+    const avatar = within(row).getByTestId("subagent-status-avatar");
+    expect(row).not.toHaveTextContent(/Failed/);
+    expect(avatar).toHaveAttribute(
       "aria-label",
       "Failed: Required terminal exited unexpectedly; the session runtime is no longer available.",
     );
@@ -847,56 +877,39 @@ describe("SubagentsPanel", () => {
   it.each([
     ["runner_disconnected", "Runner disconnected unexpectedly."],
     ["runner_failed_to_start", "runner exited before the first turn"],
-  ])(
-    "renders a quiet grey disconnected dot (no word, not red 'Failed') for the runner-disconnect code %s",
-    (code, message) => {
-      // Option B: a runner that merely disconnected/exited is NOT a task
-      // failure. The child summary still collapses to current_task_status
-      // "failed", but last_task_error.code carries the disconnect cause, so
-      // the row must branch to the quiet disconnected dot before the red
-      // "Failed" pill. The dot shows NO inline word — the cause lives in the
-      // tooltip — and uses the neutral grey --muted-foreground token, never
-      // the shared amber --warning.
-      mockChildTree({
-        conv_parent: [
-          childInfo({
-            id: "conv_child",
-            title: "researcher:auth",
-            task_summary: null,
-            tool: "researcher",
-            session_name: "auth",
-            current_task_status: "failed",
-            last_task_error: { code, message },
-          }),
-        ],
-      });
+  ])("renders a neutral disconnected avatar for the runner-disconnect code %s", (code, message) => {
+    // Option B: a runner that merely disconnected/exited is NOT a task
+    // failure. The child summary still collapses to current_task_status
+    // "failed", but last_task_error.code carries the disconnect cause, so
+    // the row must branch to the quiet disconnected dot before the red
+    // "Failed" pill. The dot shows NO inline word — the cause lives in the
+    // tooltip — and uses the neutral grey --muted-foreground token, never
+    // the shared amber --warning.
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_child",
+          title: "researcher:auth",
+          task_summary: null,
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "failed",
+          last_task_error: { code, message },
+        }),
+      ],
+    });
 
-      const { container } = renderPanel();
+    const { container } = renderPanel();
 
-      const row = childRow(container, "conv_child");
-      const indicator = within(row).getByTestId("subagent-status-dot");
-      // The inline "Disconnected" word is hidden (quiet dot, like idle/done).
-      expect(row).not.toHaveTextContent(/Disconnected/);
-      expect(row).not.toHaveTextContent(/Failed/);
-      // Positive quiet-dot guarantee: disconnected falls through to the
-      // generic quiet-dot path, so the wrapper carries the standard muted text
-      // class (same as idle/done) and the grey --muted-foreground dot is the
-      // ONLY color hook — no warning/destructive bleed on the wrapper or the
-      // dot, and crucially never the shared amber --warning (owned by "Needs
-      // response"). The blue --session-active hue is now reserved for the
-      // launching/idle/done dots, so it must NOT appear here.
-      expect(indicator).toHaveClass("text-muted-foreground");
-      expect(indicator).not.toHaveClass("text-warning");
-      expect(indicator).not.toHaveClass("text-destructive");
-      const dot = indicator.querySelector("span.rounded-full");
-      expect(dot).toHaveClass("bg-muted-foreground");
-      expect(dot).not.toHaveClass("bg-session-active");
-      expect(dot).not.toHaveClass("bg-warning");
-      expect(dot).not.toHaveClass("bg-destructive");
-      // The cause is still surfaced in the accessible label / tooltip.
-      expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
-    },
-  );
+    const row = childRow(container, "conv_child");
+    const avatar = within(row).getByTestId("subagent-status-avatar");
+    expect(row).not.toHaveTextContent(/Disconnected/);
+    expect(row).not.toHaveTextContent(/Failed/);
+    expect(avatar).toHaveClass("bg-muted", "text-muted-foreground");
+    expect(avatar).not.toHaveClass("text-warning", "text-destructive");
+    expect(avatar.querySelector(".lucide-unplug")).not.toBeNull();
+    expect(avatar).toHaveAttribute("aria-label", `Disconnected: ${message}`);
+  });
 
   it("keeps rendering red 'Failed' for a genuine task failure (non-disconnect code)", () => {
     // Guard the hard constraint: only runner-disconnect/exit codes become
@@ -918,18 +931,18 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel();
 
     const row = childRow(container, "conv_child");
-    const indicator = within(row).getByTestId("subagent-status-dot");
-    expect(row).toHaveTextContent(/Failed/);
+    const avatar = within(row).getByTestId("subagent-status-avatar");
+    expect(row).not.toHaveTextContent(/Failed/);
     expect(row).not.toHaveTextContent(/Disconnected/);
-    expect(indicator).toHaveClass("text-destructive");
-    expect(indicator.querySelector(".bg-destructive")).not.toBeNull();
+    expect(avatar).toHaveClass("bg-destructive/10", "text-destructive");
+    expect(avatar.querySelector(".lucide-circle-alert")).not.toBeNull();
   });
 
   it.each([
     ["runner_disconnected", "Runner disconnected unexpectedly."],
     ["runner_failed_to_start", "runner exited before the first turn"],
   ])(
-    "renders a quiet grey disconnected dot on the main row when the parent failed with the runner-disconnect code %s",
+    "does not add a status avatar to the main harness for runner-disconnect code %s",
     (code, message) => {
       // The session snapshot collapses a runner exit to status "failed" but
       // preserves the cause in lastTaskError.code (runner_failed_to_start /
@@ -962,29 +975,13 @@ describe("SubagentsPanel", () => {
       renderPanel({ rootSessionId: "conv_root" });
 
       const mainRow = screen.getByTestId("subagent-main-row");
-      const indicator = within(mainRow).getByTestId("subagent-status-dot");
-      // Quiet grey dot, no inline word — distinct from the red "Failed" pill.
       expect(mainRow).not.toHaveTextContent(/Disconnected/);
       expect(mainRow).not.toHaveTextContent(/Failed/);
-      // Positive quiet-dot guarantee: the wrapper carries the standard muted
-      // quiet-dot text class (same path as idle/done) and the grey dot is the
-      // ONLY color hook — no warning/destructive class bleeds onto either the
-      // wrapper or the dot. The blue --session-active hue is reserved for the
-      // launching/idle/done dots, so it must NOT appear here.
-      expect(indicator).toHaveClass("text-muted-foreground");
-      expect(indicator).not.toHaveClass("text-warning");
-      expect(indicator).not.toHaveClass("text-destructive");
-      const dot = indicator.querySelector("span.rounded-full");
-      expect(dot).toHaveClass("bg-muted-foreground");
-      expect(dot).not.toHaveClass("bg-session-active");
-      expect(dot).not.toHaveClass("bg-warning");
-      expect(dot).not.toHaveClass("bg-destructive");
-      // The disconnect cause stays in the tooltip / accessible label.
-      expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
+      expect(within(mainRow).queryByTestId("subagent-status-avatar")).toBeNull();
     },
   );
 
-  it("renders red 'Failed' on the main row for a genuine parent failure (non-disconnect code)", () => {
+  it("does not add a failure avatar to the main harness", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
       session: {
@@ -1011,13 +1008,12 @@ describe("SubagentsPanel", () => {
     renderPanel({ rootSessionId: "conv_root" });
 
     const mainRow = screen.getByTestId("subagent-main-row");
-    const indicator = within(mainRow).getByTestId("subagent-status-dot");
-    expect(mainRow).toHaveTextContent(/Failed/);
+    expect(mainRow).not.toHaveTextContent(/Failed/);
     expect(mainRow).not.toHaveTextContent(/Disconnected/);
-    expect(indicator).toHaveClass("text-destructive");
+    expect(within(mainRow).queryByTestId("subagent-status-avatar")).toBeNull();
   });
 
-  it("shows the pulsing working dot (no redundant 'Working' word) on the main row when the parent session is running", () => {
+  it("does not add a working avatar to the main harness", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
       session: {
@@ -1043,14 +1039,9 @@ describe("SubagentsPanel", () => {
     renderPanel({ rootSessionId: "conv_root" });
 
     const mainRow = screen.getByTestId("subagent-main-row");
-    // The pulsing pink dot reads as "active" on its own, so the word is dropped.
-    expect(mainRow.querySelector('[data-testid="running-dot"]')).not.toBeNull();
+    expect(mainRow.querySelector('[data-testid="running-dot"]')).toBeNull();
     expect(mainRow).not.toHaveTextContent(/Working/i);
-    // The label survives as the accessible name on the status indicator.
-    expect(within(mainRow).getByTestId("subagent-status-dot")).toHaveAttribute(
-      "aria-label",
-      "Working",
-    );
+    expect(within(mainRow).queryByTestId("subagent-status-avatar")).toBeNull();
   });
 
   it("renders the last_message_preview underneath the title when present", () => {
@@ -1077,7 +1068,7 @@ describe("SubagentsPanel", () => {
     ).toBeInTheDocument();
   });
 
-  it("tokenizes status colors and drops the raw stoplight Tailwind classes", () => {
+  it("renders tokenized state avatars with distinct icons", () => {
     mockChildTree({
       conv_parent: [
         childInfo({
@@ -1097,56 +1088,26 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel();
 
-    const dotOf = (id: string) =>
-      within(childRow(container, id))
-        .getByTestId("subagent-status-dot")
-        .querySelector("span.rounded-full");
+    const avatarOf = (id: string) =>
+      within(childRow(container, id)).getByTestId("subagent-status-avatar");
 
-    // Working reuses the sidebar RunningDot in the grey tone —
-    // identical to the sidebar's running indicator; a wrong tone drops
-    // text-muted-foreground.
-    expect(
-      childRow(container, "c_work").querySelector(
-        '[data-testid="running-dot"].text-muted-foreground',
-      ),
-    ).not.toBeNull();
+    expect(avatarOf("c_work")).toHaveClass("bg-muted", "text-muted-foreground");
+    expect(avatarOf("c_work").querySelector('[data-testid="running-dot"]')).not.toBeNull();
+    expect(avatarOf("c_launch").querySelector('[data-testid="running-dot"]')).not.toBeNull();
+    expect(avatarOf("c_done")).toHaveClass("bg-success/10", "text-success");
+    expect(avatarOf("c_done").querySelector(".lucide-check")).not.toBeNull();
+    expect(avatarOf("c_idle")).toHaveClass("bg-muted", "text-muted-foreground");
+    expect(avatarOf("c_idle").querySelector(".lucide-pause")).not.toBeNull();
+    expect(avatarOf("c_other").querySelector(".lucide-ellipsis")).not.toBeNull();
+    expect(avatarOf("c_fail")).toHaveClass("bg-destructive/10", "text-destructive");
+    expect(avatarOf("c_fail").querySelector(".lucide-circle-alert")).not.toBeNull();
 
-    // Panel-scoped palette swap: the quiet live/settled states read in the
-    // blue --session-active hue, each PRESERVING its prior opacity treatment
-    // (launching kept /70, idle + done kept /55) — only the hue flipped from
-    // grey to blue.
-    const launchDot = dotOf("c_launch");
-    expect(launchDot).toHaveClass("bg-session-active/70");
-    expect(launchDot).not.toHaveClass("bg-muted-foreground/70");
-    const doneDot = dotOf("c_done");
-    expect(doneDot).toHaveClass("bg-session-active/55");
-    expect(doneDot).not.toHaveClass("bg-muted-foreground/55");
-    const idleDot = dotOf("c_idle");
-    expect(idleDot).toHaveClass("bg-session-active/55");
-    expect(idleDot).not.toHaveClass("bg-muted-foreground/55");
-
-    // Exception: the verbatim "other status" fallthrough STAYS neutral grey —
-    // it is the one quiet dot the swap deliberately leaves on --muted-foreground.
-    const otherDot = dotOf("c_other");
-    expect(otherDot).toHaveClass("bg-muted-foreground/55");
-    expect(otherDot).not.toHaveClass("bg-session-active/55");
-
-    // Terminal failures keep destructive text + a destructive dot.
-    const failedIndicator = within(childRow(container, "c_fail")).getByTestId(
-      "subagent-status-dot",
-    );
-    expect(failedIndicator).toHaveClass("text-destructive");
-    expect(failedIndicator.querySelector(".bg-destructive")).not.toBeNull();
-    expect(failedIndicator.querySelector("svg")).toBeNull();
-    // Regression guard: "done" must not regress to the loud green success tone.
-    expect(childRow(container, "c_done").querySelector(".bg-success")).toBeNull();
-    // Regression guard: the pre-polish stoplight classes must be gone.
     expect(container.querySelector(".bg-amber-500")).toBeNull();
     expect(container.querySelector(".bg-emerald-500")).toBeNull();
     expect(container.querySelector(".bg-red-500")).toBeNull();
   });
 
-  it("surfaces an 'awaiting input' badge for a child parked on an elicitation", () => {
+  it("surfaces an awaiting-input status avatar for a child parked on an elicitation", () => {
     mockChildTree({
       conv_parent: [
         // Parked on a prompt while its turn is still live (busy=true).
@@ -1163,20 +1124,15 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel();
 
     const row = childRow(container, "c_await");
-    // The awaiting state renders the "Needs response" tag (mirroring the
-    // sidebar) — if this reads "Working", the awaiting check isn't
-    // outranking busy and the signal is hidden.
-    expect(row).toHaveTextContent(/Needs response/);
-    expect(within(row).getByTestId("subagent-status-dot")).toHaveAttribute(
-      "aria-label",
-      "Needs response",
-    );
-    // The working RunningDot must NOT render for an awaiting child —
-    // confirms the elicitation branch replaced the busy branch.
+    const avatar = within(row).getByTestId("subagent-status-avatar");
+    expect(row).not.toHaveTextContent(/Needs response/);
+    expect(avatar).toHaveAttribute("aria-label", "Needs response");
+    expect(avatar).toHaveClass("bg-warning/15", "text-warning");
+    expect(avatar.querySelector(".lucide-circle-question-mark")).not.toBeNull();
     expect(row.querySelector('[data-testid="running-dot"]')).toBeNull();
   });
 
-  it("shows the status word only for notable states, not quiet ones", () => {
+  it("keeps state names out of row copy while preserving accessible labels", () => {
     mockChildTree({
       conv_parent: [
         childInfo({ id: "c_launch", tool: "researcher", current_task_status: "launching" }),
@@ -1189,68 +1145,37 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel();
 
-    // The unexpected "cancelled" terminal state keeps its word so it stands out.
-    expect(childRow(container, "c_cancel")).toHaveTextContent(/cancelled/);
-    // Launching is not yet real work, so it shows its word and does not reuse
-    // the active running dot. Its inline word now reads in the blue
-    // --session-active hue (matching its dot), not the neutral muted text.
-    expect(childRow(container, "c_launch")).toHaveTextContent(/Launching/);
-    expect(childRow(container, "c_launch").querySelector('[data-testid="running-dot"]')).toBeNull();
-    const launchIndicator = within(childRow(container, "c_launch")).getByTestId(
-      "subagent-status-dot",
-    );
-    expect(launchIndicator).toHaveClass("text-session-active");
-    expect(launchIndicator).not.toHaveClass("text-muted-foreground");
-    // The verbatim "other" word stays neutral grey — its wrapper keeps the
-    // muted text class (the GREY exception).
-    const cancelIndicator = within(childRow(container, "c_cancel")).getByTestId(
-      "subagent-status-dot",
-    );
-    expect(cancelIndicator).toHaveClass("text-muted-foreground");
-    expect(cancelIndicator).not.toHaveClass("text-session-active");
-    // Quiet states render no word — the label lives in the tooltip. Working is
-    // quiet too: the pulsing pink dot already reads as "active".
+    expect(childRow(container, "c_launch")).not.toHaveTextContent(/Launching/);
     expect(childRow(container, "c_work")).not.toHaveTextContent(/Working/);
     expect(childRow(container, "c_done")).not.toHaveTextContent(/Done/);
     expect(childRow(container, "c_idle")).not.toHaveTextContent(/Idle/);
-    // The working dot still renders, and the word survives as the dot's label.
+    expect(childRow(container, "c_cancel")).not.toHaveTextContent(/cancelled/);
     expect(
-      childRow(container, "c_work").querySelector('[data-testid="running-dot"]'),
-    ).not.toBeNull();
+      within(childRow(container, "c_launch")).getByTestId("subagent-status-avatar"),
+    ).toHaveAttribute("aria-label", "Launching");
     expect(
-      within(childRow(container, "c_work")).getByTestId("subagent-status-dot"),
+      within(childRow(container, "c_work")).getByTestId("subagent-status-avatar"),
     ).toHaveAttribute("aria-label", "Working");
     expect(
-      within(childRow(container, "c_idle")).getByTestId("subagent-status-dot"),
+      within(childRow(container, "c_idle")).getByTestId("subagent-status-avatar"),
     ).toHaveAttribute("aria-label", "Idle");
+    expect(
+      within(childRow(container, "c_cancel")).getByTestId("subagent-status-avatar"),
+    ).toHaveAttribute("aria-label", "cancelled");
   });
 
-  it("renders the status marker last so markers align across rows regardless of label width", () => {
-    // Alignment fix: the marker trails the label, so a wide label ("Failed")
-    // can't push its marker left of a bare "Idle" dot. If the marker ever
-    // renders before the label again, lastElementChild stops being the marker
-    // and the markers fall out of column.
+  it("renders the status avatar before the title-line agent avatar", () => {
     mockChildTree({
-      conv_parent: [
-        childInfo({ id: "c_fail", tool: "researcher", current_task_status: "failed" }),
-        childInfo({ id: "c_idle", tool: "researcher" }),
-      ],
+      conv_parent: [childInfo({ id: "c_agent", tool: "researcher" })],
     });
 
     const { container } = renderPanel();
 
-    // Failed row shows its label, with the destructive dot trailing it.
-    const failIndicator = within(childRow(container, "c_fail")).getByTestId("subagent-status-dot");
-    const failDot = failIndicator.querySelector("span.rounded-full");
-    expect(failDot).not.toBeNull();
-    expect(failIndicator).toHaveTextContent(/Failed/);
-    expect(failIndicator.lastElementChild).toBe(failDot);
-
-    // Idle row is dot-only (quiet), and that dot is still the trailing child.
-    const idleIndicator = within(childRow(container, "c_idle")).getByTestId("subagent-status-dot");
-    const idleDot = idleIndicator.querySelector("span.rounded-full");
-    expect(idleDot).not.toBeNull();
-    expect(idleIndicator.lastElementChild).toBe(idleDot);
+    const row = childRow(container, "c_agent");
+    const statusAvatar = within(row).getByTestId("subagent-status-avatar");
+    const agentAvatar = within(row).getByTestId("subagent-agent-avatar");
+    expect(statusAvatar.nextElementSibling).toContainElement(agentAvatar);
+    expect(agentAvatar.parentElement).toHaveTextContent("researcher");
   });
 
   it("de-emphasizes settled (done/idle) rows, but never the working or active row", () => {
@@ -1291,10 +1216,10 @@ describe("SubagentsPanel", () => {
     // Skip the decorative nesting connector (shared by every row) and assert
     // on the role icon, which is what varies per agent type.
     const exploreIcon = childRow(container, "c_explore").querySelector(
-      "svg:not(.lucide-corner-down-right)",
+      '[data-testid="subagent-agent-avatar"] svg',
     );
     const codeIcon = childRow(container, "c_code").querySelector(
-      "svg:not(.lucide-corner-down-right)",
+      '[data-testid="subagent-agent-avatar"] svg',
     );
     expect(exploreIcon).not.toBeNull();
     expect(codeIcon).not.toBeNull();
@@ -1326,10 +1251,12 @@ describe("SubagentsPanel", () => {
     renderPanel({
       rootSessionId: "conv_root",
       // Simulate stale session-scoped params carried over from the
-      // previous session — the bug condition the fix targets. All four
-      // are listed so any regression that drops a key from
-      // SESSION_SCOPED_PARAMS surfaces here.
-      initialEntries: ["/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed"],
+      // previous session — the bug condition the fix targets. All five
+      // are listed so any regression that drops a key from the shared
+      // session-scoped search-param list surfaces here.
+      initialEntries: [
+        "/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed&message=msg_1",
+      ],
     });
 
     const main = screen.getByTestId("subagent-main-row");
@@ -1466,10 +1393,52 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "conv_grandchild")).toHaveAttribute("data-depth", "2");
     expect(childRow(container, "conv_ggchild")).toHaveAttribute("data-depth", "3");
     // Each level steps its left gutter in by one unit so the rows read
-    // as a tree.
+    // as a tree, with each child connector aligned to its parent label.
     const pad = (id: string) => parseInt(childRow(container, id).style.paddingLeft, 10);
-    expect(pad("conv_grandchild")).toBeGreaterThan(pad("conv_child"));
-    expect(pad("conv_ggchild")).toBeGreaterThan(pad("conv_grandchild"));
+    expect(pad("conv_grandchild") - pad("conv_child")).toBe(64);
+    expect(pad("conv_ggchild") - pad("conv_grandchild")).toBe(90);
+  });
+
+  it("uses the circle-dot connector only for first-level leaf nodes", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "conv_leaf", tool: "Explore", session_name: "leaf" }),
+        childInfo({ id: "conv_parent", tool: "Explore", session_name: "parent" }),
+      ],
+      conv_parent: [childInfo({ id: "conv_nested", tool: "Explore", session_name: "nested" })],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const firstLevelConnector = childRow(container, "conv_leaf").querySelector(
+      "[data-subagent-connector]",
+    );
+    expect(firstLevelConnector).toHaveClass("lucide-circle-dot");
+    expect(
+      childRow(container, "conv_nested").querySelector("[data-subagent-connector]"),
+    ).toHaveClass("lucide-corner-down-right");
+  });
+
+  it("stops the root dotted guide at the last first-level node", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "conv_first", tool: "Explore", session_name: "first" }),
+        childInfo({ id: "conv_last", tool: "Explore", session_name: "last" }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    expect(
+      childRow(container, "conv_first")
+        .closest("li")
+        ?.querySelector('[data-root-guide-segment="lower"]'),
+    ).not.toBeNull();
+    expect(
+      childRow(container, "conv_last")
+        .closest("li")
+        ?.querySelector('[data-root-guide-segment="lower"]'),
+    ).toBeNull();
   });
 
   it("collapses and expands a row's nested subagents", () => {
@@ -1489,6 +1458,7 @@ describe("SubagentsPanel", () => {
     const toggle = screen.getByTestId("subagent-collapse-toggle");
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
+    expect(toggle).toHaveClass("size-6");
 
     fireEvent.click(toggle);
 

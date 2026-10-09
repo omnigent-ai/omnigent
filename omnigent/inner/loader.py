@@ -18,6 +18,7 @@ from .datamodel import (
     OSEnvSpec,
     ParamDef,
     TerminalEnvSpec,
+    parse_write_paths,
 )
 from .policies import (
     FunctionPolicy,
@@ -88,11 +89,9 @@ def load_agent_def(
     resolution. See :func:`_resolve_instructions` for the rules.
 
     :param path_or_dict: A YAML file path or already-parsed dict.
-    :param enforce_handler_allowlist: When ``True``, reject any
-        ``type: function`` policy whose ``handler:`` / ``callable:``
-        dotted path is not a registered policy handler, *before*
-        ``_parse_agent_def`` resolves and (for factory policies)
-        **calls** it. This is the guard for the untrusted
+    :param enforce_handler_allowlist: When ``True``, reject dynamic tool
+        targets (including nested agent tools) and unregistered function
+        policy handlers before importing or calling them. This guards the untrusted
         agent-bundle upload path: ``omnigent.spec.load`` routes a
         single-file omnigent YAML bundle here during
         ``validate_agent_bundle``, and the loader executes policy
@@ -100,9 +99,10 @@ def load_agent_def(
         ``handler: subprocess.Popen`` would otherwise run during
         validation. Defaults to ``False`` so trusted callers (local
         ``omnigent run``, operator specs, the CLI) keep working with
-        custom handlers — the operator already has code execution, so
+        custom handlers and tools — the operator already has code execution, so
         the restriction would add no security there.
     """
+    path: Path | None = None
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
         with open(path) as f:
@@ -111,28 +111,36 @@ def load_agent_def(
     else:
         data = path_or_dict
         instructions_root = None
+    if not isinstance(data, dict):
+        # An empty or comments-only document loads as None, and a bare scalar or
+        # list loads as that value. Every reader below indexes it as a mapping,
+        # so without this guard the first ``data.get(...)`` raised a bare
+        # AttributeError — which the upload/validate path surfaced as an
+        # internal error instead of naming the malformed spec.
+        found = "an empty document" if data is None else f"a {type(data).__name__}"
+        where = f" in {path}" if path is not None else ""
+        raise ValueError(
+            f"Agent spec must be a YAML mapping of top-level keys; found {found}{where}."
+        )
     if enforce_handler_allowlist:
         _reject_unregistered_policy_handlers(data)
-    return _parse_agent_def(data, instructions_root=instructions_root)
+    return _parse_agent_def(
+        data,
+        instructions_root=instructions_root,
+        allow_dynamic_tools=not enforce_handler_allowlist,
+    )
 
 
 def _reject_unregistered_policy_handlers(data: YamlData) -> None:
-    """Reject ``type: function`` policies whose handler is not registered.
+    """Reject unregistered handlers before parsing an uploaded policy.
 
-    Scans the raw YAML ``policies:`` mapping for handler dotted paths
-    that are not in the policy registry and raises before any import or
-    factory call. Tool ``callable:`` paths are intentionally *not*
-    scanned — they are a separate surface and are not invoked at parse
-    time. See :func:`load_agent_def` for why this only runs on the
-    untrusted bundle-upload path.
-
-    :param data: The raw agent YAML dict (pre-parse). Non-dict input
-        (malformed YAML) is ignored here and left for the parser to
-        reject.
-    :raises ValueError: If a function policy names an unregistered
-        handler, e.g. ``"subprocess.Popen"``.
+    Check legacy handler/callable fields and native function paths, including
+    wrapped handlers. Tool targets are guarded separately by the recursive tool parser.
     """
-    from omnigent.policies.registry import is_registered_handler
+    from omnigent.policies.registry import (
+        function_policy_handler_allowed,
+        is_registered_handler,
+    )
 
     if not isinstance(data, dict):
         return
@@ -148,6 +156,23 @@ def _reject_unregistered_policy_handlers(data: YamlData) -> None:
         if isinstance(handler, str) and not is_registered_handler(handler):
             raise ValueError(
                 f"Policy {pname!r}: handler {handler!r} is not a registered policy "
+                f"handler. Uploaded agent bundles may only use handlers from the "
+                f"policy registry; a server admin must add custom handlers via the "
+                f"'policy_modules' config."
+            )
+        # Native function policies may use a string or a path/arguments mapping.
+        func = pdata.get("function")
+        if isinstance(func, str):
+            func_path, func_args = func, None
+        elif isinstance(func, dict):
+            func_path, func_args = func.get("path"), func.get("arguments")
+        else:
+            func_path, func_args = None, None
+        if isinstance(func_path, str) and not function_policy_handler_allowed(
+            func_path, func_args
+        ):
+            raise ValueError(
+                f"Policy {pname!r}: handler {func_path!r} is not a registered policy "
                 f"handler. Uploaded agent bundles may only use handlers from the "
                 f"policy registry; a server admin must add custom handlers via the "
                 f"'policy_modules' config."
@@ -228,6 +253,7 @@ def _resolve_instructions(
 def _parse_agent_def(
     data: YamlData,
     *,
+    allow_dynamic_tools: bool,
     instructions_root: Path | None = None,
 ) -> AgentDef:
     agent = AgentDef()
@@ -254,11 +280,29 @@ def _parse_agent_def(
     agent.spawn = data.get("spawn", False)
     agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
+    raw_model_egress = data.get("model_egress")
+    if raw_model_egress is not None:
+        if not isinstance(raw_model_egress, list) or not raw_model_egress:
+            raise ValueError("model_egress must be a non-empty list")
+        from .egress.rules import parse_rule
+
+        agent.model_egress = []
+        for index, rule in enumerate(raw_model_egress):
+            if not isinstance(rule, str):
+                raise ValueError(f"model_egress[{index}] must be a string")
+            parse_rule(rule)
+            agent.model_egress.append(rule)
 
     # Executor
     executor_data = data.get("executor")
     if executor_data:
         agent.executor = _parse_executor_spec(executor_data)
+
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(
+        agent.os_env, agent.executor.harness if agent.executor else None
+    )
 
     # Params
     for pname, pdata in data.get("params", {}).items():
@@ -273,7 +317,7 @@ def _parse_agent_def(
 
     # Tools
     for tname, tdata in data.get("tools", {}).items():
-        agent.tools[tname] = _parse_tool(tname, tdata)
+        agent.tools[tname] = _parse_tool(tname, tdata, allow_dynamic_tools=allow_dynamic_tools)
 
     # Policies
     for pname, pdata in data.get("policies", {}).items():
@@ -349,7 +393,7 @@ def _parse_agent_def(
 # ---------------------------------------------------------------------------
 
 
-def _parse_tool(name: str, data: str | YamlData) -> Tool:
+def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -> Tool:
     if isinstance(data, str):
         if data == "inherit":
             return InheritedTool(name=name)
@@ -365,6 +409,17 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
         return FunctionTool(name=name, description=str(data))
 
     tool_type = data.get("type", "function")
+
+    # Guard imports in the recursive parser so nested tools cannot bypass
+    # the upload restriction. Module initialization is already a side effect.
+    if not allow_dynamic_tools and (
+        (tool_type == "function" and isinstance(data.get("callable"), str))
+        or (tool_type == "cancellable_function" and isinstance(data.get("runner"), str))
+    ):
+        raise ValueError(
+            f"Tool {name!r}: uploaded agent bundles may not declare a "
+            "server-side Python callable tool."
+        )
 
     if tool_type == "function":
         # Reject typos like ``runtime: clinet`` at load time.
@@ -462,7 +517,7 @@ def _parse_tool(name: str, data: str | YamlData) -> Tool:
 
         sub_tools: dict[str, Tool] = {}
         for sname, sdata in data.get("tools", {}).items():
-            sub_tools[sname] = _parse_tool(sname, sdata)
+            sub_tools[sname] = _parse_tool(sname, sdata, allow_dynamic_tools=allow_dynamic_tools)
         raw_max_sessions = data.get("max_sessions")
         max_sessions: int | None = None
         if raw_max_sessions is not None:
@@ -644,11 +699,19 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             from omnigent.spec.parser import _parse_executor_auth
 
             auth = _parse_executor_auth(data, expand_env=True)
+        context_files = data.get("context_files")
+        if "context_files" in data and not isinstance(context_files, bool):
+            raise ValueError("executor.context_files must be a boolean")
+        system_prompt_mode = data.get("system_prompt_mode")
+        if "system_prompt_mode" in data and system_prompt_mode not in ("append", "replace"):
+            raise ValueError("executor.system_prompt_mode must be 'append' or 'replace'")
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
             auth=auth,
+            context_files=context_files,
+            system_prompt_mode=system_prompt_mode,
         )
     return None
 
@@ -762,6 +825,11 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         if raw_type is not None and not isinstance(raw_type, str):
             raise TypeError("os_env.sandbox.type must be a string or null")
         sandbox_type = _resolve_sandbox_type(raw_type)
+    parsed_write_paths = parse_write_paths(data.get("write_paths"))
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
     egress_rules = data.get("egress_rules")
     # Mirror the Omnigent parser's hard reject of ``egress_rules`` paired with
     # a backend that cannot enforce them at spawn time. Without this
@@ -828,11 +896,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=data.get("read_paths"),
-        write_paths=(
-            list(data["write_paths"])
-            if "write_paths" in data and data.get("write_paths") is not None
-            else None
-        ),
+        write_paths=parsed_write_paths,
         write_files=(
             list(data["write_files"])
             if "write_files" in data and data.get("write_files") is not None

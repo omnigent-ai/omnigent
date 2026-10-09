@@ -6,7 +6,7 @@ threaded into ``resolve_pi_native_provider(model=...)`` — which renders it
 into the runner-owned Pi ``models.json`` (and the appended ``--model``).
 
 Unlike cursor-native, a gateway-routed id (``databricks-*``) is KEPT: the
-runner-owned Pi process routes through the Databricks AI Gateway, whose
+runner-owned Pi process routes through the Databricks Unity Gateway, whose
 ``models.json`` selects the model by its gateway id.
 """
 
@@ -133,7 +133,9 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     class _SnapshotClient:
         """Fresh pi-native session snapshot (no launch args / external id)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
             del url, timeout
             return httpx.Response(
                 200,
@@ -246,7 +248,9 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
 
     class _SnapshotClient:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
             del url, timeout
             return httpx.Response(
                 200,
@@ -345,7 +349,9 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
 
     class _SnapshotClient:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
             del url, timeout
             return httpx.Response(
                 200,

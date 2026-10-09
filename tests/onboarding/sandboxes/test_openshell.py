@@ -12,8 +12,9 @@ from typing import Any
 import click
 import pytest
 
-from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
+from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE, SandboxGoneError
 from omnigent.onboarding.sandboxes.openshell import (
+    _PUT_CHUNK_BYTES,
     HOST_IMAGE_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     WORKSPACE_ENV_VAR,
@@ -259,6 +260,88 @@ def test_put_uploads_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     assert stdin == b"fake-tarball"
 
 
+@pytest.mark.parametrize(
+    "chunk_sizes",
+    [
+        (_PUT_CHUNK_BYTES,),
+        (_PUT_CHUNK_BYTES, _PUT_CHUNK_BYTES),
+        (_PUT_CHUNK_BYTES, _PUT_CHUNK_BYTES, 17),
+    ],
+    ids=["single-chunk", "exact-multiple", "partial-final-chunk"],
+)
+def test_put_chunks_large_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, chunk_sizes: tuple[int, ...]
+) -> None:
+    """``put`` splits a file that would exceed the gateway's 1 MiB message cap."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    chunks = [
+        bytes((offset + index) % 256 for offset in range(size))
+        for index, size in enumerate(chunk_sizes)
+    ]
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(b"".join(chunks))
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert [stdin for _, _, stdin in fake.exec_calls] == chunks
+    for index, (name, command, _) in enumerate(fake.exec_calls):
+        redirect = ">" if index == 0 else ">>"
+        assert name == "sb-1"
+        assert command == [
+            "bash",
+            "-c",
+            f"mkdir -p /tmp/oa && cat {redirect} /tmp/oa/wheels.tgz",
+        ]
+
+
+def test_put_snapshots_source_before_upload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A source rewritten during the upload cannot change the remaining chunks."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    payload = bytes(range(256)) * (_PUT_CHUNK_BYTES // 256 + 1)
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(payload)
+    record_execute = fake.execute
+
+    def rewrite_source(*args: Any, **kwargs: Any) -> _FakeExecResult:
+        result = record_execute(*args, **kwargs)
+        if len(fake.exec_calls) == 1:
+            local_file.write_bytes(b"rewritten")
+        return result
+
+    monkeypatch.setattr(fake, "execute", rewrite_source)
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert [stdin for _, _, stdin in fake.exec_calls] == [
+        payload[:_PUT_CHUNK_BYTES],
+        payload[_PUT_CHUNK_BYTES:],
+    ]
+
+
+def test_put_creates_empty_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``put`` still creates a zero-byte file rather than skipping it."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    local_file = tmp_path / "empty"
+    local_file.write_bytes(b"")
+
+    launcher.put("sb-1", local_file, "/tmp/oa/empty")
+
+    [(_, command, stdin)] = fake.exec_calls
+    assert "cat > /tmp/oa/empty" in command[2]
+    assert stdin == b""
+
+
 def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``put`` raises when the remote ``cat`` exits non-zero."""
     fake = _FakeOpenShellAPI(exec_result=_FakeExecResult(exit_code=1, stderr="denied"))
@@ -270,6 +353,37 @@ def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
     with pytest.raises(click.ClickException, match="File upload"):
         launcher.put("sb-1", local_file, "/tmp/wheels.tgz")
+
+
+def test_put_stops_on_chunk_failure_and_restarts_on_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed append stops the upload; a whole-call retry truncates first."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    chunks = [b"\x00" * _PUT_CHUNK_BYTES, b"\xff" * _PUT_CHUNK_BYTES, b"tail"]
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(b"".join(chunks))
+    record_execute = fake.execute
+
+    def fail_second_chunk(*args: Any, **kwargs: Any) -> _FakeExecResult:
+        result = record_execute(*args, **kwargs)
+        if len(fake.exec_calls) == 2:
+            return _FakeExecResult(exit_code=1, stderr="quota exceeded")
+        return result
+
+    monkeypatch.setattr(fake, "execute", fail_second_chunk)
+
+    with pytest.raises(click.ClickException, match="quota exceeded"):
+        launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+    assert [stdin for _, _, stdin in fake.exec_calls] == chunks[:2]
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert [stdin for _, _, stdin in fake.exec_calls[2:]] == chunks
+    assert "cat > /tmp/oa/wheels.tgz" in fake.exec_calls[2][1][2]
 
 
 def test_launcher_capabilities_join_resume_framework(sdk: _SDKState) -> None:
@@ -407,6 +521,8 @@ class _SDKState:
     connect_error: bool = False
     delete_not_found: bool = False
     delete_not_found_via_sandbox_error: bool = False
+    resume_not_found: bool = False
+    resume_sandbox_error: str | None = None
     created_spec: Any = None
     waited: tuple[str, int | None] | None = None
     got: list[str] = field(default_factory=list)
@@ -475,6 +591,10 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
             return _SandboxRef(id=f"id-for-{name}", name=name)
 
         def start(self, name: str, *, workspace: str) -> None:
+            if state.resume_not_found:
+                raise _NotFound(_StatusCode.NOT_FOUND)
+            if state.resume_sandbox_error is not None:
+                raise _SandboxError(state.resume_sandbox_error)
             state.resumed.append((name, workspace))
 
         def exec(
@@ -632,6 +752,24 @@ def test_client_resume_waits_ready_and_recaches_id(sdk: _SDKState) -> None:
     client.execute("box", ["ls"])
     assert sdk.execs[-1][0] == "id-resumed"
     assert sdk.got == ["box"]  # no re-get: the resume refreshed the cache
+
+
+def test_client_resume_missing_sandbox_raises_gone(sdk: _SDKState) -> None:
+    """A definitive gateway not-found lets the server recreate the sandbox."""
+    sdk.resume_not_found = True
+
+    with pytest.raises(SandboxGoneError, match="no longer exists"):
+        _OpenShellClient().resume_sandbox("box")
+
+
+def test_client_resume_transient_failure_stays_click_error(sdk: _SDKState) -> None:
+    """A provider outage must not trigger a workspace-destroying recreate."""
+    sdk.resume_sandbox_error = "gateway unavailable"
+
+    with pytest.raises(click.ClickException, match="gateway unavailable") as exc:
+        _OpenShellClient().resume_sandbox("box")
+
+    assert not isinstance(exc.value, SandboxGoneError)
 
 
 def test_client_resume_requires_sdk_support(

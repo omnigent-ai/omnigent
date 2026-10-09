@@ -231,7 +231,7 @@ def test_background_daemon_claims_record_before_connecting(
     monkeypatch.setattr(
         identity_module,
         "load_or_create_host_identity",
-        lambda _path: HostIdentity(host_id="host_elected", name="elected"),
+        lambda: HostIdentity(host_id="host_elected", name="elected"),
     )
 
     connected: list[str] = []

@@ -7,19 +7,27 @@ import base64
 import contextlib
 import socket
 import ssl
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
+    RefreshingSecretProvider,
+    prepare_credential_proxy_runtime,
 )
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
+from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.spec.parser import _parse_credential_proxy
 
 
 @pytest.fixture()
@@ -28,6 +36,152 @@ def ca_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     cert_path, key_path = ensure_ca(cache_dir=tmp_path)
     bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
     return cert_path, key_path, bundle_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_concurrent_credentials_share_resolution_without_exhausting_executor(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    fail: bool,
+) -> None:
+    started = threading.Event()
+    released = threading.Event()
+
+    class Provider:
+        calls = 0
+
+        def resolve(self) -> str:
+            self.calls += 1
+            started.set()
+            if not released.wait(10):
+                raise TimeoutError("test broker was not released")
+            if fail:
+                raise RuntimeError("sensitive broker error")
+            return "replacement"
+
+    provider = Provider()
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(
+        [],
+        cert_path,
+        key_path,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host="github.com",
+                scheme="basic",
+                username="x-access-token",
+                secret_provider=provider.resolve,
+            ),
+            CredentialRewriteRule(
+                host="api.github.com", scheme="token", secret_provider=provider.resolve
+            ),
+        ],
+    )
+    loop = asyncio.get_running_loop()
+    tasks = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        monkeypatch.setattr(loop, "_default_executor", executor)
+        try:
+            tasks = [
+                asyncio.create_task(
+                    proxy._rewrite_authorization_async(
+                        method="GET",
+                        host="github.com" if index % 2 else "api.github.com",
+                        headers_raw=b"Host: github.com\r\n\r\n",
+                    )
+                )
+                for index in range(64)
+            ]
+            async with asyncio.timeout(3):
+                while not started.is_set():
+                    await asyncio.sleep(0.01)
+            tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[0]
+            assert await asyncio.wait_for(asyncio.to_thread(lambda: "available"), 3) == "available"
+            assert provider.calls == 1
+            assert all(not task.done() for task in tasks[1:])
+            released.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks[1:]), 3)
+            assert provider.calls == 1
+            if fail:
+                assert all(result.status_code == 502 for result in results)
+                assert all(result.error == "Credential source unavailable" for result in results)
+                assert all(result.headers == b"" for result in results)
+            else:
+                expected_basic = base64.b64encode(b"x-access-token:replacement")
+                assert all(result.error is None for result in results)
+                assert all(
+                    b"token replacement" in result.headers or expected_basic in result.headers
+                    for result in results
+                )
+            assert not proxy._credential_resolutions
+            if fail:
+                fail = False
+                recovered = await proxy._rewrite_authorization_async(
+                    method="GET",
+                    host="api.github.com",
+                    headers_raw=b"Host: api.github.com\r\n\r\n",
+                )
+                assert recovered.error is None
+                assert b"token replacement" in recovered.headers
+                assert provider.calls == 2
+        finally:
+            released.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,host,auth,error",
+    [
+        ("TRACE", "github.com", "", None),
+        ("GET", "github.com", "Authorization: token foreign\r\n", None),
+        ("GET", "example.com", "", None),
+        ("GET", "example.com", "Authorization: token oa_cred_test\r\n", "not allowed"),
+        (
+            "GET",
+            "github.com",
+            "Authorization: token oa_cred_test\r\nAuthorization: token oa_cred_wrong\r\n",
+            "not allowed",
+        ),
+    ],
+)
+async def test_async_rewrite_does_not_resolve_unneeded_or_rejected_credentials(
+    ca_paths: tuple[Path, Path, Path],
+    method: str,
+    host: str,
+    auth: str,
+    error: str | None,
+) -> None:
+    resolver = Mock(side_effect=AssertionError("credential should not be resolved"))
+    cert_path, key_path, _ = ca_paths
+    proxy = EgressProxy(
+        [],
+        cert_path,
+        key_path,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host="github.com",
+                scheme="token",
+                synthetic="oa_cred_test",
+                secret_provider=resolver,
+            ),
+        ],
+    )
+    headers = f"Host: {host}\r\n{auth}\r\n".encode()
+    result = await proxy._rewrite_authorization_async(
+        method=method, host=host, headers_raw=headers
+    )
+    if error is None:
+        assert result.error is None
+        assert result.headers == headers
+    else:
+        assert result.error is not None and error in result.error
+    resolver.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1723,7 +1877,9 @@ class _CapturedRequest:
     method: str | None = None
 
 
-async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio.Server:
+async def _start_capturing_upstream(
+    captured: list[_CapturedRequest], ssl_context: ssl.SSLContext | None = None
+) -> asyncio.Server:
     """Start a loopback HTTP server that records each ``Authorization`` header.
 
     The server reads the request head, appends the captured authorization
@@ -1763,7 +1919,7 @@ async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio
         await writer.drain()
         writer.close()
 
-    return await asyncio.start_server(_handle, "127.0.0.1", 0)
+    return await asyncio.start_server(_handle, "127.0.0.1", 0, ssl=ssl_context)
 
 
 async def _proxied_http_get(
@@ -1961,6 +2117,114 @@ async def test_credential_rewrite_swaps_via_refreshing_provider(
     assert calls["n"] == 1
     assert captured[0].authorization == "Bearer live-token-1"
     assert synthetic not in (captured[0].authorization or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tls", [False, True])
+async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failure(
+    ca_paths: tuple[Path, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tls: bool,
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    token_file = tmp_path / "private-source-marker"
+    token_file.write_text("startup-token")
+    clock = Mock(return_value=0.0)
+    monkeypatch.setattr(
+        "omnigent.inner.credential_proxy.RefreshingSecretProvider",
+        partial(RefreshingSecretProvider, clock=clock),
+    )
+    spec = _parse_credential_proxy(
+        [{"type": "gh_basic", "source": {"file": str(token_file), "refresh_interval_seconds": 60}}]
+    )
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[],
+        write_roots=[tmp_path / "workspace"],
+        write_files=[],
+        allow_network=False,
+    )
+    runtime = prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=policy)
+    placeholders = dict(runtime.helper_env_updates)
+    captured: list[_CapturedRequest] = []
+    upstreams: dict[str, asyncio.Server] = {}
+    for host in ("github.com", "api.github.com"):
+        context = HostCertCache(cert_path, key_path).get_ssl_context(host) if tls else None
+        upstreams[host] = await _start_capturing_upstream(captured, context)
+    proxy = EgressProxy(
+        parse_rules(["* github.com/**", "* api.github.com/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+        credential_rewrites=runtime.rewrites,
+    )
+    port = await proxy.start_tcp()
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _resolve_to_loopback())
+
+    async def request(host: str) -> bytes:
+        upstream_port = upstreams[host].sockets[0].getsockname()[1]
+        target = "/probe" if tls else f"http://{host}:{upstream_port}/probe"
+        auth = (
+            f"Authorization: token {placeholders['GH_TOKEN']}\r\n"
+            if host.startswith("api.")
+            else ""
+        )
+        headers = (
+            f"GET {target} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\n"
+            f"{auth}Connection: close\r\n\r\n"
+        ).encode()
+        if tls:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _mitm_client_send_inner,
+                    port,
+                    f"{host}:{upstream_port}",
+                    host,
+                    bundle_path,
+                    headers,
+                ),
+                timeout=10,
+            )
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(headers)
+            await writer.drain()
+            return await asyncio.wait_for(reader.read(), timeout=10)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        clock.return_value = 4 * 3600.0
+        token_file.write_text("after-idle")
+        for host in upstreams:
+            assert b"200 OK" in await request(host)
+        expected_basic = base64.b64encode(b"x-access-token:after-idle").decode()
+        assert [capture.authorization for capture in captured] == [
+            f"Basic {expected_basic}",
+            "token after-idle",
+        ]
+        token_file.unlink()
+        clock.return_value += 60
+        for host in upstreams:
+            response = await request(host)
+            assert b"502 Bad Gateway" in response
+            assert b"private-source-marker" not in response
+        assert len(captured) == 2
+        assert "private-source-marker" not in caplog.text
+        token_file.write_text("recovered")
+        assert b"200 OK" in await request("api.github.com")
+        assert captured[-1].authorization == "token recovered"
+        assert runtime.helper_env_updates == placeholders
+    finally:
+        await proxy.stop()
+        for upstream in upstreams.values():
+            upstream.close()
+            await upstream.wait_closed()
 
 
 @pytest.mark.parametrize("host", ["api.cursor.com", "api2.cursor.sh", "agent.cursor.sh"])

@@ -752,7 +752,9 @@ def build_agent_bundle(
     :param description: Optional description.
     :param sub_agents: Optional list of sub-agent config dicts.
         Each must have at least a ``"name"`` key, e.g.
-        ``[{"name": "researcher", "description": "..."}]``.
+        ``[{"name": "researcher", "description": "..."}]``. An optional
+        ``"skills"`` list, shaped like ``skills``, is bundled under the
+        sub-agent's directory.
     :param max_iterations: Optional override for
         ``executor.max_iterations`` — useful for tests that want
         to force an ``incomplete`` terminal state after a known
@@ -764,7 +766,8 @@ def build_agent_bundle(
     :param skills: Optional bundled skills. Each dict must include
         ``"name"``, ``"description"``, and ``"content"``, e.g.
         ``{"name": "triage", "description": "Triage issues",
-        "content": "Ask one question."}``.
+        "content": "Ask one question."}``. An optional ``"dir"`` names
+        the skill directory when it differs from ``"name"``.
     :param guardrails: Optional ``guardrails:`` block written verbatim
         into the spec, e.g. ``{"policies": {"cost_guard": {"type":
         "function", "function": {"path": "...cost_budget",
@@ -848,7 +851,12 @@ def build_agent_bundle(
             )
             sa_info.size = len(sa_bytes)
             tf.addfile(sa_info, io.BytesIO(sa_bytes))
-        for skill in skills or []:
+        bundled_skills = [("", skill) for skill in skills or []] + [
+            (f"agents/{sa['name']}/", skill)
+            for sa in sub_agents or []
+            for skill in sa.get("skills", [])
+        ]
+        for prefix, skill in bundled_skills:
             skill_doc = (
                 "---\n"
                 + yaml.dump(
@@ -863,7 +871,7 @@ def build_agent_bundle(
             )
             skill_bytes = skill_doc.encode()
             skill_info = tarfile.TarInfo(
-                name=f"skills/{skill['name']}/SKILL.md",
+                name=f"{prefix}skills/{skill.get('dir', skill['name'])}/SKILL.md",
             )
             skill_info.size = len(skill_bytes)
             tf.addfile(skill_info, io.BytesIO(skill_bytes))
@@ -1120,3 +1128,56 @@ def echo_runner_client() -> httpx.AsyncClient:
         base_url="http://runner.test",
         transport=httpx.MockTransport(_handler),
     )
+
+
+def websocket_scope(path: str) -> dict[str, object]:
+    """Build a minimal ASGI WebSocket scope for the host tunnel."""
+    return {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "scheme": "ws",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+
+
+async def create_session_for_agent(client: httpx.AsyncClient, agent_id: str) -> str:
+    """
+    Create a session bound to an agent.
+
+    :param client: Test HTTP client.
+    :param agent_id: Agent to bind.
+    :returns: New session id.
+    """
+    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    return resp.json()["id"]
+
+
+def policy_tool_call_request(
+    tool_name: str = "Bash",
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a ``PHASE_TOOL_CALL`` policy-evaluate request.
+
+    :param tool_name: Tool name, e.g. ``"Bash"``.
+    :param arguments: Tool arguments dict.
+    :returns: JSON body for ``POST /v1/sessions/{id}/policies/evaluate``.
+    """
+    return {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {
+                "name": tool_name,
+                "arguments": arguments or {},
+            },
+            "context": {},
+        },
+    }

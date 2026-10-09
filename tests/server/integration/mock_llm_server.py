@@ -9,7 +9,8 @@ so concurrent tests / sessions get isolated response streams.
 Keyed queues:
 
 Each ``POST /mock/configure`` call specifies an optional ``key``
-(defaults to ``"default"``). When ``POST /v1/responses`` arrives,
+(defaults to ``"default"`` for model routing; content routing gets a unique key).
+When ``POST /v1/responses`` arrives,
 the server extracts the ``model`` field from the request body and
 looks up a queue by that key. If no queue matches the model, the
 ``"default"`` queue is used. This lets e2e tests register one
@@ -60,18 +61,72 @@ open-time HTTP status, cannot express).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
+import os
 import sys
+import threading
 import time as _time_mod
 import uuid as _uuid_mod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
+_evidence_journals = {}
+_evidence_journals_lock = threading.Lock()
+
+
+def _evidence_directory() -> Path | None:
+    attempt = os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR")
+    if attempt:
+        return Path(attempt)
+    runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
+    if runtime and (Path(runtime) / "execution-context.json").is_file():
+        return Path(runtime) / "execution/service"
+    return None
+
+
+def _record_evidence(kind: str, body=None, accepted_at_ns=None, *, directory=None) -> None:
+    try:
+        directory = directory if directory is not None else _evidence_directory()
+        if directory is None:
+            return
+        from dev.repro_env.execution import Journal
+
+        with _evidence_journals_lock:
+            if directory not in _evidence_journals:
+                _evidence_journals[directory] = Journal(directory)
+            journal = _evidence_journals[directory]
+        journal.emit(
+            "provider_mock",
+            action=kind,
+            accepted_at_ns=accepted_at_ns,
+            body=body,
+            boundary="model provider",
+            correlation="timestamp and request content",
+        )
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+async def _record_evidence_async(kind: str, body=None, accepted_at_ns=None) -> None:
+    try:
+        directory = _evidence_directory()
+        if directory is not None:
+            await asyncio.to_thread(
+                _record_evidence, kind, body, accepted_at_ns, directory=directory
+            )
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
+
 
 # Default queue key when none is specified or no model matches.
 _DEFAULT_KEY = "default"
@@ -85,7 +140,14 @@ def _response_id() -> str:
     return f"resp_{_uuid_mod.uuid4().hex[:12]}"
 
 
-def sse_text_response(text: str, model: str = "mock-model") -> str:
+def _response_usage(output_tokens: int, overrides: dict | None = None) -> dict:
+    """Merge scripted token counts and derive the total when it is omitted."""
+    usage = {"input_tokens": 10, "output_tokens": output_tokens, **(overrides or {})}
+    usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
+    return usage
+
+
+def sse_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build a complete SSE stream for a simple text response.
 
@@ -96,6 +158,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
 
     :param text: The assistant response text.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -119,11 +182,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -164,7 +223,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
     return "".join(events)
 
 
-def json_text_response(text: str, model: str = "mock-model") -> dict:
+def json_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> dict:
     """
     Build a non-streaming Responses API JSON body for a text response.
 
@@ -174,6 +233,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
 
     :param text: The assistant response text.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: Responses API response dict.
     """
     resp_id = _response_id()
@@ -197,11 +257,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -210,13 +266,16 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
 def sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """
     Build a complete SSE stream for a function call response.
 
     :param tool_calls: List of tool call dicts, each with
-        ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
+        ``"call_id"``, ``"name"``, and ``"arguments"`` keys, plus an optional
+        ``"namespace"`` for native Codex MCP calls.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -231,6 +290,7 @@ def sse_tool_call_response(
                 "name": tc["name"],
                 "arguments": tc.get("arguments", "{}"),
                 "status": "completed",
+                **({"namespace": tc["namespace"]} if "namespace" in tc else {}),
             }
         )
     response_obj = {
@@ -242,11 +302,7 @@ def sse_tool_call_response(
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": 5,
-            "total_tokens": 15,
-        },
+        "usage": _response_usage(5, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -295,19 +351,20 @@ def truncate_sse(body: str, keep_events: int) -> str:
     return "".join(f"{seg}\n\n" for seg in kept)
 
 
-def sse_streaming_text(text: str, model: str = "mock-model") -> str:
+def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build SSE with text deltas followed by a completed event.
 
     :param text: The assistant response text.
     :param model: Model name.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string with delta events.
     """
     events = []
     for word in text.split():
         delta = {"delta": word + " "}
         events.append(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n")
-    events.append(sse_text_response(text, model))
+    events.append(sse_text_response(text, model, usage))
     return "".join(events)
 
 
@@ -315,6 +372,7 @@ def sse_text_with_native_items(
     text: str,
     native_items: list[dict],
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """Build SSE with text + native tool output items (e.g. web_search_call).
 
@@ -343,11 +401,7 @@ def sse_text_with_native_items(
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -740,7 +794,8 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
-    # Usage overrides. On ``/v1/messages`` merged into the Anthropic
+    # Usage overrides. On ``/v1/responses`` merged into the response usage.
+    # On ``/v1/messages`` merged into the Anthropic
     # ``message_start`` event (e.g. {"input_tokens": 50000}) so a test can
     # script the context size a claude harness observes mid-turn. On
     # ``/v1/chat/completions`` returned verbatim as the OpenAI ``usage``
@@ -756,9 +811,10 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
-    # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
-    # historical single-chunk body; a small value paces the stream so live
-    # surfaces (a native TUI) visibly render intermediate deltas.
+    # Seconds to sleep between SSE events on ``/v1/messages`` and
+    # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
+    # value paces the stream so live surfaces (a native TUI) visibly render
+    # intermediate deltas.
     chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
@@ -788,6 +844,22 @@ class _ResponseQueue:
         # the #523 cross-test contamination, fixed without per-test
         # servers. ``None`` preserves the default model/"default" routing.
         self.match: str | None = None
+        self.required_tools: frozenset[str] | None = None
+
+    def accepts_tools(self, tool_names: set[str]) -> bool:
+        """Keep scripted tool calls out of requests without any tools.
+
+        Explicit guards cover the whole queue; an empty guard deliberately
+        permits calls even without tools. Otherwise only require a tool surface:
+        negative tests may deliberately call an unadvertised tool. Text, errors
+        and exhausted-queue fallbacks remain unrestricted.
+        """
+        if self.required_tools is not None:
+            return self.required_tools <= tool_names
+        if self.index < len(self.responses):
+            calls = self.responses[self.index].tool_calls or []
+            return not calls or bool(tool_names)
+        return True
 
     def next(self) -> QueuedResponse:
         """Consume the next response, or return the fallback / default."""
@@ -804,6 +876,7 @@ class _ResponseQueue:
         self.responses.clear()
         self.index = 0
         self.match = None
+        self.required_tools = None
 
 
 class MockState:
@@ -877,6 +950,8 @@ class MockState:
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, dict):
+                if content.get("type") in {"tool_result", "function_call_output"}:
+                    return
                 text = content.get("text")
                 if isinstance(text, str):
                     parts.append(text)
@@ -905,6 +980,20 @@ class MockState:
                     append_text(item.get("content"))
         return " ".join(parts)
 
+    @staticmethod
+    def tool_names(parsed: object) -> set[str]:
+        """Read advertised tool names across Messages, Responses and Chat APIs."""
+        if not isinstance(parsed, dict):
+            return set()
+        names = set()
+        for tool in parsed.get("tools") or []:
+            if isinstance(tool, dict):
+                schema = tool.get("function", tool)
+                name = schema.get("name") if isinstance(schema, dict) else None
+                if isinstance(name, str):
+                    names.add(name)
+        return names
+
     def resolve_queue_for_request(self, parsed: object) -> _ResponseQueue:
         """Pick the queue for a request: content-routed queues first, then model/default.
 
@@ -923,11 +1012,12 @@ class MockState:
         :returns: The selected response queue.
         """
         user_text = self._user_input_text(parsed)
+        tool_names = self.tool_names(parsed)
         if user_text:
             best: _ResponseQueue | None = None
             best_score = (-1, -1)
             for queue in self.queues.values():
-                if not queue.match:
+                if not queue.match or not queue.accepts_tools(tool_names):
                     continue
                 position = user_text.rfind(queue.match)
                 score = (len(queue.match), position)
@@ -937,9 +1027,13 @@ class MockState:
             if best is not None:
                 return best
         model = parsed.get("model") if isinstance(parsed, dict) else None
-        return self.resolve_queue(model)
+        queue = self.resolve_queue(model)
+        # Model/default lookup must respect both explicit and inferred guards.
+        if not queue.accepts_tools(tool_names):
+            return _ResponseQueue()
+        return queue
 
-    def reset(self) -> None:
+    def reset(self, *, record_evidence: bool = True) -> None:
         """Clear all state (queues, captured requests, gates).
 
         Queues that have a fallback response set (via ``POST /mock/set_fallback``)
@@ -962,6 +1056,8 @@ class MockState:
                 queue.reset()  # clear responses/index, keep fallback
             else:
                 del self.queues[key]
+        if record_evidence:
+            _record_evidence("reset", accepted_at_ns=_time_mod.time_ns())
         self.captured_requests.clear()
         self.request_count = 0
         self.served_models = []
@@ -990,10 +1086,13 @@ async def create_response(
         parsed = {"raw": body.decode(errors="replace")}
 
     async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    await _record_evidence_async("request", parsed, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1023,24 +1122,35 @@ async def create_response(
         model_name = (
             parsed.get("model", "mock-model") if isinstance(parsed, dict) else "mock-model"
         )
-        return JSONResponse(content=json_text_response(qr.text or "", model=model_name))
+        return JSONResponse(
+            content=json_text_response(qr.text or "", model=model_name, usage=qr.usage)
+        )
 
     # Build SSE body
     if qr.tool_calls:
-        sse_body = sse_tool_call_response(qr.tool_calls)
+        sse_body = sse_tool_call_response(qr.tool_calls, usage=qr.usage)
     elif qr.stream:
-        sse_body = sse_streaming_text(qr.text)
+        sse_body = sse_streaming_text(qr.text, usage=qr.usage)
     elif qr.native_items:
-        sse_body = sse_text_with_native_items(qr.text, qr.native_items)
+        sse_body = sse_text_with_native_items(qr.text, qr.native_items, usage=qr.usage)
     else:
-        sse_body = sse_text_response(qr.text)
+        sse_body = sse_text_response(qr.text, usage=qr.usage)
 
     # Mid-stream fault: emit only a prefix and end, dropping the completion.
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
+    chunk_delay = qr.chunk_delay
+
     async def _generate() -> AsyncIterator[str]:
-        yield sse_body
+        if chunk_delay > 0:
+            # Paced like ``/v1/messages``: one SSE event at a time.
+            for event in sse_body.split("\n\n"):
+                if event:
+                    yield event + "\n\n"
+                    await asyncio.sleep(chunk_delay)
+        else:
+            yield sse_body
 
     return StreamingResponse(
         _generate(),
@@ -1054,9 +1164,8 @@ async def create_message(
 ) -> StreamingResponse | JSONResponse:
     """Anthropic Messages API endpoint for claude-sdk harness.
 
-    Same keyed-queue routing as ``/v1/responses`` but returns
-    Anthropic SSE format (``message_start``, ``content_block_*``,
-    ``message_delta``, ``message_stop``).
+    Uses the same keyed queues as ``/v1/responses`` and honors ``stream``.
+    Native Claude's model validation requests a nonstream JSON message.
     """
     body = await request.body()
     try:
@@ -1065,10 +1174,13 @@ async def create_message(
         parsed = {"raw": body.decode(errors="replace")}
 
     async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    await _record_evidence_async("request", parsed, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1090,6 +1202,47 @@ async def create_message(
 
     req_model = parsed.get("model") if isinstance(parsed, dict) else None
     echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
+    if isinstance(parsed, dict) and not parsed.get("stream", False):
+        content: list[dict] = []
+        stop_reason = "end_turn"
+        extra: dict = {}
+        output_tokens = max(5, len(qr.text.split()) + len((qr.thinking or "").split()))
+        if qr.refusal_category is not None:
+            content.append({"type": "text", "text": "I can't help with that."})
+            stop_reason = "refusal"
+            extra["stop_details"] = {"type": "refusal", "category": qr.refusal_category}
+            output_tokens = 5
+        elif qr.tool_calls:
+            content.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.get("call_id", f"toolu_{_uuid_mod.uuid4().hex[:12]}"),
+                    "name": call["name"],
+                    "input": json.loads(call.get("arguments", "{}")),
+                }
+                for call in qr.tool_calls
+            )
+            stop_reason = "tool_use"
+            output_tokens = 5
+        else:
+            if qr.thinking:
+                content.append(
+                    {"type": "thinking", "thinking": qr.thinking, "signature": "mock-signature"}
+                )
+            content.append({"type": "text", "text": qr.text})
+        return JSONResponse(
+            {
+                "id": f"msg_{_uuid_mod.uuid4().hex[:12]}",
+                "type": "message",
+                "role": "assistant",
+                "content": content,
+                "model": echo_model,
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, **(qr.usage or {}), "output_tokens": output_tokens},
+                **extra,
+            }
+        )
     if qr.refusal_category is not None:
         sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
     elif qr.tool_calls:
@@ -1141,11 +1294,14 @@ async def create_chat_completion(
         parsed = {"raw": body.decode(errors="replace")}
 
     async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
+
+    await _record_evidence_async("request", parsed, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1298,16 +1454,47 @@ async def configure(request: Request) -> dict[str, object]:
     contamination). Omitting ``match`` keeps the default model/"default"
     routing.
 
+    Without a key, distinct content selectors and their tool guards get
+    independent queues. Reconfiguring the same selector replaces its queue.
+    Without a content match, configuration still targets the default queue;
+    required_tools then guards consumption without changing model routing.
+    Explicit keys replace the named queue, including ``"default"``.
+    ``required_tools`` restricts consumption to requests advertising all listed
+    tool names, isolating turns from title-generation/background requests.
+    The guard covers the entire queue, including its configured fallback.
+    If the model/default queue fails the guard, return the generic
+    "Mock LLM response" without consuming that queue.
+
+    When ``required_tools`` is omitted, the next ``tool_calls`` response requires
+    a request with at least one advertised tool, so a no-tools title request
+    cannot consume it. Names need not match: negative tests can still call an
+    excluded tool. This does not guard text entries or the fallback. Set
+    ``required_tools: []`` to also permit calls on requests with no tools.
+    A nonempty explicit guard still takes precedence over inference.
+
     Multiple calls with different keys accumulate queues; use
     ``POST /mock/reset`` to clear all keys.
     """
     body = await request.json()
-    key = body.get("key", _DEFAULT_KEY)
     match = body.get("match")
+    required_tools = body.get("required_tools", [])
+    if not isinstance(required_tools, list) or any(
+        not isinstance(name, str) or not name for name in required_tools
+    ):
+        raise HTTPException(400, "required_tools must be a list of nonempty tool names")
+    if match is not None and (not isinstance(match, str) or not match):
+        raise HTTPException(400, "match must be a nonempty string")
+    # Only implicit content queues get independent identities. Explicit keys
+    # retain replacement semantics, including an explicit key="default".
+    guard = frozenset(required_tools) if "required_tools" in body else None
+    route = json.dumps([match, sorted(guard) if guard is not None else None]).encode()
+    implicit_key = f"content-{hashlib.sha256(route).hexdigest()[:24]}" if match else _DEFAULT_KEY
+    key = body.get("key", implicit_key)
     async with _state._lock:
         queue = _state.get_queue(key)
         queue.reset()
         queue.match = match
+        queue.required_tools = guard
         for entry in body.get("responses", []):
             queue.responses.append(
                 QueuedResponse(
@@ -1366,7 +1553,9 @@ async def reset() -> dict[str, bool]:
     Fallbacks set via ``POST /mock/set_fallback`` are preserved.
     """
     async with _state._lock:
-        _state.reset()
+        accepted_at_ns = _time_mod.time_ns()
+        _state.reset(record_evidence=False)
+    await _record_evidence_async("reset", accepted_at_ns=accepted_at_ns)
     return {"reset": True}
 
 

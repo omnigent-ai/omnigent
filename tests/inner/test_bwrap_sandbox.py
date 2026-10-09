@@ -588,6 +588,47 @@ def test_wrap_launcher_argv_nested_write_mount_follows_read_parent(
     assert read_index < write_index
 
 
+@pytest.mark.parametrize("exposure", ["cwd", "read-root", "root-alias", "implicit", "system"])
+def test_launcher_rejects_visible_credential_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exposure: str
+) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    private = (tmp_path / "private").resolve()
+    private.mkdir()
+    policy = _make_policy(cwd)
+    source = private / "token"
+    source.write_text("secret")
+    if exposure == "cwd":
+        source = cwd / "token"
+    elif exposure == "read-root":
+        policy.read_roots = [private]
+    elif exposure == "root-alias":
+        alias = tmp_path / "alias"
+        alias.symlink_to(private, target_is_directory=True)
+        policy.read_roots = [alias]
+    elif exposure == "implicit":
+        monkeypatch.setattr(
+            bwrap_sandbox,
+            "_ensure_executable_visible",
+            lambda argv, cwd: ["--ro-bind", str(private), "/runtime"],
+        )
+    else:
+        source = Path("/usr/lib/private-token")
+    policy.credential_source_paths = [source]
+    with pytest.raises(ValueError, match="sandbox-visible mounts"):
+        _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+
+
+def test_launcher_accepts_private_credential_source(tmp_path: Path) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    policy = _make_policy(cwd)
+    policy.credential_source_paths = [(tmp_path / "private-token").resolve()]
+    argv = _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+    assert argv[-3:] == ["/bin/sh", "-c", "true"]
+
+
 def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
     tmp_path: Path,
 ) -> None:
@@ -901,6 +942,24 @@ def test_wrap_launcher_argv_target_none_no_extra_binds(
     assert without_target == with_none, (
         "Passing target=None must produce identical argv to omitting the parameter."
     )
+
+
+@pytest.mark.parametrize("target", ["/bin/bash", "/sbin/tool", "/workspace/tool"])
+def test_covered_executable_does_not_expose_parent_directories(target: str) -> None:
+    assert (
+        bwrap_sandbox._interpreter_chain_binds(
+            [target], [Path("/bin"), Path("/sbin"), Path("/workspace")]
+        )
+        == []
+    )
+
+
+def test_shallow_executable_never_exposes_the_host_root() -> None:
+    assert bwrap_sandbox._interpreter_chain_binds(["/opt/tool"], [Path("/usr")]) == [
+        "--ro-bind-try",
+        "/opt",
+        "/opt",
+    ]
 
 
 def test_wrap_launcher_argv_target_already_in_default_mounts(
@@ -2177,3 +2236,137 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_bwrap(tmp_path: Path
     assert "TMPOK" in completed.stdout, (
         f"target did not reach the scratch-write marker. stdout={completed.stdout!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Harness-staged codex skill exposure
+# ---------------------------------------------------------------------------
+
+
+def _stage_codex_skills_root(tmproot: Path) -> tuple[Path, Path]:
+    """Create a staged codex home under *tmproot* posing as the temp dir.
+
+    :returns: ``(home, skills)`` — the staged home and its skills subdir.
+    """
+    from omnigent.inner.codex_staging import CODEX_HOME_PREFIX
+
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    root = tmproot / f"omnigent-codex-homes{suffix}"
+    root.mkdir(mode=0o700)
+    home = root / f"{CODEX_HOME_PREFIX}test"
+    skills = home / "skills" / "demo-skill"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("methodology body\n")
+    (home / "auth.json").write_text('{"secret": "never-expose"}')
+    return home, home / "skills"
+
+
+def _bind_triples(argv: list[str], op: str) -> list[tuple[str, str]]:
+    """All ``(src, dst)`` pairs emitted for mount option *op* in *argv*."""
+    return [(argv[i + 1], argv[i + 2]) for i, tok in enumerate(argv) if tok == op]
+
+
+def test_wrap_launcher_argv_exposes_staged_codex_skills_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The skills subtree of a staged codex home is re-exposed read-only,
+    and nothing else from the home is mounted.
+
+    The wrapped codex executor publishes ``$CODEX_HOME/skills/...`` paths
+    in the model's skill manifest; without this bind the ``--tmpfs /tmp``
+    default leaves those paths dangling inside the namespace. The home's
+    siblings (``auth.json``) carry bridged credentials and must never
+    appear as a mount source.
+    """
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd, read_roots=[skills]), cwd
+    )
+
+    ro_pairs = _bind_triples(argv, "--ro-bind-try")
+    assert (str(skills), str(skills)) in ro_pairs, (
+        "staged codex skills subtree is not re-exposed; the paths codex "
+        "publishes in its skill manifest dangle inside the namespace"
+    )
+    # Fail-closed on the rest of the home: neither the home itself nor its
+    # credential files may be mounted by any bind flavor.
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try", "--dev-bind"):
+        for src, _dst in _bind_triples(argv, op):
+            assert src != str(home), f"{op} mounts the whole staged home"
+            assert "auth.json" not in src, f"{op} mounts a credential file"
+
+
+def test_wrap_launcher_argv_staged_codex_skills_dedupe_with_read_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skills dir already granted via ``read_paths`` is bound once."""
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    _home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"],
+        _make_policy(cwd, read_roots=[skills]),
+        cwd,
+    )
+
+    pair = (str(skills), str(skills))
+    assert _bind_triples(argv, "--ro-bind-try").count(pair) == 1
+
+
+def test_wrap_launcher_argv_does_not_discover_other_sessions_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staged home is not a read grant for an unrelated sandbox."""
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    argv = _make_backend().wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd), cwd
+    )
+
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try"):
+        assert (str(skills), str(skills)) not in _bind_triples(argv, op)
+        assert (str(home), str(home)) not in _bind_triples(argv, op)
+
+
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a depth-2 POSIX binary")
+def test_wrap_launcher_argv_never_binds_the_filesystem_root(tmp_path: Path) -> None:
+    """A depth-2 executable (``/bin/sh``) must not drag in ``--ro-bind / /``.
+
+    The interpreter-visibility walk binds each hop's parent and
+    grandparent; for ``/bin/sh`` the grandparent is ``/``, and binding it
+    would re-expose the entire host read-only — defeating the hermetic
+    default view ($HOME included).
+    """
+    backend = _make_backend()
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    argv = backend.wrap_launcher_argv(["/bin/sh", "-c", "true"], _make_policy(cwd), cwd)
+
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try"):
+        assert ("/", "/") not in _bind_triples(argv, op), (
+            f"{op} / / re-exposes the whole host inside the sandbox"
+        )

@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -15,6 +16,7 @@ from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
+from omnigent.runner import subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 
@@ -122,7 +124,7 @@ async def test_wake_post_retries_transient_503_then_succeeds(
         [_wake_response(503, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -153,7 +155,7 @@ async def test_wake_post_carries_dispatch_actor() -> None:
     parent_id = "5a81ef19fce549929c8f9925c2ee034f"
     client = _QueuedResponseServerClient([_wake_response(200, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -172,7 +174,7 @@ async def test_wake_post_retries_without_actor_when_attribution_is_rejected() ->
         [_wake_response(403, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -197,10 +199,10 @@ async def test_wake_post_persistent_503_returns_failure(
     """
     parent_id = "a25887ef53cb74bba721c20edf204d10"
     client = _QueuedResponseServerClient(
-        [_wake_response(503, parent_id) for _ in range(runner_app_mod._WAKE_POST_MAX_ATTEMPTS)]
+        [_wake_response(503, parent_id) for _ in range(subagent_work._WAKE_POST_MAX_ATTEMPTS)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -211,14 +213,14 @@ async def test_wake_post_persistent_503_returns_failure(
     assert delivered is False
     # Attempted exactly the bounded budget — not once (no retry) and not
     # unbounded. The stub would have asserted on a call past the queue.
-    assert len(client.calls) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS, (
-        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, "
+    assert len(client.calls) == subagent_work._WAKE_POST_MAX_ATTEMPTS, (
+        f"Expected {subagent_work._WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, "
         f"got {len(client.calls)}."
     )
     # One backoff fewer than attempts: we don't sleep after the final attempt.
-    assert len(_no_wake_backoff) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1, (
-        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
-        f"{runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
+    assert len(_no_wake_backoff) == subagent_work._WAKE_POST_MAX_ATTEMPTS - 1, (
+        f"Expected {subagent_work._WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
+        f"{subagent_work._WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
     )
 
 
@@ -234,7 +236,7 @@ async def test_wake_post_permanent_4xx_not_retried(
     parent_id = "43cc3eccd350fed1b91854b2adf5ec3e"
     client = _QueuedResponseServerClient([_wake_response(400, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -279,7 +281,7 @@ def test_wake_post_is_retryable_status_classification(
     )
     # Pins which statuses cost a retry vs. fail fast; a wrong verdict here
     # would either waste the budget on permanent errors or give up on a 503.
-    assert runner_app_mod._wake_post_is_retryable(exc) is expected_retryable
+    assert subagent_work._wake_post_is_retryable(exc) is expected_retryable
 
 
 def test_wake_post_transport_error_is_retryable() -> None:
@@ -292,7 +294,7 @@ def test_wake_post_transport_error_is_retryable() -> None:
     request = httpx.Request("POST", "http://test/v1/sessions/p/events")
     exc = httpx.ConnectError("connection refused", request=request)
     # True because a transport failure is not a definitive server rejection.
-    assert runner_app_mod._wake_post_is_retryable(exc) is True
+    assert subagent_work._wake_post_is_retryable(exc) is True
 
 
 @dataclass
@@ -512,6 +514,110 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
         for sid in session_ids:
             runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
             runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(sid, None)
+        await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
+async def test_teardown_all_opencode_native_servers_closes_every_session() -> None:
+    """Shutdown cancels all forwarders, closes their servers, and clears the registries."""
+    session_ids = [
+        "dddd3333dddd3333dddd3333dddd3333",
+        "eeee4444eeee4444eeee4444eeee4444",
+    ]
+    runs = [_ForwarderRun() for _ in session_ids]
+    closed: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeServer:
+        def __init__(self, sid: str) -> None:
+            self._sid = sid
+
+        async def close(self) -> None:
+            closed.append(self._sid)
+
+    try:
+        for sid, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(sid, task)
+            runner_app_mod._AUTO_OPENCODE_SERVERS[sid] = _FakeServer(sid)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_opencode_native_servers()
+
+        assert sorted(closed) == sorted(session_ids), "every opencode server must be closed"
+        assert all(sid not in runner_app_mod._AUTO_OPENCODE_SERVERS for sid in session_ids)
+        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
+        # Idempotent: a second sweep with an empty registry is a no-op.
+        await runner_app_mod.teardown_all_opencode_native_servers()
+    finally:
+        for sid in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
+        await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
+async def test_teardown_all_opencode_native_servers_survives_a_failing_close() -> None:
+    """A failed close must not abort the sweep or leave stale registry entries."""
+    failing_id = "ffff5555ffff5555ffff5555ffff5555"
+    healthy_id = "aaaa6666aaaa6666aaaa6666aaaa6666"
+    session_ids = [failing_id, healthy_id]
+    runs = [_ForwarderRun() for _ in session_ids]
+    attempted: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeServer:
+        def __init__(self, sid: str, *, fail: bool) -> None:
+            self._sid = sid
+            self._fail = fail
+
+        async def close(self) -> None:
+            attempted.append(self._sid)
+            if self._fail:
+                raise RuntimeError(f"close failed for {self._sid}")
+
+    try:
+        for sid, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(sid, task)
+            runner_app_mod._AUTO_OPENCODE_SERVERS[sid] = _FakeServer(sid, fail=sid == failing_id)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_opencode_native_servers()
+
+        assert sorted(attempted) == sorted(session_ids), (
+            "a failing close aborted the sweep; the remaining opencode servers were never reaped"
+        )
+        assert all(sid not in runner_app_mod._AUTO_OPENCODE_SERVERS for sid in session_ids), (
+            "a failing close left a stale registry entry behind"
+        )
+        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
+    finally:
+        for sid in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
         await _drain_forwarder_runs(runs)
 
 
@@ -739,22 +845,25 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         await _drain_forwarder_runs(runs)
 
 
+@pytest.mark.parametrize(
+    "recovery_state",
+    [
+        "live",
+        "exited",
+        "forwarder_done",
+        "missing_bridge",
+        "different_thread",
+        "launch_error",
+        "launch_cancelled",
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
+async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_session(
+    recovery_state: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Re-running codex terminal auto-create leaves exactly one live forwarder.
-
-    Codex flavor of the claude double-mirror regression: the codex spawn
-    registered its forwarder task in the same unkeyed set, so an ensure
-    re-create for an existing session leaked the prior known-thread
-    forwarder alongside the new one.
-
-    :param tmp_path: Temporary directory for isolated bridge state.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """A lost TUI preserves a healthy backend; stale backends get one replacement."""
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
@@ -812,12 +921,16 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
             self.config_overrides: list[str] = []
+            self.proc = SimpleNamespace(returncode=None)
+            self.closed = False
 
         async def start(self) -> None:
             """:returns: None."""
 
         async def close(self) -> None:
-            """:returns: None."""
+            self.closed = True
+
+    app_servers: list[_FakeCodexAppServer] = []
 
     def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
         """
@@ -828,6 +941,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         """
         app_server = _FakeCodexAppServer()
         app_server.codex_home = kwargs["codex_home"]
+        app_servers.append(app_server)
         return app_server
 
     class _UnexpectedDiscoveryClient:
@@ -853,6 +967,8 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -876,6 +992,8 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             run.cancelled = True
             raise
 
+    launched_specs: list[Any] = []
+
     class _FakeResourceRegistry:
         """Returns a terminal resource view without launching tmux."""
 
@@ -890,7 +1008,13 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view for the codex TUI."""
-            del terminal_name, session_key, spec, resource_role
+            del terminal_name, session_key, resource_role
+            launched_specs.append(spec)
+            if len(launched_specs) > 1:
+                if recovery_state == "launch_error":
+                    raise RuntimeError("terminal launch failed")
+                if recovery_state == "launch_cancelled":
+                    raise asyncio.CancelledError
             return SessionResourceView(
                 id="terminal_codex_main",
                 type="terminal",
@@ -930,28 +1054,65 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         )
         await asyncio.sleep(0)
 
-        await runner_app_mod._auto_create_codex_terminal(
+        original_server = app_servers[0]
+        original_forwarder = runner_app_mod._AUTO_FORWARDER_TASKS[session_id]
+        bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+        bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
+        assert bridge_state is not None
+        if recovery_state == "exited":
+            original_server.proc.returncode = 1
+        elif recovery_state == "forwarder_done":
+            original_forwarder.cancel()
+            await asyncio.gather(original_forwarder, return_exceptions=True)
+        elif recovery_state == "missing_bridge":
+            codex_native_bridge.clear_bridge_state(bridge_dir)
+        elif recovery_state == "different_thread":
+            codex_native_bridge.write_bridge_state(
+                bridge_dir,
+                codex_native_bridge.CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path=bridge_state.socket_path,
+                    thread_id="another-thread",
+                    codex_home=bridge_state.codex_home,
+                    cwd=bridge_state.cwd,
+                ),
+            )
+
+        recovery = runner_app_mod._auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
         )
+        if recovery_state == "launch_error":
+            with pytest.raises(RuntimeError, match="terminal launch failed"):
+                await recovery
+        elif recovery_state == "launch_cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await recovery
+        else:
+            await recovery
         await asyncio.sleep(0)
 
-        assert len(runs) == 2, (
-            f"Expected 2 forwarder spawns (one per auto-create), got {len(runs)}."
-        )
-        # The first forwarder was cancelled by the re-create — a False here
-        # means two live tasks mirror the same codex thread into the session.
-        assert runs[0].cancelled is True, (
-            "Re-creating the codex terminal must cancel the prior session "
-            "forwarder; it survived, so transcript records would be "
-            "double-posted."
-        )
-        # The recovery's own forwarder survives — cancelled here means the
-        # re-create killed its replacement and the session mirrors nothing.
-        assert runs[1].cancelled is False
+        reused = recovery_state in {"live", "launch_error", "launch_cancelled"}
+        assert len(app_servers) == (1 if reused else 2)
+        assert len(runs) == (1 if reused else 2)
+        assert runs[0].cancelled is not reused
+        if reused:
+            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is original_server
+            assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is original_forwarder
+            assert not original_server.closed
+            assert codex_native_bridge.read_bridge_state(bridge_dir) == bridge_state
+        else:
+            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is app_servers[1]
+            assert runs[1].cancelled is False
+        assert len(launched_specs) == 2
+        for spec in launched_specs:
+            assert spec.keep_alive_after_exit is True
+            assert thread_id in spec.args
+            assert "check_for_update_on_startup=false" in spec.args
+            assert spec.env["CODEX_HOME"] == str(original_server.codex_home)
         live_runs = [run for run in runs if not run.cancelled]
         # Exactly one live forwarder mirrors the thread for the session.
         assert len(live_runs) == 1
@@ -1135,6 +1296,8 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1189,24 +1352,57 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
+@pytest.mark.parametrize(
+    ("resume_error_payload", "expected_error_substring"),
+    [
+        (
+            {
+                "code": -32603,
+                "message": (
+                    "failed to read thread: thread-store internal error: failed to "
+                    "load thread history /codex-home/sessions/rollout.jsonl: "
+                    "stream did not contain valid UTF-8"
+                ),
+            },
+            "stream did not contain valid UTF-8",
+        ),
+        (
+            {
+                "code": -32600,
+                "message": (
+                    "invalid paginated history lineage for "
+                    "019e96aa-0be2-7343-8d3b-6f914d60936d: "
+                    "source rollout is not paginated"
+                ),
+            },
+            "source rollout is not paginated",
+        ),
+    ],
+    ids=["thread_store_error", "unpaginated_lineage"],
+)
 async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    resume_error_payload: dict[str, Any],
+    expected_error_substring: str,
 ) -> None:
     """
     A thread codex cannot read falls back to a fresh thread on the same app-server.
 
-    The large-rollout incident shape: codex's thread-store rejects the
-    persisted rollout (``-32603 failed to read thread … invalid UTF-8``) on
-    every ``thread/resume``, so re-raising failed every turn of the session
-    for good. The fallback must keep the app-server, take the fresh-thread
-    path (discovery listener connected, TUI launched without the thread id,
-    discovery forwarder) and log the Codex-side context it drops.
+    Covers two permanent-mismatch shapes: the large-rollout incident
+    (``-32603 failed to read thread … invalid UTF-8``) and the paginated-lineage
+    mismatch (``-32600 … source rollout is not paginated``). In both cases
+    re-raising fails every turn for good; the fallback must keep the app-server,
+    take the fresh-thread path (discovery listener connected, TUI launched without
+    the thread id, discovery forwarder) and log the Codex-side context it drops.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Log capture for the fallback warning.
+    :param resume_error_payload: JSON-RPC error dict codex returns for the resume.
+    :param expected_error_substring: Substring from the error that must appear in
+        the reset notice surfaced into the session.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
@@ -1317,25 +1513,18 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
-        Refuse the resume the way codex's thread-store does for a bad rollout.
+        Refuse the resume with the parametrized error payload.
 
         :param transport: App-server transport URL (ignored).
-        :param loaded_thread_id: Thread id passed to ``thread/resume``.
+        :param loaded_thread_id: Thread id passed to ``thread/resume`` (ignored).
         :raises CodexAppServerResponseError: Always, mirroring the app-server.
         """
-        del transport, terminal_launch_args
-        raise codex_app_mod.CodexAppServerResponseError(
-            {
-                "code": -32603,
-                "message": (
-                    "failed to read thread: thread-store internal error: failed to "
-                    f"load thread history /codex-home/rollout-{loaded_thread_id}.jsonl: "
-                    "stream did not contain valid UTF-8"
-                ),
-            }
-        )
+        del transport, loaded_thread_id, terminal_launch_args
+        raise codex_app_mod.CodexAppServerResponseError(resume_error_payload)
 
     launched_args: list[list[str]] = []
 
@@ -1422,8 +1611,8 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         assert notice["data"]["item_data"]["code"] == "codex_thread_reset"
         assert notice["data"]["item_data"]["level"] == "info"
         # The body names codex as the source and quotes its own error text.
-        assert "Codex reported an internal error" in notice["data"]["item_data"]["message"]
-        assert "stream did not contain valid UTF-8" in notice["data"]["item_data"]["message"]
+        assert "Codex could not load" in notice["data"]["item_data"]["message"]
+        assert expected_error_substring in notice["data"]["item_data"]["message"]
         assert connected == ["omnigent-codex-native-auto"], (
             "the fresh-thread path must connect the discovery listener"
         )

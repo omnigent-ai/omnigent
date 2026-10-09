@@ -1,26 +1,15 @@
-"""The session-drag preview must stay glued to the cursor.
-
-The sidebar ``<aside>`` always carries a Tailwind ``translate`` utility
-(``translate-x-0`` / ``-translate-x-full``), and any non-``none`` CSS
-``translate`` makes it the containing block for ``position: fixed``
-descendants. The dnd-kit ``<DragOverlay>`` renders inline inside the aside
-(not portaled to ``<body>``), so the overlay's fixed viewport coordinates
-resolve against the aside's box instead of the viewport. Docked, the aside
-sits at (0, 0) and the error is invisible; while the sidebar PEEKS (floating
-card at ``inset-2``) every drag renders the preview offset from the pointer
-by the card's offset — the "session drag jumps away from the cursor" report.
-"""
+"""Session previews use viewport coordinates even inside the translated peek sidebar."""
 
 from __future__ import annotations
 
 import contextlib
-import json
 import re
 import uuid
 
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 # A visible dot glued to the real pointer so recorded failure footage shows
@@ -42,11 +31,8 @@ _CURSOR_DOT_JS = """
 
 
 def _seed_titled_session(base_url: str, title: str) -> str:
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        timeout=30.0,
+    create = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]
@@ -119,9 +105,8 @@ def test_peek_drag_overlay_tracks_pointer(page: Page, seeded_session: tuple[str,
         expect(page.get_by_role("link", name=titles[-1], exact=True)).to_be_visible(timeout=15000)
         page.evaluate(_CURSOR_DOT_JS)
 
-        # Collapse the sidebar (⌘⌥[ / Ctrl+Alt+[), then dwell on the chat
-        # header's "Open sidebar" toggle past the 400ms peek delay.
-        page.keyboard.press("Control+Alt+BracketLeft")
+        # Close via the button so this works across platform shortcut mappings.
+        page.get_by_role("button", name="Close sidebar", exact=True).click()
         toggle = page.get_by_role("button", name="Open sidebar")
         expect(toggle).to_be_visible()
         toggle_box = toggle.bounding_box()

@@ -70,4 +70,27 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(dot?.getAttribute("class")).not.toContain("running-pulse-dot");
     expect(container.querySelector(".bg-info")).toBeNull();
   });
+
+  it("renders a static CircleAlert in the same destructive color as error text", () => {
+    const { container } = renderBadge({ kind: "error" });
+    const badge = screen.getByRole("img", { name: "Latest message is an error" });
+    expect(badge).toHaveAttribute("data-state", "error");
+    const icon = container.querySelector("svg.lucide-circle-alert");
+    expect(icon).toHaveClass("size-3.5", "shrink-0", "text-destructive");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(icon).not.toHaveClass("animate-spin", "animate-pulse", "text-brand-accent");
+  });
+
+  it("renders a host disconnect as a neutral outline dot", () => {
+    const { container } = renderBadge({ kind: "disconnected" });
+    const badge = screen.getByRole("img", { name: "Host disconnected" });
+    expect(badge).toHaveAttribute("data-state", "disconnected");
+    expect(container.querySelector("svg")).toBeNull();
+    expect(badge.firstElementChild).toHaveClass(
+      "size-2",
+      "rounded-full",
+      "border",
+      "border-muted-foreground",
+    );
+  });
 });

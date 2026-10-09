@@ -11,7 +11,7 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/omnigent)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/download/mac)**
+[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/quickstart/install#install-the-desktop-app)**
 
 </div>
 
@@ -45,6 +45,7 @@ Omnigent lets you:
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [Gensee](https://gensee.ai),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
   [Boxlite](https://github.com/boxlite-ai/boxlite),
@@ -142,13 +143,18 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
   both from a single Node install; pnpm is available via
   `corepack enable` or `npm install -g pnpm`.
+- **Devin CLI** (optional), for `omnigent devin`: install with
+  `curl -fsSL https://cli.devin.ai/install.sh | bash`, then sign in with
+  `devin auth login`. Devin tool approvals appear as Chat approval cards
+  (its `PermissionRequest` hook is mirrored to the web UI) and stay
+  answerable in the embedded Terminal. See `docs/devin-native.md`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
   one-time approvals also appear as Chat cards. See
   `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
+  (`claude`, `codex`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
@@ -257,7 +263,7 @@ also launches a local web UI at `http://localhost:6767` that shows the same
 session in the browser, or on a phone on your network (step 4). The
 [desktop app](https://omnigent.ai/docs/interact/desktop) wraps that same UI
 in a native window and adds OS notifications (with a configurable sound) and a dock badge —
-[download it for macOS](https://omnigent.ai/download/mac).
+[download it for macOS](https://omnigent.ai/quickstart/install#install-the-desktop-app).
 
 > [!NOTE]
 > The install puts two names for the same CLI on your PATH: `omnigent` and
@@ -282,6 +288,7 @@ omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
+omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
 
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
@@ -366,6 +373,15 @@ Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
 
+To suppress the automatic browser tab, use `omni host --no-open` or set
+`OMNIGENT_HOST_NO_OPEN=1` in your shell. Both also apply to `omni host
+--background` and `omni start`. Sign-in may still open a browser; use
+`--non-interactive` in scripts to fail if sign-in is required.
+
+A session can also start itself: the **Automations** page runs an agent on a
+recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)
+for the schedule format, the REST API, and the current limits.
+
 <details>
 <summary>Customize automatic session titles</summary>
 
@@ -383,8 +399,10 @@ limited to 100 characters; custom title requirements may use up to 200.
 Default titles over 100 characters are rejected, leaving the first-message
 fallback title in place. Custom titles over 200 characters are truncated with
 a trailing ellipsis. Manually assigned titles are also limited to 200
-characters. The setting applies to new sessions after the local Omnigent
-server restarts.
+characters. The setting applies after the local Omnigent server restarts, both
+to new sessions and to later agent-initiated renames through `sys_session_rename`.
+Agent proposals are formatted using the same title requirements; if formatting
+fails, the existing title is preserved. Manual renames remain unchanged.
 For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
 block scalar:
 
@@ -501,6 +519,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Share with everyone who can sign in.** Admins can allow public Edit in
+  **Settings > Sharing > Maximum public permission**. Owners then choose
+  **Share > General access > Edit**. The default stays Read.
 - **Leave a shared session.** Done with a session someone shared with you?
   Pick **Leave session** from its sidebar row menu to drop it from your
   sidebar. Nothing is deleted — the owner keeps it and can share it again.

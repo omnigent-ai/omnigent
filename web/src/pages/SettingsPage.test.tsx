@@ -4,12 +4,17 @@
 // Archived sessions list (which moved here out of the sidebar).
 
 import type { ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import * as host from "@/lib/host";
+import {
+  readTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
@@ -20,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   bulkArchiveMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
+  importSessionsPanel: vi.fn(() => null),
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -30,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
+  conversationQuery: vi.fn(),
   // Optional multi-page dataset (array of per-page row arrays) for pagination
   // tests. When unset the mock serves a single page of `conversations`.
   pages: undefined as Conversation[][] | undefined,
@@ -50,6 +57,9 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
   }),
+}));
+vi.mock("@/shell/ImportSessionsPanel", () => ({
+  ImportSessionsPanel: mocks.importSessionsPanel,
 }));
 vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
@@ -72,10 +82,12 @@ vi.mock("@/hooks/useConversations", async () => {
     // scoping.
     useConversations: (
       _searchQuery?: string,
-      _includeArchived?: boolean,
+      includeArchived?: boolean,
       _options?: unknown,
       project?: string,
+      visibility?: "mine" | "shared" | "archived",
     ) => {
+      mocks.conversationQuery({ includeArchived, project, visibility });
       // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
       // otherwise serve a single page of `mocks.conversations`.
       const source = mocks.pages ?? [mocks.conversations];
@@ -130,10 +142,12 @@ vi.mock("@/components/ui/select", async () => {
   const Select = ({
     value,
     onValueChange,
+    disabled,
     children,
   }: {
     value: string;
     onValueChange: (v: string) => void;
+    disabled?: boolean;
     children: ReactNode;
   }) => {
     const kids = Children.toArray(children);
@@ -146,6 +160,7 @@ vi.mock("@/components/ui/select", async () => {
       <select
         data-testid={typeof testId === "string" ? testId : undefined}
         value={value}
+        disabled={disabled}
         onChange={(e) => onValueChange(e.target.value)}
       >
         {kids.filter((c) => !(isValidElement(c) && c.type === SelectTrigger))}
@@ -210,8 +225,10 @@ beforeEach(() => {
   mocks.bulkArchiveMutate.mockReset();
   mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
+  mocks.conversationQuery.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
+  mocks.importSessionsPanel.mockClear();
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -222,6 +239,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   // Reset the font-size preference + applied desktop size so the Appearance
   // tests don't leak state into each other.
   localStorage.clear();
@@ -234,6 +252,16 @@ afterEach(() => {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+});
+
+describe("Import sessions", () => {
+  it("keeps session imports without the legacy Harness imports section", () => {
+    renderPage("/settings/import");
+
+    expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
+    expect(mocks.importSessionsPanel).toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
 });
 
 const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
@@ -280,6 +308,26 @@ describe("SettingsPage", () => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
   });
 
+  it("groups General settings into titled outlined cards and hides its description on mobile", () => {
+    renderPage("/settings/general");
+
+    expect(screen.getByText("Configure general Omnigent behavior.")).toHaveClass("max-md:hidden");
+
+    for (const testId of [
+      "settings-group-composer",
+      "settings-group-sessions",
+      "settings-group-terminal",
+    ]) {
+      const group = screen.getByTestId(testId);
+      expect(group.lastElementChild).toHaveClass(
+        "rounded-xl",
+        "border",
+        "border-border",
+        "bg-card",
+      );
+    }
+  });
+
   it("renders session auto-rename enabled by default", async () => {
     renderPage("/settings/general");
 
@@ -295,6 +343,89 @@ describe("SettingsPage", () => {
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
   });
+
+  it("asks before terminal copying by default and explains the scope", () => {
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    expect(select).toHaveValue("ask");
+    expect(screen.getByText("Copying from terminals")).toBeInTheDocument();
+    expect(screen.getByText(/Controls copying text from all sessions/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Allowing copying also lets terminal programs silently replace/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/all sessions and terminals on this server/)).toBeInTheDocument();
+    expect(screen.getByText(/this browser or app/)).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Allow copying" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Block copying" })).toBeInTheDocument();
+  });
+
+  it("persists terminal clipboard choices and can revoke copying", () => {
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    fireEvent.change(select, { target: { value: "allow" } });
+    expect(select).toHaveValue("allow");
+    expect(readTerminalClipboardPreference()).toBe("allow");
+
+    fireEvent.change(select, { target: { value: "block" } });
+    expect(select).toHaveValue("block");
+    expect(readTerminalClipboardPreference()).toBe("block");
+
+    fireEvent.change(select, { target: { value: "ask" } });
+    expect(select).toHaveValue("ask");
+    expect(readTerminalClipboardPreference()).toBe("ask");
+  });
+
+  it("loads a saved terminal clipboard decision and updates from same-tab changes", () => {
+    writeTerminalClipboardPreference("allow");
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    expect(select).toHaveValue("allow");
+
+    act(() => {
+      writeTerminalClipboardPreference("ask");
+    });
+    expect(select).toHaveValue("ask");
+  });
+
+  it("updates the terminal clipboard control when another tab changes its decision", () => {
+    renderPage("/settings/general");
+    const key = `omnigent:terminal-clipboard:v1:${JSON.stringify(host.getOmnigentServerIdentity())}`;
+    localStorage.setItem(key, "block");
+    fireEvent(window, new StorageEvent("storage", { key, storageArea: localStorage }));
+    expect(screen.getByTestId("terminal-clipboard-preference-select")).toHaveValue("block");
+  });
+
+  it("disables remembered clipboard preferences when the server identity is unavailable", () => {
+    vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+    renderPage("/settings/general");
+
+    expect(screen.getByTestId("terminal-clipboard-preference-select")).toBeDisabled();
+    expect(
+      screen.getByText(
+        "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("does not claim terminal clipboard permission was saved when storage fails", () => {
+    renderPage("/settings/general");
+    const select = screen.getByTestId("terminal-clipboard-preference-select");
+    const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    try {
+      fireEvent.change(select, { target: { value: "allow" } });
+      expect(select).toHaveValue("ask");
+      expect(screen.getByRole("alert")).toHaveTextContent("Your previous setting is unchanged.");
+    } finally {
+      write.mockRestore();
+    }
+
+    fireEvent.change(select, { target: { value: "allow" } });
+    expect(select).toHaveValue("allow");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("renders composer shortcut guidance as two accessible lines", () => {
     renderPage("/settings/general");
     const toggle = screen.getByTestId("composer-submit-with-mod-enter-toggle");
@@ -305,18 +436,51 @@ describe("SettingsPage", () => {
     if (description === null) throw new Error("Missing composer shortcut description");
     expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
     expect(
-      within(description).getByText("Off: Enter submits and Shift+Enter inserts a newline."),
+      within(description).getByText(
+        /Off: Enter submits and Shift\+Enter or (?:⌥|Alt)\+Enter inserts a newline\./,
+      ),
     ).toBeInTheDocument();
     expect(
       within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
     ).toBeInTheDocument();
+    expect(description).toHaveClass("max-md:hidden");
+    expect(
+      screen.getByRole("button", {
+        name: /About Submit with (?:⌘|Ctrl) \+ Enter on desktop/,
+      }),
+    ).toHaveClass("md:hidden");
     expect(toggle).toHaveAttribute("aria-labelledby");
     expect(toggle).toHaveAccessibleName(/Submit with (?:⌘|Ctrl) \+ Enter on desktop/);
   });
 
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
-    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    const heading = screen.getByRole("heading", { name: "Appearance" });
+    expect(heading).toHaveClass("settings-page-title");
+    expect(heading.closest("section")?.parentElement).toHaveClass("px-4", "md:px-8");
+    expect(screen.getByRole("button", { name: "About Interface font size" })).toHaveClass(
+      "md:hidden",
+    );
+    expect(
+      screen.getByText("Set text across the interface. Icons and spacing stay fixed."),
+    ).toHaveClass("max-md:hidden");
+    expect(screen.getByText("Choose how Omnigent looks on this device.")).toHaveClass(
+      "max-md:hidden",
+    );
+    for (const testId of [
+      "settings-group-theme",
+      "settings-group-chat",
+      "settings-group-interface-type",
+      "settings-group-code-type",
+      "settings-group-data",
+    ]) {
+      expect(screen.getByTestId(testId).lastElementChild).toHaveClass(
+        "rounded-xl",
+        "border",
+        "border-border",
+        "bg-card",
+      );
+    }
     // System is selected (theme = "system").
     expect(screen.getByTestId("theme-system")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByTestId("theme-dark"));
@@ -325,11 +489,36 @@ describe("SettingsPage", () => {
 
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
     renderPage("/settings/appearance");
-    expect(screen.getByRole("radiogroup", { name: "Terminal theme" })).toBeInTheDocument();
+    expect(screen.getByRole("radiogroup", { name: "Terminal theme" })).toHaveClass("inline-flex");
+    expect(screen.getByText("Terminal theme").closest("[data-testid]")).toHaveAttribute(
+      "data-testid",
+      "settings-group-theme",
+    );
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveClass("size-9", "bg-background");
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAccessibleName("Match app");
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "false");
     expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
     expect(localStorage.getItem("omnigent:terminal-theme")).toBeNull();
+  });
+
+  it("renders Mode as a compact monitor, sun, and moon segmented control", async () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByRole("radiogroup", { name: "Mode" })).toHaveClass(
+      "inline-flex",
+      "gap-0.5",
+      "p-0.5",
+    );
+    expect(screen.getByTestId("theme-system")).toHaveClass("size-9", "bg-background");
+    expect(screen.getByTestId("theme-system")).toHaveAccessibleName("System");
+    expect(screen.getByTestId("theme-system")).not.toHaveAttribute("title");
+    expect(screen.getByTestId("theme-system").querySelector(".lucide-monitor")).toBeInTheDocument();
+    expect(screen.getByTestId("theme-light").querySelector(".lucide-sun")).toBeInTheDocument();
+    expect(screen.getByTestId("theme-dark").querySelector(".lucide-moon")).toBeInTheDocument();
+
+    fireEvent.focus(screen.getByTestId("theme-system"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("System");
   });
 
   it("renders Terminal theme before Color theme", () => {
@@ -376,6 +565,43 @@ describe("SettingsPage", () => {
       "true",
     );
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
+  });
+
+  it("selects and persists the default Workspace tab", () => {
+    renderPage("/settings/appearance");
+
+    const group = screen.getByRole("radiogroup", { name: "Default Workspace tab" });
+    const options = within(group).getAllByRole("radio");
+    expect(options).toHaveLength(4);
+    ["Files", "Changes", "Pull Requests", "Agents"].forEach((label, index) => {
+      expect(options[index]).toHaveAccessibleName(label);
+    });
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    expect(screen.getByTestId("workspace-tab-default-subagents")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
+  });
+
+  it("seeds the default Workspace tab from storage", () => {
+    localStorage.setItem("omnigent:default-workspace-tab", "changes");
+    renderPage("/settings/appearance");
+
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
   });
 
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
@@ -575,7 +801,8 @@ describe("SettingsPage", () => {
       target: { value: "github" },
     });
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
-    fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
+    fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
+    fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -593,6 +820,8 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+    expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
@@ -609,7 +838,7 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
-    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
@@ -619,16 +848,21 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, transcript view, workspace panel, and harness visibility are restored.
+    // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
       "true",
     );
-    expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
+    expect(screen.getByTestId("workspace-panel-default-collapsed")).toHaveAttribute(
       "aria-checked",
       "true",
     );
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
     expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
       "aria-checked",
       "false",
@@ -946,6 +1180,11 @@ describe("SettingsPage", () => {
     ];
     renderPage("/settings/archived");
 
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: undefined,
+      visibility: "archived",
+    });
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Old chat")).toBeInTheDocument();
@@ -976,13 +1215,23 @@ describe("SettingsPage", () => {
     mocks.projectNames = ["Alpha", "Beta"];
     mocks.conversations = [
       conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
-      conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
+      conv("conv_b", {
+        archived: true,
+        title: "Beta chat",
+        labels: { omni_project: "Beta" },
+        owner: "bob",
+      }),
       conv("conv_active"),
     ];
     renderPage("/settings/archived");
 
-    // "All projects" (default) lists every archived session.
+    // "All projects" includes shared archives as well as owned ones.
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: undefined,
+      visibility: "archived",
+    });
     const select = screen.getByTestId("archived-project-filter");
     expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
     expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
@@ -994,10 +1243,21 @@ describe("SettingsPage", () => {
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
+    // Default visibility maps to "all", whose named-project filter is owner-scoped.
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: "Alpha",
+      visibility: undefined,
+    });
 
     // Back to "All projects" restores the full list.
     fireEvent.change(select, { target: { value: "all" } });
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: undefined,
+      visibility: "archived",
+    });
   });
 
   it("hides the project filter when no archived session belongs to a project", () => {

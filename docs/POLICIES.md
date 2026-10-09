@@ -67,6 +67,36 @@ omnigent server --config server_config.yaml
 
 After starting, you can also add or remove policies at runtime through the REST API (see [Admin policy REST API](#admin-policy-rest-api)).
 
+### Attachment admission controls
+
+The upload, copy, and fork routes apply additional server settings to `.zip`, `.docx`,
+`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These formats require
+Claude Code or Codex and an updated execution host/runner that supports their
+delivery and restoration. They are stored without extraction; the harness
+reads a local copy outside the working checkout. See
+[attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
+
+| Server config key | Default | Scope |
+|-------------------|---------|-------|
+| `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per file |
+| `filesystem_attachment_max_files` | `20` | Stored files of these types per session |
+| `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined bytes of these types per session |
+| `filesystem_attachment_denied_extensions` | `[]` | Further restrict the allowlist, e.g. `[".zip", ".db"]` |
+
+These are filename-based admission and storage limits, not content inspection.
+Classification uses the stored filename's extension, even when the browser
+reports a different MIME type. It does not identify file formats from their
+bytes, inspect archive entries, or detect renamed binary content. The denylist
+does not restrict files the agent creates or downloads through other tools.
+Images, PDFs, and text/code uploads retain their separate existing limits;
+the web composer also has a fixed 50 MiB ceiling for the formats listed above.
+
+Request-phase policies receive the filename and content type for these files,
+with an empty `text` value. Their document, archive, and database contents are
+not scanned as text. Ordinary text/code attachments continue to provide decoded
+text to request-phase policies. No attachment delivery-mode field is added to
+the policy payload.
+
 ---
 
 ## For agent developers
@@ -222,7 +252,7 @@ Forces a specific sandbox configuration on agent start.
 |-----------|------|---------|-------------|
 | `sandbox_type` | string | `"linux_bwrap"` | Sandbox backend (`linux_bwrap`, `darwin_seatbelt`, `none`) |
 | `allow_network` | boolean | `true` | Allow network access |
-| `write_paths` | string[] | `null` | Writable paths (null inherits agent config) |
+| `write_paths` | (string or object)[] | `null` | Writable paths; objects accept `path` and `copy_on_write` (null inherits agent config) |
 | `read_paths` | string[] | `null` | Read-only paths (null inherits agent config) |
 | `env_passthrough` | string[] | `null` | Env vars allowed through to the agent process (see below) |
 
@@ -246,6 +276,20 @@ declared. Two cases worth knowing:
 An agent that fails during its `initialize` handshake for no obvious reason is
 worth checking against this first; the ACP executor logs a hint pointing back at
 this field.
+
+> **How the start probe is evaluated.** `enforce_sandbox` runs when the runner
+> replays your tool-call policies over a synthetic `sys_agent_start` probe at
+> launch. Only a transform takes effect there: a policy that ALLOWs the probe
+> and returns a replacement payload (preserving the `name` and `arguments`
+> fields) reshapes the launch, chaining through later policies. A plain `DENY`
+> or `ASK` verdict on this probe does **not** block agent start — it is logged
+> and ignored, so a general-purpose tool allowlist or cost gate that happens to
+> reject the `sys_agent_start` name will not stop the agent from launching. The
+> runner only refuses to start (fails closed) when a policy cannot be evaluated
+> at all — it raised, could not be resolved, or returned a transform that drops
+> the probe's `name`/`arguments` shape — because then its intended sandbox
+> transform is unknown. Do not rely on a tool-call `DENY` to gate which agents
+> may launch; there is no agent-start policy phase today.
 
 #### `deny_pii_in_llm_request`
 
@@ -438,6 +482,42 @@ def my_policy(event: PolicyEvent) -> PolicyResponse | None:
         return {"result": "DENY", "reason": "This tool is blocked."}
     return {"result": "ALLOW"}
 ```
+
+### Response segments and `turn_final`
+
+`response` policies receive assistant text in `event["data"]`. In runner-relayed
+sessions, they run before each nonempty text segment is persisted, including
+progress text before tool calls. Use `event["context"]["turn_final"]` to decide
+whether to perform completion-specific work:
+
+| Value | Meaning |
+|-------|---------|
+| `True` | The final text segment of a successfully completed relayed turn. |
+| `False` | An intermediate segment, or text from a failed, cancelled, or incomplete relayed turn. |
+| `None` | The calling path does not distinguish segments. Also used outside the `response` phase. |
+
+Within a response policy, skip only an explicit `False` to preserve existing
+behavior on callers that supply `None`. `None` does not assert successful
+completion. For example:
+
+```python
+from omnigent.policies.schema import PolicyEvent, PolicyResponse
+
+def count_responses(event: PolicyEvent) -> PolicyResponse | None:
+    if event["type"] != "response":
+        return None
+    if event.get("context", {}).get("turn_final") is False:
+        return None
+    return {
+        "result": "ALLOW",
+        "state_updates": [{"key": "responses", "action": "increment", "value": 1}],
+    }
+```
+
+Content checks should inspect every segment, including those marked `False`.
+The relay skips empty and whitespace-only segments: a turn that ends with a tool
+call and no trailing text has no final response-policy invocation. `turn_final`
+describes the current evaluation; it does not guarantee one callback per turn.
 
 ### Factory form
 

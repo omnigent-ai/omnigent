@@ -76,7 +76,7 @@ function GoalSummary({ loading, goal }: GoalSummaryProps) {
         <span className="font-medium text-foreground">{formatGoalStatus(goal.status)}</span>
         <span className="shrink-0 text-muted-foreground">{formatGoalUsage(goal)}</span>
       </div>
-      <p className="text-ui leading-5 whitespace-pre-wrap">{goal.objective}</p>
+      <p className="text-ui leading-5 wrap-anywhere whitespace-pre-wrap">{goal.objective}</p>
     </div>
   );
 }
@@ -324,7 +324,7 @@ function GoalActions({
         loading={clearing}
         data-testid="goal-clear"
       >
-        Clear
+        Delete goal
       </Button>
       {showPause && (
         <Button
@@ -546,7 +546,10 @@ export function GoalDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg" aria-describedby={undefined}>
+      <DialogContent
+        className="sm:max-w-lg max-h-[85dvh] grid-rows-[auto_1fr_auto]"
+        aria-describedby={undefined}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <TargetIcon className="size-4" />
@@ -554,7 +557,7 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="space-y-3">
+        <div className="min-h-0 space-y-3 overflow-y-auto">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
             objective={state.objective}

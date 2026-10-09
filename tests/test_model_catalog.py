@@ -12,7 +12,9 @@ Databricks credential mint is stubbed with the real
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,7 +51,7 @@ from omnigent.models.model_metadata import (
 from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
-from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +104,118 @@ def _worker_spec(harness: str, **executor_kwargs: object) -> AgentSpec:
         name="worker",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}, **executor_kwargs),  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.parametrize("cache_state", ["fresh", "stale", "missing"])
+@pytest.mark.parametrize(
+    "provider_config",
+    ["{}", "providers:\n  claude:\n    kind: subscription\n    cli: claude\n    default: true\n"],
+    ids=["unconfigured", "subscription"],
+)
+def test_managed_claude_gateway_uses_native_catalog(
+    cache_state: str, provider_config: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(monkeypatch, tmp_path, provider_config)
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path)
+    model_id = "system.ai.claude-sonnet-5-5[1m]"
+    fingerprint = claude_catalog_fingerprint(None)
+    if cache_state != "missing":
+        model_catalog_store.write_catalog(
+            "claude-native",
+            fingerprint,
+            [
+                {"id": "sonnet", "model": model_id, "isDefault": True},
+                {"id": model_id, "model": model_id},
+            ],
+        )
+        if cache_state == "stale":
+            old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+            os.utime(model_catalog_store.catalog_path("claude-native", fingerprint), (old, old))
+    spec = _worker_spec("claude-native")
+
+    provider = resolve_model_provider(spec, "claude-native")
+    assert provider.kind == "cli-config"
+    assert provider.cli == "claude"
+    assert provider.base_url == "https://gateway.example/anthropic"
+    listing = list_models_for_worker(spec, "claude-native")
+    assert listing.source == ("static" if cache_state == "missing" else "cli")
+    assert listing.verified is (cache_state == "fresh")
+    assert [model.id for model in listing.models] == (
+        [] if cache_state == "missing" else [model_id]
+    )
+    assert "no usable model provider" not in listing.note
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "native-claude", "claude-sdk"])
+def test_managed_claude_gateway_preserves_explicit_provider(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    spec = _worker_spec(harness, auth=DatabricksAuth(profile="explicit"))
+
+    provider = resolve_model_provider(spec, harness)
+    assert provider.kind == "databricks"
+    assert provider.profile == "explicit"
+    unconfigured = resolve_model_provider(_worker_spec(harness), harness)
+    assert unconfigured.kind == ("none" if harness == "claude-sdk" else "cli-config")
+    monkeypatch.delenv("OMNIGENT_TEST_MISSING_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n  explicit:\n    kind: key\n    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $OMNIGENT_TEST_MISSING_KEY\n"
+    )
+    unusable = _worker_spec(harness, auth=ProviderAuth(name="explicit"))
+    assert resolve_model_provider(unusable, harness).kind == "none"
+
+
+@pytest.mark.parametrize(
+    ("managed_url", "helper"),
+    [
+        ("https://gateway.example/anthropic", None),
+        ("https://api.anthropic.com", "echo test-token"),
+        (None, "echo test-token"),
+    ],
+)
+def test_managed_claude_settings_require_gateway_and_credential(
+    managed_url: str | None, helper: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": managed_url}, "apiKeyHelper": helper})
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+
+    assert resolve_model_provider(_worker_spec("claude-native"), "claude-native").kind == "none"
 
 
 @pytest.mark.parametrize(
@@ -1063,6 +1177,75 @@ def test_subscription_listing_is_static_and_unverified(
     assert "static_fallback" not in payload
 
 
+@pytest.mark.parametrize("cache_state", ["fresh", "stale", "empty", "missing"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["default-provider", "spec-provider"])
+def test_codex_cli_config_uses_native_catalog(
+    cache_state: str, explicit: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Discovery uses the selected worker's cached wire IDs, not another provider's."""
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  ambient:\n    kind: cli-config\n    cli: codex\n"
+        f"    model_provider: Ambient\n    default: {str(explicit).lower()}\n"
+        "  codex-gateway:\n    kind: cli-config\n    cli: codex\n"
+        f"    model_provider: Databricks\n    default: {str(not explicit).lower()}\n",
+    )
+    source = tmp_path / "codex-source"
+    source.mkdir()
+    (source / "config.toml").write_text('model_provider = "Ambient"\n')
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(app_server, "_find_codex_cli", lambda: "/test-bin/codex")
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path / "data")
+    spec = _worker_spec(
+        "codex-native", **({"auth": ProviderAuth(name="codex-gateway")} if explicit else {})
+    )
+    launch = app_server.resolve_native_codex_launch(model=None, spec=spec)
+    fingerprint = app_server.codex_catalog_fingerprint(launch)
+    model_id = "system.ai.gpt-5-6-sol"
+    if explicit:
+        ambient = app_server.resolve_native_codex_launch(model=None)
+        model_catalog_store.write_catalog(
+            "codex-native",
+            app_server.codex_catalog_fingerprint(ambient),
+            [{"id": "system.ai.gpt-other-provider", "isDefault": True}],
+        )
+    if cache_state != "missing":
+        rows = (
+            []
+            if cache_state == "empty"
+            else [
+                {"id": "gpt-5.6-sol", "model": model_id, "isDefault": True},
+                {"id": model_id, "model": model_id},
+                {"id": "gpt-5.6-terra"},
+            ]
+        )
+        model_catalog_store.write_catalog("codex-native", fingerprint, rows)
+        if cache_state == "stale":
+            old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+            os.utime(model_catalog_store.catalog_path("codex-native", fingerprint), (old, old))
+
+    row = catalog_for_spec(spec)["self"]
+
+    assert row["source"] == ("static" if cache_state == "missing" else "cli")
+    assert row["verified"] is (cache_state in {"fresh", "empty"})
+    assert row["models"] == (
+        []
+        if cache_state in {"empty", "missing"}
+        else [
+            {"id": model_id, "family": "openai"},
+            {"id": "gpt-5.6-terra", "family": "openai"},
+        ]
+    )
+    if cache_state == "stale":
+        assert "refresh" in str(row["note"])
+    assert "no usable model provider" not in str(row["note"])
+
+
 def test_cli_config_listing_is_static_and_unverified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1709,6 +1892,62 @@ def test_spec_harness_derivation() -> None:
     assert spec_harness(SimpleNamespace()) is None
 
 
+@pytest.mark.parametrize(
+    ("provider_base", "expected"),
+    [
+        ("https://api.openai.com/v1", "https://api.openai.com/v1/models"),
+        ("https://api.openai.com/v1/", "https://api.openai.com/v1/models"),
+        ("https://api.anthropic.com", "https://api.anthropic.com/v1/models"),
+        ("https://api.z.ai/api/coding/paas/v4", "https://api.z.ai/api/coding/paas/v4/models"),
+        ("https://api.z.ai/api/coding/paas/v4/", "https://api.z.ai/api/coding/paas/v4/models"),
+        ("https://gw.example.com/v6", "https://gw.example.com/v6/models"),
+        ("https://gw.example.com/v10", "https://gw.example.com/v10/models"),
+        ("https://gw.example.com/v1beta", "https://gw.example.com/v1beta/v1/models"),
+        ("https://gw.example.com/v4/proxy", "https://gw.example.com/v4/proxy/v1/models"),
+        ("https://gw.example.com/v٤", "https://gw.example.com/v٤/v1/models"),
+        ("https://v4", "https://v4/v1/models"),
+    ],
+)
+def test_models_url_appends_models_to_any_versioned_base(
+    provider_base: str, expected: str
+) -> None:
+    """A base already ending in ``/v<n>`` lists at ``<base>/models``, not ``/v1/models``."""
+    assert model_catalog._models_url(provider_base) == expected
+
+
+def test_openai_compatible_listing_hits_the_versioned_base() -> None:
+    """Live discovery for a ``/v4`` base GETs ``<base>/models`` and parses the page."""
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        if request.url.path != "/api/coding/paas/v4/models":
+            return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "glm-4.6", "context_length": 200000}, {"id": "glm-4.5-air"}]},
+        )
+
+    provider = ResolvedModelProvider(
+        kind="key",
+        family="openai",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        api_key="test-key",
+    )
+
+    listing = model_catalog._fetch_openai_compatible_listing(
+        provider, transport=httpx.MockTransport(_handler)
+    )
+
+    assert [str(request.url) for request in requests_seen] == [
+        "https://api.z.ai/api/coding/paas/v4/models"
+    ]
+    assert [(m.id, m.context_window) for m in listing.models] == [
+        ("glm-4.6", 200000),
+        ("glm-4.5-air", None),
+    ]
+
+
 def test_openai_compatible_listing_mints_bearer_via_auth_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1882,3 +2121,404 @@ def test_model_services_listing_stops_on_repeated_page_token(
 
     assert [entry.id for entry in entries]  # partial list kept, not an exception
     assert any("repeated a page token" in record.message for record in caplog.records)
+
+
+# ── Generic ACP curation (acp_curated_models) ───────────────────────────────
+
+
+_GATEWAY_WITH_MODELS = (
+    "providers:\n"
+    "  bifrost:\n"
+    "    kind: gateway\n"
+    "    default: true\n"
+    "    anthropic:\n"
+    "      base_url: https://gw.example.com/anthropic\n"
+    "      api_key: sk-anthropic\n"
+    "      models:\n"
+    "        default: claude-fable-5\n"
+    "        opus: claude-opus-x\n"
+    "    openai:\n"
+    "      base_url: https://gw.example.com/openai\n"
+    "      api_key: sk-openai\n"
+    "      wire_api: chat\n"
+    "      models:\n"
+    "        default: gpt-5.4\n"
+    "        reasoner: claude-fable-5\n"
+)
+
+
+@pytest.mark.parametrize("harness", ["acp", "acp:custom"])
+@pytest.mark.parametrize("has_credentials", [False, True])
+def test_acp_listing_uses_only_curated_ids_without_remote_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness: str,
+    has_credentials: bool,
+) -> None:
+    """ACP discovery matches the configured policy regardless of gateway credentials."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gateway:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.com/v1\n"
+        "      api_key: $ACP_TEST_CATALOG_API_KEY\n"
+        "      models:\n"
+        "        alternate: vendor/custom-b\n"
+        "        primary: databricks-gpt-5-4\n"
+        "        default: primary\n",
+    )
+    if has_credentials:
+        monkeypatch.setenv("ACP_TEST_CATALOG_API_KEY", "fake-key")
+    else:
+        monkeypatch.delenv("ACP_TEST_CATALOG_API_KEY", raising=False)
+    requests_seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "databricks-gpt-5-4"},
+                    {"id": "vendor/custom-b"},
+                    {"id": "outside-configured-list"},
+                ]
+            },
+        )
+
+    listing = list_models_for_worker(
+        _worker_spec(harness, auth=ProviderAuth(name="gateway")),
+        harness,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert [entry.id for entry in listing.models] == [
+        "databricks-gpt-5-4",
+        "vendor/custom-b",
+    ]
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert requests_seen == []
+
+
+@pytest.mark.parametrize(
+    "models_yaml",
+    [
+        "",
+        "      models:\n        default: gpt-5\n",
+        "      models:\n        default: primary\n        primary: gpt-5\n        fast: gpt-5\n",
+    ],
+)
+def test_acp_listing_without_curation_keeps_live_discovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, models_yaml: str
+) -> None:
+    """Default-only and uncurated providers retain their unrestricted remote catalog."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gateway:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.com/v1\n"
+        "      api_key: fake-key\n" + models_yaml,
+    )
+    requests_seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "gpt-5"}, {"id": "vendor/other-model"}]},
+        )
+
+    listing = list_models_for_worker(
+        _worker_spec("acp:custom", auth=ProviderAuth(name="gateway")),
+        "acp:custom",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert {entry.id for entry in listing.models} == {"gpt-5", "vendor/other-model"}
+    assert listing.source == "openai-compatible"
+    assert listing.verified is True
+    assert len(requests_seen) == 1
+
+
+@pytest.mark.parametrize("model", [None, "gpt-5.4", "outside-configured-list"])
+def test_acp_curated_models_independent_of_session_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None
+) -> None:
+    """A session override cannot expand or reorder the configured shortlist."""
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:custom", model=model, auth=ProviderAuth(name="bifrost"))
+    assert model_catalog.acp_curated_models(spec) == (
+        "claude-fable-5",
+        "claude-opus-x",
+        "gpt-5.4",
+    )
+
+
+def test_acp_curated_models_without_models_map_is_unrestricted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Selecting a provider without model curation leaves overrides unrestricted."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  bifrost:\n"
+        "    kind: gateway\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://gw.example.com/anthropic\n"
+        "      api_key: sk-anthropic\n",
+    )
+    spec = _worker_spec("acp:custom", model="claude-x", auth=ProviderAuth(name="bifrost"))
+    assert model_catalog.acp_curated_models(spec) == ()
+    model_catalog.validate_acp_model(spec, "another-model")
+
+
+def test_acp_curated_models_provider_default_leads_when_unpinned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The provider's ``models["default"]`` tier leads an unpinned shortlist.
+
+    Gateway deployments curate the default tier as the launch model. When
+    neither the spec nor the configured ACP agent pins a model, the picker
+    must present that tier first (it becomes the default row) instead of
+    falling back to raw config order.
+    """
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
+    assert model_catalog.acp_curated_models(spec) == (
+        "claude-fable-5",
+        "claude-opus-x",
+        "gpt-5.4",
+    )
+
+
+def test_acp_curated_models_default_alias_resolves_to_concrete_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``default:`` naming another tier resolves to the concrete model id.
+
+    Gateway deployments alias tier names (``deepseek-pro``) to model ids
+    (``deepseek-v4-pro``) and reference an alias from ``default:``. Launch
+    and picker rows must be concrete ids: the alias itself never appears as
+    launch or a list row, and the aliased tier's id stays deduplicated.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  bifrost:\n"
+        "    kind: gateway\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://gw.example.com/v1\n"
+        "      api_key: sk-openai\n"
+        "      wire_api: chat\n"
+        "      models:\n"
+        "        gemma: gemma-4-31B-it\n"
+        "        deepseek-pro: deepseek-v4-pro\n"
+        "        default: deepseek-pro\n",
+    )
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
+    assert model_catalog.acp_curated_models(spec) == (
+        "deepseek-v4-pro",
+        "gemma-4-31B-it",
+    )
+    assert model_catalog._acp_launch_model(spec) == "deepseek-v4-pro"
+
+
+def test_acp_curated_models_empty_without_provider_or_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No provider config and no model: empty shortlist, no picker."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    assert model_catalog.acp_curated_models(_worker_spec("acp")) == ()
+
+
+def test_resolve_provider_acp_slug_canonicalizes_and_prefers_anthropic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``acp:<slug>`` resolves like ``acp``: family-agnostic, anthropic first."""
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    provider = resolve_model_provider(
+        _worker_spec("acp:whatever", model="claude-fable-5", auth=ProviderAuth(name="bifrost")),
+        "acp:whatever",
+    )
+    assert provider.kind == "gateway"
+    assert provider.family == "anthropic"
+
+
+def test_resolve_provider_acp_reports_none_when_unconfigured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bare acp session with no provider resolves to kind=none, not an error."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec("acp"), "acp")
+    assert provider.kind == "none"
+
+
+@pytest.mark.parametrize("model", [None, "gemini-2.5-pro"])
+def test_acp_ignores_unrelated_global_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None
+) -> None:
+    """A default provider for other harnesses cannot configure a vendor-owned ACP agent."""
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:gemini", model=model)
+    assert model_catalog._acp_launch_model(spec) == model
+    assert model_catalog.acp_curated_models(spec) == ()
+    assert resolve_model_provider(spec, "acp:gemini").kind == "none"
+    model_catalog.validate_acp_model(spec, "another-gemini-model")
+
+
+@pytest.mark.parametrize(
+    "models_yaml",
+    [
+        "        default: gpt-5\n",
+        "        default: primary\n        primary: gpt-5\n        fast: gpt-5\n",
+    ],
+)
+def test_acp_default_only_provider_does_not_restrict_model_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, models_yaml: str
+) -> None:
+    """One distinct configured model is a default, even when multiple aliases name it."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gateway:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.com/v1\n"
+        "      api_key: fake-key\n"
+        "      models:\n" + models_yaml,
+    )
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="gateway"))
+    assert model_catalog._acp_launch_model(spec) == "gpt-5"
+    assert model_catalog.acp_curated_models(spec) == ()
+    spec.executor.model = "another-model"
+    assert model_catalog.acp_curated_models(spec) == ()
+    model_catalog.validate_acp_model(spec, "another-model")
+
+
+def test_embedded_acp_agent_uses_explicit_provider_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An embedded agent without a model uses its selected provider's default."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        _GATEWAY_WITH_MODELS + "acp:\n"
+        "  agents:\n"
+        "    - name: Other agent\n"
+        "      command: other-agent\n"
+        "      model: unrelated-model\n",
+    )
+    spec = _worker_spec("acp:embedded", auth=ProviderAuth(name="bifrost"))
+    spec.executor.config["acp_agent"] = {"name": "Embedded", "command": "custom-acp"}
+    assert model_catalog._acp_launch_model(spec) == "claude-fable-5"
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+@pytest.mark.parametrize("model", ["databricks-custom", "databricks/custom"])
+def test_explicit_acp_agent_databricks_model_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, embedded: bool, model: str
+) -> None:
+    """An agent's explicit model is a vendor-local id, regardless of its prefix."""
+    config = (
+        f"acp:\n  agents:\n    - name: Custom\n      command: custom-acp\n      model: {model}\n"
+    )
+    _isolate_config(monkeypatch, tmp_path, config)
+    spec = _worker_spec("acp:custom", model="databricks-inherited")
+    if embedded:
+        spec.executor.config["acp_agent"] = {
+            "name": "Embedded",
+            "command": "embedded-acp",
+            "model": model,
+        }
+    assert model_catalog._acp_launch_model(spec) == model
+
+
+def test_acp_curated_databricks_spec_model_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Curated provider ids retain their Databricks prefix through launch selection."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        _GATEWAY_WITH_MODELS.replace("claude-opus-x", "databricks-custom"),
+    )
+    spec = _worker_spec("acp:custom", model="databricks-custom", auth=ProviderAuth(name="bifrost"))
+    assert model_catalog._acp_launch_model(spec) == "databricks-custom"
+    model_catalog.validate_acp_model(spec, "databricks-custom")
+
+
+def test_acp_curated_models_do_not_include_agent_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An agent default outside the provider set cannot silently expand its policy."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
+    spec.executor.config["acp_agent"] = {
+        "name": "Custom",
+        "command": "custom-acp",
+        "model": "outside-configured-list",
+    }
+    launch = model_catalog._acp_launch_model(spec)
+    assert launch == "outside-configured-list"
+    assert launch not in model_catalog.acp_curated_models(spec)
+    with pytest.raises(OmnigentError, match="configured model list") as error:
+        model_catalog.validate_acp_model(spec, launch)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+    model_catalog.validate_acp_model(spec, "gpt-5.4")
+    model_catalog.validate_acp_model(spec, None)
+
+
+@pytest.mark.parametrize("model", [None, "another-model"])
+def test_acp_missing_explicit_provider_is_not_unrestricted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None
+) -> None:
+    """A stale provider reference rejects both ordinary selections and resets."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="removed-provider"))
+    with pytest.raises(OmnigentError, match="no such provider") as error:
+        model_catalog.validate_acp_model(spec, model)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+    with pytest.raises(OmnigentError, match="no such provider"):
+        model_catalog._acp_launch_model(spec)
+
+
+def test_acp_provider_resolution_failure_does_not_become_empty_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed provider read preserves its cause and never advertises unrestricted models."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    failure = RuntimeError("provider configuration unavailable")
+
+    def fail_resolution(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr("omnigent.runtime.workflow._resolve_provider_for_build", fail_resolution)
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
+    with pytest.raises(OmnigentError, match="Cannot resolve ACP provider 'bifrost'") as error:
+        model_catalog.acp_curated_models(spec)
+    assert error.value.code == ErrorCode.INTERNAL_ERROR
+    assert error.value.__cause__ is failure
+    with pytest.raises(OmnigentError, match="Cannot resolve ACP provider"):
+        model_catalog._acp_launch_model(spec)
+
+    unbound = _worker_spec("acp:custom")
+    assert model_catalog.acp_curated_models(unbound) == ()
+    model_catalog.validate_acp_model(unbound, "another-model")

@@ -71,9 +71,7 @@ def _stored_size(page: Page) -> str | None:
     return page.evaluate(f"() => window.localStorage.getItem('{STORAGE_KEY}')")
 
 
-def test_mobile_ui_font_size_applies_not_just_saves(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_mobile_ui_font_size_applies_not_just_saves(page: Page, live_server: str) -> None:
     """At a phone viewport, stepping the size up must visibly scale the UI.
 
     Reporter's journey: open Settings / Appearance on mobile, increase the UI
@@ -82,16 +80,16 @@ def test_mobile_ui_font_size_applies_not_just_saves(
     half that already worked; the rendered-size checks are the regression
     guard for the applied size.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     page.set_viewport_size(_MOBILE_VIEWPORT)
     _open_appearance(page, base_url)
 
     value = page.get_by_test_id("ui-font-size-input")
     increase = page.get_by_test_id("ui-font-size-inc")
 
-    # Fresh context: the default 13px choice; mobile renders text-ui at its
-    # own base size. Capture that rendered baseline before touching anything.
-    expect(value).to_have_value("13")
+    # Fresh context: mobile defaults to 14px. Capture that rendered baseline
+    # before touching anything.
+    expect(value).to_have_value("14")
     baseline_px = _rendered_ui_text_px(page)
 
     # Step to the 18px maximum — a "significant" increase per the report.

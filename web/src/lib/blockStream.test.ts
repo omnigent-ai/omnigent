@@ -20,6 +20,7 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
+import { parseEvent } from "./sse";
 import type { Response } from "./types";
 
 function makeResponse(opts?: {
@@ -73,6 +74,35 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
+  it("does not adopt lifecycle notice ids as the parent stream identity", () => {
+    const blocks = reduce([
+      {
+        type: "native_tool_call",
+        toolType: "subagent_activity",
+        data: {},
+        itemId: "notice_1",
+        responseId: "subagent_returned",
+      },
+      { type: "text_delta", delta: "Before identity\n" },
+      {
+        type: "tool_call",
+        name: "Read",
+        arguments: {},
+        callId: "call_1",
+        status: "completed",
+        agentName: "parent",
+        itemId: "tool_1",
+        responseId: "parent_turn",
+      },
+      { type: "text_delta", delta: "After identity\n" },
+    ]);
+
+    expect(blocks[0]?.ctx.responseId).toBe("subagent_returned");
+    expect(
+      blocks.filter((block) => block.type === "text_chunk").map((block) => block.ctx.responseId),
+    ).toEqual(["", "parent_turn"]);
+  });
+
   it("every block ctx.responseId is the active response id from response.created", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_xyz" }) },
@@ -1362,6 +1392,81 @@ describe("BlockStream — terminal lifecycles", () => {
     }
   });
 
+  it.each([
+    {
+      previousModel: null,
+      previousId: "",
+      failureModel: "polly",
+      code: "executor_error",
+      source: undefined,
+    },
+    {
+      previousModel: "codex-native-ui",
+      previousId: "resp_other",
+      failureModel: "polly",
+      code: "ValueError",
+      source: "harness",
+    },
+    {
+      previousModel: "polly",
+      previousId: "resp_failed",
+      failureModel: "",
+      code: "executor_error",
+      source: undefined,
+    },
+  ])(
+    "names a turn failure from its response identity ($previousId, $failureModel, $code)",
+    ({ previousModel, previousId, failureModel, code, source }) => {
+      const events: StreamEvent[] = previousModel
+        ? [
+            {
+              type: "response_created",
+              response: makeResponse({ responseId: previousId, model: previousModel }),
+            },
+          ]
+        : [];
+      events.push({
+        type: "response_failed",
+        ...(source ? { source } : {}),
+        response: {
+          ...makeResponse({ responseId: "resp_failed", status: "failed", model: failureModel }),
+          error: {
+            code,
+            message: "The executor stopped before producing output.",
+          },
+        },
+      });
+
+      const error = reduce(events).find((block) => block.type === "error");
+      expect(error).toMatchObject({
+        code,
+        source: source ?? "",
+        message: "The executor stopped before producing output.",
+        title: "Polly ran into an error during this turn.",
+      });
+    },
+  );
+
+  it("names a runner failure without id or model using the active turn", () => {
+    const failure = parseEvent("response.failed", {
+      source: "harness",
+      response: {
+        status: "failed",
+        error: { code: "RuntimeError", message: "Harness stopped." },
+      },
+    });
+    expect(failure).not.toBeNull();
+    const blocks = reduce([
+      { type: "response_in_progress", response: makeResponse({ model: "release-reviewer" }) },
+      failure!,
+    ]);
+    expect(blocks.find((block) => block.type === "error")).toMatchObject({
+      title: "Release-reviewer ran into an error during this turn.",
+      message: "Harness stopped.",
+      ctx: { responseId: "resp_1" },
+    });
+  });
+
   it("failure without error does not emit ErrorBlock", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },
@@ -1380,14 +1485,18 @@ describe("BlockStream — terminal lifecycles", () => {
 describe("BlockStream — status events", () => {
   it("error event → ErrorBlock with both message and code", () => {
     const blocks = reduce([
-      { type: "response_created", response: makeResponse() },
+      { type: "response_created", response: makeResponse({ model: "polly" }) },
       {
         type: "error",
         source: "llm",
         toolName: null,
         error: { code: "llm_auth_failed", message: "API key invalid" },
       },
-      { type: "response_failed", response: makeResponse({ status: "failed" }) },
+      { type: "response_failed", response: makeResponse({ status: "failed", model: "polly" }) },
+      {
+        type: "response_created",
+        response: makeResponse({ responseId: "resp_switched", model: "codex-native-ui" }),
+      },
     ]);
 
     const err = blocks.find((b) => b.type === "error");
@@ -1396,8 +1505,37 @@ describe("BlockStream — status events", () => {
       expect(err.message).toBe("API key invalid");
       expect(err.code).toBe("llm_auth_failed");
       expect(err.source).toBe("llm");
+      expect(err.title).toBe("Polly ran into an error during this turn.");
     }
   });
+
+  it.each(["error", "response_failed"] as const)(
+    "does not label a delayed %s with a different response's agent",
+    (type) => {
+      const error = { code: "RuntimeError", message: "The old turn failed." };
+      const delayed: StreamEvent =
+        type === "error"
+          ? { type, source: "execution", toolName: null, error, responseId: "resp_old" }
+          : {
+              type,
+              response: {
+                ...makeResponse({ responseId: "resp_old", status: "failed", model: "" }),
+                error,
+              },
+            };
+      const blocks = reduce([
+        {
+          type: "response_created",
+          response: makeResponse({ responseId: "resp_new", model: "polly" }),
+        },
+        delayed,
+      ]);
+
+      const errorBlock = blocks.find((block) => block.type === "error");
+      expect(errorBlock).toMatchObject(error);
+      expect(errorBlock?.title).toBeUndefined();
+    },
+  );
 
   it("output_item.done error event preserves persisted ids", () => {
     const blocks = reduce([

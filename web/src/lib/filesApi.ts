@@ -1,3 +1,4 @@
+import { attachmentFilename } from "./attachments";
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
@@ -10,10 +11,8 @@ export interface UploadedFile {
 
 export async function uploadFile(sessionId: string, file: File): Promise<UploadedFile> {
   const form = new FormData();
-  // Clipboard-pasted images (e.g. Ctrl+V from a browser) produce a File
-  // with name="" which the server rejects. Use "image.png" as the fallback
-  // so the upload succeeds regardless of how the file was obtained.
-  form.append("file", file, file.name || "image.png");
+  const filename = attachmentFilename(file);
+  form.append("file", file, filename);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files`,
     {
@@ -36,7 +35,7 @@ export async function uploadFile(sessionId: string, file: File): Promise<Uploade
   };
   return {
     id: resource.id,
-    filename: resource.metadata?.filename ?? resource.name ?? (file.name || "image.png"),
+    filename: resource.metadata?.filename ?? resource.name ?? filename,
     bytes: resource.metadata?.bytes ?? file.size,
     created_at: resource.metadata?.created_at ?? 0,
   };

@@ -7,6 +7,8 @@ import contextlib
 import hashlib
 import json
 import logging
+import urllib.error
+import urllib.request
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -17,21 +19,32 @@ import httpx
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.harnesses.codex_egress import (
+    CERTIFICATE_REMEDIATION,
+    certificate_failure_message,
+    is_connection_retry,
+)
+from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
+    CodexAppServerResponseError,
     CodexMessage,
     client_for_transport,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
     MCP_STARTUP_STARTING,
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
     clear_active_turn_id_if_matches,
+    clear_certificate_failure,
+    codex_config_revision,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
     read_bridge_state,
+    read_certificate_failure,
     read_codex_config_developer_instructions_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -60,16 +73,14 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
 _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
-# How long to wait for a freshly launched Codex TUI to create its
-# app-server thread (emit ``thread/started``) before giving up. Generous
-# because a host-spawned TUI cold-starts over the runner.
-_THREAD_START_TIMEOUT_SECONDS = 30.0
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # A freshly created thread passes through a second transient state: its rollout
 # file exists but is still empty (the TUI created the thread but no turn has
@@ -78,6 +89,10 @@ _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # state as a missing rollout. Acute with the fresh-launch host auto-create,
 # whose listener races the TUI's just-created empty rollout.
 _EMPTY_ROLLOUT_FRAGMENT = "is empty"
+# Multi-agent v2 refuses ``thread/resume`` for a sub-agent thread that has not
+# been loaded through its parent. Codex's own hint is ``thread/read`` with
+# ``includeTurns: true``, which returns the same ``{"thread": Thread}`` shape.
+_UNLOADED_SUBAGENT_FRAGMENT = "cannot resume an unloaded multi-agent v2 sub-agent"
 _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
@@ -117,6 +132,10 @@ _EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
 # handlers are harmless no-ops if a build spells these differently.
 _CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
 _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+# How often the forwarder claims pending ``/side`` questions from the bridge dir.
+# The executor writes one and returns, so this is the delay before the side chat
+# starts; a fork is cheap, so poll fast enough to feel immediate.
+_SIDE_CHAT_POLL_SECONDS = 0.5
 # Transient reasoning (chain-of-thought) delta — the reasoning analogue of
 # ``external_output_text_delta``. Nothing is persisted; it publishes
 # ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
@@ -249,6 +268,13 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
+# Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
+# PERMISSION_DENIED for these, which looks like auth to the generic checks —
+# it isn't. Re-authenticating cannot resolve a spending limit.
+_CODEX_BUDGET_EXHAUSTED_FRAGMENTS = (
+    "has reached its limit",
+    "rate limit is set to 0",
+)
 
 
 @dataclass
@@ -356,6 +382,8 @@ class _CodexForwarderState:
         the last ``_refresh_effort_from_config`` read, so the refresh can tell
         an unchanged file from a rewritten one (an unchanged file must not roll
         back a live ``thread/settings/updated`` effort).
+    :param last_config_effort_revision: File identity and modification time used
+        to retry mirroring after a same-value config rewrite.
     :param collaboration_mode: Latest known Codex collaboration mode kind, e.g.
         ``"plan"`` or ``"default"``.
     :param posted_collaboration_mode: Last collaboration mode kind already
@@ -377,8 +405,10 @@ class _CodexForwarderState:
         mapped to their spawning parent thread id when known, e.g.
         ``{"thread_child": "thread_parent"}``.
     :param subscribed_child_threads: Codex child thread ids whose backlog
-        has been replayed for this connection (guards against re-replay
-        if the same collab item is observed multiple times).
+        has been replayed for this connection, or whose backfill hit a
+        non-retryable error this connection (guards against re-replay
+        or a repeated doomed attempt if the same collab item is observed
+        multiple times).
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
@@ -427,6 +457,7 @@ class _CodexForwarderState:
     # The config.toml effort as of the last _refresh_effort_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
     last_config_effort: str | None = None
+    last_config_effort_revision: tuple[int, int] | None = None
     collaboration_mode: str | None = None
     posted_collaboration_mode: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -951,11 +982,17 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
     that omit it.
 
+    Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
+    for these, which the auth checks below would otherwise misclassify.
+
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
     :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
+    lowered = message.lower()
+    if any(fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS):
+        return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
     variant: str | None = None
     http_status: object = None
@@ -967,7 +1004,6 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
     if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
-    lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
         return _CODEX_ERROR_KIND_AUTH
     return _CODEX_ERROR_KIND_GENERIC
@@ -1595,6 +1631,15 @@ class _OutputTextDeltaCoalescer:
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
+# Posted together so each token post is a self-contained cumulative snapshot;
+# older servers read an omitted cache count as zero cached tokens.
+_CUMULATIVE_TOKEN_KEYS = (
+    "cumulative_input_tokens",
+    "cumulative_cache_read_input_tokens",
+    "cumulative_output_tokens",
+)
+
+
 class _SessionUsageCoalescer:
     """
     Coalesce Codex token-usage updates before posting to AP.
@@ -1604,7 +1649,9 @@ class _SessionUsageCoalescer:
     (latest-only, deduped) so repeated frames collapse to one post. The
     caller flushes it per usage frame (so the web UI cost badge updates
     live mid-turn) and again at turn/session boundaries (a no-op when
-    nothing changed).
+    nothing changed). Cumulative token counts are posted as one group, so
+    a cache-miss turn still carries the unchanged cached total alongside
+    its grown input/output totals.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -1671,6 +1718,15 @@ class _SessionUsageCoalescer:
         if not data:
             self._pending.clear()
             return
+        if data.keys() & _CUMULATIVE_TOKEN_KEYS:
+            # Re-attach every cumulative count so the post stays self-contained:
+            # the latest pending value, else the last posted one when this frame
+            # omitted the field (older servers read an omitted count as zero).
+            for key in _CUMULATIVE_TOKEN_KEYS:
+                if key in self._pending:
+                    data[key] = self._pending[key]
+                elif key in self._last_posted:
+                    data[key] = self._last_posted[key]
         # Attach the model to every token-bearing post (not via the
         # changed-keys dedup, so it rides along even when only token
         # counts changed) — the server reprices cumulative tokens into
@@ -2061,11 +2117,6 @@ async def supervise_forwarder(
         timeout=httpx.Timeout(30.0),
         transport=ap_transport,
     ) as ap_client:
-        # Recover proven-undelivered dead-lettered forwards now that the
-        # server may be reachable again (host/server returned after an
-        # outage or restart). Runs before live forwarding begins, so no
-        # other writer races the dead-letter files (#1579).
-        await _replay_dead_letters_on_startup(ap_client, bridge_dir)
         # Synthesize the thread's MCP startup round (see the comment on
         # _CODEX_MCP_STARTUP_STATUS_METHOD): the fresh-launch forwarder
         # starts right at thread creation, which is when codex boots its
@@ -2103,6 +2154,12 @@ async def supervise_forwarder(
                 ready_signal=thread_active,
             ),
             name="codex-native-forwarder-subscribe",
+        )
+        side_chat_task = asyncio.create_task(
+            _drive_side_chat_requests(
+                client, ap_client=ap_client, bridge_dir=bridge_dir, target=target
+            ),
+            name="codex-native-forwarder-side-chat",
         )
         await _sleep(0)
         try:
@@ -2144,6 +2201,16 @@ async def supervise_forwarder(
                     # waiting forever on an idle fresh thread.
                     if not thread_active.is_set() and _event_indicates_thread_active(event):
                         thread_active.set()
+                    # Surface a /side ephemeral fork as its own sub-agent (rail)
+                    # child. No-op unless this event is a fork of the active
+                    # thread; once mapped, the fork's events route to the child.
+                    await side_chat.register_side_fork_child(
+                        ap_client,
+                        forwarder_state=forwarder_state,
+                        parent_session_id=target.session_id,
+                        parent_thread_id=target.thread_id,
+                        event=event,
+                    )
                     await _handle_event(
                         ap_client,
                         session_id=target.session_id,
@@ -2169,7 +2236,111 @@ async def supervise_forwarder(
             subscribe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task
+            side_chat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await side_chat_task
             await client.close()
+
+
+async def _drive_side_chat_requests(
+    codex_client: CodexAppServerClient,
+    *,
+    ap_client: httpx.AsyncClient,
+    bridge_dir: Path,
+    target: _ForwarderTarget,
+) -> None:
+    """
+    Fork the ``/side`` questions the executor recorded, on this connection.
+
+    The fork has to happen here: whoever calls ``thread/fork`` owns the fork's
+    event stream, and the executor's client closes as soon as it submits the
+    turn, so a fork made there streams its answer into a dead connection. The
+    fork's ``thread/started`` then registers the rail child through the normal
+    event path.
+
+    A request is removed only after it has been handled (:func:`peek` +
+    :func:`discard`), never on read, so a fork failure or a not-yet-ready parent
+    thread can't silently swallow a ``/side`` question:
+
+    * Parent thread not ready yet: leave every request in place and retry next
+      cycle, rather than consuming into the void.
+    * Fork/turn failure: isolate per request (one bad question can't drop its
+      siblings), post a visible notice so the loss is never silent, then discard
+      the request so the same failure isn't retried forever.
+
+    :param codex_client: The forwarder's long-lived app-server client.
+    :param ap_client: HTTP client for Omnigent event posts (failure notices).
+    :param bridge_dir: Native Codex bridge directory holding the requests.
+    :param target: Live forwarder target, read for the current parent thread id.
+    :returns: None. Runs until cancelled.
+    """
+    while True:
+        try:
+            parent_thread_id = target.thread_id
+            # Only claim once the parent thread exists — a request read before
+            # then can't fork, and consuming it would lose the question (#3).
+            if parent_thread_id is not None:
+                for request in side_chat.peek_side_chat_requests(bridge_dir):
+                    try:
+                        child_thread_id = await side_chat.open_side_chat_on_client(
+                            codex_client,
+                            parent_thread_id=parent_thread_id,
+                            question=request.question,
+                        )
+                        if child_thread_id is None:
+                            raise RuntimeError("thread/fork returned no thread id")
+                    except Exception:  # noqa: BLE001 - one bad request must not drop the rest.
+                        _logger.warning(
+                            "Codex /side fork failed for %s", request.path, exc_info=True
+                        )
+                        await _post_side_chat_failed_notice(
+                            ap_client, target.session_id, request.path.stem
+                        )
+                    # Remove whether it forked or failed: a forked request is
+                    # done, and a failed one has surfaced a notice — keeping it
+                    # would retry the same failure forever.
+                    side_chat.discard_side_chat_request(request.path)
+        except Exception:  # noqa: BLE001 - keep the drain loop alive.
+            _logger.warning("Codex /side drain iteration failed", exc_info=True)
+        await _sleep(_SIDE_CHAT_POLL_SECONDS)
+
+
+async def _post_side_chat_failed_notice(
+    client: httpx.AsyncClient, session_id: str, request_key: str
+) -> None:
+    """
+    Surface a visible notice when a ``/side`` chat could not be opened.
+
+    Best-effort: a failed notice must not itself break the drain loop. The
+    request key (the request file's stem) makes the notice idempotent so a
+    retry can't double-post.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Parent Omnigent conversation id.
+    :param request_key: Stable per-request id for idempotency.
+    :returns: None.
+    """
+    marker = f"side-chat-error-{request_key}"
+    try:
+        await _post_external_item(
+            client,
+            session_id,
+            item_type="message",
+            item_data={
+                "role": "assistant",
+                "agent": _AGENT_NAME,
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Couldn't open a side chat for that /side request. Try again.",
+                    }
+                ],
+            },
+            response_id=marker,
+            source_id=marker,
+        )
+    except Exception:  # noqa: BLE001 - the notice is best-effort.
+        _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
 
 
 async def _maybe_rotate_session_on_thread_started(
@@ -3190,7 +3361,15 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
         updated in place.
     :returns: None.
     """
+    # Stat before reading, so a rewrite that races this read shows on the next pass.
+    revision = codex_config_revision(bridge_dir)
     config_effort = read_codex_config_effort(bridge_dir)
+    if revision is not None:
+        previous_revision = forwarder_state.last_config_effort_revision
+        forwarder_state.last_config_effort_revision = revision
+        if config_effort and previous_revision is not None and previous_revision != revision:
+            # Retry a failed immediate mirror even when the effort is unchanged.
+            forwarder_state.posted_effort_known = False
     if not config_effort:
         return
     # Change is detected by VALUE, not file revision, so an ABA rewrite between
@@ -3361,6 +3540,92 @@ async def _sync_codex_approval_mode_change(
             forwarder_state.posted_approval_preset = preset
 
 
+async def _maybe_fail_turn_on_certificate_failure(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    params: _JsonObject,
+    usage_coalescer: _SessionUsageCoalescer,
+    delta_coalescer: _OutputTextDeltaCoalescer | None,
+    codex_client: CodexAppServerClient | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> bool:
+    """
+    Fail a turn Codex keeps retrying when its launcher reported a bad TLS certificate.
+
+    Codex never ends such a turn on its own, so the forwarder interrupts it and
+    surfaces the launcher's certificate cause and the next step as the failure.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param params: Codex ``error`` notification params carrying ``willRetry``.
+    :param usage_coalescer: Token-usage coalescer flushed with the failure.
+    :param delta_coalescer: Optional text-delta coalescer flushed first.
+    :param codex_client: Optional app-server client used to interrupt the turn.
+    :param forwarder_state: Optional forwarder state for per-turn deduplication.
+    :returns: ``True`` when the turn was failed, or already had been.
+    """
+    if not is_connection_retry(params):
+        return False
+    failure = read_certificate_failure(bridge_dir)
+    if failure is None:
+        return False
+    turn_id = _turn_id_from_payload(params)
+    if forwarder_state is None or turn_id is None:
+        # Without per-turn state the failure could be posted once per retry and
+        # the interrupt's own boundary could flip it back to idle; leave the
+        # retry to Codex.
+        _logger.info(
+            "Codex forwarder cannot fail retrying turn on certificate failure "
+            "without turn state: turn_id=%s",
+            turn_id,
+        )
+        return False
+    if turn_id in forwarder_state.surfaced_terminal_error_turns:
+        return True
+    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    thread_id = _thread_id_from_params(params)
+    if codex_client is not None and thread_id is not None:
+        try:
+            await codex_client.request(
+                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+            )
+        except Exception:  # noqa: BLE001 - the failure is surfaced either way.
+            _logger.warning(
+                "Codex turn interrupt after a certificate failure failed", exc_info=True
+            )
+    clear_active_turn_id_if_matches(bridge_dir, turn_id)
+    _logger.warning(
+        "Codex forwarder failing turn on launcher certificate failure: turn_id=%s evidence=%s",
+        turn_id,
+        failure.evidence,
+    )
+    model = forwarder_state.model
+    async with _conversation_item_delivery_scope(session_id):
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error:certificate",
+                error=_CodexTerminalError(
+                    message=(
+                        f"{certificate_failure_message(failure, model=model)}\n\n"
+                        f"{CERTIFICATE_REMEDIATION}"
+                    ),
+                    kind=_CODEX_ERROR_KIND_GENERIC,
+                ),
+            ),
+        )
+        await usage_coalescer.flush()
+    return True
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -3394,6 +3659,16 @@ async def _maybe_handle_turn_event(
             _logger.info(
                 "Codex forwarder observed retryable turn error: turn_id=%s",
                 _turn_id_from_payload(params),
+            )
+            await _maybe_fail_turn_on_certificate_failure(
+                client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                params=params,
+                usage_coalescer=usage_coalescer,
+                delta_coalescer=delta_coalescer,
+                codex_client=codex_client,
+                forwarder_state=forwarder_state,
             )
             return True
         async with _conversation_item_delivery_scope(session_id):
@@ -4723,13 +4998,18 @@ def _terminal_turn_status_edge(
             turn_id=terminal_turn_id,
             source=f"{source}:turn-failed",
         )
-    if method == "turn/completed" and _turn_items_are_empty(params):
-        _logger.warning(
-            "Codex forwarder observed an empty turn (zero items): "
-            "turn_id=%s method=%s; mapping to idle",
-            terminal_turn_id,
-            method,
-        )
+    if method == "turn/completed":
+        if _turn_items_are_empty(params):
+            _logger.warning(
+                "Codex forwarder observed an empty turn (zero items): "
+                "turn_id=%s method=%s; mapping to idle",
+                terminal_turn_id,
+                method,
+            )
+        if _turn_status_from_params(params) in (None, "completed"):
+            # The model answered, so a certificate failure recorded at launch
+            # no longer describes this app-server's egress.
+            clear_certificate_failure(bridge_dir)
     return _CodexTurnStatusEdge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
@@ -4748,13 +5028,7 @@ def _turn_status_is_failed(params: _JsonObject) -> bool:
     :param params: Codex turn event params.
     :returns: ``True`` when ``params['turn']['status']`` resolves to ``failed``.
     """
-    turn = params.get("turn")
-    if not isinstance(turn, dict):
-        return False
-    status = turn.get("status")
-    if isinstance(status, dict):
-        status = status.get("type") or status.get("status")
-    return status in {"failed", "errored"}
+    return _turn_status_from_params(params) in {"failed", "errored"}
 
 
 def _turn_items_are_empty(params: _JsonObject) -> bool:
@@ -4971,6 +5245,8 @@ async def _handle_completed_item_inner(
         await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
         return
     if item_type in _TOOL_ITEM_TYPES:
+        if item_type == "fileChange":
+            await _observe_file_change(bridge_dir, item)
         await _post_tool_item(
             client,
             session_id,
@@ -5300,6 +5576,12 @@ async def _register_child_session(
     tool_call_id = item.get("id")
     if isinstance(tool_call_id, str) and tool_call_id:
         data["tool_call_id"] = tool_call_id
+    # Display name for the child. Without it the server stamps its fixed
+    # fallback and the title keeps the raw thread id, which surfaces as a UUID
+    # in the sub-agent rail and the composer tray.
+    nickname = item.get("agent_nickname")
+    if isinstance(nickname, str) and nickname:
+        data["agent_nickname"] = nickname
     response = await _post_session_event(
         client,
         parent_session_id,
@@ -5347,10 +5629,10 @@ async def _backfill_child_thread(
 
     Called at most once per connection per child (guarded by
     ``subscribed_child_threads``). Fetches the child's rollout via
-    ``thread/resume``, upserts the nickname/role labels, and replays
-    any already-completed items. Live items arriving after discovery
-    flow through the normal routing path; the dedup key prevents
-    overlap.
+    ``thread/resume`` (or its ``thread/read`` fallback), upserts the
+    nickname/role labels, and replays any already-completed items. Live
+    items arriving after discovery flow through the normal routing path;
+    the dedup key prevents overlap.
 
     :param client: HTTP client for Omnigent event posts.
     :param codex_client: Connected Codex app-server client.
@@ -5364,7 +5646,7 @@ async def _backfill_child_thread(
     :returns: None.
     """
     response = await _resume_child_thread_or_log(
-        client, codex_client, child_session_id=child_session_id, child_thread_id=child_thread_id
+        codex_client, child_thread_id=child_thread_id, forwarder_state=forwarder_state
     )
     if response is None:
         return
@@ -5378,35 +5660,76 @@ async def _backfill_child_thread(
     )
 
 
+def _is_unloaded_subagent_resume_error(exc: Exception) -> bool:
+    """
+    Return whether ``thread/resume`` was refused for an unloaded v2 sub-agent.
+
+    Multi-agent v2 requires the parent to load a sub-agent thread before it
+    can be resumed directly; Codex's own hint is to fall back to
+    ``thread/read``.
+
+    :param exc: Exception raised by ``thread/resume``.
+    :returns: ``True`` for this specific refusal.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == -32600
+        and _UNLOADED_SUBAGENT_FRAGMENT in (exc.message or "")
+    )
+
+
 async def _resume_child_thread_or_log(
-    client: httpx.AsyncClient,
     codex_client: CodexAppServerClient,
     *,
-    child_session_id: str,
     child_thread_id: str,
+    forwarder_state: _CodexForwarderState,
 ) -> CodexMessage | None:
     """
-    Request ``thread/resume`` for a child thread, logging errors.
+    Fetch a child thread's backlog, falling back and logging on error.
 
-    :param client: HTTP client for Omnigent status posts on failure.
+    Falls back to ``thread/read`` (with ``includeTurns``) when Codex
+    refuses ``thread/resume`` for an unloaded multi-agent v2 sub-agent —
+    the read returns the same ``{"thread": Thread}`` shape ``thread/resume``
+    does, so callers can treat it identically. Any other failure (besides
+    the retryable not-ready class) is logged and marked so backfill is not
+    retried on a later child item; the child's liveness still comes from its
+    own turn/agent-status events, not this history mirror.
+
     :param codex_client: Connected Codex app-server client.
-    :param child_session_id: Omnigent child session id, e.g. ``"conv_child"``.
     :param child_thread_id: Codex child thread id, e.g.
         ``"thread_child"``.
-    :returns: JSON-RPC response on success, or ``None`` on error.
+    :param forwarder_state: Mutable state; marks a non-retryable failure
+        as done so it is not retried.
+    :returns: JSON-RPC response envelope on success, or ``None`` on error.
     """
     try:
         return await codex_client.request("thread/resume", {"threadId": child_thread_id})
     except RuntimeError as exc:
         if _is_thread_not_ready_error(exc):
             _logger.info("Codex child thread %s not ready yet; skipping backfill", child_thread_id)
-        else:
-            _logger.warning(
-                "Codex forwarder failed to backfill child thread %s",
-                child_thread_id,
-                exc_info=True,
-            )
-            await _post_status(client, child_session_id, "failed")
+            return None
+        if _is_unloaded_subagent_resume_error(exc):
+            try:
+                return await codex_client.request(
+                    "thread/read", {"threadId": child_thread_id, "includeTurns": True}
+                )
+            except RuntimeError as read_exc:
+                _logger.warning(
+                    "Codex forwarder failed to backfill child thread %s via thread/read "
+                    "fallback: %s: %s",
+                    child_thread_id,
+                    type(read_exc).__name__,
+                    read_exc,
+                )
+                forwarder_state.note_child_thread_subscribed(child_thread_id)
+                return None
+        _logger.warning(
+            "Codex forwarder failed to backfill child thread %s: %s: %s",
+            child_thread_id,
+            type(exc).__name__,
+            exc,
+        )
+        forwarder_state.note_child_thread_subscribed(child_thread_id)
         return None
 
 
@@ -6158,7 +6481,7 @@ _CODEX_SANDBOX_BYPASS_GUIDANCE = (
     "Omnigent: Codex's command sandbox could not start because this container "
     "disallows unprivileged user namespaces, so the command did not run. To run "
     'shell commands here, start a new Codex session with the "Full access" '
-    "approval preset (New chat → Advanced settings), or set "
+    "approval preset (New chat → permissions dropdown), or set "
     'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
 )
 
@@ -6247,6 +6570,57 @@ def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | 
         arguments={"changes": changes},
         output=output_text,
     )
+
+
+def _post_file_change_observer(url: str, token: str, payload: _JsonObject) -> None:
+    """POST one observer payload without the server client's auth middleware."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        response.read()
+
+
+async def _observe_file_change(bridge_dir: Path | None, item: _JsonObject) -> None:
+    """Send a completed Codex fileChange through the runner's file observer."""
+    if bridge_dir is None:
+        return
+    if item.get("status") in {"failed", "declined"}:
+        return
+    changes = item.get("changes")
+    if not isinstance(changes, list):
+        return
+    observed_changes = [
+        {"path": change.get("path"), "kind": change.get("kind")}
+        for change in changes
+        if isinstance(change, dict) and isinstance(change.get("path"), str)
+    ]
+    if not observed_changes:
+        return
+    try:
+        relay = json.loads((bridge_dir / "tool_relay.json").read_text(encoding="utf-8"))
+        url = relay["url"].rstrip("/") + "/hook/observe-tool"
+        token = relay["token"]
+        payload: _JsonObject = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"changes": observed_changes},
+            "tool_response": {"type": "success"},
+        }
+        await asyncio.to_thread(
+            _post_file_change_observer,
+            url,
+            token,
+            payload,
+        )
+    except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError) as exc:
+        _logger.warning("Codex fileChange observer delivery failed: %s", exc)
 
 
 def _web_search_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
@@ -6556,7 +6930,7 @@ async def _post_external_session_todos(
     """
     Post one ``external_session_todos`` event to the Sessions API.
 
-    Drives the web ``TodoPanel`` from a Codex plan update. The server caches
+    Drives the web ``TodoPanel`` from a Codex plan update. The server persists
     the list and broadcasts a ``session.todos`` SSE event, so the panel
     replaces its contents with the full current plan.
 
@@ -7070,12 +7444,14 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(event_type: str) -> None:
+def _note_forward_failure(event_type: str, result: _PostResult, session_id: str) -> None:
     """
     Record a permanent forward failure; escalate once when sync degrades.
 
     :param event_type: Session event type that failed to post, e.g.
         ``"external_conversation_item"``.
+    :param result: Classified outcome of the latest failed post.
+    :param session_id: Session whose event failed to post.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -7089,23 +7465,37 @@ def _note_forward_failure(event_type: str) -> None:
             "(latest type=%s)",
             _forward_health.consecutive_failures,
             event_type,
+            extra={
+                "session_id": session_id,
+                "event_name": "codex_forward_sync_degraded",
+                "attributes": {
+                    "http_status": result.response.status_code
+                    if result.response is not None
+                    else None,
+                    "transport_error": result.transport_error,
+                    "rejection_reason": result.rejection_reason,
+                    "delivered_ambiguous": result.delivered_ambiguous,
+                },
+            },
         )
         _forward_health.degraded_logged = True
 
 
-async def _replay_dead_letters_on_startup(
+async def _replay_dead_letters_before_resume(
     ap_client: httpx.AsyncClient,
     bridge_dir: Path,
 ) -> None:
     """
-    Re-POST proven-undelivered dead-lettered forwards on forwarder startup (#1579).
+    Re-POST proven-undelivered dead letters before rebuilding a resume rollout.
 
-    Best-effort recovery for the realistic case — the host/server returned after
-    an outage or a restart. Delegates to the shared
+    Best-effort recovery for the realistic case where the host/server returned
+    after an outage or restart. Running before the authoritative server-history
+    fetch ensures successfully replayed items are included in the rebuilt local
+    rollout. Delegates to the shared
     :func:`replay_dead_letters` drain, supplying a re-POST that routes each
     record to its recorded session via :func:`_post_session_event_inner` (the
     inner so a re-failure does not double dead-letter through the wrapper).
-    Never raises: a replay failure must not block live forwarding.
+    Never raises: a replay failure must not block resume.
 
     :param ap_client: HTTP client for Omnigent event posts.
     :param bridge_dir: Native Codex bridge directory holding the dead-letter files.
@@ -7150,8 +7540,8 @@ async def _replay_dead_letters_on_startup(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:  # noqa: BLE001 - replay must never block forwarder startup.
-        _logger.warning("Codex forwarder dead-letter replay failed", exc_info=True)
+    except Exception:  # noqa: BLE001 - replay must never block resume.
+        _logger.warning("Codex dead-letter replay before resume failed", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -7172,11 +7562,13 @@ class _PostResult:
     :param transport_error: Transport-error class name when a POST raised
         without a response, e.g. ``"ConnectError"``; ``None`` when the server
         responded.
+    :param rejection_reason: Local validation failure before any request was sent.
     """
 
     response: httpx.Response | None
     delivered_ambiguous: bool = False
     transport_error: str | None = None
+    rejection_reason: str | None = None
 
 
 async def _post_session_event(
@@ -7221,11 +7613,13 @@ async def _post_session_event(
     if response is not None and response.status_code < 400:
         _note_forward_success()
     else:
-        _note_forward_failure(event_type)
+        _note_forward_failure(event_type, result, session_id)
         dl_dir = _dead_letter_dir.get()
         if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
             http_status = response.status_code if response is not None else None
-            if response is not None:
+            if result.rejection_reason is not None:
+                reason = result.rejection_reason
+            elif response is not None:
                 reason = f"http {response.status_code}"
             elif result.delivered_ambiguous:
                 reason = "ambiguous transport failure (may already be committed)"
@@ -7265,11 +7659,11 @@ async def _post_session_event_inner(
     :param max_attempts: Maximum POST attempts before giving up, e.g. ``3``;
         ``None`` retries transient failures indefinitely and requires an
         idempotent event payload.
-        Startup dead-letter replay passes ``1`` — its natural retry cadence is
-        the next startup, so an in-call retry loop only adds latency (#1579).
+        Cold-resume dead-letter replay passes ``1`` — its natural retry cadence
+        is the next resume, so an in-call retry loop only adds latency (#1579).
     :param timeout: Optional per-request timeout in seconds overriding the
         client default, e.g. ``5.0``. Replay passes a short value so a hung
-        server fails fast instead of stalling startup on the 30s client default.
+        server fails fast instead of stalling resume on the 30s client default.
     :returns: A :class:`_PostResult` carrying the final response, or — for a
         legacy conversation item without ``source_id`` — whether the POST was
         abandoned after an ambiguous transport failure versus a proven-
@@ -7279,7 +7673,32 @@ async def _post_session_event_inner(
     if max_attempts is None and not idempotent:
         raise ValueError("unbounded session-event retries require an idempotent source_id")
     url = f"/v1/sessions/{url_component(session_id)}/events"
+    # The server's output cap runs after body validation; cap the mirror before
+    # upload so a large tool result can reach that handler at all.
+    item_data = data.get("item_data")
+    if (
+        event_type == "external_conversation_item"
+        and data.get("item_type") == "function_call_output"
+        and isinstance(item_data, dict)
+        and isinstance(output := item_data.get("output"), str)
+    ):
+        data = {**data, "item_data": {**item_data, "output": cap_tool_output(output)}}
     payload = {"type": event_type, "data": data}
+    # Early body rejection can surface as ReadError instead of HTTP 400 when
+    # the upload is closed. Such an event must not enter the unbounded retry loop.
+    request_bytes = len(httpx.Request("POST", url, json=payload).content)
+    if request_bytes > MAX_SESSION_EVENT_REQUEST_BYTES:
+        reason = (
+            f"session event request exceeds {MAX_SESSION_EVENT_REQUEST_BYTES} byte limit "
+            f"({request_bytes} bytes)"
+        )
+        _logger.warning(
+            "Codex session event rejected before upload: session=%s type=%s reason=%s",
+            session_id,
+            event_type,
+            reason,
+        )
+        return _PostResult(response=None, rejection_reason=reason)
     attempt = 0
     while max_attempts is None or attempt < max_attempts:
         attempt += 1
@@ -7611,7 +8030,7 @@ def _thread_started_is_ephemeral(event: CodexMessage) -> bool:
 async def wait_for_thread_started(
     client: CodexAppServerClient,
     *,
-    timeout: float | None = _THREAD_START_TIMEOUT_SECONDS,
+    timeout: float | None = CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
 ) -> str:
     """
     Wait for a freshly launched Codex TUI to create its app-server thread.

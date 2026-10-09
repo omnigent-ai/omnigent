@@ -10,15 +10,22 @@ parser; config + ambient are isolated so resolution is deterministic.
 
 from __future__ import annotations
 
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
+import tomllib
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.harnesses.codex_native.app_server import resolve_native_codex_launch
+from omnigent.harnesses.codex_native.app_server import (
+    build_codex_native_server,
+    codex_session_meta_model_provider,
+    resolve_native_codex_launch,
+)
 from omnigent.inner.codex_executor import _provider_codex_config_overrides
-from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec, ProviderAuth
 
 
 @pytest.fixture()
@@ -30,6 +37,7 @@ def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "CODEX_HOME"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
     return tmp_path
 
 
@@ -54,6 +62,82 @@ def _write_codex_login(home: Path, *, logged_in: bool) -> None:
     codex_dir.mkdir(parents=True, exist_ok=True)
     content = '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-login"}' if logged_in else "{}"
     (codex_dir / "auth.json").write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize("auth_source", ["spec", "global"])
+@pytest.mark.parametrize("endpoint_url", [None, "https://openrouter.ai/api/v1"])
+def test_native_codex_inline_api_key_routes_to_declared_endpoint(
+    _isolated: Path,
+    auth_source: str,
+    endpoint_url: str | None,
+) -> None:
+    """Native Codex uses inline credentials even without a Codex CLI login."""
+    api_key = "test-key with ' quotes"
+    if auth_source == "spec":
+        _seed(
+            _isolated,
+            {
+                "other": {
+                    "kind": "key",
+                    "default": True,
+                    "openai": {"base_url": "https://other.example.com/v1", "api_key": "other-key"},
+                }
+            },
+        )
+        spec = AgentSpec(
+            spec_version=1,
+            name="inline-auth",
+            instructions="Test inline credentials.",
+            executor=ExecutorSpec(
+                type="omnigent", auth=ApiKeyAuth(api_key=api_key, base_url=endpoint_url)
+            ),
+        )
+    else:
+        (_isolated / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"auth": {"type": "api_key", "api_key": api_key, "base_url": endpoint_url}}
+            )
+        )
+        spec = None
+
+    launch = resolve_native_codex_launch(model="test-model", spec=spec)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert provider["base_url"] == (endpoint_url or "https://api.openai.com/v1")
+    assert provider["wire_api"] == "responses"
+    assert launch.model == "test-model"
+    assert launch.profile is None
+    assert not launch.login_required
+    assert api_key not in launch.summary
+    assert provider["auth"]["command"] == "sh"
+    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+
+
+@pytest.mark.parametrize("fragment", [None, "wrong-key"])
+def test_native_codex_resolved_api_key_preserves_literal_dollars(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch, fragment: str | None
+) -> None:
+    """Literal dollars must neither change the bearer nor trigger login fallback."""
+    monkeypatch.delenv("OMNIGENT_KEY_FRAGMENT", raising=False)
+    if fragment is None:
+        monkeypatch.delenv("KEY_FRAGMENT", raising=False)
+    else:
+        monkeypatch.setenv("KEY_FRAGMENT", fragment)
+    api_key = "test-$KEY_FRAGMENT-'quoted'"
+    spec = AgentSpec(
+        spec_version=1,
+        name="literal-key",
+        instructions="Test literal credentials.",
+        executor=ExecutorSpec(type="omnigent", auth=ApiKeyAuth(api_key=api_key)),
+    )
+
+    launch = resolve_native_codex_launch(model="test-model", spec=spec)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+    assert not launch.login_required
 
 
 def test_provider_codex_overrides_coerce_chat_wire_to_responses() -> None:
@@ -177,7 +261,7 @@ def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     When Codex actually has a stored login, deferring to its own auth is
     correct — the bridged ``auth.json`` authenticates it. The launch still
     pins the built-in ``openai`` provider: the bridged config.toml may set a
-    custom default ``model_provider`` (e.g. isaac's Databricks AI Gateway),
+    custom default ``model_provider`` (e.g. isaac's Databricks Unity Gateway),
     which would otherwise silently hijack the Subscription selection. Failure
     with extra overrides means we synthesized a provider route over a working
     subscription; failure with NO overrides means the pin regressed and a
@@ -367,7 +451,7 @@ def test_resolve_native_codex_launch_cli_config_default_pins_provider(
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
                 "default": True,
             }
         },
@@ -384,7 +468,7 @@ _DISMISSIBLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]
@@ -460,7 +544,7 @@ def test_config_provider_shadowed_by_nondefault_explicit_entry_still_pins(
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             }
         },
     )
@@ -485,7 +569,7 @@ def test_shadowed_config_detection_uses_active_profile_provider(
         "[profiles.work]\n"
         'model_provider = "Databricks"\n'
         "[model_providers.Databricks]\n"
-        'name = "Databricks AI Gateway"\n'
+        'name = "Databricks Unity Gateway"\n'
         'base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"\n'
         "[model_providers.Databricks.auth]\n"
         'command = "jq"\n'
@@ -497,7 +581,7 @@ def test_shadowed_config_detection_uses_active_profile_provider(
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             }
         },
     )
@@ -822,16 +906,182 @@ def test_default_provider_without_credential_logged_out_marks_login_required(
     assert launch.login_required is True
 
 
-def test_global_auth_block_login_logged_out_marks_login_required(
-    _isolated: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A non-Databricks global auth block falling to Codex login is doomed headlessly."""
-    from omnigent.runtime import workflow
+# ── ambient built-in provider: config.toml routes without any login ─────────
 
-    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
-    monkeypatch.setattr(workflow, "_load_global_auth", lambda: object())
+
+def _write_ambient_codex_config(home: Path, content: str) -> None:
+    """Write ``~/.codex/config.toml`` under the isolated HOME (no auth.json)."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(content, encoding="utf-8")
+
+
+def _write_ambient_codex_profile(home: Path, name: str, content: str) -> None:
+    """Write the ``~/.codex/<name>.config.toml`` file profile ``--profile`` selects."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / f"{name}.config.toml").write_text(content, encoding="utf-8")
+
+
+_AMBIENT_BEDROCK_CONFIG = (
+    'model = "openai.gpt-5.6-terra"\nmodel_provider = "amazon-bedrock"\n\n'
+    '[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n'
+)
+
+
+@pytest.mark.parametrize("provider_id", ["amazon-bedrock", "ollama"])
+def test_ambient_builtin_provider_routes_without_login(_isolated: Path, provider_id: str) -> None:
+    """A config.toml selecting a self-sufficient built-in provider routes like plain ``codex``."""
+    _write_ambient_codex_config(
+        _isolated,
+        f'model = "openai.gpt-5.6-terra"\nmodel_provider = "{provider_id}"\n\n'
+        f'[model_providers.{provider_id}.aws]\nregion = "us-east-1"\n',
+    )
 
     launch = resolve_native_codex_launch(model=None)
 
-    assert "global auth block" in launch.summary
+    assert launch.config_overrides == [f'model_provider="{provider_id}"']
+    assert launch.profile is None
+    assert launch.login_required is False
+    assert provider_id in launch.summary
+    assert "no provider configured" not in launch.summary
+
+
+def test_ambient_openai_selection_still_marks_login_required(_isolated: Path) -> None:
+    """An explicit built-in ``openai`` selection still defers to Codex's own login."""
+    _write_ambient_codex_config(_isolated, 'model_provider = "openai"\nmodel = "gpt-5.4"\n')
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "no provider configured" in launch.summary
     assert launch.login_required is True
+
+
+def test_configured_provider_wins_over_ambient_builtin(_isolated: Path) -> None:
+    """An Omnigent provider default still routes ahead of the ambient built-in."""
+    _write_ambient_codex_config(_isolated, 'model_provider = "amazon-bedrock"\n')
+    _seed(
+        _isolated,
+        {
+            "vendor": {
+                "kind": "key",
+                "default": True,
+                "openai": {"base_url": "https://vendor.example.com/v1", "api_key": "test-key"},
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "vendor" in launch.summary
+    assert launch.login_required is False
+
+
+@pytest.mark.parametrize("logged_in", [False, True])
+def test_explicit_profile_selecting_openai_overrides_ambient_builtin(
+    _isolated: Path, logged_in: bool
+) -> None:
+    """``--profile`` selecting ``openai`` keeps Codex's own login over an ambient Bedrock base."""
+    _write_ambient_codex_config(_isolated, _AMBIENT_BEDROCK_CONFIG)
+    _write_ambient_codex_profile(
+        _isolated, "openai", 'model_provider = "openai"\nmodel = "gpt-5.4"\n'
+    )
+    _write_codex_login(_isolated, logged_in=logged_in)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile", "openai"])
+
+    assert "Codex CLI login" in launch.summary
+    assert "amazon-bedrock" not in launch.summary
+    assert codex_session_meta_model_provider(launch) == "openai"
+    assert launch.login_required is (not logged_in)
+
+
+@pytest.mark.parametrize("base_config", ['model = "gpt-5.4"\n', None])
+def test_explicit_profile_selecting_builtin_routes_without_login(
+    _isolated: Path, base_config: str | None
+) -> None:
+    """``--profile`` selecting Bedrock routes the launch whether or not a base config exists."""
+    if base_config is not None:
+        _write_ambient_codex_config(_isolated, base_config)
+    _write_ambient_codex_profile(_isolated, "bedrock", _AMBIENT_BEDROCK_CONFIG)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["-p", "bedrock"])
+
+    assert launch.config_overrides == ['model_provider="amazon-bedrock"']
+    assert codex_session_meta_model_provider(launch) == "amazon-bedrock"
+    assert launch.login_required is False
+
+
+def test_explicit_legacy_profile_table_routes_without_login(_isolated: Path) -> None:
+    """The legacy inline ``[profiles.<name>]`` table is layered when no file profile exists."""
+    _write_ambient_codex_config(
+        _isolated, 'model = "gpt-5.4"\n\n[profiles.bedrock]\nmodel_provider = "amazon-bedrock"\n'
+    )
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile", "bedrock"])
+
+    assert launch.config_overrides == ['model_provider="amazon-bedrock"']
+    assert launch.login_required is False
+
+
+def test_unknown_profile_does_not_pin_ambient_builtin(_isolated: Path) -> None:
+    """A profile that exists nowhere leaves the ambient tier alone; start-up reports it."""
+    _write_ambient_codex_config(_isolated, _AMBIENT_BEDROCK_CONFIG)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile", "nope"])
+
+    assert launch.config_overrides == []
+    assert "no provider configured" in launch.summary
+    assert launch.login_required is True
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (("--profile",), "Codex requires exactly one value for --profile"),
+        (("--profile", "../invalid"), "Invalid Codex config profile name"),
+        (
+            ("--profile", "one", "--profile", "two"),
+            "Codex requires exactly one value for --profile",
+        ),
+    ],
+)
+def test_malformed_profile_selector_defers_to_launch_arg_validation(
+    _isolated: Path, args: tuple[str, ...], error: str
+) -> None:
+    """A malformed ``--profile`` does not abort routing; start-up validation reports it."""
+    _write_ambient_codex_config(_isolated, _AMBIENT_BEDROCK_CONFIG)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=args)
+
+    assert launch.config_overrides == ['model_provider="amazon-bedrock"']
+    with pytest.raises(ValueError, match=error):
+        build_codex_native_server(
+            socket_path=_isolated / "codex.sock",
+            codex_home=_isolated / "private-codex-home",
+            cwd=_isolated,
+            model=launch.model,
+            profile=launch.profile,
+            bridge_dir=_isolated / "bridge",
+            codex_path=sys.executable,
+            extra_config_overrides=launch.config_overrides,
+            terminal_launch_args=args,
+        )
+
+
+def test_global_api_key_routes_without_model_or_cli_login(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inline key authenticates headlessly while Codex chooses its own model."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    (_isolated / "config.yaml").write_text(
+        yaml.safe_dump({"auth": {"type": "api_key", "api_key": "test-global-key"}})
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    assert config["model_provider"] == "omnigent_provider"
+    assert "model" not in config
+    assert launch.model is None
+    assert launch.login_required is False

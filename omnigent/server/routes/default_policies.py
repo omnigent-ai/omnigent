@@ -39,6 +39,7 @@ from omnigent.spec.types import FunctionPolicySpec
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.events import PolicyDeletedEvent as _TelPolicyDeletedEvent
 from omnigent.telemetry.events import PolicyRegisteredEvent as _TelPolicyRegisteredEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
@@ -235,13 +236,8 @@ def create_default_policies_router(
             policy.handler,
         )
         try:
-            import hashlib as _hashlib
-
             _srv_id = _get_installation_id()
-            _anon: str | None = None
-            if user_id is not None:
-                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _anon = _tel_anon_user_id(user_id, _srv_id)
             _tel_emit(
                 _TelPolicyRegisteredEvent(
                     installation_id=_srv_id,
@@ -405,13 +401,8 @@ def create_default_policies_router(
             policy_id,
         )
         try:
-            import hashlib as _hashlib
-
             _srv_id = _get_installation_id()
-            _anon: str | None = None
-            if user_id is not None:
-                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _anon = _tel_anon_user_id(user_id, _srv_id)
             _tel_emit(
                 _TelPolicyDeletedEvent(
                     installation_id=_srv_id,
