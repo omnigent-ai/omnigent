@@ -469,18 +469,9 @@ async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
 async def test_self_resumed_child_result_is_delivered_after_a_drain() -> None:
     """A worker Claude Code resumes on its own must still reach the parent.
 
-    Journey at the runner's real ``external_session_status`` route: a
-    claude-native worker finishes a first turn (``running`` -> ``idle``), the
-    parent reads it (drain), then Claude Code resumes the worker on its own
-    after a background task hands back and the worker ends a second turn with a
-    question (``running`` -> ``idle``). The trailing-idle dedup for the *first*
-    turn must stay — a bare ``idle`` after the drain is ignored — but the
-    *second* turn is a new report and must be delivered.
-
-    On the buggy build a ``running`` edge after the drain does not clear the
-    drained-delivery tombstone, so ``_ensure_subagent_work_entry`` returns None
-    and the second turn's ``idle`` is answered "already delivered": the parent
-    is left waiting on a worker that is waiting on it.
+    At the real ``external_session_status`` route: first turn delivered and
+    drained, a bare trailing ``idle`` stays ignored, then a new ``running`` ->
+    ``idle`` turn must be delivered as a fresh result.
     """
     from omnigent.runner import app as runner_app
 

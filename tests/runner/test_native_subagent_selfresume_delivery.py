@@ -1,27 +1,11 @@
-"""A claude-native worker's self-resumed turn must still reach the orchestrator.
+"""A worker's self-resumed turn must still reach the orchestrator.
 
-An orchestrator dispatches a claude-native worker with ``sys_session_send``,
-which calls ``register_subagent_work``. The worker finishes its first turn; the
-forwarder POSTs ``external_session_status: idle`` to the child's ``/events``; the
-runner delivers a ``sub_agent`` item to the parent's inbox; and the orchestrator
-drains it with ``sys_read_inbox``. Draining a delivered result remembers the
-child in ``_drained_delivered_subagent_children``
-(``unregister_subagent_work(remember_drained_delivery=True)``) so a *duplicate*
-report of that same turn is acknowledged as already delivered instead of
-re-queued.
-
-Claude Code can then resume the same worker on its own -- a background task or an
-internal sub-agent hands back -- without the orchestrator sending anything. No
-``sys_session_send`` runs, so only the child's own new activity can clear the
-drained memory. When the self-resumed turn ends, its ``external_session_status:
-idle`` edge must be delivered to the parent as a fresh result, under the dispatch
-id stamped on the child, instead of being mistaken for a duplicate of the
-already-drained turn. While that turn runs, the worker counts as a running child
-of the orchestrator, so the orchestrator reads ``waiting`` rather than idle.
-
-The tests drive the real runner app's ``/events`` handler, the runner-local
-status publisher that the claude-native status-file poller and pane watcher use,
-and the real ``sys_read_inbox`` drain path.
+Ordering invariant: a drained or delivered dispatch is re-armed by the child's
+own ``running`` edge, under the dispatch id stamped on the child; the next turn
+end is delivered as a fresh result, while a trailing ``idle`` with no new
+``running`` stays deduplicated. The tests drive the real ``/events`` handler, the
+runner-local status publisher the status-file poller uses, and the real
+``sys_read_inbox`` drain.
 """
 
 from __future__ import annotations
@@ -627,3 +611,70 @@ async def test_spurious_running_edge_restores_a_delivered_result_the_parent_has_
         r_dup = await _post_status(client, status="idle", output="round one: found the bug")
         assert r_dup.status_code == 204
         assert inbox.qsize() == 1, "the duplicate report must not deliver round one twice"
+
+
+async def _parent_harness_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+    del session_id
+    harness = {"ag_sdk_parent": "claude-sdk", "ag_native_parent": "claude-native"}.get(
+        agent_id, "claude-native"
+    )
+    return AgentSpec(
+        spec_version=1,
+        name=agent_id,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_id", "expected"),
+    [("ag_sdk_parent", ["waiting"]), ("ag_native_parent", [])],
+)
+async def test_selfresume_waiting_edge_follows_the_parent_harness(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_id: str,
+    expected: list[str],
+) -> None:
+    """An idle SDK parent is shown waiting; a native parent's status stays with its terminal.
+
+    The parent's harness comes from its initialized spec, as in production:
+    ``_publish_turn_status`` publishes for an SDK parent and defers to the
+    terminal-owned status of a native one.
+    """
+    monkeypatch.setattr(runner_app, "_server_version", "0.16.0")
+    server = _ChildSnapshotServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_parent_harness_resolver,
+        server_client=server,  # type: ignore[arg-type]
+    )
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": PARENT_SESSION_ID, "agent_id": agent_id}
+        )
+        assert created.status_code == 201, created.text
+        inbox = subagent_work._session_inboxes_ref.setdefault(PARENT_SESSION_ID, asyncio.Queue())
+        subagent_work.register_child_session(
+            CHILD_SESSION_ID,
+            parent_session_id=PARENT_SESSION_ID,
+            title="reviewer:review",
+            tool="reviewer",
+            session_name="review",
+        )
+        subagent_work.register_subagent_work(
+            parent_session_id=PARENT_SESSION_ID,
+            child_session_id=CHILD_SESSION_ID,
+            agent="reviewer",
+            title="review the diff",
+        )
+        await _deliver_and_drain_round_one(client, inbox, server)
+        app.state.native_pane_status[PARENT_SESSION_ID] = "idle"
+        _parent_status_events()
+
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        await asyncio.sleep(0)
+
+    assert _parent_status_events() == expected

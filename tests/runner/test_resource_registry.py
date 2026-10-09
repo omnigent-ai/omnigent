@@ -797,16 +797,16 @@ async def _observe_native_with_real_poller(
 
 
 @pytest.mark.asyncio
-async def test_hook_idle_rearms_a_poller_whose_file_still_says_busy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("turn_end", ["idle", "failed"])
+async def test_hook_turn_end_rearms_a_poller_whose_file_still_says_busy(
+    tmp_path: Path, turn_end: str
+) -> None:
     """A hook-derived turn end must not silence a Claude that is still working.
 
-    Claude's status file stays ``busy`` across a ``Stop`` while a delegate keeps
-    working, and when Claude then resumes the session on its own. The
-    forwarder's ``idle`` moves the shared baseline to idle, but the poller's own
-    edge baseline still says ``running`` and the file is written only on change
-    — so without a re-arm the session reads idle for the whole self-resumed
-    turn: no spinner on the worker, and no ``running`` edge to mark the parent
-    waiting or to re-arm a drained child's result delivery.
+    Claude's status file stays ``busy`` across a ``Stop`` (or ``StopFailure``)
+    while a delegate keeps working and when Claude then resumes the session on
+    its own. The file is written only on change, so without a re-arm the poller
+    would never re-publish ``running`` for that turn.
     """
     config_dir = tmp_path / "claude"
     _write_claude_status_file(config_dir, status="busy")
@@ -822,9 +822,8 @@ async def test_hook_idle_rearms_a_poller_whose_file_still_says_busy(tmp_path: Pa
     await asyncio.sleep(0)
     assert statuses == ["running"], "an unchanged file must stay silent"
 
-    # Stop hook: the forwarder posts idle to the server; the runner learns it on
-    # /events and adopts it as the baseline.
-    registry.note_external_session_status("conv_busy_after_stop", "idle")
+    # The hook's turn end reaches the runner on /events and becomes the baseline.
+    registry.note_external_session_status("conv_busy_after_stop", turn_end)
     assert not registry.session_turn_is_active("conv_busy_after_stop")
 
     # Claude's file still says busy: the next tick must re-assert running.
