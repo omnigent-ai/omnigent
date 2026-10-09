@@ -3816,7 +3816,6 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Catalog-reasoning GPT (Responses) and Gemini (MLflow) entries get ``reasoning: true``."""
-    import json
     import unittest.mock
 
     from omnigent.models import model_catalog

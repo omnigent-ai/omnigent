@@ -1,4 +1,29 @@
-"""CLI e2e: reasoning-capable Databricks gateway models expose Pi's thinking controls."""
+"""CLI e2e: Pi must offer thinking levels for reasoning-capable gateway models.
+
+Drives the reported user journey through the *real* ``omnigent pi`` CLI under a
+pseudo-TTY (pexpect), rendering the TUI with ``pyte``:
+
+1. Configure ``~/.omnigent/config.yaml`` with a ``kind: databricks`` provider
+   whose profile points at a local mock of the Unity Catalog model-services
+   listing. The listing serves authentic ``system.ai.*`` ids on their real
+   surfaces (Claude on Anthropic Messages, GPT on OpenAI Responses, Gemini and
+   DeepSeek on chat completions); a seeded MLflow catalog cache marks all of
+   them reasoning-capable.
+2. Launch a pi-native session (``omnigent pi``) and open ``/thinking`` for the
+   Claude model Pi boots with (the control).
+3. ``/model`` -> pick the GPT model -> ``/thinking``; repeat for Gemini.
+
+Pi enables its thinking controls only for ``models.json`` entries flagged
+``reasoning: true``. On the buggy build Omnigent flags only ids containing
+``deepseek``/``claude``, so the GPT and Gemini pickers list only
+``off  No reasoning`` while Claude lists every level. The test asserts the
+GPT and Gemini pickers offer more than ``off``, so it fails on the buggy
+build and passes once the catalog capability drives the flag.
+
+Modelled on ``test_pi_native_gateway_claude_misroute_e2e.py`` (pexpect + fake
+``HOME`` against ``omnigent pi``) and ``test_pi_native_model_scope_e2e.py``
+(``pyte`` screen reads of the Pi TUI).
+"""
 
 from __future__ import annotations
 
@@ -11,7 +36,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -21,204 +46,154 @@ import pytest
 from tests.e2e._harness_probes import cli_unavailable_reason
 
 pexpect = pytest.importorskip("pexpect")
+pyte = pytest.importorskip("pyte")
 
-pytestmark = pytest.mark.skipif(
-    (_reason := cli_unavailable_reason("pi")) is not None,
-    reason=f"pi-native reasoning/thinking e2e requires a runnable 'pi' CLI; {_reason}.",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        (_reason := cli_unavailable_reason("pi")) is not None,
+        reason=f"pi-native thinking e2e requires a runnable 'pi' CLI; {_reason}.",
+    ),
+    pytest.mark.timeout(900),
+]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[>=]")
-# Launch budget mirrors the CLI's internal host/runner cold-start ceiling.
 _LAUNCH_TIMEOUT = 180
+_SCREEN_COLS, _SCREEN_ROWS = 140, 40
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[>=]")
 
-# Databricks profile name; the mock host is wired to it via ``.databrickscfg``.
-_PROFILE = "repro"
+CLAUDE_MODEL = "system.ai.claude-fable-5-1"
+GPT_MODEL = "system.ai.gpt-6-luna"
+GEMINI_MODEL = "system.ai.gemini-3-8-flash"
+DEEPSEEK_MODEL = "system.ai.deepseek-v4"
 
-# Reasoning models on each gateway surface; the seeded catalog marks every one
-# reasoning-capable.
-_CLAUDE_ID = "system.ai.claude-fable-5-1"  # anthropic-messages
-_GPT_ID = "system.ai.gpt-6-luna"  # openai-responses
-_GEMINI_ID = "system.ai.gemini-3-8-flash"  # openai-completions
-_DEEPSEEK_ID = "system.ai.deepseek-v4"  # openai-completions
+# Unity Catalog model-services rows: id -> supported_api_types.
+WORKSPACE_MODEL_SERVICES: dict[str, list[str]] = {
+    CLAUDE_MODEL: ["anthropic/v1/messages", "mlflow/v1/chat/completions"],
+    GPT_MODEL: ["mlflow/v1/chat/completions", "openai/v1/responses"],
+    GEMINI_MODEL: ["mlflow/v1/chat/completions"],
+    DEEPSEEK_MODEL: ["mlflow/v1/chat/completions"],
+}
 
-_MODEL_SERVICES = [
-    {"name": f"model-services/{_CLAUDE_ID}", "supported_api_types": ["anthropic/v1/messages"]},
-    {
-        "name": f"model-services/{_GPT_ID}",
-        "supported_api_types": ["openai/v1/responses", "openai/v1/chat/completions"],
-    },
-    {
-        "name": f"model-services/{_GEMINI_ID}",
-        "supported_api_types": ["openai/v1/chat/completions"],
-    },
-    {
-        "name": f"model-services/{_DEEPSEEK_ID}",
-        "supported_api_types": ["openai/v1/chat/completions"],
-    },
-]
+# Pi's /thinking picker rows (THINKING_DESCRIPTIONS in the Pi bundle).
+PI_THINKING_ROWS: dict[str, str] = {
+    "off": "No reasoning",
+    "minimal": "Very brief reasoning",
+    "low": "Light reasoning",
+    "medium": "Moderate reasoning",
+    "high": "Deep reasoning",
+    "xhigh": "Extra-high reasoning",
+    "max": "Maximum reasoning",
+}
 
 
 class _WorkspaceHandler(BaseHTTPRequestHandler):
-    """Mock Databricks workspace: serve the Unity Catalog model-services list."""
+    """Mock Databricks workspace: model-services listing, 404 elsewhere."""
 
-    def do_GET(self) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def _handle(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        _WorkspaceHandler.requests.append({"method": self.command, "path": self.path})
         if self.path.startswith("/api/2.1/unity-catalog/model-services"):
-            payload = json.dumps({"model_services": _MODEL_SERVICES}).encode()
+            body = json.dumps(
+                {
+                    "model_services": [
+                        {"name": f"model-services/{name}", "supported_api_types": api_types}
+                        for name, api_types in WORKSPACE_MODEL_SERVICES.items()
+                    ]
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(body)
             return
         self.send_response(404)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def do_POST(self) -> None:
-        # Gateway inference endpoints are only hit at turn time; this journey
-        # navigates menus and never sends a turn.
-        self.send_response(404)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+    do_GET = do_POST = do_PUT = do_DELETE = _handle  # type: ignore[assignment]
 
-    def log_message(self, *args: object) -> None:  # keep pytest output quiet
+    def log_message(self, *args: object) -> None:
         return
 
 
-@pytest.fixture
+@contextlib.contextmanager
 def mock_workspace() -> Iterator[str]:
-    """Start the mock Databricks workspace; yield its base URL."""
+    """Serve the mock workspace; yield its base URL."""
+    _WorkspaceHandler.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _WorkspaceHandler)
-    port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{port}"
+        yield f"http://127.0.0.1:{server.server_address[1]}"
     finally:
         server.shutdown()
         thread.join(timeout=5)
 
 
-@pytest.fixture
-def pi_home(tmp_path: Path, mock_workspace: str) -> Path:
-    """A fake ``HOME`` seeded with the Databricks provider + catalog cache."""
-    config_home = tmp_path / ".omnigent"
+def write_fake_home(home: Path, workspace_url: str) -> None:
+    """Seed *home* with the Databricks provider config and catalog cache.
+
+    Only ``HOME`` reaches the daemon-spawned runner, so every file lives under
+    the default locations: ``~/.omnigent/config.yaml``, ``~/.databrickscfg``
+    and the MLflow catalog cache under ``~/.cache``.
+    """
+    from omnigent.onboarding import providers as catalog_providers
+
+    config_home = home / ".omnigent"
     config_home.mkdir(parents=True, exist_ok=True)
     (config_home / "config.yaml").write_text(
         "auto_open_conversation: false\n"
         "providers:\n"
-        "  repro-workspace:\n"
+        "  databricks:\n"
         "    kind: databricks\n"
         "    default: true\n"
-        f"    profile: {_PROFILE}\n"
+        "    profile: repro\n"
     )
-    databrickscfg = tmp_path / ".databrickscfg"
-    databrickscfg.write_text(
-        f"[{_PROFILE}]\nhost = {mock_workspace}\ntoken = dapi-fake-repro-token\n"
-    )
-    databrickscfg.chmod(0o600)
+    (home / ".databrickscfg").write_text(f"[repro]\nhost = {workspace_url}\ntoken = repro-token\n")
 
-    # Seed the MLflow model-catalog cache so resolution stays offline; every
-    # model is marked reasoning-capable.
-    cache_dir = tmp_path / ".cache" / "omnigent" / "model-catalog"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def _model(max_in: int, max_out: int, date: str) -> dict[str, Any]:
+    def row(reasoning: bool) -> dict[str, Any]:
         return {
             "mode": "chat",
-            "capabilities": {"function_calling": True, "reasoning": True, "vision": True},
-            "context_window": {"max_input": max_in, "max_output": max_out},
-            "release_date": date,
+            "capabilities": {"function_calling": True, "reasoning": reasoning, "vision": True},
+            "context_window": {"max_input": 200000, "max_output": 8192},
         }
 
     catalog = {
-        "schema_version": "1.0",
+        "schema_version": 1,
         "models": {
-            "databricks-claude-fable-5-1": _model(200000, 16384, "2026-06-01"),
-            "databricks-gpt-6-luna": _model(400000, 16384, "2026-07-01"),
-            "databricks-gemini-3-8-flash": _model(1000000, 16384, "2026-05-01"),
-            "databricks-deepseek-v4": _model(128000, 16384, "2026-04-01"),
-        },
+            f"databricks-{model.removeprefix('system.ai.')}": row(True)
+            for model in WORKSPACE_MODEL_SERVICES
+        }
+        | {"databricks-llama-4-maverick": row(False)},
     }
-    (cache_dir / "databricks.json").write_text(
+    cache_path = home / ".cache" / "omnigent" / "model-catalog" / "databricks.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
         json.dumps(
             {
                 "cache_schema_version": 1,
-                "catalog_schema_version": "1.0",
-                "source_url": (
-                    "https://github.com/mlflow/mlflow/releases/download/"
-                    "model-catalog%2Flatest/databricks.json"
-                ),
+                "catalog_schema_version": catalog["schema_version"],
+                "source_url": catalog_providers._catalog_source_url("databricks"),
                 "fetched_at": time.time(),
                 "catalog": catalog,
             }
         )
     )
-    return tmp_path
 
 
-def _strip_ansi(text: str) -> str:
-    return _ANSI_RE.sub("", text)
-
-
-class _PiTerminal:
-    """Accumulate the pi TUI's raw output for ANSI-stripped assertions."""
-
-    def __init__(self, child: Any) -> None:
-        self.child = child
-        self.raw = ""
-
-    def pump(self, seconds: float) -> bool:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            try:
-                self.raw += self.child.read_nonblocking(65536, timeout=0.2)
-            except pexpect.TIMEOUT:
-                continue
-            except pexpect.EOF:
-                return False
-        return True
-
-    def wait_for(self, needle: str, timeout: float) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            self.pump(0.4)
-            if needle in self.text():
-                return True
-        return False
-
-    def text(self) -> str:
-        return _strip_ansi(self.raw)
-
-
-def _reasoning_by_id(models_json: Path) -> dict[str, bool]:
-    data = json.loads(models_json.read_text())
-    result: dict[str, bool] = {}
-    for provider in data.get("providers", {}).values():
-        for model in provider.get("models", []):
-            result[model["id"]] = bool(model.get("reasoning"))
-    return result
-
-
-def test_pi_native_gateway_reasoning_models_expose_thinking(pi_home: Path) -> None:
-    """models.json flags GPT/Gemini ``reasoning: true``; /thinking offers a level beyond off."""
-    omnigent_bin = Path(sys.executable).parent / "omnigent"
-    assert omnigent_bin.exists(), f"omnigent CLI not found at {omnigent_bin}"
-
+def cli_env(home: Path) -> dict[str, str]:
+    """Environment for ``omnigent pi`` so the spawned runner uses *home*."""
     env = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.startswith(("OMNIGENT_", "ANTHROPIC_", "OPENAI_", "DATABRICKS_", "CLAUDE_"))
-        and k not in {"TMUX", "TMUX_PANE", "XDG_CACHE_HOME"}
-    }
-    env.update(
-        HOME=str(pi_home),
-        OMNIGENT_CONFIG_HOME=str(pi_home / ".omnigent"),
-        OMNIGENT_SKIP_ONBOARD="1",
-        OMNIGENT_NO_UPDATE_CHECK="1",
-        # Resolve omnigent + its in-repo SDK packages to this worktree.
-        PYTHONPATH=os.pathsep.join(
+        **os.environ,
+        "HOME": str(home),
+        "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
+        "OMNIGENT_SKIP_ONBOARD": "1",
+        "PYTHONPATH": os.pathsep.join(
             str(p)
             for p in (
                 _REPO_ROOT,
@@ -226,94 +201,191 @@ def test_pi_native_gateway_reasoning_models_expose_thinking(pi_home: Path) -> No
                 _REPO_ROOT / "sdks" / "ui",
             )
         ),
-        # A real TERM so the runner-owned Pi tmux pane attaches under the pty.
-        TERM="xterm-256color",
-        PROMPT_TOOLKIT_NO_CPR="1",
-        PI_OFFLINE="1",
+        "TERM": "xterm-256color",
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+    }
+    # The test suite disables catalog lookups; the runner must read the seeded
+    # cache. Ambient Databricks credentials would shadow the fake profile.
+    for key in (
+        "OMNIGENT_CONFIG",
+        "OMNIGENT_DISABLE_CATALOG_LOOKUP",
+        "XDG_CACHE_HOME",
+        "DATABRICKS_CONFIG_FILE",
+        "DATABRICKS_CONFIG_PROFILE",
+        "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def omnigent_bin() -> Path:
+    path = Path(sys.executable).parent / "omnigent"
+    assert path.exists(), f"omnigent CLI not found at {path}"
+    return path
+
+
+def stop_local_server(env: dict[str, str]) -> None:
+    """Stop the auto-spawned managed server and the local host daemon."""
+    omni = Path(sys.executable).parent / "omni"
+    if omni.exists():
+        with contextlib.suppress(Exception):
+            subprocess.run([str(omni), "server", "stop"], env=env, capture_output=True, timeout=60)
+
+
+class PiTui:
+    """Render the ``omnigent pi`` PTY stream and wait for screen states."""
+
+    def __init__(self, process: Any) -> None:
+        self.process = process
+        self.screen = pyte.Screen(_SCREEN_COLS, _SCREEN_ROWS)
+        self.stream = pyte.Stream(self.screen)
+        self.raw: list[str] = []
+
+    def _pump(self) -> None:
+        try:
+            chunk = self.process.read_nonblocking(65536, timeout=0.2)
+        except pexpect.TIMEOUT:
+            return
+        self.raw.append(chunk)
+        self.stream.feed(chunk)
+
+    def text(self) -> str:
+        return "\n".join(self.screen.display)
+
+    def raw_text(self) -> str:
+        return _ANSI_RE.sub("", "".join(self.raw))
+
+    def wait_for(self, predicate: Callable[[str], bool], *, timeout: float, what: str) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self._pump()
+            except pexpect.EOF:
+                pytest.fail(f"omnigent pi exited before {what}:\n{self.text()}")
+            rendered = self.text()
+            if predicate(rendered):
+                return rendered
+        pytest.fail(f"Pi did not show {what} within {timeout:.0f}s:\n{self.text()}")
+
+    def wait_raw(self, pattern: str, *, timeout: float, what: str) -> re.Match[str]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self._pump()
+            except pexpect.EOF:
+                pytest.fail(f"omnigent pi exited before {what}:\n{self.raw_text()[-4000:]}")
+            match = re.search(pattern, self.raw_text())
+            if match:
+                return match
+        pytest.fail(
+            f"omnigent pi did not print {what} within {timeout:.0f}s:\n{self.raw_text()[-4000:]}"
+        )
+
+    def send(self, text: str) -> None:
+        self.process.send(text)
+
+
+def _footer_shows(model: str) -> Callable[[str], bool]:
+    pattern = re.compile(r"\(omnigent(?:-[a-z]+)?\)\s+" + re.escape(model))
+    return lambda text: pattern.search(text) is not None
+
+
+def offered_thinking_levels(text: str) -> list[str]:
+    return [level for level, description in PI_THINKING_ROWS.items() if description in text]
+
+
+def select_model(tui: PiTui, model: str) -> None:
+    """``/model`` -> filter to *model* -> Enter; wait for the footer to switch."""
+    tui.send("/model\r")
+    tui.wait_for(lambda text: model in text, timeout=30, what="the model picker")
+    tui.send(model.removeprefix("system.ai."))
+    time.sleep(1)
+    tui.send("\r")
+    tui.wait_for(_footer_shows(model), timeout=30, what=f"the footer naming {model}")
+    time.sleep(1)
+
+
+def read_thinking_picker(tui: PiTui) -> tuple[str, list[str]]:
+    """``/thinking`` -> read the rows Pi offers -> Escape."""
+    tui.send("/thinking\r")
+    tui.wait_for(
+        lambda text: PI_THINKING_ROWS["off"] in text, timeout=30, what="the thinking picker"
     )
+    time.sleep(1)
+    tui._pump()
+    screen = tui.text()
+    levels = offered_thinking_levels(screen)
+    tui.send("\x1b")
+    tui.wait_for(
+        lambda text: PI_THINKING_ROWS["off"] not in text, timeout=30, what="the picker to close"
+    )
+    time.sleep(1)
+    return screen, levels
+
+
+@pytest.fixture
+def workspace_url() -> Iterator[str]:
+    with mock_workspace() as url:
+        yield url
+
+
+@pytest.fixture
+def pi_home(tmp_path: Path, workspace_url: str) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    write_fake_home(home, workspace_url)
+    return home
+
+
+def test_pi_native_gateway_reasoning_models_offer_thinking_levels(pi_home: Path) -> None:
+    """GPT and Gemini gateway models must offer thinking levels like Claude does."""
+    env = cli_env(pi_home)
+    dump_dir = (
+        Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR") or pi_home.parent) / "pi-thinking-screens"
+    )
+    dump_dir.mkdir(parents=True, exist_ok=True)
 
     child = pexpect.spawn(
-        str(omnigent_bin),
+        str(omnigent_bin()),
         ["pi", "--server", ""],  # auto-spawn a local server + runner
         cwd=str(_REPO_ROOT),
         env=env,
         encoding="utf-8",
         codec_errors="replace",
-        dimensions=(40, 140),
+        dimensions=(_SCREEN_ROWS, _SCREEN_COLS),
         timeout=_LAUNCH_TIMEOUT,
     )
-    term = _PiTerminal(child)
-
+    tui = PiTui(child)
+    offered: dict[str, list[str]] = {}
     try:
-        assert term.wait_for("Web UI:", _LAUNCH_TIMEOUT), "pi CLI never printed a Web UI url"
-        # The Pi TUI boots with the resolved Claude-family default selected.
-        assert term.wait_for(_CLAUDE_ID, _LAUNCH_TIMEOUT), "pi TUI never booted with a model"
-        time.sleep(8)  # let prompt_toolkit's input loop go live before typing
+        tui.wait_raw(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT, what="its 'Web UI:' line")
+        # Pi boots with the workspace's Claude model selected.
+        tui.wait_for(_footer_shows(CLAUDE_MODEL), timeout=_LAUNCH_TIMEOUT, what="the Pi TUI")
+        time.sleep(5)  # let the tmux attach settle before typing
 
-        # (a) The managed models.json - the artifact the resolver wrote for this
-        # session - must mark every reasoning-capable gateway model reasoning.
-        matches = sorted((pi_home / ".omnigent" / "pi-native").glob("*/pi-agent/models.json"))
-        assert matches, "pi-native session did not write a managed models.json"
-        reasoning = _reasoning_by_id(matches[-1])
-        assert reasoning.get(_CLAUDE_ID) is True, f"claude control lost reasoning: {reasoning}"
-        assert reasoning.get(_DEEPSEEK_ID) is True, f"deepseek control lost reasoning: {reasoning}"
-        assert reasoning.get(_GPT_ID) is True, (
-            f"{_GPT_ID} (openai-responses) was written without reasoning: true, so Pi shows "
-            f"'thinking: no' and hides thinking controls. models.json reasoning map: {reasoning}"
-        )
-        assert reasoning.get(_GEMINI_ID) is True, (
-            f"{_GEMINI_ID} (openai-completions) was written without reasoning: true, so Pi shows "
-            f"'thinking: no' and hides thinking controls. models.json reasoning map: {reasoning}"
-        )
+        screen, offered["claude"] = read_thinking_picker(tui)
+        (dump_dir / "thinking-claude.txt").write_text(screen)
 
-        # (b) The user-visible symptom: select the GPT model and open /thinking.
-        child.send("/model")
-        time.sleep(1)
-        child.send("\r")
-        assert term.wait_for(_GPT_ID, 30), "the /model picker never listed the GPT model"
-        child.send(_GPT_ID.rsplit(".", 1)[-1])  # filter to "gpt-6-luna"
-        time.sleep(1.5)
-        child.send("\r")
-        # The footer prints the active provider in parens once the GPT model is
-        # selected (the picker used square brackets), confirming the switch.
-        assert term.wait_for("(omnigent-openai)", 30), "the GPT model was never activated"
-
-        think_mark = len(term.raw)
-        child.send("/thinking")
-        time.sleep(1)
-        child.send("\r")
-        term.pump(6)
-        picker = _strip_ansi(term.raw[think_mark:])
-        assert "Thinking Level" in picker or "No reasoning" in picker, (
-            f"the /thinking picker did not open for the GPT model. tail: {picker[-800:]!r}"
-        )
-        offers_reasoning = (
-            "minimal" in picker
-            or "Very brief reasoning" in picker
-            or bool(re.search(r"\b(low|medium|high)\b[^\n]*reasoning", picker, re.IGNORECASE))
-        )
-        assert offers_reasoning, (
-            f"Pi's /thinking picker for {_GPT_ID} offered only 'off  No reasoning' - thinking "
-            "controls are disabled for this reasoning-capable model. Expected a reasoning level "
-            f"beyond 'off' (e.g. 'minimal'/'low'/'medium'). picker tail: {picker[-800:]!r}"
-        )
+        for name, model in (("gpt", GPT_MODEL), ("gemini", GEMINI_MODEL)):
+            select_model(tui, model)
+            screen, offered[name] = read_thinking_picker(tui)
+            (dump_dir / f"thinking-{name}.txt").write_text(screen)
     finally:
-        _teardown(child, env)
-
-
-def _teardown(child: Any, env: dict[str, str]) -> None:
-    """Stop the CLI, then its server and daemon; ``pkill -f pi_native`` would hit pytest too."""
-    with contextlib.suppress(Exception):
-        child.kill(signal.SIGTERM)
-    time.sleep(2)
-    with contextlib.suppress(Exception):
-        child.kill(signal.SIGKILL)
-    omni_bin = Path(sys.executable).parent / "omni"
-    if omni_bin.exists():
         with contextlib.suppress(Exception):
-            subprocess.run(
-                [str(omni_bin), "server", "stop"],
-                env=env,
-                capture_output=True,
-                timeout=60,
-            )
+            child.kill(signal.SIGTERM)
+        time.sleep(2)
+        with contextlib.suppress(Exception):
+            child.kill(signal.SIGKILL)
+        stop_local_server(env)
+
+    assert offered["claude"] != ["off"], (
+        f"control failed: Pi offered only {offered['claude']} for {CLAUDE_MODEL}; "
+        f"thinking is unavailable for every model, not only non-Claude ones (screens: {dump_dir})"
+    )
+    disabled = {name: levels for name, levels in offered.items() if levels == ["off"]}
+    assert not disabled, (
+        "Pi shows thinking disabled for reasoning-capable gateway models: "
+        f"{disabled} (/thinking offers only 'off  No reasoning'), while "
+        f"{CLAUDE_MODEL} offers {offered['claude']}. Screens: {dump_dir}"
+    )

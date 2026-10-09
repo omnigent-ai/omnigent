@@ -33,7 +33,9 @@ def _entry(model_id: str, *, reasoning: bool | None, wire: ModelWireAPI) -> Mode
         ("system.ai.gpt-6-luna", ModelWireAPI.OPENAI_RESPONSES),
         ("system.ai.gemini-3-8-flash", ModelWireAPI.OPENAI_CHAT),
         ("system.ai.glm-5-3", ModelWireAPI.OPENAI_RESPONSES),
+        ("system.ai.kimi-k3", ModelWireAPI.OPENAI_RESPONSES),
         ("system.ai.qwen3-next", ModelWireAPI.OPENAI_RESPONSES),
+        ("system.ai.grok-5", ModelWireAPI.OPENAI_CHAT),
     ],
 )
 def test_catalog_reasoning_capability_sets_pi_reasoning_flag(
