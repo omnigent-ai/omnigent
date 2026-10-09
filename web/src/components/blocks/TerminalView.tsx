@@ -93,6 +93,12 @@ export const RECONNECT_BACKOFF_MS = [
  */
 export const RECONNECT_STABLE_MS = 30_000;
 
+function isRetryableTerminalClose(code: number): boolean {
+  return (
+    isUnexpectedTerminalClose(code) || (code === WS_CLOSE_WRONG_REPLICA && !isDatabricksWorkspace())
+  );
+}
+
 interface TerminalClipboardRequest {
   scope: string;
   epoch: number;
@@ -546,9 +552,8 @@ export function TerminalView({
         // every await.
         await Promise.resolve();
         if (superseded()) return;
-        // Route this WS to the replica holding the session's runner tunnel
-        // (key = the session's host_id). A browser WS can't set request
-        // headers, so the key rides the query string when host routing is on.
+        // A browser WS can't set request headers, so the routing key (the
+        // session's host_id) rides the query string when host routing is on.
         // A hostless session or direct connection needs no routing key.
         const computedHostId = (() => {
           if (!isHostRoutingEnabled()) return undefined;
@@ -627,8 +632,8 @@ export function TerminalView({
   // transport dropped while the surface sat in the background — possibly
   // exhausting the reconnect budget with nobody watching — retry
   // immediately with a fresh budget. Reveal is a user signal, exactly
-  // like the visibilitychange redial for frozen tabs. Deliberate closes
-  // (4xxx) keep the dead-end overlay as ever.
+  // like the visibilitychange redial for frozen tabs. Permanent closes
+  // keep the dead-end overlay.
   const stateRef = useRef(state);
   stateRef.current = state;
   const wasActiveRef = useRef(active);
@@ -636,7 +641,7 @@ export function TerminalView({
     if (active && !wasActiveRef.current) {
       sessionRef.current?.focus();
       const current = stateRef.current;
-      if (current.kind === "closed" && isUnexpectedTerminalClose(current.code)) {
+      if (current.kind === "closed" && isRetryableTerminalClose(current.code)) {
         reconnectAttemptsRef.current = 0;
         disposeActiveSession();
         setConnectAttempt((attempt) => attempt + 1);
@@ -691,7 +696,7 @@ export function TerminalView({
       setConnectAttempt((attempt) => attempt + 1);
       return;
     }
-    if (state.code !== WS_CLOSE_WRONG_REPLICA && !isUnexpectedTerminalClose(state.code)) {
+    if (!isRetryableTerminalClose(state.code)) {
       setReconnectPending(false);
       return;
     }

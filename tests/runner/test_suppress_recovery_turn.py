@@ -254,12 +254,11 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
 ) -> None:
     """Without suppress_recovery_turn the runner starts a recovery turn from history.
 
-    This documents the pre-fix behaviour: when the session-init envelope does
-    NOT carry suppress_recovery_turn=True, the runner sees the persisted user
-    message in history and starts a recovery turn immediately.  A subsequent
-    forward then finds an active turn and buffers the message.  After the
-    recovery turn finishes, _check_and_start_next_turn processes the buffered
-    message as a second turn, so the harness is called twice.
+    When the session-init envelope does NOT carry suppress_recovery_turn=True,
+    the runner sees the persisted user message in history and starts a recovery
+    turn immediately. The recovery turn claims that message's item id, so the
+    server's later forward of the same message is answered as already accepted
+    instead of running it a second time.
     """
     app, _pm, harness = _build_sdk_app(_HistoryServerClient())
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
@@ -282,10 +281,7 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
         _assert_browser_tools_hidden(harness.posted_bodies[0])
         assert _init_rows(caplog)[0]["recovery_turn"] == "history_resume"
 
-        # Now forward the message: since the recovery turn already ran and
-        # _active_turns is now empty, the forward triggers a second turn.
-        # (In the original bug, the forward would have been buffered _during_
-        # the recovery turn and then replayed after it, resulting in two turns.)
+        # The server's forward of the same persisted message must not run it again.
         forward_resp = await client.post(
             f"/v1/sessions/{SESSION_ID}/events",
             params={"stream": "true"},
@@ -297,14 +293,12 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
                 "persisted_item_id": "msg_001",
             },
         )
-        assert forward_resp.status_code == 200, (
+        assert forward_resp.status_code == 202, (
             f"Message forward returned {forward_resp.status_code}: {forward_resp.text}"
         )
-        _ = forward_resp.text  # drain
-
-        # Second turn ran — harness called twice total.
-        assert len(harness.posted_bodies) == 2, (
-            "Expected two harness calls total (recovery turn + forward-triggered turn); "
+        assert forward_resp.json()["detail"] == "Message already accepted."
+        assert len(harness.posted_bodies) == 1, (
+            "Expected only the recovery turn to call the harness; "
             f"got {len(harness.posted_bodies)}"
         )
 

@@ -245,6 +245,28 @@ plain `uv run pytest`, which starts a private server for the test.
   period. A completed legacy transcript without saved lifecycle state must
   remain readable without a disconnect error, including when the browser
   returns to the old server after its reads recover.
+- **`message-recovery`, OSS Kubernetes rollout (own environment):**
+  With `OMNIGENT_E2E_REPLICA_HANDOFF=1`,
+  `tests/e2e_ui/chat/test_replica_handoff.py::test_replica_handoff_composer`
+  reproduces duplicate model work, a lost idle event, and duplicate text after
+  history reconciliation. A Stop marker stays visible without starting new
+  model work after reconnect. An accepted prompt whose runner acknowledgement
+  was lost must finish without a send error, even if the browser reconnects
+  after the runner finishes. It also moves a session to a
+  new host while the original browser remains open. The companion
+  `tests/e2e/test_replica_handoff_e2e.py::test_replica_handoff_client` covers the
+  same cases through the web client API. Both use real processes and transport
+  failures; only external model replies are scripted.
+  `deploy/kubernetes/multi_replica/verify_browser.py` drives six independent browser
+  conversations on six external hosts through a three-pod rolling update.
+  Follow `deploy/kubernetes/multi_replica/README.md` to run it with F5 NGINX and
+  mock OpenAI SDK replies. It records every browser and checks saved messages,
+  rendered replies, model calls, and final session status. Runner message and
+  status recovery have focused coverage in
+  `tests/runner/test_reconnect_message_delivery.py`. A missed turn header and
+  subsequent history reconciliation are covered in `web/src/lib/blockStream.test.ts`
+  and `web/src/store/chatStore.test.ts`. Native harnesses and mobile
+  viewports need separate rollout verification.
 - **`reconnect`, completed Claude Task child (own environment):**
   `tests/e2e_ui/sessions/test_claude_native_idle_handoff.py::test_completed_claude_child_survives_stale_status_handoff`
   drives a real Claude-native parent and its Agent tool through child completion,
