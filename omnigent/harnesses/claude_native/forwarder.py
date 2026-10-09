@@ -6093,6 +6093,105 @@ async def _post_external_compaction_status(
     resp.raise_for_status()
 
 
+def _restore_preserved_compaction_messages(
+    transcript_path: Path,
+    messages: list[tuple[str, dict[str, object]]],
+) -> list[tuple[str, dict[str, object]]]:
+    """Restore recent turns retained outside the summary's parent chain.
+
+    Incomplete references raise so the caller retries instead of committing a
+    snapshot that permanently drops retained context.
+    """
+    records: dict[str, dict[str, object]] = {}
+    boundary: dict[str, object] | None = None
+    with transcript_path.open(encoding="utf-8") as transcript:
+        for line in transcript:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or not isinstance(record.get("uuid"), str):
+                continue
+            records[record["uuid"]] = record
+            if record.get("type") == "system" and record.get("subtype") == "compact_boundary":
+                boundary = record
+    if boundary is None:
+        return messages
+    metadata = boundary.get("compactMetadata")
+    if not isinstance(metadata, dict):
+        return messages
+    preserved = metadata.get("preservedMessages")
+    segment = metadata.get("preservedSegment")
+    if not isinstance(preserved, dict) and not isinstance(segment, dict):
+        return messages
+
+    if isinstance(preserved, dict):
+        anchor = preserved.get("anchorUuid")
+        retained_ids = preserved.get("uuids")
+        if not isinstance(retained_ids, list) or not all(
+            isinstance(uid, str) for uid in retained_ids
+        ):
+            raise ValueError("Invalid Claude preserved-message references")
+    else:
+        assert isinstance(segment, dict)
+        anchor = segment.get("anchorUuid")
+        head, cursor = segment.get("headUuid"), segment.get("tailUuid")
+        retained_ids = []
+        seen: set[str] = set()
+        while isinstance(cursor, str) and cursor not in seen:
+            seen.add(cursor)
+            retained_ids.append(cursor)
+            if cursor == head:
+                break
+            retained = records.get(cursor)
+            cursor = retained.get("parentUuid") if retained else None
+        else:
+            raise ValueError("Incomplete Claude preserved segment")
+        retained_ids.reverse()
+
+    if not isinstance(anchor, str):
+        raise ValueError("Invalid Claude compaction summary reference")
+    summary = records.get(anchor)
+    if (
+        summary is None
+        or summary.get("type") != "user"
+        or summary.get("isCompactSummary") is not True
+        or summary.get("parentUuid") != boundary.get("uuid")
+    ):
+        raise ValueError("Claude compaction summary is not available yet")
+    snapshot: list[tuple[str, dict[str, object]]] = []
+    included: set[str] = set()
+    for uid in [anchor, *retained_ids]:
+        if uid in included:
+            continue
+        record = records.get(uid)
+        if record is None:
+            raise ValueError("Claude retained message is not available yet")
+        included.add(uid)
+        role, message = record.get("type"), record.get("message")
+        if (
+            role not in ("user", "assistant")
+            or record.get("isMeta")
+            or record.get("isSidechain")
+            or record.get("teamName")
+        ):
+            continue
+        if not isinstance(message, dict) or not message.get("content"):
+            raise ValueError("Claude retained message has no content")
+        snapshot.append((uid, {"type": "message", "role": role, "content": message["content"]}))
+
+    # The SDK may have followed either the summary or the retained tail.
+    # Replace that prefix while preserving turns that followed compaction.
+    positions = {uid: i for i, (uid, _) in enumerate(messages)}
+    prefix_end = max((positions[uid] for uid in included if uid in positions), default=-1)
+    if prefix_end < 0:
+        raise ValueError("Claude compaction snapshot does not match the active transcript")
+    snapshot.extend(
+        (uid, message) for uid, message in messages[prefix_end + 1 :] if uid not in included
+    )
+    return snapshot
+
+
 async def _persist_native_compaction_item(
     client: httpx.AsyncClient,
     *,
@@ -6110,9 +6209,9 @@ async def _persist_native_compaction_item(
     session resume knows the compaction boundary — items before this
     marker are summarized and don't need to be loaded.
 
-    After writing the boundary, it also reads the post-compaction
-    transcript from Claude's own session state via
-    ``get_session_messages`` and includes them as ``compacted_messages``
+    Before writing the boundary, it reads the post-compaction
+    transcript via ``get_session_messages`` and restores turns retained by
+    Claude's compaction metadata. It includes them as ``compacted_messages``
     so session resume in ephemeral environments can reconstruct context
     without the CLI's local transcript files.
 
@@ -6140,21 +6239,54 @@ async def _persist_native_compaction_item(
     # Read the post-compaction session messages so session resume can
     # reconstruct context in ephemeral environments.
     compacted_messages: list[dict[str, object]] | None = None
+    native_messages: list[tuple[str, dict[str, object]]] | None = None
     try:
         from claude_agent_sdk import get_session_messages
 
         claude_sid = read_claude_session_id(bridge_dir)
         if claude_sid:
-            msgs = get_session_messages(claude_sid)
-            compacted_messages = [
-                {"type": "message", "role": m.type, "content": m.message.get("content", [])}
+            msgs = await asyncio.to_thread(get_session_messages, claude_sid)
+            native_messages = [
+                (
+                    m.uuid,
+                    {"type": "message", "role": m.type, "content": m.message.get("content", [])},
+                )
                 for m in msgs
                 if isinstance(m.message, dict)
             ]
     except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Failed to read Claude session messages for compaction persist",
+        # Without these messages the boundary is saved with no snapshot, so a
+        # cold resume restores nothing from before compaction.
+        _logger.warning(
+            "Failed to read Claude session messages for compaction persist; session=%s",
+            session_id,
             exc_info=True,
+            extra={"session_id": session_id},
+        )
+
+    if native_messages is not None:
+        sdk_message_count = len(native_messages)
+        transcript_path = read_transcript_path(bridge_dir)
+        if transcript_path is not None:
+            native_messages = await asyncio.to_thread(
+                _restore_preserved_compaction_messages, transcript_path, native_messages
+            )
+        compacted_messages = [message for _, message in native_messages]
+        # Log counts only so retained content never appears in diagnostics.
+        _logger.info(
+            "Persisting Claude compaction snapshot; session=%s sdk_messages=%d "
+            "snapshot_messages=%d transcript_found=%s",
+            session_id,
+            sdk_message_count,
+            len(compacted_messages),
+            transcript_path is not None,
+            extra={"session_id": session_id},
+        )
+    else:
+        _logger.warning(
+            "Persisting Claude compaction boundary without a snapshot; session=%s",
+            session_id,
+            extra={"session_id": session_id},
         )
 
     summary = (
