@@ -108,11 +108,12 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
-# A shell's not-found line names the token it could not resolve, either after
-# the phrase (zsh: ``zsh:2: command not found: --model``) or before it (bash,
-# dash, env, exec: ``bash: line 1: claude: command not found``,
-# ``sh: 1: claude: not found``, ``env: 'claude': No such file or directory``).
-_BLAMED_AFTER_PHRASE = re.compile(r"(?:command not found|no such file or directory):\s*(\S+)")
+# A shell's not-found line names the token it could not resolve, after the
+# phrase (zsh ``command not found: --model``, fish ``Unknown command: claude``)
+# or before it (bash/dash/env/exec, e.g. ``bash: line 1: claude: command not found``).
+_BLAMED_AFTER_PHRASE = re.compile(
+    r"(?:command not found|no such file or directory|unknown command):\s*(\S+)"
+)
 _BLAMED_BEFORE_PHRASE = re.compile(
     r"(\S+):\s*(?:command not found|no such file or directory|not found\b"
     r"|executable file not found)"

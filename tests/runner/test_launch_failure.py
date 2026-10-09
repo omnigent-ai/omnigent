@@ -123,7 +123,7 @@ _PRESENT_CLI_CRASH_OUTPUT = "\n".join(
 # claude-native launches through ``env -u … claude …``, so the runner reports
 # ``env`` as the launched command; a direct launch reports the CLI itself.
 @pytest.mark.parametrize("command", ["env", "claude", "/usr/local/bin/claude"])
-def test_present_cli_crash_with_stray_flag_is_not_missing_binary(command: str) -> None:
+def test_present_cli_crash_with_stray_flag_is_unclassified(command: str) -> None:
     # The not-found line blames `--model`, not the launched command, and the
     # rest of the pane proves the CLI ran: unclassified is the honest answer.
     diagnosis = classify_terminal_failure(
@@ -172,6 +172,7 @@ def test_shell_launcher_reporting_a_stray_token_is_not_missing_binary(command: s
     ("command", "output"),
     [
         ("claude", "zsh: command not found: claude"),
+        ("claude", "fish: Unknown command: claude"),
         ("claude", "bash: claude: command not found"),
         ("claude", "bash: line 1: claude: command not found"),
         ("claude", "sh: 1: claude: not found"),
