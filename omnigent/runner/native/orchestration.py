@@ -236,6 +236,8 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
     """
+    # Forget the launch dir even when the app-server already exited on its own.
+    _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
     if session_id not in _AUTO_CODEX_APP_SERVERS:
         return
     await _cancel_auto_forwarder_task(session_id)
@@ -359,6 +361,24 @@ _CODEX_SIGN_IN_POLL_INTERVAL_S = 2.0
 # Background Codex app-server instances for host-spawned codex-native
 # runners, kept referenced so they aren't garbage-collected mid-run.
 _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
+
+# Bridge directory of each session's latest Codex launch. For a rotated session it
+# differs from the session id's, and the terminal-reuse check reads the app-server's
+# stop record there once the server is gone.
+_AUTO_CODEX_BRIDGE_DIRS: dict[str, Path] = {}
+
+
+def codex_native_bridge_dir(session_id: str) -> Path:
+    """The bridge directory a session's Codex terminal was launched into.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: The directory of the session's latest launch on this runner, else
+        the session id's own directory.
+    """
+    from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id
+
+    return _AUTO_CODEX_BRIDGE_DIRS.get(session_id) or bridge_dir_for_bridge_id(session_id)
+
 
 # Background OpenCode ``opencode serve`` instances for host-spawned
 # opencode-native runners, kept referenced so they aren't garbage-collected
@@ -610,6 +630,11 @@ class _CodexNativeLaunchConfig:
         pinned into the private ``config.toml`` at launch so the thread (and
         the TUI footer) start at it instead of the shared config's default.
         ``None`` leaves Codex's configured effort in place.
+    :param bridge_id: Id from the session's ``omnigent.codex_native.bridge_id``
+        label, e.g. ``"conv_old"``, naming the bridge directory the executor
+        reads. A session the forwarder rotated onto carries the original
+        session's id here. ``None`` when unlabelled: the bridge is then keyed
+        by the session id.
     """
 
     workspace: Path
@@ -625,6 +650,7 @@ class _CodexNativeLaunchConfig:
     routing_enabled: bool = False
     turn_routing: bool = False
     reasoning_effort: str | None = None
+    bridge_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1325,6 +1351,7 @@ async def _codex_native_launch_config(
         not isinstance(external_session_id, str) or not external_session_id
     ):
         raise RuntimeError(f"Invalid external_session_id for Codex session {session_id!r}.")
+    from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
     from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS, validate_effort
 
     reasoning_effort = snapshot.get("reasoning_effort")
@@ -1364,6 +1391,7 @@ async def _codex_native_launch_config(
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history = False
+    bridge_id: str | None = None
     _harness_override = snapshot.get("harness_override")
     _cost_control = snapshot.get("cost_control_mode_override")
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
@@ -1380,6 +1408,10 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        # The executor reads this label's bridge directory, so launch into it too.
+        _bid = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
+        if isinstance(_bid, str) and _bid:
+            bridge_id = _bid
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(
@@ -1401,6 +1433,7 @@ async def _codex_native_launch_config(
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
         reasoning_effort=reasoning_effort,
+        bridge_id=bridge_id,
     )
 
 
@@ -4828,7 +4861,7 @@ async def _auto_create_codex_terminal(
     )
     original_external_session_id = launch_config.external_session_id
     workspace = str(launch_config.workspace)
-    bridge_dir = prepare_bridge_dir(session_id)
+    bridge_dir = prepare_bridge_dir(launch_config.bridge_id or session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
     app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
@@ -5358,6 +5391,7 @@ async def _auto_create_codex_terminal(
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
+    _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
 
     event_client = CodexAppServerClient(
         ws_url=codex_ws_url,
@@ -7351,7 +7385,8 @@ def _is_runner_owned_codex_terminal(
     would fail fast on the saved startup error until the terminal is recreated.
     Reporting it as not owned makes the ensure close it and launch again,
     which also clears the saved error. A pane whose backend is alive (for
-    example one still waiting on a sign-in prompt) stays reusable.
+    example one still waiting on a sign-in prompt) stays reusable. The saved
+    error is read from the bridge directory the session's last launch used.
 
     :param resource_registry: Runner resource registry that owns private
         terminal role markers.
@@ -7359,10 +7394,7 @@ def _is_runner_owned_codex_terminal(
     :returns: ``True`` when the resource is marked as Codex native and can
         still carry chat turns.
     """
-    from omnigent.harnesses.codex_native.bridge import (
-        bridge_dir_for_bridge_id,
-        read_bridge_startup_error,
-    )
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
 
     if (
         resource_registry.terminal_resource_role(resource.session_id, resource.id)
@@ -7371,7 +7403,7 @@ def _is_runner_owned_codex_terminal(
         return False
     if resource.session_id in _AUTO_CODEX_APP_SERVERS:
         return True
-    return read_bridge_startup_error(bridge_dir_for_bridge_id(resource.session_id)) is None
+    return read_bridge_startup_error(codex_native_bridge_dir(resource.session_id)) is None
 
 
 def _is_runner_owned_antigravity_terminal(
