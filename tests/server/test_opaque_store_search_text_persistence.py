@@ -9,12 +9,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.entities import NewConversationItem
@@ -79,13 +77,6 @@ def app(db_uri: str, tmp_path: Path, opaque_store: _OpaqueStore) -> FastAPI:
         artifact_store=artifact_store,
         agent_cache=agent_cache,
     )
-
-
-@pytest_asyncio.fixture()
-async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-        yield http
 
 
 async def test_first_user_message_persists_through_opaque_store(

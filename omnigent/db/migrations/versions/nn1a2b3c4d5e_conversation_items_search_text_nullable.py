@@ -53,13 +53,19 @@ def upgrade() -> None:
 
 
 def _key_compare(
-    key: tuple[object, ...], *, after: bool, inclusive: bool
+    dialect: str, key: tuple[object, ...], *, after: bool, inclusive: bool
 ) -> sa.ColumnElement[bool]:
     """Lexicographic primary-key comparison against *key*.
 
-    Expanded into AND/OR terms rather than a row-value tuple so MySQL can walk
-    the primary key index instead of filtering a full scan.
+    A row-value comparison lets SQLite, PostgreSQL and CockroachDB seek the
+    primary key; MySQL treats tuple inequalities as filters over a full index
+    scan, so it gets the expanded AND/OR form (as ll1a2b3c4d5e does).
     """
+    if dialect != "mysql":
+        pk = sa.tuple_(*_KEY)
+        if after:
+            return pk >= key if inclusive else pk > key
+        return pk <= key if inclusive else pk < key
     clauses = []
     for index, column in enumerate(_KEY):
         equal = [earlier == key[position] for position, earlier in enumerate(_KEY[:index])]
@@ -85,11 +91,12 @@ def _commit_page(bind: sa.Connection) -> None:
 def _backfill_null_search_text() -> None:
     """Set search_text = '' on NULL rows, one committed primary-key page at a time."""
     bind = op.get_bind()
+    dialect = bind.dialect.name
     last: tuple[object, ...] | None = None
     while True:
         query = sa.select(*_KEY).order_by(*_KEY).limit(_BACKFILL_BATCH)
         if last is not None:
-            query = query.where(_key_compare(last, after=True, inclusive=False))
+            query = query.where(_key_compare(dialect, last, after=True, inclusive=False))
         rows = bind.execute(query).fetchall()
         if not rows:
             break
@@ -101,8 +108,8 @@ def _backfill_null_search_text() -> None:
             _ITEMS.update()
             .where(
                 _ITEMS.c.search_text.is_(None),
-                _key_compare(first, after=True, inclusive=True),
-                _key_compare(last, after=False, inclusive=True),
+                _key_compare(dialect, first, after=True, inclusive=True),
+                _key_compare(dialect, last, after=False, inclusive=True),
             )
             .values(search_text="")
         )
