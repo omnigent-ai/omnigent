@@ -949,7 +949,7 @@ async def _discover(
     :data:`_PLACEHOLDER_RECOVERY_INTERVAL_S`) so the TUI-minted cascade a typed
     turn creates is adopted in place instead of deadlocking discovery forever.
     ``on_adopted`` is awaited as soon as that adoption is persisted, before the
-    port resolves, so a reader restart in between cannot lose it.
+    port resolves, so the (best-effort) resume-id record is attempted at once.
 
     Readiness is checked BEFORE ``stop`` each round, so a discovery that resolves
     immediately consumes none of the caller's poll budget — ``stop`` is a
