@@ -710,3 +710,31 @@ async def test_idle_ring_estimate_model_fallback(
     # window proves the estimate reached the host (the original crash
     # left the ring untouched because the task died before this call).
     assert host.ring_updates == [_RingUpdate(tokens=1_234, context_window=200_000)]
+
+
+@pytest.mark.asyncio
+async def test_idle_ring_estimate_survives_a_failing_token_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``count_tokens`` failure leaves the ring untouched instead of raising.
+
+    The estimate runs as a background task at turn end, so an exception here
+    would surface as an unhandled-task traceback in the REPL.
+    """
+
+    def _failing_count_tokens(messages: list[dict[str, object]], model: str) -> int:
+        raise RuntimeError("encoding download blocked")
+
+    monkeypatch.setattr("omnigent.runtime.compaction.count_tokens", _failing_count_tokens)
+    session = _Session(agent_name="test-agent", context_window=200_000, session_id="conv_abc123")
+    host = _RingHost()
+    client = _ItemsClient([{"id": "item_1", "type": "message", "role": "user", "content": "hi"}])
+
+    await _update_context_ring_estimate(
+        session,  # type: ignore[arg-type] — duck-typed stub
+        client,  # type: ignore[arg-type] — duck-typed stub
+        host,  # type: ignore[arg-type] — duck-typed stub
+        200_000,
+    )
+
+    assert host.ring_updates == []
