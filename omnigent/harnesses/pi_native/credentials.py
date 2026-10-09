@@ -646,9 +646,10 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     # fails (e.g. network blip, new workspace with no endpoints yet).
     #
     # Distinguish two failure modes so the caller can surface the fatal one:
-    #   * credential resolution fails (expired OAuth token) — Pi's per-request
-    #     ``!command`` apiKey will also fail, so the session dies silently. Carry
-    #     a ``credential_warning`` so the caller can tell the user to re-auth.
+    #   * credential resolution fails (expired OAuth token) — the in-process probe
+    #     and the auth command behind Pi's per-request ``!command`` apiKey both
+    #     fail, so the session dies silently. Carry a ``credential_warning`` so
+    #     the caller can tell the user to re-auth.
     #   * model-list fetch fails after creds resolved (network blip, empty
     #     workspace) — benign; just show the single default model.
     credential_warning: str | None = None
@@ -656,17 +657,29 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     gpt_models: list[_PiModelEntry] = []
     completions_models: list[_PiModelEntry] = []
     gemini_models: list[_PiModelEntry] = []
+    list_host = host
+    list_token: str | None = None
     try:
         creds = resolve_databricks_workspace(entry.profile)
-    except Exception:  # noqa: BLE001 — credential failure must not break launch
+        list_host, list_token = creds.host, creds.token
+    except Exception as exc:  # noqa: BLE001 — credential failure must not break launch
+        # Pi authenticates with the auth command, not this probe (no SDK, or an
+        # SDK that can't refresh where the CLI can): warn only if the command fails too.
         _LOGGER.info(
-            "pi-native: falling back to single-model display (could not resolve credentials)"
+            "pi-native: in-process Databricks probe failed (%s); trying Pi's auth command",
+            type(exc).__name__,
         )
-        credential_warning = _databricks_credential_warning(entry.profile)
-    else:
+        # 10s keeps the model picker, which resolves this too, inside its 15s host timeout.
+        list_token = _run_auth_command(auth_command, timeout=10.0)
+        if not list_token:
+            _LOGGER.info(
+                "pi-native: falling back to single-model display (could not resolve credentials)"
+            )
+            credential_warning = _databricks_credential_warning(entry.profile)
+    if list_token:
         try:
             claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                creds.host, creds.token
+                list_host, list_token
             )
         except Exception:  # noqa: BLE001 — network failure must not break launch
             _LOGGER.info(

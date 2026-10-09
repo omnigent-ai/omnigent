@@ -32,6 +32,47 @@ def _databricks_config() -> dict[str, object]:
     }
 
 
+def _no_auth_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the Databricks auth command yield no token without spawning a shell."""
+    monkeypatch.setattr(creds, "_run_auth_command", lambda *_args, **_kwargs: None)
+
+
+def _stub_auth_command_and_listing(
+    monkeypatch: pytest.MonkeyPatch, *, auth_output: str | None
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Stub the auth command and model listing; return the commands run and listings made."""
+    commands: list[str] = []
+    listed: list[tuple[str, str]] = []
+
+    def _auth_command(command: str, **_kwargs: object) -> str | None:
+        commands.append(command)
+        return auth_output
+
+    def _listing(host: str, token: str):
+        listed.append((host, token))
+        return ([{"id": "system.ai.claude-opus-5"}], [], [], [])
+
+    monkeypatch.setattr(creds, "_run_auth_command", _auth_command)
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
+    return commands, listed
+
+
+def _databricks_probe_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the Databricks profile at a host whose in-process credential probe raises."""
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _boom(profile: str | None):
+        raise OSError("refresh token is invalid")
+
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+
+
 def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
     """A Databricks default → Pi anthropic-messages gateway provider.
 
@@ -46,6 +87,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
         return "https://wkspc.example.com/"
 
     monkeypatch.setattr(databricks_executor, "_read_databrickscfg_host", _host)
+    _no_auth_command(monkeypatch)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -70,26 +112,17 @@ def test_databricks_unresolvable_host_returns_none(monkeypatch: pytest.MonkeyPat
     assert creds.resolve_pi_native_provider(config_loader=_databricks_config) is None
 
 
+@pytest.mark.parametrize("auth_output", [None, ""])
 def test_databricks_unresolvable_credentials_sets_warning(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, auth_output: str | None
 ) -> None:
-    """Expired token → provider still resolves but carries a re-auth warning.
+    """Expired login (probe and auth command both fail) → re-auth warning.
 
     Pi launches fine (its ``!command`` apiKey may recover), but a silent dead
     session is worse than a visible notice — so the resolver flags it.
     """
-    from omnigent.inner import databricks_executor
-
-    monkeypatch.setattr(
-        databricks_executor,
-        "_read_databrickscfg_host",
-        lambda profile: "https://wkspc.example.com/",
-    )
-
-    def _boom(profile: str | None):
-        raise OSError("refresh token is invalid")
-
-    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    _databricks_probe_raises(monkeypatch)
+    commands, listed = _stub_auth_command_and_listing(monkeypatch, auth_output=auth_output)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -97,6 +130,46 @@ def test_databricks_unresolvable_credentials_sets_warning(
     assert provider.credential_warning is not None
     assert "demo-staging" in provider.credential_warning
     assert "databricks auth login" in provider.credential_warning
+    assert len(commands) == 1  # Pi's command was tried before warning
+    assert listed == []  # no token, so the workspace is not listed
+
+
+def test_databricks_probe_failure_uses_the_auth_command_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed in-process probe doesn't warn when Pi's own auth command works.
+
+    Pi mints its bearer with the ``!command`` apiKey, not the SDK probe, so a host
+    where the probe raises (no databricks-sdk, or an SDK that can't refresh) but
+    the command succeeds must launch clean and list models with the command's token.
+    """
+    _databricks_probe_raises(monkeypatch)
+    commands, listed = _stub_auth_command_and_listing(monkeypatch, auth_output="demo-token")
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    # The probed command is the one Pi runs per request, and its token lists models.
+    assert commands == [provider.api_key.removeprefix("!")]
+    assert listed == [("https://wkspc.example.com", "demo-token")]
+    assert [m["id"] for m in provider.extra_models] == ["system.ai.claude-opus-5"]
+
+
+def test_databricks_probe_success_does_not_run_the_auth_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A working in-process probe lists models with its own token and never shells out."""
+    _mock_databricks_profile(monkeypatch)
+    commands, listed = _stub_auth_command_and_listing(monkeypatch, auth_output="demo-token")
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    assert commands == []
+    assert listed == [("https://wkspc.example.com", "tok")]
+    assert [m["id"] for m in provider.extra_models] == ["system.ai.claude-opus-5"]
 
 
 def test_databricks_model_list_failure_has_no_warning(
@@ -1786,6 +1859,7 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
         "_read_databrickscfg_host",
         lambda profile: "https://wkspc.example.com/",
     )
+    _no_auth_command(monkeypatch)
 
     provider = creds.resolve_pi_native_provider(
         model="databricks-claude-opus-4-7", config_loader=_databricks_config
@@ -3455,8 +3529,9 @@ def test_connect_broker_managed_host_resolves_without_configured_provider(
     No omnigent provider is configured, so ``default_provider_for_harness``
     returns None; the host-only ``[omnigent]`` profile + broker sidecar then route
     Pi through the gateway with a broker ``!command`` apiKey and the ucode-served
-    model. The live-credential probe fails on the token-less profile, but that
-    warning is suppressed (the broker mints per request).
+    model. The live-credential probe fails on the token-less profile and the
+    launch-time auth command yields no token, but that warning is suppressed
+    (the broker mints per request).
     """
     from types import SimpleNamespace
 
@@ -3475,6 +3550,7 @@ def test_connect_broker_managed_host_resolves_without_configured_provider(
             agent=lambda name: SimpleNamespace(model="system.ai.claude-sonnet-4-6")
         ),
     )
+    _no_auth_command(monkeypatch)
 
     provider = creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}})
 
