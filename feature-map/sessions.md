@@ -52,12 +52,13 @@ the header menu), and each place is a separate entry point.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab.
-- `canvas-workspace`: Canvas collapses navigation to an icon rail; clicking a
+- `canvas-workspace`: desktop Canvas collapses navigation to an icon rail; clicking a
   card opens its session beside the project board. Switching cards keeps
   drafts and board state; resize, focus, and close controls adjust the split.
-- `canvas-mobile`: narrow screens show the selected session with a Canvas back
-  button, retaining the project across deep links and reloads.
-- `canvas-navigation`: the collapsed sidebar keeps its expand button at the
+- `canvas-mobile`: the board and selected session use the standard top-left
+  hamburger to open navigation. Back to canvas retains the selected project
+  across deep links and reloads.
+- `canvas-navigation`: the desktop collapsed sidebar keeps its expand button at the
   top; the remaining icons follow the expanded sidebar's order and available
   destinations, including Usage when enabled.
 - `canvas-create`: the plus button on Main or a project opens the new-session
@@ -99,7 +100,8 @@ restore the default split. Focus the session to use the full area; Escape
 restores the board. Close the session to return to the board. Opening, closing,
 or maximizing Workspace keeps the canvas visible. Session focus is independent: Show canvas
 restores the board without closing Workspace. Each card remembers whether Workspace is open.
-On narrow screens, Back to canvas returns to the selected project. A Canvas session link
+On mobile, the top-left hamburger opens the sidebar from the board or a selected
+session. Back to canvas returns to the selected project. A Canvas session link
 opens the same layout directly. If a session is replaced, for example after `/clear`,
 its replacement stays beside the same board.
 The plus button starts a new session in the selected canvas. After sending,
@@ -387,6 +389,9 @@ plain `uv run pytest`, which starts a private server for the test.
   are excluded.
 - **`canvas-mobile` (deep link, back button, and reload):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
+  At phone width and just below the desktop breakpoint, the journey compares the
+  hamburger with an ordinary session, opens navigation from both Canvas views,
+  and returns to the selected project.
 - **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_rail_matches_expanded_navigation`.
   The journey compares destinations and clicks Canvas with a project selected,

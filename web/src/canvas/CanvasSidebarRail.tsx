@@ -16,7 +16,7 @@ import { SidebarSearchButton, SidebarSettingsButton } from "@/shell/SidebarHeade
 import { MAIN_CANVAS_ID } from "./canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "./canvasNavigation";
 
-/** The collapsed navigation stays available beside the Canvas workspace. */
+/** Desktop navigation stays available beside the Canvas workspace. */
 export function CanvasSidebarRail({
   onExpand,
   onSearch,
@@ -42,7 +42,7 @@ export function CanvasSidebarRail({
     <nav
       aria-label="Collapsed sidebar"
       data-testid="canvas-sidebar-rail"
-      className="canvas-sidebar-rail flex w-12 shrink-0 flex-col items-center gap-2 border-r bg-sidebar px-1 pt-[calc(var(--omnigent-inset-top)+8px)] pb-3 md:w-14"
+      className="canvas-sidebar-rail hidden w-14 shrink-0 flex-col items-center gap-2 border-r bg-sidebar px-1 pt-[calc(var(--omnigent-inset-top)+8px)] pb-3 md:flex"
     >
       <Button
         variant="ghost"

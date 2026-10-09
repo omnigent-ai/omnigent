@@ -595,19 +595,7 @@ export function ChatHeader({
           !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
-        {canvas?.compact && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={canvas.closeConversation}
-            aria-label="Back to canvas"
-            className="shrink-0 gap-1 px-1.5 text-ui"
-          >
-            <ArrowLeftIcon className="size-4" />
-            Canvas
-          </Button>
-        )}
-        {!sidebarOpen && !canvas && (
+        {!sidebarOpen && (!canvas || isMobile) && (
           <Tooltip
             open={tooltipOpen}
             onOpenChange={(next) => {
@@ -653,6 +641,18 @@ export function ChatHeader({
               {settingsMode ? "Back to settings menu" : "Open sidebar"}
             </TooltipContent>
           </Tooltip>
+        )}
+        {canvas?.compact && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={canvas.closeConversation}
+            aria-label="Back to canvas"
+            className="shrink-0 gap-1 px-1.5 text-ui"
+          >
+            <ArrowLeftIcon className="size-4" />
+            Canvas
+          </Button>
         )}
         {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
             landing composer. A resolved title is enough; so is titleLinkTo —
