@@ -48,6 +48,7 @@ jobs:
           sleep 30
           xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/before.mp4 &
           VIDEO_PID=$!
+          sleep 2
           set +e
           xcodebuild test-without-building \
             -project web/ios/Omnigent.xcodeproj \
@@ -56,9 +57,11 @@ jobs:
             -destination "platform=iOS Simulator,id=$DEVICE_ID" \
             -derivedDataPath /tmp/before-derived \
             -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
+            -parallel-testing-enabled NO \
             CODE_SIGNING_ALLOWED=NO
           TEST_STATUS=$?
           set -e
+          sleep 2
           kill -INT "$VIDEO_PID"
           wait "$VIDEO_PID" || true
           test "$TEST_STATUS" -eq 0
@@ -80,6 +83,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO
           xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/after.mp4 &
           VIDEO_PID=$!
+          sleep 2
           set +e
           xcodebuild test-without-building \
             -project web/ios/Omnigent.xcodeproj \
@@ -88,9 +92,11 @@ jobs:
             -destination "platform=iOS Simulator,id=$DEVICE_ID" \
             -derivedDataPath /tmp/after-derived \
             -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
+            -parallel-testing-enabled NO \
             CODE_SIGNING_ALLOWED=NO
           TEST_STATUS=$?
           set -e
+          sleep 2
           kill -INT "$VIDEO_PID"
           wait "$VIDEO_PID" || true
           test "$TEST_STATUS" -eq 0
