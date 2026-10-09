@@ -1,12 +1,7 @@
-"""The claude-sdk seatbelt profile must write-grant the Claude CLI's real
-``/tmp/claude-<uid>`` runtime dir, or the CLI dies at connect with EPERM.
-
-On macOS ``tempfile.gettempdir()`` is the per-user ``/var/folders/.../T``, so
-a tempdir-anchored grant never covers the ``/tmp/claude-<uid>`` spelling the
-CLI opens (kernel-canonical ``/private/tmp/claude-<uid>``). The profile
-builder is platform-independent, so this runs on Linux CI with a macOS-shaped
-tempdir and a kernel-style matcher that canonicalises ``/tmp`` and ``/var``
-before comparing ``subpath``/``literal`` rules.
+"""Checks that the claude-sdk seatbelt profile write-grants the Claude CLI's fixed
+``/tmp``-anchored runtime dir when the system temp dir differs from it (macOS:
+``/var/folders/.../T``). Runs on Linux with a matcher that canonicalises ``/tmp``
+and ``/var`` like the macOS kernel does before comparing ``subpath`` rules.
 """
 
 from __future__ import annotations
@@ -16,15 +11,14 @@ from __future__ import annotations
 import ctypes.util  # noqa: F401
 import os
 import re
-import shutil
 import tempfile
-from collections.abc import Iterator
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 import omnigent.inner.seatbelt_sandbox as sb
+from omnigent._platform import stable_user_id
 from omnigent.inner.claude_sdk_executor import (
     _claude_internal_write_files,
     _claude_internal_write_roots,
@@ -84,22 +78,21 @@ def macos_shaped_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     return per_user_tmp
 
 
-@pytest.fixture
-def cli_runtime_dir() -> Iterator[Path]:
-    """The CLI's real ``/tmp/claude-<uid>``, removed afterwards if this test created it."""
-    runtime_dir = Path("/tmp") / f"claude-{os.getuid()}"
-    existed = runtime_dir.exists()
-    yield runtime_dir
-    if not existed:
-        shutil.rmtree(runtime_dir, ignore_errors=True)
-
-
 def test_seatbelt_profile_grants_claude_cli_tmp_runtime_dir(
-    tmp_path: Path, macos_shaped_tmpdir: Path, cli_runtime_dir: Path
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, macos_shaped_tmpdir: Path
 ) -> None:
     """Resolve the ``darwin_seatbelt`` policy as ``prepare_claude_cli_path`` does,
     add the CLI grants plus the launcher's scratch tmpdir, and check the rendered
     profile covers the CLI's runtime dir."""
+    # Keep the ~/.claude and ~/.npm grants the helper creates out of the real home,
+    # and stand in for the CLI's /tmp root with a test-owned dir.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    cli_tmp_root = tmp_path / "tmp"
+    cli_tmp_root.mkdir()
+    cli_runtime_dir = cli_tmp_root / f"claude-{stable_user_id()}"
+
     cwd = (tmp_path / "workspace").resolve()
     cwd.mkdir()
     spec = OSEnvSpec(
@@ -113,7 +106,10 @@ def test_seatbelt_profile_grants_claude_cli_tmp_runtime_dir(
     ):
         sandbox = SeatbeltSandboxBackend().resolve(spec, cwd)
 
-    claude_roots = _claude_internal_write_roots()
+    with mock.patch(
+        "omnigent.inner.claude_sdk_executor._CLAUDE_CLI_TMP_ROOT", cli_tmp_root, create=True
+    ):
+        claude_roots = _claude_internal_write_roots()
     sandbox = with_additional_read_roots(sandbox, claude_roots)
     sandbox = with_additional_write_roots(sandbox, claude_roots)
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())

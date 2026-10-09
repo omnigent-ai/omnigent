@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -51,7 +52,7 @@ def test_claude_cli_tmp_runtime_dir_writable_under_bwrap(
     if not _bwrap_functional():
         pytest.skip("bwrap cannot create a user namespace on this host")
 
-    # A non-/tmp system tempdir makes the /tmp spelling a distinct extra root,
+    # A non-/tmp system tempdir makes the /tmp-anchored root a distinct extra root,
     # as on a host with a custom $TMPDIR; HOME keeps ~/.claude out of the real home.
     system_tmp = tmp_path / "systmp"
     system_tmp.mkdir()
@@ -61,8 +62,10 @@ def test_claude_cli_tmp_runtime_dir_writable_under_bwrap(
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
 
-    runtime_dir = Path("/tmp") / f"claude-{os.getuid()}"
-    existed = runtime_dir.exists()
+    # A unique root under the real /tmp keeps bwrap's tmpfs-over-/tmp ordering in
+    # play without touching the shared /tmp/claude-<uid> of a live CLI.
+    runtime_root = Path(tempfile.mkdtemp(prefix="claude-cli-root-", dir="/tmp"))
+    runtime_dir = runtime_root / f"claude-{os.getuid()}"
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
     spec = OSEnvSpec(
@@ -79,9 +82,9 @@ def test_claude_cli_tmp_runtime_dir_writable_under_bwrap(
     launcher: str | None = None
     probe = runtime_dir / f"probe-{os.getpid()}"
     try:
-        sandbox = with_additional_write_roots(
-            resolve_sandbox(spec, workspace), _claude_internal_write_roots()
-        )
+        with patch("omnigent.inner.claude_sdk_executor._CLAUDE_CLI_TMP_ROOT", runtime_root):
+            roots = _claude_internal_write_roots()
+        sandbox = with_additional_write_roots(resolve_sandbox(spec, workspace), roots)
         assert runtime_dir.is_dir(), f"{runtime_dir} was not created by the grant"
         launcher = create_exec_launcher("/bin/sh", sandbox)
         result = subprocess.run(
@@ -95,8 +98,6 @@ def test_claude_cli_tmp_runtime_dir_writable_under_bwrap(
         # The write reached the host directory, not bwrap's private /tmp.
         assert probe.read_text() == "ok"
     finally:
-        probe.unlink(missing_ok=True)
         if launcher is not None:
-            os.unlink(launcher)
-        if not existed:
-            shutil.rmtree(runtime_dir, ignore_errors=True)
+            Path(launcher).unlink(missing_ok=True)
+        shutil.rmtree(runtime_root, ignore_errors=True)

@@ -1629,6 +1629,44 @@ class TestConstructor(unittest.TestCase):
             self.assertIn(existing, roots)
             self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o700)
 
+    def test_claude_cli_tmp_root_is_the_fixed_posix_tmp(self):
+        """The CLI anchors its fallback runtime dir at ``/tmp`` regardless of ``$TMPDIR``."""
+        from omnigent.inner.claude_sdk_executor import _CLAUDE_CLI_TMP_ROOT
+
+        self.assertEqual(_CLAUDE_CLI_TMP_ROOT, Path("/tmp"))
+
+    def test_claude_internal_write_roots_skip_runtime_dir_that_cannot_be_created(self):
+        """A runtime dir whose creation or ownership check fails is omitted with a
+        warning while the other runtime dir is still granted."""
+        from omnigent._platform import stable_user_id
+        from omnigent.harnesses.claude_native import bridge
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+            real_ensure = bridge.ensure_private_dir
+
+            def fail_for_cli_root(path: Path, my_uid: int | None) -> None:
+                if path.parent == cli_tmp:
+                    raise PermissionError(f"refusing to use {path}: owned by uid 0")
+                real_ensure(path, my_uid)
+
+            with (
+                patch.object(bridge, "ensure_private_dir", side_effect=fail_for_cli_root),
+                self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+            ):
+                roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            self.assertNotIn(cli_tmp / f"claude-{uid}", roots)
+            self.assertIn(system_tmp / f"claude-{uid}", roots)
+            self.assertTrue(any("owned by uid 0" in line for line in logs.output), logs.output)
+
 
 # ---------------------------------------------------------------------------
 # Tests: MCP tool building

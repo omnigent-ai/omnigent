@@ -1308,7 +1308,7 @@ def _claude_runtime_dirs() -> list[pathlib.Path]:
     foreign directory is skipped with a warning instead of widening the sandbox
     to wherever it points.
     """
-    from omnigent.harnesses.claude_native.bridge import _ensure_private_dir
+    from omnigent.harnesses.claude_native.bridge import ensure_private_dir
 
     uid = stable_user_id()
     my_uid = os.getuid() if hasattr(os, "getuid") else None
@@ -1325,7 +1325,7 @@ def _claude_runtime_dirs() -> list[pathlib.Path]:
             continue
         seen.add(key)
         try:
-            _ensure_private_dir(candidate, my_uid)
+            ensure_private_dir(candidate, my_uid)
         except (OSError, RuntimeError) as exc:
             logger.warning(
                 "Not granting the Claude CLI runtime dir %s to the sandboxed CLI: %s",
