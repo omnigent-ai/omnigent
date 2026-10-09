@@ -3455,20 +3455,38 @@ def resolve_native_claude_config(
         return resolved
 
     # 1. Spec-driven: reuse the harness routing precedence verbatim. A
-    #    non-None entry decides the config (including a deliberate None for a
-    #    subscription); a None entry means the spec routed to databricks /
-    #    global auth → fall back to the spec's own ucode profile.
+    #    non-None entry decides the config. A None entry may mean legacy
+    #    Databricks auth, whose profile is resolved below.
     if spec is not None:
         entry = _resolve_provider_for_build(
             spec, harness_type="claude-sdk", actual_harness="claude-native"
         )
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-        ucode_config = _ucode_config_for_profile(
-            spec.executor.profile, refresh_models=refresh_models
-        )
-        if ucode_config is not None:
-            return ucode_config
+
+        spec_auth = getattr(spec.executor, "auth", None)
+        executor_config = getattr(spec.executor, "config", {})
+        legacy_profile = getattr(spec.executor, "profile", None) or executor_config.get("profile")
+        if isinstance(spec_auth, DatabricksAuth):
+            ucode_config = _ucode_config_for_profile(
+                spec_auth.profile, refresh_models=refresh_models
+            )
+            if ucode_config is not None:
+                return ucode_config
+        elif spec_auth is None and legacy_profile:
+            ucode_config = _ucode_config_for_profile(
+                str(legacy_profile), refresh_models=refresh_models
+            )
+            if ucode_config is not None:
+                return ucode_config
+        elif spec_auth is None:
+            global_auth = _load_global_auth()
+            if isinstance(global_auth, DatabricksAuth):
+                # A profile-less wrapper inherits the same global Databricks
+                # route used by the pre-launch host picker.
+                return _ucode_config_for_profile(
+                    global_auth.profile, refresh_models=refresh_models
+                )
         # The spec named no provider and no usable ucode profile — fall through to
         # the managed-connect-host broker fallback (step 4) rather than giving up.
     else:

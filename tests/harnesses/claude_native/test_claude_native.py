@@ -8690,17 +8690,16 @@ def test_resolve_native_claude_config_subscription_uses_cli_login(
     assert cfg is None
 
 
-def test_resolve_native_claude_config_global_databricks_auth_uses_ucode(
+def test_resolve_native_claude_config_global_databricks_auth_matches_session(
     _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Spec-less with a global ``auth: databricks`` block → ucode with its profile.
+    """The host preview and a profile-less session inherit the same global auth.
 
     Preserves the Databricks behavior after the ``--profile`` flag removal:
     a databricks user (no OSS provider configured) who set up a global
-    ``auth:`` block via ``omnigent setup`` still routes a bare
-    ``omnigent claude`` launch through ucode, keyed on the auth block's
-    own profile. We assert the resolver delegates to
-    `_ucode_config_for_profile` with that profile.
+    ``auth:`` block via ``omnigent setup`` routes both the New Chat preview
+    and its generated Claude wrapper through ucode, keyed on the auth block's
+    own profile.
     """
     (_isolated_provider_config / "config.yaml").write_text(
         yaml.safe_dump({"auth": {"type": "databricks", "profile": "oss"}})
@@ -8710,25 +8709,66 @@ def test_resolve_native_claude_config_global_databricks_auth_uses_ucode(
         api_key_helper="databricks auth token",
         model="databricks-claude",
     )
-    seen: dict[str, str | bool | None] = {}
+    seen: list[tuple[str | None, bool]] = []
 
     def _fake_ucode(
         profile: str | None,
         *,
         refresh_models: bool = True,
     ) -> claude_native.ClaudeNativeUcodeConfig:
-        seen["profile"] = profile
-        seen["refresh_models"] = refresh_models
+        seen.append((profile, refresh_models))
         return sentinel
 
     monkeypatch.setattr(claude_native, "_ucode_config_for_profile", _fake_ucode)
 
-    cfg = claude_native.resolve_native_claude_config(spec=None)
-    assert cfg is sentinel
-    # The global auth block's profile was threaded to the ucode path.
-    assert seen["profile"] == "oss"
-    # Launch resolution keeps refreshing the model catalog by default.
-    assert seen["refresh_models"] is True
+    preview = claude_native.resolve_native_claude_config(spec=None)
+    session = claude_native.resolve_native_claude_config(spec=_no_auth_claude_spec())
+
+    assert preview is sentinel
+    assert session is sentinel
+    assert claude_native.claude_catalog_fingerprint(preview) == (
+        claude_native.claude_catalog_fingerprint(session)
+    )
+    assert seen == [("oss", True), ("oss", True)]
+
+
+def test_resolve_native_claude_config_spec_databricks_auth_wins_global(
+    _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit session profile still takes precedence over global auth."""
+    from omnigent.spec.types import AgentSpec, DatabricksAuth, ExecutorSpec
+
+    (_isolated_provider_config / "config.yaml").write_text(
+        yaml.safe_dump({"auth": {"type": "databricks", "profile": "global"}})
+    )
+    sentinel = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://db.example/gw"}
+    )
+    seen: list[str | None] = []
+
+    def _fake_ucode(
+        profile: str | None,
+        *,
+        refresh_models: bool = True,
+    ) -> claude_native.ClaudeNativeUcodeConfig:
+        del refresh_models
+        seen.append(profile)
+        return sentinel
+
+    monkeypatch.setattr(claude_native, "_ucode_config_for_profile", _fake_ucode)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        instructions="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            auth=DatabricksAuth(profile="session"),
+            config={"harness": "claude-native"},
+        ),
+    )
+
+    assert claude_native.resolve_native_claude_config(spec=spec) is sentinel
+    assert seen == ["session"]
 
 
 def test_resolve_native_claude_config_databricks_provider_uses_ucode(
@@ -11794,6 +11834,7 @@ def test_resolve_native_claude_config_spec_path_reaches_connect_broker(
     monkeypatch.setattr(
         claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None
     )
+    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
     spec = SimpleNamespace(executor=SimpleNamespace(profile=None))
 
     from omnigent.host import databricks_credential as dc
