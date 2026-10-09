@@ -10492,15 +10492,15 @@ async def _codex_native_session(
     interrupt_status: int = 202,
 ) -> AsyncIterator[tuple[str, list[tuple[str, dict[str, Any]]]]]:
     """
-    Scope a codex-native session whose runner answers every interrupt with one status.
+    Scope a codex-native session whose runner answers every interrupt or stop with one status.
 
     Captures the published events, and clears the pending-input index and the
     stop fence on exit.
 
     :param client: The test HTTP client.
     :param monkeypatch: Used to capture published events and route to the runner.
-    :param interrupt_status: The runner's reply; a 2xx lands the interrupt, a
-        4xx/5xx is one that did not.
+    :param interrupt_status: The runner's reply; a 2xx lands the interrupt or
+        stop, a 4xx/5xx is one that did not.
     :yields: The session id and the list the published events are captured into.
     """
     from omnigent.runtime import pending_inputs
@@ -10539,6 +10539,23 @@ async def _press_stop(client: httpx.AsyncClient, session_id: str) -> None:
         f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
     )
     assert response.status_code == 202, response.text
+
+
+async def _press_stop_session(client: httpx.AsyncClient, session_id: str) -> httpx.Response:
+    """POST a stop_session, as the web client's Stop session action does."""
+    return await client.post(
+        f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
+    )
+
+
+def _bind_to_host(db_uri: str, session_id: str) -> None:
+    """Bind the session to a host and runner, as a host-launched session is."""
+    host = HostStore(db_uri).upsert_on_connect(
+        "6b9c07bfb42f687d53af44f018adebec", "test-laptop", "owner@example.com"
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session_id, host_id=host.host_id, workspace="/Users/me/repo")
+    assert store.set_runner_id(session_id, "runner-bound")
 
 
 async def _mirror_user_message(
@@ -10687,6 +10704,192 @@ async def test_cancelled_message_the_agent_did_record_drains_as_matched(
         assert _consumed_pending_ids(published) == [cancelled]
         assert retry["item_id"] == first["item_id"]
         assert pending_inputs.pending_ids(session_id) == []
+
+
+@pytest.mark.parametrize("host_bound", [False, True])
+async def test_stop_session_settles_native_messages_queued_before_it(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    host_bound: bool,
+) -> None:
+    """
+    A message queued when the session is stopped is not an error after it relaunches.
+
+    The person sends a message and stops the session before the CLI records it,
+    then sends another that relaunches the session. The stopped CLI never records
+    the first, so the next mirror would persist it with a
+    ``native_prompt_not_recorded`` error. With the stop settling it, only the
+    message the agent did record is persisted.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import routes_events
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        if host_bound:
+            _bind_to_host(db_uri, session_id)
+            monkeypatch.setattr(
+                routes_events, "_stop_host_runner_intentionally", AsyncMock(return_value=True)
+            )
+        queued_before_stop = _queue_web_message(session_id, "cancel me")
+
+        response = await _press_stop_session(client, session_id)
+
+        assert response.status_code == 202, response.text
+        # Flagged, not dropped: hidden from a reload and from the session's "working" state.
+        assert pending_inputs.pending_ids(session_id) == [queued_before_stop]
+        assert pending_inputs.snapshot_for(session_id) == []
+        assert not pending_inputs.has_pending(session_id)
+
+        # The person's next message, which relaunches the session and which the agent records.
+        kept = _queue_web_message(session_id, "go on")
+        await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert error_codes == []
+        assert user_texts == ["go on"]
+        assert _consumed_pending_ids(published) == [kept]
+        assert pending_inputs.pending_ids(session_id) == []
+
+
+async def test_message_sent_while_stop_session_is_in_flight_stays_live(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message sent after Stop session is not one the stop cancelled.
+
+    The person sends another message while the stop is still in flight. Only the
+    messages queued before it are settled: if the new message's mirror never
+    arrives and a later one matches, it is still reported as undelivered.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        sent_during_stop: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            """Accept the stop; the person sends another message while it is in flight."""
+            if json.loads(request.content or b"{}").get("type") == "stop_session":
+                sent_during_stop.append(_queue_web_message(session_id, "sent during stop"))
+            return httpx.Response(204)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler), base_url="http://runner"
+        ) as runner:
+            _route_to_runner(monkeypatch, runner)
+            queued_before_stop = _queue_web_message(session_id, "cancel me")
+
+            response = await _press_stop_session(client, session_id)
+
+            assert response.status_code == 202, response.text
+            assert len(sent_during_stop) == 1
+            snapshot = pending_inputs.snapshot_for(session_id)
+            assert [entry["pending_id"] for entry in snapshot] == sent_during_stop
+            assert pending_inputs.has_pending(session_id)
+            assert pending_inputs.pending_ids(session_id) == [
+                queued_before_stop,
+                *sent_during_stop,
+            ]
+
+            # The message sent during the stop never reaches the transcript; the next one does.
+            kept = _queue_web_message(session_id, "go on")
+            await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
+
+            user_texts, error_codes = await _persisted_user_texts_and_error_codes(
+                client, session_id
+            )
+            # The cancelled message settles quietly, the one sent during the stop does not.
+            assert error_codes == ["native_prompt_not_recorded"]
+            assert user_texts == ["sent during stop", "go on"]
+            assert _consumed_pending_ids(published) == [*sent_during_stop, kept]
+
+
+async def test_native_message_recorded_before_stop_session_drains_as_matched(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The CLI recorded the message before the stop killed it: its mirror still settles it.
+
+    The resumed transcript mirrors the flagged entry by its own text: one user
+    message, no error, and the receipt names its pending id.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        recorded = _queue_web_message(session_id, "write it down")
+        response = await _press_stop_session(client, session_id)
+        assert response.status_code == 202, response.text
+
+        await _mirror_user_message(client, session_id, "write it down", "codex:write-it-down:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert error_codes == []
+        assert user_texts == ["write it down"]
+        assert _consumed_pending_ids(published) == [recorded]
+        assert pending_inputs.pending_ids(session_id) == []
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_status"),
+    [
+        # Runner reachable but it could not kill the session: the stop raises.
+        ("runner_503", 503),
+        # No runner resolves at all: the stop is a no-op that reports nothing delivered.
+        ("no_runner", 202),
+        # The runner stopped but the host could not confirm its runner is gone: the stop raises.
+        ("host_unconfirmed", 503),
+    ],
+)
+async def test_stop_session_that_did_not_land_keeps_queued_native_messages_pending(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    failure_mode: str,
+    expected_status: int,
+) -> None:
+    """
+    A stop that did not land leaves the queued web messages untouched.
+
+    The session may still be running, so the CLI may yet record those messages:
+    hiding them or settling them quietly would lose the undelivered report if it
+    does not.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    runner_status = 503 if failure_mode == "runner_503" else 204
+    session_scope = _codex_native_session(client, monkeypatch, interrupt_status=runner_status)
+    async with session_scope as (session_id, published):
+        if failure_mode == "no_runner":
+            monkeypatch.setattr(
+                sessions_module, "_get_runner_client", AsyncMock(return_value=None)
+            )
+            monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+        if failure_mode == "host_unconfirmed":
+            _bind_to_host(db_uri, session_id)
+            monkeypatch.setattr(
+                routes_events, "_stop_host_runner_intentionally", AsyncMock(return_value=False)
+            )
+        queued = _queue_web_message(session_id, "still live")
+
+        response = await _press_stop_session(client, session_id)
+
+        assert response.status_code == expected_status, response.text
+        snapshot = pending_inputs.snapshot_for(session_id)
+        assert [entry["pending_id"] for entry in snapshot] == [queued]
+        assert pending_inputs.has_pending(session_id)
+
+        # The next mirror still reports the message the stop did not cancel.
+        kept = _queue_web_message(session_id, "go on")
+        await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert error_codes == ["native_prompt_not_recorded"]
+        assert user_texts == ["still live", "go on"]
+        assert _consumed_pending_ids(published) == [queued, kept]
 
 
 async def test_btw_sidechat_event_leaves_an_unrelated_queued_web_message_in_place(
