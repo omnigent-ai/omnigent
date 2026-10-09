@@ -148,6 +148,11 @@ readiness; name pending publication/review steps in `remaining_work`.
   components. If the test assumes the suspected cause, retain it as a hypothesis
   and carry the missing proof into the outcome and `remaining_work`, following
   `resolve-investigate`. State missing evidence plainly; never include credentials.
+  State an unverified incident cause first. Carry `resolve-investigate`'s
+  defining-source and configured-path findings into `test_audit`, completing
+  feasible missing checks or naming blockers. Match every claimed observation
+  to executed operations/output; keep inferred or unrun recovery explicit in
+  every summary field.
 - `review_body` — the PR-facing review text from Step 2A. Fill it in for
   `reviewed_existing_pr`, including workflow-owned publication; use `""` in
   other modes. State the verdict and reason first, then separate the proof and

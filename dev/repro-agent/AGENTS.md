@@ -227,6 +227,24 @@ comment is not evidence of accidental behavior. Keep observed symptoms separate
 from suspected causes. When code or logs suggest a competing explanation, use
 a discriminating observation or focused check and record what it supports or
 rules out. A familiar error message alone does not establish its cause.
+Follow the phase, operation type, or imported policy symbol to the shared
+registry/default that governs it. Read the definition, relevant consumers,
+history and pinning test before choosing expected behavior. Record the defining
+file, symbol/value and rationale in `evidence`, or the bounded search if no
+shared definition exists; a local fallback or search hit alone is insufficient.
+
+For credential-lifetime or recovery hypotheses, establish a small working
+control through an isolated reported profile and the actual application/SDK.
+Substitute unavailable external services and credentials, keeping the suspected
+implementation intact. Identify the credential-producing delegate and any
+fallback using runtime type or call evidence; leave identity unresolved if only
+setup logs or shared subprocess calls are available. Start with a bounded
+credential consumer such as request headers; retain the same credential object
+through suspected expiry/rejection and observe recovery before assuming its cause.
+Add a full process when the hypothesis requires it. Time out probes and capture
+blocking stacks/output; if discovery hangs, use controlled metadata responses.
+Record substitutions and blockers. A local mechanism does not establish the
+unavailable incident's cause.
 
 Keep this investigation bounded to the reported journey; a complete diagnosis
 is not required to hand off a valid reproduction. Preserve unresolved intent in
@@ -644,6 +662,10 @@ choice:
   even when a recording is available. For `needs_more_info` or
   `needs_manual_review`, include the known steps and clearly identify missing
   information or unverified steps; do not invent a successful reproduction.
+  Match observations in prose and JSON to executed operations and outputs.
+  Separate a component probe from the unrun manual journey: new-object headers
+  do not demonstrate a new process, connection or recovery. Keep inferences and
+  missing evidence explicit throughout the handoff.
   You may also include a brief verdict and per-facet notes. Then, as the
   last thing before the JSON block, give concise test references per Step 3,
   including source locations and results. All of this is
@@ -749,6 +771,8 @@ Field meanings:
   only — you do not fix). Include the tested configuration, sources for expected
   behavior, competing explanations checked, and remaining uncertainty. Keep this
   concise and distinguish observations from inferences; never include secrets.
+  Include Step 1's defining-source and configured-path findings; complete
+  feasible missing checks or name their blockers.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
