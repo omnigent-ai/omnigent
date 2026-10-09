@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -83,8 +84,10 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         )
         return _FakeAck()
 
-    async def _codex_bridge_state(conv_id: str, *, action: str, **_kw: Any) -> Any | None:
-        return None
+    async def _codex_bridge_state(
+        conv_id: str, *, action: str, **_kw: Any
+    ) -> tuple[Any | None, Path]:
+        return None, Path("unused-bridge-dir")
 
     def _client_safe(exc: BaseException, *, context: str) -> str:
         return f"safe:{context}"
