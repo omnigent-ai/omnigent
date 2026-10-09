@@ -7253,15 +7253,18 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
     assert stored == ["custom-search-text"]
 
 
+class _SearchTextlessStore(SqlAlchemyConversationStore):
+    """Models an opaque-data store: the search-text seam returns None."""
+
+    def _item_search_text(self, item: NewConversationItem) -> str | None:
+        return None
+
+
 def test_item_search_text_seam_none_persists_null(db_uri: str) -> None:
     """A None search-text result must persist the item with a NULL column."""
     from sqlalchemy import select
 
     from omnigent.db.db_models import SqlConversationItem
-
-    class _SearchTextlessStore(SqlAlchemyConversationStore):
-        def _item_search_text(self, item: NewConversationItem) -> str | None:
-            return None
 
     store = _SearchTextlessStore(db_uri)
     conv = store.create_conversation()
@@ -7297,10 +7300,6 @@ def test_fork_copies_items_without_search_text(db_uri: str) -> None:
     from sqlalchemy import select
 
     from omnigent.db.db_models import SqlConversationItem
-
-    class _SearchTextlessStore(SqlAlchemyConversationStore):
-        def _item_search_text(self, item: NewConversationItem) -> str | None:
-            return None
 
     store = _SearchTextlessStore(db_uri)
     source = store.create_conversation()

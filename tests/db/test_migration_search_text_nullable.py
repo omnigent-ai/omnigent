@@ -1,4 +1,4 @@
-"""Nullable search_text migration: upgrade keeps rows and FTS; downgrade backfills in batches."""
+"""Nullable search_text migration: upgrade keeps rows and FTS, downgrade backfills by page."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ _PRIOR = "mm1a2b3c4d5e"
 _THIS = "nn1a2b3c4d5e"
 _MIGRATION = "omnigent.db.migrations.versions.nn1a2b3c4d5e_conversation_items_search_text_nullable"
 _CONVERSATION_ID = b"\x01" * 16
+_BACKFILL_UPDATE = "UPDATE conversation_items SET search_text = ''"
 
 
 def _engine_at(uri: str, revision: str) -> Engine:
@@ -34,12 +35,14 @@ def _engine_at(uri: str, revision: str) -> Engine:
 def _migrate(engine: Engine, revision: str, downgrade: bool) -> None:
     """Run an Alembic upgrade or downgrade to *revision* on *engine*."""
     cfg = _build_alembic_config(str(engine.url))
-    with engine.begin() as conn:
+    # A plain connection, not ``engine.begin()``: the migration commits its own pages.
+    with engine.connect() as conn:
         cfg.attributes["connection"] = conn
         if downgrade:
             command.downgrade(cfg, revision)
         else:
             command.upgrade(cfg, revision)
+        conn.commit()
     # Drop pooled connections so later reflection sees the migrated schema.
     engine.dispose()
 
@@ -152,17 +155,40 @@ def test_upgrade_accepts_insert_without_search_text(db_file: str) -> None:
     engine.dispose()
 
 
-def test_downgrade_backfills_null_and_restores_not_null(db_file: str) -> None:
-    """Downgrade rewrites NULL rows to ``''`` across several key pages and reinstates NOT NULL."""
+def test_downgrade_commits_each_page_and_resumes(db_file: str) -> None:
+    """An interrupted downgrade keeps the page it committed and finishes when rerun.
+
+    Item ids follow position order, so the first page holds positions below the
+    batch size. Failing the first UPDATE of the second page must leave the first
+    page's backfill committed, the rest NULL, and the column still nullable.
+    """
     batch = import_module(_MIGRATION)._BACKFILL_BATCH
     engine = _engine_at(db_file, _THIS)
     _insert_item(engine, 0, search_text="kept text")
     _insert_null_items(engine, range(1, batch + 3))
+    updates = 0
+
+    def fail_in_second_page(conn, cursor, statement, parameters, context, executemany):
+        nonlocal updates
+        if statement.startswith(_BACKFILL_UPDATE):
+            updates += 1
+            if updates == batch:
+                raise RuntimeError("interrupted second page")
+
+    sa.event.listen(engine, "before_cursor_execute", fail_in_second_page)
+    try:
+        with pytest.raises(RuntimeError, match="interrupted second page"):
+            _migrate(engine, _PRIOR, downgrade=True)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", fail_in_second_page)
+
+    texts = _stored_search_texts(engine)
+    assert texts[:batch] == ["kept text"] + [""] * (batch - 1)
+    assert texts[batch:] == [None] * 3
+    assert _search_text_nullable(engine) is True
 
     _migrate(engine, _PRIOR, downgrade=True)
 
-    texts = _stored_search_texts(engine)
-    assert texts[0] == "kept text"
-    assert texts[1:] == [""] * (batch + 2)
+    assert _stored_search_texts(engine) == ["kept text"] + [""] * (batch + 2)
     assert _search_text_nullable(engine) is False
     engine.dispose()

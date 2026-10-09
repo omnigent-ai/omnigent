@@ -11,7 +11,7 @@ out of full-text search.
 Deployment: additive and compatible with older application code, which always
 writes search_text. Apply it before enabling a store that omits the column.
 To roll back, stop such writers first; the downgrade then backfills NULL rows
-with '' in bounded primary-key batches and restores NOT NULL.
+with '' in independently committed primary-key pages and restores NOT NULL.
 """
 
 from __future__ import annotations
@@ -42,8 +42,18 @@ def upgrade() -> None:
         )
 
 
+def _commit_page(bind: sa.Connection) -> None:
+    """Commit the finished page so the backfill never holds one growing transaction."""
+    if bind.dialect.name == "cockroachdb":
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+    else:
+        with op.get_context().autocommit_block():
+            pass
+
+
 def _backfill_null_search_text() -> None:
-    """Set search_text = '' on NULL rows in bounded primary-key pages."""
+    """Set search_text = '' on NULL rows, one committed primary-key page at a time."""
     bind = op.get_bind()
     last: tuple[object, ...] | None = None
     while True:
@@ -91,7 +101,9 @@ def _backfill_null_search_text() -> None:
             )
         last = tuple(rows[-1][:4])
         if len(rows) < _BACKFILL_BATCH:
+            # The bounded final partial page commits together with the ALTER.
             break
+        _commit_page(bind)
 
 
 def downgrade() -> None:
