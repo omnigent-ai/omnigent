@@ -1,4 +1,4 @@
-import { createRef, type FormEvent, type ReactNode } from "react";
+import { createRef, useState, type FormEvent, type ReactNode } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -9,6 +9,94 @@ import {
 } from "./ChatComposer";
 
 describe("ChatComposer", () => {
+  function renderEditor(initial: string, submitWithModEnter = false) {
+    const onKeyDown = vi.fn();
+    function Editor() {
+      const [value, setValue] = useState(initial);
+      return (
+        <ChatComposer
+          keyboard={{ submitWithModEnter, preventsKeyboardSubmit: false }}
+          input={{
+            "aria-label": "Draft",
+            value,
+            onChange: (event) => setValue(event.target.value),
+            onKeyDown,
+          }}
+          actions={{ leading: null, trailing: null }}
+        />
+      );
+    }
+    render(<Editor />);
+    return { input: screen.getByRole("textbox") as HTMLTextAreaElement, onKeyDown };
+  }
+
+  it("indents list markers when typed with a space", () => {
+    const { input } = renderEditor("1.");
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: " " });
+    expect(input).toHaveValue("  1. ");
+    for (const marker of ["-", "*"]) {
+      fireEvent.change(input, { target: { value: marker } });
+      input.setSelectionRange(input.value.length, input.value.length);
+      fireEvent.keyDown(input, { key: " " });
+      expect(input).toHaveValue("  • ");
+    }
+  });
+
+  it("continues bullets and increments numbered lists with Shift+Enter", () => {
+    const { input, onKeyDown } = renderEditor("  9. First item");
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("  9. First item\n  10. ");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: false }),
+    );
+    fireEvent.change(input, { target: { value: "  • First item" } });
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("  • First item\n  • ");
+    fireEvent.change(input, { target: { value: "  * First item" } });
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("  * First item\n  • ");
+  });
+
+  it("ends a list when Shift+Enter follows an empty marker", () => {
+    const { input } = renderEditor("- First item\n- ");
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("- First item\n");
+  });
+
+  it("submits a list on plain Enter with the default shortcut", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item");
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue("  1. First item");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: true }),
+    );
+  });
+
+  it("continues a list on plain Enter when Mod+Enter is the send shortcut", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item", true);
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue("  1. First item\n  2. ");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: false }),
+    );
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(input).toHaveValue("  1. First item\n  2. ");
+    expect(onKeyDown).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: true }),
+    );
+  });
+
   it("keeps route-owned input and submit handlers on the shared surface", () => {
     const onChange = vi.fn();
     const onSubmit = vi.fn((event: FormEvent) => event.preventDefault());

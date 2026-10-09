@@ -259,6 +259,17 @@ export function ComposerTextInput({
           return;
         }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        const insertNewline =
+          event.key === "Enter" &&
+          (event.shiftKey || keyboard.submitWithModEnter) &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey;
+        const listEdit = insertNewline ? composerListEdit(event.currentTarget) : null;
+        const listStartEdit =
+          event.key === " " && !event.altKey && !event.shiftKey && !event.metaKey && !event.ctrlKey
+            ? composerListStartEdit(event.currentTarget)
+            : null;
         const shouldSubmitFromKeyboard = isComposerSendKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
@@ -274,9 +285,53 @@ export function ComposerTextInput({
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
           shouldSteerAllFromKeyboard,
         });
+        if (event.defaultPrevented) return;
+        const edit = listStartEdit ?? listEdit;
+        if (edit) {
+          event.preventDefault();
+          const textarea = event.currentTarget;
+          textarea.setRangeText(edit.text, edit.start, edit.end, "end");
+          textarea.dispatchEvent(
+            new InputEvent("input", { bubbles: true, inputType: "insertText", data: edit.text }),
+          );
+        }
       }}
     />
   );
+}
+
+function composerListStartEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  if (selectionStart !== selectionEnd) return null;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = /^([ \t]*)([-*]|\d+[.)])$/.exec(prefix);
+  if (!match) return null;
+  const [, indent, marker] = match;
+  return {
+    start: lineStart,
+    end: selectionStart,
+    text: `${indent || "  "}${/^\d/.test(marker) ? marker : "•"} `,
+  };
+}
+
+function composerListEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const lineEndIndex = value.indexOf("\n", selectionEnd);
+  const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = /^([ \t]*)([-*•]|\d+[.)])([ \t]+)(.*)$/.exec(prefix);
+  if (!match) return null;
+  const [, indent, marker, spacing, content] = match;
+  const suffix = value.slice(selectionEnd, lineEnd);
+  if (!content.trim() && !suffix.trim()) {
+    return { start: lineStart, end: lineEnd, text: "" };
+  }
+  const nextMarker = /^\d/.test(marker)
+    ? `${Number.parseInt(marker, 10) + 1}${marker.at(-1)}`
+    : "•";
+  return { start: selectionStart, end: selectionEnd, text: `\n${indent}${nextMarker}${spacing}` };
 }
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
