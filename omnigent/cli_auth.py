@@ -794,11 +794,11 @@ def open_server_client(
     this factory is routed correctly by construction, which is why it exists
     rather than each site building headers by hand.
 
-    For non-loopback targets, TLS trust comes from
-    :func:`omnigent.util.tls.client_ssl_context` (a validated CA bundle with
-    certifi fallback) rather than httpx's raw ``SSL_CERT_FILE`` /
-    ``SSL_CERT_DIR`` environment loading, so a stale CA env var (e.g. a rotated
-    bundle path) cannot crash client construction.
+    For non-loopback targets, TLS trust comes from the shared
+    :func:`omnigent.util.tls.client_ssl_context`, which honors explicit CA
+    sources and keeps malformed existing ones fail-closed, rather than httpx's
+    raw ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` environment loading, so a stale CA
+    env var (a rotated bundle path) cannot crash client construction.
 
     :param server_url: The server base URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``. Both the client's

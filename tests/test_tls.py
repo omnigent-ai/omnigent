@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import ssl
 from pathlib import Path
 
@@ -122,26 +123,6 @@ def test_client_ssl_context_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client_ssl_context() is client_ssl_context()
 
 
-def test_explicit_trust_sources_returns_configured_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """A configured ``SSL_CERT_DIR`` that exists is surfaced as the capath."""
-    capath = _hashed_cert_dir(tmp_path)
-    monkeypatch.setenv("SSL_CERT_DIR", str(capath))
-    assert explicit_trust_sources() == (None, str(capath))
-
-
-def test_explicit_trust_sources_ignores_missing_paths(
-    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Rotated-away ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` are logged and dropped, never raised."""
-    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "rotated-away-ca.pem"))
-    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "rotated-away-certs"))
-    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
-        assert explicit_trust_sources() == (None, None)
-    assert "SSL_CERT_FILE" in caplog.text and "SSL_CERT_DIR" in caplog.text
-
-
 def test_explicit_trust_sources_ignore_compiled_in_defaults(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -216,6 +197,7 @@ def test_client_ssl_context_directory_only_excludes_default_bundle(
 
     ctx = client_ssl_context()
 
+    assert explicit_trust_sources() == (None, str(capath))
     assert seen == [(None, str(capath))]
     assert ctx.get_ca_certs() == []
 
@@ -226,8 +208,9 @@ def test_client_ssl_context_directory_only_excludes_default_bundle(
         ("SSL_CERT_FILE", lambda tmp: (tmp / "empty.pem").write_bytes(b"") or tmp / "empty.pem"),
         ("SSL_CERT_FILE", lambda tmp: tmp),
         ("SSL_CERT_DIR", lambda tmp: (tmp / "empty-certs").mkdir() or tmp / "empty-certs"),
+        ("SSL_CERT_DIR", lambda tmp: _one_root_bundle(tmp)),
     ],
-    ids=["zero-byte-file", "directory-as-file", "empty-directory"],
+    ids=["zero-byte-file", "directory-as-file", "empty-directory", "file-as-directory"],
 )
 def test_client_ssl_context_existing_empty_source_trusts_nothing(
     monkeypatch: pytest.MonkeyPatch,
@@ -266,11 +249,39 @@ def test_client_ssl_context_stale_explicit_sources_fall_back(
     monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
 
     with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
+        assert explicit_trust_sources() == (None, None)
         ctx = client_ssl_context()
 
     assert ctx.verify_mode == ssl.CERT_REQUIRED
     assert len(ctx.get_ca_certs()) > 0
     assert "SSL_CERT_FILE" in caplog.text and "SSL_CERT_DIR" in caplog.text
+
+
+def test_client_ssl_context_survives_directory_vanishing_mid_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A directory removed between the existence check and loading never raises.
+
+    OpenSSL accepts a missing capath without loading anything, so the result is
+    a verifying context with no roots plus a warning.
+    """
+    capath = _hashed_cert_dir(tmp_path)
+    monkeypatch.setenv("SSL_CERT_DIR", str(capath))
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
+    real_create = ssl.create_default_context
+
+    def _vanish_then_create(*args, **kwargs):
+        if kwargs.get("capath") == str(capath):
+            shutil.rmtree(capath)
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(ssl, "create_default_context", _vanish_then_create)
+    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
+        ctx = client_ssl_context()
+
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.get_ca_certs() == []
+    assert "trusting no roots" in caplog.text
 
 
 def test_client_ssl_context_survives_bundle_vanishing_mid_build(

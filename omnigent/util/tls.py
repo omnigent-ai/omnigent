@@ -62,6 +62,14 @@ def _exists(path: str) -> bool:
     return True
 
 
+def _has_entries(path: str) -> bool:
+    """Report whether *path* is a directory with at least one entry; errors read as empty."""
+    try:
+        return any(Path(path).iterdir())
+    except OSError:
+        return False
+
+
 def explicit_trust_sources() -> tuple[str | None, str | None]:
     """Return the configured ``(cafile, capath)`` to honor, at most one of them.
 
@@ -132,7 +140,9 @@ def client_ssl_context() -> ssl.SSLContext:
                 )
                 context = _no_trust_context()
             else:
-                if capath is not None and not any(Path(capath).iterdir()):
+                # OpenSSL accepts an empty or non-directory capath without
+                # loading anything, so say so instead of failing silently.
+                if capath is not None and not _has_entries(capath):
                     logger.warning(
                         "SSL_CERT_DIR=%s holds no certificates; trusting no roots", capath
                     )
