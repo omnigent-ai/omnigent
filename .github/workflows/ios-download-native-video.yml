@@ -41,7 +41,7 @@ jobs:
             -project web/ios/Omnigent.xcodeproj \
             -scheme Omnigent \
             -configuration Debug \
-            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -destination "generic/platform=iOS Simulator" \
             -derivedDataPath /tmp/before-derived \
             CODE_SIGNING_ALLOWED=NO
           xcrun simctl boot "$DEVICE_ID" > /tmp/simulator-boot.log 2>&1 &
@@ -75,7 +75,7 @@ jobs:
             -project web/ios/Omnigent.xcodeproj \
             -scheme Omnigent \
             -configuration Debug \
-            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -destination "generic/platform=iOS Simulator" \
             -derivedDataPath /tmp/after-derived \
             CODE_SIGNING_ALLOWED=NO
           xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/after.mp4 &
