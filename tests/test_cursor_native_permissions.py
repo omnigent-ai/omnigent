@@ -991,6 +991,27 @@ async def test_send_cursor_keys_reports_spawn_failure_as_undelivered(
     assert not _keystroke_error_records(caplog)
 
 
+async def test_send_cursor_keys_keeps_tmux_error_in_dead_pane_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The dead-pane warning keeps tmux's own error, so a hung probe stays diagnosable."""
+    caplog.set_level(logging.DEBUG)
+
+    def _boom(_bridge: Path, _key: str) -> None:
+        raise RuntimeError("tmux command timed out after 5s")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: None)
+
+    assert await cnp._send_cursor_keys(tmp_path, "conv_hung", "y") is False
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "cursor pane is gone" in record.getMessage()
+    ]
+    assert warnings and "timed out after 5s" in warnings[0]
+
+
 def _shell_approval_prompt() -> CursorApprovalPrompt:
     return CursorApprovalPrompt(
         operation_type="shell",

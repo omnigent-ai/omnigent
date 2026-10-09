@@ -53,13 +53,7 @@ pytestmark = pytest.mark.skipif(
 
 
 class _ErrorRecorder(logging.Handler):
-    """Collect ERROR+ records emitted by the cursor-native permissions logger.
-
-    The mirror coroutine runs in a background thread of THIS process (the same
-    lane as ``test_cursor_multiselect_question.py``), so its log records are
-    observable here — the process-level analog of the runner log the fleet KPI
-    scrapes.
-    """
+    """Collect ERROR records from the in-process permissions logger."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.ERROR)
@@ -143,9 +137,8 @@ def test_cursor_approval_on_dead_pane_is_not_silently_dropped(
         expect(card).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
         expect(card.get_by_text("Cursor wants to run Shell")).to_be_visible()
 
-        # THE TRIGGER: while the card is still parked, the tmux server backing
-        # the cursor pane dies and its socket disappears (terminal teardown /
-        # temp cleanup) — the exact ENOENT state in the reported traceback.
+        # While the card is parked, kill the pane's tmux server and remove its
+        # socket (terminal teardown / temp cleanup).
         assert _tmux(socket_path, "kill-server").returncode == 0
         socket_path.unlink(missing_ok=True)
         assert _tmux(socket_path, "has-session", "-t", tmux_session).returncode != 0, (
@@ -185,7 +178,7 @@ def test_cursor_approval_on_dead_pane_is_not_silently_dropped(
             f"cursor approval mirror failed: {mirror_result['error']}"
         ) from mirror_result["error"]  # type: ignore[misc]
 
-    # A fixed build attributes dead-pane delivery instead of emitting this raw ERROR.
+    # Dead-pane delivery must be attributed, never logged as this raw ERROR.
     dropped = [
         record
         for record in recorder.records

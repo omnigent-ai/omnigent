@@ -178,9 +178,8 @@ def test_cursor_approval_after_pane_socket_vanishes_notifies_user(
     pane = _wait_for_cursor_pane(session_id)
     tmux_server_pid = _tmux_server_pid(pane)
     store = _seed_pending_shell_gate(os.path.realpath(str(_REPO_ROOT)), _GATED_COMMAND)
-
-    page = request.getfixturevalue("page")
     try:
+        page = request.getfixturevalue("page")
         page.goto(f"{base_url}/c/{session_id}")
         _ensure_chat_view(page)
         card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first

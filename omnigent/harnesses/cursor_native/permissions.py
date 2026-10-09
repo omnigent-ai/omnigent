@@ -47,6 +47,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
 from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cursor_pane_keys
 
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
@@ -61,9 +62,9 @@ _POLL_INTERVAL_S = 0.3
 # past any realistic wait, so the runner's POST never abandons a live prompt.
 _POST_TIMEOUT_S = 86400.0
 
-# Agent label stamped on chat notices; matches the label orchestration gives the
-# cursor transcript forwarder so notices render like other mirrored items.
-_MIRROR_AGENT_NAME = "cursor-native-ui"
+# Agent label stamped on chat notices, so they render like the forwarder's
+# mirrored items.
+_MIRROR_AGENT_NAME = CURSOR_NATIVE_WRAPPER_VALUE
 
 
 @dataclass(frozen=True)
@@ -149,14 +150,15 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError) as exc:
             if await asyncio.to_thread(capture_cursor_pane, bridge_dir) is None:
                 # The pane (or its whole tmux server) is gone — an expected
                 # end-of-life state, not a malfunction; no traceback ERROR.
                 _logger.warning(
-                    "cursor pane is gone; keystroke %r (of %r) was not delivered; session=%s",
+                    "cursor pane is gone; keystroke %r (of %r) was not delivered (%s); session=%s",
                     key,
                     keys,
+                    exc,
                     session_id,
                 )
             else:
@@ -172,13 +174,10 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
 async def _post_verdict_undelivered_notice(
     client: httpx.AsyncClient, *, session_id: str, description: str, pane_gone: bool
 ) -> None:
-    """Tell the user (in chat) that their verdict never reached the cursor TUI.
+    """Post recovery guidance for a verdict that never reached the cursor TUI.
 
-    By the time delivery fails the card has already settled as answered, so
-    without this notice the drop is invisible: the web UI reads "Approved"
-    while cursor never received the keystroke. ``pane_gone`` picks the remedy:
-    a dead pane needs a relaunch, while a live pane that rejected the
-    keystroke can still be answered in the embedded terminal.
+    The card has already settled as answered by then. ``pane_gone`` picks the
+    remedy: relaunch for a dead pane, the embedded terminal for a live one.
     """
     if pane_gone:
         reason = (
@@ -219,14 +218,10 @@ async def _deliver_verdict_keys(
     keys: tuple[str, ...],
     description: str,
 ) -> bool:
-    """Send a web verdict's keystrokes, surfacing an unreachable pane to the user.
+    """Deliver a web verdict's keystrokes, or tell the user in chat why they could not land.
 
-    The parked hook can hold a verdict for a day (:data:`_POST_TIMEOUT_S`) and
-    nothing re-checks the pane while it waits, so the tmux server that showed
-    the prompt may be gone by the time a human answers (terminal teardown, temp
-    cleanup, machine sleep). Check liveness before typing (mirroring
-    :func:`_yolo_auto_accept`) and tell the user when the verdict cannot land,
-    instead of silently dropping it behind an already-answered card.
+    The parked hook can hold a verdict for up to :data:`_POST_TIMEOUT_S`, so the
+    pane is checked again before typing (as :func:`_yolo_auto_accept` does).
 
     :returns: Whether the keystrokes were handed to tmux.
     """
@@ -285,6 +280,9 @@ async def _run_one_approval(
         # the reason prompt time to render first.
         keys = (prompt.decline_key, "Enter")
     else:
+        _logger.warning(
+            "cursor approval verdict: unexpected action=%r; session=%s", action, session_id
+        )
         return
     await _deliver_verdict_keys(
         client,
