@@ -193,8 +193,7 @@ class _SilentHttpsEndpoint:
                     b"content-length: 0\r\nconnection: close\r\n\r\n"
                 )
         except (OSError, ssl.SSLError):
-            # The host tears connections down at its own pace; either peer
-            # racing a close here is part of the journey, not a failure.
+            # A peer racing the connection close here is expected, not a failure.
             pass
         finally:
             with contextlib.suppress(OSError):
@@ -315,8 +314,8 @@ def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path)
         )
         assert endpoint.accepted_upgrades >= _SILENT_CONNECT_ESCALATE_ATTEMPTS, diagnostics
 
-        # The server's silence is a server-side condition: recorded as a WARN
-        # with attribution, not as an ERROR the error KPI counts against Omnigent.
+        # The server's silence is a server-side condition: the escalation is
+        # recorded at WARN, never at the ERROR the error KPI blames on Omnigent.
         records = [line for line in log.splitlines() if _ESCALATION_PHRASE in line]
         error_records = [line for line in records if _ERROR_RECORD_RE.search(line)]
         assert not error_records, (
