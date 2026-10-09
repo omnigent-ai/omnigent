@@ -3,6 +3,7 @@
 Heartbeat fields describe application PingFrame/PongFrame traffic, not WebSocket
 control frames. All durations use the local monotonic clock. History is bounded;
 queue timestamps travel with frames already retained by the outbound queue.
+Host-pressure fields are machine-wide procfs reads, taken only per snapshot.
 """
 
 from __future__ import annotations
@@ -10,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TypedDict, cast
 
 _logger = logging.getLogger(__name__)
@@ -22,6 +25,14 @@ _SLOW_OPERATION_S = 1.0
 _REPORT_INTERVAL_S = 60.0
 _MAX_TRACKED_SENDS = 64
 _MAX_TRACKED_PINGS = 8
+_PROC_ROOT = Path("/proc")
+# Memory "full" marks thrash, CPU "some" starvation and IO "full" a stalled disk.
+# All low next to a long loop lag points outside the guest.
+_PSI_SIGNALS = {
+    "cpu": ("some_avg10", "some_avg60"),
+    "memory": ("full_avg10", "full_avg60", "full_avg300"),
+    "io": ("full_avg60",),
+}
 
 
 class TunnelKeepaliveSettings(TypedDict, total=False):
@@ -73,6 +84,15 @@ class TunnelDiagnosticAttrs(TunnelKeepaliveSettings, total=False):
     last_app_pong_received_age_s: float | None
     last_app_ping_received_age_s: float | None
     last_app_pong_sent_age_s: float | None
+    psi_cpu_some_avg10: float | None
+    psi_cpu_some_avg60: float | None
+    psi_memory_full_avg10: float | None
+    psi_memory_full_avg60: float | None
+    psi_memory_full_avg300: float | None
+    psi_io_full_avg60: float | None
+    loadavg_1m: float | None
+    mem_available_mb: float | None
+    process_rss_mb: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +130,51 @@ def _rounded(value: float | None) -> float | None:
 
 def _age(now: float, then: float | None) -> float | None:
     return None if then is None else round(max(0.0, now - then), 3)
+
+
+def _read_proc(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _number(raw: str) -> float | None:
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _parse_psi(text: str) -> dict[str, float]:
+    """Map ``some avg10=1.5 ...`` and ``full ...`` lines to ``{"some_avg10": 1.5, ...}``."""
+    values: dict[str, float] = {}
+    kind = ""
+    for token in text.split():
+        name, has_value, raw = token.partition("=")
+        if not has_value:
+            kind = name
+        elif name.startswith("avg") and (value := _number(raw)) is not None:
+            values[f"{kind}_{name}"] = value
+    return values
+
+
+def _kib_field_as_mb(text: str, name: str) -> float | None:
+    """Read a ``Name:  <n> kB`` procfs line (KiB) as MiB."""
+    match = re.search(rf"^{name}:\s+(\d+) kB", text, re.MULTILINE)
+    return None if match is None else round(float(match[1]) / 1024, 1)
+
+
+def _host_pressure_attrs(proc_root: Path = _PROC_ROOT) -> dict[str, float | None]:
+    """Read machine-wide pressure from procfs; anything unreadable or malformed is None."""
+    attrs: dict[str, float | None] = {}
+    for resource, signals in _PSI_SIGNALS.items():
+        psi = _parse_psi(_read_proc(proc_root / "pressure" / resource))
+        attrs.update({f"psi_{resource}_{signal}": psi.get(signal) for signal in signals})
+    attrs["loadavg_1m"] = _number(_read_proc(proc_root / "loadavg").partition(" ")[0])
+    attrs["mem_available_mb"] = _kib_field_as_mb(_read_proc(proc_root / "meminfo"), "MemAvailable")
+    attrs["process_rss_mb"] = _kib_field_as_mb(_read_proc(proc_root / "self" / "status"), "VmRSS")
+    return attrs
 
 
 class TunnelDiagnostics:
@@ -288,7 +353,11 @@ class TunnelDiagnostics:
                 self._maybe_report(now)
 
     def snapshot(self) -> TunnelDiagnosticAttrs:
-        """Return scalar timings; missing observations stay null, never zero ages."""
+        """Return scalar timings; missing observations stay null, never zero ages.
+
+        Host pressure is read here, once per live runner-side snapshot, and never
+        by the sampler.
+        """
         if self._frozen is not None:
             return {
                 **self._frozen,
@@ -334,6 +403,9 @@ class TunnelDiagnostics:
             "last_app_pong_sent",
         ):
             attrs[f"{name}_age_s"] = _age(now, self._observed_at.get(name))
+        # Runner hosts only: a stalled server would read procfs once per tunnel.
+        if self.settings.get("tunnel_side") != "server":
+            attrs.update(_host_pressure_attrs())
         return cast(TunnelDiagnosticAttrs, attrs)
 
     def freeze(self) -> None:
