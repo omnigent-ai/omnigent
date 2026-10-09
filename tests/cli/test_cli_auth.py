@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -1230,6 +1232,28 @@ def _https_listener(cert_path: Path, key_path: Path) -> Iterator[str]:
         thread.join(timeout=5)
 
 
+def _hashed_ca_dir(directory: Path, cert_path: Path) -> Path | None:
+    """Create an OpenSSL hashed CA directory holding *cert_path*.
+
+    :param directory: Where the ``hashed-certs`` directory is created.
+    :param cert_path: PEM CA certificate to install under its subject hash.
+    :returns: The directory, or ``None`` when the ``openssl`` CLI is unavailable.
+    """
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        return None
+    subject_hash = subprocess.run(
+        [openssl, "x509", "-subject_hash", "-noout", "-in", str(cert_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    capath = directory / "hashed-certs"
+    capath.mkdir()
+    shutil.copy(cert_path, capath / f"{subject_hash}.0")
+    return capath
+
+
 def _get_health_status(client: httpx.AsyncClient) -> int:
     """Run one ``GET /health`` on *client* (closing it) and return the status code."""
 
@@ -1269,6 +1293,25 @@ def test_open_server_client_https_honors_valid_ssl_cert_file(
         assert _get_health_status(open_server_client(base_url)) == 200
 
 
+def test_open_server_client_https_honors_ssl_cert_dir_only(
+    token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
+) -> None:
+    """A CA shipped only as a hashed ``SSL_CERT_DIR`` authenticates a real HTTPS listener."""
+    from omnigent.cli_auth import open_server_client
+
+    cert_path, key_path = _self_signed_server_cert(tmp_path)
+    capath = _hashed_ca_dir(tmp_path, cert_path)
+    if capath is None:
+        pytest.skip("openssl CLI unavailable to build a hashed CA directory")
+    _direct_remote_env(monkeypatch)
+    _treat_server_as_remote(monkeypatch)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setenv("SSL_CERT_DIR", str(capath))
+
+    with _https_listener(cert_path, key_path) as base_url:
+        assert _get_health_status(open_server_client(base_url)) == 200
+
+
 def test_open_server_client_https_stale_ssl_cert_file_keeps_verifying(
     token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
 ) -> None:
@@ -1286,5 +1329,5 @@ def test_open_server_client_https_stale_ssl_cert_file_keeps_verifying(
 
     with _https_listener(cert_path, key_path) as base_url:
         client = open_server_client(base_url)
-        with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
+        with pytest.raises(httpx.ConnectError, match=r"(?i)certificate verify"):
             _get_health_status(client)

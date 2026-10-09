@@ -11,7 +11,7 @@ import certifi
 import pytest
 
 import omnigent.util.tls as tls_module
-from omnigent.util.tls import client_ssl_context, resolve_ca_dir, resolve_ca_file
+from omnigent.util.tls import client_ssl_context, explicit_trust_sources, resolve_ca_file
 
 
 def _verify_paths(
@@ -39,6 +39,14 @@ def _one_root_bundle(directory: Path) -> Path:
     bundle = directory / "one-root.pem"
     bundle.write_text(match.group(0) + "\n")
     return bundle
+
+
+def _hashed_cert_dir(directory: Path) -> Path:
+    """Create a non-empty OpenSSL-style hashed certificate directory."""
+    capath = directory / "certs"
+    capath.mkdir()
+    (capath / "0a1b2c3d.0").write_text("")
+    return capath
 
 
 def _spy_verify_locations(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str | None, str | None]]:
@@ -114,34 +122,63 @@ def test_client_ssl_context_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     assert client_ssl_context() is client_ssl_context()
 
 
-def test_resolve_ca_dir_returns_existing_ssl_cert_dir(
+def test_explicit_trust_sources_returns_configured_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """A configured ``SSL_CERT_DIR`` that exists is surfaced."""
-    capath = tmp_path / "certs"
-    capath.mkdir()
+    """A configured, non-empty ``SSL_CERT_DIR`` is surfaced as the capath."""
+    capath = _hashed_cert_dir(tmp_path)
     monkeypatch.setenv("SSL_CERT_DIR", str(capath))
-    assert resolve_ca_dir() == str(capath)
+    assert explicit_trust_sources() == (None, str(capath))
 
 
-def test_resolve_ca_dir_ignores_missing_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("make_path", "label"),
+    [
+        (lambda tmp: tmp / "gone", "missing"),
+        (lambda tmp: (tmp / "empty").mkdir() or tmp / "empty", "empty"),
+    ],
+)
+def test_explicit_trust_sources_ignores_unusable_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture, make_path, label
 ) -> None:
-    """A stale ``SSL_CERT_DIR`` is logged and ignored, never raised."""
-    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "gone"))
+    """A missing or empty ``SSL_CERT_DIR`` is logged and ignored, never raised or trusted."""
+    monkeypatch.setenv("SSL_CERT_DIR", str(make_path(tmp_path)))
     with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
-        assert resolve_ca_dir() is None
+        assert explicit_trust_sources() == (None, None), label
     assert "SSL_CERT_DIR" in caplog.text
 
 
-def test_resolve_ca_dir_none_when_unset(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """OpenSSL's compiled-in directory is a default, not configuration."""
-    default_dir = tmp_path / "compiled-in-certs"
-    default_dir.mkdir()
+def test_explicit_trust_sources_rejects_directory_as_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``SSL_CERT_FILE`` must name a regular file; a directory is dropped."""
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path))
+    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
+        assert explicit_trust_sources() == (None, None)
+    assert "SSL_CERT_FILE" in caplog.text
+
+
+def test_explicit_trust_sources_prefer_file_over_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """With both variables usable, the bundle is the whole explicit trust set."""
+    bundle = _one_root_bundle(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    monkeypatch.setenv("SSL_CERT_DIR", str(_hashed_cert_dir(tmp_path)))
+    assert explicit_trust_sources() == (str(bundle), None)
+
+
+def test_explicit_trust_sources_ignore_compiled_in_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """OpenSSL's compiled-in bundle and directory are defaults, not configuration."""
+    default_dir = _hashed_cert_dir(tmp_path)
     monkeypatch.setattr(
-        ssl, "get_default_verify_paths", lambda: _verify_paths(None, None, capath=str(default_dir))
+        ssl,
+        "get_default_verify_paths",
+        lambda: _verify_paths(certifi.where(), certifi.where(), capath=str(default_dir)),
     )
-    assert resolve_ca_dir() is None
+    assert explicit_trust_sources() == (None, None)
 
 
 def test_client_ssl_context_file_only_excludes_default_directory(
@@ -153,14 +190,29 @@ def test_client_ssl_context_file_only_excludes_default_directory(
     restricted trust set.
     """
     bundle = _one_root_bundle(tmp_path)
-    default_dir = tmp_path / "compiled-in-certs"
-    default_dir.mkdir()
+    default_dir = _hashed_cert_dir(tmp_path)
     monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
     monkeypatch.setattr(
         ssl,
         "get_default_verify_paths",
         lambda: _verify_paths(str(bundle), str(bundle), capath=str(default_dir)),
     )
+    seen = _spy_verify_locations(monkeypatch)
+
+    ctx = client_ssl_context()
+
+    assert seen == [(str(bundle), None)]
+    assert len(ctx.get_ca_certs()) == 1
+
+
+def test_client_ssl_context_file_wins_over_configured_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """An inherited ``SSL_CERT_DIR`` must not widen a restricted ``SSL_CERT_FILE``."""
+    bundle = _one_root_bundle(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    monkeypatch.setenv("SSL_CERT_DIR", str(_hashed_cert_dir(tmp_path)))
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
     seen = _spy_verify_locations(monkeypatch)
 
     ctx = client_ssl_context()
@@ -176,8 +228,7 @@ def test_client_ssl_context_directory_only_excludes_default_bundle(
 
     Neither the OS bundle nor certifi is added alongside it.
     """
-    capath = tmp_path / "certs"
-    capath.mkdir()
+    capath = _hashed_cert_dir(tmp_path)
     monkeypatch.setenv("SSL_CERT_DIR", str(capath))
     monkeypatch.setattr(
         ssl, "get_default_verify_paths", lambda: _verify_paths(None, certifi.where())
@@ -208,3 +259,25 @@ def test_client_ssl_context_stale_explicit_sources_fall_back(
     assert ctx.verify_mode == ssl.CERT_REQUIRED
     assert len(ctx.get_ca_certs()) > 0
     assert "SSL_CERT_FILE" in caplog.text and "SSL_CERT_DIR" in caplog.text
+
+
+def test_client_ssl_context_survives_bundle_vanishing_mid_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bundle rotated away between the usability check and loading still yields a context."""
+    bundle = _one_root_bundle(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
+    real_create = ssl.create_default_context
+
+    def _vanish_then_create(*args, **kwargs):
+        if kwargs.get("cafile") == str(bundle):
+            bundle.unlink()
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(ssl, "create_default_context", _vanish_then_create)
+    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
+        ctx = client_ssl_context()
+
+    assert len(ctx.get_ca_certs()) > 0
+    assert "vanished" in caplog.text
