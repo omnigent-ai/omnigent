@@ -4,15 +4,9 @@ description: >-
   Plain GPT brainstorming responder — answers a question on its own merits,
   and (during a debate) critiques the other partner's answer.
 
-# Plain responder on the native Codex harness (like Polly's codex worker). No
-# model is pinned, so it resolves your configured OpenAI/Codex provider's
-# default GPT model and reads reference files with Codex's own tools.
-#
-# Why codex-native, not the SDK codex harness: routed to a Databricks provider
-# the SDK harness only runs inside an active os_env sandbox with a model_egress
-# grant and one pinned Codex CLI version. Why not openai-agents: with an
-# unpinned model and no OPENAI_API_KEY it silently falls back to ambient
-# Databricks credentials; Codex routes through the configured provider instead.
+# Native Codex harness (like Polly's codex worker) with no model pinned.
+# codex-native authenticates to a managed Databricks host through the credential
+# broker, without the SDK codex harness's os_env sandbox and model-egress grant.
 executor:
   type: omnigent
   config:
