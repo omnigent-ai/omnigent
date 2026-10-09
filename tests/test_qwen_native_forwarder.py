@@ -352,6 +352,53 @@ def test_qwen_021_truncation_resets_persisted_assistant_context(tmp_path: Path) 
     assert stop_reason is None
 
 
+def test_qwen_message_stop_api_error_turn_reports_failed(tmp_path: Path) -> None:
+    """A turn whose final assistant text is a Qwen ``[API Error: ...]`` message
+    terminalizes as failed, not idle.
+
+    Qwen Code writes an unrecovered model/provider error into the turn as an
+    assistant text block and ends the turn with ``message_stop`` (no error
+    ``result`` record on the TUI ``--json-file`` path). Reporting that turn idle
+    tells an orchestrator parent the sub-agent finished successfully.
+    """
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(_asst_ev("a1", [{"type": "text", "text": "[API Error: 400 upstream failure]"}]))
+        + _ev_bytes(_message_stop_ev("stop-1"))
+    )
+
+    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+
+    terminal = actions[-1]
+    assert isinstance(terminal, fwd._TerminalStatus)
+    assert terminal.output == "[API Error: 400 upstream failure]"
+    assert terminal.status == "failed"
+
+
+def test_qwen_message_stop_thinking_only_final_does_not_restate_prior_text(
+    tmp_path: Path,
+) -> None:
+    """A turn ending on a thinking-only assistant message must not re-report the
+    previous text turn's prose as this turn's completed output.
+
+    ``_text_from_content`` joins only ``text`` blocks, so a final message that
+    carries reasoning but no prose leaves ``last_assistant_text`` unchanged and
+    the terminal edge restates an earlier line as if it were the new answer.
+    """
+    events = tmp_path / "out.ndjson"
+    events.write_bytes(
+        _ev_bytes(_asst_ev("a1", [{"type": "text", "text": "earlier partial answer"}]))
+        + _ev_bytes(_asst_ev("a2", [{"type": "thinking", "thinking": "final reasoning only"}]))
+        + _ev_bytes(_message_stop_ev("stop-1"))
+    )
+
+    actions, _, _, _ = _read_new_forward_events(events, 0, set(), _AGENT, "")
+
+    terminal = actions[-1]
+    assert isinstance(terminal, fwd._TerminalStatus)
+    assert terminal.output != "earlier partial answer"
+
+
 def test_result_is_error_is_authoritative_for_custom_success_subtype() -> None:
     terminal = fwd._event_to_terminal(
         {

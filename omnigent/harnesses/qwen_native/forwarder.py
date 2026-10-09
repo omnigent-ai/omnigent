@@ -87,6 +87,11 @@ _STATE_FILE = "qwen_forwarder.json"
 # subset and re-post recent history on a long-session relaunch.
 _DEDUP_WINDOW = 512
 
+#: Qwen writes an unrecovered provider error as assistant text with this prefix
+#: then ends the turn with a normal ``message_stop`` (the TUI ``--json-file``
+#: path has no error ``result``). Matches Qwen Code's ``API_ERROR_PREFIX``.
+_QWEN_API_ERROR_PREFIX = "[API Error: "
+
 
 def _new_seen(uuids: Iterable[str] | None = None) -> dict[str, None]:
     """Build the insertion-ordered dedup set (``dict`` used as an ordered set)."""
@@ -296,10 +301,12 @@ def _event_to_terminal(
             or last_assistant_stop_reason == "tool_use"
         ):
             return None
-        # message_stop carries no error channel: a v0.21 turn that dies is
-        # surfaced by the runner's terminal-exit watcher, not this edge.
-        failed = False
         output = last_assistant_text or None
+        # message_stop carries no error channel. A turn that ends on Qwen's
+        # ``[API Error: ...]`` text has failed even though the stream looks
+        # clean; other dying turns are surfaced by the runner's terminal-exit
+        # watcher, not this edge.
+        failed = output is not None and output.startswith(_QWEN_API_ERROR_PREFIX)
     else:
         return None
     uuid = event.get("uuid")
@@ -366,6 +373,11 @@ def _read_new_forward_events(
             encountered.add(item.uuid)
             last_assistant_text = _assistant_text_after_action(last_assistant_text, item)
             continue
+        if item is None and assistant_stop_reason is not None:
+            # A thinking-only / tool-only assistant message carries no prose, so
+            # this turn's final answer is empty. Clear the buffer so a trailing
+            # reasoning-only message can't restate an earlier line as the output.
+            last_assistant_text = ""
         terminal = _event_to_terminal(event, last_assistant_text, last_assistant_stop_reason)
         if terminal is not None and terminal.uuid not in encountered:
             actions.append(terminal)

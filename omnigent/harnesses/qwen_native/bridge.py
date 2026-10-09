@@ -84,6 +84,12 @@ _QWEN_SYNTH_VERSION = "0.18.2"
 #: ``contextWindowSize`` stamped on synthesized assistant records. Informational
 #: only — the live resume uses the resolved model's real window.
 _QWEN_SYNTH_CONTEXT_WINDOW = 131072
+#: Env var Qwen Code reads for its *System*-scope settings file, whose values
+#: have the highest merge precedence (above the user's ``~/.qwen`` and workspace).
+QWEN_SYSTEM_SETTINGS_ENV_VAR = "QWEN_CODE_SYSTEM_SETTINGS_PATH"
+#: Per-session Qwen Code system-settings file. Lives in the bridge dir, like the
+#: MCP config, so Omnigent never touches the user's ``~/.qwen`` or the workspace.
+_QWEN_SETTINGS_FILE = "qwen_system_settings.json"
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -570,6 +576,34 @@ def write_mcp_config(
         }
     }
     tmp = path.with_name(f"{_MCP_CONFIG_FILE}.{secrets.token_hex(8)}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def qwen_system_settings_path(bridge_dir: Path) -> Path:
+    """Return the per-session Qwen Code system-settings file path in the bridge dir."""
+    return bridge_dir / _QWEN_SETTINGS_FILE
+
+
+def write_qwen_system_settings(bridge_dir: Path, *, context_window: int) -> Path:
+    """Write a Qwen Code system-settings file conveying the agent's context window.
+
+    Qwen Code reads ``model.generationConfig.contextWindowSize`` from its merged
+    settings and falls back to the model's own ``tokenLimit`` when it is unset.
+    Omnigent writes the configured window into the *System* scope (highest merge
+    precedence) and points qwen at it with ``QWEN_CODE_SYSTEM_SETTINGS_PATH``, so
+    the configured value wins over the default without touching the user's
+    ``~/.qwen`` auth/settings or dropping a file in the workspace. The file lives
+    in the bridge dir, like the ``--mcp-config`` file.
+
+    :param context_window: Positive context-window size in tokens.
+    :returns: Path to the written settings file.
+    """
+    _ensure_dir(bridge_dir)
+    path = qwen_system_settings_path(bridge_dir)
+    payload = {"model": {"generationConfig": {"contextWindowSize": int(context_window)}}}
+    tmp = path.with_name(f"{_QWEN_SETTINGS_FILE}.{secrets.token_hex(8)}.tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path

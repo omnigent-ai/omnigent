@@ -659,6 +659,10 @@ class _PiNativeLaunchConfig:
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
+    :param context_window: Agent's effective context window in tokens from the
+        session snapshot, or ``None`` when unset. Consumed by the qwen-native
+        launch to convey the configured window to Qwen Code (via a System-scope
+        settings file); other paths ignore it.
     """
 
     workspace: Path
@@ -670,6 +674,7 @@ class _PiNativeLaunchConfig:
     fork_carry_history: bool = False
     model_override: str | None = None
     reasoning_effort: str | None = None
+    context_window: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1248,6 +1253,17 @@ async def _pi_native_launch_config(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
     reasoning_effort = snapshot.get("reasoning_effort")
+    # The snapshot's ``context_window`` is already the effective window; accept an
+    # explicit ``effective_context_window`` too. Only a positive int is
+    # meaningful, so anything else leaves the harness default.
+    raw_context_window = snapshot.get("effective_context_window", snapshot.get("context_window"))
+    context_window = (
+        raw_context_window
+        if isinstance(raw_context_window, int)
+        and not isinstance(raw_context_window, bool)
+        and raw_context_window > 0
+        else None
+    )
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
@@ -1260,6 +1276,7 @@ async def _pi_native_launch_config(
         reasoning_effort=reasoning_effort
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
+        context_window=context_window,
     )
 
 
@@ -4091,6 +4108,7 @@ async def _auto_create_qwen_terminal(
     # drop the prior terminal's stale forward cursor + queued input.
     await _cancel_auto_forwarder_task(session_id)
     from omnigent.harnesses.qwen_native.bridge import (
+        QWEN_SYSTEM_SETTINGS_ENV_VAR,
         bridge_dir_for_session_id,
         events_file_path,
         input_file_path,
@@ -4098,6 +4116,7 @@ async def _auto_create_qwen_terminal(
         qwen_session_id_for_conversation,
         qwen_session_recording_exists,
         write_mcp_config,
+        write_qwen_system_settings,
         write_tmux_target,
     )
     from omnigent.harnesses.qwen_native.forwarder import clear_qwen_bridge_state
@@ -4207,6 +4226,16 @@ async def _auto_create_qwen_terminal(
         else:
             mcp_args = ["--mcp-config", str(mcp_config)]
 
+    # Qwen Code has no CLI flag for the context window; it reads it from a
+    # System-scope settings file instead (see write_qwen_system_settings). An
+    # absent or zero window leaves qwen on its own model default.
+    qwen_env: dict[str, str] = {}
+    if launch_config.context_window:
+        settings_path = write_qwen_system_settings(
+            bridge_dir, context_window=launch_config.context_window
+        )
+        qwen_env[QWEN_SYSTEM_SETTINGS_ENV_VAR] = str(settings_path)
+
     # The dual-output + input-file flags wire qwen to the bridge; any user
     # ``terminal_launch_args`` (e.g. ``-m <model>``) precede them. Approval stays
     # the default in-terminal prompt (the embedded pane shows it) — Omnigent-side
@@ -4229,6 +4258,7 @@ async def _auto_create_qwen_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=qwen_command,
             args=qwen_args,
+            env=qwen_env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
