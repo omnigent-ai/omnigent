@@ -576,9 +576,9 @@ async def test_supervise_transcript_fd_exhaustion_rewarns_during_long_episode(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A sustained episode re-warns on the forwarder's cadence instead of going silent."""
+    """A sustained episode re-warns on the shared cadence and stays at DEBUG in between."""
     caplog.set_level(logging.DEBUG, logger=cnp.__name__)
-    monkeypatch.setattr(cnp, "_FD_EXHAUSTION_REWARN_S", 0.0)
+    monkeypatch.setattr(cnp, "_FD_EXHAUSTION_REWARN_S", 0.2)
 
     def _discover(*_a: object, **_k: object) -> Path:
         raise OSError(errno.EMFILE, "Too many open files")
@@ -588,10 +588,12 @@ async def test_supervise_transcript_fd_exhaustion_rewarns_during_long_episode(
 
     task = _start_supervisor(tmp_path, session_id="conv_fd_long", auto_accept_approvals=False)
     try:
-        await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 3)
+        await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 2)
     finally:
         await _stop(task)
 
+    assert _log_count(caplog, logging.WARNING, "degraded by fd exhaustion") == 2
+    assert _log_count(caplog, logging.DEBUG, "still fd-exhausted") >= 1
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 

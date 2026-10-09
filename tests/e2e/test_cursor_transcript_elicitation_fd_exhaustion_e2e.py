@@ -64,9 +64,8 @@ _DEGRADED_WAIT_S = 5.0
 _RESULT_WAIT_S = 60.0
 _ELICITATION_WAIT_S = 30.0
 
-# Runs the REAL supervisor loop, unmocked, in a separate process (the runner's
-# topology) so genuine fd exhaustion cannot destabilize pytest or the server;
-# reads its scenario from argv and reports JSON (atomic rename), never asserts.
+# Child driver: runs the real supervisor under genuine fd exhaustion in its own
+# process and reports its observations atomically as JSON.
 _DRIVER = r'''
 """Repro driver: real elicitation supervisor + genuine EMFILE window."""
 
