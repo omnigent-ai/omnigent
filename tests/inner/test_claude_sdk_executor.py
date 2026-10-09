@@ -1540,23 +1540,29 @@ class TestConstructor(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(runtime_dir.stat().st_mode), 0o700)
 
     def test_claude_internal_write_roots_dedupe_when_tempdir_is_cli_tmp_root(self):
-        """When the system tempdir already is the CLI's root, one grant suffices."""
+        """When the system tempdir already is the CLI's root, one grant suffices,
+        whether both are spelled the same or one goes through a symlink."""
         from omnigent._platform import stable_user_id
 
         if os.name != "posix":
             self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
 
         uid = stable_user_id()
-        with tempfile.TemporaryDirectory() as td:
-            cli_tmp = Path(td) / "tmp"
-            cli_tmp.mkdir()
+        for spelling in ("same", "symlinked"):
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory() as td:
+                cli_tmp = Path(td) / "tmp"
+                cli_tmp.mkdir()
+                system_tmp = cli_tmp
+                if spelling == "symlinked":
+                    system_tmp = Path(td) / "private-tmp"
+                    system_tmp.symlink_to(cli_tmp)
 
-            roots = self._claude_runtime_roots(td, system_tmp=cli_tmp, cli_tmp=cli_tmp)
+                roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
 
-            self.assertEqual(
-                [root for root in roots if root.name == f"claude-{uid}"],
-                [cli_tmp / f"claude-{uid}"],
-            )
+                self.assertEqual(
+                    [root for root in roots if root.name == f"claude-{uid}"],
+                    [system_tmp / f"claude-{uid}"],
+                )
 
     def test_claude_internal_write_roots_skip_planted_leaf(self):
         """A symlink or regular file planted at ``/tmp/claude-<uid>`` is neither

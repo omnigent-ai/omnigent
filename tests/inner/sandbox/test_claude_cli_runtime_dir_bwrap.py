@@ -49,10 +49,6 @@ def test_claude_cli_tmp_runtime_dir_writable_under_bwrap(
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
 
-    # A unique root under the real /tmp keeps bwrap's tmpfs-over-/tmp ordering in
-    # play without touching the shared /tmp/claude-<uid> of a live CLI.
-    runtime_root = Path(tempfile.mkdtemp(prefix="claude-cli-root-", dir="/tmp"))
-    runtime_dir = runtime_root / f"claude-{os.getuid()}"
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
     spec = OSEnvSpec(
@@ -67,8 +63,12 @@ def test_claude_cli_tmp_runtime_dir_writable_under_bwrap(
         ),
     )
     launcher: str | None = None
-    probe = runtime_dir / f"probe-{os.getpid()}"
+    # A unique root under the real /tmp keeps bwrap's tmpfs-over-/tmp ordering in
+    # play without touching the shared /tmp/claude-<uid> of a live CLI.
+    runtime_root = Path(tempfile.mkdtemp(prefix="claude-cli-root-", dir="/tmp"))
     try:
+        runtime_dir = runtime_root / f"claude-{os.getuid()}"
+        probe = runtime_dir / f"probe-{os.getpid()}"
         with patch("omnigent.inner.claude_sdk_executor._CLAUDE_CLI_TMP_ROOT", runtime_root):
             roots = _claude_internal_write_roots()
         sandbox = with_additional_write_roots(resolve_sandbox(spec, workspace), roots)

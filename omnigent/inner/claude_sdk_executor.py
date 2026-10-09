@@ -1305,8 +1305,8 @@ def _claude_runtime_dirs() -> list[pathlib.Path]:
     Both live under shared temp roots, so a pre-existing leaf is granted only
     when it is a real directory owned by this user. A planted symlink or
     foreign directory is skipped with a warning instead of widening the sandbox
-    to wherever it points. Under bwrap each granted dir is bound over the
-    private /tmp, so both stay host-backed like the tempdir one always has.
+    to wherever it points. Under bwrap each granted dir is bind-mounted over
+    the private /tmp.
     """
     from omnigent.harnesses.claude_native.bridge import ensure_private_dir
 
