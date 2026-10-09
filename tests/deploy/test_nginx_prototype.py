@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
+import io
 import json
 import os
 import socket
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -65,6 +67,42 @@ async def test_evidence_failure_still_removes_host_container(
     commands.assert_any_await("docker", "rm", "-f", "omnigent-prototype-client-cleanup-")
     process.terminate.assert_called_once()
     assert "host setup failed" in json.loads((args.output / "report.json").read_text())["error"]
+    assert args.mock_port > 0, "the rollout coordinator cannot probe the allocated mock port"
+
+
+async def test_transient_pod_query_failure_is_retried() -> None:
+    spec = importlib.util.spec_from_file_location("nginx_verify", PROTOTYPE / "verify.py")
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    query = AsyncMock(side_effect=[RuntimeError("Kubernetes API unavailable"), True])
+    assert await verifier.eventually(query, timeout=2)
+    assert query.await_count == 2
+
+
+@pytest.mark.parametrize("failure", [OSError, RuntimeError, asyncio.CancelledError])
+async def test_log_follower_closes_its_file_if_startup_fails(
+    monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    spec = importlib.util.spec_from_file_location("nginx_verify", PROTOTYPE / "verify.py")
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    handle = io.StringIO()
+    path = Mock()
+    path.open.return_value = handle
+    monkeypatch.setattr(
+        verifier,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=AsyncMock(side_effect=failure()),
+            subprocess=asyncio.subprocess,
+            CancelledError=asyncio.CancelledError,
+        ),
+    )
+    with pytest.raises(failure):
+        await verifier.start_log_follower(["kubectl"], "pod", path)
+    assert handle.closed
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the prototype uses Linux host networking")

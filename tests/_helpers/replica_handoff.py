@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import secrets
 import subprocess
 import time
@@ -94,6 +95,7 @@ class HandoffProxy:
         self.connections: set[asyncio.Task[Any]] = set()
         self.probes: dict[str, tuple[asyncio.Future[dict[str, Any]], bytearray]] = {}
         self.drop_forward = False
+        self.drop_forward_response = False
         self.drop_status: str | None = None
         self.refuse_tunnels = False
         self.loop.start()
@@ -102,7 +104,8 @@ class HandoffProxy:
     async def _start(self) -> None:
         self.client = httpx.AsyncClient(trust_env=False, timeout=60)
         self.gates = {
-            name: asyncio.Event() for name in ("history", "runner_stream", "browser", "updates")
+            name: asyncio.Event()
+            for name in ("history", "runner_stream", "browser", "browser_connect", "updates")
         }
         for gate in self.gates.values():
             gate.set()
@@ -136,6 +139,7 @@ class HandoffProxy:
         target: str | None = None,
         host_routes: dict[str, str] | None = None,
         drop_forward: bool | None = None,
+        drop_forward_response: bool | None = None,
         drop_status: str | None = None,
         refuse_tunnels: bool | None = None,
     ) -> None:
@@ -148,6 +152,8 @@ class HandoffProxy:
                 self.host_routes.update(host_routes)
             if drop_forward is not None:
                 self.drop_forward = drop_forward
+            if drop_forward_response is not None:
+                self.drop_forward_response = drop_forward_response
             if drop_status is not None:
                 self.drop_status = drop_status
             if refuse_tunnels is not None:
@@ -186,6 +192,8 @@ class HandoffProxy:
             if not message.get("more_body", False):
                 break
         path = scope["path"]
+        if path.endswith("/stream"):
+            await self.gates["browser_connect"].wait()
         query = scope["query_string"].decode()
         headers = [(k, v) for k, v in scope["headers"] if k not in _HOP_HEADERS]
         target = self._target(scope)
@@ -226,6 +234,12 @@ class HandoffProxy:
                 await send({"type": "http.response.body", "body": b""})
                 return
             data = await response.aread()
+            # httpx decodes compressed responses; their wire headers no longer apply.
+            response_headers = [
+                (k, v)
+                for k, v in response_headers
+                if k.lower() not in {b"content-encoding", b"content-length"}
+            ]
             if path.endswith("/items"):
                 self.note("history_read", body=evidence_body(data), target=target)
                 await self.gates["history"].wait()
@@ -343,9 +357,26 @@ class HandoffProxy:
                             future, probe_body = probe
                             if frame["kind"] == "response.body":
                                 probe_body.extend(frame["body"].encode())
-                            elif frame["kind"] == "response.end":
+                            elif frame["kind"] == "response.end" and not future.done():
                                 future.set_result(json.loads(probe_body))
                             continue
+                        request = requests.get(frame.get("id", ""))
+                        if (
+                            frame.get("kind") == "response.head"
+                            and self.drop_forward_response
+                            and request is not None
+                            and request["path"].endswith("/events")
+                            and json.loads(request.get("body") or "{}").get("type") == "message"
+                        ):
+                            self.drop_forward_response = False
+                            self.refuse_tunnels = True
+                            self.note(
+                                "lost_runner_ack",
+                                status=frame["status"],
+                                request=json.loads(request["body"]),
+                            )
+                            await send({"type": "websocket.close", "code": 1012})
+                            return
                         if frame.get("kind") == "response.body":
                             decoder = event_streams.get(frame["id"])
                             events = decoder.feed(frame["body"]) if decoder is not None else []
@@ -512,7 +543,9 @@ class HandoffLab:
             },
         )
         eventually(
-            lambda: any(self.host_id in path for path in self.proxy.tunnels), "host tunnel", 60
+            lambda: any(self.host_id in path for path in list(self.proxy.tunnels)),
+            "host tunnel",
+            60,
         )
         eventually(
             lambda: self.client.get(f"/v1/hosts/{self.host_id}").status_code == 200,
@@ -705,8 +738,12 @@ def handoff_lab(root: Path, model_url: str) -> Iterator[HandoffLab]:
         try:
             yield lab
         finally:
-            for name in ("history", "runner_stream", "browser", "updates"):
+            for name in ("history", "runner_stream", "browser", "browser_connect", "updates"):
                 lab.proxy.gate(name, hold=False)
             lab.proxy.configure(refuse_tunnels=False)
-            with contextlib.suppress(httpx.HTTPError, OSError, ValueError, TypeError):
+            try:
                 lab.save()
+            except (httpx.HTTPError, OSError, ValueError, TypeError):
+                logging.getLogger(__name__).warning(
+                    "Could not save handoff evidence", exc_info=True
+                )

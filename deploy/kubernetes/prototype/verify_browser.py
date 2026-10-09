@@ -25,7 +25,14 @@ from urllib.parse import urlsplit
 import httpx
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright, expect
-from verify import KEY_HEADER, agent_bundle, command, eventually, start_mock_server
+from verify import (
+    KEY_HEADER,
+    agent_bundle,
+    command,
+    eventually,
+    start_log_follower,
+    start_mock_server,
+)
 from verify_multi import ready
 
 OBSERVE_UI = """() => {
@@ -755,18 +762,7 @@ async def run(args):
                     }
                 )
                 if ready(pod) and name not in logs:
-                    handle = (args.output / f"{name}.log").open("w")
-                    process = await asyncio.create_subprocess_exec(
-                        *kube,
-                        "logs",
-                        name,
-                        "--timestamps",
-                        "--follow",
-                        "--since=10s",
-                        stdout=handle,
-                        stderr=asyncio.subprocess.STDOUT,
-                    )
-                    logs[name] = (process, handle)
+                    logs[name] = await start_log_follower(kube, name, args.output / f"{name}.log")
             summary["pod_samples"].append(
                 {"at": round(time.monotonic() - started, 3), "pods": pods}
             )
@@ -785,14 +781,14 @@ async def run(args):
                 for host in hosts:
                     group.create_task(host.start(browser))
             summary["browsers_ready_at_rollout"] = 6
-            summary["rollout_started_at"] = round(time.monotonic() - started, 3)
-            summary["rollout_started_epoch_ms"] = time.time() * 1000
             rolled_out = asyncio.Event()
             drivers = [asyncio.create_task(host.drive(rolled_out, summary)) for host in hosts]
             print(
                 "All six browsers ready. Starting one rolling update with turns continuing.",
                 flush=True,
             )
+            summary["rollout_started_at"] = round(time.monotonic() - started, 3)
+            summary["rollout_started_epoch_ms"] = time.time() * 1000
             await command(*kube, "rollout", "restart", "deployment/omnigent")
             summary["rollouts_triggered"] = 1
             result = await command(

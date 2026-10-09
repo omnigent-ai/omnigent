@@ -69,6 +69,25 @@ async def command(*args: str) -> str:
     return text
 
 
+async def start_log_follower(kube, name: str, path: Path):
+    handle = path.open("w")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *kube,
+            "logs",
+            name,
+            "--timestamps",
+            "--follow",
+            "--since=10s",
+            stdout=handle,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except (RuntimeError, OSError, asyncio.CancelledError):
+        handle.close()
+        raise
+    return process, handle
+
+
 async def eventually(check, *, timeout: float = 90):
     deadline = time.monotonic() + timeout
     last = None
@@ -77,7 +96,7 @@ async def eventually(check, *, timeout: float = 90):
             result = await check()
             if result:
                 return result
-        except (httpx.HTTPError, OSError, WebSocketException) as exc:
+        except (httpx.HTTPError, OSError, RuntimeError, WebSocketException) as exc:
             last = exc
         await asyncio.sleep(0.25)
     raise TimeoutError(f"Condition did not become true in {timeout}s; last error: {last}")
@@ -164,8 +183,8 @@ async def verify(
     ws = None
     try:
         mock_log = (args.output / "mock.log").open("w")
-        mock, mock_port = start_mock_server(args.mock_port, mock_log)
-        mock_url = f"http://127.0.0.1:{mock_port}"
+        mock, args.mock_port = start_mock_server(args.mock_port, mock_log)
+        mock_url = f"http://127.0.0.1:{args.mock_port}"
         client = httpx.AsyncClient(
             base_url=args.url,
             headers={"Origin": "omnigent://internal", KEY_HEADER: host_id},

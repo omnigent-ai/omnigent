@@ -249,8 +249,11 @@ plain `uv run pytest`, which starts a private server for the test.
   With `OMNIGENT_E2E_REPLICA_HANDOFF=1`,
   `tests/e2e_ui/chat/test_replica_handoff.py::test_replica_handoff_composer`
   reproduces duplicate model work, a lost idle event, and duplicate text after
-  history reconciliation. It also moves a session to a new host while the
-  original browser remains open. The companion
+  history reconciliation. Mirrored transcript records stay visible without
+  starting new model work after reconnect. An accepted prompt whose runner
+  acknowledgement was lost must finish without a send error, even if the
+  browser reconnects after the runner finishes. It also moves a session to a
+  new host while the original browser remains open. The companion
   `tests/e2e/test_replica_handoff_e2e.py::test_replica_handoff_client` covers the
   same cases through the web client API. Both use real processes and transport
   failures; only external model replies are scripted.

@@ -5390,9 +5390,14 @@ describe("chatStore — delivered-but-unacked send", () => {
       return () => attempts;
     }
 
-    it.each(["lost response", "runner unavailable"])(
-      "waits for a delayed receipt after %s without replaying the send",
-      async (failure) => {
+    it.each([
+      ["lost response", "consumed"],
+      ["runner unavailable", "consumed"],
+      ["lost response", "accepted"],
+      ["runner unavailable", "accepted"],
+    ])(
+      "waits after %s for a delayed %s receipt without replaying the send",
+      async (failure, receipt) => {
         const attempts = failSend(
           failure === "runner unavailable"
             ? new Response(
@@ -5413,12 +5418,20 @@ describe("chatStore — delivered-but-unacked send", () => {
         expect(useChatStore.getState().failedSendDraft).toBeNull();
         expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
 
-        handleSessionEvent({
-          type: "session_input_consumed",
-          itemId: attempts()[0]!,
-          itemType: "message",
-          data: { role: "user", content: [{ type: "input_text", text: "during rollout" }] },
-        });
+        handleSessionEvent(
+          receipt === "accepted"
+            ? {
+                type: "session_input_accepted",
+                conversationId: "conv_existing",
+                itemIds: [attempts()[0]!],
+              }
+            : {
+                type: "session_input_consumed",
+                itemId: attempts()[0]!,
+                itemType: "message",
+                data: { role: "user", content: [{ type: "input_text", text: "during rollout" }] },
+              },
+        );
         await vi.advanceTimersByTimeAsync(500);
         await sending;
 
@@ -5429,6 +5442,34 @@ describe("chatStore — delivered-but-unacked send", () => {
         expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
       },
     );
+
+    it("keeps a later send pending through repeated reconnect receipts for an earlier send", async () => {
+      const attempts = failSend();
+      const onError = vi.fn();
+      const sending = useChatStore
+        .getState()
+        .send("later message", "agent_xyz", undefined, { onError });
+      await vi.advanceTimersByTimeAsync(500);
+      const pending = useChatStore.getState().pendingUserMessages;
+      const blocks = useChatStore.getState().blocks;
+      const receipt = {
+        type: "session_input_accepted" as const,
+        conversationId: "conv_existing",
+        itemIds: ["earlier-message"],
+      };
+      handleSessionEvent(receipt);
+      handleSessionEvent(receipt);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+      expect(useChatStore.getState().blocks).toEqual(blocks);
+      expect(onError).not.toHaveBeenCalled();
+
+      // An unrelated receipt must not make an undelivered send look successful.
+      await vi.advanceTimersByTimeAsync(15_000);
+      await sending;
+      expect(attempts()).toHaveLength(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+    });
 
     it.each(["lost response", "runner unavailable"])(
       "returns the draft after %s when no receipt arrives within the grace period",

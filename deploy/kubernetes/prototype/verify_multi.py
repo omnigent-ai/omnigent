@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import httpx
-from verify import KEY_HEADER, command, verify
+from verify import KEY_HEADER, command, start_log_follower, verify
 
 
 def ready(pod: dict) -> bool:
@@ -137,18 +137,9 @@ async def run(args) -> None:
                         }
                     )
                     if ready(pod) and name not in logs:
-                        handle = (args.output / f"{name}.log").open("w")
-                        process = await asyncio.create_subprocess_exec(
-                            *kube,
-                            "logs",
-                            name,
-                            "--timestamps",
-                            "--follow",
-                            "--since=10s",
-                            stdout=handle,
-                            stderr=asyncio.subprocess.STDOUT,
+                        logs[name] = await start_log_follower(
+                            kube, name, args.output / f"{name}.log"
                         )
-                        logs[name] = (process, handle)
                 summary["pod_samples"].append(
                     {"at": round(time.monotonic() - started, 3), "pods": pods}
                 )

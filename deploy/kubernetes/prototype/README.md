@@ -106,14 +106,20 @@ Omnigent also needs to handle messages sent during this gap:
 
 - A `wrong_replica` response means that replica could not deliver the request.
   The browser waits and retries the same request with the same host ID.
+  It starts retries for up to 15 seconds. A request already in progress keeps
+  the caller's normal timeout or cancellation behavior; this is not an overall
+  HTTP deadline.
 - A lost HTTP response leaves delivery uncertain. A `503 runner_unavailable`
   can also mean that a prompt was saved just before its runner tunnel closed.
   The browser waits up to 15 seconds for the message's receipt on the
   reconnected event stream. It does not resend the message just because the
   connection closed. A confirmed delivery clears the pending send; a refusal
-  or an expired wait still shows
-  an error and preserves the draft. When the reconnect scan recovers a missed
-  prompt, the runner emits its acceptance receipt on the session stream.
+  or an expired wait still shows an error and preserves the draft. When the
+  reconnect scan recovers a missed prompt, the runner emits its receipt on
+  the session stream. It also confirms prompts it accepted before losing
+  the tunnel. A browser that reconnects later gets those confirmations when
+  its stream opens. These receipts identify the prompt; they do not replay
+  transcript messages or clear another pending send.
 - An SDK runner can finish a turn while its server connection is down. Its
   reconnect scan remembers which persisted message IDs it already accepted,
   queues missed messages, and keeps its local conversation history.
@@ -122,7 +128,8 @@ Omnigent also needs to handle messages sent during this gap:
   A missed message recovered after newer input has arrived runs after that
   newer input; this does not guarantee the original send order across a
   disconnect. Internal history entries, such as the marker written by Stop,
-  do not start new turns.
+  do not start new turns. The server marks newly mirrored transcript messages
+  as history-only so they cannot be mistaken for executable input.
 - The runner also sends its final SDK session status again after reconnecting.
   This clears a stale "Working…" state if the old server lost the completion.
   An actual failed turn keeps its error.
@@ -260,6 +267,8 @@ send function, recovery code, or event handling.
 | `stale_host` | An open tab retains the old host after another client moves the session through the host-launch API. |
 | `terminal_reveal` | A hidden terminal uses up its reconnect attempts before the user opens Terminal view. |
 | `stopped_turn` | After Stop and a completed later turn, reconnect recovery mistakes the interruption marker for a new prompt. |
+| `mirrored_history` | A transcript copied from another integration starts unsolicited model work when the runner reconnects. |
+| `lost_runner_ack` | The runner accepts the prompt, but its response to the server is lost before the browser receives an acceptance receipt. |
 
 The terminal test advances the browser clock through the retry delays.
 
@@ -282,13 +291,13 @@ videos, screenshots, traces, saved messages, model requests, and transport logs.
 These tests check individual recovery paths; the three-pod, six-host command
 above checks NGINX's actual endpoint reloads and Kubernetes rollout behavior.
 
-On 2026-10-09, all 18 tests passed on this branch. For the original eight cases,
-the same test and support
-files, copied without changes onto main at
-`9567b2bfc6c3f182e8ae43165c73bf0d64be9076`, produced 16 assertion failures and
+On 2026-10-09, all 22 tests passed on this branch. For ten cases, the same
+test and support files, copied without changes onto main at
+`9567b2bfc6c3f182e8ae43165c73bf0d64be9076`, produced 20 assertion failures and
 no setup errors. Main showed the send errors, extra model turns, stuck queued
 message, duplicate reply, stale host error, and terminal reconnect failure
-described above. Main's application code was unchanged for that comparison.
+described above. The newer cases also reproduced execution of mirrored history
+and a send error after the runner had already accepted the prompt. Main's application code was unchanged for that comparison.
 The two Stop tests instead exposed a regression in the earlier PR commit
 `038a1934e`: both started an unsolicited model turn there and passed after the
 fix. The test files were unchanged between those runs too.
@@ -304,16 +313,16 @@ file requests every 250 ms, the longest observed failure interval was
 Requests to both were succeeding consistently at the end. These timings
 describe that run; they do not guarantee a maximum interruption.
 
-With the recovery changes described above and `minReadySeconds: 10`, five
+With the recovery changes described above and `minReadySeconds: 10`, six
 three-pod, six-host browser runs passed on the same day. They completed
-**165, 173, 172, 169, and 170 turns**, respectively. The last run includes the
-review fixes and stricter checks for incomplete browser evidence. Every prompt and reply was
+**165, 173, 172, 169, 170, and 167 turns**, respectively. The last run includes
+the lost-acknowledgement and mirrored-history fixes. Every prompt and reply was
 saved and rendered once, each turn made one model request, no browser showed
 an error, and all six sessions finished idle. Each run started with two hosts
 per pod, replaced all three pods, and completed two additional turns per host
-after the old pods were gone. The latest rollout took **53.57 seconds**, measured
+after the old pods were gone. The latest rollout took **53.55 seconds**, measured
 through deletion of the last old pod. Its longest turn, including the model
-response, took **4.25 seconds**. These observations do not guarantee availability.
+response, took **3.96 seconds**. These observations do not guarantee availability.
 
 This is a local experiment with authentication disabled and disposable
 database credentials. The artifact volume is `ReadWriteOnce`: both server

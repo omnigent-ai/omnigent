@@ -7523,6 +7523,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // without a fresh transition, would strand the queue forever.
       return;
     }
+    case "session_input_accepted": {
+      const accepted = new Set(event.itemIds);
+      for (const itemId of accepted) {
+        if (inFlightSends.has(itemId)) inFlightSends.set(itemId, true);
+      }
+      // Repeated receipts confirm delivery; they must not pop a newer bubble.
+      applyToConversation((s) => retractDeliveredSendDraft(s, accepted, "consumed"));
+      return;
+    }
     case "session_input_consumed":
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft

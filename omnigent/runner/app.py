@@ -3221,6 +3221,13 @@ def create_runner_app(
             },
         )
 
+    @app.get("/v1/sessions/{session_id}/input-receipts")
+    async def get_input_receipts(session_id: str) -> JSONResponse:
+        """Confirm accepted inputs even when no browser saw the reconnect event."""
+        return JSONResponse(
+            {"item_ids": sorted(_received_server_item_ids.get(session_id, ()))},
+        )
+
     @app.get("/v1/sessions/{session_id}")
     async def get_session(session_id: str) -> JSONResponse:
         if process_manager is None:
@@ -7556,6 +7563,18 @@ def create_runner_app(
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue
+            # A forward's answer can die with the tunnel after we accepted it.
+            # Report acceptance independently of the history scan's cursor.
+            accepted_ids = sorted(_received_server_item_ids.get(session_id, ()))
+            for start in range(0, len(accepted_ids), 100):
+                _publish_event(
+                    session_id,
+                    {
+                        "type": "session.input.accepted",
+                        "conversation_id": session_id,
+                        "item_ids": accepted_ids[start : start + 100],
+                    },
+                )
             # A completed SDK turn's final status may have died with the old server.
             # Keep the original error/turn ID; don't replay a running edge mid-stream.
             status_event = _session_status_events.get(session_id)
@@ -7603,7 +7622,8 @@ def create_runner_app(
                     if (
                         item.get("type") != "message"
                         or item.get("role") != "user"
-                        # Stop writes history, not input; its save acknowledgment can be lost.
+                        or item.get("history_only") is True
+                        # Older servers did not mark Stop records as history-only.
                         or (
                             isinstance(response_id, str)
                             and response_id.startswith(_CANCELLATION_RESPONSE_PREFIX)

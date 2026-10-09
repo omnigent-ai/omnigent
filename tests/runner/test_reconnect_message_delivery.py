@@ -12,7 +12,7 @@ import pytest
 from omnigent.runner import app as runner_app
 from omnigent.runner import session_history
 from omnigent.runner.app import _session_histories_ref
-from omnigent.server.schemas import SessionInputConsumedEvent
+from omnigent.server.schemas import SessionInputAcceptedEvent, SessionInputConsumedEvent
 from tests.runner.conftest import _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.test_suppress_recovery_turn import (
     AGENT_ID,
@@ -67,6 +67,49 @@ async def _settle(app: Any) -> None:
         ):
             return
     pytest.fail("runner did not finish its turns")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cold_history", [False, True])
+async def test_reconnect_confirms_accepted_input_even_after_history_cursor_passes_it(
+    monkeypatch: pytest.MonkeyPatch, cold_history: bool
+) -> None:
+    server = _Server()
+    app, _, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True))
+        if cold_history:
+            monkeypatch.delitem(_session_histories_ref, SESSION_ID, raising=False)
+        else:
+            monkeypatch.setitem(_session_histories_ref, SESSION_ID, [])
+        server.items.append(_user("accepted"))
+        assert (await _forward(client, "accepted")).status_code == 200
+        await _settle(app)
+        # The first scan advances the cursor even when live delivery used warm history.
+        await app.state.catch_up_scan()
+        queue = app.state.session_event_queues[SESSION_ID]
+        while not queue.empty():
+            queue.get_nowait()
+
+        # A browser can miss every live reconnect event and ask afterward.
+        response = await client.get(f"/v1/sessions/{SESSION_ID}/input-receipts")
+        assert response.status_code == 200
+        assert response.json() == {"item_ids": ["accepted"]}
+
+        for _ in range(2):
+            await app.state.catch_up_scan()
+            events = []
+            while not queue.empty():
+                events.append(queue.get_nowait())
+            accepted = [
+                SessionInputAcceptedEvent.model_validate(event)
+                for event in events
+                if event["type"] == "session.input.accepted"
+            ]
+            assert [event.item_ids for event in accepted] == [["accepted"]]
+            assert accepted[0].conversation_id == SESSION_ID
+            assert not any(event["type"] == "session.input.consumed" for event in events)
+            assert len(harness.posted_bodies) == 1
 
 
 @pytest.mark.asyncio
@@ -320,6 +363,33 @@ async def test_attachment_failure_does_not_strand_already_recovered_messages(
         ]
 
 
+@pytest.mark.asyncio
+async def test_reconnect_recovers_inputs_but_does_not_execute_mirrored_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    app, _, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True))
+        monkeypatch.setitem(_session_histories_ref, SESSION_ID, [])
+        server.items = [
+            {**_user("mirror"), "response_id": "turn_external", "history_only": True},
+            {**_user("hidden-mirror"), "history_only": True, "is_meta": True},
+        ]
+        await app.state.catch_up_scan()
+        await _settle(app)
+        assert not harness.posted_bodies, "reconnect executed mirrored history"
+        server.items.extend([_user("missed"), {**_user("skill"), "is_meta": True}])
+        await app.state.catch_up_scan()
+        await _settle(app)
+        assert len(harness.posted_bodies) == 1
+        users = [item for item in _session_histories_ref[SESSION_ID] if item.get("role") == "user"]
+        assert [item["content"] for item in users] == [
+            _user(item_id)["content"] for item_id in ("missed", "skill")
+        ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delayed_ack", [False, True])
 async def test_reconnect_after_stop_does_not_execute_the_interruption_marker(
     monkeypatch: pytest.MonkeyPatch, delayed_ack: bool

@@ -26,6 +26,8 @@ CASES = (
     "stale_host",
     "terminal_reveal",
     "stopped_turn",
+    "mirrored_history",
+    "lost_runner_ack",
 )
 
 
@@ -61,6 +63,7 @@ class Driver:
             }
           };
           new MutationObserver(scan).observe(document.body, {childList:true, subtree:true});
+          scan();
         }""")
 
     def wait(self, check: Callable[[], Any], what: str, timeout: float = 30) -> Any:
@@ -211,7 +214,10 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
         driver.send(prompt)
         driver.wait(
             lambda: any(
-                r["status"] == 400 and r["body"].get("error", {}).get("code") == "wrong_replica"
+                r["status"] == 400
+                and isinstance(r["body"], dict)
+                and isinstance(r["body"].get("error"), dict)
+                and r["body"]["error"].get("code") == "wrong_replica"
                 for r in proxy.seen("message_response")
             ),
             "real wrong_replica response",
@@ -249,6 +255,37 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
         assert lab.messages("user").count(prompt) == 1
         page.wait_for_timeout(500)
         lab.handoff()
+    elif case == "lost_runner_ack":
+        followup = "Continue after the runner's acknowledgement was lost."
+        followup_reply = "The next turn completed after the lost acknowledgement."
+        lab.configure([{"text": reply, "pause_after": 1}, {"text": followup_reply}])
+        proxy.configure(drop_forward_response=True)
+        driver.send(prompt)
+        driver.wait(lambda: proxy.seen("lost_runner_ack"), "accepted runner response to be lost")
+        assert proxy.seen("lost_runner_ack")[0]["status"] == 202
+        driver.wait(lab.model_paused, "accepted turn to reach the model")
+        driver.wait(
+            lambda: any(r["status"] == 503 for r in proxy.seen("message_response")),
+            "server to report its lost forward response",
+        )
+        assert len(lab.model_requests()) - lab.baseline_calls == 1
+        assert lab.messages("user").count(prompt) == 1
+        # The browser reconnects after the runner, so a transient receipt alone
+        # cannot settle this send. The new stream must read the runner's receipts.
+        proxy.gate("browser_connect", hold=True)
+        lab.handoff()
+        lab.release_model()
+        driver.wait(lambda: reply in lab.messages("assistant"), "accepted turn's saved reply")
+        driver.wait(lambda: lab.snapshot()["status"] == "idle", "accepted turn to settle")
+        assert not any(r["target"] == lab.b.base_url for r in proxy.seen("browser_stream")), (
+            "the browser reconnected before the runner finished"
+        )
+        proxy.gate("browser_connect", hold=False)
+        driver.send(followup)
+        # Sends share a chain: the next POST proves the original send settled.
+        driver.wait(lambda: followup in lab.messages("user"), "follow-up after the lost receipt")
+        driver.assert_clean(followup, followup_reply, turns=2)
+        return
     elif case == "lost_idle":
         proxy.configure(drop_status="idle")
         driver.send(prompt)
@@ -266,6 +303,42 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
             "the lost idle event left the composer stuck",
         )
         driver.assert_clean(followup, followup_reply, turns=2)
+        return
+    elif case == "mirrored_history":
+        lab.configure([{"text": reply}, {"text": "UNSOLICITED: mirrored history ran as input."}])
+        driver.send(prompt)
+        driver.assert_clean(prompt, reply)
+        mirror = "This is a transcript copy, already handled elsewhere."
+        lab.client.post(
+            f"/v1/sessions/{lab.session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": mirror}],
+                        "history_only": False,
+                    },
+                    "response_id": "turn_external",
+                },
+            },
+        ).raise_for_status()
+        expect(page.get_by_text(mirror, exact=True)).to_be_visible()
+        assert len(lab.model_requests()) - lab.baseline_calls == 1
+        lab.handoff()
+        driver.wait(
+            lambda: any(
+                record["target"] == lab.b.base_url for record in proxy.seen("history_delivered")
+            ),
+            "reconnect scan to read mirrored history",
+        )
+        page.wait_for_timeout(1000)
+        assert len(lab.model_requests()) - lab.baseline_calls == 1, (
+            "reconnect executed transcript-only history as a new model turn"
+        )
+        driver.assert_clean(prompt, reply)
+        expect(page.get_by_text(mirror, exact=True)).to_be_visible()
         return
     elif case == "stopped_turn":
         lab.configure([{"text": "This turn will be interrupted.", "pause_after": 1}])

@@ -644,6 +644,43 @@ describe("OSS host routing", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("leaves an in-flight retry under the caller's abort signal after the retry window", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_oss");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ error: { code: "wrong_replica" } }, { ok: false, status: 400 }),
+    );
+    fetchMock.mockImplementationOnce(
+      (_url, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init.signal!;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
+    );
+    const { authenticatedFetch } = await import("./identity");
+    const controller = new AbortController();
+    const reason = new DOMException("Left the conversation", "AbortError");
+    let settled = false;
+    const pending = authenticatedFetch("/v1/sessions/sess_oss/events", {
+      method: "POST",
+      body: "{}",
+      signal: controller.signal,
+    })
+      .catch((error: unknown) => error)
+      .finally(() => {
+        settled = true;
+      });
+
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(settled).toBe(false);
+    expect(controller.signal.aborted).toBe(false);
+    controller.abort(reason);
+    expect(await pending).toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("cancels a pending retry without sending again", async () => {
     const { setSessionHost } = await import("./sessionHost");
     setSessionHost("sess_oss", "host_oss");

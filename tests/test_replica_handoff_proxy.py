@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -27,10 +29,79 @@ def bare_proxy() -> HandoffProxy:
     proxy.host_routes = {}
     proxy.records = []
     proxy.streams = set()
-    proxy.gates = {name: asyncio.Event() for name in ("history", "browser", "updates")}
+    proxy.gates = {
+        name: asyncio.Event() for name in ("history", "browser", "browser_connect", "updates")
+    }
     for gate in proxy.gates.values():
         gate.set()
     return proxy
+
+
+async def test_decoded_response_does_not_keep_compressed_headers() -> None:
+    proxy = bare_proxy()
+    body = b'{"status":"healthy","padding":"' + b"x" * 2048 + b'"}'
+    compressed = gzip.compress(body)
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200,
+            headers={"content-encoding": "gzip", "content-length": str(len(compressed))},
+            content=compressed,
+        )
+    )
+    messages = []
+    async with httpx.AsyncClient(transport=transport) as client:
+        proxy.client = client
+        await proxy._http(
+            {"path": "/health", "method": "GET", "query_string": b"", "headers": []},
+            AsyncMock(return_value={"type": "http.request", "body": b""}),
+            AsyncMock(side_effect=messages.append),
+        )
+    headers = dict(messages[0]["headers"])
+    assert b"content-encoding" not in headers
+    assert int(headers.get(b"content-length", len(body))) == len(body)
+    assert messages[1]["body"] == body
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_late_probe_reply_does_not_break_the_runner_tunnel(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    proxy = bare_proxy()
+    proxy.refuse_tunnels = False
+    proxy.tunnels = {}
+    future = asyncio.get_running_loop().create_future()
+    if cancelled:
+        future.cancel()
+    else:
+        future.set_result({})
+    proxy.probes = {"probe": (future, bytearray(b"{}"))}
+
+    class Upstream:
+        send = AsyncMock()
+
+        async def __aiter__(self):
+            await asyncio.Event().wait()
+            yield "unreachable"
+
+    upstream = Upstream()
+    connection = AsyncMock()
+    connection.__aenter__.return_value = upstream
+    monkeypatch.setattr("tests._helpers.replica_handoff.connect", Mock(return_value=connection))
+    following_frame = json.dumps({"kind": "response.end", "id": "real-request"})
+    receive = AsyncMock(
+        side_effect=[
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": '{"kind":"response.end","id":"probe"}'},
+            {"type": "websocket.receive", "text": following_frame},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    await proxy._websocket(
+        {"path": "/v1/runners/runner/tunnel", "query_string": b"", "headers": []},
+        receive,
+        AsyncMock(),
+    )
+    upstream.send.assert_awaited_once_with(following_frame)
 
 
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
@@ -166,11 +237,7 @@ async def test_plain_errors_reach_the_client_unchanged(
 
 
 async def test_cancel_before_sse_headers_does_not_send_a_body() -> None:
-    proxy = HandoffProxy.__new__(HandoffProxy)
-    proxy.target = "http://upstream"
-    proxy.host_routes = {}
-    proxy.records = []
-    proxy.streams = set()
+    proxy = bare_proxy()
     start_requested = asyncio.Event()
     messages = []
 
