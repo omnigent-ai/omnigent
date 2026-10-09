@@ -182,3 +182,6 @@ recovery after repeated connection and routing errors. The full browser flow
 through Kubernetes, managed-host startup, scheduled and background jobs,
 multiple ingress controllers, and abrupt node loss need separate validation
 before using this as a production deployment.
+
+For the additional message-recovery behavior and continuous browser rollout
+checks, see [Verify session recovery across server replicas](../../../docs/replica-handoff-testing.md).

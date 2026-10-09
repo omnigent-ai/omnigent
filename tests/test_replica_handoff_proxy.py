@@ -1,0 +1,366 @@
+"""The fault relay must preserve real responses and release open streams."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import gzip
+import json
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, Mock
+
+import httpx
+import pytest
+
+from tests._helpers.replica_handoff import HandoffProxy
+
+
+class OpenStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"data: {}\n\n"
+        await asyncio.Event().wait()
+
+
+def bare_proxy() -> HandoffProxy:
+    proxy = HandoffProxy.__new__(HandoffProxy)
+    proxy.target = "http://upstream"
+    proxy.host_routes = {}
+    proxy.records = []
+    proxy.streams = set()
+    proxy.connections = set()
+    proxy.tunnels = {}
+    proxy.probes = {}
+    proxy.drop_forward = False
+    proxy.drop_forward_response = False
+    proxy.drop_status = None
+    proxy.refuse_tunnels = False
+    proxy.gates = {
+        name: asyncio.Event()
+        for name in ("history", "runner_stream", "browser", "browser_connect", "updates")
+    }
+    for gate in proxy.gates.values():
+        gate.set()
+    return proxy
+
+
+async def test_decoded_response_does_not_keep_compressed_headers() -> None:
+    proxy = bare_proxy()
+    body = b'{"status":"healthy","padding":"' + b"x" * 2048 + b'"}'
+    compressed = gzip.compress(body)
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200,
+            headers={"content-encoding": "gzip", "content-length": str(len(compressed))},
+            content=compressed,
+        )
+    )
+    messages = []
+    async with httpx.AsyncClient(transport=transport) as client:
+        proxy.client = client
+        await proxy._http(
+            {"path": "/health", "method": "GET", "query_string": b"", "headers": []},
+            AsyncMock(return_value={"type": "http.request", "body": b""}),
+            AsyncMock(side_effect=messages.append),
+        )
+    headers = dict(messages[0]["headers"])
+    assert b"content-encoding" not in headers
+    assert int(headers.get(b"content-length", len(body))) == len(body)
+    assert messages[1]["body"] == body
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_late_probe_reply_does_not_break_the_runner_tunnel(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    proxy = bare_proxy()
+    proxy.refuse_tunnels = False
+    proxy.tunnels = {}
+    future = asyncio.get_running_loop().create_future()
+    if cancelled:
+        future.cancel()
+    else:
+        future.set_result({})
+    proxy.probes = {"probe": (future, bytearray(b"{}"))}
+
+    class Upstream:
+        send = AsyncMock()
+
+        async def __aiter__(self):
+            await asyncio.Event().wait()
+            yield "unreachable"
+
+    upstream = Upstream()
+    connection = AsyncMock()
+    connection.__aenter__.return_value = upstream
+    monkeypatch.setattr("tests._helpers.replica_handoff.connect", Mock(return_value=connection))
+    following_frame = json.dumps({"kind": "response.end", "id": "real-request"})
+    receive = AsyncMock(
+        side_effect=[
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": '{"kind":"response.end","id":"probe"}'},
+            {"type": "websocket.receive", "text": following_frame},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    await proxy._websocket(
+        {"path": "/v1/runners/runner/tunnel", "query_string": b"", "headers": []},
+        receive,
+        AsyncMock(),
+    )
+    upstream.send.assert_awaited_once_with(following_frame)
+
+
+@pytest.mark.parametrize(
+    ("armed_status", "event_status"),
+    [(None, None), (None, "idle"), ("idle", None), ("idle", "idle")],
+)
+async def test_status_fault_only_drops_an_explicitly_armed_status(
+    monkeypatch: pytest.MonkeyPatch, armed_status: str | None, event_status: str | None
+) -> None:
+    proxy = bare_proxy()
+    proxy.drop_status = armed_status
+    stream_opened = asyncio.Event()
+    event = {"type": "session.status"}
+    if event_status is not None:
+        event["status"] = event_status
+    frame = json.dumps(
+        {"kind": "response.body", "id": "stream", "body": f"data: {json.dumps(event)}\n\n"}
+    )
+
+    class Upstream:
+        send = AsyncMock()
+
+        async def __aiter__(self):
+            yield json.dumps(
+                {
+                    "kind": "request",
+                    "id": "stream",
+                    "path": "/sessions/session/stream",
+                    "method": "GET",
+                }
+            )
+            await asyncio.Event().wait()
+
+    upstream = Upstream()
+    connection = AsyncMock()
+    connection.__aenter__.return_value = upstream
+    monkeypatch.setattr("tests._helpers.replica_handoff.connect", Mock(return_value=connection))
+    messages = iter(
+        [
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": frame},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    async def receive():
+        message = next(messages)
+        if message["type"] == "websocket.receive":
+            await asyncio.wait_for(stream_opened.wait(), 1)
+        return message
+
+    async def send(message):
+        if message["type"] == "websocket.send":
+            stream_opened.set()
+
+    await proxy._websocket(
+        {"path": "/v1/runners/runner/tunnel", "query_string": b"", "headers": []}, receive, send
+    )
+    should_drop = armed_status is not None and event_status == armed_status
+    assert bool(proxy.seen("lost_status")) is should_drop
+    if should_drop:
+        upstream.send.assert_not_awaited()
+    else:
+        upstream.send.assert_awaited_once_with(frame)
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+async def test_fragmented_sse_preserves_events_and_wire_bytes(newline: bytes) -> None:
+    proxy = bare_proxy()
+    wire = b'data: {"type":"response.in_progress"}\n\ndata: {"text":"\xce\xa9"}\n\n'
+    wire = wire.replace(b"\n", newline)
+
+    class FragmentedStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for value in wire:
+                yield bytes([value])
+
+    messages = []
+    receive = AsyncMock(return_value={"type": "http.request", "body": b""})
+    send = AsyncMock(side_effect=messages.append)
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=FragmentedStream()
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        proxy.client = client
+        await proxy._http(
+            {"path": "/stream", "method": "GET", "query_string": b"", "headers": []},
+            receive,
+            send,
+        )
+    assert b"".join(message.get("body", b"") for message in messages) == wire
+    assert [event for record in proxy.seen("browser_events") for event in record["events"]] == [
+        {"type": "response.in_progress"},
+        {"text": "Ω"},
+    ]
+
+
+@pytest.mark.parametrize("closed_transport", [False, True])
+async def test_cancel_open_sse_preserves_cancellation(closed_transport: bool) -> None:
+    proxy = bare_proxy()
+    streaming = asyncio.Event()
+    receive = AsyncMock(return_value={"type": "http.request", "body": b""})
+
+    async def send(message: dict[str, Any]) -> None:
+        if message.get("more_body"):
+            streaming.set()
+        elif message["type"] == "http.response.body" and closed_transport:
+            raise RuntimeError("transport already closed")
+
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=OpenStream()
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        proxy.client = client
+        task = asyncio.create_task(
+            proxy._http(
+                {"path": "/stream", "method": "GET", "query_string": b"", "headers": []},
+                receive,
+                send,
+            )
+        )
+        await asyncio.wait_for(streaming.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert task.cancelled()
+    assert not proxy.streams
+
+
+@pytest.mark.parametrize("use_header", [False, True])
+async def test_websocket_uses_the_moved_hosts_route(
+    monkeypatch: pytest.MonkeyPatch, use_header: bool
+) -> None:
+    proxy = bare_proxy()
+    proxy.host_routes = {"moved-host": "http://replacement"}
+    dial = Mock(return_value=AsyncMock())
+    monkeypatch.setattr("tests._helpers.replica_handoff.connect", dial)
+    query = b"" if use_header else b"omnigent_slice_key=moved-host"
+    headers = [(b"x-databricks-omnigent-slice-key", b"moved-host")] if use_header else []
+    await proxy._websocket(
+        {"path": "/v1/sessions/session/updates", "query_string": query, "headers": headers},
+        AsyncMock(return_value={"type": "websocket.disconnect"}),
+        AsyncMock(),
+    )
+    expected = "ws://replacement/v1/sessions/session/updates"
+    if query:
+        expected += f"?{query.decode()}"
+    assert dial.call_args.args[0] == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "request_body", "status", "response_body"),
+    [
+        ("/items", b"", 500, b"upstream unavailable"),
+        ("/items", b"", 204, b""),
+        ("/events", b'{"type":"message"}', 503, b"upstream unavailable"),
+        ("/events", b"not json", 400, b"invalid JSON"),
+        ("/events", b"[]", 400, b"expected an object"),
+    ],
+)
+async def test_plain_errors_reach_the_client_unchanged(
+    path: str, request_body: bytes, status: int, response_body: bytes
+) -> None:
+    proxy = bare_proxy()
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": request_body}
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == f"http://upstream{path}"
+        assert request.content == request_body
+        return httpx.Response(status, content=response_body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        proxy.client = client
+        await proxy._http(
+            {"path": path, "method": "POST", "query_string": b"", "headers": []},
+            receive,
+            send,
+        )
+    assert messages[0]["status"] == status
+    assert messages[1] == {"type": "http.response.body", "body": response_body}
+
+
+async def test_cancel_before_sse_headers_does_not_send_a_body() -> None:
+    proxy = bare_proxy()
+    start_requested = asyncio.Event()
+    messages = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b""}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            start_requested.set()
+            await asyncio.Event().wait()
+        messages.append(message)
+
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=OpenStream()
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        proxy.client = client
+        task = asyncio.create_task(
+            proxy._http(
+                {"path": "/stream", "method": "GET", "query_string": b"", "headers": []},
+                receive,
+                send,
+            )
+        )
+        await asyncio.wait_for(start_requested.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert messages == [], "the relay sent an SSE body before its headers"
+    assert not proxy.streams
+
+
+def test_shutdown_finishes_while_the_browser_keeps_its_stream_open(tmp_path: Path) -> None:
+    proxy = HandoffProxy("http://upstream", tmp_path / "network.json")
+
+    async def install_upstream() -> None:
+        await proxy.client.aclose()
+        proxy.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200, headers={"content-type": "text/event-stream"}, stream=OpenStream()
+                )
+            )
+        )
+
+    proxy.loop.run(install_upstream())
+    try:
+        with httpx.Client(trust_env=False, timeout=2) as browser:
+            with browser.stream("GET", f"{proxy.url}/stream") as response:
+                chunks = response.iter_raw()
+                assert next(chunks) == b"data: {}\n\n"
+                proxy.close()
+                assert list(chunks) == []
+        assert not proxy.connections
+    finally:
+        if not proxy.task.done():
+            with contextlib.suppress(Exception):
+                proxy.close()

@@ -84,6 +84,21 @@ def test_truncate_sse_beyond_length_is_a_noop() -> None:
     assert truncate_sse(full, _count_events(full) + 5) == full
 
 
+@pytest.mark.parametrize("pause_after", [0, 10_000])
+def test_unreachable_pause_reports_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch, pause_after: int
+) -> None:
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        client.post(
+            "/mock/configure",
+            json={"responses": [{"text": "hello", "pause_after": pause_after}]},
+        ).raise_for_status()
+        response = client.post("/v1/responses", json={"model": "mock-model", "stream": True})
+    assert response.status_code == 422
+    assert f"pause_after={pause_after}" in response.json()["error"]["message"]
+
+
 @pytest.mark.parametrize(
     "queued_response",
     [

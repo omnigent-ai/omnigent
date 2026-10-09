@@ -5360,6 +5360,138 @@ describe("chatStore — delivered-but-unacked send", () => {
   // A network failure on the send POST only proves the acknowledgement was lost;
   // the committed item arriving under the send's stable id proves delivery.
 
+  describe("OSS replica handoff", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+    });
+
+    afterEach(() => vi.unstubAllEnvs());
+
+    const lostResponse = () => Promise.reject(new TypeError("Failed to fetch"));
+    const runnerUnavailable = () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: { code: "runner_unavailable", message: "Tunnel closed during delivery" },
+          }),
+          { status: 503 },
+        ),
+      );
+
+    /** Fail the first `failures` send POSTs; returns the stable id of every attempt. */
+    function failSend(failure: () => Promise<Response>, failures = Infinity): () => string[] {
+      const attempts: string[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path === "/v1/sessions/conv_existing/events" && init?.method === "POST") {
+          const event = JSON.parse(init.body as string) as { data: { stable_id: string } };
+          attempts.push(event.data.stable_id);
+          if (attempts.length <= failures) return failure();
+        }
+        return defaultFetchHandler(input, init);
+      });
+      return () => attempts;
+    }
+
+    it.each([
+      ["lost response", lostResponse],
+      ["runner reconnect", runnerUnavailable],
+    ])("resends the same message after a %s until the server answers", async (_, failure) => {
+      const attempts = failSend(failure, 2);
+      const onError = vi.fn();
+      const sending = useChatStore
+        .getState()
+        .send("during rollout", "agent_xyz", undefined, { onError });
+      await vi.advanceTimersByTimeAsync(2000);
+      await sending;
+
+      expect(attempts()).toHaveLength(3);
+      expect(new Set(attempts()).size).toBe(1);
+      expect(onError).not.toHaveBeenCalled();
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
+    });
+
+    it("stops resending once the runner's acknowledgement confirms delivery", async () => {
+      const attempts = failSend(lostResponse);
+      const onError = vi.fn();
+      const sending = useChatStore
+        .getState()
+        .send("during rollout", "agent_xyz", undefined, { onError });
+      await vi.advanceTimersByTimeAsync(600);
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: attempts()[0]!,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "during rollout" }] },
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      await sending;
+
+      expect(attempts().length).toBeLessThan(4);
+      expect(onError).not.toHaveBeenCalled();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
+    });
+
+    it.each([
+      ["lost response", lostResponse, false],
+      ["runner reconnect", runnerUnavailable, true],
+    ])(
+      "returns the draft when a %s outlasts the handoff window",
+      async (_, failure, serverRefused) => {
+        const attempts = failSend(failure);
+        const sending = useChatStore.getState().send("during rollout", "agent_xyz");
+        await vi.advanceTimersByTimeAsync(15_000);
+        await sending;
+
+        expect(attempts().length).toBeGreaterThan(1);
+        expect(new Set(attempts()).size).toBe(1);
+        expect(useChatStore.getState().failedSendDraft).toMatchObject({
+          text: "during rollout",
+          stableId: attempts()[0],
+          serverRefused,
+        });
+        expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(true);
+      },
+    );
+
+    it("surfaces a confirmed refusal without resending", async () => {
+      const attempts = failSend(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error: { code: "invalid_request", message: "Message refused" },
+            }),
+            { status: 400, headers: { "Content-Type": "application/json" } },
+          ),
+        ),
+      );
+      await useChatStore.getState().send("during rollout", "agent_xyz");
+
+      expect(attempts()).toHaveLength(1);
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({ serverRefused: true });
+      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(true);
+    });
+
+    it("sends a native terminal session's message once", async () => {
+      // The runner's duplicate check covers SDK sessions only.
+      useChatStore.setState({ isNativeTerminalSession: true });
+      const attempts = failSend(lostResponse);
+      const sending = useChatStore.getState().send("during rollout", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(15_000);
+      await sending;
+
+      expect(attempts()).toHaveLength(1);
+    });
+  });
+
   it("retracts the failed-send draft when its message commits under the send's stable id", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -5447,6 +5579,7 @@ describe("chatStore — delivered-but-unacked send", () => {
 
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(false);
   });
 
   it("marks the draft server-refused when the POST is answered with an Omnigent error", async () => {
@@ -11863,6 +11996,45 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("keeps one saved reply when a replacement server missed the turn header", async () => {
+    const id = "conv_missing_turn_header";
+    const reply = "The conversation is responding.";
+    const saved = assistantMessage("turn_recovered", reply);
+    seedSession(id, []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: id, abortController: controller });
+    const loop = startStreamPump(id, controller, setState, getState);
+    try {
+      await drainAsync();
+      sinks[0]!.push(sse("response.in_progress", { id: "resp_original", status: "in_progress" }));
+      await drainAsync();
+      sinks[0]!.error();
+      await drainAsync();
+
+      // Captured rollout sequence: the new relay gets the text and completion,
+      // but persists under a fallback ID because the old relay got the header.
+      sinks[1]!.push(sse("response.output_text.delta", { delta: reply }));
+      sinks[1]!.push(sse("response.output_item.done", { item: saved }));
+      sinks[1]!.push(sse("response.completed", { id: "resp_original", status: "completed" }));
+      sinks[1]!.push(sse("session.status", { status: "idle" }));
+      await drainAsync();
+      seedSessionItems(id, [saved]);
+      sinks[1]!.error();
+      await drainAsync();
+
+      const texts = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
+      expect(texts).toHaveLength(1);
+      expect(texts[0]!.fullText).toBe(reply);
+      expect(texts[0]!.ctx.itemId).toBe(saved.id);
+    } finally {
+      controller.abort();
+      sinks.at(-1)!.close();
+      await drainAsync();
+      await loop;
+    }
   });
 
   it("reopens the stream after a transport drop, then stops on [DONE]", async () => {

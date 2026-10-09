@@ -10,7 +10,7 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   getSessionSlim: vi.fn(),
 }));
 
-import { getSessionHost } from "@/lib/sessionHost";
+import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import { prefetchSessionHostChain, useSession } from "./useSession";
@@ -185,6 +185,32 @@ describe("prefetchSessionHostChain", () => {
       "managed_child",
       "managed_parent",
     ]);
+  });
+
+  it.each([false, true])("refreshes a stale host mapping (inherited: %s)", async (inherited) => {
+    const { client } = harness();
+    const id = `moved_${inherited}`;
+    const parent = `${id}_parent`;
+    const old = routed(id, inherited ? null : "host_old", inherited ? parent : null);
+    client.setQueryData(["session", id], old);
+    setSessionHost(id, old.hostId);
+    setSessionParent(id, old.parentSessionId);
+    if (inherited) {
+      client.setQueryData(["session", parent], routed(parent, "host_old", null));
+      setSessionHost(parent, "host_old");
+    }
+    expect(getSessionHost(id)).toBe("host_old");
+    serve([
+      routed(id, inherited ? null : "host_new", inherited ? parent : null),
+      routed(parent, "host_new", null),
+    ]);
+
+    await prefetchSessionHostChain(client, id, { force: true });
+
+    expect(getSessionHost(id)).toBe("host_new");
+    expect(getSessionSlimMock.mock.calls.map(([sessionId]) => sessionId)).toEqual(
+      inherited ? [id, parent] : [id],
+    );
   });
 
   it("fetches again after a pre-provisioning snapshot already in flight settles", async () => {

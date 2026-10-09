@@ -809,6 +809,8 @@ describe("BlockStream — multi-response (session-lifetime reducer)", () => {
     const textDones = blocks.filter((b): b is TextDone => b.type === "text_done");
     expect(textDones).toHaveLength(1);
     expect(textDones[0]!.fullText).toBe("Hi! 👋");
+    // Reconnect snapshots deduplicate by the saved item ID.
+    expect(textDones[0]!.ctx.itemId).toBe("msg_X");
   });
 
   it("response_in_progress sets the responseId when response.created is absent", () => {

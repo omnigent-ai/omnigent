@@ -80,6 +80,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   Codex terminal's other keys still behave as before.
 - **`reconnect`:**
   `tests/e2e_ui/shells/test_terminal_bridge_reconnect.py::test_embedded_terminal_reconnects_after_transport_close`
+- **`reconnect`, hidden terminal during an OSS routing outage (own environment):**
+  `OMNIGENT_E2E_REPLICA_HANDOFF=1 uv run --no-sync pytest tests/e2e_ui/chat/test_replica_handoff.py -k terminal_reveal --ui-skip-build --video=on`
+  closes a real terminal connection with `4400`, verifies the visible reconnect,
+  exhausts the hidden terminal's retry budget, and opens Terminal view to
+  recover. It then sends another message through the composer. The fixture
+  starts its own servers, host, and runner; see the Kubernetes example README
+  for dependencies.
 - **`host-switch-reattach`:**
   `tests/e2e_ui/sessions/test_host_switch_reattaches_terminal.py::test_switching_host_reattaches_the_web_terminal`
   covers the terminal strip. The agent terminal has only web unit coverage:

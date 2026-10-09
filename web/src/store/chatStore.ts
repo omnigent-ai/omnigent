@@ -134,7 +134,7 @@ import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
-import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
+import { getOmnigentHostConfig, isDatabricksWorkspace, isHostRoutingEnabled } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
 import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
@@ -1501,6 +1501,31 @@ const sendChains = new Map<string | symbol, SendChain>();
  */
 const inFlightSends = new Map<string, boolean>();
 
+/**
+ * Resend a message whose answer an OSS replica handoff lost. The server keeps
+ * one item per stable id and an SDK runner answers a repeat as already
+ * accepted, so a resend cannot start a second turn.
+ */
+async function postAcrossReplicaHandoff<T>(stableId: string, post: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop
+      return await post();
+    } catch (err) {
+      const answerLost = !(err instanceof ApiError) || (err.code === null && err.status >= 500);
+      const runnerMoving = err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE;
+      // A consumed event already proved delivery; the caller settles the send.
+      const delivered = inFlightSends.get(stableId) === true;
+      if (delivered || !(answerLost || runnerMoving) || Date.now() + 500 > deadline) throw err;
+      // oxlint-disable-next-line no-await-in-loop
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 500);
+      });
+    }
+  }
+}
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2473,14 +2498,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
-          stable_id: stableId,
-        },
-      });
+      const postMessage = () =>
+        postEvent(sessionId, {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+            stable_id: stableId,
+          },
+        });
+      // OSS ingress can lose an SDK send's answer while its host's tunnels move.
+      const resendable =
+        isHostRoutingEnabled() &&
+        !isDatabricksWorkspace() &&
+        setterForState(sessionId)?.isNativeTerminalSession === false;
+      const postResult = await (resendable
+        ? postAcrossReplicaHandoff(stableId, postMessage)
+        : postMessage());
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2538,21 +2572,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
-      // A codex `/side` that armed the side-chat latch (line ~2103) but then
-      // failed — e.g. the host is too old and the server refused — must disarm
-      // it, or the next sub-agent created under this parent would wrongly open
-      // as a side-chat tab. Clear only our own arm: a newer `/side` re-arm or a
-      // `session_created` that already consumed the latch must not be clobbered.
-      if (opensSideChat && get().awaitingSideChatFor === submitConversationId) {
-        useChatStore.setState({ awaitingSideChatFor: null });
-      }
-      // A caller that owns its own failure UX (e.g. a codex `/side`, whose error
-      // belongs to the side-chat tab, not the parent chat) takes the message and
-      // suppresses the default surfacing below — no restored draft, no error
-      // block in the parent transcript. The bubble rollback + status settle still
-      // run so the parent isn't left mid-send.
-      const callerHandlesError = opts?.onError !== undefined;
-      opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -2589,9 +2608,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
       }
+      if (deliveredDespiteFailure) {
+        if (draftSessionId !== null) {
+          setterFor(draftSessionId)((s) => ({
+            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          }));
+        }
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
+      // Clear only this send's side-chat latch; a newer /side may have replaced it.
+      if (opensSideChat && get().awaitingSideChatFor === submitConversationId) {
+        useChatStore.setState({ awaitingSideChatFor: null });
+      }
+      const callerHandlesError = opts?.onError !== undefined;
+      opts?.onError?.(message);
       if (
         !callerHandlesError &&
-        !deliveredDespiteFailure &&
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {

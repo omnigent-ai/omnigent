@@ -37,6 +37,9 @@ class SessionHistory:
     extract_last_assistant_text: Callable[[str], str]
     handle_harness_compaction: Callable[[str, _JsonObject], Coroutine[Any, Any, None]]
     load_history_as_input: _LoadHistoryAsInputFn
+    load_history_with_prompt_id: Callable[
+        [str], Coroutine[Any, Any, tuple[list[_JsonObject], str | None]]
+    ]
     seed_last_server_item_id: Callable[[str], Coroutine[Any, Any, None]]
 
 
@@ -97,6 +100,14 @@ def build_session_history(
         session_id: str,
         drop_item_id: str | None = None,
     ) -> list[_JsonObject]:
+        history, _prompt_id = await _load_history_with_prompt_id(session_id, drop_item_id)
+        return history
+
+    async def _load_history_with_prompt_id(
+        session_id: str,
+        drop_item_id: str | None = None,
+    ) -> tuple[list[_JsonObject], str | None]:
+        """Load history as harness input, with the id of a user message that ends it."""
         all_items: list[_JsonObject] = []
         after_cursor: str | None = None
         while True:
@@ -155,7 +166,10 @@ def build_session_history(
                     session_id=session_id,
                     server_client=server_client,
                 )
-        return converted
+        tail: _JsonObject = all_items[-1] if all_items else {}
+        prompt_id = tail.get("id")
+        ends_on_prompt = tail.get("type") == "message" and tail.get("role") == "user"
+        return converted, prompt_id if ends_on_prompt and isinstance(prompt_id, str) else None
 
     def _convert_raw_items_to_input(
         items: list[_JsonObject],
@@ -439,5 +453,6 @@ def build_session_history(
         extract_last_assistant_text=_extract_last_assistant_text,
         handle_harness_compaction=_handle_harness_compaction,
         load_history_as_input=_load_history_as_input,
+        load_history_with_prompt_id=_load_history_with_prompt_id,
         seed_last_server_item_id=_seed_last_server_item_id,
     )
