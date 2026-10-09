@@ -1,18 +1,9 @@
-"""E2E regression: a stale ``SSL_CERT_FILE`` must not kill Claude transcript forwarding.
+"""E2E regression: a stale ``SSL_CERT_FILE`` must not stop the supervised Claude
+transcript forwarder from delivering a session's transcript to the web chat view.
 
-A claude-native session against a remote (non-loopback) Omnigent server mirrors
-its transcript through ``supervise_forwarder``, whose server clients come from
-``open_server_client``. That factory honors the CA environment for non-loopback
-URLs, so with ``SSL_CERT_FILE`` pointing at a file that no longer exists the
-client construction used to raise ``FileNotFoundError`` before the first poll,
-the supervisor restarted the identical crash forever, and the web chat view
-never received the transcript.
-
-Stand-in environment: a real ``omnigent server`` subprocess bound to ``0.0.0.0``
-reached at a non-loopback alias that still routes to the local listener, so
-``open_server_client`` takes the same branch as a remote deployment. The real
-claude-native session, bridge dir, and ``supervise_forwarder`` are used; only a
-seeded one-turn JSONL transcript replaces a live Claude CLI.
+A real ``omnigent server`` subprocess is reached at a non-loopback alias so
+``open_server_client`` takes its remote-server branch; a seeded one-turn JSONL
+transcript replaces a live Claude CLI.
 
 Run::
 
@@ -158,7 +149,14 @@ def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
         "OMNIGENT_AUTH_PROVIDER": "header",
         "OMNIGENT_LOCAL_SINGLE_USER": "1",
     }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
         env.pop(name, None)
     # Strip ambient credentials/config that would alter server behaviour.
     for name in list(env):
@@ -405,7 +403,14 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
 
     # The in-process forwarder legs must connect directly (trust_env=True
     # would otherwise route the non-loopback URL through any ambient proxy).
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
         monkeypatch.delenv(name, raising=False)
 
     db_path = tmp_path / "chat.db"
@@ -450,6 +455,7 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
                 "reported crash lives in"
             )
 
+        import omnigent.util.tls as tls_module
         from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
 
         # ---- Control leg: healthy SSL_CERT_FILE at the same non-loopback URL.
@@ -497,6 +503,9 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
         stale_ca = tmp_path / "rotated-away-ca-bundle.pem"  # never created
         assert not stale_ca.exists()
         monkeypatch.setenv("SSL_CERT_FILE", str(stale_ca))
+        # The control leg cached the shared context; drop it so this leg
+        # resolves trust with the stale bundle in place.
+        tls_module._client_ssl_context = None
 
         def _bug_done(cap: _CrashLogCapture) -> bool:
             # Either the crash loop is demonstrated (>= 3 identical restarts)
@@ -550,3 +559,6 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
         server_log.close()
         for bridge in bridges:
             shutil.rmtree(bridge, ignore_errors=True)
+        import omnigent.util.tls as tls_module
+
+        tls_module._client_ssl_context = None

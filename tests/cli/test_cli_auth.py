@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import socket
 import sys
 import time
 from collections.abc import Iterator
@@ -1136,47 +1135,21 @@ def test_open_server_client_loopback_skips_shared_trust_context(
         asyncio.run(client.aclose())
 
 
-def _url_host(host: str) -> str:
-    """Format *host* for a URL authority (IPv6 literals need brackets)."""
-    return f"[{host}]" if ":" in host else host
+# The handshake tests serve TLS on loopback and override the loopback
+# classification, so ``open_server_client`` takes its remote-server branch
+# (``trust_env=True`` plus the shared verifying context) deterministically.
+_TLS_LISTENER_HOST = "127.0.0.1"
 
 
-def _remote_style_listener_address() -> tuple[str, str] | None:
-    """Return ``(bind_host, client_host)`` for a local TLS listener reached as a remote.
-
-    ``open_server_client`` takes its remote-server branch only for a URL that
-    ``is_loopback_url`` rejects, so the client must address the listener at a
-    non-loopback-classified host that still routes to this machine. The
-    IPv4-mapped loopback alias is preferred because nothing leaves the host;
-    interpreters that classify it as loopback fall back to the primary
-    interface address. ``None`` when neither candidate works here.
-    """
-    from omnigent_client._http import is_loopback_url
-
-    candidates = [("127.0.0.1", "::ffff:127.0.0.1")]
-    with contextlib.suppress(OSError), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        probe.connect(("8.8.8.8", 80))  # route lookup only; a UDP connect sends nothing
-        primary = probe.getsockname()[0]
-        candidates.append((primary, primary))
-    for bind_host, client_host in candidates:
-        if is_loopback_url(f"https://{_url_host(client_host)}:1"):
-            continue
-        with socket.socket() as listener:
-            try:
-                listener.bind((bind_host, 0))
-                listener.listen(1)
-                with socket.create_connection((client_host, listener.getsockname()[1]), timeout=2):
-                    return bind_host, client_host
-            except OSError:
-                continue
-    return None
+def _treat_server_as_remote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``open_server_client`` classify every URL as non-loopback."""
+    monkeypatch.setattr("omnigent_client._http.is_loopback_url", lambda _url: False)
 
 
-def _self_signed_server_cert(directory: Path, host: str) -> tuple[Path, Path]:
-    """Write a self-signed TLS server certificate valid for the IP literal *host*.
+def _self_signed_server_cert(directory: Path) -> tuple[Path, Path]:
+    """Write a self-signed TLS server certificate for the loopback listener.
 
     :param directory: Where ``server.pem`` / ``server.key`` are written.
-    :param host: IP address the client will verify the certificate against.
     :returns: ``(cert_path, key_path)``; the certificate is also its own CA.
     """
     import datetime as dt
@@ -1199,7 +1172,9 @@ def _self_signed_server_cert(directory: Path, host: str) -> tuple[Path, Path]:
         .not_valid_before(now - dt.timedelta(minutes=5))
         .not_valid_after(now + dt.timedelta(days=1))
         .add_extension(
-            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(host))]),
+            x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address(_TLS_LISTENER_HOST))]
+            ),
             critical=False,
         )
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
@@ -1219,16 +1194,12 @@ def _self_signed_server_cert(directory: Path, host: str) -> tuple[Path, Path]:
 
 
 @contextlib.contextmanager
-def _https_listener(
-    cert_path: Path, key_path: Path, *, bind_host: str, client_host: str
-) -> Iterator[str]:
-    """Serve ``200`` for every GET over TLS on *bind_host*.
+def _https_listener(cert_path: Path, key_path: Path) -> Iterator[str]:
+    """Serve ``200`` for every GET over TLS 1.2+ on loopback.
 
     :param cert_path: PEM certificate to present.
     :param key_path: PEM private key for *cert_path*.
-    :param bind_host: Address the listener binds to.
-    :param client_host: Non-loopback-classified host clients use to reach it.
-    :yields: The ``https://<client_host>:<port>`` base URL of the listener.
+    :yields: The ``https://127.0.0.1:<port>`` base URL of the listener.
     """
     import ssl
     import threading
@@ -1244,7 +1215,7 @@ def _https_listener(
         def log_message(self, *_args: object) -> None:
             pass
 
-    server = HTTPServer((bind_host, 0), _Handler)
+    server = HTTPServer((_TLS_LISTENER_HOST, 0), _Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(cert_path), str(key_path))
@@ -1252,7 +1223,7 @@ def _https_listener(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"https://{_url_host(client_host)}:{server.server_address[1]}"
+        yield f"https://{_TLS_LISTENER_HOST}:{server.server_address[1]}"
     finally:
         server.shutdown()
         server.server_close()
@@ -1287,19 +1258,14 @@ def test_open_server_client_https_honors_valid_ssl_cert_file(
     token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
 ) -> None:
     """A valid ``SSL_CERT_FILE`` still verifies a real HTTPS listener end to end."""
-    address = _remote_style_listener_address()
-    if address is None:
-        pytest.skip("no non-loopback-classified address reaches a local listener here")
-    bind_host, client_host = address
     from omnigent.cli_auth import open_server_client
 
-    cert_path, key_path = _self_signed_server_cert(tmp_path, client_host)
+    cert_path, key_path = _self_signed_server_cert(tmp_path)
     _direct_remote_env(monkeypatch)
+    _treat_server_as_remote(monkeypatch)
     monkeypatch.setenv("SSL_CERT_FILE", str(cert_path))
 
-    with _https_listener(
-        cert_path, key_path, bind_host=bind_host, client_host=client_host
-    ) as base_url:
+    with _https_listener(cert_path, key_path) as base_url:
         assert _get_health_status(open_server_client(base_url)) == 200
 
 
@@ -1311,19 +1277,14 @@ def test_open_server_client_https_stale_ssl_cert_file_keeps_verifying(
     Construction must succeed, and the handshake against a listener the default
     roots do not trust must still fail closed.
     """
-    address = _remote_style_listener_address()
-    if address is None:
-        pytest.skip("no non-loopback-classified address reaches a local listener here")
-    bind_host, client_host = address
     from omnigent.cli_auth import open_server_client
 
-    cert_path, key_path = _self_signed_server_cert(tmp_path, client_host)
+    cert_path, key_path = _self_signed_server_cert(tmp_path)
     _direct_remote_env(monkeypatch)
+    _treat_server_as_remote(monkeypatch)
     monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "rotated-away-ca.pem"))
 
-    with _https_listener(
-        cert_path, key_path, bind_host=bind_host, client_host=client_host
-    ) as base_url:
+    with _https_listener(cert_path, key_path) as base_url:
         client = open_server_client(base_url)
         with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
             _get_health_status(client)

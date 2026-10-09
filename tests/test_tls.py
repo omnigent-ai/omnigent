@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import ssl
+from pathlib import Path
 
 import certifi
 import pytest
@@ -21,13 +24,41 @@ def _verify_paths(
         openssl_cafile_env="SSL_CERT_FILE",
         openssl_cafile=openssl_cafile,
         openssl_capath_env="SSL_CERT_DIR",
-        openssl_capath=None,
+        openssl_capath=capath,
     )
 
 
+def _one_root_bundle(directory: Path) -> Path:
+    """Write a bundle holding exactly one root taken from certifi."""
+    match = re.search(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        Path(certifi.where()).read_text(),
+        re.S,
+    )
+    assert match is not None
+    bundle = directory / "one-root.pem"
+    bundle.write_text(match.group(0) + "\n")
+    return bundle
+
+
+def _spy_verify_locations(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str | None, str | None]]:
+    """Record every ``(cafile, capath)`` loaded into any context."""
+    seen: list[tuple[str | None, str | None]] = []
+    real_load = ssl.SSLContext.load_verify_locations
+
+    def _spy(self, cafile=None, capath=None, cadata=None):
+        seen.append((cafile, capath))
+        return real_load(self, cafile=cafile, capath=capath, cadata=cadata)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_verify_locations", _spy)
+    return seen
+
+
 @pytest.fixture(autouse=True)
-def _reset_context_cache() -> None:
-    """Reset the module-level cached context around each test."""
+def _isolated_trust_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test without ambient CA env vars and with an empty context cache."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     tls_module._client_ssl_context = None
     yield
     tls_module._client_ssl_context = None
@@ -86,53 +117,94 @@ def test_client_ssl_context_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_resolve_ca_dir_returns_existing_ssl_cert_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """A present ``SSL_CERT_DIR`` (capath) directory is surfaced."""
+    """A configured ``SSL_CERT_DIR`` that exists is surfaced."""
     capath = tmp_path / "certs"
     capath.mkdir()
-    monkeypatch.setattr(
-        ssl, "get_default_verify_paths", lambda: _verify_paths(None, None, capath=str(capath))
-    )
+    monkeypatch.setenv("SSL_CERT_DIR", str(capath))
     assert resolve_ca_dir() == str(capath)
 
 
-def test_resolve_ca_dir_ignores_missing_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """A stale/missing capath is ignored (never raises), unlike a bare load."""
+def test_resolve_ca_dir_ignores_missing_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stale ``SSL_CERT_DIR`` is logged and ignored, never raised."""
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "gone"))
+    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
+        assert resolve_ca_dir() is None
+    assert "SSL_CERT_DIR" in caplog.text
+
+
+def test_resolve_ca_dir_none_when_unset(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """OpenSSL's compiled-in directory is a default, not configuration."""
+    default_dir = tmp_path / "compiled-in-certs"
+    default_dir.mkdir()
+    monkeypatch.setattr(
+        ssl, "get_default_verify_paths", lambda: _verify_paths(None, None, capath=str(default_dir))
+    )
+    assert resolve_ca_dir() is None
+
+
+def test_client_ssl_context_file_only_excludes_default_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A restricted ``SSL_CERT_FILE`` trusts only that bundle.
+
+    The compiled-in certificate directory must not widen an explicitly
+    restricted trust set.
+    """
+    bundle = _one_root_bundle(tmp_path)
+    default_dir = tmp_path / "compiled-in-certs"
+    default_dir.mkdir()
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
     monkeypatch.setattr(
         ssl,
         "get_default_verify_paths",
-        lambda: _verify_paths(None, None, capath=str(tmp_path / "gone")),
+        lambda: _verify_paths(str(bundle), str(bundle), capath=str(default_dir)),
     )
-    assert resolve_ca_dir() is None
+    seen = _spy_verify_locations(monkeypatch)
+
+    ctx = client_ssl_context()
+
+    assert seen == [(str(bundle), None)]
+    assert len(ctx.get_ca_certs()) == 1
 
 
-def test_resolve_ca_dir_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No ``SSL_CERT_DIR`` configured -> no capath."""
-    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
-    assert resolve_ca_dir() is None
+def test_client_ssl_context_directory_only_excludes_default_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A corporate CA shipped only as ``SSL_CERT_DIR`` is the sole trust source.
 
-
-def test_client_ssl_context_honors_ssl_cert_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """A configured ``SSL_CERT_DIR`` (capath) is loaded into the shared context.
-
-    Dropping it would break deployments whose corporate CA ships only as an
-    OpenSSL hashed-cert directory.
+    Neither the OS bundle nor certifi is added alongside it.
     """
     capath = tmp_path / "certs"
     capath.mkdir()
+    monkeypatch.setenv("SSL_CERT_DIR", str(capath))
     monkeypatch.setattr(
-        ssl, "get_default_verify_paths", lambda: _verify_paths(None, None, capath=str(capath))
+        ssl, "get_default_verify_paths", lambda: _verify_paths(None, certifi.where())
     )
+    seen = _spy_verify_locations(monkeypatch)
 
-    seen: list[str | None] = []
-    real_load = ssl.SSLContext.load_verify_locations
+    ctx = client_ssl_context()
 
-    def _spy(self, cafile=None, capath=None, cadata=None):
-        seen.append(capath)
-        return real_load(self, cafile=cafile, capath=capath, cadata=cadata)
+    assert seen == [(None, str(capath))]
+    assert ctx.get_ca_certs() == []
 
-    monkeypatch.setattr(ssl.SSLContext, "load_verify_locations", _spy)
-    client_ssl_context()
-    assert str(capath) in seen, (
-        "SSL_CERT_DIR (capath) trust must be loaded into the client context; "
-        f"load_verify_locations was called with capath values {seen}"
-    )
+
+def test_client_ssl_context_stale_explicit_sources_fall_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Rotated-away ``SSL_CERT_FILE``/``SSL_CERT_DIR`` fall back to default roots.
+
+    Construction must succeed with a verifying context instead of raising, and
+    the operator is told which configured path was ignored.
+    """
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "rotated-away-ca.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "rotated-away-certs"))
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
+
+    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
+        ctx = client_ssl_context()
+
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert len(ctx.get_ca_certs()) > 0
+    assert "SSL_CERT_FILE" in caplog.text and "SSL_CERT_DIR" in caplog.text

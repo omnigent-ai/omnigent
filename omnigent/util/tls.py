@@ -20,6 +20,7 @@ for our own client connections. Both share the CA-file resolution below.
 from __future__ import annotations
 
 import logging
+import os
 import ssl
 from pathlib import Path
 
@@ -52,36 +53,53 @@ def resolve_ca_file() -> str:
     return certifi.where()
 
 
-def resolve_ca_dir() -> str | None:
-    """Return a valid hashed-cert CA directory (capath), or ``None``.
+def explicit_trust_sources() -> tuple[str | None, str | None]:
+    """Return the operator-configured ``(cafile, capath)`` that exist on disk.
 
-    Honors ``SSL_CERT_DIR`` via ``ssl.get_default_verify_paths`` so a corporate CA
-    shipped only as an OpenSSL hashed directory stays trusted; a missing or
-    non-directory path is ignored rather than raised.
+    Only the ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` environment variables count as
+    configuration; OpenSSL's compiled-in defaults are fallbacks and are never
+    mixed into an explicitly restricted trust set. A configured path that is
+    missing or empty (a rotated bundle) is logged and dropped instead of raised.
 
-    :returns: An existing capath directory, or ``None`` when none is configured.
+    :returns: ``(cafile, capath)``, each ``None`` when unset or unusable.
     """
-    capath = ssl.get_default_verify_paths().capath
-    if capath and Path(capath).is_dir():
-        logger.debug("Using system CA directory: %s", capath)
-        return capath
-    return None
+    paths = ssl.get_default_verify_paths()
+    cafile = os.environ.get(paths.openssl_cafile_env) or None
+    capath = os.environ.get(paths.openssl_capath_env) or None
+    if cafile is not None and not (Path(cafile).is_file() and Path(cafile).stat().st_size > 0):
+        logger.warning(
+            "%s=%s is not a readable CA bundle; ignoring it", paths.openssl_cafile_env, cafile
+        )
+        cafile = None
+    if capath is not None and not Path(capath).is_dir():
+        logger.warning("%s=%s is not a directory; ignoring it", paths.openssl_capath_env, capath)
+        capath = None
+    return cafile, capath
+
+
+def resolve_ca_dir() -> str | None:
+    """Return the configured ``SSL_CERT_DIR`` when it is an existing directory.
+
+    :returns: The capath directory, or ``None`` when unset or missing.
+    """
+    return explicit_trust_sources()[1]
 
 
 def client_ssl_context() -> ssl.SSLContext:
     """Return a cached verifying client SSL context.
 
-    Built once so reconnect loops do not re-read the bundle. Trusts the resolved CA
-    bundle plus a configured ``SSL_CERT_DIR`` (:func:`resolve_ca_dir`) and keeps
-    :func:`ssl.create_default_context`'s hostname checking and ``CERT_REQUIRED``.
+    Trusts exactly the configured sources when any is usable (``SSL_CERT_FILE``
+    and/or ``SSL_CERT_DIR``), otherwise the OS bundle or certifi via
+    :func:`resolve_ca_file`. Built once so reconnect loops do not re-read the
+    bundle; keeps :func:`ssl.create_default_context`'s hostname checking and
+    ``CERT_REQUIRED``.
 
     :returns: A shared :class:`ssl.SSLContext`.
     """
     global _client_ssl_context
     if _client_ssl_context is None:
-        context = ssl.create_default_context(cafile=resolve_ca_file())
-        capath = resolve_ca_dir()
-        if capath is not None:
-            context.load_verify_locations(capath=capath)
-        _client_ssl_context = context
+        cafile, capath = explicit_trust_sources()
+        if cafile is None and capath is None:
+            cafile = resolve_ca_file()
+        _client_ssl_context = ssl.create_default_context(cafile=cafile, capath=capath)
     return _client_ssl_context
