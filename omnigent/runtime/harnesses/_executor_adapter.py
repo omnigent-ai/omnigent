@@ -1309,7 +1309,8 @@ def classify_inner_exception(exception: BaseException) -> str | None:
     """Classify the exception and its explicit causes; the first SDK match wins.
 
     Walks ``__cause__`` so a wrapper raised ``from`` an SDK error classifies by that
-    error. Unrecognized or cyclic chains return ``None``. Keep specific classifiers first.
+    error, then scans the whole chain once for a context-length signal. Unrecognized
+    or cyclic chains return ``None``. Keep specific classifiers first.
     """
     from omnigent.llms.errors import is_context_length_exceeded
 
@@ -1326,9 +1327,9 @@ def classify_inner_exception(exception: BaseException) -> str | None:
             code = classifier(current)
             if code is not None:
                 return code
-        if is_context_length_exceeded(current):
-            return "context_length_exceeded"
         current = current.__cause__
+    if is_context_length_exceeded(exception):
+        return "context_length_exceeded"
     return None
 
 
