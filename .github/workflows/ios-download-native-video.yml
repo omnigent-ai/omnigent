@@ -43,7 +43,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO > /tmp/before-xcodebuild.log 2>&1 &
           TEST_PID=$!
           BOOTED=0
-          for attempt in {1..120}; do
+          for attempt in {1..600}; do
             if xcrun simctl list devices | grep "$DEVICE_ID" | grep -q '(Booted)'; then
               BOOTED=1
               break
