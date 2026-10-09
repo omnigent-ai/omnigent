@@ -3260,6 +3260,46 @@ async def test_launch_real_tmux_survives_oversized_argv(
         await instance.close()
 
 
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("start_on_attach", [False, True])
+async def test_launch_delivers_metachar_argv_over_tmux_command_cap_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, start_on_attach: bool
+) -> None:
+    """An oversized argv full of shell metacharacters reaches the pane unchanged.
+
+    The launcher script execs ``shlex.join(argv)`` under ``/bin/sh``, which
+    re-parses the quoted text. Quotes, newlines, ``;|&``, globs, and
+    ``$``/backtick substitutions in a >16KB argv must arrive byte-for-byte and
+    unsplit, whether or not the start-on-attach gate wraps the pane command.
+    """
+    output = tmp_path / "argv.json"
+    script = (
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+    )
+    hostile = "a'b\"c d;e|f&g$h`i(j)k*l?m<n>o\\p#q\n" * 600
+    expected = ["--append-system-prompt", hostile, "--model", "sonnet"]
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-c", script, str(output), *expected],
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=start_on_attach,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        if start_on_attach:
+            await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(10):
+            while await instance.is_alive():
+                await asyncio.sleep(0.05)
+        assert json.loads(output.read_text()) == expected
+    finally:
+        await instance.close()
+
+
 def test_idle_detector_honors_short_threshold_override() -> None:
     """A per-watcher ``idle_threshold_s`` override fires idle sooner.
 
@@ -3729,9 +3769,6 @@ async def test_launch_delivers_argv_over_tmux_command_cap_real_tmux(
     Large agent instructions ride the CLI argv (``--append-system-prompt``), and
     tmux rejects one oversized client command with "command too long".
     """
-    # ``close()`` removes the private dir, so the pane's output lives beside it.
-    private_dir = tmp_path / "terminal"
-    private_dir.mkdir()
     output = tmp_path / "argv.json"
     script = (
         "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
@@ -3741,7 +3778,7 @@ async def test_launch_delivers_argv_over_tmux_command_cap_real_tmux(
         name="claude",
         session_key="main",
         socket_path=short_tmp_parent / "tmux.sock",
-        private_dir=private_dir,
+        private_dir=tmp_path,
         command=sys.executable,
         args=["-c", script, str(output), *expected],
         keep_alive_after_exit=True,
@@ -3751,6 +3788,7 @@ async def test_launch_delivers_argv_over_tmux_command_cap_real_tmux(
         async with asyncio.timeout(10):
             while await instance.is_alive():
                 await asyncio.sleep(0.05)
+        # Read the delivered argv before ``close()`` removes the private dir.
+        assert json.loads(output.read_text()) == expected
     finally:
         await instance.close()
-    assert json.loads(output.read_text()) == expected
