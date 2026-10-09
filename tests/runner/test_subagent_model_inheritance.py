@@ -584,3 +584,25 @@ async def test_binding_lets_foreign_multi_model_child_inherit(
         },
     )
     assert bodies[0]["model_override"] == "databricks-claude-opus-5"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_child_of_claude_parent_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude parent's selection is not inherited by an agy child: agy accepts
+    Claude ids, so only the different-vendor rule keeps it off agy's catalog."""
+    _stub_worker_launchable(monkeypatch)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_parent_agy_foreign",
+        parent_snapshot={
+            "id": "conv_parent_agy_foreign",
+            "agent_id": "ag_parent",
+            "harness": "claude-native",
+            "model_override": "claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]

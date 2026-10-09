@@ -106,6 +106,13 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+The native `antigravity-native` harness (aliases `agy-native`,
+`native-antigravity`) launches the signed-in `agy` CLI instead and passes a
+session or dispatch `model` straight to `agy --model`, so it accepts any id the
+CLI's `agy models` catalog lists — Gemini as well as the Claude / GPT ids the
+account's separate quota offers. Only `databricks-` gateway ids are rejected
+for it; neither antigravity harness has a gateway path.
+
 ### Pi context files
 
 With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`

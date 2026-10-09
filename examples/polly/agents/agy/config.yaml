@@ -6,8 +6,9 @@ description: Google Antigravity CLI coding sub-agent — implements, cross-vendo
 # in its own terminal the human can open in the UI's Subagents panel and TAKE
 # OVER. Antigravity's in-terminal approval prompt still fires for dangerous
 # commands and is mirrored to the web UI, so risky actions surface as approval
-# cards rather than being auto-bypassed. agy is Gemini-native (own Google
-# account auth via ~/.gemini) and does not run Claude/GPT-family models.
+# cards rather than being auto-bypassed. agy signs in with its own Google
+# account (~/.gemini) and runs the models that account's `agy models` catalog
+# lists: Gemini, plus Claude/GPT ids when the account offers them.
 executor:
   type: omnigent
   config:
