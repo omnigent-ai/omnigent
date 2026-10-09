@@ -54,6 +54,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
+from omnigent.runtime.harnesses.native_session import (
+    NativeSessionCheckpointAck,
+    NativeSessionCheckpointRequest,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -76,6 +80,8 @@ from omnigent.server.schemas import (
 )
 
 _logger = logging.getLogger(__name__)
+
+_HarnessEvent = HarnessStreamEvent | NativeSessionCheckpointRequest
 
 # Cadence for ``response.heartbeat`` SSE events while a turn is
 # streaming. Matches the existing Omnigent cadence at
@@ -263,6 +269,7 @@ class MessageEvent(BaseModel):
     content: str | list[dict[str, Any]]
     model: str
     previous_response_id: str | None = None
+    native_session_id: str | None = Field(default=None, min_length=1, max_length=1024)
     # Allow runner-side passthrough of CreateResponseRequest fields
     # (instructions, conversation, reasoning, context_management,
     # tools, plus the ignored-but-tolerated controls). Forwarded
@@ -287,6 +294,7 @@ class MessageEvent(BaseModel):
         payload = self.model_dump()
         payload.pop("type", None)
         payload.pop("role", None)
+        payload.pop("native_session_id", None)
         payload["input"] = payload.pop("content")
         return CreateResponseRequest(**payload)
 
@@ -409,7 +417,12 @@ class PolicyVerdictEvent(BaseModel):
 # unknown values raise 422 (fail-loud per
 # ``designs/DESIGN_PRINCIPLES.md``).
 InboundEventRequest = Annotated[
-    MessageEvent | InterruptEvent | ToolResultEvent | ApprovalEvent | PolicyVerdictEvent,
+    MessageEvent
+    | InterruptEvent
+    | ToolResultEvent
+    | ApprovalEvent
+    | PolicyVerdictEvent
+    | NativeSessionCheckpointAck,
     Field(discriminator="type"),
 ]
 
@@ -450,11 +463,15 @@ class TurnContext:
     def __init__(
         self,
         response_id: str,
-        event_queue: asyncio.Queue[HarnessStreamEvent | None],
+        event_queue: asyncio.Queue[_HarnessEvent | None],
         cancelled: asyncio.Event,
         session_id: str | None = None,
+        native_session_id: str | None = None,
+        native_session_reference_present: bool = False,
     ) -> None:
         self.session_id = session_id
+        self.native_session_id = native_session_id
+        self.native_session_reference_present = native_session_reference_present
         self.response_id = response_id
         self._event_queue = event_queue
         self.cancelled = cancelled
@@ -477,6 +494,9 @@ class TurnContext:
         # Populated by ``evaluate_policy``; resolved by the
         # ``policy_verdict`` /events handler.
         self._pending_policy_evaluations: dict[str, asyncio.Future[PolicyVerdictPayload]] = {}
+        self._pending_native_checkpoints: dict[
+            str, asyncio.Future[NativeSessionCheckpointAck]
+        ] = {}
         # In-band injections (steering, async completions) the
         # scaffold's ``message`` /events handler pushes here when
         # ``previous_response_id`` matches this turn. Subclass
@@ -499,7 +519,7 @@ class TurnContext:
         self._hold_idle_watchdog: Callable[[], None] | None = None
         self._has_progress = False
 
-    def emit(self, event: HarnessStreamEvent) -> None:
+    def emit(self, event: _HarnessEvent) -> None:
         """
         Push an SSE event upstream.
 
@@ -537,6 +557,39 @@ class TurnContext:
         elif self._pending_human_waits > 0 and self._hold_idle_watchdog is not None:
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
+
+    async def checkpoint_native_session(self, session_id: str) -> None:
+        """Wait for durable runner persistence before sending a native prompt."""
+        if self.cancelled.is_set():
+            raise asyncio.CancelledError
+        checkpoint_id = uuid.uuid4().hex
+        future: asyncio.Future[NativeSessionCheckpointAck] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._pending_native_checkpoints[checkpoint_id] = future
+        self.emit(
+            NativeSessionCheckpointRequest(
+                checkpoint_id=checkpoint_id, native_session_id=session_id
+            )
+        )
+        try:
+            acknowledgement = await asyncio.wait_for(future, timeout=30.0)
+            if not acknowledgement.success:
+                raise RuntimeError(
+                    acknowledgement.error
+                    or "Native session checkpoint failed; no prompt was sent."
+                )
+            if self.cancelled.is_set():
+                raise asyncio.CancelledError
+        finally:
+            self._pending_native_checkpoints.pop(checkpoint_id, None)
+
+    def _complete_native_checkpoint(self, acknowledgement: NativeSessionCheckpointAck) -> bool:
+        future = self._pending_native_checkpoints.get(acknowledgement.checkpoint_id)
+        if future is None or future.done():
+            return False
+        future.set_result(acknowledgement)
+        return True
 
     async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
         """
@@ -809,6 +862,9 @@ class TurnContext:
         for policy_future in self._pending_policy_evaluations.values():
             if not policy_future.done():
                 policy_future.cancel()
+        for checkpoint_future in self._pending_native_checkpoints.values():
+            if not checkpoint_future.done():
+                checkpoint_future.cancel()
 
 
 class HarnessApp:
@@ -1216,7 +1272,10 @@ class HarnessApp:
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
             return await self._start_or_inject_turn(
-                body.to_create_request(), session_id=conversation_id
+                body.to_create_request(),
+                session_id=conversation_id,
+                native_session_id=body.native_session_id,
+                native_session_reference_present="native_session_id" in body.model_fields_set,
             )
         if isinstance(body, InterruptEvent):
             return await self._handle_interrupt_event()
@@ -1228,6 +1287,11 @@ class HarnessApp:
             )
         if isinstance(body, PolicyVerdictEvent):
             return await self._handle_policy_verdict_event(body)
+        if isinstance(body, NativeSessionCheckpointAck):
+            for ctx in self._in_flight.values():
+                if ctx._complete_native_checkpoint(body):
+                    break
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
         # Pydantic's discriminated-union validator should reject
         # unknown variants before we reach this branch; if it ever
         # falls through, fail loud rather than silently no-op.
@@ -1306,7 +1370,12 @@ class HarnessApp:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
-        self, request: CreateResponseRequest, *, session_id: str | None = None
+        self,
+        request: CreateResponseRequest,
+        *,
+        session_id: str | None = None,
+        native_session_id: str | None = None,
+        native_session_reference_present: bool = False,
     ) -> StreamingResponse | Response:
         """
         Start a new turn or inject into the in-flight one.
@@ -1366,13 +1435,15 @@ class HarnessApp:
                 )
 
             response_id = f"resp_{uuid.uuid4().hex[:24]}"
-            event_queue: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
+            event_queue: asyncio.Queue[_HarnessEvent | None] = asyncio.Queue()
             cancelled = asyncio.Event()
             ctx = TurnContext(
                 response_id=response_id,
                 event_queue=event_queue,
                 cancelled=cancelled,
                 session_id=session_id,
+                native_session_id=native_session_id,
+                native_session_reference_present=native_session_reference_present,
             )
             self._in_flight[response_id] = ctx
             self._active_turn_ctx = ctx
@@ -1966,7 +2037,7 @@ class HarnessApp:
         )
 
 
-def _format_sse_event(event: HarnessStreamEvent) -> bytes:
+def _format_sse_event(event: _HarnessEvent) -> bytes:
     """
     Serialize a typed event to an SSE wire frame.
 

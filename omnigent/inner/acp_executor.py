@@ -22,8 +22,9 @@ handful of things those two hardcode become config knobs here:
                            the model from their own config / the command's flags).
 
 Protocol flow (identical for every ACP agent):
-  1. ``initialize``     — handshake; learn ``agentCapabilities`` (image support).
-  2. ``session/new``    — create/adopt a session id + ``cwd`` + ``mcpServers``.
+  1. ``initialize``     — handshake; learn image and ``loadSession`` capabilities.
+  2. ``session/new`` / ``session/load`` — create or restore a session. When a
+     runner checkpointer is configured, persist a new loadable id before prompting.
   3. ``session/prompt`` — send a user turn; consume streaming ``session/update``
      notifications (``agent_message_chunk``, ``agent_thought_chunk``,
      ``tool_call`` / ``tool_call_update``), answer any server-initiated
@@ -72,6 +73,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    NativeSessionCheckpointer,
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
@@ -81,6 +83,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     describe_exception,
 )
@@ -116,6 +119,7 @@ _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_AUTHENTICATE = "authenticate"
 _AGENT_METHOD_SESSION_NEW = "session/new"
+_AGENT_METHOD_SESSION_LOAD = "session/load"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
 # Browser/device-login method ids that cannot complete on a headless sandbox.
 _ACP_INTERACTIVE_AUTH_METHODS = frozenset({"grok.com"})
@@ -457,8 +461,8 @@ class AcpExecutor(Executor):
             sandbox (bwrap/seatbelt) at spawn — see :meth:`_sandbox_launch_path`.
         :param extension: Vendor behavior for the agent being driven, injected by
             that vendor's harness wrap (e.g.
-            a vendor wrap). The default is protocol-only,
-            so the generic ``acp`` harness reads no vendor field.
+            a vendor wrap). The default uses standard ACP plus recognized
+            pending-input metadata; it does not infer vendor spawn configuration.
         """
         self._config = config
         self._extension = extension
@@ -501,8 +505,16 @@ class AcpExecutor(Executor):
 
         self._rpc_id: int = 0
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
+        self._loading_session_request_id: int | None = None
+        self._session_load_requested_action = False
 
         self._session_id: str | None = None
+        self._native_session_id: str | None = None
+        self._native_session_checkpoint: NativeSessionCheckpointer | None = None
+        self._load_supported = False
+        self._session_restored = False
+        self._pending_native_input = False
+        self._native_conversation_url: str | None = None
         self._initialized: bool = False
         self._image_supported: bool = False
         # One-way latch per subprocess: set after a successful ACP
@@ -568,8 +580,10 @@ class AcpExecutor(Executor):
             _resolve_cwd(None, session_id=self._session_id)
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
+        self._reset_session_state()
         self._initialized = False
         self._image_supported = False
+        self._load_supported = False
         self._authenticated = False
         self._auth_advertisement = {}
         env = self._build_spawn_env()
@@ -723,6 +737,30 @@ class AcpExecutor(Executor):
                     fut = self._pending.pop(msg_id)
                     if not fut.done():
                         fut.set_result(msg)
+                elif (
+                    self._loading_session_request_id is not None
+                    and msg_id is not None
+                    and "method" in msg
+                ):
+                    self._session_load_requested_action = True
+                    await self._send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "error": {
+                                "code": -32601,
+                                "message": "Requests during session replay are not supported.",
+                            },
+                        }
+                    )
+                    load = self._pending.get(self._loading_session_request_id)
+                    if load is not None and not load.done():
+                        load.set_exception(
+                            RuntimeError(
+                                "The agent requested an action during session replay; "
+                                "no prompt was sent."
+                            )
+                        )
                 else:
                     await self._queue.put(msg)
         except (asyncio.CancelledError, EOFError):
@@ -755,9 +793,11 @@ class AcpExecutor(Executor):
         loop = asyncio.get_event_loop()
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
-
-        await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        if method == _AGENT_METHOD_SESSION_LOAD:
+            self._loading_session_request_id = req_id
+            self._session_load_requested_action = False
         try:
+            await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError as exc:
             self._pending.pop(req_id, None)
@@ -767,6 +807,10 @@ class AcpExecutor(Executor):
                 f"ACP agent {self._config.name!r} did not answer {method} "
                 f"within {timeout:g}s (command: {self._config.command!r})"
             ) from exc
+        finally:
+            self._pending.pop(req_id, None)
+            if self._loading_session_request_id == req_id:
+                self._loading_session_request_id = None
 
     # ------------------------------------------------------------------
     # ACP handshake
@@ -844,12 +888,16 @@ class AcpExecutor(Executor):
             self._warn_initialize_failed(str(message))
             raise RuntimeError(f"ACP initialize failed: {message}")
         result = resp.get("result") or {}
-        prompt_caps = (
-            result.get("agentCapabilities", {}).get("promptCapabilities", {})
-            if isinstance(result, dict)
-            else {}
-        )
+        capabilities = result.get("agentCapabilities", {}) if isinstance(result, dict) else {}
+        if not isinstance(capabilities, dict):
+            raise RuntimeError("ACP initialize returned invalid agentCapabilities.")
+        prompt_caps = capabilities.get("promptCapabilities", {})
+        if not isinstance(prompt_caps, dict):
+            raise RuntimeError("ACP initialize returned invalid promptCapabilities.")
+        if "loadSession" in capabilities and not isinstance(capabilities["loadSession"], bool):
+            raise RuntimeError("ACP initialize returned invalid loadSession capability.")
         self._image_supported = bool(prompt_caps.get("image"))
+        self._load_supported = capabilities.get("loadSession") is True
         # Stash the advertised auth methods but do NOT authenticate here:
         # sending an unsolicited ``authenticate`` would change the handshake
         # for every agent that advertises methods informationally (or is
@@ -876,8 +924,11 @@ class AcpExecutor(Executor):
             raise RuntimeError(f"ACP authenticate failed: {message}")
         self._authenticated = True
 
-    async def _authenticate_and_retry_session_new(
-        self, resp: _AcpJsonObject, params: _AcpJsonObject
+    async def _authenticate_and_retry_session_setup(
+        self,
+        resp: _AcpJsonObject,
+        params: _AcpJsonObject,
+        method: str = _AGENT_METHOD_SESSION_NEW,
     ) -> _AcpJsonObject:
         """Authenticate with an advertised headless method and retry once.
 
@@ -896,13 +947,13 @@ class AcpExecutor(Executor):
                 error = resp["error"]
                 message = error.get("message", error) if isinstance(error, dict) else error
                 raise RuntimeError(
-                    "ACP session/new requires authentication, but the agent "
+                    f"ACP {method} requires authentication, but the agent "
                     "advertises no headless auth method (browser-only or "
                     f"malformed authMethods): {message}"
                 )
             return resp
         await self._authenticate(method_id)
-        return await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        return await self._rpc(method, params, timeout=_INIT_TIMEOUT_SECONDS)
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning the session id.
@@ -913,6 +964,7 @@ class AcpExecutor(Executor):
         relay) unless disabled — see :class:`OmnigentAcpMcp`.
         """
         if self._session_id is not None:
+            await self._checkpoint_session()
             return self._session_id
 
         params: _AcpJsonObject = {
@@ -921,6 +973,37 @@ class AcpExecutor(Executor):
             # helper returns [] when Omnigent MCP is disabled.
             "mcpServers": self._session_mcp_servers(),
         }
+        if self._native_session_id is not None:
+            if not self._load_supported:
+                raise RuntimeError(
+                    "The agent no longer supports session/load; "
+                    "the saved session was not replaced."
+                )
+            params["sessionId"] = self._native_session_id
+            response = await self._rpc(
+                _AGENT_METHOD_SESSION_LOAD, params, timeout=_INIT_TIMEOUT_SECONDS
+            )
+            if (
+                "error" in response
+                and not self._authenticated
+                and _is_auth_required_error(response["error"])
+            ):
+                response = await self._authenticate_and_retry_session_setup(
+                    response, params, method=_AGENT_METHOD_SESSION_LOAD
+                )
+            if "error" in response:
+                raise RuntimeError("ACP session/load failed; the saved session was not replaced.")
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("ACP session/load returned an invalid response.")
+            await self._consume_session_replay()
+            self._session_id = self._native_session_id
+            self._session_restored = True
+            self._note_config_options(result.get("configOptions"))
+            self._note_session_models(result.get("models"))
+            self._initial_model = self._active_model
+            self._note_native_input(result)
+            return self._session_id
         client_id: str | None = None
         if self._config.session_id_mode == "client":
             client_id = secrets.token_urlsafe(16)
@@ -930,7 +1013,7 @@ class AcpExecutor(Executor):
 
         resp = await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
         if "error" in resp and not self._authenticated and _is_auth_required_error(resp["error"]):
-            resp = await self._authenticate_and_retry_session_new(resp, params)
+            resp = await self._authenticate_and_retry_session_setup(resp, params)
         if "error" in resp:
             raise RuntimeError(
                 f"ACP session/new failed: {resp['error'].get('message', resp['error'])}"
@@ -938,7 +1021,7 @@ class AcpExecutor(Executor):
         result = resp.get("result", {})
         server_session_id = result.get("sessionId") if isinstance(result, dict) else None
         session_id = server_session_id or client_id
-        if not session_id:
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 1024:
             raise RuntimeError(
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
@@ -951,7 +1034,98 @@ class AcpExecutor(Executor):
             self._note_config_options(result.get("configOptions"))
             self._note_session_models(result.get("models"))
         self._initial_model = self._active_model
+        await self._checkpoint_session()
         return self._session_id
+
+    async def _checkpoint_session(self) -> None:
+        if (
+            self._load_supported
+            and self._native_session_id is None
+            and self._native_session_checkpoint is not None
+            and self._session_id is not None
+        ):
+            checkpoint = asyncio.create_task(self._native_session_checkpoint(self._session_id))
+            try:
+                if self._reader_task is not None:
+                    await asyncio.wait(
+                        {checkpoint, self._reader_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if not checkpoint.done():
+                        raise EOFError("ACP transport closed during native session checkpoint.")
+                await checkpoint
+                self._native_session_id = self._session_id
+                if self._reader_task is not None and self._reader_task.done():
+                    raise EOFError("ACP transport closed before prompting the native session.")
+            finally:
+                if not checkpoint.done():
+                    checkpoint.cancel()
+                await asyncio.gather(checkpoint, return_exceptions=True)
+
+    def configure_native_session(
+        self, session_id: str | None, checkpoint: NativeSessionCheckpointer
+    ) -> None:
+        """Bind the executor to the runner's durable native session reference."""
+        if session_id is not None and (
+            not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 1024
+        ):
+            raise ValueError("Invalid native session reference.")
+        self._native_session_id = session_id
+        self._native_session_checkpoint = checkpoint
+
+    async def _consume_session_replay(self) -> None:
+        """Keep load-time transcript replay out of the next turn's output."""
+        if self._session_load_requested_action:
+            raise RuntimeError(
+                "The agent requested an action during session replay; no prompt was sent."
+            )
+        while not self._queue.empty():
+            message = self._queue.get_nowait()
+            if message.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                update = message.get("params", {}).get("update", {})
+                if update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION:
+                    self._note_config_options(update.get("configOptions"))
+            elif message.get("id") is not None and message.get("method"):
+                await self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "error": {
+                            "code": -32601,
+                            "message": "Requests during session replay are not supported.",
+                        },
+                    }
+                )
+                raise RuntimeError(
+                    "The agent requested an action during session replay; no prompt was sent."
+                )
+
+    def _note_native_input(self, result: _AcpJsonObject) -> None:
+        """A native pending-input extension keeps its checkpoint in the owning app."""
+        metadata = result.get("_meta")
+        if not isinstance(metadata, dict):
+            self._pending_native_input = False
+            self._native_conversation_url = None
+            return
+        self._pending_native_input = metadata.get("caipeStatus") == "input_required" or isinstance(
+            metadata.get("caipePendingInterrupt"), dict
+        )
+        conversation_url = metadata.get("caipeConversationUrl")
+        self._native_conversation_url = (
+            conversation_url if isinstance(conversation_url, str) else None
+        )
+
+    def _native_input_error(self, *, undelivered: bool = False) -> ExecutorError:
+        return ExecutorError(
+            message="The agent is waiting for input in its own application.",
+            code="acp_input_required",
+            title="Agent input required",
+            remediation=(
+                self._native_conversation_url
+                or "Open the agent's application to resolve pending input, then retry."
+            ),
+            preserve_session=True,
+            undelivered=undelivered,
+        )
 
     def _note_session_models(self, models: object) -> None:
         """Record the model catalog an agent returns from ``session/new``.
@@ -1512,6 +1686,9 @@ class AcpExecutor(Executor):
     def _reset_session_state(self) -> None:
         """Forget state that is only valid for the current ACP session."""
         self._session_id = None
+        self._session_restored = False
+        self._pending_native_input = False
+        self._native_conversation_url = None
         self._initial_model = None
         self._system_prompt_sent = False
         self._tool_names.clear()
@@ -1810,9 +1987,17 @@ class AcpExecutor(Executor):
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
             await self._ensure_initialized()
+            if self._pending_native_input and self._native_session_id is not None:
+                self._session_id = None
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
-            yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
+            yield ExecutorError(
+                message=self._startup_error_message(exc), retryable=False, undelivered=True
+            )
+            return
+
+        if self._pending_native_input:
+            yield self._native_input_error(undelivered=True)
             return
 
         # Apply a ``/model`` pick to the live session before prompting, so the
@@ -1843,7 +2028,7 @@ class AcpExecutor(Executor):
 
         # A fresh ACP session holds no prior context. Captured before the latch
         # flips so we know whether to replay history into this turn.
-        fresh_session = not self._system_prompt_sent
+        fresh_session = not self._system_prompt_sent and not self._session_restored
 
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
@@ -1939,6 +2124,26 @@ class AcpExecutor(Executor):
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
+                stop_reason = result.get("stopReason") if isinstance(result, dict) else None
+                if stop_reason == "cancelled":
+                    yield TurnCancelled()
+                    return
+                if stop_reason == "refusal":
+                    self._note_native_input(result)
+                    if self._pending_native_input:
+                        error = self._native_input_error()
+                        error.usage = usage
+                        yield error
+                    else:
+                        yield ExecutorError(
+                            message="The ACP agent refused this turn.",
+                            code="acp_refused",
+                            title="Agent refused the turn",
+                            remediation="".join(accumulated_text) or None,
+                            usage=usage,
+                            preserve_session=True,
+                        )
+                    return
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
