@@ -35,7 +35,13 @@ from omnigent.server.auth import AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
+from omnigent.server.schemas import (
+    AgentDetailObject,
+    AgentObject,
+    MCPServerSummary,
+    PaginatedList,
+    SkillSummary,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 
@@ -305,7 +311,7 @@ def create_builtin_agents_router(
         )
 
     @router.get("/agents/{agent_id}")
-    async def get_agent(request: Request, agent_id: str) -> AgentObject:
+    async def get_agent(request: Request, agent_id: str) -> AgentDetailObject:
         """Return the list summary for a server agent or the caller's own user agent.
 
         Missing and inaccessible agents both return 404. Sharing a session
@@ -313,7 +319,7 @@ def create_builtin_agents_router(
 
         :param request: The incoming request (for auth).
         :param agent_id: Agent to read.
-        :returns: The same redacted :class:`AgentObject` used by the list routes.
+        :returns: The redacted summary plus whether the caller owns the agent.
         """
         user_id = _require_user(request, auth_provider)
         agent = await asyncio.to_thread(agent_store.get, agent_id)
@@ -326,7 +332,8 @@ def create_builtin_agents_router(
             )
         ):
             raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
-        return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
+        summary = await asyncio.to_thread(_to_agent_object, agent, agent_cache)
+        return AgentDetailObject(**summary.model_dump(), user_owned=agent.kind == "user")
 
     # Multipart is CORS-safelisted, so a cross-site form post needs the Origin check.
     @router.post("/agents", dependencies=[Depends(require_trusted_origin)])

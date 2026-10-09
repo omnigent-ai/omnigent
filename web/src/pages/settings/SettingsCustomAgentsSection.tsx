@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { Link, useNavigate } from "@/lib/routing";
@@ -20,11 +20,13 @@ import { CreateAgentForm } from "@/shell/CreateAgentDialog";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import {
   useCustomAgents,
+  useCustomAgent,
   useSaveCustomAgent,
   useDeleteCustomAgent,
   type ManagedAgent,
 } from "@/hooks/useCustomAgents";
 import { BackButton } from "./HarnessCatalog";
+import { ApiError } from "@/lib/sessionsApi";
 
 const BASE = "/settings/custom-agents";
 const agentPath = (id: string) => `${BASE}/${encodeURIComponent(id)}`;
@@ -32,31 +34,50 @@ const date = (value: number | null) =>
   value === null ? "—" : new Date(value * 1000).toLocaleDateString();
 
 export function SettingsCustomAgentsSection() {
-  const enabled = customAgentsSettingsEnabled(useServerInfo());
+  const info = useServerInfo();
+  const enabled = customAgentsSettingsEnabled(info);
+  const supported = enabled && info !== "loading" && info.agent_detail === true;
   const { agentId } = useSettingsRoute();
   const navigate = useNavigate();
-  const client = useQueryClient();
-  const servers = useCustomAgents("server", enabled);
-  const yours = useCustomAgents("user", enabled);
+  const servers = useCustomAgents("server", supported && !agentId);
+  const yours = useCustomAgents("user", supported && !agentId);
   const save = useSaveCustomAgent();
-  const labels = useHarnessLabels(enabled);
-  const acpHarnesses = useAcpHarnessIds(enabled);
+  const labels = useHarnessLabels(supported);
+  const acpHarnesses = useAcpHarnessIds(supported);
   const [search, setSearch] = useState("");
-  const serverAgents = servers.data?.pages.flatMap((page) => page.data) ?? [];
-  const userAgents = yours.data?.pages.flatMap((page) => page.data) ?? [];
-  const owned = userAgents.find((a) => a.id === agentId);
-  const detail = owned ?? serverAgents.find((a) => a.id === agentId);
+  const serverAgents = useMemo(
+    () => servers.data?.pages.flatMap((page) => page.data) ?? [],
+    [servers.data],
+  );
+  const userAgents = useMemo(
+    () => yours.data?.pages.flatMap((page) => page.data) ?? [],
+    [yours.data],
+  );
   const detailId = agentId === "new" ? undefined : agentId;
+  const detail = useCustomAgent(detailId, supported);
 
-  // ponytail: bookmarks scan list pages until a by-ID API is available.
-  useEffect(() => {
-    if (!enabled || !detailId || detail) return;
-    if (yours.hasNextPage && !yours.isFetching && !yours.isError) void yours.fetchNextPage();
-    if (servers.hasNextPage && !servers.isFetching && !servers.isError)
-      void servers.fetchNextPage();
-  }, [enabled, detailId, detail, yours, servers]);
+  const searchTerm = search.trim().toLowerCase();
+  const { builtins, filtered } = useMemo(() => {
+    const matches = (a: ManagedAgent) =>
+      `${a.name} ${a.description ?? ""}`.toLowerCase().includes(searchTerm);
+    return {
+      builtins: serverAgents.filter(
+        (a) =>
+          !(
+            a.builtin &&
+            (nativeCodingAgentForAgentName(a.name) ||
+              isAcpHarnessAgent({
+                harness: a.harness,
+                acpHarness: acpHarnesses.has(a.harness ?? "") || undefined,
+              }))
+          ) && matches(a),
+      ),
+      filtered: userAgents.filter(matches),
+    };
+  }, [serverAgents, userAgents, acpHarnesses, searchTerm]);
 
   if (!enabled) return null;
+  if (!supported) return <UnsupportedServer />;
   const back = (
     <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
   );
@@ -81,60 +102,38 @@ export function SettingsCustomAgentsSection() {
     return (
       <div className="@container">
         {back}
-        {detail ? (
+        {detail.isError ? (
+          detail.error instanceof ApiError && [405, 501].includes(detail.error.status) ? (
+            <UnsupportedServer />
+          ) : (
+            <p role="alert">
+              Could not load this agent.{" "}
+              <Button variant="link" onClick={() => void detail.refetch()}>
+                Retry
+              </Button>
+            </p>
+          )
+        ) : detail.data ? (
           <AgentDetail
-            key={detail.id}
-            agent={detail}
-            owned={!!owned}
-            harness={labels[detail.harness ?? ""] ?? detail.harness ?? "Unknown"}
+            key={detail.data.id}
+            agent={detail.data}
+            owned={detail.data.user_owned}
+            harness={labels[detail.data.harness ?? ""] ?? detail.data.harness ?? "Unknown"}
             onDeleted={() => navigate(BASE)}
           />
         ) : (
           <>
             <h1 className="mb-6 text-2xl font-semibold">Custom agent</h1>
-            {servers.isError || yours.isError ? (
-              <p role="alert">
-                Could not load this agent.{" "}
-                <Button
-                  variant="link"
-                  onClick={() => void client.resetQueries({ queryKey: ["settings-agents"] })}
-                >
-                  Retry
-                </Button>
-              </p>
-            ) : (
-              <p className="text-ui text-muted-foreground">
-                {servers.isFetching ||
-                yours.isFetching ||
-                servers.isPending ||
-                yours.isPending ||
-                servers.hasNextPage ||
-                yours.hasNextPage
-                  ? "Loading agent…"
-                  : "Agent not found. It may have been removed or belong to another user."}
-              </p>
-            )}
+            <p className="text-ui text-muted-foreground">
+              {detail.isPending
+                ? "Loading agent…"
+                : "Agent not found. It may have been removed or belong to another user."}
+            </p>
           </>
         )}
       </div>
     );
   }
-  const matches = (a: ManagedAgent) =>
-    `${a.name} ${a.description ?? ""}`.toLowerCase().includes(search.trim().toLowerCase());
-  const builtins = serverAgents
-    .filter(
-      (a) =>
-        !(
-          a.builtin &&
-          (nativeCodingAgentForAgentName(a.name) ||
-            isAcpHarnessAgent({
-              harness: a.harness,
-              acpHarness: acpHarnesses.has(a.harness ?? "") || undefined,
-            }))
-        ),
-    )
-    .filter(matches);
-  const filtered = userAgents.filter(matches);
   return (
     <div className="@container">
       <h1 className="pb-6 text-2xl font-semibold">Custom agents</h1>
@@ -249,6 +248,18 @@ export function SettingsCustomAgentsSection() {
   );
 }
 
+function UnsupportedServer() {
+  return (
+    <div>
+      <h1 className="mb-6 text-2xl font-semibold">Custom agents</h1>
+      <p role="alert" className="text-ui text-muted-foreground">
+        Custom agents settings is unavailable on this server. Update the server and reload to enable
+        it.
+      </p>
+    </div>
+  );
+}
+
 function ListStatus({
   query,
   scope,
@@ -299,7 +310,7 @@ function AgentDetail({
   onDeleted,
 }: {
   agent: ManagedAgent;
-  owned: boolean;
+  owned: boolean | undefined;
   harness: string;
   onDeleted: () => void;
 }) {
@@ -319,7 +330,7 @@ function AgentDetail({
     <>
       <div className="flex items-start justify-between gap-4">
         <h1 className="min-w-0 break-words text-2xl font-semibold">{agent.name}</h1>
-        {owned && (
+        {owned === true && (
           <Button
             variant="ghost"
             size="icon"
@@ -391,9 +402,11 @@ function AgentDetail({
         )}
       </section>
       <p className="text-xs text-muted-foreground">
-        {owned
+        {owned === true
           ? "Configuration editing is not available here yet."
-          : "Server-provided agents are read-only."}
+          : owned === false
+            ? "Server-provided agents are read-only."
+            : "Update the server to enable agent deletion. Ownership information is unavailable."}
       </p>
       <Dialog
         open={confirm}

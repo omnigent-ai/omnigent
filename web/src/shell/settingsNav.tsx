@@ -201,7 +201,12 @@ export function useSettingsRoute(): {
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
   if (section === "custom-agents" && segments[idx + 2]) {
-    return { inSettings: true, section, agentId: segments[idx + 2] };
+    try {
+      return { inSettings: true, section, agentId: decodeURIComponent(segments[idx + 2]) };
+    } catch {
+      // Malformed escapes in a bookmarked URL should not crash Settings.
+      return { inSettings: true, section };
+    }
   }
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
 }
