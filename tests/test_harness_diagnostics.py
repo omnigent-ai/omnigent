@@ -259,6 +259,124 @@ def test_detect_sign_in_prompt_accepts_a_device_flow_by_its_instructions() -> No
     assert prompt.code == "1A2B-3C4D"
 
 
+_WORKSPACE = "https://example.cloud.databricks.com"
+_AUTHORIZE_URL = (
+    f"{_WORKSPACE}/oidc/v1/authorize?response_type=code&client_id=example-client"
+    "&redirect_uri=http%3A%2F%2Flocalhost%3A8020%2Foauth-callback"
+    "&state=abc123&code_challenge=REDACTED&code_challenge_method=S256"
+    "&scope=offline_access+all-apis"
+)
+_OAUTH_FLOW_LINES = (
+    f"[INFO] Cached token expired or missing for {_WORKSPACE}. Starting OAuth flow...\n"
+    "[INFO] Waiting for OAuth callback on port 8020. "
+    "Please open this URL in your browser:\n"
+    f"{_AUTHORIZE_URL}\n"
+)
+_PAUSED_AUTO_OPEN_LINES = (
+    "[WARNING] Not opening a browser tab automatically: the last authentication attempt "
+    "did not complete within 120s, so the launcher is pausing auto-open to avoid piling up "
+    "tabs while you're away. Open this URL in your browser to authenticate:\n"
+    f"{_AUTHORIZE_URL}\n\n\n"
+)
+
+
+@pytest.mark.parametrize("reprint", ["", _PAUSED_AUTO_OPEN_LINES])
+def test_detect_sign_in_prompt_prefers_the_endpoint_over_a_cue_adjacent_host(reprint: str) -> None:
+    """
+    A launcher names the workspace host above the real authorize link.
+
+    The host sits next to "open this URL" wording but is not the link; the
+    authorize address is, including when the launcher prints it again.
+    """
+    prompt = detect_sign_in_prompt(_OAUTH_FLOW_LINES + reprint)
+    assert prompt is not None
+    assert prompt.url == _AUTHORIZE_URL
+    assert prompt.code is None
+
+
+def test_detect_sign_in_prompt_ignores_an_endpoint_the_launcher_moved_past() -> None:
+    """Output after the cue-adjacent host still marks a preferred endpoint as stale."""
+    screen = (
+        _OAUTH_FLOW_LINES
+        + "[INFO] Token cached for the workspace\n"
+        + "╭── OpenAI Codex (v0.156.1) ──╮\n"
+        + "› Ask Codex to do anything\n"
+    )
+    assert detect_sign_in_prompt(screen) is None
+
+
+def test_detect_sign_in_prompt_ignores_output_that_extends_a_bare_host() -> None:
+    """A line that only starts with the fallback address is agent output, not a re-print."""
+    screen = (
+        "[INFO] Cached token expired for https://host.example.com. Starting sign-in...\n"
+        "Opened https://host.example.com/pr/123 for review\n"
+    )
+    assert detect_sign_in_prompt(screen) is None
+
+
+def test_detect_sign_in_prompt_ignores_a_later_endpoint_after_the_prompt_completed() -> None:
+    """An auth-shaped docs link below a finished prompt must not revive it."""
+    screen = (
+        "Open the following URL to sign in:\n"
+        "https://dbcert.example.com/x\n"
+        "Signed in as someone@example.com.\n"
+        "Agent ready. Help: https://example.com/login\n"
+    )
+    assert detect_sign_in_prompt(screen) is None
+
+
+def test_detect_sign_in_prompt_ignores_a_docs_link_below_the_waiting_line() -> None:
+    """The stale check runs from the first qualifying address, not from the chosen link."""
+    screen = (
+        "Enter code ABCD-1234 at https://x.example/verify\n"
+        "waiting for sign-in...\n"
+        "See https://docs.example.com/oauth/troubleshooting\n"
+    )
+    assert detect_sign_in_prompt(screen) is None
+
+
+def test_detect_sign_in_prompt_takes_the_latest_link_of_a_retrying_launcher() -> None:
+    """A retry prints a fresh authorize link; the earlier attempt's link is dead."""
+    retry_url = _AUTHORIZE_URL.replace("state=abc123", "state=def456")
+    screen = (
+        _OAUTH_FLOW_LINES
+        + "[WARNING] The last authentication attempt did not complete. "
+        + "Open this URL in your browser to authenticate:\n"
+        + f"{retry_url}\n"
+    )
+    prompt = detect_sign_in_prompt(screen)
+    assert prompt is not None
+    assert prompt.url == retry_url
+
+
+def test_detect_sign_in_prompt_accepts_a_link_printed_again_after_a_trailer() -> None:
+    """A re-printed link has no trailer wording of its own, so it must count as the prompt."""
+    url = "https://example.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU"
+    screen = (
+        "Please open this URL in your browser:\n"
+        f"\t{url}\n"
+        "Still waiting. Please open this URL in your browser:\n"
+        f"\t{url}\n"
+    )
+    prompt = detect_sign_in_prompt(screen)
+    assert prompt is not None
+    assert prompt.url == url
+
+
+def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_endpoint() -> None:
+    """Only the path, query, or fragment marks an endpoint, never the workspace host."""
+    authorize_url = "https://sso.corp.example.com/oidc/v1/authorize?response_type=code&state=x"
+    screen = (
+        "[INFO] Cached token expired or missing for https://sso.corp.example.com. "
+        "Starting OAuth flow...\n"
+        "Please open this URL in your browser:\n"
+        f"{authorize_url}\n"
+    )
+    prompt = detect_sign_in_prompt(screen)
+    assert prompt is not None
+    assert prompt.url == authorize_url
+
+
 def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:
     """The next step never embeds the one-time link; the card fetches it live."""
     step = sign_in_next_step("Codex")
