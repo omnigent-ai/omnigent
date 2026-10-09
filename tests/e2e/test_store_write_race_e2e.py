@@ -44,7 +44,6 @@ user-invisible data-loss shapes themselves.
 from __future__ import annotations
 
 import contextlib
-import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -56,13 +55,14 @@ from omnigent.db.db_models import SqlConversationLabel
 from omnigent.runtime.policies.builder import build_policy_engine
 from omnigent.spec.parser import parse
 from omnigent.spec.types import AgentSpec, StateUpdate, StateUpdateAction
+from omnigent.stores.conversation_store import ConversationNotFoundError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 
 
 @pytest.fixture()
-def store() -> SqlAlchemyConversationStore:
+def store(tmp_path: Path) -> SqlAlchemyConversationStore:
     """
     A production store over a fresh on-disk SQLite database.
 
@@ -74,8 +74,7 @@ def store() -> SqlAlchemyConversationStore:
     :returns: A :class:`SqlAlchemyConversationStore` on a unique
         temp-file database.
     """
-    tmp = Path(tempfile.mkdtemp(prefix="store-write-race-"))
-    return SqlAlchemyConversationStore(f"sqlite:///{tmp}/ap-{uuid.uuid4().hex}.db")
+    return SqlAlchemyConversationStore(f"sqlite:///{tmp_path}/ap-{uuid.uuid4().hex}.db")
 
 
 @pytest.fixture()
@@ -121,9 +120,8 @@ class _SeedWindowRacingStore:
         self.raced = False
 
     def __getattr__(self, name: str) -> Any:
-        # Intercept the current seeding primitive (set_labels on HEAD)
-        # and any insert-if-absent successor, so the constructed race
-        # keeps racing the seed write itself after a fix renames it.
+        # Hook both label-write primitives so the injected race targets
+        # whichever one seeding uses.
         if name in ("set_labels", "seed_labels_if_absent"):
             real = getattr(self._inner, name)
 
@@ -236,7 +234,7 @@ async def test_increment_session_usage_absent_row_is_not_a_phantom_write(
 
     try:
         returned = store.increment_session_usage(deleted_id, {"total_tokens": 5})
-    except Exception:
+    except ConversationNotFoundError:
         # Raising on an absent row is the correct contract.
         return
 

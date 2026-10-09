@@ -1695,11 +1695,8 @@ def _accumulate_session_usage(
     try:
         new_current = conversation_store.increment_session_usage(session_id, delta)
     except ConversationNotFoundError:
-        # The session was deleted while its turn was still streaming. There is
-        # no row to bill and nothing to publish; the store now refuses to report
-        # a total it did not persist, and failing the relay loop over a deleted
-        # session would be worse than dropping the increment. The primitive that
-        # raises ships this handler, so it can land without regressing callers.
+        # Session deleted mid-stream: no row to bill or publish. Dropping the
+        # increment is better than failing the relay loop over a deleted session.
         return None
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)

@@ -1590,11 +1590,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> dict[str, str]:
             if stable_defaults:
-                # Existence is checked inside the same transaction as the
-                # insert, for the same reason the insert is
-                # insert-if-absent: a check the caller made earlier can be
-                # stale by now. Unlocked, so it narrows rather than closes
-                # the race against a concurrent delete of this same row.
+                # Same-transaction, unlocked check: narrows (does not close)
+                # the race against a concurrent delete of this row.
                 exists = session.execute(
                     select(SqlConversation.id).where(
                         SqlConversation.workspace_id == current_workspace_id(),

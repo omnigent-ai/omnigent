@@ -63,7 +63,12 @@ def _engine_on(
 
 
 def _drop_metadata_row(store: SqlAlchemyConversationStore, conversation_id: str) -> None:
-    """Delete a conversation's metadata row, leaving nothing to mutate."""
+    """Drop only the metadata row, leaving the conversation row intact.
+
+    Reaches into store internals on purpose: ``delete_conversation`` would
+    remove the whole conversation, but this scenario needs the row present
+    with its session-state metadata gone.
+    """
     from sqlalchemy import delete as sa_delete
 
     from omnigent.db.db_models import SqlConversationMetadata

@@ -13,7 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -33,6 +33,8 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     DailyCostState,
 )
+
+_logger = logging.getLogger(__name__)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -587,10 +589,9 @@ class PolicyEngine:
             else:
                 session_ops.append(op)
         if session_ops:
-            # Merge under a row lock rather than overwriting the whole blob
-            # from this engine's snapshot: concurrent evaluations (parallel
-            # tool calls on one session) each hold their own snapshot, and a
-            # blind write dropped the other's counter increments / appends.
+            # Merge under a row lock instead of overwriting the whole blob:
+            # parallel evaluations on one session each hold their own snapshot,
+            # so a blind write would drop the other's increments / appends.
             def _merge(state: dict[str, Any]) -> None:
                 for op in session_ops:
                     _apply_one(state, op)
@@ -602,33 +603,20 @@ class PolicyEngine:
             try:
                 merged = self._store.mutate_session_state(self._conversation_id, _merge)
             except ConversationNotFoundError:
-                # The conversation was deleted while this turn was in flight:
-                # there is no row to merge into and nothing left to persist.
-                # Apply the ops to the in-memory view only, so guardrails
-                # keep counting for the rest of the turn instead of the hot
-                # evaluate() path failing the turn over a session that is
-                # gone (the deferred write paths suppress this the same way).
+                # Conversation deleted mid-turn: nothing left to persist. Apply
+                # ops to the in-memory view only so guardrails keep counting for
+                # the rest of the turn rather than failing it over a gone session.
+                _logger.debug(
+                    "conversation %s gone mid-turn; session state kept in memory only",
+                    self._conversation_id,
+                )
                 merged = dict(self._session_state)
                 _merge(merged)
-            # Hot cache: persisted truth (``merged``) is authoritative for
-            # every key it holds. For a key it DOESN'T hold, though, absence
-            # is ambiguous — a blanket union with the old cache
-            # (``{**old, **merged}``) resolved it one way unconditionally,
-            # which is wrong for a genuine delete: a key this call just
-            # deleted is correctly missing from ``merged``, and re-adding it
-            # from the old cache silently undoes the delete.
-            #
-            # The two cases are told apart by what this call actually asked
-            # for, not by key identity: a key missing from ``merged`` that
-            # THIS BATCH deleted stays gone; a key missing from ``merged``
-            # that this batch never touched was never part of this
-            # conversation's own persisted row to begin with (the two
-            # sub-agent root-inherited cost-approval keys, which are routed
-            # to the ROOT's row above and never reach ``session_ops`` at
-            # all; or any value seeded straight into the engine's
-            # constructor without ever being written through the store) and
-            # survives from the old cache, exactly as it did before this
-            # call.
+            # ``merged`` is authoritative for the keys it holds; a key this
+            # batch deleted stays gone. Any other key missing from ``merged`` is
+            # kept from the old cache: constructor-seeded/root-routed values
+            # never in this row, and (known limitation) a key a concurrent
+            # writer deleted this turn, held until the next build rereads.
             preserved = {
                 key: value
                 for key, value in self._session_state.items()
@@ -652,15 +640,17 @@ class PolicyEngine:
             cost-approval keys, e.g.
             ``StateUpdate(key=..., action=StateUpdateAction.SET, value=0.05)``.
         """
-        # Same atomic merge as the per-conversation path: a sibling sub-agent
-        # approving concurrently must not lose this checkpoint (or vice versa).
-        # A root deleted while this sub-agent runs has nowhere to hold the
-        # checkpoint. Recording it here was always best-effort (a lost approval
-        # re-prompts, it does not overspend), so keep the in-memory mirror below
-        # and let the turn continue rather than failing the tool call.
-        with contextlib.suppress(ConversationNotFoundError):
+        # Atomic merge so sibling approvals don't lose each other. A deleted
+        # root is best-effort: a lost approval re-prompts, it never overspends,
+        # so mirror in memory below and let the turn continue.
+        try:
             self._store.mutate_session_state(
                 self._root_conversation_id, lambda state: _apply_one(state, op)
+            )
+        except ConversationNotFoundError:
+            _logger.debug(
+                "root conversation %s gone; cost-ask approval kept in memory only",
+                self._root_conversation_id,
             )
         # Also mirror into this engine's hot in-memory state so a subsequent
         # evaluate() within the same sub-agent turn sees the approval (its

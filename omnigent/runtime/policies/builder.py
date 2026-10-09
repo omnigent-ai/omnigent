@@ -47,7 +47,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -1124,12 +1128,21 @@ def _seed_and_load_labels(
         if existing is None:
             existing = _load_existing_labels(conversation_id, conversation_store)
         return existing
-    # Insert-if-absent in one statement, NOT "diff against the snapshot then
-    # upsert": a policy write landing between the snapshot and the seed would
-    # be overwritten back to the initial value by an upsert. The database
-    # decides which keys are missing, and the returned snapshot is read in
-    # the same transaction as the insert.
-    return conversation_store.seed_labels_if_absent(conversation_id, declared)
+    # Fast path: when the caller's snapshot already holds every declared key
+    # there is nothing to seed, so skip the write transaction entirely;
+    # insert-if-absent stays the authority for any key that is still missing.
+    if existing is not None and declared.keys() <= existing.keys():
+        return existing
+    # The database decides which keys are missing inside the insert itself,
+    # so a concurrent policy write can never be reset to its initial value;
+    # the returned snapshot is read in the same transaction.
+    try:
+        return conversation_store.seed_labels_if_absent(conversation_id, declared)
+    except ConversationNotFoundError as err:
+        raise OmnigentError(
+            f"Conversation {conversation_id!r} has no row to seed labels into.",
+            code=ErrorCode.CONFLICT,
+        ) from err
 
 
 def _load_existing_labels(
