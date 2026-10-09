@@ -13,6 +13,7 @@ import {
   type ReactNode,
   type RefObject,
   createContext,
+  Fragment,
   memo,
   useCallback,
   useContext,
@@ -34,12 +35,17 @@ import {
   ClockIcon,
   CircleAlertIcon,
   CircleStopIcon,
+  FolderGit2Icon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
   GitForkIcon,
+  GitMergeIcon,
+  GitPullRequestClosedIcon,
+  GitPullRequestDraftIcon,
+  GitPullRequestIcon,
   InboxIcon,
   ListChecksIcon,
   ListFilterIcon,
@@ -64,9 +70,11 @@ import {
   SquareIcon,
   SquareCheckIcon,
   Trash2Icon,
+  UserRoundIcon,
   UsersIcon,
   WalletIcon,
   XIcon,
+  type LucideIcon,
 } from "lucide-react";
 import {
   DndContext,
@@ -126,9 +134,9 @@ import {
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
@@ -182,7 +190,8 @@ import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { useHasSessionDraft } from "@/lib/sessionDrafts";
+import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
+import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useSessionErrorStates } from "@/hooks/useSessionErrors";
@@ -209,6 +218,15 @@ import {
   readSessionFilter,
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
+import {
+  readSidebarViewPreferences,
+  SIDEBAR_SHOW_FIELDS,
+  type SidebarGrouping,
+  type SidebarOrdering,
+  type SidebarShowField,
+  type SidebarViewPreferences,
+  writeSidebarViewPreferences,
+} from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
@@ -223,18 +241,30 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
+  getConversationAgentType,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  groupConversations,
   orderByPinnedTimestamp,
   pinOrderWrites,
   readPinnedConversationIds,
   resolveSidebarDrop,
+  sessionsListAcceptsDrop,
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
+  STATUS_BUCKETS,
+  type StatusBucket,
+  statusBucket,
+  UPDATED_BUCKETS,
+  updatedBucket,
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
   sessionBelongsToProject,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
+import { deriveRepoName, SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
@@ -250,7 +280,7 @@ import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/component
 // + kebab take its place; on mobile those controls are gone, so the badge holds
 // that edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -291,6 +321,8 @@ const ProjectNamesContext = createContext<Map<string, string>>(new Map());
 // surface the real project glyph in the pinned flyout without its own query.
 const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
+// The filter menu's "Show" toggles: which optional metadata each row renders.
+const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
 // `useViewerId` (an identity-resolve effect) per instance.
@@ -328,6 +360,7 @@ function SidebarRowDataProvider({
   projectNamesById,
   projectIconsById,
   hostsById,
+  show,
   isMobile,
   viewerId,
   serverInfo,
@@ -337,6 +370,7 @@ function SidebarRowDataProvider({
   projectNamesById: Map<string, string>;
   projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
+  show: readonly SidebarShowField[];
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
@@ -347,15 +381,17 @@ function SidebarRowDataProvider({
     <ProjectNamesContext.Provider value={projectNamesById}>
       <ProjectIconsContext.Provider value={projectIconsById}>
         <HostsByIdContext.Provider value={hostsById}>
-          <IsMobileContext.Provider value={isMobile}>
-            <ViewerIdContext.Provider value={viewerId}>
-              <ServerInfoContext.Provider value={serverInfo}>
-                <RowActivationContext.Provider value={onActivate}>
-                  {children}
-                </RowActivationContext.Provider>
-              </ServerInfoContext.Provider>
-            </ViewerIdContext.Provider>
-          </IsMobileContext.Provider>
+          <SidebarShowContext.Provider value={show}>
+            <IsMobileContext.Provider value={isMobile}>
+              <ViewerIdContext.Provider value={viewerId}>
+                <ServerInfoContext.Provider value={serverInfo}>
+                  <RowActivationContext.Provider value={onActivate}>
+                    {children}
+                  </RowActivationContext.Provider>
+                </ServerInfoContext.Provider>
+              </ViewerIdContext.Provider>
+            </IsMobileContext.Provider>
+          </SidebarShowContext.Provider>
         </HostsByIdContext.Provider>
       </ProjectIconsContext.Provider>
     </ProjectNamesContext.Provider>
@@ -1645,6 +1681,30 @@ function ConversationList({
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
+  // Grouping / ordering / show options from the Sessions filter menu, seeded
+  // from the persisted per-device preference.
+  const [view, setView] = useState<SidebarViewPreferences>(readSidebarViewPreferences);
+  const updateView = useCallback(
+    (patch: Partial<SidebarViewPreferences>) => {
+      // Regrouping swaps which sections (and selection scopes) exist, so leave
+      // selection the way a Display switch does.
+      if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
+        onExitSelectionMode();
+      }
+      const next = { ...view, ...patch };
+      writeSidebarViewPreferences(next);
+      setView(next);
+    },
+    [view, selectionMode, onExitSelectionMode],
+  );
+  const grouped = view.grouping !== "default";
+  const groupOrder: readonly string[] =
+    view.grouping === "status" ? STATUS_BUCKETS : UPDATED_BUCKETS;
+  // Status buckets read the unread mirror and the drafts store; only a status
+  // view subscribes, so other views don't re-render the list on those writes.
+  const statusView = view.grouping === "status" || view.ordering === "status";
+  const unseenTick = useUnseenTick(statusView);
+  const draftIds = useSessionDraftIds(statusView);
   // All loaded conversations from the single paginated list (for the flat
   // session list; pinned rows are merged in from the server pinned query).
   const allConversations = useMemo(
@@ -1734,6 +1794,9 @@ function ConversationList({
   // write) and is cleared once neither hold is active, when the order snaps
   // back to reality.
   const frozenKeysRef = useRef<Map<string, number>>(new Map());
+  // Status buckets freeze the same way, so a turn finishing under the cursor
+  // doesn't move its row to another group.
+  const frozenStatusRef = useRef<Map<string, StatusBucket>>(new Map());
   const [pointerInside, setPointerInside] = useState(false);
   const [editingIds, setEditingIds] = useState<ReadonlySet<string>>(() => new Set());
   const reportRowEditing = useCallback((id: string, editing: boolean) => {
@@ -1747,8 +1810,11 @@ function ConversationList({
   }, []);
   const orderFrozen = pointerInside || editingIds.size > 0;
   const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
+  const frozenStatus = orderFrozen ? frozenStatusRef.current : null;
   useEffect(() => {
-    if (!orderFrozen) frozenKeysRef.current.clear();
+    if (orderFrozen) return;
+    frozenKeysRef.current.clear();
+    frozenStatusRef.current.clear();
   }, [orderFrozen]);
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
@@ -1795,13 +1861,14 @@ function ConversationList({
     // project name alone, pulling a foreign session into the viewer's folder
     // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
+    // Grouped views drop the folders: filed sessions join the groups instead.
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
       name: string;
       icon?: string | null;
       conversations: Conversation[];
-    }[] = projects.map(({ id, name, icon }) => {
+    }[] = (grouped ? [] : projects).map(({ id, name, icon }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -1823,21 +1890,61 @@ function ConversationList({
     // rather than hiding it (matches the target sidebar layout).
 
     // Sessions: the remainder — not pinned, not filed.
-    const sessions = sortByUpdatedAtDesc(
+    const byUpdated = sortByUpdatedAtDesc(
       tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
       frozenKeys,
     );
-    return { pinned, sessions, projectGroups };
+    const statusOf = (c: Conversation): StatusBucket => {
+      const frozen = frozenStatus?.get(c.id);
+      if (frozen) return frozen;
+      const unseen = isConversationUnseen(c.id, c.updated_at, c.status);
+      const live = statusBucket(c, unseen, hasSessionDraft(c.id));
+      frozenStatus?.set(c.id, live);
+      return live;
+    };
+    // Status ordering is a stable sort by bucket, so updated_at order holds within one.
+    const ordered =
+      view.ordering === "status"
+        ? groupConversations(byUpdated, statusOf, STATUS_BUCKETS).flatMap((g) => g.conversations)
+        : byUpdated;
+    if (!grouped) return { pinned, sessions: ordered, projectGroups, groupTitles: null };
+    // Buckets use render-time "now", so a day rollover shows on the next list update.
+    const now = new Date();
+    const groupTitles = new Map<string, string>(
+      ordered.map((c) => [
+        c.id,
+        view.grouping === "status"
+          ? statusOf(c)
+          : updatedBucket(
+              frozenKeys?.get(c.id) ??
+                (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at),
+              now,
+            ),
+      ]),
+    );
+    const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
+      (g) => g.conversations,
+    );
+    return { pinned, sessions, projectGroups, groupTitles };
+    // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
     pinnedConversations,
     pinnedSet,
     activeOverride,
     frozenKeys,
+    frozenStatus,
     projects,
     activeTab,
     viewerId,
+    grouped,
+    groupOrder,
+    view.grouping,
+    view.ordering,
+    unseenTick,
+    draftIds,
   ]);
 
   const config = useContext(SidebarConfigContext);
@@ -1854,6 +1961,13 @@ function ConversationList({
     () => ({ ...loadedSections, sessions: displayPagination.rows }),
     [loadedSections, displayPagination.rows],
   );
+  // The paginated Sessions rows split into titled groups; null keeps the single
+  // "Sessions" section (default grouping, or nothing to group).
+  const sessionGroups = useMemo(() => {
+    const titles = loadedSections.groupTitles;
+    if (!titles || sections.sessions.length === 0) return null;
+    return groupConversations(sections.sessions, (c) => titles.get(c.id), groupOrder);
+  }, [loadedSections.groupTitles, sections.sessions, groupOrder]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
   // + bulk-action bar). Only one is ever true at a time.
@@ -2196,9 +2310,11 @@ function ConversationList({
     return [
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
-      ...visible("Chats", sections.sessions),
+      ...(sessionGroups
+        ? sessionGroups.flatMap((g) => visible(g.title, g.conversations))
+        : visible("Chats", sections.sessions)),
     ].map((c) => c.id);
-  }, [sections, effectiveCollapsedSections, expandedProjects]);
+  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects]);
   // Getter for the shift-select range, built on demand (at click time). Scopes
   // to whichever section is selectable: the flat Sessions list, or the sessions
   // across expanded project folders (in render order). For projects scope the
@@ -2213,6 +2329,11 @@ function ConversationList({
         const rows = folderConversations.get(g.name) ?? g.conversations;
         return rows.map((c) => c.id);
       });
+    }
+    if (sessionGroups) {
+      return sessionGroups.flatMap((g) =>
+        effectiveCollapsedSections.includes(g.title) ? [] : g.conversations.map((c) => c.id),
+      );
     }
     return effectiveCollapsedSections.includes("Chats") ? [] : sections.sessions.map((c) => c.id);
   };
@@ -2263,6 +2384,87 @@ function ConversationList({
   const showShared = activeTab === "shared";
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
 
+  // Sessions header controls and row props, shared by the single "Sessions"
+  // section and the grouped sections (which put the controls on the first group).
+  const sessionRowProps = {
+    activeConversationId: displayedActiveId,
+    pinnedConversationIds,
+    onRowClick,
+    onTogglePinned,
+    selectionMode: sessionsSelecting,
+    selectedIds,
+    onToggleSelected,
+    onProjectAssigned: expandProject,
+  };
+  const sessionsBulkBar = sessionsSelecting ? (
+    <BulkActionBar
+      selectedIds={selectedIds}
+      allConversations={sections.sessions}
+      onDeselectAll={onDeselectAll}
+      onExit={onExitSelectionMode}
+      onProjectAssigned={expandProject}
+    />
+  ) : undefined;
+  // The filter stays reachable while bulk-selecting; switching scope just exits
+  // selection. Only the "select" entry point hides, being already active.
+  const sessionsHeaderActions = !selectionMode ? (
+    <div className="flex items-center gap-0.5">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            asChild
+            variant="ghost"
+            size="icon-xs"
+            aria-label="New session"
+            data-testid="sessions-new-session"
+            className="text-muted-foreground"
+          >
+            <Link
+              to="/"
+              componentId="sidebar.sessions_new_chat"
+              onClick={(event) => {
+                event.stopPropagation();
+                onActiveTabChange("mine");
+                onRowClick(event);
+              }}
+            >
+              <MessageCirclePlusIcon className="size-3.5" />
+            </Link>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">New session</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Select sessions"
+            data-testid="toggle-selection-mode"
+            className="text-muted-foreground"
+            onClick={(event) => {
+              event.stopPropagation();
+              onEnterSelectionMode("sessions");
+            }}
+          >
+            <ListChecksIcon className="size-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Select sessions</TooltipContent>
+      </Tooltip>
+    </div>
+  ) : undefined;
+  const sessionsFilterMenu = (
+    <SessionFilterMenu
+      value={activeTab}
+      onChange={onActiveTabChange}
+      multiUser={multiUser}
+      view={view}
+      onViewChange={updateView}
+    />
+  );
+
   // Archived sessions are surfaced on the Settings page, not here, so they
   // don't count toward the sidebar's empty-state threshold. Each project
   // counts itself (not just its loaded chats) so an empty project still
@@ -2283,6 +2485,7 @@ function ConversationList({
       projectNamesById={projectNamesById}
       projectIconsById={projectIconsById}
       hostsById={hostsById}
+      show={view.show}
       isMobile={isMobile}
       viewerId={viewerId}
       serverInfo={serverInfo}
@@ -2347,9 +2550,10 @@ function ConversationList({
             ungroup target (wrapped below). This top strip is only a FALLBACK
             for when there are no ungrouped chats yet, so the Chats section
             isn't rendered and there'd otherwise be nowhere to drop. */}
-              {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-                <UngroupDropZone />
-              )}
+              {!showShared &&
+                !grouped &&
+                activeDrag?.project != null &&
+                sections.sessions.length === 0 && <UngroupDropZone />}
               {totalVisible === 0 && searchQuery && !sessionStatus ? (
                 <>
                   <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
@@ -2401,107 +2605,110 @@ function ConversationList({
               a project row; the group/section headers carry no icon or count.
               Always shown (even with zero projects), unaffected by the filter, so
               "New project" (create-empty) stays discoverable and folders don't
-              vanish when switching to Shared or Archived. */}
-                  <SectionGroup
-                    title="Projects"
-                    collapsed={effectiveCollapsedSections.includes("Projects")}
-                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                    afterHeader={
-                      projectsSelecting ? (
-                        <BulkActionBar
-                          selectedIds={selectedIds}
-                          allConversations={projectSessionPool}
-                          onDeselectAll={onDeselectAll}
-                          onExit={onExitSelectionMode}
-                          onProjectAssigned={expandProject}
-                        />
-                      ) : undefined
-                    }
-                    headerAction={
-                      !selectionMode ? (
-                        <ProjectHeaderActions
-                          onOrderChange={(manual) => {
-                            const ranks = new Map(
-                              projectOrder.data?.ordered_project_ids?.map((id, index) => [
-                                id,
-                                index,
-                              ]),
-                            );
-                            const restored = [...projects].sort(
-                              (a, b) =>
-                                (ranks.get(a.id ?? "") ?? Infinity) -
-                                (ranks.get(b.id ?? "") ?? Infinity),
-                            );
-                            saveOrder.mutate(manual ? restored : null);
-                          }}
-                          manualOrder={projectOrder.data?.sort_mode === "manual"}
-                          orderDisabled={saveOrder.isPending || !projectOrder.data}
-                          projectNames={sections.projectGroups.map((group) => group.name)}
-                          collapsed={effectiveCollapsedSections.includes("Projects")}
-                          expandedProjects={expandedProjects}
-                          hasProjectSessions={sections.projectGroups.some(
-                            (group) => group.conversations.length > 0,
-                          )}
-                          onExpandAll={expandAllProjects}
-                          onCollapseAll={collapseAllProjects}
-                          onProjectCreated={expandProject}
-                          onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                        />
-                      ) : undefined
-                    }
-                  >
-                    <SortableContext
-                      items={projects.map((p) => projectDragId(p.name))}
-                      strategy={verticalListSortingStrategy}
+              vanish when switching to Shared or Archived. Grouped views hide it:
+              their groups already hold the filed sessions. */}
+                  {!grouped && (
+                    <SectionGroup
+                      title="Projects"
+                      collapsed={effectiveCollapsedSections.includes("Projects")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                      afterHeader={
+                        projectsSelecting ? (
+                          <BulkActionBar
+                            selectedIds={selectedIds}
+                            allConversations={projectSessionPool}
+                            onDeselectAll={onDeselectAll}
+                            onExit={onExitSelectionMode}
+                            onProjectAssigned={expandProject}
+                          />
+                        ) : undefined
+                      }
+                      headerAction={
+                        !selectionMode ? (
+                          <ProjectHeaderActions
+                            onOrderChange={(manual) => {
+                              const ranks = new Map(
+                                projectOrder.data?.ordered_project_ids?.map((id, index) => [
+                                  id,
+                                  index,
+                                ]),
+                              );
+                              const restored = [...projects].sort(
+                                (a, b) =>
+                                  (ranks.get(a.id ?? "") ?? Infinity) -
+                                  (ranks.get(b.id ?? "") ?? Infinity),
+                              );
+                              saveOrder.mutate(manual ? restored : null);
+                            }}
+                            manualOrder={projectOrder.data?.sort_mode === "manual"}
+                            orderDisabled={saveOrder.isPending || !projectOrder.data}
+                            projectNames={sections.projectGroups.map((group) => group.name)}
+                            collapsed={effectiveCollapsedSections.includes("Projects")}
+                            expandedProjects={expandedProjects}
+                            hasProjectSessions={sections.projectGroups.some(
+                              (group) => group.conversations.length > 0,
+                            )}
+                            onExpandAll={expandAllProjects}
+                            onCollapseAll={collapseAllProjects}
+                            onProjectCreated={expandProject}
+                            onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                          />
+                        ) : undefined
+                      }
                     >
-                      {sections.projectGroups.map((group, index) => (
-                        <ProjectFolder
-                          key={group.name}
-                          ordering={{
-                            disabled:
-                              !projectOrder.data ||
-                              saveOrder.isPending ||
-                              selectionMode ||
-                              editingIds.size > 0,
-                            first: index === 0,
-                            last: index === projects.length - 1,
-                            move: (destination) => moveProject(group.name, destination),
-                            insertion:
-                              overProject === group.name &&
-                              draggedProject !== group.name &&
-                              draggedProject !== null
-                                ? projects.findIndex((p) => p.name === draggedProject) < index
-                                  ? "after"
-                                  : "before"
-                                : undefined,
-                          }}
-                          name={group.name}
-                          projectId={group.id}
-                          icon={group.icon}
-                          windowConversations={group.conversations}
-                          activeConversationId={displayedActiveId}
-                          expanded={expandedProjects.includes(group.name)}
-                          active={newSessionProjectName === group.name}
-                          onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                          pinnedConversationIds={pinnedConversationIds}
-                          activeOverride={activeOverride}
-                          frozenSortKeys={frozenKeys}
-                          scrollRoot={scrollContainerRef}
-                          onRowClick={onRowClick}
-                          onTogglePinned={onTogglePinned}
-                          selectionMode={projectsSelecting}
-                          selectedIds={selectedIds}
-                          onToggleSelected={onToggleSelected}
-                          onProjectAssigned={expandProject}
-                          onConversationsLoaded={handleFolderConversationsLoaded}
-                        />
-                      ))}
-                    </SortableContext>
-                    {sections.projectGroups.length === 0 &&
-                      !effectiveCollapsedSections.includes("Projects") && (
-                        <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
-                      )}
-                  </SectionGroup>
+                      <SortableContext
+                        items={projects.map((p) => projectDragId(p.name))}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {sections.projectGroups.map((group, index) => (
+                          <ProjectFolder
+                            key={group.name}
+                            ordering={{
+                              disabled:
+                                !projectOrder.data ||
+                                saveOrder.isPending ||
+                                selectionMode ||
+                                editingIds.size > 0,
+                              first: index === 0,
+                              last: index === projects.length - 1,
+                              move: (destination) => moveProject(group.name, destination),
+                              insertion:
+                                overProject === group.name &&
+                                draggedProject !== group.name &&
+                                draggedProject !== null
+                                  ? projects.findIndex((p) => p.name === draggedProject) < index
+                                    ? "after"
+                                    : "before"
+                                  : undefined,
+                            }}
+                            name={group.name}
+                            projectId={group.id}
+                            icon={group.icon}
+                            windowConversations={group.conversations}
+                            activeConversationId={displayedActiveId}
+                            expanded={expandedProjects.includes(group.name)}
+                            active={newSessionProjectName === group.name}
+                            onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                            pinnedConversationIds={pinnedConversationIds}
+                            activeOverride={activeOverride}
+                            frozenSortKeys={frozenKeys}
+                            scrollRoot={scrollContainerRef}
+                            onRowClick={onRowClick}
+                            onTogglePinned={onTogglePinned}
+                            selectionMode={projectsSelecting}
+                            selectedIds={selectedIds}
+                            onToggleSelected={onToggleSelected}
+                            onProjectAssigned={expandProject}
+                            onConversationsLoaded={handleFolderConversationsLoaded}
+                          />
+                        ))}
+                      </SortableContext>
+                      {sections.projectGroups.length === 0 &&
+                        !effectiveCollapsedSections.includes("Projects") && (
+                          <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
+                        )}
+                    </SectionGroup>
+                  )}
                   {/* Always rendered, even with no rows: the header carries the
                     filter menu, so hiding it on an empty slice would strand the
                     viewer with no way to pick another filter. */}
@@ -2511,97 +2718,43 @@ function ConversationList({
                     // session (removes it from its project) or a pinned one (unpins
                     // it), since both have somewhere to land here.
                     <ChatsDropZone
-                      active={
-                        activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)
-                      }
+                      active={activeDrag != null && sessionsListAcceptsDrop(activeDrag, grouped)}
                     >
-                      <ConversationSection
-                        title="Sessions"
-                        conversations={sections.sessions}
-                        activeConversationId={displayedActiveId}
-                        emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
-                        footer={sessionStatus}
-                        pinnedConversationIds={pinnedConversationIds}
-                        collapsed={effectiveCollapsedSections.includes("Chats")}
-                        onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-                        onRowClick={onRowClick}
-                        onTogglePinned={onTogglePinned}
-                        selectionMode={sessionsSelecting}
-                        selectedIds={selectedIds}
-                        onToggleSelected={onToggleSelected}
-                        onProjectAssigned={expandProject}
-                        afterHeader={
-                          sessionsSelecting ? (
-                            <BulkActionBar
-                              selectedIds={selectedIds}
-                              allConversations={sections.sessions}
-                              onDeselectAll={onDeselectAll}
-                              onExit={onExitSelectionMode}
-                              onProjectAssigned={expandProject}
+                      {sessionGroups ? (
+                        // Grouped: one titled section per group; the first carries
+                        // the header controls, the last the load status.
+                        <div className="flex flex-col gap-6">
+                          {sessionGroups.map((group, index) => (
+                            <ConversationSection
+                              key={group.title}
+                              title={group.title}
+                              conversations={group.conversations}
+                              footer={
+                                index === sessionGroups.length - 1 ? sessionStatus : undefined
+                              }
+                              collapsed={effectiveCollapsedSections.includes(group.title)}
+                              onToggleCollapsed={() => effectiveToggleSectionCollapsed(group.title)}
+                              afterHeader={index === 0 ? sessionsBulkBar : undefined}
+                              headerAction={index === 0 ? sessionsHeaderActions : undefined}
+                              persistentHeaderAction={index === 0 ? sessionsFilterMenu : undefined}
+                              {...sessionRowProps}
                             />
-                          ) : undefined
-                        }
-                        headerAction={
-                          // The filter stays reachable while bulk-selecting;
-                          // switching scope just exits selection. Only the
-                          // "select" entry point hides, being already active.
-                          !selectionMode ? (
-                            <div className="flex items-center gap-0.5">
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    asChild
-                                    variant="ghost"
-                                    size="icon-xs"
-                                    aria-label="New session"
-                                    data-testid="sessions-new-session"
-                                    className="text-muted-foreground"
-                                  >
-                                    <Link
-                                      to="/"
-                                      componentId="sidebar.sessions_new_chat"
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        onActiveTabChange("mine");
-                                        onRowClick(event);
-                                      }}
-                                    >
-                                      <MessageCirclePlusIcon className="size-3.5" />
-                                    </Link>
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">New session</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-xs"
-                                    aria-label="Select sessions"
-                                    data-testid="toggle-selection-mode"
-                                    className="text-muted-foreground"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      onEnterSelectionMode("sessions");
-                                    }}
-                                  >
-                                    <ListChecksIcon className="size-3.5" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">Select sessions</TooltipContent>
-                              </Tooltip>
-                            </div>
-                          ) : undefined
-                        }
-                        persistentHeaderAction={
-                          <SessionFilterMenu
-                            value={activeTab}
-                            onChange={onActiveTabChange}
-                            multiUser={multiUser}
-                          />
-                        }
-                      />
+                          ))}
+                        </div>
+                      ) : (
+                        <ConversationSection
+                          title="Sessions"
+                          conversations={sections.sessions}
+                          emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
+                          footer={sessionStatus}
+                          collapsed={effectiveCollapsedSections.includes("Chats")}
+                          onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
+                          afterHeader={sessionsBulkBar}
+                          headerAction={sessionsHeaderActions}
+                          persistentHeaderAction={sessionsFilterMenu}
+                          {...sessionRowProps}
+                        />
+                      )}
                     </ChatsDropZone>
                   }
                   {/* Every filter renders this same Pinned / Projects / Sessions
@@ -2609,10 +2762,12 @@ function ConversationList({
               and Projects is empty for Shared and Archived. */}
                   {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-                  {/* Infinite-scroll sentinel for the global list. Pagination extends
-              the Chats list, so it hides with a collapsed Chats group — a loader
-              under a collapsed group reads orphaned. */}
-                  {!effectiveCollapsedSections.includes("Chats") && (
+                  {/* Infinite-scroll sentinel. A new page can land in any group, so
+              it hides only when every visible group is collapsed (a loader under
+              a collapsed group reads orphaned). */}
+                  {!(sessionGroups
+                    ? sessionGroups.every((g) => effectiveCollapsedSections.includes(g.title))
+                    : effectiveCollapsedSections.includes("Chats")) && (
                     <InfiniteScrollSentinel
                       scopeKey={activeTab}
                       budgetRef={autoLoadBudget}
@@ -2950,14 +3105,56 @@ function SectionHeader({
 
 // Scope filter on the Sessions heading. A radio group: the options are
 // mutually exclusive slices of one list.
+const GROUPING_LABELS: Record<SidebarGrouping, string> = {
+  default: "Default",
+  status: "Status",
+  updated: "Updated",
+};
+const ORDERING_LABELS: Record<SidebarOrdering, string> = { updated: "Updated", status: "Status" };
+const SHOW_LABELS: Record<SidebarShowField, string> = {
+  updated: "Updated",
+  environment: "Environment",
+  repo: "Repo",
+  branch: "Branch",
+};
+
+// A filter-menu submenu whose trigger shows the current pick at its right edge.
+function FilterMenuSub({
+  label,
+  value,
+  testId,
+  children,
+}: {
+  label: string;
+  value?: string;
+  testId: string;
+  children: ReactNode;
+}) {
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger data-testid={testId}>
+        {label}
+        {value && <span className="ml-auto pl-6 text-muted-foreground">{value}</span>}
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="min-w-40 [&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui">
+        {children}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
 function SessionFilterMenu({
   value,
   onChange,
   multiUser,
+  view,
+  onViewChange,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
   multiUser: boolean;
+  view: SidebarViewPreferences;
+  onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const filters = multiUser
     ? SIDEBAR_FILTERS
@@ -2987,22 +3184,88 @@ function SessionFilterMenu({
           Filter sessions
         </TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
-        <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
-        <DropdownMenuRadioGroup
-          value={value}
-          onValueChange={(next) => onChange(next as SidebarTab)}
+      <DropdownMenuContent align="end" className="min-w-56">
+        <FilterMenuSub
+          label="Grouping"
+          value={GROUPING_LABELS[view.grouping]}
+          testId="session-grouping-menu"
         >
-          {filters.map((filter) => (
-            <DropdownMenuRadioItem
-              key={filter.value}
-              value={filter.value}
-              data-testid={`session-filter-${filter.value}`}
+          <DropdownMenuRadioGroup
+            value={view.grouping}
+            onValueChange={(next) => onViewChange({ grouping: next as SidebarGrouping })}
+          >
+            {Object.entries(GROUPING_LABELS).map(([grouping, label]) => (
+              <DropdownMenuRadioItem
+                key={grouping}
+                value={grouping}
+                data-testid={`session-grouping-${grouping}`}
+              >
+                {label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </FilterMenuSub>
+        <FilterMenuSub
+          label="Display"
+          value={filters.find((filter) => filter.value === value)?.label}
+          testId="session-display-menu"
+        >
+          <DropdownMenuRadioGroup
+            value={value}
+            onValueChange={(next) => onChange(next as SidebarTab)}
+          >
+            {filters.map((filter) => (
+              <DropdownMenuRadioItem
+                key={filter.value}
+                value={filter.value}
+                data-testid={`session-filter-${filter.value}`}
+              >
+                {filter.label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </FilterMenuSub>
+        <FilterMenuSub
+          label="Ordering"
+          value={ORDERING_LABELS[view.ordering]}
+          testId="session-ordering-menu"
+        >
+          <DropdownMenuRadioGroup
+            value={view.ordering}
+            onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
+          >
+            {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
+              <DropdownMenuRadioItem
+                key={ordering}
+                value={ordering}
+                data-testid={`session-ordering-${ordering}`}
+              >
+                {label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </FilterMenuSub>
+        <DropdownMenuSeparator />
+        <FilterMenuSub label="Show" testId="session-show-menu">
+          {SIDEBAR_SHOW_FIELDS.map((field) => (
+            <DropdownMenuCheckboxItem
+              key={field}
+              checked={view.show.includes(field)}
+              data-testid={`session-show-${field}`}
+              // Keep the menu open so several fields can be toggled in one go.
+              onSelect={(event) => event.preventDefault()}
+              onCheckedChange={(checked) =>
+                onViewChange({
+                  show: SIDEBAR_SHOW_FIELDS.filter((f) =>
+                    f === field ? checked : view.show.includes(f),
+                  ),
+                })
+              }
             >
-              {filter.label}
-            </DropdownMenuRadioItem>
+              {SHOW_LABELS[field]}
+            </DropdownMenuCheckboxItem>
           ))}
-        </DropdownMenuRadioGroup>
+        </FilterMenuSub>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -3758,6 +4021,154 @@ function SessionErrorHint() {
   );
 }
 
+/** Where a session runs: local machine, a sandbox provider, or the host's name (id while unresolved). */
+function sessionLocationLabel(
+  conversation: Conversation,
+  hostsById: ReadonlyMap<string, Host>,
+): string {
+  if (!conversation.host_id) return "Local machine";
+  const host = hostsById.get(conversation.host_id);
+  return host?.sandbox_provider
+    ? sandboxOptionLabel(host.sandbox_provider)
+    : (host?.name ?? conversation.host_id);
+}
+
+/** A managed-sandbox session's repo name from its first `omnigent.sandbox.repo` label; null otherwise. */
+function sessionRepoName(conversation: Conversation): string | null {
+  const labels = conversation.labels ?? {};
+  const workspace = labels[`${SANDBOX_REPO_LABEL_KEY}.0`] ?? labels[SANDBOX_REPO_LABEL_KEY];
+  // Label value is `<url>[#<branch>]`; the name is derived from the url part.
+  return workspace ? deriveRepoName(workspace.split("#")[0]!) : null;
+}
+
+// Its own component so only rows showing the timestamp subscribe to the shared clock.
+function SessionUpdatedLabel({ updatedAt }: { updatedAt: number }) {
+  const now = useNow();
+  return relativeTime(updatedAt * 1000, now.getTime());
+}
+
+// A row's second line: the "Show" environment and branch, each omitted when empty.
+function SessionMetaLine({
+  environment,
+  repo,
+  branch,
+}: {
+  environment: string | null;
+  repo: string | null;
+  branch: string | null;
+}) {
+  const parts: { icon: LucideIcon; value: string }[] = [
+    environment !== null && { icon: LaptopIcon, value: environment },
+    repo !== null && { icon: FolderGit2Icon, value: repo },
+    branch !== null && { icon: GitBranchIcon, value: branch },
+  ].filter((p): p is { icon: LucideIcon; value: string } => p !== false);
+  if (parts.length === 0) return null;
+  return (
+    <span
+      data-testid="session-row-meta"
+      className="flex w-full min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
+    >
+      {parts.map(({ icon: Icon, value }, i) => (
+        <Fragment key={value}>
+          {i > 0 && <span aria-hidden>·</span>}
+          <span className="flex min-w-0 items-center gap-1">
+            <Icon aria-hidden className="size-3.5 shrink-0" />
+            <span className="truncate">{value}</span>
+          </span>
+        </Fragment>
+      ))}
+    </span>
+  );
+}
+
+// A label-left, value-right line in the session tooltip's details block.
+function SessionTooltipDetail({
+  label,
+  icon: Icon,
+  testId,
+  children,
+}: {
+  label: string;
+  icon: LucideIcon;
+  testId: string;
+  children: ReactNode;
+}) {
+  return (
+    <div data-testid={testId} className="flex items-center justify-between gap-3 text-sm">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className="flex min-w-0 items-center gap-1.5">
+        <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="truncate">{children}</span>
+      </span>
+    </div>
+  );
+}
+
+// GitHub's glyph and label for a PR state; gh reports a draft as OPEN + is_draft.
+function pullRequestStatus(pr: PullRequest): { icon: LucideIcon; label: string } {
+  const state = pr.state.toUpperCase();
+  if (state === "MERGED") return { icon: GitMergeIcon, label: "Merged" };
+  if (state === "CLOSED") return { icon: GitPullRequestClosedIcon, label: "Closed" };
+  if (pr.is_draft) return { icon: GitPullRequestDraftIcon, label: "Draft" };
+  return { icon: GitPullRequestIcon, label: "Open" };
+}
+
+// The tooltip's detail rows. Repo, PR and a non-worktree branch come from the
+// session's GitHub info, fetched only while the tooltip is open (Radix mounts
+// its content on open) and shared with the GitHub panel's cache.
+function SessionTooltipDetails({ conversation }: { conversation: Conversation }) {
+  const viewerId = useContext(ViewerIdContext);
+  // Only a workspace-bound session has a checkout to read GitHub state from.
+  const { data: github } = usePullRequestInfo(conversation.workspace ? conversation.id : undefined);
+  // `owner` is null when permissions are off; there's no creator to name then.
+  const owner = conversation.owner ?? null;
+  const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
+  const repo = github?.repo?.name_with_owner?.split("/").pop() ?? null;
+  // Prefer the resolved PR (carries state); fall back to the tracked association
+  // (number only) so the row still shows when gh can't resolve state — e.g. gh
+  // isn't authenticated on the host.
+  const pr = github?.pr ?? null;
+  const association =
+    github?.prs?.find((p) => p.url === github.selected_pr_url) ?? github?.prs?.[0] ?? null;
+  const prNumber = pr?.number ?? association?.number ?? null;
+  const prStatus = pr ? pullRequestStatus(pr) : null;
+  const branch = conversation.git_branch ?? github?.branch ?? null;
+  if (createdBy === null && repo === null && prNumber === null && branch === null) return null;
+  return (
+    <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">
+      {createdBy !== null && (
+        <SessionTooltipDetail
+          label="Created by"
+          icon={UserRoundIcon}
+          testId="session-tooltip-owner"
+        >
+          {createdBy}
+        </SessionTooltipDetail>
+      )}
+      {repo !== null && (
+        <SessionTooltipDetail label="Repo" icon={FolderGit2Icon} testId="session-tooltip-repo">
+          {repo}
+        </SessionTooltipDetail>
+      )}
+      {prNumber !== null && (
+        <SessionTooltipDetail
+          label="PR"
+          icon={prStatus?.icon ?? GitPullRequestIcon}
+          testId="session-tooltip-pr"
+        >
+          #{prNumber}
+          {prStatus ? ` · ${prStatus.label}` : ""}
+        </SessionTooltipDetail>
+      )}
+      {branch !== null && (
+        <SessionTooltipDetail label="Branch" icon={GitBranchIcon} testId="session-tooltip-branch">
+          {branch}
+        </SessionTooltipDetail>
+      )}
+    </div>
+  );
+}
+
 function SessionTooltipContent({
   conversation,
   hostsById,
@@ -3767,12 +4178,12 @@ function SessionTooltipContent({
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
 }) {
-  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
-  const locationLabel = !conversation.host_id
-    ? "Local machine"
-    : host?.sandbox_provider
-      ? sandboxOptionLabel(host.sandbox_provider)
-      : (host?.name ?? conversation.host_id);
+  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
+  const harnessAgent = nativeAgent
+    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
+    : conversation.agent_name === "nessie"
+      ? { name: "nessie", harness: null }
+      : null;
 
   return (
     <TooltipContent
@@ -3780,33 +4191,32 @@ function SessionTooltipContent({
       align="start"
       sideOffset={8}
       data-testid="session-tooltip-content"
-      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
-      // then muted, small-icon metadata lines.
-      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title and a
+      // muted "updated · harness · environment" line, then label/value rows.
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
-        <span className="font-normal text-muted-foreground">
-          {" · "}
-          {relativeTime(conversation.updated_at * 1000)}
+      </p>
+      <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+        <span className="shrink-0">{relativeTime(conversation.updated_at * 1000)}</span>
+        <span aria-hidden>·</span>
+        {harnessAgent && (
+          <span
+            role="img"
+            aria-label={`${getConversationAgentType(conversation)} harness`}
+            data-testid="session-tooltip-harness"
+            className="flex shrink-0"
+          >
+            <ComposerAgentIcon agent={harnessAgent} className="size-4" />
+          </span>
+        )}
+        <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
+          <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
-      <p
-        data-testid="session-tooltip-location"
-        className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
-      >
-        <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
-        <span className="truncate">{locationLabel}</span>
-      </p>
-      {conversation.git_branch && (
-        <p
-          data-testid="session-tooltip-branch"
-          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
-        >
-          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{conversation.git_branch}</span>
-        </p>
-      )}
+      <SessionTooltipDetails conversation={conversation} />
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -4020,7 +4430,21 @@ function ConversationRowImpl({
   const showDraftIndicator = hasDraft && !isActive;
   const showSharedIndicator = !isOwner;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
+  // The "Show → Updated" timestamp takes the indicator slot only when it's free.
+  const show = useContext(SidebarShowContext);
+  const showUpdated = show.includes("updated") && !hasSessionIndicator;
+  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
+  const metaEnvironment = show.includes("environment")
+    ? sessionLocationLabel(conversation, hostsById)
+    : null;
+  const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
+  const metaBranch = show.includes("branch") ? gitBranch : null;
+  // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
+  // the row, or on the title line — padding + half its 20px box — above a meta line.
+  const overlayTop =
+    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+      ? "top-4 md:top-3.5"
+      : "top-1/2";
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -4233,11 +4657,15 @@ function ConversationRowImpl({
             ? showSharedIndicator
               ? "pr-36"
               : "pr-29"
-            : hasSessionIndicator && showSharedIndicator
-              ? "pr-14"
-              : hasTrailingIndicator
-                ? "pr-8"
-                : "pr-2"),
+            : showUpdated
+              ? showSharedIndicator
+                ? "pr-18"
+                : "pr-11"
+              : hasSessionIndicator && showSharedIndicator
+                ? "pr-14"
+                : hasTrailingIndicator
+                  ? "pr-8"
+                  : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -4299,6 +4727,8 @@ function ConversationRowImpl({
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
+      {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
+      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
     </Link>
   );
 
@@ -4430,7 +4860,12 @@ function ConversationRowImpl({
         </Tooltip>
       )}
       {selectionMode ? (
-        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
+        <span
+          className={cn(
+            "-translate-y-1/2 pointer-events-none absolute left-2 flex items-center",
+            overlayTop,
+          )}
+        >
           {isSelected ? (
             <SquareCheckIcon className="size-4 text-primary" />
           ) : (
@@ -4441,6 +4876,7 @@ function ConversationRowImpl({
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
+            overlayTop,
             "right-1",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
@@ -4461,6 +4897,17 @@ function ConversationRowImpl({
             </span>
           )}
         </span>
+      ) : showUpdated ? (
+        <span
+          data-testid="session-row-updated"
+          className={cn(
+            SESSION_STATE_SLOT_CLASS,
+            overlayTop,
+            "right-2 text-sm text-muted-foreground",
+          )}
+        >
+          <SessionUpdatedLabel updatedAt={conversation.updated_at} />
+        </span>
       ) : null}
       {!selectionMode && showSharedIndicator && (
         <span
@@ -4468,8 +4915,9 @@ function ConversationRowImpl({
           aria-label="Shared session"
           title="Shared with you"
           className={cn(
-            "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
-            hasSessionIndicator ? "right-8" : "right-1",
+            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            overlayTop,
+            hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
           )}
         >
           <UsersIcon className="size-3.5" aria-hidden="true" />
@@ -4484,7 +4932,12 @@ function ConversationRowImpl({
       {!selectionMode && (
         <ContextMenu>
           <ContextMenuTrigger asChild>
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+            <div
+              className={cn(
+                "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
+                overlayTop,
+              )}
+            >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
               {!isArchived && (

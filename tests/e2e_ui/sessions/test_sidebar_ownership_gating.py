@@ -45,6 +45,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
     MultiUserServer,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.conftest import open_session_display_menu
 
 # Edit access (2) is the interesting non-owner case: it proves the sidebar gates
 # on ownership, not level — an EDIT holder still can't rename/share from the
@@ -157,7 +158,7 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
         # The shared session is not the viewer's own, so the default "My
         # sessions" filter hides it; it shows under the "Shared sessions" filter.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        page.locator(_FILTER).click()
+        open_session_display_menu(page)
         page.locator(_FILTER_SHARED).click()
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
