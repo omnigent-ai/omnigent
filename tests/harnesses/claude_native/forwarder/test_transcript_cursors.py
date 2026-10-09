@@ -1215,6 +1215,8 @@ async def test_forwarder_migrates_hook_cursor_state_to_byte_offset(tmp_path: Pat
         server.server_close()
         thread.join(timeout=5.0)
 
+    context = request["body"]["data"].pop("failure_context")
+    assert context["native_hook_cursor"] == 2
     assert request["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed"},

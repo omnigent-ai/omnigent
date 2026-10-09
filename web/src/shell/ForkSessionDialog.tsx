@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -28,6 +28,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
@@ -680,7 +683,40 @@ function ForkRunConfig({
  * @param onClose - Closes the host dialog (Cancel, and after a
  *   successful fork).
  */
-export function ForkSessionForm({
+export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionForm>[0]) {
+  const { forkDisabledReason } = useSessionActionRestrictions(props.sourceSessionId, {
+    hostId: props.sourceHostId,
+  });
+  if (forkDisabledReason) {
+    const loading = forkDisabledReason === SESSION_ACTIONS_LOADING;
+    return (
+      <>
+        <p
+          role="status"
+          className="text-sm text-muted-foreground"
+          data-testid="fork-session-unavailable"
+        >
+          {forkDisabledReason}
+        </p>
+        <DialogFooter>
+          <Button variant="ghost" onClick={props.onClose}>
+            Cancel
+          </Button>
+          {!loading && (
+            <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
+              <Button data-testid="fork-session-submit" disabled>
+                {props.sourceWorkspace ? "Clone & start" : "Clone"}
+              </Button>
+            </DisabledActionTooltip>
+          )}
+        </DialogFooter>
+      </>
+    );
+  }
+  return <SupportedForkSessionForm {...props} />;
+}
+
+function SupportedForkSessionForm({
   sourceSessionId,
   sourceTitle,
   sourceWorkspace,
@@ -699,6 +735,15 @@ export function ForkSessionForm({
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const formRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    // Replacing a focused capability-loading placeholder must not strand focus on the body.
+    if (document.activeElement === document.body) {
+      formRef.current
+        ?.querySelector<HTMLElement>("button:not(:disabled), input:not(:disabled)")
+        ?.focus();
+    }
+  }, []);
   // Name is optional — left blank, the server derives "Fork of <source
   // title>" (shown as the input's placeholder). So the field starts empty.
   const [title, setTitle] = useState("");
@@ -1265,7 +1310,10 @@ export function ForkSessionForm({
 
   return (
     <>
-      <div className="-mr-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-4 [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+      <div
+        ref={formRef}
+        className="-mr-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-4 [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
+      >
         {/* Host first: with nothing to run the clone on, the user learns up
               front whether they can proceed. Mirrors NewChatDialog: a picker
               when a target is available (sandbox rows pinned above the
