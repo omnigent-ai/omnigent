@@ -325,3 +325,32 @@ def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None
     handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
     assert handoff["ocr_review"]
     assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}
+
+
+def test_handoff_spells_out_footage_or_a_reason_on_every_handoff() -> None:
+    startup = " ".join(build_instructions(load(_RESOLVE_AGENT), None, []).split())
+    assert "the `recordings`/`recording_unavailable_reason` pair" in startup
+    assert "declared clips or a stated reason, never neither" in startup
+
+    output = _normalized_resolve_instructions().split("## Output —", 1)[1]
+    rules = output.split("Field meanings:", 1)[0]
+    assert "`recordings` and `recording_unavailable_reason` are a required pair" in rules
+    assert "including one written after an interruption, salvage prompt, or retry" in rules
+    assert (
+        "A handoff with neither key, or with `[]` and an empty reason, drops the footage silently"
+        in rules
+    )
+    assert "including any under `.omnigent/repro-evidence/`" in rules
+    assert (
+        "A clip named only in `test_audit`, the PR Demo section, or an evidence directory "
+        "is undeclared" in rules
+    )
+
+    example = _resolve_procedures().split("## Output —", 1)[1]
+    handoff = json.loads(example.split("```json\n", 1)[1].split("```", 1)[0])
+    assert "recordings" in handoff
+    assert "recording_unavailable_reason" in handoff
+
+    fields = output.split("Field meanings:", 1)[1]
+    assert "Paths are workspace-relative under `recordings/<slug>/`; never omit this key" in fields
+    assert "always include this key; it is non-empty whenever `recordings` is `[]`" in fields

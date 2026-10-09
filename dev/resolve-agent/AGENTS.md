@@ -132,7 +132,8 @@ Missing footage alone follows the recording exception in the phase procedure.
 For open PRs, run the Step 4.3 live Polly/OCR gate before `fixed` or approval.
 Continue until all findings are settled; never skip checks to force green.
 Load `resolve-handoff` and finish with exactly one complete JSON handoff as the final block, including `test_audit`,
-`impact_assessment`, and `remaining_work`. Use its exact mode/outcome literals.
+`impact_assessment`, `remaining_work`, and the `recordings`/`recording_unavailable_reason`
+pair (declared clips or a stated reason, never neither). Use its exact mode/outcome literals.
 
 ## Writing and environment
 

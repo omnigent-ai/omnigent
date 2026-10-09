@@ -19,6 +19,18 @@ the message. Same discipline as repro-agent:
   carries `pr_url` + a provisional `outcome`; this final block is authoritative.
 - Emit it as **JSON**, never YAML. Include **every** key below, always, even when
   a value is empty (`""`, `[]`).
+- `recordings` and `recording_unavailable_reason` are a required pair on every
+  handoff in every mode, including one written after an interruption, salvage
+  prompt, or retry. Spell the footage out: list every clip you produced or
+  recovered in `recordings`, or set `recordings: []` and give the concrete
+  reason. A handoff with neither key, or with `[]` and an empty reason, drops
+  the footage silently — the workflow attaches only declared entries and reports
+  the omission as unexplained. Before writing the handoff, list the `.webm` and
+  `.mp4` files this session produced, including any under
+  `.omnigent/repro-evidence/`, move each selected clip to
+  `recordings/<slug>/<kind>-<facet>.<ext>`, and declare it there. A clip named
+  only in `test_audit`, the PR Demo section, or an evidence directory is
+  undeclared.
 - `mode` must be exactly `"reviewed_existing_pr"`, `"authored_fix"`, or
   `"review_remediation"` — which entry path you took.
 - `outcome` must be **exactly one** of the string literals `"fixed"`,
@@ -179,9 +191,11 @@ readiness; name pending publication/review steps in `remaining_work`.
   captions unchanged. Each after-clip's caption lists the actions shown, ending
   with the corrected behavior. A missing before-clip is not a reason to skip
   the after-clip. Use `[]` only for internal/API-only results with no visible
-  user interaction, or when recording is blocked as described above.
-- `recording_unavailable_reason` — leave empty when every expected clip is
-  present. Otherwise explain each missing clip:
+  user interaction, or when recording is blocked as described above. Paths are
+  workspace-relative under `recordings/<slug>/`; never omit this key.
+- `recording_unavailable_reason` — always include this key; it is non-empty
+  whenever `recordings` is `[]`. Leave it empty only when every expected clip
+  is present. Otherwise explain each missing clip:
 
   - For internal/API-only results, say there is no visible user interaction
     and put the written before/after evidence in the PR Demo section.
