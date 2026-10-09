@@ -15,11 +15,10 @@ pseudo-TTY (pexpect), rendering the TUI with ``pyte``:
 
 Pi's status footer renders ``<model> • <level>`` (for example ``• medium`` or
 ``• thinking off``) only for ``models.json`` entries flagged ``reasoning:
-true``; a non-reasoning model shows just ``<model>`` with no bullet. On the
-buggy build Omnigent flags only ids containing ``deepseek``/``claude``, so the
-GPT and Gemini footers drop the thinking indicator while Claude keeps it. The
-test asserts the GPT and Gemini footers still show the indicator, so it fails
-on the buggy build and passes once the catalog capability drives the flag.
+true``; a non-reasoning model shows just ``<model>`` with no bullet. The test
+asserts the GPT and Gemini footers carry the indicator like Claude's, guarding
+the contract that every reasoning-capable gateway model offers thinking
+whatever its vendor.
 
 The footer indicator is the thinking surface available on every Pi build this
 suite runs against: the ``/thinking`` slash command only exists in newer Pi,

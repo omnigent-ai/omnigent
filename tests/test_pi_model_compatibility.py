@@ -73,11 +73,23 @@ def test_catalog_unsupported_reasoning_leaves_flag_unset() -> None:
     assert "reasoning" not in entry
 
 
-def test_deepseek_keeps_reasoning_channel_flag_despite_catalog() -> None:
-    """DeepSeek streams on ``reasoning_content``; Pi reads that channel only with the flag."""
-    entry = pi_model_json_entry(
-        _entry("databricks-deepseek-v4", reasoning=False, wire=ModelWireAPI.OPENAI_CHAT)
-    )
+@pytest.mark.parametrize(
+    ("model_id", "wire"),
+    [
+        ("databricks-deepseek-v4", ModelWireAPI.OPENAI_CHAT),
+        ("databricks-claude-fable-5-1", ModelWireAPI.ANTHROPIC_MESSAGES),
+    ],
+)
+def test_vendor_floor_keeps_reasoning_flag_despite_catalog(
+    model_id: str, wire: ModelWireAPI
+) -> None:
+    """DeepSeek and Claude keep ``reasoning: true`` even when the catalog denies it.
+
+    DeepSeek reads its chain of thought off ``reasoning_content`` and Claude
+    enables extended thinking; the id floor preserves both whatever the catalog
+    reports.
+    """
+    entry = pi_model_json_entry(_entry(model_id, reasoning=False, wire=wire))
 
     assert entry.get("reasoning") is True
 
