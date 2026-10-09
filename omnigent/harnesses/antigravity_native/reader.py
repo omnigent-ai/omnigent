@@ -507,6 +507,13 @@ def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) ->
     return isinstance(root, str) and bool(root) and root != cascade_id
 
 
+def _is_root_cascade(cascade_id: str, summary: dict[str, object]) -> bool:
+    """Return whether a trajectory summary is a root cascade rather than a subagent child."""
+    if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
+        return False
+    return not _summary_is_child_trajectory(cascade_id, summary)
+
+
 def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
     """
     Return the id of a newer-active root cascade than the bound one, else ``None``.
@@ -557,12 +564,8 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
     best_id: str | None = None
     best_activity: datetime | None = None
     for cascade_id, summary in summaries.items():
-        if not isinstance(summary, dict):
-            continue
-        if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
-            continue  # never rotate to a non-cascade trajectory
-        if _summary_is_child_trajectory(cascade_id, summary):
-            continue  # a subagent works FOR the bound cascade; it is not a new one
+        if not isinstance(summary, dict) or not _is_root_cascade(cascade_id, summary):
+            continue  # never rotate to a non-cascade trajectory or a subagent child
         if cascade_id == bound_cascade_id:
             continue
         activity = _summary_activity(summary)
@@ -602,9 +605,7 @@ def _typed_root_cascade(summaries: dict[str, object]) -> str | None:
     for cascade_id, summary in summaries.items():
         if not isinstance(summary, dict) or not _is_cascade_uuid(cascade_id):
             continue
-        if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
-            continue
-        if _summary_is_child_trajectory(cascade_id, summary):
+        if not _is_root_cascade(cascade_id, summary):
             continue
         typed = _parse_activity_timestamp(summary.get("lastUserInputTime"))
         if typed is None:
