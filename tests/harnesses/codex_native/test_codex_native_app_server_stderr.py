@@ -16,6 +16,7 @@ from omnigent.harnesses.codex_native.app_server import (
     _STDERR_CHUNK_LIMIT,
     CodexNativeAppServer,
 )
+from omnigent.harnesses.codex_native.bridge import read_certificate_failure
 
 
 @pytest.fixture
@@ -139,3 +140,31 @@ async def test_stderr_cancellation_is_not_logged_as_a_failure(
         await reader
 
     assert "Codex app-server stderr drain failed" not in caplog.text
+
+
+async def test_stderr_certificate_failure_is_recorded_for_the_forwarder(
+    server: CodexNativeAppServer, tmp_path: Path
+) -> None:
+    """A launcher's certificate-expiry line is kept and mirrored into the bridge."""
+    child = """
+import sys
+
+sys.stderr.write(
+    "WARNING: proceeding, even though we could not create PATH aliases\\n"
+    "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
+    "ssl/tls alert certificate expired (_ssl.c:2580)\\n"
+    "Missing/Expired Certificate\\n"
+)
+sys.stderr.flush()
+"""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", child, stderr=asyncio.subprocess.PIPE
+    )
+    server.proc = proc
+    await asyncio.wait_for(server._stderr_loop(), 5)
+    await asyncio.wait_for(proc.wait(), 5)
+
+    assert server.certificate_failure is not None
+    assert server.certificate_failure.expired is True
+    assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in server.certificate_failure.evidence
+    assert read_certificate_failure(tmp_path) == server.certificate_failure

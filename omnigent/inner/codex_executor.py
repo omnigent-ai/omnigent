@@ -41,6 +41,17 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.errors import HarnessTransportClosedError
+from omnigent.harnesses.codex_egress import (
+    CERTIFICATE_FAILURE_CODE,
+    CERTIFICATE_FAILURE_TITLE,
+    CERTIFICATE_REMEDIATION,
+    CertificateFailure,
+    certificate_failure_message,
+    connection_retry_detail,
+    detect_certificate_failure,
+    is_connection_failure_text,
+    is_connection_retry,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -109,7 +120,7 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is unset.
 # Not Databricks-specific: the same fallback applies to any gateway producer
-# (Databricks AI gateway or a generic key/gateway provider).
+# (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _GATEWAY_AUTH_TIMEOUT_MS = 15_000
 
@@ -170,6 +181,13 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # home starts with no memories and past-conversation context is lost. The ``_1``
 # suffix is Codex's schema version — update if Codex migrates to a newer schema.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json", "memories_1.sqlite")
+# Bridged as hard links instead: Codex rewrites its OAuth store in place through
+# an ``O_NOFOLLOW`` open, which fails on a symlink (ELOOP). A hard link shares the
+# inode, so refreshes still reach the real home.
+_CODEX_HOME_HARDLINK_FILES = frozenset({".credentials.json"})
+# Unlike a symlink, a hard link records no path back to its source home, so the
+# private home records it here for nested launches to resolve.
+_CODEX_HOME_SOURCE_RECORD = ".omnigent-codex-source"
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -262,6 +280,16 @@ def _parse_codex_gateway_error(line: str) -> _CodexGatewayError | None:
     url_match = _CODEX_STDERR_URL_RE.search(line)
     url = url_match.group("url").rstrip(",") if url_match else None
     return _CodexGatewayError(code, reason, url)
+
+
+def _codex_turn_status(turn: object) -> str | None:
+    """Return a Codex turn object's status, e.g. ``"completed"`` or ``"interrupted"``."""
+    if not isinstance(turn, dict):
+        return None
+    status = turn.get("status")
+    if isinstance(status, dict):
+        status = status.get("type") or status.get("status")
+    return status if isinstance(status, str) else None
 
 
 def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[str, object] | None:
@@ -727,8 +755,9 @@ def codex_skill_sources(
     ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
     provider — so the linked set and the menu cannot drift on which roots
     are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    the host-installed skills dir (a bundled skill shadows a host skill of
-    the same name). Only existing directories are returned.
+    the host-installed Codex skills dir, then ``~/.agents/skills`` (a bundled
+    skill shadows a host skill of the same name). Only existing directories
+    are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
@@ -747,6 +776,9 @@ def codex_skill_sources(
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
+    shared = home / ".agents" / "skills"
+    if shared.is_dir():
+        sources.append(shared)
     return sources
 
 
@@ -992,7 +1024,8 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
     A parent Omnigent launch bridges ``auth.json`` and ``config.toml`` into
     its private home as symlinks. If a nested launch inherits that private
     ``CODEX_HOME``, those symlink targets are the only durable record of a
-    custom parent source.
+    custom parent source, along with the source recorded beside a
+    hard-linked credential store.
 
     :param path: Private ``CODEX_HOME`` path, e.g.
         ``"/home/user/.omnigent/codex-native/<hash>/codex-home"``.
@@ -1006,6 +1039,10 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
             continue
         with suppress(OSError):
             source_dirs.add(config_file.resolve().parent)
+    with suppress(OSError):
+        recorded = (path / _CODEX_HOME_SOURCE_RECORD).read_text().strip()
+        if recorded:
+            source_dirs.add(Path(recorded))
     if len(source_dirs) == 1:
         return next(iter(source_dirs))
     return None
@@ -1156,22 +1193,30 @@ def _populate_codex_home_config(
         # home would either shadow it or (worse) be written through.
         symlink_files = tuple(name for name in symlink_files if name != _CODEX_HOOKS_FILENAME)
     for filename in symlink_files:
+        link_path = target_dir / filename
+        if filename in _CODEX_HOME_HARDLINK_FILES and link_path.is_symlink():
+            # A home reused from before hard-linking still holds the symlink.
+            link_path.unlink()
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
-        link_path = target_dir / filename
         if link_path.exists() or link_path.is_symlink():
             continue
         try:
-            link_path.symlink_to(source_file)
+            if filename in _CODEX_HOME_HARDLINK_FILES:
+                os.link(source_file, link_path)
+            else:
+                link_path.symlink_to(source_file)
         except OSError as exc:
             logger.warning(
-                "could not symlink %r into %s (%s); copying instead",
+                "could not link %r into %s (%s); copying instead",
                 filename,
                 target_dir,
                 exc,
             )
             shutil.copy2(source_file, link_path)
+        if filename in _CODEX_HOME_HARDLINK_FILES:
+            (target_dir / _CODEX_HOME_SOURCE_RECORD).write_text(f"{source_dir.resolve()}\n")
 
     if not minimal_config:
         for reldir in _CODEX_HOME_SYMLINK_DIRS:
@@ -2098,7 +2143,7 @@ def _normalize_copied_codex_effort(
 
 
 def _databricks_codex_base_url(host: str) -> str:
-    """Return the Unity AI Gateway Codex Responses base URL for *host*."""
+    """Return the Unity Gateway Codex Responses base URL for *host*."""
     return f"{host.rstrip('/')}/ai-gateway/codex/v1"
 
 
@@ -2767,6 +2812,12 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error: _CodexGatewayError | None = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error: _CodexGatewayError | None = None
+        # A TLS certificate failure the codex launcher printed to stderr. The
+        # launcher prints it once at start, so it stays until a turn reaches
+        # the model and proves the egress works.
+        self._certificate_failure: CertificateFailure | None = None
+        # Whether this turn saw Codex retry a request that got no HTTP response.
+        self._saw_connection_retry = False
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
         self._worker_launch: CodexWorkerLaunch | None = None
@@ -3529,6 +3580,7 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error = None
+        self._saw_connection_retry = False
         native_forwarder_health.note_post_success()
 
         is_new_thread = self.thread_id is None
@@ -3780,10 +3832,7 @@ class _CodexAppServerSession:
                     event_task.cancel()
                     with suppress(BaseException):
                         await event_task
-                    try:
-                        await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
-                    except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
-                        logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
+                    await self._interrupt_failed_turn("auth-failure")
                     if (
                         fatal_gateway_error.code == 401
                         and self._provider_auth_authority is not None
@@ -4011,6 +4060,10 @@ class _CodexAppServerSession:
                             active_turn_id,
                         )
                         continue
+                    if _codex_turn_status(turn) in (None, "completed"):
+                        # The model answered, so a certificate failure printed at
+                        # launch no longer describes this process's egress.
+                        self._certificate_failure = None
                     if not final_response:
                         final_response = _latest_buffered_agent_message(message_buffers)
                     if not final_response:
@@ -4041,6 +4094,13 @@ class _CodexAppServerSession:
                         or turn.get("error")
                         or "Codex App Server turn failed"
                     )
+                    # Only a connection-level failure is the certificate's doing;
+                    # a tool or provider error keeps its own retryable text.
+                    if self._certificate_failure is not None and (
+                        self._saw_connection_retry or is_connection_failure_text(error_text)
+                    ):
+                        yield self._certificate_error(model, codex_error=error_text)
+                        return
                     # turn/failed is a provider/runtime-level turn error
                     # (e.g. tool exit code, transient provider issue) —
                     # mark retryable so the workflow's retry policy
@@ -4050,6 +4110,18 @@ class _CodexAppServerSession:
 
                 if method == "error":
                     if isinstance(params, dict) and params.get("willRetry") is True:
+                        if is_connection_retry(params):
+                            # Codex retries a connection failure indefinitely:
+                            # name it for the idle watchdog, and fail fast once
+                            # the launcher has already reported the certificate.
+                            self._saw_connection_retry = True
+                            native_forwarder_health.record_transport_failure(
+                                connection_retry_detail(params)
+                            )
+                            if self._certificate_failure is not None:
+                                await self._interrupt_failed_turn("certificate-failure")
+                                yield self._certificate_error(model)
+                                return
                         continue
                     # JSON-RPC-shaped error frames from the app server
                     # carry ``code`` / ``message`` / ``data``. Some error
@@ -4114,6 +4186,28 @@ class _CodexAppServerSession:
             },
         )
         return True
+
+    async def _interrupt_failed_turn(self, cause: str) -> None:
+        """Best-effort interrupt of a turn the head is about to fail on *cause*."""
+        try:
+            await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
+        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+            logger.debug("Codex %s turn interrupt failed: %s", cause, exc)
+
+    def _certificate_error(
+        self, model: str | None, *, codex_error: str | None = None
+    ) -> ExecutorError:
+        """The terminal error for a turn blocked by the launcher-reported certificate failure."""
+        assert self._certificate_failure is not None
+        return ExecutorError(
+            message=certificate_failure_message(
+                self._certificate_failure, model=model, codex_error=codex_error
+            ),
+            retryable=False,
+            code=CERTIFICATE_FAILURE_CODE,
+            title=CERTIFICATE_FAILURE_TITLE,
+            remediation=CERTIFICATE_REMEDIATION,
+        )
 
     async def _execute_dynamic_tool(
         self,
@@ -4305,7 +4399,17 @@ class _CodexAppServerSession:
         its own retry budget (a final ``Reconnecting N/N``); the two signals can
         arrive in either order, so both are tracked and fast-fail arms when both
         hold — a single blip the CLI recovers from never kills a healthy turn.
+
+        A TLS certificate failure printed by the codex launcher is kept
+        separately; it arms fast-fail once Codex reports a connection retry.
         """
+        if self._certificate_failure is None:
+            failure = detect_certificate_failure(text)
+            if failure is not None:
+                self._certificate_failure = failure
+                logger.warning(
+                    "codex launcher reported a TLS certificate failure: %s", failure.evidence
+                )
         retry = _CODEX_STDERR_RETRY_EXHAUSTED_RE.search(text)
         if retry is not None and retry.group("n") == retry.group("total"):
             self._saw_retries_exhausted = True
