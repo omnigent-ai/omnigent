@@ -6,6 +6,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -2257,6 +2258,43 @@ async def test_launch_failure_names_silent_exit(
     assert "tmux launch failed (rc=2)" in message
     assert not message.rstrip().endswith(":")
     assert "<tmux produced no output>" in message
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.skipif(sys.platform == "win32", reason="requires RLIMIT_NPROC")
+async def test_launch_failure_names_silent_exit_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tmux reports fatal errors such as a failed server fork only to its ``-v``
+    log, so the client exits 1 with nothing on either stream."""
+    import resource
+
+    if os.geteuid() == 0:
+        pytest.skip("RLIMIT_NPROC is not enforced for root")
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+
+    def forbid_child_processes() -> None:
+        resource.setrlimit(resource.RLIMIT_NPROC, (1, 1))
+
+    async def spawn(*cmd: str, **kwargs: object) -> asyncio.subprocess.Process:
+        return await real_create_subprocess_exec(*cmd, preexec_fn=forbid_child_processes, **kwargs)
+
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+    instance = TerminalInstance(
+        name="pi",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await instance.launch(cwd=tmp_path)
+
+    message = str(excinfo.value)
+    assert message.startswith("tmux launch failed (rc=1): ")
+    assert message.removeprefix("tmux launch failed (rc=1): ").strip(), message
+    assert instance.running is False
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])
