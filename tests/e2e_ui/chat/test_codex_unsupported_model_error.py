@@ -2,17 +2,15 @@
 provider's reason in the chat error pill, not the raw JSON error envelope.
 
 The real web SPA, a live server + runner and the real ``codex`` CLI app-server
-are driven against the mock ``/v1/responses``, which answers the turn with the
-HTTP 400 a ChatGPT account returns for a model it does not allow.
+are driven against the mock ``/v1/responses``, which answers the turn with a
+nested Responses-style HTTP 400 error.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import re
 import shutil
-import tarfile
 import uuid
 from typing import Any
 
@@ -21,7 +19,7 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
-from tests._helpers.session import bind_session_runner, post_session_bundle
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 pytestmark = pytest.mark.skipif(
@@ -50,13 +48,7 @@ def _build_codex_bundle(name: str, model: str) -> bytes:
         "prompt": "You are a terse assistant. Answer in as few words as possible.",
         "executor": {"harness": "codex", "model": model},
     }
-    with io.BytesIO() as buf:
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            yaml_bytes = yaml.safe_dump(config, sort_keys=False).encode()
-            info = tarfile.TarInfo(f"{name}.yaml")
-            info.size = len(yaml_bytes)
-            tar.addfile(info, io.BytesIO(yaml_bytes))
-        return buf.getvalue()
+    return bundle_files({f"{name}.yaml": yaml.safe_dump(config, sort_keys=False).encode()})
 
 
 def _create_codex_session(base_url: str, runner_id: str, model: str) -> str:

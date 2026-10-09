@@ -3042,6 +3042,10 @@ def test_format_codex_error_params_unwraps_responses_api_envelope_message() -> N
         "willRetry": False,
     }
     assert _format_codex_error_params(flat) == "Bad model. (error_code=BAD_REQUEST)"
+    # A top-level ``code`` the envelope does not name is still reported.
+    assert _format_codex_error_params({**params, "code": "upstream_error"}).endswith(
+        "(error_code=invalid_request_error); code=upstream_error"
+    )
 
 
 def test_format_codex_error_params_reports_a_repeated_reason_once() -> None:
@@ -3054,55 +3058,28 @@ def test_format_codex_error_params_reports_a_repeated_reason_once() -> None:
     assert result == "Model not allowed. (error_code=invalid_request_error)"
 
 
-async def test_run_turn_turn_failed_unwraps_provider_error_envelope() -> None:
+def test_run_turn_turn_failed_unwraps_provider_error_envelope() -> None:
     """A ``turn/failed`` frame carrying the provider's JSON envelope surfaces the reason."""
-    session = _CodexAppServerSession(
-        codex_path="/bin/echo",
-        cwd="/tmp/workspace",
-        env={},
-        tool_executor=None,
-    )
-    session.start = AsyncMock()
-    session._proc = _FakeProcess()
-    session.thread_id = "thread-1"
-    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
 
-    envelope = (
-        '{"type": "error", "status": 400, "error": {"type": '
-        '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
-        'is not supported when using Codex with a ChatGPT account."}}'
-    )
-    # ``turnId`` must be set in ``params`` so the startup drain
-    # preserves the event for the main loop.
-    await session._events.put(
-        {
-            "method": "turn/failed",
-            "params": {
-                "turnId": "turn-1",
-                "turn": {"id": "turn-1"},
-                "message": envelope,
-            },
-        }
-    )
-
-    events = [
-        event
-        async for event in session.run_turn(
-            messages=[{"role": "user", "content": "hi"}],
-            tools=[],
-            system_prompt="",
-            model="gpt-5.4-mini",
-            cwd=".",
-            sandbox="workspace-write",
+    async def _t():
+        envelope = (
+            '{"type": "error", "status": 400, "error": {"type": '
+            '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
+            'is not supported when using Codex with a ChatGPT account."}}'
         )
-    ]
+        events = await _run_turn_with_events(
+            _session_with_scripted_turn(), [_failed_turn_event(envelope)]
+        )
 
-    error_events = [e for e in events if isinstance(e, ExecutorError)]
-    assert len(error_events) == 1, f"expected exactly 1 ExecutorError, got: {events}"
-    surfaced = error_events[0].message
-    assert "model is not supported when using Codex with a ChatGPT account" in surfaced
-    assert not surfaced.lstrip().startswith("{")
-    assert '"invalid_request_error"' not in surfaced
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is True
+        assert errors[0].message == (
+            "The 'gpt-6-astra' model is not supported when using Codex with "
+            "a ChatGPT account. (error_code=invalid_request_error)"
+        )
+
+    _run(_t())
 
 
 def test_extract_codex_last_turn_usage_splits_cached_out_of_input() -> None:

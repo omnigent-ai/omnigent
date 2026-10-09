@@ -30,8 +30,7 @@ _UNSUPPORTED_MODEL = "gpt-6-astra"
 _UNSUPPORTED_REASON = (
     f"The '{_UNSUPPORTED_MODEL}' model is not supported when using Codex with a ChatGPT account."
 )
-# The provider's verbatim 400 body (the ChatGPT-account rejection for an
-# unsupported model). This is the upstream fault the account produces.
+# Exact Responses API 400 body for an unsupported ChatGPT-account model.
 _ERROR_BODY = {
     "type": "error",
     "status": 400,
@@ -52,7 +51,8 @@ def _codex_bin_or_skip() -> str:
     if probe.returncode != 0 or not match:
         pytest.skip("could not determine codex CLI version")
     if tuple(int(part) for part in match.groups()) < _CODEX_MIN_VERSION:
-        pytest.skip("codex CLI >= 0.139.0 is required for the mocked app-server e2e")
+        required = ".".join(str(part) for part in _CODEX_MIN_VERSION)
+        pytest.skip(f"codex CLI >= {required} is required for the mocked app-server e2e")
     return codex_path
 
 
