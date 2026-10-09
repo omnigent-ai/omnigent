@@ -269,10 +269,17 @@ def test_paired_comparisons_require_repeated_runs(
     assert "at least three --runs" in capsys.readouterr().err.partition("error:")[2]
 
 
-@pytest.mark.parametrize("regression", [False, True])
+@pytest.mark.parametrize(
+    ("candidate_style_ms", "expected_status"),
+    [(2.0, "ok"), (10.0, "advisory"), (150.0, "regression")],
+)
 async def test_orchestration_alternates_bundles_and_propagates_verdict(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, regression: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_style_ms: float,
+    expected_status: str,
 ) -> None:
+    regression = expected_status == "regression"
     args = _args()
     args.output_dir = tmp_path / "results"
     args.web_dist, args.baseline_dist = Path("candidate"), Path("baseline")
@@ -293,8 +300,8 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
     async def scenario(_browser, env, _session_id, mode, _args, _evidence):
         calls.append((env.dist.name, mode))
         result = copy.deepcopy(sample)
-        if regression and env.dist == args.web_dist:
-            result["style_layout"] = [150.0] * args.iterations
+        if env.dist == args.web_dist:
+            result["style_layout"] = [candidate_style_ms] * args.iterations
         return result
 
     monkeypatch.setattr(ui_run, "async_playwright", playwright_context)
@@ -310,9 +317,14 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
     comparison = json.loads((args.output_dir / "comparison.json").read_text())
     assert comparison["passed"] is not regression
     assert bool(comparison["failures"]) is regression
-    assert (
-        (args.output_dir / "summary.md").read_text().endswith("FAIL\n" if regression else "PASS\n")
-    )
+    assert {
+        row["status"] for row in comparison["rows"] if row["journey"].endswith("_style_layout")
+    } == {expected_status}
+    summary = (args.output_dir / "summary.md").read_text()
+    assert summary.endswith("FAIL\n" if regression else "PASS\n")
+    if expected_status == "advisory":
+        assert "| ⚠️ advisory |" in summary
+        assert "**PASS** — no blocking regressions detected." in summary
     for variant in ("candidate", "baseline"):
         report = json.loads((args.output_dir / f"{variant}.json").read_text())
         assert report["git_sha"] == f"{variant}-sha"

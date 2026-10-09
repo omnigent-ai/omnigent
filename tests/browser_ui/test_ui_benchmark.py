@@ -83,6 +83,36 @@ def test_measure_scenario_rejects_failed_static_asset(
     assert (tmp_path / "asset.failed.png").is_file()
 
 
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("page-error", "Browser errors:.*benchmark test error"),
+        ("small-dom", "Fixture has only .* elements; requires"),
+    ],
+)
+def test_measure_scenario_rejects_invalid_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, message: str
+) -> None:
+    body = _BODY if failure == "page-error" else _BODY.replace("<span></span>", "")
+    script = "throw new Error('benchmark test error');" if failure == "page-error" else ""
+
+    async def handler(route: Route) -> None:
+        await route.fulfill(
+            content_type="text/html",
+            body=f"<html><head><script>{script}</script></head><body>{body}</body></html>",
+        )
+
+    async def drive() -> None:
+        async with _routed_browser(monkeypatch, handler) as browser:
+            with pytest.raises(RuntimeError, match=message):
+                await measure_scenario(
+                    browser, _ENV, "session", "browser", _ARGS, tmp_path / failure
+                )
+
+    run_in_fresh_loop(drive())
+    assert (tmp_path / f"{failure}.failed.png").is_file()
+
+
 def test_measure_typing_rejects_lost_keystroke(monkeypatch: pytest.MonkeyPatch) -> None:
     async def handler(route: Route) -> None:
         await route.fulfill(
