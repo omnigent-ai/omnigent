@@ -1469,6 +1469,19 @@ def test_a_relayed_transient_self_call_4xx_is_not_latched() -> None:
         assert router_permanently_disabled(404, json.dumps({"message": inner})) is False
 
 
+def test_the_self_call_404_is_read_from_the_gateways_own_message() -> None:
+    """Only the body's top-level ``message`` relays the self-call: the phrase
+    quoted in another field, or a longer status, does not latch; a plain-text
+    relay is its own message."""
+    from omnigent.server.smart_routing import router_permanently_disabled
+
+    quoted = {"message": "no route", "details": _SELF_CALL_404_BODY["message"]}
+    assert router_permanently_disabled(404, json.dumps(quoted)) is False
+    longer = {"message": "responses self-call returned status 4040: odd"}
+    assert router_permanently_disabled(404, json.dumps(longer)) is False
+    assert router_permanently_disabled(404, _SELF_CALL_404_BODY["message"]) is True
+
+
 @pytest.mark.asyncio
 async def test_a_relayed_self_call_429_is_retried_on_the_next_turn() -> None:
     """A rate-limited extraction call must not disable routing for the process."""

@@ -10,10 +10,10 @@ not an outage: like the account-level "not enabled" 404, the client must latch
 it — stop re-issuing the doomed call every turn and stop advertising the
 external router — instead of silently re-failing for the life of the process.
 
-These tests drive the real user journey (create a Smart-Routing session, send
-messages over ``POST /v1/sessions/{id}/events``) with the real
-:class:`~omnigent.server.smart_routing.ExternalRoutingClient` wired at a
-loopback service returning that 404 body verbatim.
+This test drives the real user journey (create a Smart-Routing session, send
+messages over ``POST /v1/sessions/{id}/events``, read ``GET /v1/info``) with
+the real :class:`~omnigent.server.smart_routing.ExternalRoutingClient` wired at
+a loopback service returning that 404 body verbatim.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import pytest
 from omnigent.runtime import _globals as runtime_globals
 from omnigent.server.routing_backend import RoutingBackends
 from omnigent.server.smart_routing import ExternalRoutingClient
-from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -202,44 +201,31 @@ async def _send_message(client: httpx.AsyncClient, session_id: str, text: str) -
     assert resp.status_code == 202, resp.text
 
 
-def _observed_state(
-    db_uri: str,
-    session_id: str,
-    router: ExternalRoutingClient,
-    gateway: _Gateway,
-) -> str:
-    """One-line snapshot of the routing outcome, for failure output."""
-    conv_store = SqlAlchemyConversationStore(db_uri)
-    conv = conv_store.get_conversation(session_id)
-    cards = [
-        item
-        for item in conv_store.list_items(session_id).data
-        if getattr(item, "type", None) == "routing_decision"
-    ]
-    return (
-        f"routes:select calls={gateway.count()} "
-        f"permanently_unavailable={router.permanently_unavailable} "
-        f"last_error={router.last_error!r} "
-        f"model_override={getattr(conv, 'model_override', None)!r} "
-        f"routing_decision_items={len(cards)}"
-    )
+async def _advertised_external(client: httpx.AsyncClient) -> bool | None:
+    """What ``GET /v1/info`` currently says about the external router."""
+    info = await client.get("/v1/info")
+    assert info.status_code == 200, info.text
+    return (info.json().get("smart_routing_sources") or {}).get("external")
 
 
 async def test_selection_model_404_latches_instead_of_refailing_every_turn(
     client: httpx.AsyncClient,
-    db_uri: str,
     gateway_404: _Gateway,
     external_router: ExternalRoutingClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One selection-model 404 must latch: turn 2 must not re-issue the call.
+    """One selection-model 404 must latch: turn 2 must not re-issue the call,
+    and ``/v1/info`` must stop advertising the external router.
 
     The 404 body is configuration (the extraction model is not served), so
     every later call fails identically. Re-issuing it wastes a round trip per
-    turn for the life of the process.
+    turn for the life of the process, and a deployment reporting
+    ``external: true`` while every call 404s is what made the misconfiguration
+    undiagnosable for an operator.
     """
     forwarded = _stub_runner(monkeypatch)
     session_id = await _routing_session(client)
+    assert await _advertised_external(client) is True, "a fresh client is advertised"
 
     await _send_message(client, session_id, "rename a local variable in one file")
 
@@ -257,47 +243,20 @@ async def test_selection_model_404_latches_instead_of_refailing_every_turn(
     )
     assert external_router.last_error is not None, "the 404 must be recorded on the client"
 
-    print("after turn 1:", _observed_state(db_uri, session_id, external_router, gateway_404))
-
     await _send_message(client, session_id, "now rename the other local variable")
-
-    print("after turn 2:", _observed_state(db_uri, session_id, external_router, gateway_404))
 
     assert gateway_404.count() == 1, (
         "the selection-model 404 is a permanent configuration failure, not an "
         "outage: after the first failure no further routes:select calls may go "
-        f"out, but the gateway served {gateway_404.count()} calls"
+        f"out, but the gateway served {gateway_404.count()} calls "
+        f"(permanently_unavailable={external_router.permanently_unavailable}, "
+        f"last_error={external_router.last_error!r})"
     )
     assert external_router.permanently_unavailable, (
         "the client must latch the selection-model 404 the way it latches the "
         "account-level 'not enabled' 404"
     )
-
-
-async def test_selection_model_404_stops_advertising_external_router(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    gateway_404: _Gateway,
-    external_router: ExternalRoutingClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``GET /v1/info`` must stop reporting the external source once it latches.
-
-    The deployment reporting ``external: true`` while every ``routes:select``
-    404s is what makes the misconfiguration undiagnosable for an operator.
-    """
-    _stub_runner(monkeypatch)
-    session_id = await _routing_session(client)
-
-    await _send_message(client, session_id, "rename a local variable in one file")
-    assert gateway_404.count() == 1, "the first turn must reach the router"
-
-    print("after turn 1:", _observed_state(db_uri, session_id, external_router, gateway_404))
-
-    info = await client.get("/v1/info")
-    assert info.status_code == 200, info.text
-    sources = info.json().get("smart_routing_sources") or {}
-    assert sources.get("external") is False, (
-        "after the router's permanent configuration failure the deployment "
-        f"must stop advertising it; /v1/info reported {sources!r}"
+    assert await _advertised_external(client) is False, (
+        "after the router's permanent configuration failure the deployment must "
+        "stop advertising it"
     )

@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -757,12 +756,22 @@ def _router_error_detail(body: str) -> str:
     return text[:300]
 
 
-# The gateway relays a failure of the router's own extraction call as
-# ``responses self-call returned status <code>: ...``. A relayed 404 means the
-# selection model is not served on this workspace — configuration, not an
-# outage. Any other relayed status (429 rate limit, 408 timeout, 400
-# request-specific, 5xx outage) may clear on its own and stays retriable.
-_SELF_CALL_CONFIG_FAILURE = re.compile(r"self-call returned status 404")
+# How the gateway relays its own extraction call's failure; only a relayed 404
+# is configuration rather than an outage, so only that status latches.
+_SELF_CALL_404 = "self-call returned status 404:"
+
+
+def _top_level_message(body: str) -> str:
+    """A JSON body's own ``message`` field; a non-JSON body is its own message."""
+    text = body or ""
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    if isinstance(parsed, dict):
+        message = parsed.get("message")
+        return message if isinstance(message, str) else ""
+    return text
 
 
 def router_selection_model_unserved(status_code: int, body: str) -> bool:
@@ -771,7 +780,9 @@ def router_selection_model_unserved(status_code: int, body: str) -> bool:
     Happens when ``routing.selection_model`` names a model the workspace does
     not serve — or is unset and the router's frozen default does. Every later
     call fails identically until the deployment config changes. Only a relayed
-    404 qualifies; other relayed statuses may be transient and stay retriable.
+    404 in the gateway's own ``message`` qualifies: other relayed statuses may
+    be transient and stay retriable, and the phrase quoted elsewhere in a body
+    is not the gateway reporting it.
 
     :param status_code: The response status.
     :param body: The raw response text.
@@ -779,7 +790,7 @@ def router_selection_model_unserved(status_code: int, body: str) -> bool:
     """
     if status_code != 404:
         return False
-    return _SELF_CALL_CONFIG_FAILURE.search((body or "").lower()) is not None
+    return _SELF_CALL_404 in _top_level_message(body).lower()
 
 
 def router_permanently_disabled(status_code: int, body: str) -> bool:
