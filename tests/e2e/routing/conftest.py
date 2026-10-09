@@ -117,7 +117,7 @@ def _provider_block() -> dict[str, Any]:
     """Read the ``providers:`` block the host needs for gateway-backed launches.
 
     Smart Routing's apply layer can only rewrite a launch's model when the
-    launch resolves through the Databricks AI Gateway, so the host has to see a
+    launch resolves through the Databricks Unity Gateway, so the host has to see a
     databricks provider. The routing worktree's isolated dev config is the
     canonical source (three canonical prompt classes: trivial, delegate-shaped, crosscutting).
 

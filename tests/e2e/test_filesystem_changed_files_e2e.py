@@ -43,10 +43,7 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
-import signal
 import subprocess
-import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -56,11 +53,11 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     build_agent_bundle,
     configure_mock_llm,
-    find_free_port,
     reset_mock_llm,
 )
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
@@ -220,8 +217,6 @@ def _build_mock_workspace_writer_bundle(mock_llm_server_url: str) -> bytes:
 _SEED_TRACKED_FILE = "tracked.md"
 _SEED_TRACKED_CONTENT = "# seed file\n\noriginal committed content\n"
 
-_fs_ws_runner_state: dict[str, str] = {}
-
 
 @pytest.fixture(scope="module")
 def fs_workspace(tmp_path_factory: pytest.TempPathFactory) -> Path:
@@ -261,158 +256,40 @@ def fs_workspace(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def fs_ws_runner_id() -> str:
-    """Stable runner id for the module-scoped workspace-rooted server.
-
-    :returns: Runner id string bound to a per-module binding token.
-    """
-    from omnigent.runner.identity import token_bound_runner_id
-
-    if "runner_id" not in _fs_ws_runner_state:
-        token = secrets.token_urlsafe(32)
-        _fs_ws_runner_state["binding_token"] = token
-        _fs_ws_runner_state["runner_id"] = token_bound_runner_id(token)
-    return _fs_ws_runner_state["runner_id"]
-
-
-@pytest.fixture(scope="module")
-def fs_ws_server(
+def fs_ws_stack(
     llm_api_key: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     fs_workspace: Path,
-    fs_ws_runner_id: str,
-) -> Iterator[str]:
-    """Spawn an ``omnigent server`` + runner rooted at the isolated git workspace.
-
-    The runner is given ``OMNIGENT_RUNNER_WORKSPACE=fs_workspace`` (and the
-    server CWD matches), so ``create_filesystem_registry`` builds a
-    :class:`GitFilesystemRegistry` over that workspace and the agent's relative
-    ``sys_os_write`` lands inside it — the two prerequisites for writes to
-    surface in ``GET .../changes``.
-
-    :param llm_api_key: The ``--llm-api-key`` option value.
-    :param mock_llm_server_url: Mock LLM server URL.
-    :param tmp_path_factory: pytest temp path factory (db / artifacts / logs).
-    :param fs_workspace: The isolated git workspace to root the runner at.
-    :param fs_ws_runner_id: Runner id to register.
-    :returns: Server base URL, e.g. ``"http://localhost:18600"``.
-    """
-    port = find_free_port()
-    db_path = tmp_path_factory.mktemp("e2e_fs") / "e2e.db"
-    artifact_dir = tmp_path_factory.mktemp("e2e_fs_artifacts")
-    server_log = tmp_path_factory.mktemp("e2e_fs_logs") / "server.log"
-
-    binding_token = _fs_ws_runner_state["binding_token"]
-    env: dict[str, str] = {
-        **os.environ,
+) -> Iterator[ServerRunner]:
+    """Run both processes in the workspace observed by the filesystem registry."""
+    env = {
         "OPENAI_API_KEY": llm_api_key,
-        # PYTHONPATH stays the repo so the subprocess imports this worktree's
-        # omnigent; only the *workspace* (cwd / OMNIGENT_RUNNER_WORKSPACE) is
-        # the throwaway git dir.
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
-        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
     }
+    with server_runner(
+        tmp_path_factory.mktemp("fs_ws_stack"),
+        workspace=fs_workspace,
+        server_cwd=fs_workspace,
+        server_env=env,
+        health_timeout=HEALTH_TIMEOUT_S,
+        poll_interval=POLL_INTERVAL_S,
+        wait_ready=False,
+    ) as stack:
+        stack.start_runner(cwd=fs_workspace, env=env)
+        yield stack
 
-    log_handle = open(server_log, "w")  # noqa: SIM115 — closed in cleanup below
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-        ],
-        env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-        cwd=str(fs_workspace),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    base_url = f"http://localhost:{port}"
 
-    runner_log = tmp_path_factory.mktemp("e2e_fs_runner_logs") / "runner.log"
-    runner_log_handle = open(runner_log, "w")  # noqa: SIM115 — closed in cleanup below
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env={
-            **env,
-            "OMNIGENT_RUNNER_ID": fs_ws_runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-            # The crux: without a workspace the runner builds no filesystem
-            # registry (app.py) so writes never surface in GET .../changes,
-            # and sys_os_write falls back to a throwaway tmp cwd. Root it at
-            # the isolated git workspace so the GitFilesystemRegistry watches
-            # the same tree the agent writes into. The real CLI sets this via
-            # _start_cli_runner_process.
-            "OMNIGENT_RUNNER_WORKSPACE": str(fs_workspace),
-        },
-        cwd=str(fs_workspace),
-        stdout=runner_log_handle,
-        stderr=subprocess.STDOUT,
-    )
+@pytest.fixture(scope="module")
+def fs_ws_runner_id(fs_ws_stack: ServerRunner) -> str:
+    return fs_ws_stack.runner_id
 
-    health_iters = int(HEALTH_TIMEOUT_S / POLL_INTERVAL_S)
-    for _ in range(health_iters):
-        try:
-            health_resp = httpx.get(f"{base_url}/health", timeout=2)
-            runner_resp = httpx.get(
-                f"{base_url}/v1/runners/{fs_ws_runner_id}/status",
-                timeout=2,
-            )
-            if (
-                health_resp.status_code == 200
-                and runner_resp.status_code == 200
-                and runner_resp.json().get("online") is True
-            ):
-                break
-        except httpx.ConnectError:
-            # Expected while the server is still binding its port during
-            # startup; keep polling until the health checks pass or the loop
-            # times out (the ``else`` branch below).
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    else:
-        if runner_proc.poll() is None:
-            runner_proc.kill()
-            runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.kill()
-        log_handle.close()
-        log_contents = server_log.read_text() if server_log.exists() else ""
-        runner_log_contents = runner_log.read_text() if runner_log.exists() else ""
-        raise RuntimeError(
-            f"Workspace-rooted server did not start within {HEALTH_TIMEOUT_S}s.\n"
-            f"Server log: {log_contents[-3000:]}\n"
-            f"Runner log: {runner_log_contents[-3000:]}"
-        )
 
-    try:
-        yield base_url
-    finally:
-        if runner_proc.poll() is None:
-            runner_proc.send_signal(signal.SIGTERM)
-            try:
-                runner_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                runner_proc.kill()
-                runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        log_handle.close()
+@pytest.fixture(scope="module")
+def fs_ws_server(fs_ws_stack: ServerRunner) -> str:
+    return fs_ws_stack.base_url
 
 
 @pytest.fixture(scope="module")

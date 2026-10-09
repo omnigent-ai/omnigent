@@ -96,6 +96,7 @@ function loadMainHarness({
       getPath: (name) => (name === "userData" ? userData : userData),
       getVersion: () => "0.3.0",
       setName: () => {},
+      setPath: () => {},
       requestSingleInstanceLock: () => true,
       on: (name, listener) => appEvents.set(name, listener),
       whenReady: () => ({ then: () => {} }),
