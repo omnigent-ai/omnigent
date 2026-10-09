@@ -5835,7 +5835,10 @@ def _is_box_rule(line: str) -> bool:
     as the person's browser terminal. A title wider than the pane is cut
     with ``…`` and leaves no leading run at all
     (``" a very long title… ─"``), so a rule without one is accepted only
-    when its label ends in that truncation mark.
+    when its label ends in that mark plus one space and starts one space
+    into the row, where the rule's own edge would be. Draft and transcript
+    rows are indented further, so a line that merely trails off in ``… ─``
+    stays content.
 
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
@@ -5854,7 +5857,8 @@ def _is_box_rule(line: str) -> bool:
     if any(ch in _BOX_RULE_CHARS for ch in label):
         return False
     if lead < 1:
-        return label.endswith("… ") and bool(label[:-2].strip())
+        starts_at_edge = line.startswith(" ") and not line.startswith("  ")
+        return starts_at_edge and label.endswith("… ") and bool(label[:-2].strip())
     return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
 
 

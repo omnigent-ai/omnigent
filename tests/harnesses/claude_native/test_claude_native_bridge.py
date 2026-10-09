@@ -8673,6 +8673,28 @@ def test_claude_prompt_rendered_sees_prompt_under_truncated_label() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_ignores_draft_line_trailing_off_in_a_glyph() -> None:
+    """
+    A draft line ending in ``… ─`` is not mistaken for a truncated title.
+
+    Only the box's own opening rule starts one space into the row; Claude
+    indents draft continuation lines further. Reading such a line as an
+    interior rule would hide the composer under it and time the turn out.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            rule,  # opening rule
+            "❯ first line of the draft",
+            "  second line of the draft trails off… ─",
+            "  third line",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -8689,6 +8711,7 @@ def test_claude_prompt_rendered_sees_prompt_under_truncated_label() -> None:
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
         # A title wider than the pane is cut with "…" and loses the leading run.
         " Retry failed billing webhook deliveries with exponential backoff … ─",
+        " 修复计费回调的重试路径并加入指数退避与抖动以及每小时上限… ─",  # wide-character title
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -8717,6 +8740,9 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "a sentence that ends in a box glyph ─",
         "a truncated sentence that ends…─",
         "… " + "─" * 30,  # the mark with no label before it
+        # Indented past the rule's edge: a draft or transcript line, not a title.
+        "  the build was cancelled because the graph is huge… ─",
+        "- item one that trails off somewhere… ─",
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
