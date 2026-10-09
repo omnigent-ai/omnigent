@@ -58,7 +58,7 @@ function writeHistory(key: string, entries: ComposerDraft[]): void {
 
 /**
  * Append `text` to the persisted prompt history for `scope` (localStorage),
- * trimming plain text and skipping empty / consecutive-duplicate entries (matching
+ * trimming trailing whitespace and skipping empty / consecutive-duplicate entries (matching
  * shell ``HISTCONTROL=ignoredups``). Caps at {@link MAX_ENTRIES} with FIFO
  * eviction.
  *
@@ -81,7 +81,7 @@ export function appendPromptHistoryEntry(
 ): ComposerDraft[] | null {
   if (!text.trim()) return null;
   const entry = readComposerDraft({ text, replyDraft })!;
-  if (!entry.replyDraft) entry.text = text.trim();
+  if (!entry.replyDraft) entry.text = text.trimEnd();
   const key = scopedKey(scope);
   const history = readHistory(key);
   // Identical text with different quote provenance must remain separate entries.
@@ -99,7 +99,7 @@ export function appendPromptHistoryEntry(
 
 export interface PromptHistory {
   /**
-   * Append `text` to history and reset the recall cursor. Trims plain text;
+   * Append `text` to history and reset the recall cursor. Trims trailing whitespace;
    * skips empty / whitespace-only and consecutive duplicates.
    */
   appendEntry: (text: string, replyDraft?: StoredReplyDraft) => void;

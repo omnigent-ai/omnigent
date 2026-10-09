@@ -82,12 +82,13 @@ def side_chat_question_from_text(text: str) -> str | None:
     the parent chat or drop it entirely.
 
     :param text: Raw user text, e.g. ``"/side why?"``.
-    :returns: The trimmed question after ``/side``, or ``None`` when *text* is
-        not a ``/side <question>`` command.
+    :returns: The question after ``/side``, preserving leading indentation and
+        trimming trailing whitespace, or ``None`` when *text* is not a
+        ``/side <question>`` command.
     """
     if not text.startswith(_SIDE_PREFIX):
         return None
-    question = text[len(_SIDE_PREFIX) :].strip()
+    question = text[len(_SIDE_PREFIX) :].rstrip()
     return question or None
 
 
@@ -113,8 +114,8 @@ def side_chat_question(input_items: list[_JsonObject]) -> str | None:
 
     :param input_items: Codex ``turn/start`` input items, e.g.
         ``[{"type": "text", "text": "/side why?"}]``.
-    :returns: The trimmed question after ``/side``, or ``None`` when the input
-        is not a single ``/side <question>`` text item.
+    :returns: The question with leading indentation preserved, or ``None`` when
+        the input is not a single ``/side <question>`` text item.
     """
     if len(input_items) != 1:
         return None

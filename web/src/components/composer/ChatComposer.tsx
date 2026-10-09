@@ -310,7 +310,7 @@ function composerListStartEdit(textarea: HTMLTextAreaElement) {
   if (selectionStart !== selectionEnd) return null;
   const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
   const prefix = value.slice(lineStart, selectionStart);
-  const match = /^([ \t]*)([-*]|\d+[.)])$/.exec(prefix);
+  const match = prefix.match(/^([ \t]*)([-*]|\d+[.)])$/);
   if (!match) return null;
   const [, indent, marker] = match;
   return {
@@ -326,11 +326,11 @@ function composerListEdit(textarea: HTMLTextAreaElement) {
   const lineEndIndex = value.indexOf("\n", selectionEnd);
   const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
   const prefix = value.slice(lineStart, selectionStart);
-  const match = /^([ \t]*)([-*•]|\d+[.)])([ \t]+)(.*)$/.exec(prefix);
+  const match = prefix.match(/^([ \t]*)([-*•]|\d+[.)])([ \t]+)(.*)$/);
   if (!match) return null;
   const [, indent, marker, spacing, content] = match;
   const suffix = value.slice(selectionEnd, lineEnd);
-  if (!content.trim() && !suffix.trim()) {
+  if (selectionStart === selectionEnd && !content.trim() && !suffix.trim()) {
     return { start: lineStart, end: lineEnd, text: "" };
   }
   // Keep the typed bullet so the draft stays valid Markdown.

@@ -78,6 +78,24 @@ describe("ChatComposer", () => {
     expect(input).toHaveValue("- First item\n");
   });
 
+  it("preserves the unselected marker when Shift+Enter replaces a selected list body", () => {
+    const { input } = renderEditor("- selected text");
+    input.setSelectionRange(2, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("- \n- ");
+    expect(input.selectionStart).toBe(5);
+    expect(input.selectionEnd).toBe(5);
+  });
+
+  it("leaves list continuation to a route handler that prevents Shift+Enter", () => {
+    const { input, onKeyDown } = renderEditor("- First item");
+    onKeyDown.mockImplementation((event) => event.preventDefault());
+    caretToEnd(input);
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(false);
+    expect(onKeyDown).toHaveBeenCalledOnce();
+    expect(input).toHaveValue("- First item");
+  });
+
   it("ignores Enter and Space while an IME composition is active", () => {
     const { input } = renderEditor("  1. 日本", true);
     caretToEnd(input);

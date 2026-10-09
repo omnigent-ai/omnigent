@@ -150,6 +150,23 @@ describe("side-chat working indicator", () => {
 });
 
 describe("side chat opened from a text selection", () => {
+  it.each([false, true])("preserves list indentation when sending (pending: %s)", (pending) => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    const id = pending ? "pending:side" : childId;
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={id} onStart={onStart} />);
+    const text = "  - First\n  - Second";
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    if (pending) {
+      expect(onStart).toHaveBeenCalledExactlyOnceWith(text);
+    } else {
+      expect(send).toHaveBeenCalledExactlyOnceWith(text, "agent_side", undefined, {
+        pinnedConversationId: childId,
+      });
+    }
+  });
+
   it("quotes the selection in the pending tab and sends it with the question", async () => {
     const onStart = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ sideChatDrafts: { "pending:quoted": "restore the row" } });

@@ -1196,7 +1196,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     // Surrounding whitespace + an embedded control char (\x07 bell) prove the
     // screen sanitizes the message before handing it off.
-    typeMessage("  read the README\x07 and refactor  ");
+    typeMessage("  - read the README\x07\n  - refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -1214,11 +1214,10 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.initial_items).toBeUndefined();
 
     // It's stashed in the chatStore (keyed by the new conversation id),
-    // trimmed + control-char-stripped, for ChatPage to auto-send. Plain
-    // text (no leading "/") carries no skill invocation.
+    // control-char-stripped with list indentation intact, for ChatPage to send.
     await waitFor(() =>
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
-        text: "read the README and refactor",
+        text: "  - read the README\n  - refactor",
         skill: null,
         files: [],
       }),
@@ -1398,7 +1397,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Same sanitization vehicle as the chatStore handoff test — the history
-    // entry must be the SENT prompt (control-char stripped, trimmed), so a
+    // entry must be the SENT prompt (control-char stripped), so a
     // recall + resend reproduces exactly what was sent.
     typeMessage("  read the README\x07 and refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1409,10 +1408,10 @@ describe("NewChatLandingScreen create flow", () => {
     const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) ?? "[]");
     // The stored entry is the SANITIZED prompt: the \x07 bell is gone (proving
     // sanitizeInitialPrompt ran — a bare trim would have kept it) and the
-    // surrounding whitespace is trimmed. So a recall + resend reproduces
+    // indentation is preserved. So a recall + resend reproduces
     // exactly what was sent, not the raw keystrokes.
     expect(history[0]).not.toContain("\x07");
-    expect(history).toEqual(["read the README and refactor"]);
+    expect(history).toEqual(["  read the README and refactor"]);
   });
 
   it("attaches terminal-wrapper labels when the claude-native agent is chosen", async () => {
@@ -2537,7 +2536,8 @@ describe("NewChatLandingScreen create flow", () => {
 
 describe("sanitizeInitialPrompt", () => {
   it.each([
-    ["trims surrounding whitespace", "  hello  ", "hello"],
+    ["trims trailing whitespace and preserves indentation", "  hello  ", "  hello"],
+    ["still trims native slash commands", "  /side explain this  ", "/side explain this"],
     // \n and \t must survive — multi-line prompts depend on it.
     ["preserves newlines and tabs", "line1\n\tline2", "line1\n\tline2"],
     // C0/C1 controls (bell \x07, NUL \x00, DEL \x7f) corrupt tmux

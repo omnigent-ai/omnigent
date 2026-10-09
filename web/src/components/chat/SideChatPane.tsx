@@ -26,6 +26,7 @@ import {
 import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { isSlashCommandText } from "@/components/SlashCommandMenu";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
@@ -444,7 +445,7 @@ function SideChatComposer({
   };
 
   const submit = () => {
-    const trimmed = text.trim();
+    const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
