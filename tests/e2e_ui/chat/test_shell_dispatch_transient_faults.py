@@ -246,14 +246,19 @@ def probe_session(faulted_stack: _FaultedStack) -> Iterator[tuple[str, str]]:
 
 
 def _run_probe_command(
-    page: Page,
+    request: pytest.FixtureRequest,
     stack: _FaultedStack,
     session_id: str,
     model: str,
     mock_url: str,
     token: str,
-) -> Locator:
-    """Drive the turn that echoes *token* via ``sys_os_shell``; return the Output ``<pre>``."""
+) -> tuple[Page, Locator]:
+    """Drive the turn that echoes *token* via ``sys_os_shell``.
+
+    Returns the page and the tool card's Output ``<pre>``. The page is requested
+    only once the mock model is scripted, so a recording starts at the first
+    navigation instead of during setup.
+    """
     command = f"echo {token}"
     configure_mock_llm(
         mock_url,
@@ -272,6 +277,7 @@ def _run_probe_command(
     )
     set_fallback_mock_llm(mock_url, model, _REPLY)
 
+    page: Page = request.getfixturevalue("page")
     page.goto(f"{stack.base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
@@ -295,7 +301,7 @@ def _run_probe_command(
 
     output_panel = page.locator("[data-language]", has=page.get_by_text("Output", exact=True))
     expect(output_panel).to_be_visible(timeout=15_000)
-    return output_panel.locator("pre")
+    return page, output_panel.locator("pre")
 
 
 def _assert_command_ran(
@@ -328,7 +334,7 @@ def _assert_command_ran(
 
 @pytest.mark.timeout(300)
 def test_shell_command_survives_transient_mcp_proxy_500(
-    page: Page,
+    request: pytest.FixtureRequest,
     faulted_stack: _FaultedStack,
     probe_session: tuple[str, str],
     mock_llm_server_url: str,
@@ -336,13 +342,15 @@ def test_shell_command_survives_transient_mcp_proxy_500(
     """One HTTP 500 from the server MCP proxy must not fail the shell command."""
     session_id, model = probe_session
     token = f"{PROXY_500_MARKER}{uuid.uuid4().hex[:8]}"
-    output = _run_probe_command(page, faulted_stack, session_id, model, mock_llm_server_url, token)
+    page, output = _run_probe_command(
+        request, faulted_stack, session_id, model, mock_llm_server_url, token
+    )
     _assert_command_ran(page, output, token, faulted_stack, "tool sys_os_shell failed")
 
 
 @pytest.mark.timeout(300)
 def test_shell_command_survives_transient_helper_fork_eagain(
-    page: Page,
+    request: pytest.FixtureRequest,
     faulted_stack: _FaultedStack,
     probe_session: tuple[str, str],
     mock_llm_server_url: str,
@@ -350,7 +358,9 @@ def test_shell_command_survives_transient_helper_fork_eagain(
     """One EAGAIN while spawning the OS helper must not fail the shell command."""
     session_id, model = probe_session
     token = f"{FORK_EAGAIN_MARKER}{uuid.uuid4().hex[:8]}"
-    output = _run_probe_command(page, faulted_stack, session_id, model, mock_llm_server_url, token)
+    page, output = _run_probe_command(
+        request, faulted_stack, session_id, model, mock_llm_server_url, token
+    )
     _assert_command_ran(
         page,
         output,
