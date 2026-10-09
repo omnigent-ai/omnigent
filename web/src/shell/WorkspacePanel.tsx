@@ -1066,6 +1066,22 @@ function WorkspacePanelImpl({
     browserFallbackTab,
     onRightRailTabChange,
   ]);
+  // Whether the picker's current interaction came from the pointer or the
+  // keyboard; decides whether closing it hands focus back to the trigger.
+  const pickerInputRef = useRef<"pointer" | "keyboard">("keyboard");
+  // The nav view is showing when no file, shell, browser or side-chat tab is
+  // active. A sticky terminal key whose terminal is gone counts as nav view too,
+  // so its nav tab highlights and the picker marks that panel.
+  const navViewActive =
+    selectedFilePath === null &&
+    !browserSelected &&
+    !sideChatSelected &&
+    (selectedTerminalKey === null || !openTerminals.includes(selectedTerminalKey));
+  // Radix highlights the trigger matching `value`; while a file or shell tab is
+  // active, feed it a sentinel that matches none of the fixed triggers.
+  let navTabsValue = "__tab__";
+  if (pending) navTabsValue = "__pending__";
+  else if (navViewActive) navTabsValue = rightRailTab;
   const panelLabels = {
     files: "Files",
     changes: "Changes",
@@ -1076,14 +1092,7 @@ function WorkspacePanelImpl({
     ...visiblePermanentTabs.map((tab) => ({
       key: tab,
       label: panelLabels[tab],
-      // Same gate as the Tabs sentinel below: a sticky terminal key whose
-      // terminal is gone falls back to the nav view, so its panel is active.
-      active:
-        selectedFilePath === null &&
-        (selectedTerminalKey === null || !openTerminals.includes(selectedTerminalKey)) &&
-        !browserSelected &&
-        !sideChatSelected &&
-        rightRailTab === tab,
+      active: navViewActive && rightRailTab === tab,
       select: () => selectPermanentTab(tab),
       disabled: false,
     })),
@@ -1268,22 +1277,7 @@ function WorkspacePanelImpl({
         >
           <Tabs
             className={cn("shrink-0", showOpenTabs && NARROW_RAIL_HIDES_PANEL_TABS)}
-            // When a file or shell tab is active no fixed trigger should
-            // highlight, so feed the radix group a sentinel that matches none of
-            // them. The active file/shell tab carries its own highlight. Gate the
-            // shell case on the terminal actually being present (same gate as the
-            // content slot below): a sticky selection whose terminal is gone shows
-            // the fallback nav view, so its nav tab must highlight, not "__tab__".
-            value={
-              pending
-                ? "__pending__"
-                : selectedFilePath !== null ||
-                    browserSelected ||
-                    sideChatSelected ||
-                    (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
-                  ? "__tab__"
-                  : rightRailTab
-            }
+            value={navTabsValue}
             onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
             componentId="chat.right_rail.tabs"
           >
@@ -1433,7 +1427,11 @@ function WorkspacePanelImpl({
             />
           )}
           {/* The picker and fullscreen toggle form the trailing control group. */}
-          <DropdownMenu>
+          <DropdownMenu
+            onOpenChange={(isOpen) => {
+              if (isOpen) pickerInputRef.current = "keyboard";
+            }}
+          >
             <WorkspaceTabTooltip label="Select panel" className="ml-auto pl-1">
               <DropdownMenuTrigger asChild>
                 <Button
@@ -1448,7 +1446,24 @@ function WorkspacePanelImpl({
                 </Button>
               </DropdownMenuTrigger>
             </WorkspaceTabTooltip>
-            <DropdownMenuContent align="end" className="max-w-[min(32rem,calc(100vw-2rem))]">
+            <DropdownMenuContent
+              align="end"
+              className="max-w-[min(32rem,calc(100vw-2rem))]"
+              onPointerDown={() => {
+                pickerInputRef.current = "pointer";
+              }}
+              onPointerDownOutside={() => {
+                pickerInputRef.current = "pointer";
+              }}
+              onKeyDown={() => {
+                pickerInputRef.current = "keyboard";
+              }}
+              // Restoring focus after a mouse pick reopens the trigger's tooltip and
+              // leaves it hanging; keyboard picks keep Radix's focus restore.
+              onCloseAutoFocus={(event) => {
+                if (pickerInputRef.current === "pointer") event.preventDefault();
+              }}
+            >
               <SuppressBrowserView />
               <DropdownMenuLabel>Panels</DropdownMenuLabel>
               {panelOptions.map((option) => (

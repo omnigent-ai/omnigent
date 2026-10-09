@@ -39,7 +39,9 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
       const delta = event.deltaX || event.deltaY;
       if (!delta) return;
       event.preventDefault();
-      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientWidth : 1;
+      let unit = 1;
+      if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) unit = 16;
+      else if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) unit = viewport.clientWidth;
       viewport.scrollLeft += delta * unit;
       measure();
     };

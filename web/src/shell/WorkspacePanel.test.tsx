@@ -1148,6 +1148,32 @@ describe("WorkspacePanel panel picker", () => {
     expect(screen.getByRole("menuitem", { name: "Files" })).toHaveAttribute("aria-current", "true");
   });
 
+  it("leaves the trigger unfocused after a mouse pick so its tooltip does not linger", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"] });
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    fireEvent.pointerDown(trigger, { button: 0 });
+    const item = await screen.findByRole("menuitem", { name: "docs/README.md" });
+    fireEvent.pointerDown(item, { button: 0 });
+    fireEvent.click(item);
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    // Radix restores focus on a timer; give it the chance before asserting.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    expect(trigger).not.toHaveFocus();
+  });
+
+  it("returns focus to the trigger after a keyboard pick", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    const item = await screen.findByRole("menuitem", { name: "src/App.tsx" });
+    fireEvent.keyDown(item, { key: "Enter" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
   it("selects an open terminal", () => {
     const { openTerminalTab } = renderWorkspace({ openTerminals: ["terminal:zsh"] });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
