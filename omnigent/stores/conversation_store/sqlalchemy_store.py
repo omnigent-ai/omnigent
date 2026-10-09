@@ -17,6 +17,7 @@ from sqlalchemy import (
     asc,
     delete,
     desc,
+    false,
     func,
     insert,
     literal,
@@ -115,6 +116,12 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
+from omnigent.stores.conversation_store.pg_content_search import (
+    content_search_mode,
+    has_content_search_index,
+    is_trigram_eligible,
+    probe_content_matches,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -148,16 +155,9 @@ def _encode_session_state(
     return json.dumps(payload, separators=(",", ":"))
 
 
-# Server-side deadline (ms) for the content-search query in
-# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
-# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
-# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
-# scan can run unbounded and — since the query runs in a worker thread — a
-# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
-# a degraded deployment fails the search fast instead of pinning a DB
-# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
-# to the connection's next pooled use. Longer than the client's own
-# ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
+# Server-side deadline (ms) for content-search statements in ``list_conversations``: an
+# unindexed rare term scans every item, and a worker-thread query outlives a client
+# disconnect. Longer than the client's ``SEARCH_FETCH_TIMEOUT_MS`` so the browser quits first.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
 # Upper bound on rows fetched per SQL statement when listing conversation
@@ -632,6 +632,8 @@ def _fetch_search_snippets(
     session: Session,
     conversation_ids: list[str],
     query: str,
+    *,
+    earliest_match_positions: Mapping[str, int] | None = None,
 ) -> dict[str, str]:
     """
     Build a per-conversation preview excerpt of matching chat content.
@@ -652,52 +654,71 @@ def _fetch_search_snippets(
     :param conversation_ids: Conversation IDs to build snippets for,
         e.g. ``["conv_a", "conv_b"]``.
     :param query: The user's search string.
+    :param earliest_match_positions: ``{conversation_id: position}`` of the
+        earliest matching item when the trigram probe already found them; the
+        bodies are then read by key instead of a second ``ILIKE`` lookup.
     :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
         only match was the title (no item body match) are absent — the
         caller leaves their ``search_snippet`` as ``None``.
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
     workspace_id = current_workspace_id()
-    # workspace_id leads the (workspace_id, conversation_id, position) index.
-    # Both the aggregate and the join-back below must include it or Postgres
-    # can't use that index and falls back to a full table scan of every item.
-    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
-    # same reason as the content match in ``list_conversations``: the lower()
-    # form matches the pg_trgm index expression, and the planner then scans the
-    # whole workspace even though this is already scoped to one page of ids.
-    match_pred = and_(
-        SqlConversationItem.workspace_id == workspace_id,
-        SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
-    )
-    # Earliest matching position per conversation — a small (conv_id, position)
-    # aggregate, no bodies materialized.
-    earliest = (
-        select(
-            SqlConversationItem.conversation_id.label("cid"),
-            func.min(SqlConversationItem.position).label("pos"),
-        )
-        .where(match_pred)
-        .group_by(SqlConversationItem.conversation_id)
-        .subquery()
-    )
-    # Join back to pull exactly one search_text body per conversation. The
-    # workspace_id predicate keeps this on the composite index.
-    rows = session.execute(
-        select(
-            SqlConversationItem.conversation_id,
-            SqlConversationItem.search_text,
-        ).join(
-            earliest,
-            and_(
+    if earliest_match_positions is not None:
+        positions = [
+            (cid, earliest_match_positions[cid])
+            for cid in conversation_ids
+            if cid in earliest_match_positions
+        ]
+        if not positions:
+            return {}
+        rows = session.execute(
+            select(
+                SqlConversationItem.conversation_id,
+                SqlConversationItem.search_text,
+            ).where(
                 SqlConversationItem.workspace_id == workspace_id,
-                SqlConversationItem.conversation_id == earliest.c.cid,
-                SqlConversationItem.position == earliest.c.pos,
-            ),
+                tuple_(SqlConversationItem.conversation_id, SqlConversationItem.position).in_(
+                    positions
+                ),
+            )
+        ).all()
+    else:
+        pattern = f"%{query.lower()}%"
+        # workspace_id must appear in both the aggregate and the join-back so Postgres
+        # stays on the (workspace_id, conversation_id, position) index. Raw-column ILIKE,
+        # not ``lower(search_text) LIKE``: see the content match in ``list_conversations``.
+        match_pred = and_(
+            SqlConversationItem.workspace_id == workspace_id,
+            SqlConversationItem.conversation_id.in_(conversation_ids),
+            SqlConversationItem.search_text.ilike(pattern),
         )
-    ).all()
+        # Earliest matching position per conversation — a small (conv_id, position)
+        # aggregate, no bodies materialized.
+        earliest = (
+            select(
+                SqlConversationItem.conversation_id.label("cid"),
+                func.min(SqlConversationItem.position).label("pos"),
+            )
+            .where(match_pred)
+            .group_by(SqlConversationItem.conversation_id)
+            .subquery()
+        )
+        # Join back to pull exactly one search_text body per conversation. The
+        # workspace_id predicate keeps this on the composite index.
+        rows = session.execute(
+            select(
+                SqlConversationItem.conversation_id,
+                SqlConversationItem.search_text,
+            ).join(
+                earliest,
+                and_(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == earliest.c.cid,
+                    SqlConversationItem.position == earliest.c.pos,
+                ),
+            )
+        ).all()
     out: dict[str, str] = {}
     for conv_id, search_text in rows:
         if not search_text:
@@ -891,6 +912,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Omnigent) gets the correct lock strategy for each table group.
         self._supports_for_update = self._conv_engine.dialect.name != "sqlite"
         self._meta_supports_for_update = self._engine.dialect.name != "sqlite"
+        # Opt-in Postgres trigram fast path for content search; resolved once so
+        # a bad setting fails at startup rather than on the first search.
+        self._pg_content_search_mode = content_search_mode()
         # SQLite rowid is monotonically increasing absent deletions; it serves
         # as an insertion-ordered tiebreaker for timestamp ties. Note: without
         # the AUTOINCREMENT keyword, SQLite may reuse a rowid if the max-rowid
@@ -3004,32 +3028,35 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
+            # Earliest matching item per conversation from the opt-in trigram
+            # probe; None means the legacy correlated scan answers the search.
+            content_positions: dict[str, int] | None = None
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
-                # form is uncorrelated, so the match set is built for the WHOLE
-                # workspace before the outer query discards every row the caller
-                # cannot see. Correlating on conversation_id keeps each probe on
-                # the (workspace_id, conversation_id) index and lets it stop at
-                # the first matching item per conversation.
-                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
-                # the latter matches the ``lower(search_text)`` pg_trgm index
-                # expression, and the planner then prefers that index — scanning
-                # every item in the workspace out of a multi-GB index that does
-                # not fit in shared_buffers. ILIKE is the same case-insensitive
-                # match but cannot use that index, so the probe stays on the
-                # (workspace_id, conversation_id) btree above. Do not "simplify"
-                # this back to lower(...) LIKE; see the covering test.
-                content_match = (
-                    select(SqlConversationItem.conversation_id)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                if self._uses_content_search_index(session, search_query):
+                    content_positions = probe_content_matches(session, pattern)
+                if content_positions is not None:
+                    # A complete probe names every matching session; the ACL
+                    # and kind filters above still apply to the id list.
+                    content_match = (
+                        SqlConversation.id.in_(list(content_positions))
+                        if content_positions
+                        else false()
                     )
-                    .exists()
-                )
+                else:
+                    # Correlated EXISTS, not ``id IN (SELECT ...)``, so the match set is
+                    # not built for the whole workspace before the ACL applies. Raw-column
+                    # ILIKE, not ``lower(search_text) LIKE``; see the covering test.
+                    content_match = (
+                        select(SqlConversationItem.conversation_id)
+                        .where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == SqlConversation.id,
+                            SqlConversationItem.search_text.ilike(pattern),
+                        )
+                        .exists()
+                    )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
@@ -3162,7 +3189,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(
+                    session, row_ids, search_query, earliest_match_positions=content_positions
+                )
+                if search_query
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
@@ -3195,6 +3226,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             first_id=convs[0].id if convs else None,
             last_id=convs[-1].id if convs else None,
             has_more=has_more,
+        )
+
+    def _uses_content_search_index(self, session: Session, search_query: str) -> bool:
+        """Whether this search may take the opt-in Postgres trigram probe."""
+        return (
+            self._pg_content_search_mode == "auto"
+            and self._conv_engine.dialect.name == "postgresql"
+            and is_trigram_eligible(search_query)
+            and has_content_search_index(session, self._conv_engine)
         )
 
     @staticmethod
