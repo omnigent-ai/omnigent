@@ -67,7 +67,7 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
-from omnigent.claude_paths import claude_config_dir, claude_json_path
+from omnigent.claude_paths import claude_config_dir
 from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
@@ -1777,7 +1777,7 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
 
     Claude Code blocks on two TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
-    top-level ``hasCompletedOnboarding`` key in Claude's ``.claude.json``, and a
+    top-level ``hasCompletedOnboarding`` key in ``~/.claude.json``, and a
     per-directory "Do you trust the files in this folder?" dialog gated
     by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
@@ -1787,7 +1787,7 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     therefore untrusted — directory on every session.
 
     Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other ``.claude.json`` state (the
+    those two keys are written; all other ``~/.claude.json`` state (the
     user's own onboarding choices, project history, MCP config, OAuth
     account) is preserved, and the file is left untouched when both keys
     are already set. This deliberately does NOT skip per-tool permission
@@ -1806,14 +1806,15 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
         ``Path("/home/user/repo-worktrees/feature-x")``. Resolved to an
         absolute path to match Claude's ``projects`` key convention.
     :returns: None.
-    :raises ValueError: If an existing ``.claude.json`` (or its
+    :raises ValueError: If an existing ``~/.claude.json`` (or its
         ``projects`` map / target project entry) is not a JSON object.
         Surfaced rather than silently overwritten so a corrupt or
         unexpected user config is never clobbered (fail loud).
-    :raises json.JSONDecodeError: If an existing ``.claude.json`` is
+    :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is
         not valid JSON, for the same reason.
     """
-    config_path = claude_json_path()
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_path = (Path(config_dir).expanduser() if config_dir else Path.home()) / ".claude.json"
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):

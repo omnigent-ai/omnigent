@@ -7575,6 +7575,37 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
     assert not clone_project_dir.exists() or not any(clone_project_dir.iterdir())
 
 
+def test_find_claude_transcript_follows_claude_config_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A transcript Claude wrote under ``CLAUDE_CONFIG_DIR`` is found for move/fork."""
+    home = tmp_path / "home"
+    (home / ".claude" / "projects").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    work = tmp_path / "profiles" / "work"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work))
+    external_session_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    transcript = work / "projects" / "-work-some-repo" / f"{external_session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "user", "sessionId": external_session_id}) + "\n")
+
+    assert claude_native._find_claude_transcript(external_session_id) == transcript
+
+
+def test_claude_project_dir_for_cwd_uses_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A moved transcript lands where the configured profile's Claude will look for it."""
+    profile = tmp_path / "work-profile"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+    assert claude_native._claude_project_dir_for_cwd(Path("/work/repo")) == (
+        profile / "projects" / "-work-repo"
+    )
+
+
 def test_clone_claude_transcript_repairs_stale_image_duplication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -11844,30 +11875,3 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
 
     assert claude_native.resolve_native_claude_config(spec=spec, refresh_models=False) is None
-
-
-def test_find_claude_transcript_searches_the_configured_claude_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Transcripts are found in ``$CLAUDE_CONFIG_DIR/projects``, where Claude writes them."""
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    profile = tmp_path / "work-profile"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
-    session_id = "02857840-6362-408f-b41f-309e396ed7c6"
-    transcript = profile / "projects" / "-work-repo" / f"{session_id}.jsonl"
-    transcript.parent.mkdir(parents=True)
-    transcript.write_text("{}\n", encoding="utf-8")
-
-    assert claude_native._find_claude_transcript(session_id) == transcript
-
-
-def test_claude_project_dir_for_cwd_uses_the_configured_claude_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A moved transcript lands where the configured profile's Claude will look for it."""
-    profile = tmp_path / "work-profile"
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
-
-    assert claude_native._claude_project_dir_for_cwd(Path("/work/repo")) == (
-        profile / "projects" / "-work-repo"
-    )

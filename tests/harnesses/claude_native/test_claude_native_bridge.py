@@ -7494,6 +7494,48 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
     assert claude_native_bridge.read_user_effort_level() is None
 
 
+def _two_claude_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A default ``~/.claude`` profile plus a selected ``CLAUDE_CONFIG_DIR`` profile."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps(
+            {"statusLine": {"type": "command", "command": "echo default"}, "effortLevel": "low"}
+        ),
+        encoding="utf-8",
+    )
+    work = tmp_path / "profiles" / "work"
+    work.mkdir(parents=True)
+    (work / "settings.json").write_text(
+        json.dumps(
+            {"statusLine": {"type": "command", "command": "echo work"}, "effortLevel": "high"}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work))
+    return work
+
+
+def test_read_user_status_line_command_follows_claude_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chained statusLine comes from the profile Claude itself runs on."""
+    _two_claude_profiles(tmp_path, monkeypatch)
+
+    assert claude_native_bridge.read_user_status_line_command() == "echo work"
+
+
+def test_read_user_effort_level_follows_claude_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stamped effort comes from the profile Claude itself runs on."""
+    _two_claude_profiles(tmp_path, monkeypatch)
+
+    assert claude_native_bridge.read_user_effort_level() == "high"
+
+
 # ---------------------------------------------------------------------------
 # launch_model storage and retrieval
 # ---------------------------------------------------------------------------
@@ -8253,6 +8295,24 @@ def test_ensure_trusted_refuses_malformed_config(
 
     # The original (malformed) bytes are preserved — no clobber occurred.
     assert config_path.read_text() == raw
+
+
+def test_ensure_trusted_writes_into_the_configured_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Trust lands in the ``.claude.json`` the configured profile's Claude reads."""
+    home_config = _redirect_home(monkeypatch, tmp_path / "home")
+    profile = tmp_path / "work-profile"
+    profile.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    ensure_claude_workspace_trusted(workspace)
+
+    assert not home_config.exists()
+    data = json.loads((profile / ".claude.json").read_text(encoding="utf-8"))
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
 
 
 def test_display_cost_approval_popup_builds_detached_tmux_command(
@@ -12523,37 +12583,3 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
-
-
-def test_ensure_trusted_writes_into_the_configured_claude_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Trust lands in the ``.claude.json`` the configured profile's Claude reads."""
-    home_config = _redirect_home(monkeypatch, tmp_path / "home")
-    profile = tmp_path / "work-profile"
-    profile.mkdir()
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-
-    ensure_claude_workspace_trusted(workspace)
-
-    assert not home_config.exists()
-    data = json.loads((profile / ".claude.json").read_text(encoding="utf-8"))
-    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
-
-
-def test_read_user_status_line_command_reads_the_configured_claude_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """User settings come from ``$CLAUDE_CONFIG_DIR/settings.json`` when it is set."""
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    profile = tmp_path / "work-profile"
-    profile.mkdir()
-    (profile / "settings.json").write_text(
-        json.dumps({"statusLine": {"type": "command", "command": "work-profile-hud"}}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
-
-    assert claude_native_bridge.read_user_status_line_command() == "work-profile-hud"
