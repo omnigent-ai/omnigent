@@ -13,21 +13,6 @@ Debug builds allow `http://` web content for local development by enabling
 `NSAllowsArbitraryLoadsInWebContent`. Release builds keep App Transport
 Security defaults and require remote servers to use `https://`.
 
-### Keyboard background verification
-
-Run the `ThemeBackgroundTests` tests in the `Omnigent` scheme. Then connect the
-app to a development server and select the dark theme in Appearance settings.
-Focus the composer in both a new session and an existing session. Check that
-the exposed areas around the keyboard's rounded corners remain themed, including
-the bottom corners and home indicator. Dismiss and reopen the keyboard, and
-repeat in landscape. Verify light mode and system mode too; in system mode,
-toggle the simulator's appearance with the keyboard open. On iPad, also check
-the floating keyboard. Finally, return to server setup and focus the URL field
-to verify its keyboard backdrop.
-
-Check that the web content stays visible after focusing a text field. Native
-backgrounds must not make keyboard or effect overlay windows opaque.
-
 ## Scope
 
 The first version provides native setup chrome, recent servers, WKWebView
