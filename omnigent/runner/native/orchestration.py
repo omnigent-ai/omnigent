@@ -6920,9 +6920,8 @@ async def _cold_start_agy_conversation(
             session_id,
         )
         return None
-    # Persist the real id over the placeholder, but never over a live binding: the
-    # reader may have adopted agy's TUI-minted cascade while this bootstrap settled,
-    # and the headless StartCascade phantom must not clobber it. Offloaded (file I/O).
+    # Refuse to replace a real id: the reader may have adopted the TUI-minted
+    # cascade meanwhile, and the headless phantom must not clobber it.
     if not await asyncio.to_thread(
         update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
     ):

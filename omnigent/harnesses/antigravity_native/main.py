@@ -1314,9 +1314,8 @@ async def _cold_start_agy_conversation(
             exc_info=True,
         )
         return
-    # The reader runs concurrently on this path and its placeholder recovery may
-    # have adopted agy's TUI-minted cascade meanwhile; never replace a real id
-    # with the headless StartCascade phantom. Offloaded (file I/O).
+    # Refuse to replace a real id: the concurrent reader may have adopted the
+    # TUI-minted cascade meanwhile, and the headless phantom must not clobber it.
     if not await asyncio.to_thread(
         update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
     ):

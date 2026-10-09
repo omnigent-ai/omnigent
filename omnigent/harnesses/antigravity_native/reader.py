@@ -61,6 +61,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -590,6 +591,8 @@ def _typed_root_cascade(summaries: dict[str, object]) -> str | None:
 
     Root filters match rotation; requiring ``lastUserInputTime`` excludes the
     headless cold-start phantom and bare ``/clear`` mints (never typed into).
+    Only UUID-shaped ids qualify: the id is later used as a file name and a
+    ``--conversation`` argument, so a malformed key from the RPC is never adopted.
 
     :param summaries: ``trajectorySummaries`` from ``GetAllCascadeTrajectories``.
     :returns: The typed-into root cascade id, or ``None`` when none exists yet.
@@ -597,7 +600,7 @@ def _typed_root_cascade(summaries: dict[str, object]) -> str | None:
     best_id: str | None = None
     best_input: datetime | None = None
     for cascade_id, summary in summaries.items():
-        if not isinstance(summary, dict):
+        if not isinstance(summary, dict) or not _is_cascade_uuid(cascade_id):
             continue
         if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
             continue
@@ -609,6 +612,15 @@ def _typed_root_cascade(summaries: dict[str, object]) -> str | None:
         if best_input is None or typed > best_input:
             best_id, best_input = cascade_id, typed
     return best_id
+
+
+def _is_cascade_uuid(cascade_id: str) -> bool:
+    """Return whether *cascade_id* parses as a UUID (agy mints UUIDs for cascades)."""
+    try:
+        uuid.UUID(cascade_id)
+    except ValueError:
+        return False
+    return True
 
 
 async def _sleep(seconds: float) -> None:
@@ -834,7 +846,12 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
     return None
 
 
-def _recover_placeholder_cascade(bridge_dir: Path, *, warn_fallback: bool = True) -> str | None:
+def _recover_placeholder_cascade(
+    bridge_dir: Path,
+    *,
+    warn_fallback: bool = True,
+    reported_foreign: set[str] | None = None,
+) -> str | None:
     """
     Adopt agy's TUI-minted cascade while bridge state still holds the placeholder.
 
@@ -847,6 +864,8 @@ def _recover_placeholder_cascade(bridge_dir: Path, *, warn_fallback: bool = True
     :param bridge_dir: Native Antigravity bridge directory.
     :param warn_fallback: Passed to the port resolver; ``False`` after the first
         round so a restricted-``/proc`` fallback is reported once per discovery.
+    :param reported_foreign: Candidates already reported as not locally owned;
+        a repeat refusal of the same cascade logs at DEBUG and the set is updated.
     :returns: The adopted cascade id (persisted), or ``None`` this round.
     """
     state = read_bridge_state(bridge_dir)
@@ -882,12 +901,16 @@ def _recover_placeholder_cascade(bridge_dir: Path, *, warn_fallback: bool = True
     if cascade_id is None:
         return None
     if not agy_conversation_db(bridge_dir, cascade_id).is_file():
-        _logger.warning(
+        repeated = reported_foreign is not None and cascade_id in reported_foreign
+        _logger.log(
+            logging.DEBUG if repeated else logging.WARNING,
             "agy placeholder recovery: typed cascade %s on port %s is NOT in this "
             "session's Gemini dir (a foreign agy answered the scan); refusing to adopt.",
             cascade_id,
             port,
         )
+        if reported_foreign is not None:
+            reported_foreign.add(cascade_id)
         return None
     # The scan above took seconds; a cold-start may have bound a real id meanwhile.
     if not update_conversation_id(bridge_dir, cascade_id, expect_placeholder=True):
@@ -941,13 +964,17 @@ async def _discover(
         fired before discovery completed.
     """
     recovery_rounds = 0
+    reported_foreign: set[str] = set()
     next_recovery_at = 0.0
     while True:
         cascade_id = await asyncio.to_thread(_resolve_cascade_id, bridge_dir)
         if cascade_id is None and time.monotonic() >= next_recovery_at:
             next_recovery_at = time.monotonic() + _PLACEHOLDER_RECOVERY_INTERVAL_S
             cascade_id = await asyncio.to_thread(
-                _recover_placeholder_cascade, bridge_dir, warn_fallback=recovery_rounds == 0
+                _recover_placeholder_cascade,
+                bridge_dir,
+                warn_fallback=recovery_rounds == 0,
+                reported_foreign=reported_foreign,
             )
             recovery_rounds += 1
             if cascade_id is not None and on_adopted is not None:
