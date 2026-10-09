@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const fetchMock = vi.fn();
 const isWorkspace = vi.fn(() => true);
+let embeddedFetcher = true;
 const SLICE_KEY = "X-Databricks-Omnigent-Slice-Key";
 const SESSION_ID = "managed-session";
 const EVENTS_URL = `/v1/sessions/${SESSION_ID}/events`;
@@ -18,9 +19,10 @@ beforeEach(() => {
   vi.resetModules();
   fetchMock.mockReset();
   isWorkspace.mockReturnValue(true);
+  embeddedFetcher = true;
   vi.doUnmock("./sessionHost");
   vi.doMock("./host", () => ({
-    getOmnigentHostConfig: () => ({ fetcher: fetchMock }),
+    getOmnigentHostConfig: () => (embeddedFetcher ? { fetcher: fetchMock } : {}),
     hostFetch: fetchMock,
     isDatabricksWorkspace: isWorkspace,
     isHostRoutingEnabled: isWorkspace,
@@ -92,12 +94,7 @@ describe("managed first-message routing", () => {
   });
 
   it("recovers workspace dev requests without an embedded fetcher", async () => {
-    vi.doMock("./host", () => ({
-      getOmnigentHostConfig: () => ({}),
-      hostFetch: fetchMock,
-      isDatabricksWorkspace: isWorkspace,
-      isHostRoutingEnabled: isWorkspace,
-    }));
+    embeddedFetcher = false;
     const { authenticatedFetch, resolve } = await setup();
     fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
 

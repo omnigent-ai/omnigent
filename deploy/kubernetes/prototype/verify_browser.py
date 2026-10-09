@@ -126,6 +126,9 @@ class BrowserHost:
             "page_errors": [],
             "ui_observations": [],
             "cleanup_errors": [],
+            "passed": False,
+            "visible_issue_counts": {},
+            "http_error_counts": {},
         }
 
     def at(self):
@@ -589,7 +592,7 @@ class BrowserHost:
                 output = await command(*args)
                 if destination:
                     destination.write_text(output)
-            except RuntimeError as exc:
+            except (RuntimeError, OSError) as exc:
                 self.report["cleanup_errors"].append(str(exc))
         if self.mock:
             self.mock.terminate()
@@ -598,6 +601,7 @@ class BrowserHost:
             except subprocess.TimeoutExpired:
                 self.mock.kill()
                 await asyncio.to_thread(self.mock.wait, timeout=5)
+        if self.mock_log:
             self.mock_log.close()
         await self.client.aclose()
         await self.llm.aclose()
@@ -830,16 +834,33 @@ async def run(args):
             for host, result in zip(hosts, evidence, strict=True):
                 if isinstance(result, BaseException):
                     host.report["api_crosscheck_error"] = f"{type(result).__name__}: {result}"
-            await asyncio.gather(*(host.cleanup() for host in hosts))
-            await browser.close()
+            cleanup = await asyncio.gather(
+                *(host.cleanup() for host in hosts), return_exceptions=True
+            )
+            for host, result in zip(hosts, cleanup, strict=True):
+                if isinstance(result, BaseException):
+                    host.report["cleanup_errors"].append(f"{type(result).__name__}: {result}")
+                    host.report["passed"] = False
+            summary["cleanup_errors"] = []
+            try:
+                await browser.close()
+            except PlaywrightError as exc:
+                summary["cleanup_errors"].append(str(exc))
             monitor.cancel()
             await asyncio.gather(monitor, return_exceptions=True)
             for process, handle in logs.values():
-                if process.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.terminate()
-                    await asyncio.wait_for(process.wait(), 5)
-                handle.close()
+                try:
+                    if process.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            process.terminate()
+                        try:
+                            await asyncio.wait_for(process.wait(), 5)
+                        except TimeoutError:
+                            with contextlib.suppress(ProcessLookupError):
+                                process.kill()
+                            await process.wait()
+                finally:
+                    handle.close()
             with contextlib.suppress(RuntimeError):
                 (args.output / "nginx.log").write_text(
                     await command(*kube, "logs", "deployment/nginx", "--timestamps", "--since=10m")
@@ -867,11 +888,13 @@ async def run(args):
                         "visible_issue_counts": host.report["visible_issue_counts"],
                         "page_errors": host.report["page_errors"],
                         "http_error_counts": host.report["http_error_counts"],
+                        "cleanup_errors": host.report["cleanup_errors"],
                         "video": host.report.get("video"),
                     }
                 )
             summary["passed"] = bool(
                 summary.get("rollout_verified")
+                and not summary["cleanup_errors"]
                 and all(
                     host["passed"] and host["turns_sent_during_rollout"] >= 2
                     for host in summary["hosts"]

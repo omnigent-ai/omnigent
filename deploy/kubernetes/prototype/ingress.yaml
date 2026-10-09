@@ -16,23 +16,11 @@ metadata:
   name: omnigent-prototype-nginx
 rules:
   - apiGroups: [""]
-    resources: [services, endpoints, pods, secrets, namespaces, configmaps, nodes]
-    verbs: [get, list, watch]
-  - apiGroups: [discovery.k8s.io]
-    resources: [endpointslices]
-    verbs: [get, list, watch]
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [update]
-  - apiGroups: [networking.k8s.io]
-    resources: [ingresses, ingressclasses]
+    resources: [namespaces, nodes]
     verbs: [get, list, watch]
   - apiGroups: [networking.k8s.io]
-    resources: [ingresses/status]
-    verbs: [update]
-  - apiGroups: [""]
-    resources: [events]
-    verbs: [create, patch, update]
+    resources: [ingressclasses]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -42,6 +30,45 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: omnigent-prototype-nginx
+subjects:
+  - kind: ServiceAccount
+    name: nginx
+    namespace: omnigent-prototype
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nginx
+  namespace: omnigent-prototype
+rules:
+  - apiGroups: [""]
+    resources: [services, endpoints, pods, secrets, configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [update]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [update]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nginx
+  namespace: omnigent-prototype
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nginx
 subjects:
   - kind: ServiceAccount
     name: nginx

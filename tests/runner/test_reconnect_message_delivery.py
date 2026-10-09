@@ -6,8 +6,11 @@ import asyncio
 import copy
 from typing import Any
 
+import httpx
 import pytest
 
+from omnigent.runner import app as runner_app
+from omnigent.runner import session_history
 from omnigent.runner.app import _session_histories_ref
 from omnigent.server.schemas import SessionInputConsumedEvent
 from tests.runner.conftest import _runner_client, _ScriptedHarnessClient, _sse
@@ -249,3 +252,149 @@ async def test_reconnect_buffers_missed_work_while_another_turn_is_running(
         assert [item["content"] for item in users] == [
             _user(item_id)["content"] for item_id in ("running", "missed")
         ]
+
+
+@pytest.mark.asyncio
+async def test_failed_history_resolution_does_not_claim_an_unaccepted_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    app, _, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True))
+        monkeypatch.delitem(_session_histories_ref, SESSION_ID, raising=False)
+        server.items = [_user("previous"), _user("retryable")]
+        fail = True
+
+        async def resolve_history(content: Any, **kwargs: Any) -> Any:
+            nonlocal fail
+            if fail:
+                fail = False
+                raise httpx.ConnectError("history attachment connection lost")
+            return content
+
+        monkeypatch.setattr(session_history, "_resolve_forwarded_message_content", resolve_history)
+        with pytest.raises(httpx.ConnectError, match="history attachment"):
+            await _forward(client, "retryable")
+        assert not harness.posted_bodies
+
+        assert (await _forward(client, "retryable")).status_code == 200
+        await _settle(app)
+        assert len(harness.posted_bodies) == 1
+        users = [item for item in _session_histories_ref[SESSION_ID] if item.get("role") == "user"]
+        assert [item["content"] for item in users] == [
+            _user(item_id)["content"] for item_id in ("previous", "retryable")
+        ]
+
+
+@pytest.mark.asyncio
+async def test_attachment_failure_does_not_strand_already_recovered_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    app, _, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True))
+        monkeypatch.setitem(_session_histories_ref, SESSION_ID, [])
+        server.items = [_user("ready"), _user("attachment")]
+        fail = True
+
+        async def resolve_content(content: Any, **kwargs: Any) -> Any:
+            if fail and content == _user("attachment")["content"]:
+                raise httpx.ConnectError("attachment connection lost")
+            return content
+
+        monkeypatch.setattr(runner_app, "_resolve_forwarded_message_content", resolve_content)
+        await app.state.catch_up_scan()
+        await _settle(app)
+        assert len(harness.posted_bodies) == 1
+        assert not app.state.session_message_buffers.get(SESSION_ID)
+
+        fail = False
+        await app.state.catch_up_scan()
+        await _settle(app)
+        assert len(harness.posted_bodies) == 2
+        users = [item for item in _session_histories_ref[SESSION_ID] if item.get("role") == "user"]
+        assert [item["content"] for item in users] == [
+            _user(item_id)["content"] for item_id in ("ready", "attachment")
+        ]
+
+
+@pytest.mark.parametrize("delayed_ack", [False, True])
+async def test_reconnect_after_stop_does_not_execute_the_interruption_marker(
+    monkeypatch: pytest.MonkeyPatch, delayed_ack: bool
+) -> None:
+    started, persisted, release_ack = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    if not delayed_ack:
+        release_ack.set()
+
+    class CancellationServer(_Server):
+        async def post(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+            event = kwargs.get("json", {})
+            if event.get("type") != "external_conversation_item":
+                return self._Resp({})
+            data = event["data"]
+            item = {
+                "id": "interruption-marker",
+                "type": data["item_type"],
+                **data["item_data"],
+                "response_id": data["response_id"],
+            }
+            self.items.append(item)
+            persisted.set()
+            await release_ack.wait()
+            return self._Resp({"queued": False, "item_id": item["id"]})
+
+    first = True
+    original = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+    async def pause_first_turn(handle: Any) -> Any:
+        nonlocal first
+        if first:
+            first = False
+            started.set()
+            await asyncio.Event().wait()
+        async for frame in original(handle):
+            yield frame
+
+    monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", pause_first_turn)
+    server = CancellationServer()
+    app, _, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True))
+        monkeypatch.setitem(_session_histories_ref, SESSION_ID, [])
+        server.items.append(_user("abandoned"))
+        assert (await _forward(client, "abandoned", stream=False)).status_code == 202
+        await asyncio.wait_for(started.wait(), 2)
+        try:
+            response = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events", json={"type": "stop_session"}
+            )
+            assert response.status_code == 204
+            await _settle(app)
+            await asyncio.wait_for(persisted.wait(), 2)
+            marker = server.items[-1]
+            assert marker["role"] == "user"
+            assert marker["content"][0]["text"].startswith("[System: interrupted]")
+
+            server.items.append(_user("next-prompt"))
+            assert (await _forward(client, "next-prompt")).status_code == 200
+            await _settle(app)
+            server.items.append(
+                {"id": "reply", "type": "message", "role": "assistant", "content": []}
+            )
+            history = copy.deepcopy(_session_histories_ref[SESSION_ID])
+            queue = app.state.session_event_queues[SESSION_ID]
+            while not queue.empty():
+                queue.get_nowait()
+
+            await app.state.catch_up_scan()
+            await _settle(app)
+            assert len(harness.posted_bodies) == 2, "reconnect executed an internal Stop marker"
+            assert _session_histories_ref[SESSION_ID] == history
+            events = []
+            while not queue.empty():
+                events.append(queue.get_nowait())
+            assert not [e for e in events if e["type"] == "session.input.consumed"]
+        finally:
+            release_ack.set()

@@ -54,7 +54,7 @@ async def test_evidence_failure_still_removes_host_container(
 
 
 def _run_up(
-    tmp_path: Path, *, port: str, migration: str
+    tmp_path: Path, *, port: str, migration: str, cluster_exists: bool = True
 ) -> tuple[subprocess.CompletedProcess, str]:
     state = tmp_path / "state"
     state.mkdir()
@@ -68,7 +68,9 @@ def _run_up(
 name=${0##*/}
 printf '%s %s\\n' "$name" "$*" >> "$PROTOTYPE_TEST_COMMANDS"
 case "$name $*" in
-  'docker port '*) printf '%s\\n' "$PROTOTYPE_TEST_PORT" ;;
+  'docker port '*)
+    [[ "$PROTOTYPE_TEST_CLUSTER_EXISTS" == true ]] || exit 1
+    printf '%s\\n' "$PROTOTYPE_TEST_PORT" ;;
   'kubectl '*"get job migrate"*) printf '%s\\n' "$PROTOTYPE_TEST_MIGRATION" ;;
   'kubectl '*"logs job/migrate"*) printf 'migration diagnostic\\n' ;;
 esac
@@ -86,6 +88,7 @@ esac
         "PROTOTYPE_TEST_COMMANDS": str(commands),
         "PROTOTYPE_TEST_PORT": port,
         "PROTOTYPE_TEST_MIGRATION": migration,
+        "PROTOTYPE_TEST_CLUSTER_EXISTS": str(cluster_exists).lower(),
     }
     result = subprocess.run(
         ["bash", str(PROTOTYPE / "run.sh"), "up"],
@@ -103,6 +106,14 @@ def test_existing_cluster_rejects_changed_port_before_building(tmp_path: Path) -
     assert result.returncode == 1
     assert "down before changing the port" in result.stderr
     assert "Ready:" not in result.stdout
+    assert "docker build" not in commands
+
+
+def test_deleted_cluster_reports_how_to_reset_stale_kubeconfig(tmp_path: Path) -> None:
+    result, commands = _run_up(tmp_path, port="", migration="Complete=True", cluster_exists=False)
+    assert result.returncode == 1
+    assert "no running cluster container" in result.stderr
+    assert "down and retry" in result.stderr
     assert "docker build" not in commands
 
 

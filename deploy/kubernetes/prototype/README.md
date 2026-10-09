@@ -119,6 +119,10 @@ Omnigent also needs to handle messages sent during this gap:
   queues missed messages, and keeps its local conversation history.
   Otherwise a reply waiting to be saved can make an already completed turn
   look unfinished and cause it to run again.
+  A missed message recovered after newer input has arrived runs after that
+  newer input; this does not guarantee the original send order across a
+  disconnect. Internal history entries, such as the marker written by Stop,
+  do not start new turns.
 - The runner also sends its final SDK session status again after reconnecting.
   This clears a stale "Working…" state if the old server lost the completion.
   An actual failed turn keeps its error.
@@ -253,11 +257,11 @@ send function, recovery code, or event handling.
 | `completed_turn` | The runner finishes locally while reconnect recovery reads history ending in the already-accepted prompt. |
 | `lost_idle` | The reply is saved, but the final idle event is lost, leaving the next message queued. |
 | `missing_header` | The new server misses the start of a reply; later history reconciliation renders its text twice. |
+| `stale_host` | An open tab retains the old host after another client moves the session through the host-launch API. |
+| `terminal_reveal` | A hidden terminal uses up its reconnect attempts before the user opens Terminal view. |
+| `stopped_turn` | After Stop and a completed later turn, reconnect recovery mistakes the interruption marker for a new prompt. |
 
-Two further cases cover review findings: `stale_host` moves the session through
-the real host-launch API while its original browser remains open;
-`terminal_reveal` exhausts a hidden terminal's retry budget, then opens Terminal
-view. The terminal test advances the browser clock through the retry delays.
+The terminal test advances the browser clock through the retry delays.
 
 Install tmux and the test dependencies, then run from the repository root:
 
@@ -278,12 +282,16 @@ videos, screenshots, traces, saved messages, model requests, and transport logs.
 These tests check individual recovery paths; the three-pod, six-host command
 above checks NGINX's actual endpoint reloads and Kubernetes rollout behavior.
 
-On 2026-10-09, all 16 cases passed on this branch. The same test and support
+On 2026-10-09, all 18 tests passed on this branch. For the original eight cases,
+the same test and support
 files, copied without changes onto main at
 `9567b2bfc6c3f182e8ae43165c73bf0d64be9076`, produced 16 assertion failures and
 no setup errors. Main showed the send errors, extra model turns, stuck queued
 message, duplicate reply, stale host error, and terminal reconnect failure
 described above. Main's application code was unchanged for that comparison.
+The two Stop tests instead exposed a regression in the earlier PR commit
+`038a1934e`: both started an unsolicited model turn there and passed after the
+fix. The test files were unchanged between those runs too.
 
 ## Results and limits
 
@@ -298,8 +306,8 @@ describe that run; they do not guarantee a maximum interruption.
 
 With the recovery changes described above and `minReadySeconds: 10`, three
 three-pod, six-host browser runs passed on the same day. They completed
-**165, 173, and 172 turns**, respectively. The last run used the final image
-including the review fixes. Every prompt and reply was
+**165, 173, and 172 turns**, respectively. The last run used commit `038a1934e`,
+before the subsequent CI and review fixes. Every prompt and reply was
 saved and rendered once, each turn made one model request, no browser showed
 an error, and all six sessions finished idle. Each run started with two hosts
 per pod, replaced all three pods, and completed two additional turns per host

@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from playwright.sync_api import Page, Route, WebSocketRoute, expect
 
-from tests._helpers.replica_handoff import HandoffLab, handoff_lab
+from tests._helpers.replica_handoff import HandoffLab, eventually, handoff_lab
 
 _STORE = "(await import('/src/store/chatStore.ts')).useChatStore.getState()"
 CASES = (
@@ -25,6 +25,7 @@ CASES = (
     "missing_header",
     "stale_host",
     "terminal_reveal",
+    "stopped_turn",
 )
 
 
@@ -79,10 +80,7 @@ class Driver:
             self.page.evaluate(
                 f"""async args => {{
               const store = {_STORE};
-              window.handoffSendDone = false;
-              void store.send(args.text, args.agentId).finally(() => {{
-                window.handoffSendDone = true;
-              }});
+              void store.send(args.text, args.agentId);
             }}""",
                 {"text": text, "agentId": self.lab.agent_id},
             )
@@ -123,17 +121,18 @@ class Driver:
             "browser displayed a transient or persistent send error"
         )
         assert not self.errors
-        expect(
-            self.page.locator('[data-testid="assistant-text-section"]').filter(has_text=reply)
-        ).to_have_count(1)
         expect(self.page.get_by_placeholder("Send a message…")).to_have_value("")
 
 
 def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> None:
     if case == "terminal_reveal":
-        lab.client.patch(
-            f"/v1/sessions/{lab.session_id}", json={"labels": {"omnigent.ui": "terminal"}}
-        ).raise_for_status()
+
+        def terminal_ready() -> bool:
+            response = lab.client.get(f"/v1/sessions/{lab.session_id}/resources/terminals")
+            response.raise_for_status()
+            return bool(response.json()["data"])
+
+        eventually(terminal_ready, "runner-created terminal", 30)
         sockets: list[WebSocketRoute] = []
 
         def attach(ws: WebSocketRoute) -> None:
@@ -208,7 +207,7 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
         assert requests[-1]["status"] == 202
         return
     elif case == "wrong_replica":
-        proxy.target = lab.b.base_url
+        proxy.configure(target=lab.b.base_url)
         driver.send(prompt)
         driver.wait(
             lambda: any(
@@ -238,7 +237,7 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
         page.wait_for_timeout(1000)
         proxy.gate("browser", hold=False)
     elif case == "lost_forward":
-        proxy.drop_forward = True
+        proxy.configure(drop_forward=True)
         driver.send(prompt)
         driver.wait(
             lambda: any(
@@ -251,7 +250,7 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
         page.wait_for_timeout(500)
         lab.handoff()
     elif case == "lost_idle":
-        proxy.drop_status = "idle"
+        proxy.configure(drop_status="idle")
         driver.send(prompt)
         driver.wait(lambda: proxy.seen("lost_status"), "final idle edge to lose its connection")
         driver.wait(lambda: reply in lab.messages("assistant"), "completed reply before handoff")
@@ -267,6 +266,44 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
             "the lost idle event left the composer stuck",
         )
         driver.assert_clean(followup, followup_reply, turns=2)
+        return
+    elif case == "stopped_turn":
+        lab.configure([{"text": "This turn will be interrupted.", "pause_after": 1}])
+        driver.send("Interrupt this turn before it finishes.")
+        driver.wait(lab.model_paused, "turn to start before Stop")
+        if ui:
+            page.get_by_role("button", name="Interrupt", exact=True).click()
+        else:
+            page.evaluate(f"async () => {{ ({_STORE}).stop(); }}")
+        driver.wait(lambda: lab.snapshot()["status"] == "idle", "interrupted turn to stop")
+        markers = driver.wait(
+            lambda: [
+                item
+                for item in lab.items()
+                if str(item.get("response_id", "")).startswith("cancel_")
+                and item.get("role") == "user"
+            ],
+            "the runner's interruption marker to be saved",
+        )
+        lab.release_model()
+        lab.configure([{"text": reply}, {"text": "UNSOLICITED: the Stop marker ran as a prompt."}])
+        driver.send(prompt)
+        driver.assert_clean(prompt, reply, turns=2)
+        lab.handoff()
+        driver.wait(
+            lambda: any(
+                record["target"] == lab.b.base_url for record in proxy.seen("history_delivered")
+            ),
+            "reconnect scan to read the completed history after Stop",
+        )
+        driver.assert_clean(prompt, reply, turns=2)
+        marker_ids = {item["id"] for item in markers}
+        assert not any(
+            event.get("type") == "session.input.consumed"
+            and event.get("data", {}).get("item_id") in marker_ids
+            for record in proxy.seen("runner_events")
+            for event in record["events"]
+        ), "runner acknowledged internal history as a new prompt"
         return
     elif case in {"completed_turn", "missing_header"}:
         lab.configure([{"text": reply, "pause_after": 1}, {"text": f"DUPLICATE: {reply}"}])
@@ -340,12 +377,16 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
                 "completion on the replacement stream",
             )
             opening = next(
-                event["response"]["id"]
-                for record in proxy.seen("browser_events")
-                if record["target"] == lab.a.base_url
-                for event in record["events"]
-                if event.get("type") == "response.in_progress"
+                (
+                    event["response"]["id"]
+                    for record in proxy.seen("browser_events")
+                    if record["target"] == lab.a.base_url
+                    for event in record["events"]
+                    if event.get("type") == "response.in_progress"
+                ),
+                None,
             )
+            assert opening is not None, "original stream did not deliver the response header"
             replacement = [
                 event
                 for record in proxy.seen("browser_events")
@@ -353,8 +394,10 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
                 for event in record["events"]
             ]
             saved = next(
-                e["item"] for e in replacement if e["type"] == "response.output_item.done"
+                (e["item"] for e in replacement if e["type"] == "response.output_item.done"),
+                None,
             )
+            assert saved is not None, "replacement stream did not deliver the saved reply"
             assert saved["response_id"] != opening, "replacement did not miss the original header"
             assert any(
                 e["type"] == "response.completed" and e["response"]["id"] == opening

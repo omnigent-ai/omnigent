@@ -8,6 +8,7 @@ on:
       - 'web/**'
       - 'tests/_helpers/**'
       - 'tests/e2e/test_replica_handoff_e2e.py'
+      - 'tests/e2e/resilience/lab/**'
       - 'tests/e2e_ui/chat/test_replica_handoff.py'
       - 'tests/server/integration/mock_llm_server.py'
       - '.github/workflows/replica-handoff.yml'
@@ -79,5 +80,7 @@ jobs:
             handoff-results/processes/**/web.log
             handoff-results/processes/**/server.log
             handoff-results/processes/**/host.log
+            handoff-results/processes/**/home/.omnigent/logs/
             handoff-results/processes/**/terminal-*.png
+          include-hidden-files: true
           retention-days: 14

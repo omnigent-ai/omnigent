@@ -132,25 +132,29 @@ async def verify(
     backfills = []
     tasks = []
     started = time.monotonic()
-    mock_log = (args.output / "mock.log").open("w")
-    mock = subprocess.Popen(
-        [
-            sys.executable,
-            str(ROOT / "tests/server/integration/mock_llm_server.py"),
-            str(args.mock_port),
-        ],
-        stdout=mock_log,
-        stderr=subprocess.STDOUT,
-    )
-    client = httpx.AsyncClient(
-        base_url=args.url,
-        headers={"Origin": "omnigent://internal", KEY_HEADER: host_id},
-        timeout=5,
-        trust_env=False,
-    )
-    llm = httpx.AsyncClient(base_url=mock_url, timeout=5, trust_env=False)
+    mock_log = None
+    mock = None
+    client = None
+    llm = None
     ws = None
     try:
+        mock_log = (args.output / "mock.log").open("w")
+        mock = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "tests/server/integration/mock_llm_server.py"),
+                str(args.mock_port),
+            ],
+            stdout=mock_log,
+            stderr=subprocess.STDOUT,
+        )
+        client = httpx.AsyncClient(
+            base_url=args.url,
+            headers={"Origin": "omnigent://internal", KEY_HEADER: host_id},
+            timeout=5,
+            trust_env=False,
+        )
+        llm = httpx.AsyncClient(base_url=mock_url, timeout=5, trust_env=False)
 
         async def mock_ready():
             if mock.poll() is not None:
@@ -227,15 +231,16 @@ async def verify(
             return ready
 
         await eventually(host_ready)
-        name = f"nginx-prototype-{host_id[:8]}"
         response = await client.post(
             "/v1/sessions",
             data={"metadata": "{}"},
-            files={"bundle": ("agent.tar.gz", agent_bundle(name, mock_url), "application/gzip")},
+            files={
+                "bundle": ("agent.tar.gz", agent_bundle(host_name, mock_url), "application/gzip")
+            },
         )
         response.raise_for_status()
         listing = await client.get(
-            "/v1/sessions", params={"agent_name": name, "limit": 1, "visibility": "all"}
+            "/v1/sessions", params={"agent_name": host_name, "limit": 1, "visibility": "all"}
         )
         listing.raise_for_status()
         agent_id = listing.json()["data"][0]["agent_id"]
@@ -524,8 +529,19 @@ async def verify(
         await asyncio.gather(*tasks, return_exceptions=True)
         if ws is not None:
             await ws.close()
-        await client.aclose()
-        await llm.aclose()
+        if client is not None:
+            await client.aclose()
+        if llm is not None:
+            await llm.aclose()
+        if mock is not None:
+            mock.terminate()
+            try:
+                await asyncio.to_thread(mock.wait, timeout=5)
+            except subprocess.TimeoutExpired:
+                mock.kill()
+                await asyncio.to_thread(mock.wait, timeout=5)
+        if mock_log is not None:
+            mock_log.close()
         for kind in ("host", "runner"):
             samples = [s for s in report["samples"] if s["kind"] == kind]
             report[f"{kind}_statuses"] = dict(Counter(str(s["status"]) for s in samples))
@@ -557,13 +573,6 @@ async def verify(
             (args.output / "nginx.log").write_text(
                 await command(*kube, "logs", "deployment/nginx", "--since=15m")
             )
-        mock.terminate()
-        try:
-            await asyncio.to_thread(mock.wait, timeout=5)
-        except subprocess.TimeoutExpired:
-            mock.kill()
-            await asyncio.to_thread(mock.wait, timeout=5)
-        mock_log.close()
         print(f"Evidence: {args.output / 'report.json'}", flush=True)
 
 

@@ -1148,13 +1148,12 @@ async def create_response(
         if chunk_delay > 0 or qr.pause_after is not None:
             # Paced like ``/v1/messages``: one SSE event at a time.
             for index, event in enumerate(filter(None, sse_body.split("\n\n")), start=1):
-                if event:
-                    yield event + "\n\n"
-                    if index == qr.pause_after:
-                        qr._pending.set()
-                        _state.pending_gates.append(qr)
-                        await qr._gate.wait()
-                    await asyncio.sleep(chunk_delay)
+                yield event + "\n\n"
+                if index == qr.pause_after:
+                    qr._pending.set()
+                    _state.pending_gates.append(qr)
+                    await qr._gate.wait()
+                await asyncio.sleep(chunk_delay)
         else:
             yield sse_body
 

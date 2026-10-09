@@ -4,6 +4,8 @@ Run with OMNIGENT_E2E_REPLICA_HANDOFF=1 after installing web dependencies and
 Chromium. The companion UI suite types the same messages in the composer.
 """
 
+import os
+
 import pytest
 from playwright.sync_api import Page
 
@@ -14,6 +16,11 @@ from tests._helpers.replica_handoff_journeys import (
 )
 from tests._helpers.replica_handoff_journeys import (
     replica_lab as _replica_lab,  # noqa: F401 -- registers the shared pytest fixture
+)
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_REPLICA_HANDOFF") != "1",
+    reason="run in the Replica handoff regressions job with Chromium and web dependencies",
 )
 
 

@@ -37,7 +37,11 @@ wait_for_migration() {
 case "${1:-help}" in
   up)
     if [[ -f "$state/kubeconfig" ]]; then
-      published_address=$(docker port "$cluster-control-plane" 30080/tcp)
+      if ! published_address=$(docker port "$cluster-control-plane" 30080/tcp 2>/dev/null); then
+        printf 'Found %s but no running cluster container. Run %s down and retry.\n' \
+          "$state/kubeconfig" "$0" >&2
+        exit 1
+      fi
       if [[ "$published_address" != "127.0.0.1:$prototype_port" ]]; then
         printf 'The existing cluster publishes %s, but PROTOTYPE_PORT is %s. Run %s down before changing the port.\n' \
           "$published_address" "$prototype_port" "$0" >&2

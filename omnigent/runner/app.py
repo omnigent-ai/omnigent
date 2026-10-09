@@ -2990,9 +2990,15 @@ def create_runner_app(
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
-        elif session_id in _session_histories and _turn_bind_epoch.get(session_id) is not None:
-            # Reinitializing a live runner must preserve replies still waiting to be saved.
-            # Missed user messages are recovered by the reconnect scan below.
+        elif (
+            session_id in _session_histories
+            and _turn_bind_epoch.get(session_id) is not None
+            and not (
+                init_context.envelope is not None and init_context.envelope.resume_interrupted_turn
+            )
+        ):
+            # A live reconnect keeps unsaved replies. Explicit task recovery reloads
+            # history because this runner may have missed work on another runner.
             history = []
         else:
             history = await _load_history_as_input(session_id)
@@ -3456,7 +3462,7 @@ def create_runner_app(
             item_type = item.get("type", "message")
             item_data = {k: v for k, v in item.items() if k != "type"}
             try:
-                await server_client.post(
+                response = await server_client.post(
                     f"/v1/sessions/{conv_id}/events",
                     json={
                         "type": "external_conversation_item",
@@ -3468,7 +3474,11 @@ def create_runner_app(
                     },
                     timeout=10.0,
                 )
-            except (httpx.HTTPError, RuntimeError):
+                response.raise_for_status()
+                item_id = response.json().get("item_id")
+                if isinstance(item_id, str) and conv_id in _session_histories:
+                    _received_server_item_ids.setdefault(conv_id, set()).add(item_id)
+            except (httpx.HTTPError, RuntimeError, ValueError):
                 _logger.warning(
                     "Failed to persist cancellation item for %s: %s",
                     conv_id,
@@ -6355,6 +6365,7 @@ def create_runner_app(
                     )
 
                 persisted_item_id = message_body.get("persisted_item_id")
+                received_ids: set[str] | None = None
                 if not _is_native_harness(conversation_id) and isinstance(persisted_item_id, str):
                     received_ids = _received_server_item_ids.setdefault(conversation_id, set())
                     if persisted_item_id in received_ids:
@@ -6362,7 +6373,6 @@ def create_runner_app(
                             status_code=202,
                             content={"status": "accepted", "detail": "Message already accepted."},
                         )
-                    received_ids.add(persisted_item_id)
 
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
@@ -6386,6 +6396,8 @@ def create_runner_app(
                         conversation_id,
                         [],
                     ).append(message_body)
+                    if received_ids is not None and isinstance(persisted_item_id, str):
+                        received_ids.add(persisted_item_id)
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
@@ -6466,15 +6478,22 @@ def create_runner_app(
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:
-                    persisted_item_id = message_body.get("persisted_item_id")
                     loaded = await _load_history_as_input(
                         conversation_id,
                         drop_item_id=persisted_item_id,
                     )
+                    # Reconnect recovery may have queued this message during the read.
+                    if received_ids is not None and persisted_item_id in received_ids:
+                        return JSONResponse(
+                            status_code=202,
+                            content={"status": "accepted", "detail": "Message already accepted."},
+                        )
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
                 _begin_turn_slot(conversation_id)
+                if received_ids is not None and isinstance(persisted_item_id, str):
+                    received_ids.add(persisted_item_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -7576,6 +7595,7 @@ def create_runner_app(
                 received_ids = _received_server_item_ids.setdefault(session_id, set())
                 for item in all_new:
                     item_id = item.get("id")
+                    response_id = item.get("response_id")
                     # Replies and tool results already live in this runner's history.
                     # Only user messages can have missed their server-to-runner delivery.
                     if (
@@ -7583,6 +7603,8 @@ def create_runner_app(
                         or item.get("role") != "user"
                         or not isinstance(item_id, str)
                         or item_id in received_ids
+                        # Stop writes history, not input; its save acknowledgment can be lost.
+                        or (isinstance(response_id, str) and response_id.startswith("cancel_"))
                     ):
                         continue
                     raw_content = item.get("content", [])
@@ -7607,8 +7629,8 @@ def create_runner_app(
                         # Catch-up has no live server dispatch carrying renderer state.
                         "browser_renderer_available": False,
                     }
-                    received_ids.add(item_id)
                     _session_message_buffers.setdefault(session_id, []).append(msg_body)
+                    received_ids.add(item_id)
                     # The failed forward could not acknowledge this saved message.
                     _publish_event(
                         session_id,
@@ -7624,13 +7646,15 @@ def create_runner_app(
                     )
                 if after_id:
                     _last_server_item_id[session_id] = after_id
-                await _check_and_start_next_turn(session_id)
             except (httpx.HTTPError, RuntimeError):
                 _logger.warning(
                     "Catch-up scan failed for %s",
                     session_id,
                     exc_info=True,
                 )
+            finally:
+                # A later attachment failure must not strand inputs already acknowledged.
+                await _check_and_start_next_turn(session_id)
 
     app.state.catch_up_scan = _catch_up_scan
 
