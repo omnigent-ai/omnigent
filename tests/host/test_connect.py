@@ -1873,9 +1873,10 @@ def test_runner_exit_error_promotes_a_bare_traceback_final_line(tmp_path: Path) 
 def test_runner_exit_error_tail_starts_on_a_whole_line_after_the_byte_bound(
     tmp_path: Path,
 ) -> None:
-    """When the last lines exceed the tail budget, the cut drops its partial leading line."""
+    """When the last lines exceed the tail budget in UTF-8 bytes, the cut drops its
+    partial leading line and never splits a multibyte character."""
     log = tmp_path / "runner-x.log"
-    lines = [f"line {n:02d} " + "x" * 400 for n in range(20)]
+    lines = [f"line {n:02d} " + "é" * 300 for n in range(20)]
     log.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     error = _runner_exit_error(1, log)
@@ -1884,7 +1885,7 @@ def test_runner_exit_error_tail_starts_on_a_whole_line_after_the_byte_bound(
     tail_lines = tail.splitlines()
     assert tail_lines, error
     assert all(line in lines for line in tail_lines), tail_lines[0][:40]
-    assert len(tail) <= 4096
+    assert len(tail.encode("utf-8")) <= 4096
 
 
 async def test_watch_runner_silent_on_intentional_stop(

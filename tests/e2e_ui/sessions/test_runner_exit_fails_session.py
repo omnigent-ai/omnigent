@@ -18,12 +18,21 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.compat import compat_runner_python, compat_server_python
 from tests._helpers.runner_faults import (
     disk_full_spec_cache_pythonpath,
     tunnel_rejection_spec_cache_pythonpath,
 )
 from tests._helpers.server_runner import server_runner
 from tests.e2e_ui.conftest import _register_extra_agent
+
+# The cause line comes from the host and the headline from the SPA, both new in
+# 0.18.0; the stack here is built from this checkout, so a pinned older server
+# or runner build cannot show them (and would also strip the PYTHONPATH fault).
+pytestmark = pytest.mark.skipif(
+    compat_runner_python() is not None or compat_server_python() is not None,
+    reason="requires the 0.18.0 host report and SPA card",
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _REJECT_REASON = (
@@ -32,6 +41,12 @@ _REJECT_REASON = (
 )
 
 _T = TypeVar("_T")
+
+
+def _hold_for_recording(page: Page, ms: int) -> None:
+    """Pause only while filming, so the clip shows the state; plain runs skip it."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(ms)
 
 
 def _wait_until(predicate: Callable[[], _T | None], *, timeout: float = 90.0) -> _T:
@@ -132,17 +147,26 @@ def test_runner_boot_crash_names_the_cause(
         # the headline, the expand, and the stated cause.
         headline.scroll_into_view_if_needed()
         expect(headline).to_be_visible()
-        page.wait_for_timeout(1_500)
+        _hold_for_recording(page, 1_500)
         pill.locator("button[aria-expanded]").click()
-        expect(page.get_by_test_id("error-message-content")).to_contain_text(cause_substring)
+        message = page.get_by_test_id("error-message-content")
+        expect(message).to_contain_text(cause_substring)
         headline.scroll_into_view_if_needed()
-        page.wait_for_timeout(2_000)
+        _hold_for_recording(page, 2_000)
 
         # The card leads with a specific headline rather than the generic fallback.
         expect(page.get_by_test_id("error-headline")).not_to_have_text(
             "Something went wrong", timeout=10_000
         )
+        expect(headline).to_have_text("The session's runner failed to start on the host.")
         # The composed message names the cause up front (line two) instead of
         # burying it in the log tail or cutting it off above the shown lines.
         lines = error["message"].splitlines()
         assert len(lines) > 1 and lines[1].startswith("cause:"), error["message"]
+        # The raw runner log stays one click away in diagnostics, not in the body.
+        expect(message).not_to_contain_text("Traceback")
+        page.get_by_role("button", name="View diagnostics").click()
+        expect(page.get_by_test_id("error-diagnostics-content")).to_contain_text(
+            cause_substring, timeout=15_000
+        )
+        _hold_for_recording(page, 2_000)

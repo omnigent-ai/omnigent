@@ -38,15 +38,21 @@ def spawn_host_daemon(
 ) -> tuple[subprocess.Popen[bytes], str, Path]:
     """Start a host with a fresh ``host_id``; return ``(process, host_id, daemon_log)``.
 
-    A *pythonpath* fault forces direct runner spawns so it lands in the runner
-    process itself rather than in a shared zygote.
+    A *pythonpath* fault must land in the runner process itself, so it needs
+    ``zygote=False`` and a run that is not pinned to an older runner build.
     """
+    if pythonpath is not None:
+        if zygote:
+            raise ValueError("a PYTHONPATH fault needs direct runner spawns; pass zygote=False")
+        if compat_runner_python() is not None:
+            raise RuntimeError(
+                "a PYTHONPATH fault would shadow the pinned runner build; "
+                "gate the test with min_runner_version"
+            )
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
     host_id = uuid.uuid4().hex
-    config: dict[str, object] = {
-        "host": {"host_id": host_id, "name": f"runner-exit-{host_id[:8]}"}
-    }
+    config: dict[str, object] = {"host": {"host_id": host_id, "name": f"test-host-{host_id[:8]}"}}
     if runner_idle_timeout_s is not None:
         config["runner"] = {"idle_timeout_s": runner_idle_timeout_s}
     (omni_dir / "config.yaml").write_text(
@@ -63,7 +69,6 @@ def spawn_host_daemon(
         }
     )
     if pythonpath is not None:
-        zygote = False
         env["PYTHONPATH"] = pythonpath
     elif compat_runner_python() is None:
         env["PYTHONPATH"] = os.pathsep.join(
@@ -117,6 +122,17 @@ def await_launched_runner(daemon_log: Path, *, timeout: float = 15.0) -> tuple[s
             return launches[0]
         time.sleep(0.2)
     raise AssertionError("daemon never logged a runner launch")
+
+
+def pid_alive(pid: int) -> bool:
+    """Return whether *pid* still exists; a permission error means it does."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def terminate_host_daemon(daemon: subprocess.Popen[bytes] | None) -> None:

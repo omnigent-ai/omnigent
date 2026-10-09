@@ -12,13 +12,14 @@ import pytest
 
 from tests._helpers.host_daemon import (
     await_launched_runner,
+    pid_alive,
     spawn_host_daemon,
     terminate_host_daemon,
     wait_for_host_online,
 )
 from tests._helpers.runner_faults import disk_full_spec_cache_pythonpath
 from tests.e2e.conftest import lookup_agent_id, upload_agent
-from tests.e2e.test_host_e2e import _pid_alive, _write_smoke_agent_yaml
+from tests.e2e.test_host_e2e import _write_smoke_agent_yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOST_ONLINE_TIMEOUT_S = 30.0
@@ -111,7 +112,7 @@ def test_runner_process_exit_fails_bound_session(
             workspace=workspace,
         )
         _, runner_pid = await_launched_runner(daemon_log)
-        assert _pid_alive(runner_pid), "runner exited before we could observe it connected"
+        assert pid_alive(runner_pid), "runner exited before we could observe it connected"
 
         # A killed runner stands in for a non-zero runner-process exit.
         os.kill(runner_pid, signal.SIGKILL)
@@ -131,7 +132,8 @@ def test_runner_process_exit_fails_bound_session(
         terminate_host_daemon(daemon)
 
 
-@pytest.mark.min_runner_version("0.16.0")
+# The cause line is composed by the host, new in 0.18.0.
+@pytest.mark.min_runner_version("0.18.0")
 @pytest.mark.timeout(300)
 def test_runner_boot_crash_names_the_cause_before_the_log_tail(
     live_server: str,
@@ -148,6 +150,7 @@ def test_runner_boot_crash_names_the_cause_before_the_log_tail(
         pythonpath=disk_full_spec_cache_pythonpath(
             tmp_path / "fault", _REPO_ROOT, os.environ.get("PYTHONPATH")
         ),
+        zygote=False,
     )
     try:
         wait_for_host_online(live_server, host_id, timeout=_HOST_ONLINE_TIMEOUT_S)
@@ -208,9 +211,9 @@ def test_clean_idle_shutdown_does_not_fail_session(
 
         # Let the idle reaper exit the connected runner with code 0.
         deadline = time.monotonic() + 60.0
-        while time.monotonic() < deadline and _pid_alive(runner_pid):
+        while time.monotonic() < deadline and pid_alive(runner_pid):
             time.sleep(0.5)
-        assert not _pid_alive(runner_pid), "runner never idle-exited within the window"
+        assert not pid_alive(runner_pid), "runner never idle-exited within the window"
 
         deadline = time.monotonic() + 15.0
         while (

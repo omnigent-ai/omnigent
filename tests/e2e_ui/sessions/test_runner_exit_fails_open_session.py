@@ -1,8 +1,7 @@
-"""Browser journeys for a host runner process that dies under an open session."""
+"""Browser journey: a host runner process that dies under an open session fails it."""
 
 from __future__ import annotations
 
-import contextlib
 import os
 import re
 import signal
@@ -20,13 +19,15 @@ from tests._helpers.host_daemon import (
     terminate_host_daemon,
     wait_for_host_online,
 )
-from tests._helpers.runner_faults import disk_full_spec_cache_pythonpath
 from tests.e2e_ui.conftest import _register_extra_agent
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
 _RUNNER_EXIT_TEXT = re.compile(r"runner process exited")
-# The error code determines the banner headline.
-_EXPECTED_HEADLINE = "The session's runner failed to start on the host."
+
+
+def _hold_for_recording(page: Page, ms: int) -> None:
+    """Pause only while filming, so the clip shows the state; plain runs skip it."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(ms)
 
 
 def _runner_online(base_url: str, runner_id: str) -> bool:
@@ -81,12 +82,8 @@ def test_host_runner_exit_fails_open_session(
 ) -> None:
     """A killed host runner fails the open session; the banner names the exit."""
     daemon: subprocess.Popen[bytes] | None = None
-    killed_pids: list[int] = []
     try:
-        # Direct spawn so the logged PID is the runner itself.
-        daemon, host_id, daemon_log = spawn_host_daemon(
-            tmp_path, live_server, mock_llm_server_url, zygote=False
-        )
+        daemon, host_id, daemon_log = spawn_host_daemon(tmp_path, live_server, mock_llm_server_url)
         wait_for_host_online(live_server, host_id)
         session_id = _create_host_session(
             live_server, host_id, "runner-exit-agent", tmp_path / "project"
@@ -111,7 +108,6 @@ def test_host_runner_exit_fails_open_session(
 
         # Kill the connected runner process: a stand-in for any non-zero exit.
         os.kill(pid, signal.SIGKILL)
-        killed_pids.append(pid)
 
         _wait_for_failed(live_server, session_id)
 
@@ -122,59 +118,6 @@ def test_host_runner_exit_fails_open_session(
         error_pill.click()
         message = page.get_by_test_id("error-message-content")
         expect(message).to_contain_text(_RUNNER_EXIT_TEXT, timeout=15_000)
-        page.wait_for_timeout(2_500)
-    finally:
-        terminate_host_daemon(daemon)
-        for extra_pid in killed_pids:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(extra_pid, signal.SIGKILL)
-
-
-@pytest.mark.min_server_version("0.16.0")
-@pytest.mark.timeout(300)
-def test_runner_boot_crash_banner_names_the_cause(
-    page: Page,
-    live_server: str,
-    mock_llm_server_url: str,
-    tmp_path: Path,
-) -> None:
-    """The failed-session banner states why the runner died, above its log."""
-    daemon: subprocess.Popen[bytes] | None = None
-    try:
-        daemon, host_id, _daemon_log = spawn_host_daemon(
-            tmp_path,
-            live_server,
-            mock_llm_server_url,
-            pythonpath=disk_full_spec_cache_pythonpath(
-                tmp_path / "fault", _REPO_ROOT, os.environ.get("PYTHONPATH")
-            ),
-        )
-        wait_for_host_online(live_server, host_id)
-        session_id = _create_host_session(
-            live_server, host_id, "runner-boot-crash-agent", tmp_path / "project"
-        )
-        _wait_for_failed(live_server, session_id)
-
-        page.goto(f"{live_server}/c/{session_id}")
-        error_pill = page.get_by_test_id("error-pill")
-        expect(error_pill).to_be_visible(timeout=30_000)
-        expect(page.get_by_test_id("error-headline")).to_have_text(
-            _EXPECTED_HEADLINE, timeout=15_000
-        )
-
-        error_pill.click()
-        message = page.get_by_test_id("error-message-content")
-        expect(message).to_contain_text(_RUNNER_EXIT_TEXT, timeout=15_000)
-        # The runner's own reason is stated up front ...
-        expect(message).to_contain_text("No space left on device")
-        # ... instead of at the bottom of a traceback in the message body.
-        expect(message).not_to_contain_text("Traceback")
-
-        # The raw runner log, with the crash site, is one click away.
-        page.get_by_role("button", name="View diagnostics").click()
-        expect(page.get_by_test_id("error-diagnostics-content")).to_contain_text(
-            "in create_app", timeout=15_000
-        )
-        page.wait_for_timeout(2_500)
+        _hold_for_recording(page, 2_500)
     finally:
         terminate_host_daemon(daemon)

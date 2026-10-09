@@ -416,10 +416,12 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     if reason is not None:
         message += f"\ncause: {_redact_log_tail(reason)[:_EXIT_REASON_MAX_CHARS]}"
     # Redact whole lines before bounding so the cut cannot leave half a credential,
-    # then drop the partial line the cut leaves at the front.
+    # then drop the partial leading line (a single oversized line stays as cut).
     tail = _redact_log_tail("\n".join(lines))
-    if len(tail) > _LOG_TAIL_MAX_BYTES:
-        tail = tail[-_LOG_TAIL_MAX_BYTES:].split("\n", 1)[-1]
+    encoded = tail.encode("utf-8")
+    if len(encoded) > _LOG_TAIL_MAX_BYTES:
+        cut = encoded[-_LOG_TAIL_MAX_BYTES:].decode("utf-8", errors="ignore")
+        tail = cut.split("\n", 1)[-1]
     message += "\n--- runner log tail ---\n" + tail
     return message
 
