@@ -23,6 +23,8 @@ implements them separately, so a fix for one harness does not reach the others.
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
+- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
+  stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `disconnect`: startup waits and active operations settle when their native
@@ -33,8 +35,8 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings (or its card's gear). One Startup configuration block shows Command,
   Environment, and Arguments, unmasked and read-only, with the selected host's source.
   Env wrappers are split into these fields, without a duplicate raw invocation.
-  Session and workspace config can add to or override these host defaults. Behind
-  `harness_settings_ui`; other harnesses keep their credential card only.
+  Session and workspace config can add to or override these host defaults.
+  Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
 
@@ -42,10 +44,9 @@ implements them separately, so a fix for one harness does not reach the others.
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
-- `harness-settings-navigation`: with `harness_settings_ui` enabled, the import
-  review modal's See more opens Harnesses and dismisses the modal. Settings →
-  Import sessions keeps session imports but hides Harness imports. With the flag
-  off, the modal has no See more and Harness imports remains available.
+- `harness-settings-navigation`: Harnesses is always available in Settings and
+  through direct links. The import review modal's See more opens Harnesses and
+  dismisses the modal. Import sessions contains only session imports.
 
 ## How to get to it (user POV)
 
@@ -58,21 +59,24 @@ without a session ID to resume.
 
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
-list or plugin. Requires `harness_settings_ui`.
+list or plugin.
 
 **MCP tools:** Settings → Harnesses → configured harness card (or gear),
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
-Probes run only on expansion; requires `harness_settings_ui`.
+Probes run only on expansion.
 
-**Harness settings navigation:** the import review modal shown for a newly
-connected or requested host → See more opens Settings → Harnesses. With the
-flag off, Settings → Import sessions → Harness imports → Review imports reopens
-the review modal instead.
+**Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
+`/settings/harnesses` or its harness detail pages, or the import review modal
+shown for a newly connected or requested host → See more.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
 [sessions](./sessions.md); a detached terminal has its own paths in
 [terminals](./terminals.md).
+
+**Codex side chat:** type `/side <question>` in the parent composer, send a
+follow-up in the side pane, then close its tab. The parent conversation stays
+separate. See [sessions](./sessions.md) for all side-chat entry points.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -106,8 +110,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
 
-**Launch settings (own environment):** enable `harness_settings_ui`, connect a
-host with Claude/Codex configured, and put a command and two args under
+**Launch settings (own environment):** connect a host with Claude/Codex
+configured, and put a command and two args under
 `harness.claude-native` / `harness.codex-native` in its `~/.omnigent/config.yaml`.
 Open each harness through both its gear and card → Settings. Check one Startup
 configuration block with Command, Environment, and Arguments, plus source and
@@ -125,13 +129,23 @@ the extra fields. Resolver and raw-tunnel checks:
 
 Cross-harness journeys:
 
+- **`side-chat`, Codex:**
+  `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
+  uses a real Codex CLI/app-server and the local mock model. It verifies inherited
+  model context, distinct native threads on one runner, transcript isolation,
+  follow-ups, and a working parent after side-chat closure.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
-  `web/src/pages/SettingsPage.test.tsx`. In an isolated instance, connect a new
+  `web/src/pages/SettingsPage.test.tsx`, plus
+  `web/src/shell/settingsNav.test.tsx` and
+  `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_once_and_links_to_harnesses`.
+  Start the isolated instance without release flags. Check the Harnesses sidebar
+  link and direct links to the catalog and a harness detail page. Connect a new
   host, then click See more beside Confirm. Check that the modal closes and
   Harnesses opens. Open Import sessions and check that only session imports
-  remain. Repeat with `harness_settings_ui` off: no See more, and Harness
-  imports can still reopen the modal.
+  remain. Older clients connected to an upgraded server keep these entry points
+  without deployment changes. The server response contract is covered by
+  `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
 - **`needs-auth`:**
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
@@ -139,7 +153,8 @@ Cross-harness journeys:
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
 - **`model-and-effort`:**
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,
-  `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`;
+  `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
+  (real host API and Codex CLI, with custom/bundled catalogs and a hidden default; desktop and mobile);
   see also [composer](./composer.md) for effort.
 - **`model-and-effort`, Codex runtime settings:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
@@ -227,6 +242,21 @@ Cross-harness journeys:
   `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
   keeps a resumed effort whose config write failed for later updates.
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`chat-render`, Claude shell commands from the web composer:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
+  drives the built SPA at desktop and phone widths with controlled backend
+  events. The shell prompt remains one user bubble after settlement, with its
+  output below it; a following prompt and reload preserve both user turns.
+  `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_web_shell_command_settles_before_the_next_prompt`
+  covers the real CLI and transcript forwarder through the repro environment.
+  It requires Claude Code and tmux; machine-managed Claude settings need an
+  isolated container for the scripted model endpoint.
+- **`chat-render`, Claude shell commands from the agent terminal:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
+  replays terminal-origin records in the built SPA at desktop and phone widths.
+  After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
+  prompt must remain a separate user turn outside the assistant's folded work,
+  including after reload. This browser contract does not launch the Claude CLI.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
@@ -281,6 +311,14 @@ Cross-harness journeys:
   checks output recovery across a real server restart and injected stream-open
   failures. It supplies native-style events; it does not run a vendor CLI.
   Run with plain `uv run pytest` and the browser prerequisites in the skill.
+- **`disconnect`, completed Claude Task child (own environment):**
+  `tests/e2e_ui/sessions/test_claude_native_idle_handoff.py::test_completed_claude_child_survives_stale_status_handoff`
+  uses the real Claude CLI, native child forwarder, two server replicas, and a
+  runner tunnel cut. A completed child with stale saved `running` state must
+  not acquire a failure on the new replica, in its chat or the Agents panel,
+  including after reload. Run with plain `uv run pytest` and the browser
+  prerequisites in the skill. Requires Claude Code and tmux; machine-managed
+  Claude credentials need an isolated container for the scripted model endpoint.
 
 - **`plugin-inventory` (component and host tests):**
   `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real
@@ -288,7 +326,7 @@ Cross-harness journeys:
   `tests/host/test_plugins.py`, `tests/server/routes/test_plugins.py`, and
   `tests/server/integration/test_host_tunnel_route.py::test_host_tunnel_routes_plugins_result_to_future`.
   Run `pnpm --dir web test src/hooks/useHarnessInventory.test.tsx src/pages/settings/SettingsHarnessesSection.test.tsx`.
-  With `harness_settings_ui` enabled, open Settings → Harnesses, select the test
+  Open Settings → Harnesses, select the test
   host and Claude Code, then Plugins. Verify name, version, marketplace, enabled
   state, and hook/command labels from the host. Open a plugin, inspect its
   description and Skills/MCPs tabs, then return with Plugins. Repeat via the

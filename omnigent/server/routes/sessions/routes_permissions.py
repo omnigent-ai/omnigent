@@ -431,7 +431,7 @@ def _to_agent_object(
             )
             # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description)
+                SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
                 for s in loaded.spec.skills
                 if s.user_invocable
             ]

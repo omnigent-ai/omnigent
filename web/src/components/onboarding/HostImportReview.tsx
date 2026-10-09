@@ -1,9 +1,7 @@
-// Wires the import modal to a real host: the reviewable dialog Settings opens,
-// and the gate that opens it for a requested host or once per newly connected host.
+// Opens the import modal for a requested host or once per newly connected host.
 
 import { useEffect, useState } from "react";
 import { ImportContextModal } from "@/components/onboarding/ImportContextModal";
-import { Button } from "@/components/ui/button";
 import { useHarnessInventory, type HarnessInventory } from "@/hooks/useHarnessInventory";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import {
@@ -45,30 +43,6 @@ function InventoryModal({
       mcpUnsupported={inventory.mcpUnsupported}
       hostName={hostName}
       loadingMessage={loadingMessage}
-    />
-  );
-}
-
-/** The import modal for one host, loading its inventory only while open. */
-export function HostImportsDialog({
-  host,
-  open,
-  onOpenChange,
-  showHostName = false,
-}: {
-  host: Host;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  showHostName?: boolean;
-}) {
-  const inventory = useHarnessInventory(host, { enabled: open });
-  return (
-    <InventoryModal
-      hostId={host.host_id}
-      hostName={showHostName ? host.name : undefined}
-      inventory={inventory}
-      open={open}
-      onOpenChange={onOpenChange}
     />
   );
 }
@@ -154,56 +128,5 @@ function NewHostImportReview() {
         if (!next) setOpenHostId(null);
       }}
     />
-  );
-}
-
-/** Settings rows that reopen the import modal for each online machine. */
-export function ReviewImportsPanel() {
-  const { data: hosts } = useHosts();
-  const onlineHosts = (hosts ?? []).filter((host) => host.status === "online");
-  const [openHostId, setOpenHostId] = useState<string | null>(null);
-  const openHost = onlineHosts.find((host) => host.host_id === openHostId);
-
-  if (onlineHosts.length === 0) {
-    return (
-      <p className="text-sm text-muted-foreground">
-        None of your machines are online. Start one with{" "}
-        <code className="rounded bg-muted px-1 py-0.5 font-mono">omnigent host</code> to review what
-        its harnesses bring over.
-      </p>
-    );
-  }
-  return (
-    <>
-      <ul className="flex flex-col">
-        {onlineHosts.map((host) => (
-          <li
-            key={host.host_id}
-            className="flex items-center justify-between gap-4 border-b border-border py-3 first:pt-0 last:border-b-0 last:pb-0"
-          >
-            <span className="min-w-0 truncate text-ui font-medium">{host.name}</span>
-            <Button
-              variant="outline"
-              size="sm"
-              componentId="settings.import.reviewImports"
-              aria-label={`Review imports on ${host.name}`}
-              onClick={() => setOpenHostId(host.host_id)}
-            >
-              Review imports
-            </Button>
-          </li>
-        ))}
-      </ul>
-      {openHost && (
-        <HostImportsDialog
-          host={openHost}
-          open
-          onOpenChange={(open) => {
-            if (!open) setOpenHostId(null);
-          }}
-          showHostName={onlineHosts.length > 1}
-        />
-      )}
-    </>
   );
 }

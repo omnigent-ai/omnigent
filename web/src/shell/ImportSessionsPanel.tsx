@@ -33,7 +33,7 @@ const SOURCES: { value: ImportSourceSelector; label: string }[] = [
   { value: "kimi", label: "Kimi" },
 ];
 
-const LIMITS = [25, 50, 100];
+const LIMITS = [25, 50, 100, 200, 500, 1000];
 type ImportMode = "recent" | "session";
 
 /**

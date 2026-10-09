@@ -3,8 +3,8 @@
 // users can select rendered text and attach review comments — parity with the
 // Markdown (TipTap) and code (Monaco/Shiki) comment surfaces.
 //
-// The iframe stays sandboxed WITHOUT `allow-same-origin` (see HTML_PREVIEW_SANDBOX),
-// so the parent can't touch its DOM directly. All selection capture and
+// The default iframe has an opaque origin; an embedded host may provide its own
+// isolated content frame. All selection capture and
 // highlight painting happens inside the iframe via the injected bridge, relayed
 // over a private MessageChannel. See htmlCommentBridge.ts for the protocol and
 // trust model.
@@ -15,7 +15,7 @@ import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useIsEmbedded } from "@/lib/embedded";
-import { getEmbedRoot } from "@/lib/host";
+import { getEmbedRoot, getOmnigentHtmlPreviewFrame } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import {
@@ -89,10 +89,14 @@ export function HtmlCommentViewer({
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
-  const loadBridgeExternally = useIsEmbedded();
+  const isEmbedded = useIsEmbedded();
+  const HtmlPreviewFrame = getOmnigentHtmlPreviewFrame();
+  // Only the default srcdoc frame inherits the host CSP. Isolated host frames
+  // use the inline bridge to avoid cross-origin requests back to the host.
+  const loadBridgeExternally = isEmbedded && !HtmlPreviewFrame;
 
-  // A fresh nonce + srcDoc per content load. Changing srcDoc reloads the iframe
-  // document, which re-runs the bridge and (via the new nonce) re-establishes
+  // A fresh nonce + srcDoc per content load. The nonce key remounts either frame,
+  // which re-runs the bridge and (via the new nonce) re-establishes
   // the channel — clearing any stale highlights from the previous content.
   const { nonce, srcDoc } = useMemo(() => {
     const n = genNonce();
@@ -217,16 +221,20 @@ export function HtmlCommentViewer({
   // race and makes the timeout measure the bridge startup, not document parsing.
   const onLoad = () => {
     const win = iframeRef.current?.contentWindow;
-    if (!win) return;
+    if (!win) {
+      console.warn(
+        "HTML comment bridge cannot connect: preview frame did not expose its content window.",
+      );
+      return;
+    }
     channelRef.current?.port1.close();
     const channel = new MessageChannel();
     channelRef.current = channel;
     // The port pins this closure, so mutable values in handleInbound must come from refs.
     channel.port1.onmessage = (ev) => handleInbound(ev.data);
     portRef.current = channel.port1;
-    // targetOrigin "*" is required: the sandboxed frame has an opaque ("null")
-    // origin, so we cannot name a concrete origin. The transferred port + the
-    // nonce are the trust mechanism, not the origin.
+    // "*" is required for opaque frames; hosts may also use a separate origin.
+    // The renderer enforces isolation; the port + nonce bind bridge messages.
     win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [channel.port2]);
     clearReadyTimer();
     readyTimerRef.current = setTimeout(() => {
@@ -264,7 +272,9 @@ export function HtmlCommentViewer({
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, []);
 
-  const preview = (
+  const preview = HtmlPreviewFrame ? (
+    <HtmlPreviewFrame key={nonce} htmlContent={srcDoc} iframeRef={setIframeRef} onLoad={onLoad} />
+  ) : (
     <iframe
       key={nonce}
       ref={setIframeRef}
