@@ -1329,9 +1329,31 @@ async def _get_agent_contents_with_retry(
             extra={"session_id": session_id},
         )
         await asyncio.sleep(delay_s)
-    # Final attempt: a transport error propagates, and a 5xx response is
+    # Final attempt: a transport error propagates and a transient 5xx is
     # returned for the caller's status check to raise the canonical error.
-    return await server_client.get(path)
+    # Log either outcome so the exhausted budget is visible like the retries.
+    try:
+        resp = await server_client.get(path)
+    except httpx.TransportError as exc:
+        _logger.warning(
+            "spec_resolver: GET %s attempt %d/%d failed (%s); retry budget exhausted",
+            path,
+            attempts,
+            attempts,
+            repr(exc),
+            extra={"session_id": session_id},
+        )
+        raise
+    if resp.status_code in _SPEC_FETCH_TRANSIENT_STATUSES:
+        _logger.warning(
+            "spec_resolver: GET %s attempt %d/%d failed (HTTP %s); retry budget exhausted",
+            path,
+            attempts,
+            attempts,
+            resp.status_code,
+            extra={"session_id": session_id},
+        )
+    return resp
 
 
 async def _resolve_agent_spec_from_server(
@@ -1357,7 +1379,8 @@ async def _resolve_agent_spec_from_server(
         directory, or ``None`` when the server returns 404 for the
         requested agent.
     :raises RuntimeError: If the server returns a non-200 status
-        other than 404. Transient failures (5xx, transport errors) are
+        other than 404. Transient failures (the 5xx statuses in
+        :data:`_SPEC_FETCH_TRANSIENT_STATUSES`, transport errors) are
         retried with backoff first — see
         :func:`_get_agent_contents_with_retry`.
     """

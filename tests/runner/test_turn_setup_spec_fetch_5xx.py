@@ -403,7 +403,7 @@ async def test_bg_turn_setup_rides_out_transient_spec_fetch_5xx(
             events = _drain_status_events(app.state.session_event_queues, _CONV)
 
     failed = [event for event in events if event.get("status") == "failed"]
-    # The corrected behavior: the blip never reaches the UI as a failed turn.
+    # A transient blip must not surface to the UI as a failed turn.
     assert failed == [], f"transient 5xx surfaced as a failed turn: {failed}"
     # The turn genuinely proceeded past spec resolution into harness dispatch.
     assert captured.get("harness") == _BLIP_HARNESS

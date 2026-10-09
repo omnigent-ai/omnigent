@@ -2912,6 +2912,7 @@ async def test_resolve_agent_spec_from_server_5xx_retry_budget_is_bounded(
     tmp_path: Path,
     status_code: int,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A persistent 5xx still raises — after exactly the bounded budget.
 
@@ -2919,6 +2920,7 @@ async def test_resolve_agent_spec_from_server_5xx_retry_budget_is_bounded(
     :param status_code: 5xx HTTP status persistently returned by the AP
         server.
     :param monkeypatch: Used to zero the backoff delays for test speed.
+    :param caplog: Pytest log capture fixture.
     :returns: None.
     """
     monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
@@ -2938,7 +2940,10 @@ async def test_resolve_agent_spec_from_server_5xx_retry_budget_is_bounded(
         transport=httpx.MockTransport(_handler),
         base_url="http://server.test",
     ) as client:
-        with pytest.raises(RuntimeError) as exc_info:
+        with (
+            caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
             await _resolve_agent_spec_from_server(
                 client, tmp_path, "ag_test", session_id="conv_test"
             )
@@ -2948,6 +2953,11 @@ async def test_resolve_agent_spec_from_server_5xx_retry_budget_is_bounded(
     assert "/v1/sessions/conv_test/agent/contents" in message
     # Initial attempt plus one retry per backoff delay — no unbounded loop.
     assert len(requested_paths) == 4
+    # The exhausted final attempt is logged like the in-loop retries.
+    assert any(
+        "retry budget exhausted" in record.message and f"HTTP {status_code}" in record.message
+        for record in caplog.records
+    ), f"final-attempt failure not logged: {[r.message for r in caplog.records]}"
 
 
 @pytest.mark.asyncio
@@ -2998,11 +3008,13 @@ async def test_resolve_agent_spec_from_server_retries_transport_errors(
 async def test_resolve_agent_spec_from_server_propagates_persistent_transport_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An unreachable server still surfaces its transport error — bounded.
 
     :param tmp_path: Temporary spec cache root.
     :param monkeypatch: Used to zero the backoff delays for test speed.
+    :param caplog: Pytest log capture fixture.
     :returns: None.
     """
     monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
@@ -3022,12 +3034,19 @@ async def test_resolve_agent_spec_from_server_propagates_persistent_transport_er
         transport=httpx.MockTransport(_handler),
         base_url="http://server.test",
     ) as client:
-        with pytest.raises(httpx.ConnectError):
+        with (
+            caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"),
+            pytest.raises(httpx.ConnectError),
+        ):
             await _resolve_agent_spec_from_server(
                 client, tmp_path, "ag_test", session_id="conv_test"
             )
 
     assert len(calls) == 4
+    # The exhausted final attempt is logged before the transport error propagates.
+    assert any("retry budget exhausted" in record.message for record in caplog.records), (
+        f"final-attempt transport failure not logged: {[r.message for r in caplog.records]}"
+    )
 
 
 def test_main_reports_tunnel_rejection_without_traceback(

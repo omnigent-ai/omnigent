@@ -14,10 +14,11 @@ runner, open it in the web app, and send a message while the runner -> server
 path returns a transient 5xx on the agent-bundle fetch. A loopback TCP proxy
 between the runner and the server answers a leading burst of agent-bundle GETs
 with a synthetic 503 and forwards everything else untouched (including the
-WebSocket tunnel that keeps the runner online). It is armed before the session
-is bound, so the session-init resolve, the SPA's page-load reads, and the
-turn-setup resolves all land inside the fault window; the window is sized so a
-retrying resolver exhausts it and a later attempt reaches a real 200.
+WebSocket tunnel that keeps the runner online). The session-init resolve runs
+first against an unarmed proxy; the fault is armed only once the composer is
+ready, right before the message is sent, so the injected 5xx window belongs to
+the turn-setup resolve alone (the per-turn fetch always re-runs) and is sized
+smaller than its retry budget so a later attempt reaches a real 200.
 
 The rig mirrors ``test_cursor_native_launch_config_timeout.py`` (dedicated
 server + runner with an isolated ``HOME`` / ``OMNIGENT_CONFIG_HOME``), plus the
@@ -57,14 +58,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Boot budget for the spawned server + proxy + runner trio.
 _HEALTH_TIMEOUT_S = 120.0
-# Turn-outcome budget (ms): time for the failed status (bug) or the mock reply
-# (fixed) to reach the SPA after the message is sent.
+# Turn-outcome budget (ms): time for a failed status or the mock reply to reach
+# the SPA after the message is sent.
 _OUTCOME_TIMEOUT_MS = 60_000
 
 # Answer this many leading agent-bundle GETs with a synthetic 503, then forward.
-# Not a multiple of the resolver's four attempts: session init burns 1-4, so the
-# turn-setup resolve recovers mid-retry instead of exhausting its own budget.
-_FAIL_FIRST_N = int(os.environ.get("SPEC_5XX_E2E_FAIL_FIRST_N", "6"))
+# Fewer than the resolver's four attempts, so the turn-setup resolve recovers
+# mid-retry once a later attempt reaches the backend.
+_FAIL_FIRST_N = int(os.environ.get("SPEC_5XX_E2E_FAIL_FIRST_N", "2"))
 
 _ERROR_PILL = '[data-testid="error-pill"]'
 _ERROR_HEADLINE = '[data-testid="error-headline"]'
@@ -87,11 +88,9 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-#: Ambient variables that must not leak into the rig: provider credentials and
-#: config (the rig uses its isolated HOME / OMNIGENT_CONFIG_HOME and the mock
-#: LLM), and runner/host identity from any outer Omnigent runner running this
-#: test (a leaked OMNIGENT_RUNNER_* makes the spawned runner take the
-#: zygote-fork path and hang before coming online).
+#: Ambient vars that must not leak into the rig: provider credentials/config
+#: (it uses its isolated HOME / OMNIGENT_CONFIG_HOME and the mock LLM) and
+#: runner/host identity (a leaked OMNIGENT_RUNNER_* forces the zygote-fork path).
 _AMBIENT_STRIP_PREFIXES = (
     "OPENAI_",
     "ANTHROPIC_",
@@ -501,8 +500,8 @@ def test_agent_bundle_5xx_during_turn_setup_does_not_brick_the_turn(
     """
     rig = spec_5xx_rig
 
-    # A working model reply so a retry-tolerant (fixed) runner completes the
-    # turn cleanly -- the fail -> pass side of the guard.
+    # A working model reply so a retry-tolerant runner completes the turn
+    # cleanly once the resolve recovers.
     set_fallback_mock_llm(mock_llm_server_url, "gpt-4o-mini", "Hello! How can I help you today?")
     configure_mock_llm(
         mock_llm_server_url,
@@ -512,11 +511,8 @@ def test_agent_bundle_5xx_during_turn_setup_does_not_brick_the_turn(
 
     session_id = _create_hello_world_session(rig.base_url)
 
-    # Arm before binding: the bind triggers the runner's session-init resolve.
-    # If that succeeded, the turn would reuse the cached spec and never hit the
-    # fault window during turn setup.
-    rig.proxy.arm(session_id)
-
+    # Bind against an unarmed proxy so the session-init resolve succeeds; the
+    # fault is armed later, right before Send.
     _bind_session_to_runner(rig.base_url, session_id, rig.runner_id)
 
     try:
@@ -525,22 +521,29 @@ def test_agent_bundle_5xx_during_turn_setup_does_not_brick_the_turn(
         expect(composer).to_be_visible(timeout=30_000)
 
         composer.fill("Say hello")
+
+        # Arm only now, so the injected 5xx belongs to the turn-setup resolve
+        # alone. Snapshot the count first to prove this Send -- not session
+        # init -- hit the fault.
+        injected_before = rig.proxy.injected_count
+        rig.proxy.arm(session_id)
         page.get_by_role("button", name="Send", exact=True).click()
 
         error_pill = page.locator(_ERROR_PILL)
         assistant = page.locator(_ASSISTANT)
 
-        # Wait for a definitive turn outcome: the failed status drives the error
-        # pill (bug) or the mock reply lands as an assistant bubble (fixed).
+        # Wait for a definitive turn outcome: a failed status drives the error
+        # pill, or the mock reply lands as an assistant bubble.
         expect(error_pill.or_(assistant).first).to_be_visible(timeout=_OUTCOME_TIMEOUT_MS)
 
-        # Prove the fault was actually exercised: a green pass with
-        # injected_count == 0 would mean the 5xx never fired.
-        assert rig.proxy.injected_count >= 1, (
-            "the agent-bundle fetch never hit the degraded proxy path "
-            f"(injected_count=0, match_count={rig.proxy.match_count}); the "
-            "reproduction did not inject its fault.\nRunner log tail:\n"
-            f"{_real_runner_log(rig.work)[-3000:]}"
+        # Prove the turn-setup resolve itself hit the fault: injections rose
+        # after Send. A green pass without that would not exercise the 5xx.
+        assert rig.proxy.injected_count > injected_before, (
+            "the turn-setup agent-bundle fetch never hit the degraded proxy "
+            f"path (injected_before={injected_before}, "
+            f"injected_count={rig.proxy.injected_count}, "
+            f"match_count={rig.proxy.match_count}); the reproduction did not "
+            f"inject its fault.\nRunner log tail:\n{_real_runner_log(rig.work)[-3000:]}"
         )
 
         if error_pill.count() > 0:
