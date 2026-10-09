@@ -178,13 +178,10 @@ def _readvertise_live_claude_tmux_target(
     session_id: str,
 ) -> None:
     """
-    Restore a live Claude pane's tmux advertisement when it is missing.
+    Restore a missing tmux advertisement from the registered live Claude pane.
 
-    Pane liveness does not imply deliverability: ``tmux.json`` can lag behind
-    the launch or be lost while the pane stays alive, and message injection
-    hard-fails once its advertisement wait expires. The registry instance
-    still knows the socket and target, so rewrite the advertisement instead.
-    Best-effort: on failure the injection falls back to its own wait.
+    A live pane is not deliverable until ``tmux.json`` names its socket and
+    target. Failures are logged and leave injection to its existing wait.
 
     :param bridge_dir: The session's claude-native bridge directory.
     :param instance: The registered, alive ``claude`` pane instance.

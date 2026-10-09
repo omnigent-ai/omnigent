@@ -4,149 +4,22 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     _TMUX_FILE,
     bridge_dir_for_conversation_id,
     tmux_target_advertised,
 )
-from omnigent.inner.terminal import TerminalInstance
-from omnigent.runner import create_runner_app, native_controls
-from omnigent.spec.types import AgentSpec, ExecutorSpec
-from omnigent.terminals import TerminalRegistry
-from tests.runner.conftest import (
-    _FakeProcessManager,
-    _runner_client,
-    _ScriptedHarnessClient,
+from tests.runner.conftest import _runner_client
+from tests.runner.test_app_sessions_native_session_change_heal import (
+    _open_claude_native_session,
+    _plant_live_claude_pane,
 )
-from tests.runner.helpers import NullServerClient
-
-
-def _native_spec() -> AgentSpec:
-    """Return a claude-native agent spec for session create."""
-    return AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
-
-
-def _plant_live_unadvertised_pane(
-    registry: TerminalRegistry,
-    conv_id: str,
-    tmp_path: Path,
-    bridge_dir: Path,
-) -> TerminalInstance:
-    """Register a live Claude pane whose tmux target is not advertised.
-
-    This is the reproduced gap: the registry instance is alive, but the
-    bridge directory carries no ``tmux.json`` for the injection to read.
-
-    :returns: The planted live instance.
-    """
-    live_sock = tmp_path / "omnigent-terminal-live" / "tmux.sock"
-    instance = TerminalInstance(
-        name="claude",
-        session_key="main",
-        socket_path=live_sock,
-        private_dir=tmp_path / "live_private",
-    )
-    instance.running = True
-    (tmp_path / "live_private").mkdir(exist_ok=True)
-
-    async def _alive() -> bool:
-        return True
-
-    instance.is_alive = _alive  # type: ignore[method-assign]
-    with registry._lock:
-        registry._by_conversation[conv_id] = {("claude", "main"): instance}
-        registry._instance_locks[(conv_id, "claude", "main")] = threading.Lock()
-    # The fault: nothing advertises the live pane's tmux target.
-    (bridge_dir / _TMUX_FILE).unlink(missing_ok=True)
-    return instance
-
-
-async def _open_claude_native_session(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    conv_id: str,
-    auto_create_calls: list[str],
-) -> tuple[Any, TerminalRegistry]:
-    """Build a runner with a real terminal registry and a claude-native session.
-
-    ``_auto_create_claude_terminal`` is stubbed so session create does not
-    spawn a real Claude TUI; recording its calls lets tests assert a live
-    pane was never recreated.
-    """
-
-    async def _stub_auto_create(
-        session_id: str,
-        resource_registry: object,
-        publish_event: object,
-        **_kwargs: object,
-    ) -> SessionResourceView:
-        del resource_registry, publish_event
-        auto_create_calls.append(session_id)
-        return SessionResourceView(
-            id="terminal_claude_main",
-            type="terminal",
-            session_id=session_id,
-            name="claude",
-        )
-
-    monkeypatch.setattr(
-        "omnigent.runner.native.orchestration._auto_create_claude_terminal",
-        _stub_auto_create,
-    )
-    monkeypatch.setattr(
-        "omnigent.runner.native._auto_create_claude_terminal",
-        _stub_auto_create,
-    )
-
-    async def _stub_launch_claude(ctx: Any) -> SessionResourceView:
-        return await _stub_auto_create(ctx.session_id, ctx.resource_registry, ctx.publish_event)
-
-    monkeypatch.setattr(
-        "omnigent.runner.native.orchestration._launch_claude",
-        _stub_launch_claude,
-    )
-    monkeypatch.setattr("omnigent.runner.native._launch_claude", _stub_launch_claude)
-    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_POLL_S", 0.01)
-    monkeypatch.setattr(
-        claude_native_bridge,
-        "read_model_env",
-        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
-    )
-    monkeypatch.setattr(
-        claude_native_bridge, "post_tools_changed", lambda _bridge_dir, **kwargs: None
-    )
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return _native_spec()
-
-    registry = TerminalRegistry()
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        terminal_registry=registry,
-    )
-    async with _runner_client(app) as client:
-        create_resp = await client.post(
-            "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
-        )
-        assert create_resp.status_code == 201, create_resp.text
-    return app, registry
 
 
 @pytest.mark.asyncio
@@ -180,7 +53,9 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     )
     auto_create_calls.clear()
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
-    instance = _plant_live_unadvertised_pane(registry, conv_id, tmp_path, bridge_dir)
+    instance = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    # The fault: the pane is alive but nothing advertises its tmux target.
+    (bridge_dir / _TMUX_FILE).unlink()
 
     captured: list[tuple[str, dict[str, str]]] = []
 
@@ -235,7 +110,7 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     )
     auto_create_calls.clear()
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
-    instance = _plant_live_unadvertised_pane(registry, conv_id, tmp_path, bridge_dir)
+    instance = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
     # Advertise a valid target up front; the heal must keep it verbatim.
     claude_native_bridge.write_tmux_target(
         bridge_dir,

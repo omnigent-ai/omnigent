@@ -83,9 +83,10 @@ def _not_advertised_error_text(page: Page) -> str | None:
     pill = page.locator(_ERROR_PILL).first
     if pill.count() == 0:
         return None
-    pill.click()
+    content = page.get_by_test_id("error-message-content").first
+    if not content.is_visible():
+        pill.click()  # a click toggles the pill, so expand only a collapsed one
     try:
-        content = page.get_by_test_id("error-message-content").first
         content.wait_for(state="visible", timeout=10_000)
         text = content.inner_text()
     except Exception:  # an unreadable body means the pill isn't ready yet

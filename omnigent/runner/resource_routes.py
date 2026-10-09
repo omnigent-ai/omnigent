@@ -627,9 +627,8 @@ def register_resource_routes(
     async def _readvertise_live_claude_pane(conv_id: str, instance: TerminalInstance) -> None:
         """Restore a live Claude pane's missing ``tmux.json`` before a turn.
 
-        The relay binding already resolved the bridge dir; deriving it from
-        the session labels costs a server round trip per turn, so that is
-        the fallback. Best-effort: the inject keeps its own advertisement wait.
+        The relay binding already knows the bridge dir; the session labels
+        (a server round trip) are the fallback. Best-effort.
         """
         from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
 
