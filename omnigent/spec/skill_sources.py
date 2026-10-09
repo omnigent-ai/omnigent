@@ -425,6 +425,12 @@ def _plugin_install_paths(
             cache_target = cache_link.resolve()
             if cache_target.is_dir():
                 plugin_roots.append(cache_target)
+            else:
+                _log.warning(
+                    "Ignoring plugins cache %s: target %s is not a directory",
+                    cache_link,
+                    cache_target,
+                )
     except (OSError, RuntimeError) as exc:
         # A symlink loop raises here; the root alone keeps other plugins usable.
         _log.warning("Ignoring unresolvable plugins cache %s: %s", cache_link, exc)

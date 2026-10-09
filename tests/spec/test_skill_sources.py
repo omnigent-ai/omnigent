@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -1001,9 +1002,13 @@ def test_claude_provider_follows_symlinked_plugin_cache(
 
 @pytest.mark.parametrize("escape", ["direct", "nested_symlink"])
 def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, escape: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    escape: str,
 ) -> None:
     """Only the cache target is trusted: neither its siblings nor a link escaping it."""
+    caplog.set_level(logging.WARNING, logger="omnigent.spec.skill_sources")
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     outside = tmp_path / "evil"
@@ -1022,13 +1027,20 @@ def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
         _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
     )
     assert out == []
+    rejection = next(m for m in caplog.messages if "outside the trusted roots" in m)
+    assert str((cfg / "plugins").resolve()) in rejection
+    assert str((tmp_path / "shared-cache").resolve()) in rejection
 
 
 @pytest.mark.parametrize("cache_link", ["loop", "dangling"])
 def test_claude_provider_survives_broken_plugin_cache_link(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_link: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cache_link: str,
 ) -> None:
     """A looping or dangling ``plugins/cache`` link skips only the entries behind it."""
+    caplog.set_level(logging.WARNING, logger="omnigent.spec.skill_sources")
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     cfg = tmp_path / "profile"
@@ -1066,6 +1078,9 @@ def test_claude_provider_survives_broken_plugin_cache_link(
     # The entry behind the link is unresolvable (loop) or outside every root
     # (dangling); the plugin's next scope entry still counts either way.
     assert sorted(s.name for s in out) == ["multi:plan", "sp:using-superpowers"]
+    assert any(
+        "plugins cache" in m and str(cfg / "plugins" / "cache") in m for m in caplog.messages
+    )
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(
