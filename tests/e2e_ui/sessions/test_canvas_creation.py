@@ -122,13 +122,14 @@ def test_canvas_plus_creates_session_on_the_selected_board(
         if route.request.method != "POST":
             route.fallback()
             return
-        payload = route.request.post_data_json
-        # The shared verification runner has no host daemon. Create through the
-        # real API and bind it directly; the rest of the UI and turn are live.
-        body = {
-            key: payload[key] for key in ("agent_id", "project_id", "labels") if key in payload
-        }
         try:
+            payload = route.request.post_data_json
+            assert isinstance(payload, dict), "Canvas session POST must contain a JSON object"
+            # The shared verification runner has no host daemon. Create through the
+            # real API and bind it directly; the rest of the UI and turn are live.
+            body = {
+                key: payload[key] for key in ("agent_id", "project_id", "labels") if key in payload
+            }
             assert payload.get("agent_id") == agent_id, (
                 "Canvas creation must use the fixture agent"
             )
@@ -140,7 +141,7 @@ def test_canvas_plus_creates_session_on_the_selected_board(
                 httpx.patch, base_url, created["id"], source["runner_id"], timeout=10
             )
             route.fulfill(status=response.status_code, json=created)
-        except (httpx.HTTPError, AssertionError) as error:
+        except Exception as error:
             creation_errors.append(error)
             route.fulfill(status=500, json={"detail": "Canvas fixture runner setup failed"})
 

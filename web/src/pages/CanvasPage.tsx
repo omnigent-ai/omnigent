@@ -88,8 +88,6 @@ const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2.5;
 const RESIZE_REFIT_DELAY_MS = 100;
 const EMPTY_PROJECTS: ProjectSummary[] = [];
-/** Query parameter carrying the selected canvas so a reload lands on the same tab. */
-export { CANVAS_QUERY_PARAM } from "@/canvas/canvasNavigation";
 
 const TAB_CLASS =
   "flex h-7 max-w-[200px] shrink-0 items-center gap-1.5 rounded-md px-2.5 text-ui text-muted-foreground transition-colors hover:bg-muted hover:text-foreground aria-selected:bg-brand-accent/10 aria-selected:text-foreground";
@@ -180,8 +178,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const layoutViewerRef = useRef<string | null | undefined>(undefined);
   // Live positions for every session, including unsaved grid slots.
   const positionsRef = useRef<CanvasPositions>({});
-  // True once the user pans or zooms by hand; auto-fits then leave the view
-  // alone until the canvas changes.
+  // Preserve the view after the user pans, zooms, or opens a card.
+  // Fit and Reset explicitly release that preference.
   const viewportDirtyRef = useRef(false);
   const viewportsRef = useRef(new Map<string, { viewport: Viewport; dirty: boolean }>());
   const pendingViewportRef = useRef<Viewport | null>(null);
@@ -243,11 +241,11 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const prepareCanvasViewport = useCallback(
     (canvasId: string) => {
       viewportsRef.current.set(activeCanvasRef.current, {
-        viewport: getViewport(),
+        viewport: pendingViewportRef.current ?? getViewport(),
         dirty: viewportDirtyRef.current,
       });
       const remembered = viewportsRef.current.get(canvasId);
-      pendingViewportRef.current = remembered?.viewport ?? null;
+      pendingViewportRef.current = remembered?.dirty ? remembered.viewport : null;
       viewportDirtyRef.current = remembered?.dirty ?? false;
       fittedKeyRef.current = null;
     },
@@ -438,9 +436,12 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
 
   // A project canvas whose project was deleted (or a stale URL) falls back to Main.
   useEffect(() => {
-    if (activeCanvas === MAIN_CANVAS_ID || projectsQuery.data === undefined) return;
-    if (projects.some((project) => projectCanvasId(project) === activeCanvas)) return;
-    viewportsRef.current.delete(activeCanvas);
+    if (projectsQuery.data === undefined) return;
+    const available = new Set([MAIN_CANVAS_ID, ...projects.map(projectCanvasId)]);
+    for (const canvasId of viewportsRef.current.keys()) {
+      if (!available.has(canvasId)) viewportsRef.current.delete(canvasId);
+    }
+    if (available.has(activeCanvas)) return;
     activeCanvasRef.current = MAIN_CANVAS_ID;
     setActiveCanvas(MAIN_CANVAS_ID);
     writeCanvasParam(MAIN_CANVAS_ID);

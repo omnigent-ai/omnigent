@@ -363,7 +363,9 @@ plain `uv run pytest`, which starts a private server for the test.
   dialog with Escape preserves conversation focus and that resizing respects
   both panes' minimum widths; double-click restores and saves the default split.
   `web/src/pages/CanvasPage.test.tsx` checks viewport
-  translation across successive resizes, hiding, and restoring the pane.
+  translation across successive resizes, hiding, and restoring the pane,
+  refitting untouched boards after card changes, and preserving queued viewports
+  during rapid project switches.
 - **`canvas-session-health` (card selection and direct session links):** component
   tests in `web/src/hooks/useActiveConversationId.test.tsx` cover standalone and
   embedded session routes, switching cards, and returning to the board.

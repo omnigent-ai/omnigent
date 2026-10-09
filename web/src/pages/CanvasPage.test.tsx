@@ -470,6 +470,60 @@ describe("CanvasPage", () => {
     expect(flowFitView).toHaveBeenCalledTimes(2);
   });
 
+  it("refits an untouched board when returning after its cards changed", async () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    const rows = [conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })];
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
+    const { rerender } = render(pageTree("/canvas", true));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
+    flowApi.getViewport.mockReturnValue({ x: 100, y: 100, zoom: 1 });
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(2));
+
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("new", 3), ...rows]),
+    );
+    rerender(pageTree("/canvas", true));
+    fireEvent.click(screen.getByRole("tab", { name: "Main" }));
+    expect(screen.getByTestId("flow-node-new")).toBeInTheDocument();
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(3));
+    expect(flowSetViewport).not.toHaveBeenCalled();
+  });
+
+  it("preserves a queued viewport when switching again before it is applied", async () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(
+      projectsStub([...PROJECTS, { id: "proj_b", name: "Beta" }]),
+    );
+    const rows = [
+      conversation("main", 3),
+      conversation("alpha", 2, { project_id: "proj_a" }),
+      conversation("beta", 1, { project_id: "proj_b" }),
+    ];
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
+    render(pageTree("/canvas", true));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
+    const mainViewport = { x: -80, y: 24, zoom: 0.75 };
+    flowApi.getViewport.mockReturnValue(mainViewport);
+    const onMoveEnd = () =>
+      (flowProps.current!.onMoveEnd as (event: MouseEvent) => void)(new MouseEvent("mouseup"));
+    act(onMoveEnd);
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(2));
+    const alphaViewport = { x: 200, y: -100, zoom: 1.25 };
+    flowApi.getViewport.mockReturnValue(alphaViewport);
+    act(onMoveEnd);
+    fireEvent.click(screen.getByRole("tab", { name: "Main" }));
+    await waitFor(() => expect(flowSetViewport).toHaveBeenLastCalledWith(mainViewport));
+    flowApi.getViewport.mockReturnValue(mainViewport);
+
+    act(() => {
+      fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+      fireEvent.click(screen.getByRole("tab", { name: "Beta" }));
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    await waitFor(() => expect(flowSetViewport).toHaveBeenLastCalledWith(alphaViewport));
+  });
+
   it("keeps the panned center through successive resizes and hiding the pane", async () => {
     let notifyResize: () => void = () => {};
     let width = 1000;
