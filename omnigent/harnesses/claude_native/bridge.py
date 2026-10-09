@@ -54,7 +54,7 @@ import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -1633,26 +1633,10 @@ def build_claude_native_spawn_env(
 
 
 def _bridge_sandbox_payload(sandbox: OSEnvSandboxSpec) -> dict[str, Any]:
-    """
-    Build the JSON-safe sandbox payload persisted into the bridge config.
+    """Persist sandbox settings without parent-only credential sources."""
+    from omnigent.inner.os_env_serialization import encode_sandbox_spec
 
-    ``dataclasses.asdict`` flattens ``credential_proxy`` (a nested
-    ``CredentialProxySpec``) to a plain dict with no way to tell it apart
-    from a real one on read, so a naive ``OSEnvSandboxSpec(**payload)``
-    round-trip silently stores a ``dict`` where a ``CredentialProxySpec``
-    is expected — a real crash the first time sandboxed code dereferences
-    ``.entries`` / ``.databricks`` on it. ``credential_proxy`` is resolved
-    parent-side only and is never meant to cross a serialization boundary
-    in the first place — :func:`omnigent.inner.sandbox.SandboxPolicy.to_jsonable`
-    excludes it for the same reason (it can carry a credential *source*,
-    e.g. an env var name or a shell command, that has no business landing
-    in a file on disk). Dropping it here matches that existing convention
-    instead of inventing a new one.
-
-    :param sandbox: Resolved sandbox spec to serialize.
-    :returns: JSON-safe dict with ``credential_proxy`` omitted.
-    """
-    payload = asdict(sandbox)
+    payload = encode_sandbox_spec(sandbox)
     payload.pop("credential_proxy", None)
     return payload
 
@@ -7449,6 +7433,7 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     # Only the bridge MCP server (launch path) ever builds these tools.
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.os_env import create_os_environment
+    from omnigent.inner.os_env_serialization import decode_sandbox_spec
     from omnigent.tools.builtins.os_env import build_os_env_tools
 
     workspace_raw = config.get("workspace")
@@ -7457,7 +7442,7 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     if workspace is not None:
         sandbox_payload = config.get("sandbox")
         sandbox = (
-            OSEnvSandboxSpec(**sandbox_payload)
+            decode_sandbox_spec(sandbox_payload)
             if isinstance(sandbox_payload, dict)
             else OSEnvSandboxSpec(type="none")
         )

@@ -7,6 +7,7 @@ import base64
 import codecs
 import contextlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ from .credential_proxy import (
     prepare_credential_proxy_runtime,
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
+from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .sandbox import (
     ContainmentHandle,
     SandboxPolicy,
@@ -74,6 +76,8 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # opaque JSON object at this boundary with runtime validation in
 # ``_handle_helper_request``.
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+logger = logging.getLogger(__name__)
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
 EditEntry: TypeAlias = dict[str, str]
@@ -416,6 +420,7 @@ class _HelperProcessClient:
         # introspects them, but the lifecycle is driven through
         # the handle when present.
         self._egress_handle: EgressProxyHandle | None = None
+        self._git_ssh_broker: GitSshBroker | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -466,6 +471,13 @@ class _HelperProcessClient:
         self._start_locked()
 
     def _start_locked(self) -> None:
+        try:
+            self._start_unchecked_locked()
+        except BaseException:
+            self._stop_locked()
+            raise
+
+    def _start_unchecked_locked(self) -> None:
         sandbox = self.sandbox
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
@@ -524,6 +536,11 @@ class _HelperProcessClient:
                     credential_runtime.rewrites if credential_runtime is not None else None
                 ),
             )
+
+        if sandbox.git_ssh and self._tmpdir is not None:
+            self._git_ssh_broker = start_git_ssh_broker(sandbox.git_ssh, self._tmpdir)
+            apply_git_ssh_env(env, self._git_ssh_broker)
+            sandbox = replace(sandbox, git_ssh_socket_path=str(self._git_ssh_broker.socket_path))
 
         if self._tmpdir is not None:
             set_sandbox_env(env, self._tmpdir)
@@ -632,8 +649,7 @@ class _HelperProcessClient:
                 **popen_kwargs,
             )
         except Exception:
-            cleanup_private_tmpdir(self._tmpdir)
-            self._tmpdir = None
+            self._stop_locked()
             raise
         finally:
             # Close the parent's copy of the read end either way —
@@ -649,10 +665,14 @@ class _HelperProcessClient:
         # launcher backends (they isolate via wrap_launcher_argv before
         # exec); on Windows this assigns the helper to a kill-on-close
         # Job Object so the whole tree is torn down in ``_stop_locked``.
-        if sandbox.active and self._proc.pid is not None:
-            self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
-                sandbox, self._proc.pid
-            )
+        try:
+            if sandbox.active and self._proc.pid is not None:
+                self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
+                    sandbox, self._proc.pid
+                )
+        except Exception:
+            self._stop_locked()
+            raise
 
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
@@ -705,6 +725,12 @@ class _HelperProcessClient:
                     self._sandbox_handle.close()
                 self._sandbox_handle = None
             self._stop_egress_proxy_locked()
+            if self._git_ssh_broker is not None:
+                try:
+                    self._git_ssh_broker.stop()
+                except Exception:
+                    logger.exception("Git SSH broker stop failed")
+                self._git_ssh_broker = None
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
 
