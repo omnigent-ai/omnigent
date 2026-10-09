@@ -1449,10 +1449,10 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
-# 0.130.0 sits below the 0.131.0 bypass-hook-trust flag gate, 0.133.0 above
-# it: both halves of the window the capability floor admits must read
-# installed (the flag gate degrades launch args, never installability).
-@pytest.mark.parametrize("version", ["0.130.0", "0.133.0"])
+# 0.129.0 is the floor itself; 0.130.0 sits below the 0.131.0 bypass-hook-trust
+# flag gate and 0.133.0 above it. The whole window the capability floor admits
+# must read installed (the flag gate degrades launch args, never installability).
+@pytest.mark.parametrize("version", ["0.129.0", "0.130.0", "0.133.0"])
 def test_the_codex_floor_is_the_policy_hook_capability_floor(
     monkeypatch: pytest.MonkeyPatch,
     version: str,
