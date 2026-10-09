@@ -18,8 +18,9 @@ exclude-newer = "P7D"
 # - cwsandbox: first-party CoreWeave SDK pinned to an exact, tested version
 #   (the `cwsandbox` extra), published 2026-06-11. Drop once aged past P7D.
 # - google-antigravity: the SDK the `antigravity` harness drives (the
-#   `antigravity` extra in pyproject), published 2026-06-11. Drop once aged
-#   past P7D.
+#   `antigravity` extra in pyproject); 0.1.20 (published 2026-09-27) is the
+#   release that routes `run_command` through the pre-tool hook Omnigent's
+#   approval card needs. Drop once aged past P7D.
 # - nimble-python: the verified Agent API V2 1.2 contract release, required by
 #   nimble_research for typed run fields. Drop once it has aged past P7D.
 # - mlflow / mlflow-skinny / mlflow-tracing: the mlflow release train cross-pins
@@ -29,4 +30,4 @@ exclude-newer = "P7D"
 #   <51, which unblocks cryptography 50.0.0 (CVE-2026-69247); 3.16.0 is also
 #   above the mlflow AI Gateway SSRF range <=3.15.2 (CVE-2026-71211). Drop once
 #   aged past P7D (2026-09-11).
-exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }
+exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-09-28T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }
