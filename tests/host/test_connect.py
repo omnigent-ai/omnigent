@@ -124,12 +124,10 @@ def _isolated_provider_resolution(
     """Keep the machine's ambient provider state out of these tests.
 
     Model-options frames decorate every row with the host's resolved provider
-    ``source``, read from ``~/.omnigent/config.yaml`` via ``load_config()``
-    and from ambient-credential detection (CLI logins, vendor env keys). On a
-    machine with subscription defaults or detectable credentials, that
-    decoration leaks into the exact-frame assertions here and fails a pristine
-    tree. Relocate the config home to an empty per-test directory and stub the
-    detection sweep, the way neighboring suites isolate the same seams.
+    ``source`` (``~/.omnigent/config.yaml`` plus ambient-credential detection),
+    so a developer's subscription defaults or vendor keys would leak into the
+    exact-frame assertions here. Point the config home at an empty directory
+    and stub the detection sweep, as neighboring suites do for the same seams.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path_factory.mktemp("config_home")))
     monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
