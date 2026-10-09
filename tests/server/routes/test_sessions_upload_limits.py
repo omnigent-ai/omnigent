@@ -177,7 +177,6 @@ def test_message_cannot_inline_a_filesystem_attachment(
     assert "payload.zip" in resp.text
 
 
-@pytest.mark.parametrize("transition", ["switch-agent", "fork"])
 @pytest.mark.parametrize(
     "filename,target_harness,event_type,block_type,status",
     [
@@ -190,11 +189,10 @@ def test_message_cannot_inline_a_filesystem_attachment(
         ("notes.txt", "openai-agents", "message", "input_file", 202),
     ],
 )
-def test_send_rechecks_unsent_upload_after_harness_transition(
+def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
     upload_client: tuple[TestClient, str],
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    transition: str,
     filename: str,
     target_harness: str,
     event_type: str,
@@ -217,8 +215,8 @@ def test_send_rechecks_unsent_upload_after_harness_transition(
         )
 
     monkeypatch.setattr(sessions, "get_agent_cache", lambda: SimpleNamespace(load=load))
-    changed = client.post(f"/v1/sessions/{source_id}/{transition}", json={"agent_id": target.id})
-    assert changed.status_code == (201 if transition == "fork" else 200), changed.text
+    changed = client.post(f"/v1/sessions/{source_id}/fork", json={"agent_id": target.id})
+    assert changed.status_code == 201, changed.text
     session_id = changed.json()["id"]
     files = SqlAlchemyFileStore(db_uri).list(session_id).data
     assert len(files) == 1

@@ -127,9 +127,7 @@ class Session:
     :param agent_id: Durable identifier of the bound agent, e.g.
         ``"ag_abc123"``. Stable across renames of the agent.
     :param agent_name: Human-readable name of the bound agent, e.g.
-        ``"polly"``. Changes when the session is switched to a
-        different agent in place (``POST .../switch-agent``), so
-        attached clients can refresh their displayed agent label.
+        ``"polly"``.
         ``None`` when the server couldn't resolve the agent row.
     :param status: Session lifecycle status. One of ``"idle"``,
         ``"running"``, or ``"failed"``.

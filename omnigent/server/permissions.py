@@ -8,8 +8,9 @@ this single function.
 
 from __future__ import annotations
 
-from omnigent.entities import ResolvedAccess
+from omnigent.entities import Conversation, ResolvedAccess
 from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER
+from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -20,6 +21,7 @@ def check_session_access(
     required_level: int,
     permission_store: PermissionStore,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> bool:
     """Check whether *user_id* may perform an action on a session.
 
@@ -39,12 +41,18 @@ def check_session_access(
     :param permission_store: Store for permission lookups.
     :param conversation_store: Store for conversation lookups
         (needed for sub-agent parent delegation).
+    :param conversation: Optional authoritative row already loaded for
+        ``conversation_id``. A mismatched row is rejected rather than used for
+        authorization. Parent delegation still loads the parent normally.
     :returns: ``True`` if access is allowed, ``False`` otherwise.
     """
+    if conversation is not None and conversation.id != conversation_id:
+        return False
+
     if user_id is not None and permission_store.is_admin(user_id):
         return True
 
-    conv = conversation_store.get_conversation(conversation_id)
+    conv = conversation or conversation_store.get_conversation(conversation_id)
     if conv is None:
         return False
 
@@ -79,7 +87,8 @@ def resolved_allows(access: ResolvedAccess, required_level: int) -> bool:
         return True
     if access.user_grant_level is not None and access.user_grant_level >= required_level:
         return True
-    if access.public_grant_level is not None and access.public_grant_level >= required_level:
+    public_level = effective_public_level(access.public_grant_level)
+    if public_level is not None and public_level >= required_level:
         return True
     return False
 
@@ -88,11 +97,8 @@ def resolved_level(access: ResolvedAccess) -> int | None:
     """The effective level for UI display from a resolved-access snapshot.
 
     The in-memory equivalent of :meth:`PermissionStore.get_permission_level`:
-    admin → ``LEVEL_OWNER``; otherwise the user's own grant, falling back to
-    the ``"__public__"`` grant, else ``None``. Note this deliberately prefers
-    the user's own grant over a (possibly higher) public grant, matching the
-    store — so it can differ from :func:`resolved_allows`, which is satisfied
-    by either.
+    admin → ``LEVEL_OWNER``; otherwise the maximum of the direct grant and
+    the capped public grant, or ``None`` if neither grants access.
 
     :param access: The resolved-access snapshot for one ``(user, conv)``.
     :returns: Numeric level (1/2/3/4), or ``None`` when the user has no
@@ -100,9 +106,12 @@ def resolved_level(access: ResolvedAccess) -> int | None:
     """
     if access.is_admin:
         return LEVEL_OWNER
-    if access.user_grant_level is not None:
-        return access.user_grant_level
-    return access.public_grant_level
+    levels = [
+        level
+        for level in (access.user_grant_level, effective_public_level(access.public_grant_level))
+        if level is not None
+    ]
+    return max(levels) if levels else None
 
 
 def check_is_manager(

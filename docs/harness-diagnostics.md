@@ -254,6 +254,87 @@ discovery task exists yet; its cause reaches the session's
 Earlier app-server process-launch failures, resume failures, and errors after a
 thread starts keep their existing logging.
 
+## Native turn failure evidence
+
+Failed `external_session_status` events accept optional `failure_context`
+metadata. The server adds it to the existing `session_turn_failed` log without
+changing status, error codes, displayed text, or failure classification. Unknown
+keys and malformed values are ignored; strings are bounded and credential-redacted.
+The original error category is independent of the text shown to the user.
+
+For example, a Claude `StopFailure` containing `error=server_error` and
+`last_assistant_message="I am waiting for a background task."` now retains
+`native_error_category=server_error` and
+`detail_source=hook_last_assistant_message`. The assistant text alone is not
+evidence of the cause. If the server fills in absent detail from stored assistant
+output, it records `detail_source=assistant_output_fallback`; if it finds no
+output, it records `detail_source=missing`.
+
+| Attributes | Source and meaning |
+| --- | --- |
+| `failure_source`, `detail_source` | Distinguish Claude hooks, explicit transcript API errors, forwarder delivery failures, and legacy external status data |
+| `failure_id` | Stable observation identity across forwarding retries; deduplicate observations by this ID |
+| `native_error_category` | Original hook category, retained even when last-assistant text is also present |
+| `native_error_message` | Bounded, redacted text from an explicit API-error record or formatted API-error payload, before display rewriting |
+| `native_session_id`, `native_agent_id`, `native_agent_role` | Native actor identity when supplied or established by the existing hook suppression rules |
+| `native_hook_event`, `native_hook_cursor`, `native_hook_offset`, `native_hook_recorded_at` | Original hook position and timestamp; not the time of a retry |
+| `runner_version`, `native_cli_version`, `native_model` | Runner package version and, when supplied in the native record, CLI version and model |
+| `native_api_error_message` | The original `isApiErrorMessage` boolean, never inferred from ordinary assistant prose |
+| `http_status`, `provider_error_type`, `provider_error_code`, `provider_error_param` | Structured error fields or an explicitly formatted API-error payload; `inference_detail_source` identifies which |
+| `native_request_id`, `native_error_request_id` | Claude's `requestId` and an unqualified error-body `request_id`, respectively; neither is assumed to be a provider ID |
+| `gateway_request_id`, `provider_request_id` | Only populated when the source explicitly names that ownership |
+| `failure_context_missing_fields` | Comma-separated list of unavailable source fields, including IDs, versions, and inference details |
+
+Claude transcript entries marked `isApiErrorMessage` also produce INFO
+`native_failure_observed` events, correlated by Omnigent session/response ID and
+native record ID. These observations do not publish an additional failed status.
+Transcript observations are logged before delivery so a rejected upload still
+leaves evidence. Each text block has its own `failure_id`; count distinct IDs to
+deduplicate retries of the same block. For transcript-record counts, group by
+session ID and `native_record_id` when available; for affected sessions, count
+distinct session IDs.
+Hook and transcript observations have separate source identities: do not sum
+their counts as failed turns or copy a nearby request ID onto a hook failure.
+The ordinary log-envelope `request_id` may refer to an Omnigent event POST; it
+is not an inference request ID.
+
+Subagent hook failures suppressed by the existing parent-status guard produce
+the same INFO event with `failure_decision=suppressed`, a `suppression_reason`,
+and available native child/parent identity. The parent retains its status.
+Ordinary transcript evidence has `failure_decision=observed`.
+
+Claude hook failures include the most recent completed diagnostic poll's
+metadata: `diagnostic_capture_enabled`, `diagnostic_capture_state`, marker/file
+presence, last successful read time/offset, read-error class, and cumulative
+truncation/omission counts for the launch. States distinguish `disabled`,
+`not_polled`, `missing_marker`, `invalid_marker`, `missing_file`, `read_error`,
+and `ready`. Malformed marker JSON is `read_error`, with
+`diagnostic_read_error_kind=JSONDecodeError`; `invalid_marker` covers decoded
+metadata that fails validation or markers exceeding the size limit.
+`diagnostic_launch_id` matches the `launch_id` on existing bounded
+`harness_diagnostic_output` events, with `diagnostic_read_offset` locating the
+consumed position. This is the collector's current launch, not proof that a
+buffered hook originated in that launch. A snapshot can lag newly written
+diagnostics by one poll; it does not force another file read.
+Presence and capture metadata are separate observations within a poll. Concurrent
+marker replacement can temporarily skew the state until the next poll.
+Disabled capture creates no follower and reads no diagnostic files or markers.
+Absent CLI versions and IDs remain explicit in the missing-fields list; this
+telemetry never runs an extra CLI process to discover them.
+
+To verify without a model call, run:
+
+```sh
+uv run --no-sync pytest -q tests/harnesses/claude_native/forwarder/test_failure_telemetry.py tests/server/routes/test_native_failure_output.py
+```
+
+The synthetic replay checks category preservation with ordinary assistant
+prose, stable identity after a failed POST, explicit API-error metadata, and
+stored-output provenance. After deploying both runner and server, inspect a
+new Claude native failure's `session_turn_failed` attributes for the category,
+detail source, and capture state. Older runners still receive fallback
+provenance from the updated server but cannot supply the new native fields.
+
 ## Claude continuous diagnostics
 
 Both CLI and host-managed native launches add `--debug-file` pointing to a fresh
@@ -317,14 +398,14 @@ or deleted.
 ## Verification
 
 ```sh
-uv run --no-sync pytest -q tests/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
-uv run --no-sync pytest -q tests/test_codex_native_continuous_diagnostics.py tests/test_codex_native_app_server_stderr.py
-uv run --no-sync pytest -q tests/test_codex_native_logging_env.py tests/test_harness_diagnostics.py
+uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
+uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_continuous_diagnostics.py tests/harnesses/codex_native/test_codex_native_app_server_stderr.py
+uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_logging_env.py tests/test_harness_diagnostics.py
 uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_terminal_startup_exit.py
 uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e_ui/chat/test_codex_early_tui_startup_error.py
-uv run --no-sync pytest -q tests/test_claude_native_diagnostics.py tests/test_claude_native_diagnostics_integration.py
+uv run --no-sync pytest -q tests/harnesses/claude_native/test_claude_native_diagnostics.py tests/harnesses/claude_native/test_claude_native_diagnostics_integration.py
 ```
 
 These tests inject a startup timeout and an ended event stream, inspect the

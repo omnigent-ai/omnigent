@@ -30,6 +30,7 @@ from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
 )
+from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import PermissionStore
 
 # Sentinel rows excluded from list_users() — never real, actionable
@@ -519,7 +520,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return True
 
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
+        public_level = effective_public_level(public_grant.level if public_grant else None)
+        if public_level is not None and public_level >= required_level:
             return True
 
         return False
@@ -535,12 +537,16 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if self.is_admin(user_id):
             return LEVEL_OWNER
         grant = self.get(user_id, conversation_id)
-        if grant is not None:
-            return grant.level
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None:
-            return public_grant.level
-        return None
+        levels = [
+            level
+            for level in (
+                grant.level if grant is not None else None,
+                effective_public_level(public_grant.level if public_grant else None),
+            )
+            if level is not None
+        ]
+        return max(levels) if levels else None
 
     def _resolve_cache_lookup(self, conversation_id: str, user_id: str) -> ResolvedAccess | None:
         """Return a live cached resolve_access result, or ``None`` on miss/expiry."""

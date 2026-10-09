@@ -2,8 +2,10 @@ name: Benchmark (PR)
 
 # Runs a lightweight SQLite benchmark when a PR touches migration files or
 # store-layer or project API code and compares against the latest nightly
-# benchmark artifact as a baseline. Posts results as a PR comment and blocks the PR if a
-# regression is detected.
+# benchmark artifact as a baseline. Posts results as a PR comment.
+#
+# Hosted VMs vary ~1.5x in speed, so a regression flagged against the nightly
+# fails the PR only if a same-runner base-vs-PR re-check also flags it.
 #
 # Only runs on PRs to the main repo (not forks without secrets). Skips
 # comparison if no nightly baseline artifact is available — the benchmark still
@@ -24,7 +26,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 env:
   OMNIGENT_SKIP_WEB_UI: "true"
@@ -39,14 +40,37 @@ jobs:
   benchmark-pr:
     name: Benchmark regression check (sqlite)
     if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.draft
+    permissions:
+      contents: read
+      pull-requests: write # posts the results comment
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    outputs:
+      flagged: ${{ steps.compare.outputs.flagged }}
+      journeys: ${{ steps.compare.outputs.journeys }}
+      base_sha: ${{ steps.base.outputs.sha }}
 
     steps:
       - name: Check out repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      # The checkout is the PR's test merge commit; its first parent is the
+      # exact base this candidate was built on (the shallow clone still holds
+      # the raw parent lines). Fall back to the event's base SHA otherwise.
+      - name: Resolve the base commit
+        id: base
+        env:
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          parents="$(git cat-file -p HEAD | awk '/^parent /{print $2}')"
+          if [ "$(printf '%s\n' "$parents" | grep -c .)" -eq 2 ]; then
+            sha="$(printf '%s\n' "$parents" | head -1)"
+          else
+            sha="$EVENT_BASE_SHA"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -137,12 +161,23 @@ jobs:
             --candidate candidate.json \
             --backend sqlite \
             --threshold 1.0 \
-            --output-markdown comparison.md
-          echo "EXIT_CODE=$?" >> "$GITHUB_ENV"
+            --output-markdown comparison.md \
+            --output-json comparison.json
+          RC=$?
+          if [ "$RC" -gt 1 ]; then
+            echo "::error::Benchmark comparison failed with exit code ${RC}."
+            exit "$RC"
+          fi
+          echo "EXIT_CODE=${RC}" >> "$GITHUB_ENV"
+          echo "flagged=$([ "$RC" -eq 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          # The re-check must re-measure exactly these.
+          journeys="$(jq -r '[.rows[] | select(.status == "regression" or .status == "failed") | .journey] | join(",")' comparison.json)"
+          echo "journeys=${journeys}" >> "$GITHUB_OUTPUT"
 
       - name: Build PR comment body
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           {
             echo "<!-- benchmark-pr-comment -->"
@@ -150,7 +185,13 @@ jobs:
             echo ""
             echo "Commit: \`${{ github.event.pull_request.head.sha }}\`"
             echo ""
-            if [ "$BASELINE_FOUND" = "true" ]; then
+            if [ "$BASELINE_FOUND" = "true" ] && [ "$EXIT_CODE" = "1" ]; then
+              echo "**Re-checking on one runner.** The comparison against the latest nightly flagged a regression, but the nightly ran on a different VM. The base commit \`${BASE_SHA:0:12}\` and this PR are now running side by side on one runner; this comment will be updated with the verdict."
+              echo ""
+              cat comparison.md
+            elif [ "$BASELINE_FOUND" = "true" ]; then
+              echo "**Verdict: PASS**, decided by the comparison against the latest nightly (different VM)."
+              echo ""
               cat comparison.md
             else
               echo "No nightly baseline artifact found — comparison skipped."
@@ -189,8 +230,122 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Fail on regression
-        if: env.BASELINE_FOUND == 'true' && env.EXIT_CODE == '1'
+      - name: Upload nightly comparison for the verdict
+        if: steps.compare.outputs.flagged == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-pr-nightly-comparison-${{ github.run_id }}
+          path: |
+            comparison.md
+            comparison.json
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+  # Only when the nightly comparison flagged a regression: run this PR's base
+  # commit and the PR concurrently on one runner, so VM speed cancels out.
+  confirm:
+    needs: [benchmark-pr]
+    if: needs.benchmark-pr.outputs.flagged == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/benchmark-release.yml
+    with:
+      candidate_ref: ${{ github.sha }}
+      baseline_ref: ${{ needs.benchmark-pr.outputs.base_sha }}
+      require_journeys: ${{ needs.benchmark-pr.outputs.journeys }}
+
+  verdict:
+    name: Benchmark regression verdict (same runner)
+    needs: [benchmark-pr, confirm]
+    if: ${{ !cancelled() && needs.benchmark-pr.outputs.flagged == 'true' }}
+    permissions:
+      pull-requests: write # updates the results comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # A missing artifact must still end in a posted verdict, not a stale comment.
+      - name: Download comparisons
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "{benchmark-pr-nightly-comparison,benchmark-release}-${{ github.run_id }}"
+          path: artifacts
+
+      - name: Decide and update the PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ needs.benchmark-pr.outputs.base_sha }}
+          CONFIRM_RESULT: ${{ needs.confirm.result }}
+          CONFIRMED: ${{ needs.confirm.outputs.regression }}
+          COMPLETE: ${{ needs.confirm.outputs.complete }}
+          UNMEASURED: ${{ needs.confirm.outputs.unmeasured }}
+          FLAGGED: ${{ needs.benchmark-pr.outputs.journeys }}
         run: |
-          echo "Benchmark regression detected. See the PR comment for details."
-          exit 1
+          set -euo pipefail
+          same_runner="artifacts/benchmark-release-${GITHUB_RUN_ID}/comparison.md"
+          nightly="artifacts/benchmark-pr-nightly-comparison-${GITHUB_RUN_ID}/comparison.md"
+          base="\`${BASE_SHA:0:12}\`"
+          flagged="\`${FLAGGED//,/\`, \`}\`"
+          decided=""
+          if [ "$CONFIRM_RESULT" = "success" ] && [ "$CONFIRMED" = "true" ]; then
+            verdict="FAIL"
+            decided=" (decided the verdict)"
+            why="Confirmed: the base commit ${base} and this PR ran on one runner, and that comparison also flags a regression."
+          elif [ "$CONFIRM_RESULT" = "success" ] && [ "$COMPLETE" = "true" ] && [ -f "$same_runner" ]; then
+            verdict="PASS"
+            decided=" (decided the verdict)"
+            why="The comparison against the latest nightly flagged ${flagged}, but the base commit ${base} and this PR ran on one runner, both measured every flagged journey, and that comparison did not reproduce the regression. The same-runner comparison decided."
+          elif [ "$CONFIRM_RESULT" = "success" ]; then
+            verdict="FAIL"
+            if [ -n "$UNMEASURED" ]; then
+              gap="did not measure \`${UNMEASURED//,/\`, \`}\` on both sides"
+            else
+              gap="left no comparison report"
+            fi
+            why="The comparison against the latest nightly flagged ${flagged}, and the same-runner re-check against ${base} ${gap}, so the nightly result stands."
+          else
+            verdict="FAIL"
+            why="The comparison against the latest nightly flagged a regression, and the same-runner re-check against ${base} did not complete (${CONFIRM_RESULT}), so the nightly result stands."
+          fi
+          {
+            echo "<!-- benchmark-pr-comment -->"
+            echo "## Benchmark results (SQLite, PR #${PR_NUMBER})"
+            echo ""
+            echo "Commit: \`${HEAD_SHA}\`"
+            echo ""
+            echo "**Verdict: ${verdict}.** ${why}"
+            echo ""
+            if [ -f "$same_runner" ]; then
+              echo "### Same-runner comparison: base ${base} vs this PR${decided}"
+              echo ""
+              sed '1{/^## /d;}' "$same_runner"
+              echo ""
+            fi
+            if [ -f "$nightly" ]; then
+              echo "<details><summary>Comparison against the latest nightly (different VM)</summary>"
+              echo ""
+              sed '1{/^## /d;}' "$nightly"
+              echo ""
+              echo "</details>"
+            fi
+          } > comment_body.md
+          cat comment_body.md >> "$GITHUB_STEP_SUMMARY"
+          # Fork PRs have a read-only token; the comment may fail, the verdict still applies.
+          marker="<!-- benchmark-pr-comment -->"
+          comment_id="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | startswith(\"${marker}\")) | .id" | head -1)" || comment_id=""
+          if [ -n "$comment_id" ]; then
+            gh api "repos/${REPO}/issues/comments/${comment_id}" -X PATCH \
+              -f body="$(cat comment_body.md)" >/dev/null || echo "::warning::Could not update the PR comment."
+          else
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file comment_body.md \
+              || echo "::warning::Could not post the PR comment."
+          fi
+          if [ "$verdict" = "FAIL" ]; then
+            echo "::error::Benchmark regression detected. See the PR comment for details."
+            exit 1
+          fi

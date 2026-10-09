@@ -45,6 +45,7 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -55,6 +56,7 @@ import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/native
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import type { CodexPersistMode, RememberScope } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
@@ -64,6 +66,10 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+
+const AUTO_RESOLVED_DETAIL =
+  "This request was answered outside this view, for example in the " +
+  "agent's own terminal, another tab, or the approve page.";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -183,6 +189,8 @@ interface ApprovalCardProps {
    * sessions other than the chat store's active one.
    */
   onSubmit?: SubmitApprovalFn;
+  /** Extra classes for the card container, e.g. to drop its border when embedded. */
+  className?: string;
 }
 
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
@@ -205,6 +213,7 @@ export function ApprovalCard({
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
+  className,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
@@ -500,13 +509,17 @@ export function ApprovalCard({
       icon = <ClockIcon className="size-4 text-muted-foreground" />;
       label = "Prompt expired";
     } else if (autoResolved) {
-      // Card was cleared by the chat store when the gated tool's
-      // function_call_output arrived without a UI verdict —
-      // typically because the user approved (or denied) via Claude
-      // Code's TUI prompt directly. We can't know the actual
-      // verdict, so render a neutral pill rather than implying an
-      // accept/reject decision the UI never witnessed.
-      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      // Verdict unknown here; explain the neutral pill.
+      icon = (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={0} className="inline-flex" aria-label={AUTO_RESOLVED_DETAIL}>
+              <InfoIcon className="size-4 text-muted-foreground" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-72">{AUTO_RESOLVED_DETAIL}</TooltipContent>
+        </Tooltip>
+      );
       label = "Resolved elsewhere";
     } else if (response.action === "cancel") {
       // Dismissed without deciding — neither approved nor rejected.
@@ -561,7 +574,7 @@ export function ApprovalCard({
       <Alert
         data-testid="approval-card"
         data-state="responded"
-        className="flex flex-col gap-1 border-muted"
+        className={cn("flex flex-col gap-1 border-muted", className)}
       >
         <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
@@ -621,7 +634,7 @@ export function ApprovalCard({
     <Alert
       data-testid="approval-card"
       data-state="pending"
-      className="flex flex-col gap-2 py-3 px-4"
+      className={cn("flex flex-col gap-2 py-3 px-4", className)}
     >
       <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval ? (
