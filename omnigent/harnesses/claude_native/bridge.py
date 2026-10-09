@@ -1399,14 +1399,12 @@ def ensure_secure_dir(target: Path) -> None:
 
 
 def ensure_private_dir(path: Path, my_uid: int | None) -> None:
-    """Public alias for :func:`_ensure_private_dir`.
-
-    The claude-sdk executor grants the Claude CLI's per-uid runtime dirs under
-    shared temp roots and needs the same single-directory hardening.
+    """Create ``path`` as a 0o700 directory, or validate an existing one.
 
     :param path: Directory that must be owner-only.
     :param my_uid: Current uid, or ``None`` where POSIX ownership does not apply.
-    :raises RuntimeError: If ``path`` is a symlink, a non-directory, or foreign-owned.
+    :raises RuntimeError: If ``path`` is a symlink, a non-directory, or owned by
+        another uid.
     """
     _ensure_private_dir(path, my_uid)
 

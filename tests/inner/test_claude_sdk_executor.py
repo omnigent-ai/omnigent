@@ -468,7 +468,7 @@ class TestConstructor(unittest.TestCase):
         self.assertEqual(executor._cli_path, "/tmp/omnigent-claude-wrapper")
         self.assertEqual(executor._cwd, "/tmp/work")
 
-    def test_prepare_claude_cli_path_adds_internal_roots_to_read_allowlist(self):
+    def test_prepare_claude_cli_path_adds_internal_roots_to_read_and_write_allowlists(self):
         from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
         from omnigent.inner.sandbox import SandboxPolicy
@@ -525,6 +525,7 @@ class TestConstructor(unittest.TestCase):
         # across platforms.
         expected = Path("/home/test/.claude/sessions").resolve(strict=False)
         self.assertIn(expected, captured["sandbox"].read_roots)
+        self.assertIn(expected, captured["sandbox"].write_roots)
 
     def test_default_process_sandbox_wraps_cli_without_enabling_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor

@@ -31,6 +31,7 @@ no platform branching inside the tests themselves.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import shutil
 import subprocess
@@ -47,6 +48,7 @@ _BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 _SANDBOX_EXEC_AVAILABLE = shutil.which("sandbox-exec") is not None
 
 
+@functools.lru_cache(maxsize=1)
 def _bwrap_functional() -> bool:
     """Whether bwrap can actually create a namespace on this host.
 

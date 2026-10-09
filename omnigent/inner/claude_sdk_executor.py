@@ -1295,9 +1295,7 @@ def _parse_optional_int(value: str | None) -> int | None:
         return None
 
 
-# Reported Claude CLI builds opened /tmp/claude-<uid> regardless of $TMPDIR (the
-# denied path in the macOS launch failure); current builds use $CLAUDE_CODE_TMPDIR
-# or os.tmpdir(), so both spellings are granted.
+# Claude CLI versions use either the system temp root or fixed /tmp, so grant both.
 _CLAUDE_CLI_TMP_ROOT = pathlib.Path("/tmp")
 
 
@@ -1307,7 +1305,8 @@ def _claude_runtime_dirs() -> list[pathlib.Path]:
     Both live under shared temp roots, so a pre-existing leaf is granted only
     when it is a real directory owned by this user. A planted symlink or
     foreign directory is skipped with a warning instead of widening the sandbox
-    to wherever it points.
+    to wherever it points. Under bwrap each granted dir is bound over the
+    private /tmp, so both stay host-backed like the tempdir one always has.
     """
     from omnigent.harnesses.claude_native.bridge import ensure_private_dir
 
@@ -1441,8 +1440,9 @@ def prepare_claude_cli_path(
         # whole native-tool process tree inside a network-denying sandbox.
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
 
-    sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+    internal_roots = _claude_internal_write_roots()
+    sandbox = with_additional_read_roots(sandbox, internal_roots)
+    sandbox = with_additional_write_roots(sandbox, internal_roots)
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
     # Dry-run the spawn-time wrap now, while degrading is still possible.
     # The real wrap happens later inside run_launcher, where an OSError
