@@ -6,10 +6,12 @@ from collections.abc import Callable
 from typing import Any, Literal, overload
 
 import httpx
+from pydantic import ValidationError
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.server.schemas import UsageReport
 
-from ._errors import OmnigentError
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._files import FilesNamespace
 from ._http import is_loopback_url
 from ._query import QueryResult, QueryStream
@@ -96,7 +98,9 @@ class OmnigentClient:
 
     For access to raw events or semantic blocks (tool-call display,
     reasoning, lifecycle), drop to :attr:`responses` or
-    :class:`BlockStream`.
+    :class:`BlockStream`. Server-level reads that are not tied to one
+    session — :meth:`info`, :meth:`usage`, :meth:`list_hosts` — live on
+    the client itself.
 
     :param base_url: Server base URL, e.g. ``"http://localhost:8080"``.
     :param headers: Extra headers sent on every request (e.g. auth).
@@ -322,6 +326,71 @@ class OmnigentClient:
             agent_tools_getter=self._fetch_agent_tools,
             hooks=hooks,
         )
+
+    async def info(self) -> dict[str, Any]:
+        """Fetch the server's version and capability report.
+
+        Calls ``GET /v1/info`` (served without authentication) and
+        returns the raw ``ServerInfoResponse`` JSON, e.g.
+        ``info["server_version"]`` for a version check or
+        ``info["accounts_enabled"]`` to learn whether login is required.
+        Returned as a dict because the report is the server's own
+        feature inventory and grows with each release.
+
+        :returns: The ``/v1/info`` body.
+        :raises OmnigentError: On non-2xx status or a non-JSON body.
+        """
+        resp = await self._http.get(f"{self._base_url}/v1/info")
+        raise_for_status(resp.status_code, response_body(resp))
+        return require_json_object(resp, "GET /v1/info")
+
+    async def usage(self) -> UsageReport:
+        """Fetch the calling user's aggregated LLM spend.
+
+        Calls ``GET /v1/usage`` and validates the body into
+        :class:`omnigent.server.schemas.UsageReport`: UTC calendar-day
+        windows (``cost_today``, ``cost_last_7d``, ``cost_last_30d``),
+        the all-time ``total_cost_usd``, the ``daily_costs`` timeline,
+        and per-session ``sessions`` detail.
+
+        :returns: The typed usage report.
+        :raises OmnigentError: On non-2xx status (401 when the server
+            requires authentication and the client sent none), or when
+            a 2xx body does not match the ``UsageReport`` schema.
+        """
+        resp = await self._http.get(f"{self._base_url}/v1/usage")
+        raise_for_status(resp.status_code, response_body(resp))
+        body = require_json_object(resp, "GET /v1/usage")
+        try:
+            return UsageReport.model_validate(body)
+        except ValidationError as exc:
+            raise OmnigentError(
+                f"GET /v1/usage returned an unexpected body "
+                f"({exc.error_count()} validation error(s))",
+                resp.status_code,
+            ) from exc
+
+    async def list_hosts(self) -> list[dict[str, Any]]:
+        """List the hosts owned by the calling user.
+
+        Calls ``GET /v1/hosts`` and returns its ``hosts`` array: one
+        dict per host with ``host_id``, ``name``, ``owner``, ``status``
+        (``"online"`` or ``"offline"``), ``sandbox_provider``,
+        ``configured_harnesses``, and ``gateway_inference``. Lets a
+        client choose a launch target through the public API.
+
+        :returns: Host dicts, empty when the user owns no hosts.
+        :raises OmnigentError: On non-2xx status, or when a 2xx body
+            lacks a well-formed ``hosts`` array.
+        """
+        resp = await self._http.get(f"{self._base_url}/v1/hosts")
+        raise_for_status(resp.status_code, response_body(resp))
+        hosts = require_json_object(resp, "GET /v1/hosts").get("hosts")
+        if not isinstance(hosts, list) or not all(isinstance(host, dict) for host in hosts):
+            raise OmnigentError(
+                "GET /v1/hosts returned a malformed 'hosts' array", resp.status_code
+            )
+        return hosts
 
     async def _fetch_agent_tools(
         self, agent_id: str, session_id: str | None = None
