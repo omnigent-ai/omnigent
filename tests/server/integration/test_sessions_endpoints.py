@@ -7294,6 +7294,7 @@ async def test_accumulate_session_usage_unpriced_model_has_tokens_no_cost(
 async def test_accumulate_session_usage_deleted_session_returns_none(
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A session deleted mid-stream is dropped, not raised, from the relay loop.
 
@@ -7303,6 +7304,10 @@ async def test_accumulate_session_usage_deleted_session_returns_none(
     """
     from omnigent.server.routes import sessions as sessions_routes
 
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,
+    )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     store = SqlAlchemyConversationStore(db_uri)

@@ -43,7 +43,6 @@ user-invisible data-loss shapes themselves.
 
 from __future__ import annotations
 
-import contextlib
 import uuid
 from pathlib import Path
 from typing import Any
@@ -52,6 +51,7 @@ import pytest
 from sqlalchemy import select
 
 from omnigent.db.db_models import SqlConversationLabel
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.policies.builder import build_policy_engine
 from omnigent.spec.parser import parse
 from omnigent.spec.types import AgentSpec, StateUpdate, StateUpdateAction
@@ -269,14 +269,15 @@ async def test_label_seeding_absent_row_leaves_no_orphans(
     assert await store.delete_conversation(deleted_id)
     assert store.get_conversation(deleted_id) is None
 
-    # Refusing to build for a deleted conversation is acceptable fixed
-    # behaviour; the invariant below must hold either way.
-    with contextlib.suppress(Exception):
+    # Building for a deleted conversation fails closed with a CONFLICT
+    # OmnigentError; the orphan-free invariant below must hold on that path.
+    with pytest.raises(OmnigentError) as seed_error:
         build_policy_engine(
             spec=seeded_spec,
             conversation_id=deleted_id,
             conversation_store=store,
         )
+    assert seed_error.value.code == ErrorCode.CONFLICT
 
     with store._conv_session("test_orphan_label_check") as session:
         orphans = (

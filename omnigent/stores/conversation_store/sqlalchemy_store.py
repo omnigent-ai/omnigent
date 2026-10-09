@@ -618,6 +618,11 @@ def _insert_labels_if_absent(
                 session.add(SqlConversationLabel(**row))
         except IntegrityError:
             # Another writer inserted this key first — that value wins.
+            _logger.debug(
+                "seed_labels_if_absent: skipped existing label key %r for %s",
+                row["key"],
+                conversation_id,
+            )
             continue
 
 
@@ -1568,12 +1573,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: The conversation to seed,
             e.g. ``"conv_abc123"``.
         :param defaults: ``key -> initial value``. Empty skips the write
-            and just returns the current snapshot — including for a
-            conversation that does not exist: with nothing to insert,
-            there is nothing that needs the existence check below.
+            and reads the current labels on a read-only session, without
+            an existence check — normally ``{}`` for a conversation that
+            does not exist, though pre-existing orphan rows read back
+            unchanged.
         :param updated_at: Timestamp for inserted rows (``None`` → now).
-        :returns: The conversation's labels after seeding, or ``{}`` when
-            *defaults* is empty and the conversation does not exist.
+        :returns: The conversation's labels after seeding. When *defaults*
+            is empty this is the current stored labels, read without an
+            existence check (see above).
         :raises ConversationNotFoundError: When *defaults* is non-empty and
             the conversation does not exist. Labels are not foreign-keyed,
             so an unchecked insert leaves orphan rows behind for a
@@ -1588,21 +1595,26 @@ class SqlAlchemyConversationStore(ConversationStore):
         stamp = updated_at if updated_at is not None else now_epoch()
         stable_defaults = dict(defaults)
 
+        if not stable_defaults:
+            # No insert to make, so take no write lock: read the current
+            # labels on a read-only session, without an existence check.
+            with self._conv_session("seed_labels_if_absent") as session:
+                return _fetch_labels(session, conversation_id)
+
         def write(session: Session) -> dict[str, str]:
-            if stable_defaults:
-                # Same-transaction, unlocked check: narrows (does not close)
-                # the race against a concurrent delete of this row.
-                exists = session.execute(
-                    select(SqlConversation.id).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id == conversation_id,
-                    )
-                ).first()
-                if exists is None:
-                    raise ConversationNotFoundError(
-                        f"Cannot seed labels for {conversation_id!r}: no conversation row exists."
-                    )
-                _insert_labels_if_absent(session, conversation_id, stable_defaults, stamp)
+            # Same-transaction, unlocked check: narrows (does not close)
+            # the race against a concurrent delete of this row.
+            exists = session.execute(
+                select(SqlConversation.id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+            ).first()
+            if exists is None:
+                raise ConversationNotFoundError(
+                    f"Cannot seed labels for {conversation_id!r}: no conversation row exists."
+                )
+            _insert_labels_if_absent(session, conversation_id, stable_defaults, stamp)
             return _fetch_labels(session, conversation_id)
 
         return run_write_transaction(self._conv_session_immediate, "seed_labels_if_absent", write)
@@ -1695,11 +1707,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         requires to carry a string literal) at the public call sites rather
         than inside this helper.
 
-        The single row-missing contract for every read-modify-write primitive
-        on this table: no row means nothing can be persisted, so raise rather
-        than return a merged dict the database does not hold. Each caller used
-        to carry its own copy of this loop, and a fix applied to one of them
-        left the other reporting phantom writes.
+        Centralizes the locked read-merge-write and the single row-missing
+        contract for every such primitive on this table: no row means nothing
+        can be persisted, so raise rather than return a merged dict the
+        database does not hold.
 
         Locking is dialect-complementary: ``SELECT … FOR UPDATE`` where
         supported, and ``BEGIN IMMEDIATE`` on SQLite (via the immediate

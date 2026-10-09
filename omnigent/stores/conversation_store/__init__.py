@@ -327,17 +327,9 @@ class ConversationNotFoundError(Exception):
     """
     Raised when a store method needed a conversation row that isn't there.
 
-    What the CALLER does with it varies by call site, deliberately: a route
-    handler resolving a conversation the user named should surface this as a
-    typed 404, since the caller asked about a specific id and got a genuine
-    answer of "no such thing". A best-effort write on a background path —
-    accumulating usage on a relay completion, mirroring a cost-ask
-    checkpoint to a tree root — instead catches it and treats it as a no-op:
-    the session vanished mid-turn, there is nothing left to record, and
-    failing the turn over a write that can no longer land would be worse
-    than silently dropping it. The exception's meaning ("this write did not
-    happen") doesn't change; whether that is 404-worthy is a decision each
-    caller makes for itself.
+    The meaning is fixed — the write did not happen because the row was
+    gone. Whether that is a typed 404 or a silently dropped best-effort
+    write is a decision each call site makes for itself.
     """
 
 
@@ -1124,14 +1116,15 @@ class ConversationStore(ABC):
         :param conversation_id: The conversation to seed,
             e.g. ``"conv_abc123"``.
         :param defaults: ``key -> initial value`` for declared labels.
-            Empty performs no write and just returns the snapshot — INCLUDING
-            for a conversation that does not exist, since there is nothing to
-            insert and therefore nothing that needs an existence check.
+            Empty performs no write and returns the current label snapshot
+            without an existence check — normally ``{}`` for a conversation
+            that does not exist, though any pre-existing orphan rows are
+            returned unchanged.
         :param updated_at: Timestamp for inserted rows; ``None`` uses the
             current wall-clock.
-        :returns: The conversation's full label snapshot after seeding, or
-            ``{}`` when *defaults* is empty and the conversation does not
-            exist (see above).
+        :returns: The conversation's full label snapshot after seeding. When
+            *defaults* is empty this is the current stored labels, without an
+            existence check (see above).
         :raises ConversationNotFoundError: When *defaults* is non-empty and
             the conversation does not exist. Implementations must check
             existence in the same transaction as the insert whenever they

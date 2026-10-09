@@ -612,11 +612,9 @@ class PolicyEngine:
                 )
                 merged = dict(self._session_state)
                 _merge(merged)
-            # ``merged`` is authoritative for the keys it holds; a key this
-            # batch deleted stays gone. Any other key missing from ``merged`` is
-            # kept from the old cache: constructor-seeded/root-routed values
-            # never in this row, and (known limitation) a key a concurrent
-            # writer deleted this turn, held until the next build rereads.
+            # ``merged`` wins for its keys; keys this batch deleted stay gone.
+            # Other cache-only keys are preserved (constructor-seeded values;
+            # concurrently deleted keys linger until the next build rereads).
             preserved = {
                 key: value
                 for key, value in self._session_state.items()

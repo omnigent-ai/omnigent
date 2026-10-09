@@ -7276,8 +7276,7 @@ def test_read_modify_write_primitives_report_a_missing_row(
             missing, {"total_tokens": 10}
         ),
         # Labels are not foreign-keyed, so an unchecked insert here leaves
-        # orphan rows rather than failing — the same phantom write, on the
-        # write path that was missed the first time.
+        # orphan rows rather than failing — the same phantom write.
         "labels": lambda: conversation_store.seed_labels_if_absent(missing, {"risk": "seed"}),
     }
     for what, write in writers.items():
@@ -7292,6 +7291,26 @@ def test_read_modify_write_primitives_report_a_missing_row(
             select(SqlConversationLabel.key).where(SqlConversationLabel.conversation_id == missing)
         ).all()
     assert orphans == [], f"orphan label rows left behind: {orphans}"
+
+
+def test_seed_labels_if_absent_empty_defaults_reads_without_writing(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Empty defaults read back the current labels and never raise.
+
+    With nothing to insert the call takes no write lock and skips the
+    existence check: an existing conversation returns its stored labels,
+    and a conversation that is gone returns ``{}`` rather than the
+    ConversationNotFoundError the non-empty seed raises for a missing row.
+    """
+    conv = conversation_store.create_conversation(title="seed-empty")
+    conversation_store.seed_labels_if_absent(conv.id, {"risk": "low"})
+
+    assert conversation_store.seed_labels_if_absent(conv.id, {}) == {"risk": "low"}
+
+    missing = "0" * 32
+    assert conversation_store.get_conversation(missing) is None
+    assert conversation_store.seed_labels_if_absent(missing, {}) == {}
 
 
 def test_two_real_writers_race_on_one_metadata_row(
@@ -7321,7 +7340,7 @@ def test_two_real_writers_race_on_one_metadata_row(
     # Both threads try to meet here from inside their transactions. When the
     # store serialises correctly only one can arrive, so the wait must expire
     # rather than block forever.
-    barrier = threading.Barrier(2, timeout=0.5)
+    barrier = threading.Barrier(2, timeout=5.0)
     errors: list[BaseException] = []
 
     def _increment() -> None:
@@ -7341,6 +7360,9 @@ def test_two_real_writers_race_on_one_metadata_row(
     for thread in threads:
         thread.join(timeout=30)
 
+    assert not any(thread.is_alive() for thread in threads), (
+        "a racing writer never finished — the timed join expired"
+    )
     assert not errors, errors
     persisted = dict(conversation_store.get_conversation(conv.id).session_state)
     assert persisted["risk"] == 2, (
