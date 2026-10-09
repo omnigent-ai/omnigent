@@ -161,6 +161,7 @@ export function CanvasWorkspace({
             } as CSSProperties
           }
         >
+          {/* Match the chat header's native safe-area offset for the mobile menu. */}
           {onOpenSidebar && (
             <div className="chat-header pointer-events-none absolute inset-x-0 top-0 z-30 flex h-14 items-center px-2 md:hidden">
               <Button

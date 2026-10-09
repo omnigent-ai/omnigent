@@ -583,6 +583,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
         paddingBottom: "var(--omnigent-inset-bottom)",
       }}
     >
+      {/* Keep the mobile menu's space reserved while the sidebar overlays it. */}
       <header className="flex items-start justify-between gap-4 px-6 pt-5 max-md:pt-3 max-md:pl-16">
         <div>
           <h1 className="text-2xl font-semibold">Canvas</h1>

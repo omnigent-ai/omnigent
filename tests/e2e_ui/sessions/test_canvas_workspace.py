@@ -275,7 +275,7 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     expect(page.get_by_label("Message the agent", exact=True)).to_be_visible()
     expect(page.get_by_role("region", name="Canvas pane", exact=True)).not_to_be_visible()
     page.get_by_role("button", name="Back to canvas", exact=True).click()
-    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={project_id}$"))
+    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={re.escape(project_id)}$"))
     expect(page.get_by_role("tab", name=re.compile("Canvas review"))).to_have_attribute(
         "aria-selected", "true"
     )
@@ -305,9 +305,10 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
         assert conversation_bounds[key] == pytest.approx(ordinary_bounds[key], abs=1)
     menu.click()
     page.get_by_test_id("canvas-nav").click()
-    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={project_id}$"))
+    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={re.escape(project_id)}$"))
     expect(menu).to_be_visible()
     first_card.click()
+    expect(page.get_by_role("button", name="Back to canvas", exact=True)).to_be_visible()
     page.reload()
     page.get_by_role("button", name="Back to canvas", exact=True).click()
     expect(page.get_by_role("tab", name=re.compile("Canvas review"))).to_have_attribute(
