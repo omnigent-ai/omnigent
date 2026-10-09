@@ -13,6 +13,8 @@ equivalents:
   all of its descendants, using the process-group fast path on POSIX and
   :mod:`psutil` walking on every platform.
 * :func:`process_alive` — liveness check that doesn't rely on ``os.kill(pid, 0)``.
+* :func:`run_isolated` — ``subprocess.run`` built on the above, so a timeout
+  kills the child's whole tree instead of only the direct child.
 
 :mod:`psutil` is already a core dependency, so the descendant walk needs no new
 package.
@@ -26,8 +28,9 @@ import signal
 import subprocess
 import time
 import weakref
+from collections.abc import Sequence
 from contextlib import suppress
-from typing import Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 import psutil  # type: ignore[import-untyped]
 
@@ -90,6 +93,7 @@ _owned_process_identities: weakref.WeakKeyDictionary[object, dict[int, float]] =
 )
 _CENSUS_MAX_ITERATIONS = 3
 _CENSUS_MAX_SECONDS = 0.05
+_RUN_ISOLATED_REAP_TIMEOUT_S = 2.0
 
 
 class SpawnKwargs(TypedDict, total=False):
@@ -403,6 +407,79 @@ def kill_tree(process: _ProcessLike | None) -> None:
     if not group_signaled and not identities:
         with suppress(Exception):
             process.kill()
+
+
+def _kill_surviving_leader(process: subprocess.Popen[Any]) -> None:
+    # If the leader outlived group teardown (a denied killpg, or a kill still
+    # pending), end it directly so Popen.__exit__'s unbounded wait() can't hang.
+    if process.poll() is None:
+        with suppress(Exception):
+            process.kill()
+
+
+def run_isolated(
+    args: Sequence[str],
+    *,
+    timeout: float | None = None,
+    capture_output: bool = False,
+    **popen_kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    """
+    Run ``args`` to completion like :func:`subprocess.run`, tearing down its
+    process group and discoverable descendants on timeout.
+
+    ``subprocess.run(timeout=...)`` kills only its direct child, so anything that
+    child spawned (an updater, a ``git fetch``) survives the timeout and is
+    re-parented to this process or to init. Here the child starts in its own
+    session/process group (:func:`spawn_kwargs`) and a timeout runs
+    :func:`kill_tree` over it before re-raising :class:`subprocess.TimeoutExpired`.
+
+    :param args: The argv to execute, e.g. ``["claude", "--version"]``.
+    :param timeout: Seconds to wait before killing the tree; ``None`` waits forever.
+    :param capture_output: Capture stdout and stderr, as in :func:`subprocess.run`.
+    :param popen_kwargs: Remaining :class:`subprocess.Popen` keyword arguments
+        (``stdin``, ``text``, ``env``, ...).
+    :returns: The completed process; a non-zero exit is returned, not raised.
+    :raises ValueError: For ``capture_output`` conflicts or kwargs this helper owns.
+    :raises subprocess.TimeoutExpired: After the tree has been killed.
+    :raises OSError: When the child cannot be started.
+    """
+    if capture_output:
+        if popen_kwargs.get("stdout") is not None or popen_kwargs.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not be used with capture_output.")
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+    isolation = spawn_kwargs()
+    conflicts = popen_kwargs.keys() & isolation.keys()
+    if conflicts:
+        raise ValueError(f"run_isolated manages process isolation; remove {sorted(conflicts)}")
+    with subprocess.Popen(args, **popen_kwargs, **isolation) as process:
+        remember_process_group(process)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                kill_tree(process)
+            finally:
+                # Run teardown even if kill_tree raised: reap the leader without
+                # blocking on a surviving descendant holding the pipes, then end
+                # the leader directly so Popen.__exit__'s wait() cannot hang.
+                with suppress(Exception):
+                    reaped: tuple[Any, Any] = process.communicate(
+                        timeout=_RUN_ISOLATED_REAP_TIMEOUT_S
+                    )
+                    exc.stdout, exc.stderr = reaped
+                _kill_surviving_leader(process)
+            raise
+        except BaseException:
+            try:
+                kill_tree(process)
+            finally:
+                with suppress(Exception):
+                    process.communicate(timeout=_RUN_ISOLATED_REAP_TIMEOUT_S)
+                _kill_surviving_leader(process)
+            raise
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 
 def _wait_gone(pid: int, timeout: float) -> None:

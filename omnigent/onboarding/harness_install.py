@@ -56,6 +56,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.inner._proc import run_isolated
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -981,13 +982,12 @@ def _harness_cli_version_string(
         if cached is not None:
             return cached
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             [binary, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
-            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1183,9 +1183,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             return True
     argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
-        result = subprocess.run(
+        result = run_isolated(
             [argv_binary, *spec.status_args],
-            check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,
