@@ -92,7 +92,8 @@ you remove them.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
-cards. Drag the divider to resize, or focus it and use Left/Right arrows to
+cards. Choosing Canvas in either navigation state returns to the selected board.
+Drag the divider to resize, or focus it and use Left/Right arrows to
 adjust the split and Home/End to reach its limits. Double-click the divider to
 restore the default split. Focus the session to use the full area; Escape
 restores the board. Close the session to return to the board. Opening, closing,
@@ -103,7 +104,8 @@ opens the same layout directly. If a session is replaced, for example after `/cl
 its replacement stays beside the same board.
 The plus button starts a new session in the selected canvas. After sending,
 the new session opens beside that board; on narrow screens, Back to canvas
-returns to it. The collapsed sidebar keeps its expand button first, followed by
+returns to it. Reloading a temporary session before creation finishes returns to
+the same board. The collapsed sidebar keeps its expand button first, followed by
 Search, Settings, and the same primary destinations as the expanded sidebar.
 Open a Canvas session outside the loaded sidebar pages to see its current host
 status and live session updates, including when the app is embedded.
@@ -384,6 +386,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
 - **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_rail_matches_expanded_navigation`.
+  The journey compares destinations and clicks Canvas with a project selected,
+  then reloads to confirm the selected project remains remembered.
   `web/src/extensions/ExtensionPrimaryNavigation.test.tsx` verifies compact
   extension links retain accessible labels and work when activated.
 - **`canvas-create` (Main/project plus button, desktop/mobile):**
@@ -392,6 +396,10 @@ plain `uv run pytest`, which starts a private server for the test.
   runner, and the mock-backed first reply use the real server. Temporary-id
   replacement, server-first creation, feature gating, and failed-create draft
   recovery also run in `web/src/shell/NewChatDialog.flow.test.tsx`.
+  Stale temporary routes return to their board in
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_canvas_creation_url_returns_to_its_board`;
+  ordinary sessions still return to the new-session page in
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 
 ## Gotchas
 

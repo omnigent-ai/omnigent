@@ -19,16 +19,20 @@ from tests.e2e_ui.sessions.test_canvas_workspace import canvas_project as canvas
 
 @pytest.mark.parametrize("usage", [False, True])
 def test_canvas_rail_matches_expanded_navigation(
-    page: Page, live_server: str, usage: bool
+    page: Page, canvas_project: tuple[str, str, str, str], usage: bool
 ) -> None:
+    base_url, _first, _second, project_id = canvas_project
     page.set_viewport_size({"width": 1440, "height": 900})
     _stub_server_info(page, canvas=True, usage=usage)
-    page.goto(f"{live_server}/canvas")
+    page.goto(f"{base_url}/canvas")
+    project = page.get_by_role("tab", name=re.compile("Canvas review"))
+    project.click()
     rail = page.get_by_role("navigation", name="Collapsed sidebar")
     expect(rail).to_be_visible()
     collapsed = rail.locator("button, a").evaluate_all(
         "elements => elements.map(element => ({"
         "label: element.getAttribute('aria-label') || element.textContent.trim(),"
+        "href: element.getAttribute('href'),"
         "icon: element.querySelector('svg')?.innerHTML}))"
     )
     rail.get_by_role("button", name="Expand sidebar", exact=True).click()
@@ -38,6 +42,7 @@ def test_canvas_rail_matches_expanded_navigation(
         "elements => elements.map(element => ({"
         "label: [...element.childNodes].filter(node => node.nodeType === Node.TEXT_NODE)"
         ".map(node => node.textContent).join('').trim(),"
+        "href: element.getAttribute('href'),"
         "icon: element.querySelector('svg')?.innerHTML}))"
     )
     header = (
@@ -46,9 +51,37 @@ def test_canvas_rail_matches_expanded_navigation(
         .evaluate_all("elements => elements.map(element => element.getAttribute('aria-label'))")
     )
     header = ["Expand sidebar"] + [label for label in header if label != "Close sidebar"]
+    primary.get_by_role("link", name="Canvas", exact=True).click()
+    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={project_id}$"))
+    expect(project).to_have_attribute("aria-selected", "true")
+    page.reload()
+    expect(project).to_have_attribute("aria-selected", "true")
+    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={project_id}$"))
     assert [item["label"] for item in collapsed] == header + [item["label"] for item in expanded]
     assert collapsed[len(header) :] == expanded
     assert ("Usage" in [item["label"] for item in expanded]) is usage
+
+
+@pytest.mark.parametrize("project_canvas", [False, True], ids=["main", "project"])
+def test_stale_canvas_creation_url_returns_to_its_board(
+    page: Page, canvas_project: tuple[str, str, str, str], project_canvas: bool
+) -> None:
+    base_url, _first, _second, project_id = canvas_project
+    _stub_server_info(page, canvas=True)
+    query = f"?canvas={project_id}" if project_canvas else ""
+    page.goto(f"{base_url}/canvas/c/temp%3Aexpired{query}")
+    expect(page).to_have_url(re.compile(r"/canvas" + re.escape(query) + "$"))
+    tab_name = re.compile("Canvas review") if project_canvas else "Main"
+    expect(page.get_by_role("tab", name=tab_name, exact=not project_canvas)).to_have_attribute(
+        "aria-selected", "true"
+    )
+
+
+def test_stale_regular_creation_url_returns_to_new_session(page: Page, live_server: str) -> None:
+    _stub_server_info(page, canvas=True)
+    page.goto(f"{live_server}/c/temp%3Aexpired")
+    expect(page).to_have_url(f"{live_server}/")
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
 
 
 @pytest.mark.parametrize("project_canvas", [False, True], ids=["main", "project"])
@@ -196,7 +229,9 @@ def test_canvas_plus_creates_session_on_the_selected_board(
             expect(page.get_by_role("tab", name="Main", exact=True)).to_have_attribute(
                 "aria-selected", "true"
             )
-        snapshot = httpx.get(f"{base_url}/v1/sessions/{created_id}", timeout=10).json()
+        snapshot_response = httpx.get(f"{base_url}/v1/sessions/{created_id}", timeout=10)
+        snapshot_response.raise_for_status()
+        snapshot = snapshot_response.json()
         assert snapshot.get("project_id") == (project_id if project_canvas else None)
         assert urlparse(page.url).path.startswith("/canvas")
     finally:
