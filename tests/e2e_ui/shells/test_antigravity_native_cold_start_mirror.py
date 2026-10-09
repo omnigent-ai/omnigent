@@ -12,6 +12,7 @@ without credentials using the local mock Gemini server::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -123,11 +124,12 @@ def _assistant_items(session: AntigravitySession) -> list[dict]:
 
 
 def _snapshot(session: AntigravitySession, name: str, **facts: object) -> None:
+    """Record evidence best-effort: a vanished pane or server must not mask the assertion."""
     evidence = session.directory / "evidence"
     evidence.mkdir(exist_ok=True)
     state = read_bridge_state(session.bridge_dir)
     log = _runner_log(session)
-    record = {
+    record: dict[str, object] = {
         "at": time.time(),
         "session_id": session.session_id,
         "bridge_conversation_id": state.conversation_id if state else None,
@@ -140,10 +142,13 @@ def _snapshot(session: AntigravitySession, name: str, **facts: object) -> None:
         "runner_log_reader_bound": [line for line in log.splitlines() if _READER_BOUND in line],
         **facts,
     }
+    with contextlib.suppress(Exception):
+        record["assistant_items"] = _assistant_items(session)
     (evidence / f"{name}.json").write_text(
         json.dumps(record, indent=2, default=str), encoding="utf-8"
     )
-    (evidence / f"{name}.pane.txt").write_text(_pane_text(session), encoding="utf-8")
+    with contextlib.suppress(Exception):
+        (evidence / f"{name}.pane.txt").write_text(_pane_text(session), encoding="utf-8")
     # The fixture deletes the bridge dir on teardown; keep its state and agy's own log.
     bridge_copy = evidence / f"{name}.bridge"
     bridge_copy.mkdir(exist_ok=True)
@@ -211,11 +216,11 @@ def _drive_journey(
     page.wait_for_timeout(4_000)
     page.screenshot(path=str(session.directory / "evidence" / "agy-answered-terminal.png"))
     page.get_by_test_id("view-mode-chat").click()
-    _snapshot(session, "2-agy-answered", token=token, assistant_items=_assistant_items(session))
+    _snapshot(session, "2-agy-answered", token=token)
 
     reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
     try:
         expect(reply.filter(has_text=token)).to_have_count(1, timeout=90_000)
     finally:
         page.screenshot(path=str(session.directory / "evidence" / "chat-after-wait.png"))
-        _snapshot(session, "3-after-wait", token=token, assistant_items=_assistant_items(session))
+        _snapshot(session, "3-after-wait", token=token)
