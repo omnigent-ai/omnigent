@@ -89,7 +89,7 @@ def _journey_env(
     env = dict(os.environ)
     for stale in _STALE_ENV_VARS:
         env.pop(stale, None)
-    env["PATH"] = f"{shim_dir}{os.pathsep}{env['PATH']}"
+    env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
     env["OMNIGENT_DATA_DIR"] = str(data_dir)
     env["HOME"] = str(home_dir)
@@ -185,9 +185,9 @@ def test_pi_terminal_ensure_failure_keeps_tmux_diagnostic(tmp_path: Path) -> Non
         assert failure_lines, (
             f"Runner log never recorded the tmux launch failure. Log tail:\n{log_text[-2500:]}"
         )
-        assert _TMUX_DIAG_MARKER in log_text, (
+        assert all(_TMUX_DIAG_MARKER in line for line in failure_lines), (
             "The runner log dropped the failing tmux's own diagnostic "
-            f"({_TMUX_DIAG_MARKER!r}); its launch-failure lines carry an empty reason, "
+            f"({_TMUX_DIAG_MARKER!r}) from its launch-failure lines, "
             "so nobody reading the log can tell why tmux failed. Logged lines:\n"
             + "\n".join(failure_lines)
         )
