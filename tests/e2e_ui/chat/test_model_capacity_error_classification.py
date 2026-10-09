@@ -1,14 +1,17 @@
-"""A turn that hits an upstream model-capacity 429 must fail with a structured reason.
+"""A model-capacity 429 must fail the turn as a classified rate-limit error.
 
-If the openai-agents harness flattens the provider's ``RateLimitError`` into
-wrapper strings, the failed turn persists an unclassified ``RuntimeError`` and
-the chat shows the generic "<agent> ran into an error during this turn."
-headline instead of the rate-limit headline that names the upstream cause and
-offers a retry.
+Production sessions log ``session turn failed for <id>: Selected model is at
+capacity. Please try a different model.`` — an upstream model-serving
+throttle (HTTP 429), not an Omnigent defect. The failed turn has to keep that
+structured reason: the chat pill names the rate limit and the persisted
+``error`` item carries ``rate_limit_exceeded``, so the failure is not counted
+as an unexplained Omnigent error. A harness that retries through the outage
+and completes the turn also satisfies the journey.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -18,47 +21,63 @@ from tests.e2e_ui.conftest import configure_mock_llm
 
 _CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model."
 _CAPACITY_SIGNATURE = "Selected model is at capacity"
-# Content matching routes the SDK's retries to the same scripted outage.
 _TRIGGER = "Summarize the release notes for me"
-# Cover SDK retries and a concurrent title-generation call drawing from the same queue.
+# The provider SDK retries 429s itself and title generation matches the same
+# text; queue enough refusals that every attempt of this turn sees the outage.
 _CAPACITY_RESPONSES = 16
 _RATE_LIMIT_HEADLINE = "The model's rate limit was reached. You can retry this turn."
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
-_TURN_SETTLE_TIMEOUT_MS = 120_000
+_TURN_SETTLE_TIMEOUT_S = 90.0
 
 
-def _failure_error_item(base_url: str, session_id: str) -> dict[str, Any] | None:
-    """Return the turn's persisted failure ``error`` item, if any.
+def _error_fields(item: dict[str, Any]) -> dict[str, Any]:
+    """Return the error fields of a listed item, which the API flattens."""
+    nested = item.get("data")
+    return nested if isinstance(nested, dict) else item
 
-    :param base_url: Live server base URL.
+
+def _settled_turn_error(base_url: str, session_id: str) -> dict[str, Any] | None:
+    """Poll the transcript until the turn settles.
+
+    :param base_url: Server base URL.
     :param session_id: The session/conversation id.
-    :returns: The first non-info ``error`` item, or ``None``.
+    :returns: The persisted failure ``error`` item's fields, or ``None`` when
+        an assistant reply landed instead.
+    :raises AssertionError: If neither is persisted within the timeout.
     """
-    resp = httpx.get(
-        f"{base_url}/v1/sessions/{session_id}/items",
-        params={"limit": 200, "order": "asc"},
-        timeout=10.0,
+    deadline = time.monotonic() + _TURN_SETTLE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        resp = httpx.get(
+            f"{base_url}/v1/sessions/{session_id}/items",
+            params={"limit": 200, "order": "asc"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("data", [])
+        for item in items:
+            fields = _error_fields(item)
+            if item.get("type") == "error" and str(fields.get("level") or "") != "info":
+                return fields
+        for item in items:
+            role = item.get("role") or (item.get("data") or {}).get("role")
+            if item.get("type") == "message" and role == "assistant":
+                return None
+        time.sleep(0.5)
+    raise AssertionError(
+        f"turn never settled within {_TURN_SETTLE_TIMEOUT_S:.0f}s: no error item "
+        "and no assistant reply were persisted"
     )
-    resp.raise_for_status()
-    for item in resp.json().get("data", []):
-        if item.get("type") != "error":
-            continue
-        data = item.get("data") or {}
-        if str(data.get("level") or item.get("level") or "") == "info":
-            continue
-        return item
-    return None
 
 
-def test_model_capacity_429_preserves_structured_error_reason(
-    page: Page,
+def test_model_capacity_429_fails_turn_as_rate_limit(
+    request: Any,
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """Sending a message while the model is at capacity fails with a classified error.
+    """Sending a message while the model is at capacity yields a rate-limit failure.
 
-    :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, session_id)`` from the live server.
+    :param request: Pytest request; the recorded page is created after setup.
+    :param seeded_session: ``(base_url, session_id)`` on the live server.
     :param mock_llm_server_url: Mock model endpoint scripted to be at capacity.
     """
     base_url, session_id = seeded_session
@@ -69,43 +88,43 @@ def test_model_capacity_429_preserves_structured_error_reason(
         match=_TRIGGER,
     )
 
+    page = request.getfixturevalue("page")
+    assert isinstance(page, Page)
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_role("textbox", name="Message the agent")
     expect(composer).to_be_visible(timeout=15_000)
     composer.fill(_TRIGGER)
     page.get_by_role("button", name="Send", exact=True).click()
 
-    pills = page.get_by_test_id("error-pill")
-    expect(pills.or_(page.locator(_ASSISTANT)).first).to_be_visible(
-        timeout=_TURN_SETTLE_TIMEOUT_MS
-    )
-    if pills.count() == 0:
-        # A turn retried through the outage has no error to classify.
-        expect(page.locator(_ASSISTANT).first).to_be_visible()
-        assert _failure_error_item(base_url, session_id) is None
+    error = _settled_turn_error(base_url, session_id)
+    if error is None:
+        expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=15_000)
         return
 
-    pill = pills.first
+    pill = page.get_by_test_id("error-pill").first
+    expect(pill).to_be_visible(timeout=15_000)
     headline = pill.get_by_test_id("error-headline")
-    expect(headline).to_be_visible()
-    headline.click()
-    expect(pill.get_by_test_id("error-message-content")).to_contain_text(
-        _CAPACITY_SIGNATURE, timeout=15_000
-    )
+    expect(headline).not_to_be_empty()
+    pill.click()
+    expect(pill).to_contain_text(_CAPACITY_SIGNATURE, timeout=10_000)
+    # Hold the expanded pill so a recording of the journey stays readable.
+    page.wait_for_timeout(1_500)
 
-    error_item = _failure_error_item(base_url, session_id)
-    assert error_item is not None, "the chat shows a failure pill but no error item was persisted"
-    data = error_item.get("data") or {}
-    code = str(data.get("code") or error_item.get("code") or "")
-    message = str(data.get("message") or error_item.get("message") or "")
+    code = str(error.get("code") or "")
+    message = str(error.get("message") or "")
+    session = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+    print(
+        f"observed session={session_id} headline={headline.inner_text()!r} "
+        f"code={code!r} message={message!r} "
+        f"last_task_error={session.get('last_task_error')!r}"
+    )
 
     assert _CAPACITY_SIGNATURE in message, (
-        f"the failed turn does not carry the upstream capacity reason; "
+        f"the failed turn's error lost the upstream capacity reason; "
         f"got code={code!r} message={message!r}"
     )
+    expect(headline).to_have_text(_RATE_LIMIT_HEADLINE, timeout=5_000)
     assert code == "rate_limit_exceeded", (
-        "a model-capacity 429 must fail the turn with the structured provider-throttle "
-        f"code 'rate_limit_exceeded'; got unclassified code={code!r} "
-        f"(headline={headline.inner_text()!r}, message={message!r})"
+        "a model-capacity 429 must fail the turn with the structured code "
+        f"'rate_limit_exceeded'; got unclassified code={code!r}"
     )
-    expect(headline).to_have_text(_RATE_LIMIT_HEADLINE)
