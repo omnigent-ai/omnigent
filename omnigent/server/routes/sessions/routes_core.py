@@ -76,6 +76,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -714,6 +715,9 @@ def register_core_routes(
             Depends(require_json_or_multipart_content_type),
             Depends(require_trusted_origin),
         ],
+        # The body is parsed by hand (dispatch on Content-Type), so FastAPI
+        # cannot infer it; describe both accepted shapes explicitly.
+        openapi_extra=SESSION_CREATE_OPENAPI_EXTRA,
     )
     async def create_session(
         request: Request,
