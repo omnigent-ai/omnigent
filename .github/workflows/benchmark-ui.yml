@@ -119,6 +119,7 @@ jobs:
       # One browser, one active page at a time, alternating base/candidate order.
       # Both bundles use the candidate's OSS server and the same fixture/driver.
       - name: Benchmark production UI
+        id: benchmark
         env:
           EVENT_NAME: ${{ github.event_name }}
           COMPARE_SAME_BUILD: ${{ inputs.compare_same_build }}

@@ -1,4 +1,4 @@
-"""Exercise the workflow's path detection and shallow-merge baseline selection."""
+"""Exercise workflow detection, baseline selection, and benchmark command modes."""
 
 from __future__ import annotations
 
@@ -109,6 +109,76 @@ def test_detect_without_complete_file_list(
     )
     assert output == f"ui={expected}\n"
     assert called_api == uses_api
+
+
+@pytest.mark.parametrize(
+    ("event", "compare_same_build", "baseline"),
+    [
+        ("pull_request", "", "baseline"),
+        ("schedule", "", None),
+        ("workflow_dispatch", "false", None),
+        ("workflow_dispatch", "true", "candidate"),
+    ],
+    ids=["pr-comparison", "nightly", "manual-standalone", "manual-aa"],
+)
+def test_benchmark_command_selects_comparison_mode(
+    tmp_path: Path, event: str, compare_same_build: str, baseline: str | None
+) -> None:
+    script = next(
+        step["run"]
+        for step in _WORKFLOW["jobs"]["benchmark"]["steps"]
+        if step.get("id") == "benchmark"
+    )
+    captured = tmp_path / "uv-args"
+    runner_temp = tmp_path / "runner temp"
+    uv = tmp_path / "uv"
+    uv.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$UV_ARGS_OUTPUT"\n')
+    uv.chmod(0o755)
+    git = tmp_path / "git"
+    git.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  "rev-parse HEAD") echo candidate-revision ;;\n'
+        '  "-C ui-baseline rev-parse HEAD") echo base-revision ;;\n'
+        "  *) exit 2 ;;\n"
+        "esac\n"
+    )
+    git.chmod(0o755)
+    subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=tmp_path,
+        env={
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "EVENT_NAME": event,
+            "COMPARE_SAME_BUILD": compare_same_build,
+            "RUNNER_TEMP": str(runner_temp),
+            "UV_ARGS_OUTPUT": str(captured),
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    expected = [
+        "run",
+        "--no-sync",
+        "dev/benchmarks/ui/run.py",
+        "--web-dist",
+        str(runner_temp / "ui-candidate"),
+        "--revision",
+        "candidate-revision",
+        "--output-dir",
+        "artifacts/ui-benchmark",
+    ]
+    if baseline:
+        expected.extend(
+            [
+                "--baseline-dist",
+                str(runner_temp / f"ui-{baseline}"),
+                "--baseline-revision",
+                "base-revision" if baseline == "baseline" else "candidate-revision",
+            ]
+        )
+    assert [arg.decode() for arg in captured.read_bytes().split(b"\0")[:-1]] == expected
 
 
 @pytest.mark.skipif(not shutil.which("git"), reason="Needs git")

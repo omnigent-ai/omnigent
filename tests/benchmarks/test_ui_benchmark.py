@@ -367,6 +367,34 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal handling")
+def test_cli_records_ordinary_measurement_errors(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text("<html></html>")
+    output_dir = tmp_path / "results"
+    script = """
+import sys
+from dev.benchmarks.ui import run
+
+async def failed_benchmark(args):
+    raise RuntimeError('Synthetic measurement failure')
+
+run.run_benchmark = failed_benchmark
+raise SystemExit(run.main(['--web-dist', sys.argv[1], '--output-dir', sys.argv[2]]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(output_dir)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "RuntimeError: Synthetic measurement failure" in result.stderr
+    assert (
+        output_dir / "error.txt"
+    ).read_text() == "RuntimeError: Synthetic measurement failure\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal handling")
 def test_sigterm_finishes_teardown_and_reports_error(tmp_path: Path) -> None:
     (tmp_path / "index.html").write_text("<html></html>")
     script = """
