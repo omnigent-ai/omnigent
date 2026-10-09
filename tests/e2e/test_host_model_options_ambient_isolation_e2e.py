@@ -1,12 +1,12 @@
-"""The host model-options tests must stay green on a credential-rich machine.
+"""Model-options frame assertions must not depend on machine-global provider state.
 
-Runs the developer's command in a child pytest whose config home carries
-subscription defaults and whose environment carries vendor API keys. Pure
-host-side resolution: no LLM or live server, so no ``--llm-api-key`` is needed.
+Runs the developer's command in a child pytest seeded with every ambient provider
+channel (config home, inference overlay, vendor API keys); host-side only.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -35,6 +35,11 @@ providers:
     default: true
 """
 
+# The managed-sandbox overlay replaces the local providers block wholesale.
+_AMBIENT_INFERENCE_OVERLAY = {
+    "providers": {"claude": {"kind": "subscription", "cli": "claude", "default": True}}
+}
+
 # Vendor keys that ambient detection adopts as provider defaults (fake values).
 _AMBIENT_DETECTION_ENV = {
     "ANTHROPIC_API_KEY": "test-anthropic-key",
@@ -44,15 +49,14 @@ _AMBIENT_DETECTION_ENV = {
 # Every selected test answers a frame through HostProcess._handle_model_options.
 _MODEL_OPTIONS_SELECTION = "handle_model_options or model_options_frame"
 
-# A handful of tests, but a cold interpreter imports the host graph first.
-_NESTED_PYTEST_TIMEOUT_S = 240.0
+# Stays under the outer E2E job's 180s per-test cap; a cold run takes seconds.
+_NESTED_PYTEST_TIMEOUT_S = 150.0
 
 
 def _partial_output(exc: subprocess.TimeoutExpired) -> str:
-    parts = (exc.stdout, exc.stderr)
     return "\n".join(
         part.decode(errors="replace") if isinstance(part, bytes) else (part or "")
-        for part in parts
+        for part in (exc.stdout, exc.stderr)
     )
 
 
@@ -61,12 +65,16 @@ def test_model_options_tests_ignore_ambient_subscription_defaults(tmp_path: Path
     config_home = tmp_path / "ambient-omnigent-home"
     config_home.mkdir()
     (config_home / "config.yaml").write_text(_AMBIENT_SUBSCRIPTION_CONFIG, encoding="utf-8")
+    overlay = tmp_path / "inference-overlay.json"
+    overlay.write_text(json.dumps(_AMBIENT_INFERENCE_OVERLAY), encoding="utf-8")
 
     # Drop the outer runner's pytest vars so the nested run starts clean.
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    env["OMNIGENT_INFERENCE_CONFIG"] = str(overlay)
     env.update(_AMBIENT_DETECTION_ENV)
 
+    timed_out: str | None = None
     try:
         nested = subprocess.run(
             [
@@ -89,9 +97,13 @@ def test_model_options_tests_ignore_ambient_subscription_defaults(tmp_path: Path
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        timed_out = _partial_output(exc)
+    finally:
+        # The inherited environment may carry credentials; keep it out of --showlocals.
+        env.clear()
+    if timed_out is not None:
         pytest.fail(
-            f"nested pytest exceeded {_NESTED_PYTEST_TIMEOUT_S:.0f}s; partial output:\n"
-            f"{_partial_output(exc)}"
+            f"nested pytest exceeded {_NESTED_PYTEST_TIMEOUT_S:.0f}s; partial output:\n{timed_out}"
         )
 
     output = f"{nested.stdout}\n{nested.stderr}"
