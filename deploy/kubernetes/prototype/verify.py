@@ -579,7 +579,11 @@ async def verify(
                 await asyncio.to_thread(mock.wait, timeout=5)
             except subprocess.TimeoutExpired:
                 mock.kill()
-                await asyncio.to_thread(mock.wait, timeout=5)
+                try:
+                    await asyncio.to_thread(mock.wait, timeout=5)
+                except subprocess.TimeoutExpired as exc:
+                    report["cleanup_error"] = str(exc)
+                    report["passed"] = False
         if mock_log is not None:
             mock_log.close()
         for kind in ("host", "runner"):
@@ -630,4 +634,4 @@ if __name__ == "__main__":
     parser.add_argument("--replicas", type=int, default=2)
     parser.add_argument("--host-id")
     parser.add_argument("--output", type=Path, required=True)
-    asyncio.run(verify(parser.parse_args()))
+    sys.exit(0 if asyncio.run(verify(parser.parse_args())).get("passed") else 1)

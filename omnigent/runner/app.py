@@ -20,7 +20,7 @@ import re
 import tempfile
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -212,6 +212,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 _logger = logging.getLogger(__name__)
 
 _CANCELLATION_RESPONSE_PREFIX = "cancel_"
+_MAX_INPUT_RECEIPTS = 1000
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
@@ -1414,6 +1415,16 @@ def create_runner_app(
     _last_server_item_id: dict[str, str] = {}
     # A completed turn's reply can reach the server after its tunnel reconnects.
     _received_server_item_ids: dict[str, set[str]] = {}
+    _recent_input_receipts: dict[str, deque[str]] = {}
+
+    def _remember_accepted_input(session_id: str, item_id: str) -> None:
+        received = _received_server_item_ids.setdefault(session_id, set())
+        if item_id not in received:
+            received.add(item_id)
+            _recent_input_receipts.setdefault(
+                session_id, deque(maxlen=_MAX_INPUT_RECEIPTS)
+            ).append(item_id)
+
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
@@ -3186,7 +3197,7 @@ def create_runner_app(
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
-    async def stream_session(session_id: str) -> StreamingResponse:
+    async def stream_session(session_id: str, input_receipts: bool = False) -> StreamingResponse:
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -3204,6 +3215,9 @@ def create_runner_app(
                     continue
                 if event is None:
                     break
+                # Each server connection must opt in to the new receipt event.
+                if event.get("type") == "session.input.accepted" and not input_receipts:
+                    continue
                 frame = "data: " + json.dumps(event) + "\n\n"
                 try:
                     yield frame.encode("utf-8")
@@ -3225,7 +3239,7 @@ def create_runner_app(
     async def get_input_receipts(session_id: str) -> JSONResponse:
         """Confirm accepted inputs even when no browser saw the reconnect event."""
         return JSONResponse(
-            {"item_ids": sorted(_received_server_item_ids.get(session_id, ()))},
+            {"item_ids": list(_recent_input_receipts.get(session_id, ()))},
         )
 
     @app.get("/v1/sessions/{session_id}")
@@ -3430,6 +3444,7 @@ def create_runner_app(
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _received_server_item_ids.pop(session_id, None)
+        _recent_input_receipts.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
         _subagent_recovery_done.discard(session_id)
@@ -6406,7 +6421,7 @@ def create_runner_app(
                         [],
                     ).append(message_body)
                     if received_ids is not None and isinstance(persisted_item_id, str):
-                        received_ids.add(persisted_item_id)
+                        _remember_accepted_input(conversation_id, persisted_item_id)
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
@@ -6502,7 +6517,7 @@ def create_runner_app(
 
                 _begin_turn_slot(conversation_id)
                 if received_ids is not None and isinstance(persisted_item_id, str):
-                    received_ids.add(persisted_item_id)
+                    _remember_accepted_input(conversation_id, persisted_item_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -7565,7 +7580,7 @@ def create_runner_app(
                 continue
             # A forward's answer can die with the tunnel after we accepted it.
             # Report acceptance independently of the history scan's cursor.
-            accepted_ids = sorted(_received_server_item_ids.get(session_id, ()))
+            accepted_ids = list(_recent_input_receipts.get(session_id, ()))
             for start in range(0, len(accepted_ids), 100):
                 _publish_event(
                     session_id,
@@ -7660,7 +7675,7 @@ def create_runner_app(
                         "browser_renderer_available": False,
                     }
                     _session_message_buffers.setdefault(session_id, []).append(msg_body)
-                    received_ids.add(item_id)
+                    _remember_accepted_input(session_id, item_id)
                     # The failed forward could not acknowledge this saved message.
                     _publish_event(
                         session_id,

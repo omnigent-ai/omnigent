@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.sync_api import Page, Route, WebSocketRoute, expect
+from playwright.sync_api import Page, Response, Route, WebSocketRoute, expect
 
 from tests._helpers.replica_handoff import HandoffLab, eventually, handoff_lab
 
@@ -28,14 +28,23 @@ CASES = (
     "stopped_turn",
     "mirrored_history",
     "lost_runner_ack",
+    "older_server",
 )
 
 
 @pytest.fixture(name="replica_lab")
-def replica_lab(tmp_path: Path, mock_llm_server_url: str) -> Iterator[HandoffLab]:
+def replica_lab(tmp_path: Path, mock_llm_server_url: str, case: str) -> Iterator[HandoffLab]:
     if os.environ.get("OMNIGENT_E2E_REPLICA_HANDOFF") != "1":
         pytest.skip("set OMNIGENT_E2E_REPLICA_HANDOFF=1; requires web dependencies and Chromium")
-    with handoff_lab(tmp_path, mock_llm_server_url) as lab:
+    older_server = None
+    if case == "older_server":
+        checkout = os.environ.get("OMNIGENT_E2E_LEGACY_SERVER_ROOT")
+        assert checkout, (
+            "set OMNIGENT_E2E_LEGACY_SERVER_ROOT to the documented pre-receipt checkout"
+        )
+        older_server = Path(checkout).resolve()
+        assert (older_server / "omnigent/server/schemas.py").is_file()
+    with handoff_lab(tmp_path, mock_llm_server_url, older_server_root=older_server) as lab:
         yield lab
 
 
@@ -128,6 +137,13 @@ class Driver:
 
 
 def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> None:
+    if case == "older_server":
+
+        def record_stream_failure(response: Response) -> None:
+            if response.url.split("?", 1)[0].endswith("/stream") and response.status >= 500:
+                lab.proxy.note("browser_stream_error", status=response.status, url=response.url)
+
+        page.on("response", record_stream_failure)
     if case == "terminal_reveal":
 
         def terminal_ready() -> bool:
@@ -148,6 +164,45 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
     prompt = f"Check the rolling update: {case}."
     reply = f"The {case} message completed once."
     lab.configure([{"text": reply}, {"text": f"DUPLICATE: {reply}"}])
+    if case == "older_server":
+        schema = lab.client.get(f"{lab.b.base_url}/openapi.json")
+        schema.raise_for_status()
+        assert "SessionInputAcceptedEvent" not in schema.text, (
+            "replacement must be an older server"
+        )
+        driver.send(prompt)
+        driver.assert_clean(prompt, reply)
+        lab.handoff()
+        driver.wait(
+            lambda: any(
+                record["target"] == lab.b.base_url for record in proxy.seen("browser_stream")
+            ),
+            "browser subscription on the older server",
+        )
+        for _ in range(2):
+            before = len(proxy.records)
+            proxy.cut(browser=False)
+            driver.wait(
+                lambda before=before: any(
+                    record["kind"] == "runner_events"
+                    and record["target"] == lab.b.base_url
+                    and any(event.get("type") == "session.heartbeat" for event in record["events"])
+                    for record in proxy.records[before:]
+                ),
+                "older server's runner stream to reconnect",
+            )
+            page.wait_for_timeout(1000)
+            assert not proxy.seen("browser_stream_error"), (
+                "the older server rejected its browser stream after a runner receipt: "
+                f"{proxy.seen('browser_stream_error')}"
+            )
+        followup = "Continue after reconnecting to the older server."
+        followup_reply = "The older server's browser stream stayed open."
+        lab.configure([{"text": followup_reply}])
+        driver.send(followup)
+        driver.assert_clean(followup, followup_reply, turns=2)
+        assert not proxy.seen("browser_stream_error")
+        return
     if case == "terminal_reveal":
         surface = page.get_by_test_id("main-terminal-view")
         terminal = surface.get_by_test_id("terminal-view")
@@ -467,13 +522,18 @@ def run_handoff_case(page: Page, lab: HandoffLab, case: str, *, ui: bool) -> Non
                 for event in record["events"]
             ]
             saved = next(
-                (e["item"] for e in replacement if e["type"] == "response.output_item.done"),
+                (
+                    e.get("item")
+                    for e in replacement
+                    if e.get("type") == "response.output_item.done"
+                ),
                 None,
             )
             assert saved is not None, "replacement stream did not deliver the saved reply"
             assert saved["response_id"] != opening, "replacement did not miss the original header"
             assert any(
-                e["type"] == "response.completed" and e["response"]["id"] == opening
+                e.get("type") == "response.completed"
+                and (e.get("response") or {}).get("id") == opening
                 for e in replacement
             )
             assert lab.messages("assistant").count(reply) == 1

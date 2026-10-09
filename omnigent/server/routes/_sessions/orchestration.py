@@ -8146,7 +8146,7 @@ async def _relay_runner_stream_once(
     try:
         async with runner_client.stream(
             "GET",
-            f"/v1/sessions/{session_id}/stream",
+            f"/v1/sessions/{session_id}/stream?input_receipts=true",
             timeout=_relay_timeout,
         ) as resp:
             resp.raise_for_status()

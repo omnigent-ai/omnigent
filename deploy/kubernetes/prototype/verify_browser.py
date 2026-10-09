@@ -27,6 +27,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright, expect
 from verify import (
     KEY_HEADER,
+    ROOT,
     agent_bundle,
     command,
     eventually,
@@ -623,7 +624,10 @@ class BrowserHost:
                 await asyncio.to_thread(self.mock.wait, timeout=5)
             except subprocess.TimeoutExpired:
                 self.mock.kill()
-                await asyncio.to_thread(self.mock.wait, timeout=5)
+                try:
+                    await asyncio.to_thread(self.mock.wait, timeout=5)
+                except subprocess.TimeoutExpired as exc:
+                    self.report["cleanup_errors"].append(str(exc))
         if self.mock_log:
             self.mock_log.close()
         await self.client.aclose()
@@ -693,8 +697,12 @@ async def run(args):
         ],
     }
     (args.output / "verify_browser.py").write_text(Path(__file__).read_text())
-    (args.output / "source-revision.txt").write_text(await command("git", "rev-parse", "HEAD"))
-    (args.output / "source-working-tree.patch").write_text(await command("git", "diff"))
+    (args.output / "source-revision.txt").write_text(
+        await command("git", "-C", str(ROOT), "rev-parse", "HEAD")
+    )
+    (args.output / "source-working-tree.patch").write_text(
+        await command("git", "-C", str(ROOT), "diff")
+    )
     summary["client_image_id"] = (
         await command(
             "docker", "image", "inspect", "omnigent-prototype-client:local", "--format", "{{.Id}}"
@@ -744,28 +752,34 @@ async def run(args):
                 )
             )
     logs = {}
+    monitor_errors = []
 
     async def monitor_pods():
         while True:
-            snapshot = json.loads(
-                await command(*kube, "get", "pods", "-l", "app=omnigent", "-o", "json")
-            )
-            pods = []
-            for pod in snapshot["items"]:
-                name = pod["metadata"]["name"]
-                pods.append(
-                    {
-                        "name": name,
-                        "ready": ready(pod),
-                        "terminating": bool(pod["metadata"].get("deletionTimestamp")),
-                        "ip": pod["status"].get("podIP"),
-                    }
+            try:
+                snapshot = json.loads(
+                    await command(*kube, "get", "pods", "-l", "app=omnigent", "-o", "json")
                 )
-                if ready(pod) and name not in logs:
-                    logs[name] = await start_log_follower(kube, name, args.output / f"{name}.log")
-            summary["pod_samples"].append(
-                {"at": round(time.monotonic() - started, 3), "pods": pods}
-            )
+                pods = []
+                for pod in snapshot["items"]:
+                    name = pod["metadata"]["name"]
+                    pods.append(
+                        {
+                            "name": name,
+                            "ready": ready(pod),
+                            "terminating": bool(pod["metadata"].get("deletionTimestamp")),
+                            "ip": pod["status"].get("podIP"),
+                        }
+                    )
+                    if ready(pod) and name not in logs:
+                        logs[name] = await start_log_follower(
+                            kube, name, args.output / f"{name}.log"
+                        )
+                summary["pod_samples"].append(
+                    {"at": round(time.monotonic() - started, 3), "pods": pods}
+                )
+            except (RuntimeError, OSError, json.JSONDecodeError) as exc:
+                monitor_errors.append(f"{type(exc).__name__}: {exc}")
             await asyncio.sleep(0.5)
 
     monitor = asyncio.create_task(monitor_pods())
@@ -859,7 +873,14 @@ async def run(args):
             except PlaywrightError as exc:
                 summary["cleanup_errors"].append(str(exc))
             monitor.cancel()
-            await asyncio.gather(monitor, return_exceptions=True)
+            outcomes = await asyncio.gather(monitor, return_exceptions=True)
+            summary["cleanup_errors"].extend(
+                f"Pod monitoring: {type(result).__name__}: {result}"
+                for result in outcomes
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            )
+            summary["monitor_errors"] = monitor_errors
             for process, handle in logs.values():
                 try:
                     if process.returncode is None:

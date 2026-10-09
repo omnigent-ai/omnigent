@@ -29,8 +29,16 @@ def bare_proxy() -> HandoffProxy:
     proxy.host_routes = {}
     proxy.records = []
     proxy.streams = set()
+    proxy.connections = set()
+    proxy.tunnels = {}
+    proxy.probes = {}
+    proxy.drop_forward = False
+    proxy.drop_forward_response = False
+    proxy.drop_status = None
+    proxy.refuse_tunnels = False
     proxy.gates = {
-        name: asyncio.Event() for name in ("history", "browser", "browser_connect", "updates")
+        name: asyncio.Event()
+        for name in ("history", "runner_stream", "browser", "browser_connect", "updates")
     }
     for gate in proxy.gates.values():
         gate.set()
@@ -102,6 +110,70 @@ async def test_late_probe_reply_does_not_break_the_runner_tunnel(
         AsyncMock(),
     )
     upstream.send.assert_awaited_once_with(following_frame)
+
+
+@pytest.mark.parametrize(
+    ("armed_status", "event_status"),
+    [(None, None), (None, "idle"), ("idle", None), ("idle", "idle")],
+)
+async def test_status_fault_only_drops_an_explicitly_armed_status(
+    monkeypatch: pytest.MonkeyPatch, armed_status: str | None, event_status: str | None
+) -> None:
+    proxy = bare_proxy()
+    proxy.drop_status = armed_status
+    stream_opened = asyncio.Event()
+    event = {"type": "session.status"}
+    if event_status is not None:
+        event["status"] = event_status
+    frame = json.dumps(
+        {"kind": "response.body", "id": "stream", "body": f"data: {json.dumps(event)}\n\n"}
+    )
+
+    class Upstream:
+        send = AsyncMock()
+
+        async def __aiter__(self):
+            yield json.dumps(
+                {
+                    "kind": "request",
+                    "id": "stream",
+                    "path": "/sessions/session/stream",
+                    "method": "GET",
+                }
+            )
+            await asyncio.Event().wait()
+
+    upstream = Upstream()
+    connection = AsyncMock()
+    connection.__aenter__.return_value = upstream
+    monkeypatch.setattr("tests._helpers.replica_handoff.connect", Mock(return_value=connection))
+    messages = iter(
+        [
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": frame},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    async def receive():
+        message = next(messages)
+        if message["type"] == "websocket.receive":
+            await asyncio.wait_for(stream_opened.wait(), 1)
+        return message
+
+    async def send(message):
+        if message["type"] == "websocket.send":
+            stream_opened.set()
+
+    await proxy._websocket(
+        {"path": "/v1/runners/runner/tunnel", "query_string": b"", "headers": []}, receive, send
+    )
+    should_drop = armed_status is not None and event_status == armed_status
+    assert bool(proxy.seen("lost_status")) is should_drop
+    if should_drop:
+        upstream.send.assert_not_awaited()
+    else:
+        upstream.send.assert_awaited_once_with(frame)
 
 
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
@@ -205,13 +277,7 @@ async def test_websocket_uses_the_moved_hosts_route(
 async def test_plain_errors_reach_the_client_unchanged(
     path: str, request_body: bytes, status: int, response_body: bytes
 ) -> None:
-    proxy = HandoffProxy.__new__(HandoffProxy)
-    proxy.target = "http://upstream"
-    proxy.host_routes = {}
-    proxy.records = []
-    proxy.streams = set()
-    proxy.gates = {"history": asyncio.Event()}
-    proxy.gates["history"].set()
+    proxy = bare_proxy()
     messages: list[dict[str, Any]] = []
 
     async def receive() -> dict[str, Any]:

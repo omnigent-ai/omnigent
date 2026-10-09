@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from typing import Any
 
 import httpx
@@ -71,13 +72,17 @@ async def _settle(app: Any) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cold_history", [False, True])
+@pytest.mark.parametrize("legacy_init", [False, True])
 async def test_reconnect_confirms_accepted_input_even_after_history_cursor_passes_it(
-    monkeypatch: pytest.MonkeyPatch, cold_history: bool
+    monkeypatch: pytest.MonkeyPatch, cold_history: bool, legacy_init: bool
 ) -> None:
     server = _Server()
     app, _, harness = _build_sdk_app(server)
     async with _runner_client(app) as client:
-        await client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True))
+        init = _session_init_payload(suppress_recovery_turn=True)
+        if legacy_init:
+            init.pop("session_init")
+        await client.post("/v1/sessions", json=init)
         if cold_history:
             monkeypatch.delitem(_session_histories_ref, SESSION_ID, raising=False)
         else:
@@ -96,20 +101,66 @@ async def test_reconnect_confirms_accepted_input_even_after_history_cursor_passe
         assert response.status_code == 200
         assert response.json() == {"item_ids": ["accepted"]}
 
-        for _ in range(2):
+        for supports_receipts in (False, True, False, True):
             await app.state.catch_up_scan()
-            events = []
-            while not queue.empty():
-                events.append(queue.get_nowait())
+            queue.put_nowait(None)
+            response = await client.get(
+                f"/v1/sessions/{SESSION_ID}/stream",
+                params={"input_receipts": "true"} if supports_receipts else {},
+            )
+            events = [
+                json.loads(line.removeprefix("data: "))
+                for line in response.text.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            ]
             accepted = [
                 SessionInputAcceptedEvent.model_validate(event)
                 for event in events
                 if event["type"] == "session.input.accepted"
             ]
-            assert [event.item_ids for event in accepted] == [["accepted"]]
-            assert accepted[0].conversation_id == SESSION_ID
+            assert [event.item_ids for event in accepted] == (
+                [["accepted"]] if supports_receipts else []
+            )
+            if supports_receipts:
+                assert accepted[0].conversation_id == SESSION_ID
+            assert response.text.endswith("data: [DONE]\n\n")
             assert not any(event["type"] == "session.input.consumed" for event in events)
             assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_receipt_window_does_not_forget_lifetime_duplicate_prevention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_app, "_MAX_INPUT_RECEIPTS", 3)
+    server = _Server()
+    app, _, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=True))
+        for item_id in ("first", "second", "third", "fourth"):
+            server.items.append(_user(item_id))
+            assert (await _forward(client, item_id)).status_code == 200
+            await _settle(app)
+        response = await client.get(f"/v1/sessions/{SESSION_ID}/input-receipts")
+        assert response.json() == {"item_ids": ["second", "third", "fourth"]}
+        queue = app.state.session_event_queues[SESSION_ID]
+        while not queue.empty():
+            queue.get_nowait()
+        await app.state.catch_up_scan()
+        queue.put_nowait(None)
+        response = await client.get(f"/v1/sessions/{SESSION_ID}/stream?input_receipts=true")
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        receipts = [
+            event["item_ids"] for event in events if event["type"] == "session.input.accepted"
+        ]
+        assert receipts == [["second", "third", "fourth"]]
+        assert (await _forward(client, "first")).status_code == 202
+        await _settle(app)
+        assert len(harness.posted_bodies) == 4
 
 
 @pytest.mark.asyncio

@@ -42,7 +42,7 @@ case "${1:-help}" in
           "$state/kubeconfig" "$0" >&2
         exit 1
       fi
-      if [[ "$published_address" != "127.0.0.1:$prototype_port" ]]; then
+      if ! grep -qxF "127.0.0.1:$prototype_port" <<< "$published_address"; then
         printf 'The existing cluster publishes %s, but PROTOTYPE_PORT is %s. Run %s down before changing the port.\n' \
           "$published_address" "$prototype_port" "$0" >&2
         exit 1

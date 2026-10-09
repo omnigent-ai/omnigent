@@ -3058,7 +3058,15 @@ def register_events_routes(
                         timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
                     )
                     if resp.status_code == 200:
-                        item_ids = resp.json().get("item_ids", [])
+                        payload = resp.json()
+                        item_ids = payload.get("item_ids") if isinstance(payload, dict) else None
+                        if not isinstance(item_ids, list) or any(
+                            not isinstance(item_id, str) or not item_id for item_id in item_ids
+                        ):
+                            _logger.warning(
+                                "snapshot: malformed input receipts for %s", session_id
+                            )
+                            item_ids = []
                         for start in range(0, len(item_ids), 100):
                             events.append(
                                 {

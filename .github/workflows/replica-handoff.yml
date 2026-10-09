@@ -28,6 +28,7 @@ concurrency:
 env:
   OMNIGENT_SKIP_WEB_UI: 'true'
   OMNIGENT_E2E_REPLICA_HANDOFF: '1'
+  OMNIGENT_E2E_LEGACY_SERVER_ROOT: '${{ github.workspace }}/.replica-legacy-server'
   UV_INDEX_URL: https://pypi.org/simple
 
 jobs:
@@ -39,10 +40,16 @@ jobs:
     needs: gate
     if: github.event.pull_request.draft != true
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          persist-credentials: false
+      - name: Check out the server from before receipt events existed
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: '9567b2bfc6c3f182e8ae43165c73bf0d64be9076'
+          path: .replica-legacy-server
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:

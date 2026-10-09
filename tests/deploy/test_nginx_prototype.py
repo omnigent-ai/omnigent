@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PROTOTYPE = ROOT / "deploy/kubernetes/prototype"
 
 
-@pytest.mark.parametrize("failed_command", ["logs", "cp", "write", "missing-binary"])
+@pytest.mark.parametrize("failed_command", ["logs", "cp", "write", "missing-binary", "mock-wait"])
 async def test_evidence_failure_still_removes_host_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_command: str
 ) -> None:
@@ -31,6 +31,8 @@ async def test_evidence_failure_still_removes_host_container(
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
     process = Mock()
+    if failed_command == "mock-wait":
+        process.wait.side_effect = subprocess.TimeoutExpired("mock", 5)
     monkeypatch.setattr(verifier.subprocess, "Popen", Mock(return_value=process))
     monkeypatch.setattr(
         verifier, "eventually", AsyncMock(side_effect=RuntimeError("host setup failed"))
@@ -133,7 +135,7 @@ async def test_mock_keeps_its_ephemeral_port_until_the_child_is_ready(tmp_path: 
                 await asyncio.to_thread(process.wait, timeout=5)
 
 
-@pytest.mark.parametrize("failed_capture", ["observer", "response"])
+@pytest.mark.parametrize("failed_capture", ["observer", "response", "mock-wait"])
 async def test_browser_evidence_failure_cannot_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_capture: str
 ) -> None:
@@ -162,15 +164,24 @@ async def test_browser_evidence_failure_cannot_pass(
         host.monitor_task = asyncio.create_task(host.observe_ui())
         with pytest.raises(RuntimeError, match="observer disappeared"):
             await host.monitor_task
-    else:
+    elif failed_capture == "response":
 
         async def failed_response():
             raise OSError("response evidence unavailable")
 
         host.response_tasks.append(asyncio.create_task(failed_response()))
+    else:
+        host.mock = Mock()
+        host.mock.wait.side_effect = subprocess.TimeoutExpired("mock", 5)
+        host.mock_log = io.StringIO()
     await host.cleanup()
     assert not host.report["passed"]
     assert host.report["cleanup_errors"]
+    assert json.loads((host.output / "report.json").read_text())["passed"] is False
+    if failed_capture == "mock-wait":
+        host.mock.kill.assert_called_once()
+        assert host.mock_log.closed
+        assert host.client.is_closed
 
 
 def _run_up(
@@ -258,8 +269,9 @@ def test_failed_migration_reports_logs_without_waiting_for_timeout(tmp_path: Pat
     assert "server.yaml" not in commands
 
 
-def test_completed_migration_allows_deployment(tmp_path: Path) -> None:
-    result, commands = _run_up(tmp_path, port="127.0.0.1:18081", migration="Complete=True")
+@pytest.mark.parametrize("port", ["127.0.0.1:18081", "127.0.0.1:18081\n[::1]:18081"])
+def test_completed_migration_allows_deployment(tmp_path: Path, port: str) -> None:
+    result, commands = _run_up(tmp_path, port=port, migration="Complete=True")
     assert result.returncode == 0, result.stderr
     assert "Ready: http://localhost:18081" in result.stdout
     assert "server.yaml" in commands

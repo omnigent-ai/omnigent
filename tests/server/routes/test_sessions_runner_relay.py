@@ -163,7 +163,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
         assert fake_runner.stream_calls[0][0] == "GET"
         assert (
             fake_runner.stream_calls[0][1]
-            == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
+            == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream?input_receipts=true"
         )
     finally:
         release.set()

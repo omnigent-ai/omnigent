@@ -382,7 +382,7 @@ class HandoffProxy:
                             events = decoder.feed(frame["body"]) if decoder is not None else []
                             if events:
                                 self.note("runner_events", target=target, events=events)
-                            if any(
+                            if self.drop_status is not None and any(
                                 e.get("type") == "session.status"
                                 and e.get("status") == self.drop_status
                                 for e in events
@@ -489,7 +489,14 @@ class HandoffProxy:
 class HandoffLab:
     """Two real servers, a host, one SDK runner, and the checkout's web client."""
 
-    def __init__(self, root: Path, model_url: str, resources: ExitStack) -> None:
+    def __init__(
+        self,
+        root: Path,
+        model_url: str,
+        resources: ExitStack,
+        *,
+        older_server_root: Path | None = None,
+    ) -> None:
         self.root = root
         self.model_url = model_url
         httpx.post(f"{model_url}/mock/reset", timeout=5, trust_env=False).raise_for_status()
@@ -515,11 +522,13 @@ class HandoffLab:
         self.b = resources.enter_context(
             server_runner(
                 root / "b",
-                server_env=env,
+                server_env=(
+                    {**env, "PYTHONPATH": str(older_server_root)} if older_server_root else env
+                ),
                 binding_token=token,
                 database_uri=self.a.database_uri,
                 artifact_location=self.a.artifact_location,
-                server_cwd=ROOT,
+                server_cwd=older_server_root or ROOT,
             )
         )
         self.proxy = HandoffProxy(self.a.base_url, root / "network.json")
@@ -710,9 +719,8 @@ class HandoffLab:
         return response.json()
 
     def handoff(self) -> None:
-        self.proxy.configure(target=self.b.base_url)
+        self.proxy.configure(target=self.b.base_url, refuse_tunnels=False)
         self.proxy.cut()
-        self.proxy.configure(refuse_tunnels=False)
         eventually(
             lambda: any(
                 record["target"] == self.b.base_url and "/runners/" in record["path"]
@@ -732,13 +740,15 @@ class HandoffLab:
 
 
 @contextmanager
-def handoff_lab(root: Path, model_url: str) -> Iterator[HandoffLab]:
+def handoff_lab(
+    root: Path, model_url: str, *, older_server_root: Path | None = None
+) -> Iterator[HandoffLab]:
     with ExitStack() as resources:
-        lab = HandoffLab(root, model_url, resources)
+        lab = HandoffLab(root, model_url, resources, older_server_root=older_server_root)
         try:
             yield lab
         finally:
-            for name in ("history", "runner_stream", "browser", "browser_connect", "updates"):
+            for name in lab.proxy.gates:
                 lab.proxy.gate(name, hold=False)
             lab.proxy.configure(refuse_tunnels=False)
             try:

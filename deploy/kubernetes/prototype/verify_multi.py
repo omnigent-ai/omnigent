@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import sys
 import time
 import traceback
 import uuid
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import httpx
-from verify import KEY_HEADER, command, start_log_follower, verify
+from verify import KEY_HEADER, ROOT, command, start_log_follower, verify
 
 
 def ready(pod: dict) -> bool:
@@ -30,7 +31,7 @@ def ready(pod: dict) -> bool:
     )
 
 
-async def run(args) -> None:
+async def run(args) -> bool:
     if urlsplit(args.url).hostname != "localhost":
         raise ValueError("Only the local prototype at localhost is supported")
     if args.replicas < 1 or args.hosts < args.replicas or args.hosts % args.replicas:
@@ -54,9 +55,13 @@ async def run(args) -> None:
         "rollouts_triggered": 0,
         "pod_samples": [],
     }
-    (args.output / "source-revision.txt").write_text(await command("git", "rev-parse", "HEAD"))
+    (args.output / "source-revision.txt").write_text(
+        await command("git", "-C", str(ROOT), "rev-parse", "HEAD")
+    )
     (args.output / "local-test-changes.patch").write_text(
-        await command("git", "diff", "--", "deploy/kubernetes/prototype/verify.py")
+        await command(
+            "git", "-C", str(ROOT), "diff", "--", "deploy/kubernetes/prototype/verify.py"
+        )
     )
     (args.output / "verify_multi.py").write_text(Path(__file__).read_text())
     deployment = json.loads(await command(*kube, "get", "deployment/omnigent", "-o", "json"))
@@ -277,6 +282,7 @@ async def run(args) -> None:
             flush=True,
         )
         print(f"Evidence: {args.output / 'summary.json'}", flush=True)
+    return summary["passed"]
 
 
 if __name__ == "__main__":
@@ -286,4 +292,4 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replicas", type=int, default=3)
     parser.add_argument("--hosts", type=int, default=6)
-    asyncio.run(run(parser.parse_args()))
+    sys.exit(0 if asyncio.run(run(parser.parse_args())) else 1)

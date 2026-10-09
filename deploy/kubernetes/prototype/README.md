@@ -119,7 +119,11 @@ Omnigent also needs to handle messages sent during this gap:
   the session stream. It also confirms prompts it accepted before losing
   the tunnel. A browser that reconnects later gets those confirmations when
   its stream opens. These receipts identify the prompt; they do not replay
-  transcript messages or clear another pending send.
+  transcript messages or clear another pending send. The runner retains the
+  most recent 1,000 receipts. It keeps older accepted IDs separately to prevent
+  duplicate work. A server opts in to receipt events each time it opens a
+  runner stream, so reconnecting to an older server does not send it an event
+  it cannot understand.
 - An SDK runner can finish a turn while its server connection is down. Its
   reconnect scan remembers which persisted message IDs it already accepted,
   queues missed messages, and keeps its local conversation history.
@@ -269,6 +273,7 @@ send function, recovery code, or event handling.
 | `stopped_turn` | After Stop and a completed later turn, reconnect recovery mistakes the interruption marker for a new prompt. |
 | `mirrored_history` | A transcript copied from another integration starts unsolicited model work when the runner reconnects. |
 | `lost_runner_ack` | The runner accepts the prompt, but its response to the server is lost before the browser receives an acceptance receipt. |
+| `older_server` | A new runner reconnects to an older server that cannot parse the new receipt event, closing the browser stream. |
 
 The terminal test advances the browser clock through the retry delays.
 
@@ -278,7 +283,11 @@ Install tmux and the test dependencies, then run from the repository root:
 uv sync --frozen --extra all --group test
 pnpm install --frozen-lockfile --filter web
 uv run --no-sync playwright install chromium
-OMNIGENT_E2E_REPLICA_HANDOFF=1 uv run --no-sync pytest \
+git worktree add --detach /tmp/omnigent-legacy-server \
+  9567b2bfc6c3f182e8ae43165c73bf0d64be9076
+OMNIGENT_E2E_REPLICA_HANDOFF=1 \
+OMNIGENT_E2E_LEGACY_SERVER_ROOT=/tmp/omnigent-legacy-server \
+uv run --no-sync pytest \
   tests/e2e/test_replica_handoff_e2e.py \
   tests/e2e_ui/chat/test_replica_handoff.py \
   --ui-skip-build --video=on --screenshot=on --tracing=on \
@@ -290,39 +299,12 @@ Use `-k lost_forward`, for example, to run one case in both suites. The
 videos, screenshots, traces, saved messages, model requests, and transport logs.
 These tests check individual recovery paths; the three-pod, six-host command
 above checks NGINX's actual endpoint reloads and Kubernetes rollout behavior.
+The compatibility case runs the checkout's server first, then moves the same
+runner to the pinned older server and reconnects it twice with the browser
+subscribed. The old server's application code is unchanged. The PR's Test Plan
+and Demo sections contain the recorded results and baseline comparisons.
 
-On 2026-10-09, all 22 tests passed on this branch. For ten cases, the same
-test and support files, copied without changes onto main at
-`9567b2bfc6c3f182e8ae43165c73bf0d64be9076`, produced 20 assertion failures and
-no setup errors. Main showed the send errors, extra model turns, stuck queued
-message, duplicate reply, stale host error, and terminal reconnect failure
-described above. The newer cases also reproduced execution of mirrored history
-and a send error after the runner had already accepted the prompt. Main's application code was unchanged for that comparison.
-The two Stop tests instead exposed a regression in the earlier PR commit
-`038a1934e`: both started an unsolicited model turn there and passed after the
-fix. The test files were unchanged between those runs too.
-
-## Results and limits
-
-The initial two-pod, one-host command-line check on 2026-10-09 passed with
-kind 0.31.0 and Kubernetes 1.32.2. Both server pods were replaced, the shell
-kept its process ID, the active turn completed, and the host launched another
-runner. Sampling
-file requests every 250 ms, the longest observed failure interval was
-**4.94 seconds for host requests** and **4.89 seconds for runner requests**.
-Requests to both were succeeding consistently at the end. These timings
-describe that run; they do not guarantee a maximum interruption.
-
-With the recovery changes described above and `minReadySeconds: 10`, six
-three-pod, six-host browser runs passed on the same day. They completed
-**165, 173, 172, 169, 170, and 167 turns**, respectively. The last run includes
-the lost-acknowledgement and mirrored-history fixes. Every prompt and reply was
-saved and rendered once, each turn made one model request, no browser showed
-an error, and all six sessions finished idle. Each run started with two hosts
-per pod, replaced all three pods, and completed two additional turns per host
-after the old pods were gone. The latest rollout took **53.55 seconds**, measured
-through deletion of the last old pod. Its longest turn, including the model
-response, took **3.96 seconds**. These observations do not guarantee availability.
+## Limits
 
 This is a local experiment with authentication disabled and disposable
 database credentials. The artifact volume is `ReadWriteOnce`: both server
