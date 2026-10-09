@@ -2128,6 +2128,103 @@ def test_list_conversations_search_snippet_uses_earliest_match(
     assert "second mention" not in snippet
 
 
+def _seed_sessions_for_literal_search(
+    store: SqlAlchemyConversationStore,
+) -> dict[str, str]:
+    """Create sessions only a literal substring search can tell apart, keyed by role."""
+
+    def _session(role: str, title: str, *texts: str) -> str:
+        conv = store.create_conversation()
+        store.update_conversation(conv.id, title=title)
+        if texts:
+            store.append(
+                conv.id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id=f"resp_{role}_{index}",
+                        data=MessageData(
+                            role="user",
+                            content=[{"type": "input_text", "text": text}],
+                        ),
+                    )
+                    for index, text in enumerate(texts)
+                ],
+            )
+        return conv.id
+
+    return {
+        "plain": _session("plain", "Plain prose", "innocent prose"),
+        "percent_title": _session("percent_title", "Progress 50% done"),
+        "percent_content": _session(
+            "percent_content", "Progress report", "innocent first", "literal 50% later"
+        ),
+        "underscore": _session("underscore", "file_name notes"),
+        "lookalike": _session("lookalike", "fileXname notes"),
+        "bang": _session("bang", "General chat", "deploy it now!"),
+        "backslash": _session("backslash", "Windows path", "path C:\\temp done"),
+        "no_backslash": _session("no_backslash", "Other path", "path C:temp done"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_roles"),
+    [
+        ("%", {"percent_title", "percent_content"}),
+        ("_", {"underscore"}),
+        ("file_name", {"underscore"}),
+        ("!", {"bang"}),
+        ("50%", {"percent_title", "percent_content"}),
+        ("% later", {"percent_content"}),
+        ("\\", {"backslash"}),
+        ("C:\\temp", {"backslash"}),
+        ("C:temp", {"no_backslash"}),
+        ("PROSE", {"plain"}),
+    ],
+    ids=[
+        "percent",
+        "underscore",
+        "underscore-in-word",
+        "bang",
+        "percent-in-word",
+        "percent-then-space",
+        "backslash",
+        "backslash-in-path",
+        "no-backslash",
+        "case-insensitive",
+    ],
+)
+def test_list_conversations_search_matches_like_metacharacters_literally(
+    conversation_store: SqlAlchemyConversationStore,
+    query: str,
+    expected_roles: set[str],
+) -> None:
+    """
+    ``%``, ``_`` and backslash in ``search_query`` match themselves, never as wildcards.
+    """
+    ids = _seed_sessions_for_literal_search(conversation_store)
+
+    page = conversation_store.list_conversations(search_query=query)
+
+    assert {c.id for c in page.data} == {ids[role] for role in expected_roles}
+
+
+def test_list_conversations_search_snippet_follows_literal_match(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``%`` previews the item literally containing ``%``; a title-only hit keeps no snippet.
+    """
+    ids = _seed_sessions_for_literal_search(conversation_store)
+
+    by_id = {c.id: c for c in conversation_store.list_conversations(search_query="%").data}
+
+    snippet = by_id[ids["percent_content"]].search_snippet
+    assert snippet is not None
+    assert "50% later" in snippet
+    assert by_id[ids["percent_title"]].search_snippet is None
+
+
 def test_list_conversations_excludes_archived_by_default(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

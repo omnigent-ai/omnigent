@@ -842,7 +842,9 @@ class ConversationStore(ABC):
             (``search_text``). ``None`` or empty string disables
             the filter. A conversation matches if its title
             contains the query OR any of its items' search text
-            does. Powers the sidebar's session search on
+            does; ``%``, ``_`` and backslash in the query are
+            literal characters, not ``LIKE`` wildcards. Powers
+            the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
         :param accessible_by: When set, filter to sessions the
             user has a direct grant on in ``session_permissions``.

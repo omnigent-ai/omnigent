@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, event, text
 from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
+    LIKE_ESCAPE_CHAR,
     _build_alembic_config,
     _get_current_db_revision,
     _get_head_db_revision,
@@ -39,6 +40,7 @@ from omnigent.db.utils import (
     set_lakebase_token_provider,
     shared_read_scope,
     strip_nul_bytes,
+    substring_like_pattern,
 )
 from omnigent.entities.conversation import (
     ErrorData,
@@ -1413,3 +1415,20 @@ def test_run_migrations_with_retry_rejects_bad_max_attempts() -> None:
     """max_attempts < 1 is a programming error, not a runtime retry."""
     with pytest.raises(ValueError, match="max_attempts"):
         run_migrations_with_retry("postgresql://x", max_attempts=0)
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("deploy", "%deploy%"),
+        ("50%", "%50!%%"),
+        ("file_name", "%file!_name%"),
+        ("done!", "%done!!%"),
+        ("C:\\temp", "%C:\\temp%"),
+        ("!%_", "%!!!%!_%"),
+    ],
+)
+def test_substring_like_pattern_escapes_like_metacharacters(query: str, expected: str) -> None:
+    """Escapes ``%``, ``_`` and the escape char; backslash stays literal under ``ESCAPE``."""
+    assert len(LIKE_ESCAPE_CHAR) == 1
+    assert substring_like_pattern(query) == expected
