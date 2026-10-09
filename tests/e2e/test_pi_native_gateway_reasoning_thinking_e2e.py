@@ -1,4 +1,4 @@
-"""CLI e2e: Pi must offer thinking levels for reasoning-capable gateway models.
+"""CLI e2e: Pi must enable thinking for reasoning-capable gateway models.
 
 Drives the reported user journey through the *real* ``omnigent pi`` CLI under a
 pseudo-TTY (pexpect), rendering the TUI with ``pyte``:
@@ -9,16 +9,22 @@ pseudo-TTY (pexpect), rendering the TUI with ``pyte``:
    surfaces (Claude on Anthropic Messages, GPT on OpenAI Responses, Gemini and
    DeepSeek on chat completions); a seeded MLflow catalog cache marks all of
    them reasoning-capable.
-2. Launch a pi-native session (``omnigent pi``) and open ``/thinking`` for the
+2. Launch a pi-native session (``omnigent pi``) and read the footer for the
    Claude model Pi boots with (the control).
-3. ``/model`` -> pick the GPT model -> ``/thinking``; repeat for Gemini.
+3. ``/model`` -> pick the GPT model -> read the footer; repeat for Gemini.
 
-Pi enables its thinking controls only for ``models.json`` entries flagged
-``reasoning: true``. On the buggy build Omnigent flags only ids containing
-``deepseek``/``claude``, so the GPT and Gemini pickers list only
-``off  No reasoning`` while Claude lists every level. The test asserts the
-GPT and Gemini pickers offer more than ``off``, so it fails on the buggy
-build and passes once the catalog capability drives the flag.
+Pi's status footer renders ``<model> • <level>`` (for example ``• medium`` or
+``• thinking off``) only for ``models.json`` entries flagged ``reasoning:
+true``; a non-reasoning model shows just ``<model>`` with no bullet. On the
+buggy build Omnigent flags only ids containing ``deepseek``/``claude``, so the
+GPT and Gemini footers drop the thinking indicator while Claude keeps it. The
+test asserts the GPT and Gemini footers still show the indicator, so it fails
+on the buggy build and passes once the catalog capability drives the flag.
+
+The footer indicator is the thinking surface available on every Pi build this
+suite runs against: the ``/thinking`` slash command only exists in newer Pi,
+while the footer reflects ``model.reasoning`` with no picker, model request, or
+network round-trip.
 
 Modelled on ``test_pi_native_gateway_claude_misroute_e2e.py`` (pexpect + fake
 ``HOME`` against ``omnigent pi``) and ``test_pi_native_model_scope_e2e.py``
@@ -74,16 +80,11 @@ WORKSPACE_MODEL_SERVICES: dict[str, list[str]] = {
     DEEPSEEK_MODEL: ["mlflow/v1/chat/completions"],
 }
 
-# Pi's /thinking picker rows (THINKING_DESCRIPTIONS in the Pi bundle).
-PI_THINKING_ROWS: dict[str, str] = {
-    "off": "No reasoning",
-    "minimal": "Very brief reasoning",
-    "low": "Light reasoning",
-    "medium": "Moderate reasoning",
-    "high": "Deep reasoning",
-    "xhigh": "Extra-high reasoning",
-    "max": "Maximum reasoning",
-}
+# Thinking levels Pi can render after the footer's bullet. Any of them (even
+# "thinking off") means Pi treats the model as reasoning-capable.
+PI_FOOTER_LEVELS: frozenset[str] = frozenset(
+    {"thinking off", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 
 
 class _WorkspaceHandler(BaseHTTPRequestHandler):
@@ -156,6 +157,26 @@ def write_fake_home(home: Path, workspace_url: str) -> None:
     )
     (home / ".databrickscfg").write_text(f"[repro]\nhost = {workspace_url}\ntoken = repro-token\n")
 
+    # Offline CI has no real ``databricks`` binary, but Pi resolves the gateway
+    # provider's apiKey by shelling out to ``databricks auth token``. Provide a
+    # stand-in on PATH that mints the fake profile's PAT the way a configured
+    # workstation's CLI would, so the auth command succeeds without network.
+    bin_dir = home / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    databricks_shim = bin_dir / "databricks"
+    databricks_shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "auth" ] && [ "$2" = "token" ]; then\n'
+        '  for arg in "$@"; do\n'
+        '    [ "$arg" = "--help" ] && { echo "Usage: databricks auth token"; exit 0; }\n'
+        "  done\n"
+        '  printf \'{"access_token": "repro-token"}\\n\'\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    databricks_shim.chmod(0o755)
+
     def row(reasoning: bool) -> dict[str, Any]:
         return {
             "mode": "chat",
@@ -203,6 +224,7 @@ def cli_env(home: Path) -> dict[str, str]:
         ),
         "TERM": "xterm-256color",
         "PROMPT_TOOLKIT_NO_CPR": "1",
+        "PATH": os.pathsep.join([str(home / "bin"), os.environ.get("PATH", "")]),
     }
     # The test suite disables catalog lookups; the runner must read the seeded
     # cache. Ambient Databricks credentials would shadow the fake profile.
@@ -291,8 +313,17 @@ def _footer_shows(model: str) -> Callable[[str], bool]:
     return lambda text: pattern.search(text) is not None
 
 
-def offered_thinking_levels(text: str) -> list[str]:
-    return [level for level, description in PI_THINKING_ROWS.items() if description in text]
+def footer_thinking_level(text: str, model: str) -> str | None:
+    """Return the thinking level Pi's footer advertises for *model*, or None.
+
+    Pi renders ``<model> • <level>`` only for reasoning-capable models; a
+    non-reasoning model shows ``<model>`` with no bullet, so None means Pi
+    believes the model cannot think.
+    """
+    match = re.search(re.escape(model) + r"[ \t]*•[ \t]*(thinking off|[a-z]+)", text)
+    if match and match.group(1) in PI_FOOTER_LEVELS:
+        return match.group(1)
+    return None
 
 
 def select_model(tui: PiTui, model: str) -> None:
@@ -306,22 +337,21 @@ def select_model(tui: PiTui, model: str) -> None:
     time.sleep(1)
 
 
-def read_thinking_picker(tui: PiTui) -> tuple[str, list[str]]:
-    """``/thinking`` -> read the rows Pi offers -> Escape."""
-    tui.send("/thinking\r")
-    tui.wait_for(
-        lambda text: PI_THINKING_ROWS["off"] in text, timeout=30, what="the thinking picker"
-    )
-    time.sleep(1)
-    tui._pump()
-    screen = tui.text()
-    levels = offered_thinking_levels(screen)
-    tui.send("\x1b")
-    tui.wait_for(
-        lambda text: PI_THINKING_ROWS["off"] not in text, timeout=30, what="the picker to close"
-    )
-    time.sleep(1)
-    return screen, levels
+def read_footer_thinking(tui: PiTui, model: str, *, settle: float = 8.0) -> str | None:
+    """Return the thinking level Pi's footer advertises for *model*.
+
+    Polls briefly so a reasoning-capable model's indicator has time to render,
+    then returns None if the footer never shows one (the reported bug).
+    """
+    deadline = time.monotonic() + settle
+    level: str | None = None
+    while time.monotonic() < deadline:
+        tui._pump()
+        level = footer_thinking_level(tui.text(), model)
+        if level is not None:
+            return level
+        time.sleep(0.2)
+    return level
 
 
 @pytest.fixture
@@ -339,7 +369,7 @@ def pi_home(tmp_path: Path, workspace_url: str) -> Path:
 
 
 def test_pi_native_gateway_reasoning_models_offer_thinking_levels(pi_home: Path) -> None:
-    """GPT and Gemini gateway models must offer thinking levels like Claude does."""
+    """GPT and Gemini gateway models must enable thinking like Claude does."""
     env = cli_env(pi_home)
     dump_dir = (
         Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR") or pi_home.parent) / "pi-thinking-screens"
@@ -357,20 +387,20 @@ def test_pi_native_gateway_reasoning_models_offer_thinking_levels(pi_home: Path)
         timeout=_LAUNCH_TIMEOUT,
     )
     tui = PiTui(child)
-    offered: dict[str, list[str]] = {}
+    thinking: dict[str, str | None] = {}
     try:
         tui.wait_raw(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT, what="its 'Web UI:' line")
         # Pi boots with the workspace's Claude model selected.
         tui.wait_for(_footer_shows(CLAUDE_MODEL), timeout=_LAUNCH_TIMEOUT, what="the Pi TUI")
-        time.sleep(5)  # let the tmux attach settle before typing
+        time.sleep(5)  # let the tmux attach settle before reading the footer
 
-        screen, offered["claude"] = read_thinking_picker(tui)
-        (dump_dir / "thinking-claude.txt").write_text(screen)
+        thinking["claude"] = read_footer_thinking(tui, CLAUDE_MODEL)
+        (dump_dir / "footer-claude.txt").write_text(tui.text())
 
         for name, model in (("gpt", GPT_MODEL), ("gemini", GEMINI_MODEL)):
             select_model(tui, model)
-            screen, offered[name] = read_thinking_picker(tui)
-            (dump_dir / f"thinking-{name}.txt").write_text(screen)
+            thinking[name] = read_footer_thinking(tui, model)
+            (dump_dir / f"footer-{name}.txt").write_text(tui.text())
     finally:
         with contextlib.suppress(Exception):
             child.kill(signal.SIGTERM)
@@ -379,13 +409,13 @@ def test_pi_native_gateway_reasoning_models_offer_thinking_levels(pi_home: Path)
             child.kill(signal.SIGKILL)
         stop_local_server(env)
 
-    assert offered["claude"] != ["off"], (
-        f"control failed: Pi offered only {offered['claude']} for {CLAUDE_MODEL}; "
-        f"thinking is unavailable for every model, not only non-Claude ones (screens: {dump_dir})"
+    assert thinking["claude"] is not None, (
+        f"control failed: Pi's footer showed no thinking indicator for {CLAUDE_MODEL}; "
+        f"thinking looks disabled for every model, not just non-Claude ones. Screens: {dump_dir}"
     )
-    disabled = {name: levels for name, levels in offered.items() if levels == ["off"]}
+    disabled = sorted(name for name, level in thinking.items() if level is None)
     assert not disabled, (
-        "Pi shows thinking disabled for reasoning-capable gateway models: "
-        f"{disabled} (/thinking offers only 'off  No reasoning'), while "
-        f"{CLAUDE_MODEL} offers {offered['claude']}. Screens: {dump_dir}"
+        f"Pi shows thinking disabled for reasoning-capable gateway models {disabled}: "
+        f"their footers lack the ' • <level>' indicator that {CLAUDE_MODEL} shows "
+        f"('• {thinking['claude']}'). Screens: {dump_dir}"
     )
