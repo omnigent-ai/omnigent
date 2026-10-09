@@ -309,6 +309,54 @@ uv run python deploy/databricks/deploy.py --no-otel ...
 > deploy warns when `--no-otel` is paired with a target that lacks those
 > overrides, since OTel then stays on.
 
+## Server-managed Databricks Sandboxes
+
+The `databricks` sandbox provider runs managed sessions (`host_type: "managed"`, or
+the Web UI's New Sandbox option) in [Databricks
+Sandbox](https://docs.databricks.com/aws/en/compute/serverless/sandbox) over the
+workspace REST API. The Sandbox preview must be enabled in the workspace.
+
+> [!NOTE]
+> The Databricks Apps entry point (`src/app.py`) does not yet pass the server
+> config's `sandbox:` section or Databricks Connect to `create_app`
+> ([#8878](https://github.com/omnigent-ai/omnigent/issues/8878)). Until it does,
+> configure this on a server started with `omnigent server -c config.yaml`.
+
+```yaml
+sandbox:
+  provider: databricks
+  server_url: https://your-host        # public URL the Sandbox host dials back to
+  databricks:
+    identity: owner                    # or "server" (the default)
+    workspace_host: https://<workspace>.cloud.databricks.com   # optional pin
+    proxy_bearer: true                 # only behind the Databricks Apps OAuth proxy
+    inactivity_timeout_s: 3600         # optional idle stop; resumed on the next turn
+    sandbox_id_prefix: omnigent        # optional
+```
+
+**Identity.** With `identity: server`, every Sandbox is created and driven by the
+server's own Databricks identity (`sandbox.databricks.profile`, or `DATABRICKS_*`
+env). Sandboxes then share one owner, so use it only for single-tenant servers.
+
+With `identity: owner`, each Sandbox is created and driven by the user who started
+the session, with the token they connected under **Settings → Connections →
+Databricks**. The token inside the Sandbox and its proxy bearer are that user's,
+and the server's identity cannot `get` or `exec` the Sandbox. A user who has not
+connected is refused with a "Connect Databricks first" message: no Sandbox is
+created and nothing falls back to the server identity. `workspace_host` refuses a
+connection to any other workspace. `profile` cannot be combined with `owner`.
+
+`identity: owner` needs [Databricks Connect](../../designs/DATABRICKS_CONNECT.md)
+configured on the server: an account-level [custom OAuth app
+integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
+with the redirect URL `<server_url>/v1/connections/databricks/callback` and the
+scopes `all-apis offline_access`. Its client id and secret go in
+`OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`.
+
+**Stop and resume.** A Sandbox stopped by its idle timeout is started in place on
+the session's next turn, and its host is re-bootstrapped. The keepalive refreshes
+the proxy bearer while a runner is connected.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

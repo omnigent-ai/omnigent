@@ -38,7 +38,7 @@ from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKE
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
@@ -398,6 +398,18 @@ class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
     Resumable providers use this only for a definitive absence, never for a
     timeout, connectivity failure, or unknown state. The managed-host wake path
     catches it and provisions a fresh sandbox generation instead.
+    """
+
+
+class OwnerCredentialMissingError(click.ClickException, _sandbox_types.SandboxError):
+    """Raised when an owner-identity launcher has no credential for the host's owner.
+
+    An owner-identity launcher (:attr:`SandboxHostLauncher.owner_credential_provider`)
+    acts on the provider *as the user who owns the host*, never as the server.
+    When that user has not connected the provider (or the server has no
+    connection flow for it), the launcher refuses with this error rather than
+    falling back to a shared server identity. The message tells the user what
+    to connect.
     """
 
 
@@ -926,6 +938,33 @@ class SandboxHostLauncher(SandboxLifecycle):
     def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
         """Bind credentials needed for background cleanup in one workspace."""
         return nullcontext()
+
+    @property
+    def owner_credential_provider(self) -> str | None:
+        """
+        Per-user connection provider this launcher acts as, or ``None``.
+
+        ``None`` (the default) means the launcher uses one deployment-wide
+        identity. A name such as ``"databricks"`` means every provider call is
+        made *as the host's owner* with the credential that user connected
+        under that provider; the server then binds a resolver with
+        :meth:`bind_owner_credential` before using the launcher.
+        """
+        return None
+
+    def bind_owner_credential(self, resolve: Callable[[], Mapping[str, object] | None]) -> None:
+        """
+        Bind the resolver for the host owner's credential.
+
+        Called once per launcher, right after the factory builds it, only when
+        :attr:`owner_credential_provider` is set. *resolve* returns the
+        owner's current credential payload (``{"token": ..., ...}``), refreshed
+        server-side, or ``None`` when the owner has not connected; it may block
+        (store read, token refresh) and is only called from worker threads.
+
+        :param resolve: Zero-argument resolver for this host's owner.
+        """
+        del resolve
 
     @abstractmethod
     def start_host(

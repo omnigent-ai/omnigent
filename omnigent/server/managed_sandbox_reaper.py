@@ -203,14 +203,24 @@ class ManagedSandboxReaper:
                 return 0
 
             reaped = 0
+            # An owner-identity launcher acts as one user; each candidate host
+            # may belong to a different owner, so bind per candidate.
+            per_owner = getattr(launcher, "owner_credential_provider", None) is not None
             with launcher.reaper_identity(workspace_id):
                 for candidate in candidates:
+                    acting = (
+                        _launcher_for_teardown(candidate, self._sandbox_config)
+                        if per_owner
+                        else launcher
+                    )
+                    if acting is None:
+                        continue
                     try:
                         if candidate.deleted_at is not None:
                             sandbox_id = candidate.terminating_sandbox_id or candidate.sandbox_id
                             if sandbox_id is None:
                                 continue
-                            launcher.terminate(sandbox_id)
+                            acting.terminate(sandbox_id)
                             if self._host_store.mark_sandbox_terminated(
                                 candidate.host_id,
                                 sandbox_id=sandbox_id,
@@ -236,7 +246,7 @@ class ManagedSandboxReaper:
                                 candidate.host_id,
                             )
                             continue
-                        launcher.terminate(sandbox_id)
+                        acting.terminate(sandbox_id)
                         if self._host_store.mark_sandbox_terminated(
                             candidate.host_id,
                             sandbox_id=sandbox_id,

@@ -22,18 +22,28 @@ _logger = logging.getLogger(__name__)
 # mid-launch (or shortly after) inside the sandbox.
 _REFRESH_MARGIN_S = 300
 
+# Margin for the managed-sandbox owner identity (``sandbox.databricks.identity:
+# owner``). The token the server acts with is also written into the sandbox as
+# its front-door proxy bearer, refreshed by the keepalive every ~10 minutes, so
+# it must stay valid for longer than one keepalive interval.
+OWNER_IDENTITY_REFRESH_MARGIN_S = 900
+
 
 async def resolve_databricks_token(
     user_id: str,
     *,
     store: DatabricksConnectionStore,
     client: DatabricksAppClient,
+    refresh_margin_s: int = _REFRESH_MARGIN_S,
 ) -> tuple[str, str] | None:
     """Resolve a valid ``(access_token, workspace_host)`` for *user_id*, or ``None``.
 
     Reads the stored connection and transparently refreshes a token at/near
     expiry (persisting the refresh, workspace-scoped). Best-effort: any failure
     (no connection, no refresh token, refresh rejected) returns ``None``.
+
+    :param refresh_margin_s: Refresh when the token expires within this many
+        seconds, so the returned token stays valid at least that long.
     """
     connection = await _run_sync(store.get, user_id, with_tokens=True)
     if connection is None or not connection.access_token or not connection.workspace_host:
@@ -41,7 +51,7 @@ async def resolve_databricks_token(
     access_token = connection.access_token
     workspace_host = connection.workspace_host
     expires_at = connection.token_expires_at
-    if expires_at is not None and expires_at <= now_epoch() + _REFRESH_MARGIN_S:
+    if expires_at is not None and expires_at <= now_epoch() + refresh_margin_s:
         if not connection.refresh_token:
             return None
         try:
@@ -59,6 +69,7 @@ async def resolve_databricks_credential(
     *,
     store: DatabricksConnectionStore,
     client: DatabricksAppClient,
+    refresh_margin_s: int = _REFRESH_MARGIN_S,
 ) -> dict[str, object] | None:
     """Resolve the Databricks broker payload for *user_id*, or ``None``.
 
@@ -69,7 +80,9 @@ async def resolve_databricks_credential(
     Databricks. Mirrors
     :func:`omnigent.server.github_identity.resolve_github_credential`.
     """
-    resolved = await resolve_databricks_token(user_id, store=store, client=client)
+    resolved = await resolve_databricks_token(
+        user_id, store=store, client=client, refresh_margin_s=refresh_margin_s
+    )
     if resolved is None:
         return None
     access_token, workspace_host = resolved

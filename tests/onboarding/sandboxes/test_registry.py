@@ -345,3 +345,11 @@ def test_instantiate_rejects_non_launcher_class(
 
     with pytest.raises(SandboxRegistryError, match="not a SandboxHostLauncher subclass"):
         instantiate("not-a-launcher")
+
+
+def test_databricks_provider_is_builtin_and_instantiates_without_extras() -> None:
+    """The REST launcher needs no optional SDK beyond the databricks extra."""
+    reset_plugin_state_for_tests()
+    assert "databricks" in available_providers()
+    launcher = instantiate("databricks")
+    assert launcher.provider == "databricks"

@@ -615,3 +615,74 @@ async def test_identity_and_termination_run_off_event_loop_thread() -> None:
     assert await reaper.sweep_once(now=now) == 1
     assert modal.identity_threads == modal.termination_threads
     assert modal.identity_threads[0] != event_loop_thread
+
+
+class _OwnerLauncher(_RecordingLauncher):
+    """An owner-identity launcher: each instance acts as whoever it is bound to."""
+
+    owner_credential_provider = "databricks"
+
+    def __init__(self, built: list[_OwnerLauncher]) -> None:
+        super().__init__("databricks")
+        self.owner: str | None = None
+        built.append(self)
+
+    def bind_owner_credential(self, resolve: Callable[[], object]) -> None:
+        resolve()
+
+    def terminate(self, sandbox_id: str) -> None:
+        self.terminated.append(f"{self.owner}:{sandbox_id}")
+
+
+async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
+    now = 4_000_000
+    built: list[_OwnerLauncher] = []
+    hosts = _FakeHostStore(
+        {
+            7: [
+                replace(
+                    _host(
+                        "h_a",
+                        provider="databricks",
+                        sandbox_id="sb-a",
+                        updated_at=now - 2 * _DAY_S,
+                    ),
+                    user_id="alice",
+                ),
+                replace(
+                    _host(
+                        "h_b",
+                        provider="databricks",
+                        sandbox_id="sb-b",
+                        updated_at=now - 3 * _DAY_S,
+                    ),
+                    user_id="bob",
+                ),
+            ]
+        }
+    )
+    current: dict[str, _OwnerLauncher] = {}
+
+    def resolve(user: str) -> None:
+        # Record which owner the most recently built launcher was bound to.
+        built[-1].owner = user
+        current[user] = built[-1]
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=lambda: _OwnerLauncher(built),  # type: ignore[arg-type]
+                token_ttl_s=3600,
+                provider="databricks",
+            ),
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True, terminate_after_offline_days=1),
+        owner_credentials={"databricks": resolve},
+    )
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=deployment)  # type: ignore[arg-type]
+
+    assert await reaper.sweep_once(now=now) == 2
+
+    assert current["alice"].terminated == ["alice:sb-a"]
+    assert current["bob"].terminated == ["bob:sb-b"]

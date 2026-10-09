@@ -207,7 +207,12 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                 host.sandbox_provider
             )
             try:
-                extended = config.launcher_factory().keep_alive(host.sandbox_id)
+                # Owner-identity launchers (e.g. Databricks) refresh with the
+                # host owner's own credential, never a server identity.
+                from omnigent.server.managed_hosts import build_owner_launcher
+
+                launcher = build_owner_launcher(config, deployment, host.user_id)
+                extended = launcher.keep_alive(host.sandbox_id)
                 # INFO from the server layer so the keepalive is visible in the
                 # server log (onboarding-layer loggers do not surface there); the
                 # provider logs the new deadline at debug. A provider returns

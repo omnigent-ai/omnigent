@@ -33,8 +33,8 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|
-         # kubernetes|microsandbox|gensee
+         # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
+         # e2b|openshell|kubernetes|microsandbox|gensee
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -142,7 +142,16 @@ stores into ``create_app``):
    or ``sandbox.openshell.cluster``), so the server process needs
    OpenShell gateway access. The microsandbox launcher needs no
    credentials at all: VMs run embedded on the server host itself
-   (Apple Silicon macOS / KVM Linux). Every provider except
+   (Apple Silicon macOS / KVM Linux). The ``databricks`` launcher uses
+   the workspace REST API through ``databricks-sdk`` credential resolution
+   (``sandbox.databricks.profile``, or ``DATABRICKS_*`` env such as a
+   Databricks App's service principal); behind the Databricks Apps OAuth
+   proxy set ``sandbox.databricks.proxy_bearer: true`` (see
+   :mod:`omnigent.util.proxy_bearer`). ``sandbox.databricks.identity:
+   owner`` instead runs each sandbox as the user who owns it, through that
+   user's Databricks Connect credential (``OMNIGENT_DATABRICKS_CLIENT_ID``
+   / ``_CLIENT_SECRET``); optionally pin ``sandbox.databricks.workspace_host``.
+   Every provider except
    ``lakebox`` has managed-launch support; ``lakebox`` parses but
    rejects at launch.
 
@@ -184,7 +193,7 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
-from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError, SandboxGoneError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -207,6 +216,7 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
     {
         "lakebox",
+        "databricks",
         "modal",
         "daytona",
         "blaxel",
@@ -223,6 +233,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
     {
+        "databricks",
         "modal",
         "daytona",
         "blaxel",
@@ -280,6 +291,9 @@ BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # The seven-day policy keeps live VMs reconnecting while stale tokens expire.
 # A relaunch mints a fresh token.
 MICROSANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML databricks path (resumable sandboxes).
+DATABRICKS_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are
 # deleted by managed-session teardown; use the same 7-day policy bound
@@ -672,11 +686,23 @@ class ManagedSandboxDeployment:
         default a request that names no provider gets.
     :param reaper: One deployment-wide reaper policy shared by every
         configured provider.
+    :param owner_credentials: Per-user credential resolvers keyed by
+        connection provider name, e.g. ``{"databricks": resolve}`` where
+        ``resolve(user_id)`` returns that user's current connected credential
+        payload (``{"token": ..., "workspace_host": ...}``) or ``None``. Filled
+        in by ``create_app`` from the configured connection providers; a
+        launcher whose :attr:`~omnigent.onboarding.sandboxes.base.
+        SandboxHostLauncher.owner_credential_provider` names one of them is
+        bound to the host owner's resolver (:func:`build_owner_launcher`).
+        Resolvers block and are only called from worker threads.
     """
 
     configs: tuple[ManagedSandboxConfig, ...]
     reaper: ManagedSandboxReaperConfig = dataclass_field(
         default_factory=ManagedSandboxReaperConfig
+    )
+    owner_credentials: Mapping[str, Callable[[str], Mapping[str, object] | None]] = (
+        dataclass_field(default_factory=dict)
     )
 
     def __post_init__(self) -> None:
@@ -1542,6 +1568,47 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # Derived from OMNIGENT_CWSANDBOX_MAX_LIFETIME_S so the token always
         # outlives the (operator-overridable) sandbox lifetime.
         token_ttl_s = managed_token_ttl_s()
+    elif provider == "databricks":
+        section = _parse_provider_section(raw, "databricks")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {
+                    "profile",
+                    "sandbox_id_prefix",
+                    "inactivity_timeout_s",
+                    "bootstrap_command",
+                    "proxy_bearer",
+                    "identity",
+                    "workspace_host",
+                },
+                "sandbox.databricks",
+            )
+        identity = _parse_provider_string(raw, "databricks", "identity") or "server"
+        if identity not in ("server", "owner"):
+            raise ValueError(
+                f"sandbox.databricks.identity must be 'server' or 'owner', got {identity!r}"
+            )
+        databricks_profile = _parse_provider_string(raw, "databricks", "profile")
+        if identity == "owner" and databricks_profile:
+            raise ValueError(
+                "sandbox.databricks.identity 'owner' runs every sandbox as its owner; "
+                "remove sandbox.databricks.profile"
+            )
+        launcher_factory = _databricks_launcher_factory(
+            profile=databricks_profile,
+            sandbox_id_prefix=_parse_provider_string(raw, "databricks", "sandbox_id_prefix"),
+            inactivity_timeout_s=_parse_provider_positive_int(
+                raw, "databricks", "inactivity_timeout_s"
+            ),
+            bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
+            proxy_bearer=bool(_parse_provider_bool(raw, "databricks", "proxy_bearer")),
+            identity=identity,
+            workspace_host=_parse_provider_string(raw, "databricks", "workspace_host"),
+        )
+        # Sandboxes stop on idle and resume under the same id; the token must
+        # outlive an idle weekend. A wake re-arms a fresh token anyway.
+        token_ttl_s = DATABRICKS_MANAGED_TOKEN_TTL_S
     elif provider == "islo":
         launcher_factory = _islo_launcher_factory(
             image=_parse_provider_image(raw, "islo"),
@@ -2351,6 +2418,34 @@ def _parse_islo_idle_pause_after_s(raw: dict[str, object]) -> int | None:
             "server config 'sandbox.islo.idle_pause_after_s' must be a positive integer or null"
         )
     return value
+
+
+def _databricks_launcher_factory(
+    *,
+    profile: str | None,
+    sandbox_id_prefix: str | None,
+    inactivity_timeout_s: int | None,
+    bootstrap_command: str | None,
+    proxy_bearer: bool = False,
+    identity: str = "server",
+    workspace_host: str | None = None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: databricks`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+
+        return DatabricksSandboxLauncher(
+            profile=profile,
+            sandbox_id_prefix=sandbox_id_prefix,
+            inactivity_timeout_s=inactivity_timeout_s,
+            bootstrap_command=bootstrap_command,
+            proxy_bearer=proxy_bearer,
+            identity="owner" if identity == "owner" else "server",
+            workspace_host=workspace_host,
+        )
+
+    return _build
 
 
 def _islo_launcher_factory(
@@ -3436,6 +3531,40 @@ def _select_provider_config(
     return selected
 
 
+def build_owner_launcher(
+    entry: ManagedSandboxConfig,
+    deployment: ManagedSandboxDeployment | None,
+    owner: str,
+) -> SandboxHostLauncher:
+    """
+    Build *entry*'s launcher, bound to *owner*'s credential when it needs one.
+
+    The single place a managed-host path turns a provider config into a
+    launcher. A launcher that acts as the host's owner (its
+    ``owner_credential_provider`` names a connection provider, e.g.
+    ``"databricks"``) is bound to the deployment's resolver for that provider,
+    curried with *owner*. With no resolver (the server has no connect flow for
+    that provider) the launcher stays unbound and refuses at first use with
+    :class:`~omnigent.onboarding.sandboxes.base.OwnerCredentialMissingError` —
+    there is never a fallback to a shared server identity.
+
+    :param entry: The provider config to build from.
+    :param deployment: The deployment whose ``owner_credentials`` to bind
+        from, or ``None``.
+    :param owner: The host owner (the session creator), e.g.
+        ``"alice@example.com"``.
+    :returns: A ready launcher.
+    """
+    launcher = entry.launcher_factory()
+    # getattr: embedding deployments may inject duck-typed launchers.
+    needed = getattr(launcher, "owner_credential_provider", None)
+    if needed is not None and deployment is not None:
+        resolver = deployment.owner_credentials.get(needed)
+        if resolver is not None:
+            launcher.bind_owner_credential(partial(resolver, owner))
+    return launcher
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3493,7 +3622,7 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
-    launcher = entry.launcher_factory()
+    launcher = build_owner_launcher(entry, config, owner)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
@@ -3504,6 +3633,9 @@ async def launch_managed_host(
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+    except OwnerCredentialMissingError as exc:
+        # The user must act (connect the provider); not a backend failure.
+        raise HTTPException(status_code=409, detail=exc.message) from exc
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3596,6 +3728,8 @@ async def relaunch_managed_host(
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+    except OwnerCredentialMissingError as exc:
+        raise HTTPException(status_code=409, detail=exc.message) from exc
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3917,7 +4051,7 @@ def _launcher_for_teardown(
         return None
     entry = config.recorded(host.sandbox_provider)
     try:
-        launcher = entry.launcher_factory()
+        launcher = build_owner_launcher(entry, config, host.user_id)
     except HTTPException:
         # The YAML path's unsupported-provider factory raises; there is
         # no launcher to terminate with.
@@ -4128,6 +4262,8 @@ async def resume_managed_host(
             # is the user's); just surface it. Full teardown is handled above.
             if isinstance(exc, HTTPException):
                 raise
+            if isinstance(exc, OwnerCredentialMissingError):
+                raise HTTPException(status_code=409, detail=exc.message) from exc
             message = exc.message if isinstance(exc, click.ClickException) else str(exc)
             raise HTTPException(
                 status_code=502, detail=f"managed host wake failed: {message}"
