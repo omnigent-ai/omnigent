@@ -111,7 +111,7 @@ function toMCPInputs(entries: MCPFormEntry[]): MCPServerInput[] | undefined {
   return result.length > 0 ? result : undefined;
 }
 
-/** The new-chat dialog and Settings share the same creation fields. */
+/** Collect a draft for a new session, or import an installed agent bundle. */
 export function CreateAgentDialog({
   open,
   onOpenChange,
@@ -124,15 +124,49 @@ export function CreateAgentDialog({
   /** Install a picked bundle; rejects with a user-facing message on failure. */
   onImport?: (bundle: File) => Promise<void>;
 }) {
+  const fields = useAgentFormFields();
   const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function reset() {
+    fields.reset();
+    setImportError(null);
+  }
+
+  function handleOpenChange(next: boolean) {
+    // Stay open while an import is in flight so its result lands somewhere.
+    if (!next && importing) return;
+    if (!next) reset();
+    onOpenChange(next);
+  }
+
+  function handleSubmit() {
+    if (!AGENT_NAME_PATTERN.test(fields.name.trim())) return;
+    onCreate(fields.toInput());
+    reset();
+    onOpenChange(false);
+  }
+
+  async function handleImport(bundle: File | undefined) {
+    if (!bundle || !onImport) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      await onImport(bundle);
+      reset();
+      onOpenChange(false);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setImporting(false);
+      // Clear so re-picking the same file after a fix fires onChange again.
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next && importing) return;
-        onOpenChange(next);
-      }}
-    >
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
         data-testid="create-agent-dialog"
         className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
@@ -140,45 +174,123 @@ export function CreateAgentDialog({
         <DialogHeader>
           <DialogTitle>Create custom agent</DialogTitle>
         </DialogHeader>
-        <CreateAgentForm
-          onCreate={(input) => {
-            onCreate(input);
-            onOpenChange(false);
-          }}
-          onCancel={() => onOpenChange(false)}
-          onImport={
-            onImport
-              ? async (bundle) => {
-                  setImporting(true);
-                  try {
-                    await onImport(bundle);
-                  } finally {
-                    setImporting(false);
-                  }
-                }
-              : undefined
-          }
-        />
+
+        {/* px-1/-mx-1 give the fields' 3px focus ring room to paint:
+            overflow-y-auto also clips horizontally at the padding box. */}
+        <div className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
+          <AgentFormFields {...fields} />
+        </div>
+
+        {importError && (
+          <p
+            data-testid="create-agent-import-error"
+            role="alert"
+            className="text-sm text-destructive"
+          >
+            {importError}
+          </p>
+        )}
+
+        <DialogFooter>
+          {onImport && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".tar.gz,.tgz,application/gzip"
+                className="hidden"
+                data-testid="create-agent-import-input"
+                onChange={(e) => void handleImport(e.target.files?.[0])}
+              />
+              <Button
+                variant="outline"
+                className="sm:mr-auto"
+                disabled={importing}
+                data-testid="create-agent-import"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <UploadIcon className="size-3.5" />
+                {importing ? "Importing…" : "Import bundle"}
+              </Button>
+            </>
+          )}
+          <Button variant="ghost" disabled={importing} onClick={() => handleOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            data-testid="create-agent-submit"
+            onClick={handleSubmit}
+            disabled={!fields.canSubmit || importing}
+          >
+            Create
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
 }
 
+/** Settings saves persist the agent and keep the draft available on failure. */
 export function CreateAgentForm({
   onCreate,
   onCancel,
-  onImport,
   notice,
   submitLabel = "Create",
 }: {
   onCreate: (input: AgentBundleInput) => void | Promise<void>;
   onCancel: () => void;
-  onImport?: (bundle: File) => Promise<void>;
   notice?: string;
   submitLabel?: string;
 }) {
+  const fields = useAgentFormFields();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    if (pending || !fields.canSubmit) return;
+    setPending(true);
+    setError(null);
+    try {
+      await onCreate(fields.toInput());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the agent.");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <form onSubmit={(event) => void handleSubmit(event)} className="flex min-h-0 flex-col gap-4">
+      {notice && <p className="text-ui text-muted-foreground">{notice}</p>}
+      <div className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
+        <fieldset disabled={pending} className="contents">
+          <AgentFormFields {...fields} />
+        </fieldset>
+      </div>
+      {error && (
+        <p role="alert" className="text-ui text-destructive">
+          {error}
+        </p>
+      )}
+      <DialogFooter>
+        <Button type="button" variant="ghost" onClick={onCancel} disabled={pending}>
+          Cancel
+        </Button>
+        <Button
+          type="submit"
+          data-testid="create-agent-submit"
+          loading={pending}
+          disabled={!fields.canSubmit || pending}
+        >
+          {submitLabel}
+        </Button>
+      </DialogFooter>
+    </form>
+  );
+}
+
+function useAgentFormFields() {
   const brainHarnessLabels = useBrainHarnessLabels();
   const harnessOptions = Object.entries(brainHarnessLabels).map(([value, label]) => ({
     value,
@@ -191,9 +303,16 @@ export function CreateAgentForm({
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
-  const [importing, setImporting] = useState(false);
-  const [importError, setImportError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function reset() {
+    setName("");
+    setDescription("");
+    setInstructions("");
+    setHarness(DEFAULT_HARNESS);
+    setModel("");
+    setMcpEntries([]);
+    setNextKey(0);
+  }
 
   function addMCPServer() {
     setMcpEntries((prev) => [...prev, emptyMCPEntry(nextKey)]);
@@ -208,245 +327,189 @@ export function CreateAgentForm({
     setMcpEntries((prev) => prev.map((e) => (e.key === key ? { ...e, ...patch } : e)));
   }
 
-  async function handleSubmit(event: React.FormEvent) {
-    event.preventDefault();
-    if (pending || importing || !canSubmit) return;
-    setPending(true);
-    setError(null);
-    try {
-      await onCreate({
-        name: name.trim(),
-        description: description.trim() || undefined,
-        instructions: instructions.trim() || undefined,
-        harness,
-        model: model.trim(),
-        mcpServers: toMCPInputs(mcpEntries),
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save the agent.");
-    } finally {
-      setPending(false);
-    }
-  }
-
   const nameInvalid = name.trim().length > 0 && !AGENT_NAME_PATTERN.test(name.trim());
   const canSubmit = AGENT_NAME_PATTERN.test(name.trim()) && model.trim().length > 0;
 
-  async function handleImport(bundle: File | undefined) {
-    if (!bundle || !onImport || pending || importing) return;
-    setImporting(true);
-    setImportError(null);
-    try {
-      await onImport(bundle);
-      onCancel();
-    } catch (err) {
-      setImportError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setImporting(false);
-      // Clear so re-picking the same file after a fix fires onChange again.
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
+  function toInput(): AgentBundleInput {
+    return {
+      name: name.trim(),
+      description: description.trim() || undefined,
+      instructions: instructions.trim() || undefined,
+      harness,
+      model: model.trim(),
+      mcpServers: toMCPInputs(mcpEntries),
+    };
   }
 
+  return {
+    name,
+    setName,
+    description,
+    setDescription,
+    instructions,
+    setInstructions,
+    harness,
+    setHarness,
+    harnessOptions,
+    model,
+    setModel,
+    mcpEntries,
+    addMCPServer,
+    removeMCPServer,
+    updateMCPEntry,
+    nameInvalid,
+    canSubmit,
+    reset,
+    toInput,
+  };
+}
+
+function AgentFormFields({
+  name,
+  setName,
+  description,
+  setDescription,
+  instructions,
+  setInstructions,
+  harness,
+  setHarness,
+  harnessOptions,
+  model,
+  setModel,
+  mcpEntries,
+  addMCPServer,
+  removeMCPServer,
+  updateMCPEntry,
+  nameInvalid,
+}: ReturnType<typeof useAgentFormFields>) {
   return (
-    <form onSubmit={(event) => void handleSubmit(event)} className="flex min-h-0 flex-col gap-4">
-      {notice && <p className="text-ui text-muted-foreground">{notice}</p>}
-      {/* px-1/-mx-1 give the fields' 3px focus ring room to paint:
-            overflow-y-auto also clips horizontally at the padding box. */}
-      <div className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
-        <fieldset disabled={pending || importing} className="contents">
-          {/* Name */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-name"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              Name <span className="text-destructive">*</span>
-            </label>
-            <Input
-              id="create-agent-name"
-              data-testid="create-agent-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              required
-              pattern="[a-zA-Z0-9_\-]+"
-              title="Use letters, numbers, hyphens, and underscores."
-              placeholder="my-agent"
-              aria-invalid={nameInvalid || undefined}
-              aria-describedby={nameInvalid ? "create-agent-name-error" : undefined}
-              autoFocus
-            />
-            {nameInvalid && (
-              <p
-                id="create-agent-name-error"
-                data-testid="create-agent-name-error"
-                className="text-xs text-destructive"
-              >
-                Use only letters, numbers, hyphens, and underscores.
-              </p>
-            )}
-          </div>
-
-          {/* Description */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-description"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              Description
-            </label>
-            <Input
-              id="create-agent-description"
-              data-testid="create-agent-description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="A short summary of what this agent does"
-            />
-          </div>
-
-          {/* Harness */}
-          <div className="flex flex-col gap-1.5">
-            <label className="text-sm font-medium text-muted-foreground">
-              Harness <span className="text-destructive">*</span>
-            </label>
-            <Select
-              value={harness}
-              onValueChange={setHarness}
-              componentId="create_agent.harness"
-              valueHasNoPii
-            >
-              <SelectTrigger
-                aria-label="Harness"
-                data-testid="create-agent-harness"
-                className="w-full"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {harnessOptions.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Model */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-model"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              Model <span className="text-destructive">*</span>
-            </label>
-            <Input
-              id="create-agent-model"
-              data-testid="create-agent-model"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              required
-              placeholder="claude-sonnet-4-20250514"
-            />
-          </div>
-
-          {/* Instructions / System Prompt */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-instructions"
-              className="text-sm font-medium text-muted-foreground"
-            >
-              System instructions
-            </label>
-            <Textarea
-              id="create-agent-instructions"
-              data-testid="create-agent-instructions"
-              value={instructions}
-              onChange={(e) => setInstructions(e.target.value)}
-              placeholder="You are a helpful assistant that..."
-              className="min-h-[120px]"
-              componentId="create_agent.instructions"
-            />
-          </div>
-
-          {/* MCP Servers */}
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={addMCPServer}
-                data-testid="create-agent-add-mcp"
-                className="h-6 gap-1 px-2 text-sm text-muted-foreground"
-              >
-                <PlusIcon className="size-3" />
-                Add server
-              </Button>
-            </div>
-            {mcpEntries.map((entry) => (
-              <MCPServerRow
-                key={entry.key}
-                entry={entry}
-                onChange={(patch) => updateMCPEntry(entry.key, patch)}
-                onRemove={() => removeMCPServer(entry.key)}
-              />
-            ))}
-          </div>
-        </fieldset>
-      </div>
-      {error && (
-        <p role="alert" className="text-ui text-destructive">
-          {error}
-        </p>
-      )}
-      {importError && (
-        <p
-          data-testid="create-agent-import-error"
-          role="alert"
-          className="text-sm text-destructive"
-        >
-          {importError}
-        </p>
-      )}
-      <DialogFooter>
-        {onImport && (
-          <>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".tar.gz,.tgz,application/gzip"
-              className="hidden"
-              data-testid="create-agent-import-input"
-              onChange={(e) => void handleImport(e.target.files?.[0])}
-            />
-            <Button
-              type="button"
-              variant="outline"
-              className="sm:mr-auto"
-              disabled={pending || importing}
-              data-testid="create-agent-import"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <UploadIcon className="size-3.5" />
-              {importing ? "Importing…" : "Import bundle"}
-            </Button>
-          </>
+    <>
+      {/* Name */}
+      <div className="flex flex-col gap-1.5">
+        <label htmlFor="create-agent-name" className="text-sm font-medium text-muted-foreground">
+          Name <span className="text-destructive">*</span>
+        </label>
+        <Input
+          id="create-agent-name"
+          data-testid="create-agent-name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="my-agent"
+          aria-invalid={nameInvalid || undefined}
+          aria-describedby={nameInvalid ? "create-agent-name-error" : undefined}
+          autoFocus
+        />
+        {nameInvalid && (
+          <p
+            id="create-agent-name-error"
+            data-testid="create-agent-name-error"
+            className="text-xs text-destructive"
+          >
+            Use only letters, numbers, hyphens, and underscores.
+          </p>
         )}
-        <Button type="button" variant="ghost" onClick={onCancel} disabled={pending || importing}>
-          Cancel
-        </Button>
-        <Button
-          type="submit"
-          data-testid="create-agent-submit"
-          loading={pending}
-          disabled={!canSubmit || pending || importing}
+      </div>
+
+      {/* Description */}
+      <div className="flex flex-col gap-1.5">
+        <label
+          htmlFor="create-agent-description"
+          className="text-sm font-medium text-muted-foreground"
         >
-          {submitLabel}
-        </Button>
-      </DialogFooter>
-    </form>
+          Description
+        </label>
+        <Input
+          id="create-agent-description"
+          data-testid="create-agent-description"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="A short summary of what this agent does"
+        />
+      </div>
+
+      {/* Harness */}
+      <div className="flex flex-col gap-1.5">
+        <label className="text-sm font-medium text-muted-foreground">
+          Harness <span className="text-destructive">*</span>
+        </label>
+        <Select
+          value={harness}
+          onValueChange={setHarness}
+          componentId="create_agent.harness"
+          valueHasNoPii
+        >
+          <SelectTrigger aria-label="Harness" data-testid="create-agent-harness" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {harnessOptions.map((opt) => (
+              <SelectItem key={opt.value} value={opt.value}>
+                {opt.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* Model */}
+      <div className="flex flex-col gap-1.5">
+        <label htmlFor="create-agent-model" className="text-sm font-medium text-muted-foreground">
+          Model <span className="text-destructive">*</span>
+        </label>
+        <Input
+          id="create-agent-model"
+          data-testid="create-agent-model"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          placeholder="claude-sonnet-4-20250514"
+        />
+      </div>
+
+      {/* Instructions / System Prompt */}
+      <div className="flex flex-col gap-1.5">
+        <label
+          htmlFor="create-agent-instructions"
+          className="text-sm font-medium text-muted-foreground"
+        >
+          System instructions
+        </label>
+        <Textarea
+          id="create-agent-instructions"
+          data-testid="create-agent-instructions"
+          value={instructions}
+          onChange={(e) => setInstructions(e.target.value)}
+          placeholder="You are a helpful assistant that..."
+          className="min-h-[120px]"
+          componentId="create_agent.instructions"
+        />
+      </div>
+
+      {/* MCP Servers */}
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={addMCPServer}
+            data-testid="create-agent-add-mcp"
+            className="h-6 gap-1 px-2 text-sm text-muted-foreground"
+          >
+            <PlusIcon className="size-3" />
+            Add server
+          </Button>
+        </div>
+        {mcpEntries.map((entry) => (
+          <MCPServerRow
+            key={entry.key}
+            entry={entry}
+            onChange={(patch) => updateMCPEntry(entry.key, patch)}
+            onRemove={() => removeMCPServer(entry.key)}
+          />
+        ))}
+      </div>
+    </>
   );
 }
 
