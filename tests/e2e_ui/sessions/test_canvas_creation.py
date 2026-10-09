@@ -66,7 +66,9 @@ def test_canvas_plus_creates_session_on_the_selected_board(
         {"width": 390, "height": 844} if mobile else {"width": 1440, "height": 900}
     )
     _stub_server_info(page, canvas=True)
-    source = httpx.get(f"{base_url}/v1/sessions/{first}", timeout=10).json()
+    source_response = httpx.get(f"{base_url}/v1/sessions/{first}", timeout=10)
+    source_response.raise_for_status()
+    source = source_response.json()
     agent_id = source["agent_id"]
     host_id = "canvas-create-host"
     page.route(
@@ -114,6 +116,7 @@ def test_canvas_plus_creates_session_on_the_selected_board(
         'JSON.stringify({"canvas-create-host": ["/tmp"]}));'
     )
     created_ids: list[str] = []
+    creation_errors: list[Exception] = []
 
     def create_on_fixture_runner(route: Route) -> None:
         if route.request.method != "POST":
@@ -137,9 +140,9 @@ def test_canvas_plus_creates_session_on_the_selected_board(
                 httpx.patch, base_url, created["id"], source["runner_id"], timeout=10
             )
             route.fulfill(status=response.status_code, json=created)
-        except (httpx.HTTPError, AssertionError):
-            route.abort()
-            raise
+        except (httpx.HTTPError, AssertionError) as error:
+            creation_errors.append(error)
+            route.fulfill(status=500, json={"detail": "Canvas fixture runner setup failed"})
 
     page.route(re.compile(r"/v1/sessions(?:\?.*)?$"), create_on_fixture_runner)
     prompt = f"Create from Canvas {uuid.uuid4().hex[:8]}"
@@ -154,7 +157,18 @@ def test_canvas_plus_creates_session_on_the_selected_board(
         page.get_by_test_id("new-chat-landing-custom-agents").click()
         page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
         page.get_by_test_id("new-chat-landing-input").fill(prompt)
-        page.get_by_test_id("new-chat-landing-submit").click()
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST" and urlparse(response.url).path == "/v1/sessions"
+            ),
+            timeout=30_000,
+        ) as creation:
+            page.get_by_test_id("new-chat-landing-submit").click()
+        if creation_errors:
+            raise AssertionError(
+                "Canvas creation on the fixture runner failed"
+            ) from creation_errors[0]
+        assert creation.value.ok
         expect(page).to_have_url(
             re.compile(r"/canvas/c/(?!temp)[^/?]+" + re.escape(query) + "$"), timeout=30_000
         )

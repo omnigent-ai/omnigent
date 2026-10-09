@@ -59,11 +59,11 @@ export function CanvasSidebarRail({
       <div className="flex flex-col items-center gap-2" data-testid="canvas-sidebar-primary-nav">
         {links.map(({ label, to, Icon, componentId }) => (
           <PrimaryNavLink
-            key={label}
+            key={componentId}
             to={to}
             label={label}
             icon={Icon}
-            active={label === "Canvas"}
+            active={componentId === "sidebar.canvas"}
             componentId={componentId}
             compact
           />

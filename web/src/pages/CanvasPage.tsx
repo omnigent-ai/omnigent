@@ -440,6 +440,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   useEffect(() => {
     if (activeCanvas === MAIN_CANVAS_ID || projectsQuery.data === undefined) return;
     if (projects.some((project) => projectCanvasId(project) === activeCanvas)) return;
+    viewportsRef.current.delete(activeCanvas);
     activeCanvasRef.current = MAIN_CANVAS_ID;
     setActiveCanvas(MAIN_CANVAS_ID);
     writeCanvasParam(MAIN_CANVAS_ID);

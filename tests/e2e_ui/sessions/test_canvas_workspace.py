@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import uuid
 from collections.abc import Iterator
@@ -35,7 +36,8 @@ def canvas_project(
             ).raise_for_status()
         yield base_url, first, second, project_id
     finally:
-        httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0).raise_for_status()
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0).raise_for_status()
 
 
 def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
