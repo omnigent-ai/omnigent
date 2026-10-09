@@ -67,29 +67,14 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          fetch-depth: 2
 
-      - name: Resolve baseline
-        id: base
+      - name: Check out base of test merge
         if: github.event_name == 'pull_request'
-        env:
-          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           # First parent of the test merge is the exact base it was built on.
-          parents="$(git cat-file -p HEAD | awk '/^parent /{print $2}')"
-          if [ "$(printf '%s\n' "$parents" | grep -c .)" -eq 2 ]; then
-            BASELINE_REF="$(printf '%s\n' "$parents" | head -1)"
-          else
-            BASELINE_REF="$EVENT_BASE_SHA"
-          fi
-          echo "ref=$BASELINE_REF" >> "$GITHUB_OUTPUT"
-
-      - name: Check out baseline UI
-        if: github.event_name == 'pull_request'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ steps.base.outputs.ref }}
-          path: ui-baseline
-          persist-credentials: false
+          git rev-parse --verify 'HEAD^2' > /dev/null
+          git worktree add --detach ui-baseline 'HEAD^1'
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -125,11 +110,11 @@ jobs:
       # Both bundles use the candidate's OSS server and the same fixture/driver.
       - name: Benchmark production UI
         env:
-          BASELINE_REF: ${{ steps.base.outputs.ref }}
+          EVENT_NAME: ${{ github.event_name }}
           COMPARE_SAME_BUILD: ${{ inputs.compare_same_build }}
         run: |
           args=()
-          if [ -n "$BASELINE_REF" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             args+=(--baseline-dist "$RUNNER_TEMP/ui-baseline"
                    --baseline-revision "$(git -C ui-baseline rev-parse HEAD)")
           elif [ "$COMPARE_SAME_BUILD" = "true" ]; then
