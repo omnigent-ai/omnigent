@@ -3792,13 +3792,11 @@ def test_placeholder_recovery_reports_a_foreign_cascade_once(
     monkeypatch.setattr(
         reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
     )
-    reported: set[str] = set()
+    scan_log = reader._RecoveryScanLog()
 
     with caplog.at_level(logging.DEBUG, logger=reader.__name__):
         for _ in range(3):
-            assert (
-                reader._recover_placeholder_cascade(bridge_dir, reported_foreign=reported) is None
-            )
+            assert reader._recover_placeholder_cascade(bridge_dir, scan_log=scan_log) is None
 
     levels = [
         record.levelname
@@ -3806,7 +3804,7 @@ def test_placeholder_recovery_reports_a_foreign_cascade_once(
         if "NOT in this session's Gemini dir" in record.getMessage()
     ]
     assert levels == ["WARNING", "DEBUG", "DEBUG"]
-    assert reported == {_CASCADE_ID}
+    assert scan_log.foreign_reported == {_CASCADE_ID}
 
 
 def test_placeholder_recovery_noop_when_id_is_already_real(
@@ -3927,6 +3925,38 @@ async def test_discover_reports_the_resolver_fallback_once(
 
     assert await reader._discover(bridge_dir, poll_interval_s=0.0, stop=_stop_after(2)) is None
     assert warn_flags == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_warning_waits_for_a_round_that_reaches_the_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rounds that bail out before the port resolver (no pane advertised yet) do
+    not use up the one WARNING; the first round that resolves still warns."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path, with_pane=False)
+    warn_flags: list[bool] = []
+
+    def _resolver(_s: object, _t: object, *, warn_fallback: bool = True) -> int | None:
+        warn_flags.append(warn_fallback)
+        return None
+
+    sleeps = 0
+
+    async def _advertise_pane_on_second_sleep(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            socket = tmp_path / "tmux.sock"
+            socket.touch()
+            write_tmux_target(bridge_dir, socket_path=socket, tmux_target="main")
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _resolver)
+    monkeypatch.setattr(reader, "_PLACEHOLDER_RECOVERY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(reader, "_sleep", _advertise_pane_on_second_sleep)
+
+    assert await reader._discover(bridge_dir, poll_interval_s=0.0, stop=_stop_after(3)) is None
+    assert warn_flags == [True, False]
 
 
 @pytest.mark.asyncio
