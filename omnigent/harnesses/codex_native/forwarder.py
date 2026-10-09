@@ -153,7 +153,7 @@ _CODEX_ELICITATION_CONNECT_TIMEOUT_SECONDS = 30.0
 # First retry must land inside the server's re-park grace (proxies sever
 # idle long-polls); later retries back off.
 _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
-_CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS = 30.0
+_CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS = 2.0
 # A POST held at least this long before failing was severed by the gateway at
 # its request cap, not refused by a sick server, so its retry must not back off
 # — see the backoff reset in :func:`_post_codex_elicitation_request`.

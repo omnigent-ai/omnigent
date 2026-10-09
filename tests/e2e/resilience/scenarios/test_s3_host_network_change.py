@@ -37,18 +37,6 @@ _KNOWN_GAPS_BY_MODE = {
         [(contract.TOOL_RUNNING, 120), (contract.APPROVAL_PENDING, 120)],
         harnesses=("claude", "codex"),
     ),
-    "reset": {
-        **contract.gaps(
-            "R1: refused re-POSTs back off to 30s, so the approval card returns late and an "
-            "approval in the gap is lost",
-            [(contract.APPROVAL_PENDING, 45)],
-        ),
-        **contract.gaps(
-            "R2: the permission hook gives up after 8 failed re-POSTs and moves the prompt "
-            "to the terminal",
-            [(contract.APPROVAL_PENDING, 120)],
-        ),
-    },
 }
 
 

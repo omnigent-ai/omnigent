@@ -913,6 +913,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
             ? ctx(state, null, `${ELICITATION_RESPONSE_PREFIX}${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
+        requestFingerprint: event.requestFingerprint,
         targetSessionId: event.targetSessionId,
         message: event.message,
         phase: event.phase,

@@ -530,6 +530,7 @@ async def _publish_and_wait_for_harness_elicitation(
             params=params,
         )
         event_payload = event.model_dump()
+        event_payload["request_fingerprint"] = request_fingerprint
         session_stream.publish(session_id, event_payload)
         published_request = True
         if conversation_store is not None:
@@ -2258,7 +2259,30 @@ async def _resolve_elicitation(
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
     harness_future = _harness_elicitation_registry.get(elicitation_id)
+    # A card displayed before a server restart carries the fingerprint of
+    # its question. The in-memory pending index is gone after restart, but
+    # the re-POST can still match this verdict to exactly that question.
+    meta = data.get("_meta")
+    card_fingerprint = meta.get("omnigent_request_fingerprint") if isinstance(meta, dict) else None
+    if (
+        not isinstance(card_fingerprint, str)
+        or len(card_fingerprint) != 64
+        or any(ch not in "0123456789abcdef" for ch in card_fingerprint)
+    ):
+        card_fingerprint = None
+    if isinstance(meta, dict) and "omnigent_request_fingerprint" in meta:
+        clean_meta = {k: v for k, v in meta.items() if k != "omnigent_request_fingerprint"}
+        data = {**data, **({"_meta": clean_meta} if clean_meta else {})}
+        if not clean_meta:
+            data.pop("_meta", None)
     if harness_future is not None and not harness_future.done():
+        parked_question = _harness_parked_elicitations.get(elicitation_id)
+        if (
+            card_fingerprint is not None
+            and parked_question is not None
+            and parked_question.request_fingerprint != card_fingerprint
+        ):
+            return
         # Only the session that owns this elicitation
         # may resolve its server-side Future. A mismatch skips
         # resolution (the runner forward still fires below).
@@ -2322,12 +2346,25 @@ async def _resolve_elicitation(
                     )
                 except ValidationError:
                     gap_fingerprint = None
+            if gap_fingerprint and card_fingerprint and gap_fingerprint != card_fingerprint:
+                return
             _prune_pre_resolved_harness_elicitations()
+            existing = _harness_pre_resolved_elicitations.get(elicitation_id)
+            fingerprint = gap_fingerprint or card_fingerprint
+            if (
+                existing is not None
+                and existing.session_id == session_id
+                and existing.result is not None
+                and existing.request_fingerprint is not None
+                and existing.request_fingerprint == fingerprint
+            ):
+                # The first verdict wins until the re-POST consumes it.
+                return
             _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
                 session_id=session_id,
                 created_at=time.time(),
                 result=pre_resolved,
-                request_fingerprint=gap_fingerprint,
+                request_fingerprint=fingerprint,
             )
             _prune_pre_resolved_harness_elicitations()
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its

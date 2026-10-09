@@ -2981,10 +2981,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!sessionId) return;
     const scopedState = conversationId ? (setterForState(conversationId) ?? get()) : get();
     const write = setterFor(sessionId);
-    const targetSessionId =
-      scopedState.blocks.find(
-        (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
-      )?.targetSessionId ?? sessionId;
+    const card = scopedState.blocks.find(
+      (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
+    );
+    const targetSessionId = card?.targetSessionId ?? sessionId;
     // Optimistically flip the matching elicitation block to
     // "responded" so the buttons disappear immediately. No server
     // event confirms the approval — the agent just resumes (or
@@ -3018,7 +3018,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       await approveElicitation(targetSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
-        ...(meta === undefined ? {} : { _meta: meta }),
+        ...(meta === undefined && !card?.requestFingerprint
+          ? {}
+          : {
+              _meta: {
+                ...meta,
+                ...(card?.requestFingerprint
+                  ? { omnigent_request_fingerprint: card.requestFingerprint }
+                  : {}),
+              },
+            }),
       });
     } catch {
       // Roll back to pending so the user can retry. Surfacing the

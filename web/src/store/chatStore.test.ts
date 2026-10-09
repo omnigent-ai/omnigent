@@ -9406,6 +9406,25 @@ describe("chatStore — submitApproval", () => {
     }
   });
 
+  it("sends a stale card's question identity across a server restart", async () => {
+    const fingerprint = "a".repeat(64);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [{ ...elicitationBlock("elic_gap"), requestFingerprint: fingerprint }],
+    });
+
+    await useChatStore.getState().submitApproval("elic_gap", "accept");
+
+    const events = fetchMock.mock.calls.filter(([u]) =>
+      String(u).endsWith("/v1/sessions/conv_abc/elicitations/elic_gap/resolve"),
+    );
+    expect(events).toHaveLength(1);
+    expect(JSON.parse((events[0]![1] as RequestInit).body as string)).toEqual({
+      action: "accept",
+      _meta: { omnigent_request_fingerprint: fingerprint },
+    });
+  });
+
   it("preserves Codex MCP persistence metadata in the resolve payload", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",

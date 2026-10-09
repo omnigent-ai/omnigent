@@ -300,7 +300,16 @@ export function InboxPage() {
       void approve(item.resolveSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
-        ...(meta === undefined ? {} : { _meta: meta }),
+        ...(meta === undefined && !item.elicitation.requestFingerprint
+          ? {}
+          : {
+              _meta: {
+                ...meta,
+                ...(item.elicitation.requestFingerprint
+                  ? { omnigent_request_fingerprint: item.elicitation.requestFingerprint }
+                  : {}),
+              },
+            }),
       }).then(
         () => {
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });

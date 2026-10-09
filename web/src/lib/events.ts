@@ -278,6 +278,8 @@ export interface ElicitationRequest {
    * where the allow rule is meaningful.
    */
   rememberScope?: RememberScope | null;
+  /** Question identity for an approval answered across a server restart. */
+  requestFingerprint?: string;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
 }

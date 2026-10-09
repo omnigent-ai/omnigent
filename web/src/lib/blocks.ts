@@ -606,6 +606,8 @@ export interface ElicitationBlock {
   type: "elicitation";
   ctx: BlockContext;
   elicitationId: string;
+  /** Server fingerprint of this question, retained with a stale card across restarts. */
+  requestFingerprint?: string;
   /**
    * Session whose resolve endpoint should receive the verdict.
    * Present when a child/sub-agent prompt is mirrored into an
