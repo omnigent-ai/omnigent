@@ -66,6 +66,79 @@ def test_disabled_does_not_read_or_create_files(
     follower.poll("conv_test")
     follower.close("conv_test")
     assert list(bridge_dir.iterdir()) == []
+    assert follower.health_snapshot() == {
+        "diagnostic_capture_enabled": False,
+        "diagnostic_capture_state": "disabled",
+    }
+
+
+def test_health_distinguishes_missing_marker_from_missing_file(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+    follower = diagnostics.ClaudeDebugLogFollower(bridge_dir)
+    follower.poll("conv_test")
+    health = follower.health_snapshot()
+    assert health["diagnostic_capture_state"] == "missing_marker"
+    assert health["diagnostic_marker_present"] is False
+    args = diagnostics.augment_claude_debug_args([], bridge_dir)
+    Path(args[-1]).unlink()
+    follower.poll("conv_test")
+    health = follower.health_snapshot()
+    assert health["diagnostic_capture_state"] == "missing_file"
+    assert health["diagnostic_marker_present"] is True
+    assert health["diagnostic_file_present"] is False
+    assert health["diagnostic_launch_id"]
+    assert "diagnostic_last_read_at" not in health
+    follower.close("conv_test")
+
+
+def test_health_records_read_error_without_exception_text_and_recovers(
+    capture_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+    capture_file.write_text("first diagnostic\n")
+    follower.poll("conv_test")
+    good = follower.health_snapshot()
+    assert good["diagnostic_capture_state"] == "ready"
+    assert good["diagnostic_last_read_at"] > 0
+    assert good["diagnostic_read_offset"] == capture_file.stat().st_size
+    assert good["diagnostic_launch_id"] in capture_file.name
+    assert "launch_id" not in good
+
+    def fail(directory_fd: int, filename: str) -> int:
+        raise PermissionError("synthetic-private-exception-text")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(diagnostics, "_open_file", fail)
+        follower.poll("conv_test")
+    failed = follower.health_snapshot()
+    assert failed["diagnostic_capture_state"] == "read_error"
+    assert failed["diagnostic_read_error_kind"] == "PermissionError"
+    assert failed["diagnostic_last_read_at"] == good["diagnostic_last_read_at"]
+    assert failed["diagnostic_read_offset"] == good["diagnostic_read_offset"]
+    assert "synthetic-private" not in str(failed)
+    follower.poll("conv_test")
+    assert follower.health_snapshot()["diagnostic_capture_state"] == "ready"
+    assert "diagnostic_read_error_kind" not in follower.health_snapshot()
+    follower.close("conv_test")
+
+
+def test_close_does_not_clear_the_last_poll_read_error(
+    capture_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+
+    def fail(directory_fd: int, filename: str) -> int:
+        raise PermissionError("synthetic-private-exception-text")
+
+    monkeypatch.setattr(diagnostics, "_open_file", fail)
+    follower.close("conv_test")
+    assert follower.health_snapshot()["diagnostic_capture_state"] == "read_error"
+    assert follower.health_snapshot()["diagnostic_read_error_kind"] == "PermissionError"
 
 
 def test_fresh_launch_files_are_private_and_replace_previous_generation(
@@ -266,6 +339,10 @@ def test_oversized_record_is_dropped_with_counts_then_forwarding_recovers(
     assert sum(event["lines_omitted"] for event in events) == 1
     assert sum(event["bytes_omitted"] for event in events) == len(oversized)
     assert [event["text"] for event in events if event["text"]] == ["recovered"]
+    health = follower.health_snapshot()
+    assert health["diagnostic_truncated"] is True
+    assert health["diagnostic_lines_omitted"] == 1
+    assert health["diagnostic_bytes_omitted"] == len(oversized)
 
 
 def test_rotation_drains_old_inode_before_new_file(
@@ -571,9 +648,17 @@ def test_unsafe_predecessor_is_ignored_without_losing_current_evidence(
     assert sum(event["bytes_omitted"] for event in events) == 0
 
 
-@pytest.mark.parametrize("kind", ["symlink", "traversal", "oversized", "malformed"])
+@pytest.mark.parametrize(
+    ("kind", "expected_state"),
+    [
+        ("symlink", "read_error"),
+        ("traversal", "invalid_marker"),
+        ("oversized", "invalid_marker"),
+        ("malformed", "read_error"),
+    ],
+)
 def test_invalid_marker_cannot_select_other_files(
-    capture_file: Path, caplog: pytest.LogCaptureFixture, kind: str
+    capture_file: Path, caplog: pytest.LogCaptureFixture, kind: str, expected_state: str
 ) -> None:
     capture_file.write_text("should not be exported\n")
     marker = capture_file.parent / diagnostics.CLAUDE_DEBUG_LOG_MARKER
@@ -593,3 +678,8 @@ def test_invalid_marker_cannot_select_other_files(
     follower.poll("conv_test")
     follower.close("conv_test")
     assert not _events(caplog)
+    health = follower.health_snapshot()
+    assert health["diagnostic_capture_state"] == expected_state
+    assert health["diagnostic_marker_present"] is True
+    if kind == "malformed":
+        assert health["diagnostic_read_error_kind"] == "JSONDecodeError"
