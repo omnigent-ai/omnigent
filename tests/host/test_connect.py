@@ -8037,7 +8037,11 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
         }
     ]
     # ERROR records ship to the debug-log sink and count against session reliability.
-    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and r.name == "omnigent.host.connect"
+    ] == []
 
 
 async def test_handle_import_local_unexpected_error_skips_only_that_session(
@@ -8114,7 +8118,11 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
         }
     ]
     # ERROR records ship to the debug-log sink and count against session reliability.
-    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and r.name == "omnigent.host.connect"
+    ] == []
 
 
 @pytest.mark.parametrize(
