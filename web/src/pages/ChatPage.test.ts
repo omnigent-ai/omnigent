@@ -1579,6 +1579,7 @@ describe("shouldSendInitialPrompt", () => {
     sentForConversationId: null,
     conversationId: "conv_abc",
     loadingConversation: false,
+    conversationLoadError: null,
     agentId: "ag_abc123",
   } as const;
 
@@ -1645,6 +1646,15 @@ describe("shouldSendInitialPrompt", () => {
     // Sending mid-hydration races the stream bind. A failure means the
     // streamed response could be published before the subscriber exists.
     expect(shouldSendInitialPrompt({ ...ready, loadingConversation: true })).toBe(false);
+  });
+
+  it("does not send when the conversation failed to load", () => {
+    // A failed load clears loadingConversation but sets conversationLoadError;
+    // without this gate the first message posts into a session that never came
+    // up, re-opening the duplicate/vanished-prompt path the error screen fixes.
+    expect(
+      shouldSendInitialPrompt({ ...ready, conversationLoadError: new Error("not found") }),
+    ).toBe(false);
   });
 
   it("waits until an agent is resolved", () => {

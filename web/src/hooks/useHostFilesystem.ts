@@ -125,16 +125,13 @@ async function describeListError(res: Response, path: string): Promise<string> {
 /**
  * React Query retry predicate for the directory listing.
  *
- * 4xx responses are deterministic (missing path, bad path, not the owner), so
- * retrying them just delays the error behind the stale placeholder listing the
- * picker keeps on screen while a query is pending. 502/504 are verdicts the
- * server already settled — a dropped host connection, a host-reported
- * filesystem failure, or the host taking the server's whole ``list_dir``
- * window (5s) without answering — so a silent retry mostly repeats a
- * multi-second wait behind a bare loading row; surface those immediately. A
- * gateway blip can also read as 502/504: skipping its retry trades that rare
- * auto-recovery for bounded feedback, and re-opening the folder retries.
- * Other 5xx and network errors retry, up to the default cap of 3.
+ * Don't retry 4xx (deterministic: missing/bad path, not the owner) or the
+ * settled host-connectivity verdicts 502/504 (dropped connection, host
+ * filesystem failure, or the host consuming the server's whole 5s ``list_dir``
+ * window): a silent retry just repeats a multi-second wait behind a loading
+ * row, so surface those immediately. Skipping retry on a rare gateway blip
+ * reading as 502/504 trades auto-recovery for bounded feedback; re-opening the
+ * folder retries. Other 5xx and network errors retry up to the cap of 3.
  *
  * @param failureCount Number of failures so far (0 on the first failure).
  * @param error The thrown error; a ``FetchError`` carries the HTTP ``status``.

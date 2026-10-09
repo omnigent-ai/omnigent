@@ -2151,7 +2151,7 @@ export function restoreLandingDraftMessage(message: string, files: File[]): bool
   if (message.trim() === "" && files.length === 0) return false;
   if (landingDraft !== null) {
     if (landingDraft.message.trim() !== "" || landingDraft.files.length > 0) return false;
-    writeLandingDraft({ ...landingDraft, message, files: [...landingDraft.files, ...files] });
+    writeLandingDraft({ ...landingDraft, message, files });
     return true;
   }
   writeLandingDraft({ ...defaultLandingDraft(), message, files });

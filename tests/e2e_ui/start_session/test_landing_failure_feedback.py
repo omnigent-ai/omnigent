@@ -196,12 +196,16 @@ async def _wait_host_online(base_url: str) -> str:
                 if host["name"] == HOST_NAME and host["status"] == "online":
                     return str(host["host_id"])
             await asyncio.sleep(0.1)
-    raise AssertionError("scripted host never came online")
+    raise AssertionError(
+        f"scripted host never came online; last /v1/hosts response: "
+        f"{resp.status_code} {resp.text[:500]}"
+    )
 
 
 async def agent_id_by_name(base_url: str, name: str) -> str:
     async with httpx.AsyncClient(trust_env=False) as client:
         resp = await client.get(f"{base_url}/v1/agents")
+    assert resp.status_code == 200, f"/v1/agents returned {resp.status_code}: {resp.text[:500]}"
     agents = {agent["name"]: agent["id"] for agent in resp.json()["data"]}
     assert name in agents, f"agent {name!r} not registered; have {sorted(agents)}"
     return str(agents[name])
@@ -319,14 +323,16 @@ async def _drive_prompt_journey(base_url: str, browser_name: str, output: Path) 
                 # Chain teardown so a context.close() failure still closes the
                 # browser and runs session cleanup rather than leaking both.
                 try:
-                    await context.close()
+                    try:
+                        await context.close()
+                    finally:
+                        await browser.close()
                 finally:
-                    await browser.close()
-                (output / "created-sessions.json").write_text(json.dumps(created))
-                async with httpx.AsyncClient(trust_env=False) as client:
-                    for entry in created:
-                        if entry["id"]:
-                            await client.delete(f"{base_url}/v1/sessions/{entry['id']}")
+                    (output / "created-sessions.json").write_text(json.dumps(created))
+                    async with httpx.AsyncClient(trust_env=False) as client:
+                        for entry in created:
+                            if entry["id"]:
+                                await client.delete(f"{base_url}/v1/sessions/{entry['id']}")
 
 
 # ── Journey 2: directory picker on an online-but-unresponsive host ───────────

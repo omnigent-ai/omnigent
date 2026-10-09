@@ -589,6 +589,7 @@ export function ChatPage() {
         sentForConversationId: initialPromptSentForConvRef.current,
         conversationId: urlConvId,
         loadingConversation,
+        conversationLoadError,
         agentId,
       })
     ) {
@@ -601,7 +602,7 @@ export function ChatPage() {
     initialPromptSentForConvRef.current = urlConvId;
     const { send, sendSlashCommand } = useChatStore.getState();
     dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
-  }, [initialPrompt, urlConvId, loadingConversation, agentId]);
+  }, [initialPrompt, urlConvId, loadingConversation, conversationLoadError, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
   // survives a re-mount of the chat surface. Declared BEFORE the
@@ -4251,6 +4252,7 @@ export function shouldSendInitialPrompt(params: {
   sentForConversationId: string | null;
   conversationId: string | null | undefined;
   loadingConversation: boolean;
+  conversationLoadError: Error | null;
   agentId: string | null;
 }): boolean {
   // Reject a contentless prompt — falsy text (null or "") AND no files —
@@ -4271,6 +4273,10 @@ export function shouldSendInitialPrompt(params: {
   // (or null) id means a later new chat reusing the mounted ChatPage, so
   // it falls through and sends.
   if (params.sentForConversationId === params.conversationId) return false;
+  // A failed load leaves `loadingConversation` false but `conversationLoadError`
+  // set; the error screen recovers the prompt into the landing composer, so
+  // reject it here rather than posting into a session that never came up.
+  if (params.conversationLoadError) return false;
   if (!params.conversationId || params.loadingConversation || !params.agentId) {
     return false;
   }
