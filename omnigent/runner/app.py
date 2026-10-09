@@ -948,20 +948,13 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     Coerce a turn-failure ``error`` dict into a ``{code, message}`` shape.
 
     The ``error`` dicts passed to :func:`_on_proxy_stream_end` vary by
-    call site: some carry an explicit ``{"code": ...}``, most carry
-    ``{"message": "..."}`` (and sometimes ``"type"``), and a few carry
-    only ``{"status": <http status>}``. The wire
-    ``SessionStatusEvent.error`` field (``ErrorDetail``) requires both
-    ``code`` and ``message``, so this normalizes every shape into one the
-    schema accepts, never raising on a missing key. The result is what
-    gets published on the ``failed`` status event and ultimately rendered
-    as the REPL's terminal error line.
-
-    An explicit ``code`` wins over ``type``, which is only the raised
-    exception's class name: the code is what lands in the durable
-    ``last_task_error`` and selects the failure headline, so a semantic
-    code such as ``connection_error`` must not degrade to ``ReadError``
-    or ``runner_error`` on the way there.
+    call site: most carry ``{"message": "..."}`` (and sometimes
+    ``"type"``), but a few carry only ``{"status": <http status>}``.
+    The wire ``SessionStatusEvent.error`` field (``ErrorDetail``)
+    requires both ``code`` and ``message``, so this normalizes every
+    shape into one the schema accepts, never raising on a missing key.
+    The result is what gets published on the ``failed`` status event
+    and ultimately rendered as the REPL's terminal error line.
 
     A harness ``response.failed`` error already names its failure in ``code``;
     that code is kept so the failed status edge and the persisted error item

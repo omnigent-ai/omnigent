@@ -2620,33 +2620,45 @@ def test_context_length_exceeded_re_raises() -> None:
     _run(_t())
 
 
-def test_connection_error_re_raises_for_classification() -> None:
-    """A classifiable SDK exception propagates typed so the adapter can stamp its code."""
+async def test_connection_error_keeps_connection_error_classification() -> None:
+    """A refused model connection surfaces as ``connection_error``, not a generic error."""
     import openai
+
+    from omnigent.runtime.harnesses._executor_adapter import classify_inner_exception
 
     conn_error = openai.APIConnectionError(
         request=httpx.Request("POST", "http://127.0.0.1:9/v1/responses")
     )
-
-    async def _t() -> None:
-        executor = OpenAIAgentsSDKExecutor(client=object())
-
-        _FakeRunner.last_calls = []
-        _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=conn_error)
-        with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
-            return_value=_fake_agents_sdk(),
-        ):
-            with pytest.raises(openai.APIConnectionError):
-                await _collect(
-                    executor.run_turn(
-                        [{"role": "user", "content": "hi", "session_id": "s_conn_reraise"}],
-                        [],
-                        "Be helpful.",
-                    )
+    executor = OpenAIAgentsSDKExecutor(client=object())
+    _FakeRunner.last_calls = []
+    _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=conn_error)
+    raised: BaseException | None = None
+    events: list[Any] = []
+    with patch(
+        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+        return_value=_fake_agents_sdk(),
+    ):
+        try:
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s_conn_error"}],
+                    [],
+                    "Be helpful.",
                 )
+            )
+        except Exception as exc:
+            raised = exc
 
-    _run(_t())
+    # The adapter stamps a code either from a typed exception or from the event itself.
+    if raised is not None:
+        code = classify_inner_exception(raised)
+    else:
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert len(errors) == 1, f"expected one ExecutorError, got events: {events!r}"
+        code = errors[0].code
+    assert code == "connection_error", (
+        f"connection failure lost its classification: raised={raised!r} events={events!r}"
+    )
 
 
 def test_unclassifiable_error_still_yields_executor_error() -> None:
