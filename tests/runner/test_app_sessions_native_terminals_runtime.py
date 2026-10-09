@@ -54,6 +54,9 @@ from tests.runner.conftest import (
 )
 from tests.runner.helpers import NullServerClient
 
+# Synthetic id of the session whose Codex bridge a rotated session shares.
+_ROTATED_BRIDGE_ID = "5f1c0a9e7b2d4c36a8e4d1f0b9a72c15"
+
 
 @pytest.mark.asyncio
 async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
@@ -349,6 +352,56 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        pytest.param({}, None, id="unlabelled"),
+        pytest.param({codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: ""}, None, id="empty"),
+        pytest.param(
+            {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: _ROTATED_BRIDGE_ID},
+            _ROTATED_BRIDGE_ID,
+            id="rotated",
+        ),
+    ],
+)
+async def test_codex_native_launch_config_reads_the_bridge_id_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    labels: dict[str, str],
+    expected: str | None,
+) -> None:
+    """
+    The launch config carries the session's bridge id label, and nothing without one.
+
+    The executor reads bridge state from the label's directory, so a launch that
+    ignores the label publishes its state where no turn looks. An unlabelled
+    session keeps ``None`` so its bridge stays keyed by the session id.
+    """
+    from omnigent.runner.native.orchestration import _codex_native_launch_config
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
+    snapshot = RunnerSessionInitSnapshot(
+        created_at=10, updated_at=11, workspace=str(tmp_path), labels=labels
+    )
+    envelope = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "test",
+            "session_id": session_id,
+            "agent_id": "agent_codex",
+            "snapshot": snapshot.model_dump(mode="json"),
+        }
+    )
+
+    config = await _codex_native_launch_config(
+        session_id=session_id, server_client=None, session_init=envelope
+    )
+
+    assert config.bridge_id == expected
+
+
+@pytest.mark.asyncio
 async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -421,6 +474,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
 )
 @pytest.mark.parametrize("cancel_launch", [False, True])
 @pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
+@pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -429,6 +483,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     retain_subscription: bool,
     cancel_launch: bool,
     use_envelope: bool,
+    rotated: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -442,6 +497,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     this regresses, the CLI falls back into split ownership or loses user
     pass-through flags on resume.
 
+    A session the forwarder rotated onto carries a bridge id label naming another
+    session. The executor reads bridge state from that label's directory, so the
+    relaunch must publish there and leave its own id's directory untouched.
+
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -449,6 +508,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native import orchestration
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
@@ -464,10 +524,16 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     caplog.set_level(logging.INFO, logger="omnigent.runner.native.orchestration")
-    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+    bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(bridge_id)
+    session_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+    session_labels: dict[str, str] = (
+        {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
+    )
     launch_snapshot = RunnerSessionInitSnapshot(
         created_at=10,
         updated_at=11,
+        labels=session_labels,
         terminal_launch_args=["--config", "approval_policy=on-request"],
         model_override="gpt-5.4-mini",
         reasoning_effort="high",
@@ -757,6 +823,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert app_server.closed
             assert not forward_calls
             assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            if rotated:
+                assert not session_dir.exists()
             return
         terminal_view = await _auto_create_codex_terminal(
             session_id,
@@ -767,15 +835,19 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             session_init=session_init,
         )
         await asyncio.sleep(0)
+        remembered_dir = orchestration._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
     finally:
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        orchestration._AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
 
     assert terminal_view.id == "terminal_codex_main"
     assert app_server.started is True
-    expected_codex_home = codex_native_bridge.codex_home_for_bridge_dir(
-        codex_native_bridge.bridge_dir_for_bridge_id(session_id)
-    )
+    expected_codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
     assert app_server.codex_home == expected_codex_home
+    # The terminal-reuse check reads the app-server's stop record from this directory.
+    assert remembered_dir == bridge_dir
+    if rotated:
+        assert not session_dir.exists()
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
@@ -861,6 +933,17 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     # Codex executor starts turns with the runner process's own cwd, so
     # web-driven shell tools run from the wrong directory.
     assert bridge_state.cwd == str(tmp_path / "workspace")
+    # The harness spawned for this session finds that state: it reads the
+    # directory its own spawn env names, derived from the same labels.
+    spawn_env = await orchestration._resolve_native_spawn_env(
+        "codex-native",
+        session_id,
+        server_client=cast(httpx.AsyncClient, NullServerClient()),
+        optional_labels=session_labels,
+    )
+    assert spawn_env is not None
+    executor_dir = Path(spawn_env[codex_native_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR])
+    assert codex_native_bridge.read_bridge_state(executor_dir) == bridge_state
     # Resume state is published before the configured wrapper starts, so the
     # executor never needs a startup-timeout marker for this path.
     assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) is None
@@ -1986,11 +2069,13 @@ def test_auto_create_codex_terminal_imports_branch_codex_native_modules_at_entry
         pytest.param(False, True, id="login-required"),
     ],
 )
+@pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
 async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     marker_write_fails: bool,
     login_required: bool,
+    rotated: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The tool relay is started at session creation, non-blocking.
@@ -2009,6 +2094,9 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     path the spy would never fire here; if it regressed to
     ``await_notify=True`` the assertion on that kwarg would fail.
 
+    A rotated session's bridge dir is its bridge id label's: the fresh-thread
+    discovery, the startup timeout marker and the relay must all share it.
+
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -2016,6 +2104,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.native import orchestration
 
     session_id = "de154ca6405fb8912623984a14a2b044"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -2028,6 +2117,11 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         lambda _bridge_dir: pytest.fail("fresh Codex launch ran stale-writer recovery"),
     )
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(bridge_id)
+    session_labels: dict[str, str] = (
+        {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
+    )
 
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
@@ -2045,6 +2139,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
                 200,
                 json={
                     "workspace": str(tmp_path / "workspace"),
+                    "labels": session_labels,
                     "terminal_launch_args": None,
                     "model_override": None,
                     "external_session_id": None,
@@ -2177,23 +2272,26 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         await asyncio.sleep(0)
     finally:
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        orchestration._AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
 
     # Exactly one relay start, at session creation, for this session's bridge
     # dir, and non-blocking (await_notify=False) — the crux of the fix.
     assert len(relay_calls) == 1, relay_calls
     assert relay_calls[0]["session_id"] == session_id
-    assert relay_calls[0]["explicit_bridge_dir"] == codex_native_bridge.bridge_dir_for_bridge_id(
-        session_id
-    )
+    assert relay_calls[0]["explicit_bridge_dir"] == bridge_dir
     assert relay_calls[0]["await_notify"] is False
     assert len(discover_calls) == 1
+    assert discover_calls[0]["bridge_dir"] == bridge_dir
     # A failed marker write falls the forwarder back to the legacy timeout
     # too, keeping it aligned with the executor's unextended legacy wait.
     expected_timeout = None if marker_write_fails or login_required else 120.0
     assert discover_calls[0]["thread_start_timeout_seconds"] == expected_timeout
-    assert codex_native_bridge.read_bridge_startup_timeout(
-        codex_native_bridge.bridge_dir_for_bridge_id(session_id)
-    ) == (None if marker_write_fails or login_required else 120.0)
+    assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) == (
+        None if marker_write_fails or login_required else 120.0
+    )
+    if rotated:
+        # The rotated session's own id never gets a bridge directory.
+        assert not codex_native_bridge.bridge_dir_for_bridge_id(session_id).exists()
     if login_required:
         assert "requires interactive login" in caplog.text
         assert "preserving the unbounded sign-in wait" in caplog.text
@@ -4266,6 +4364,7 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before
         ("generic", True, False, False),
     ],
 )
+@pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
 def test_codex_terminal_reuse_requires_a_live_backend_after_a_startup_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4273,19 +4372,36 @@ def test_codex_terminal_reuse_requires_a_live_backend_after_a_startup_failure(
     backend_alive: bool,
     startup_error: bool,
     expected: bool,
+    rotated: bool,
 ) -> None:
     """
     After a recorded startup failure, a registered Codex pane with no live
     app-server is not reusable: every send would fail fast on the saved error,
     so the ensure must close it and launch again (which clears the record).
+
+    A rotated session's record lives in the directory its launch used, its bridge
+    id label's. A record under the session's own id (an earlier launch's) is stale
+    and must not count either way.
     """
     from omnigent.runner.app import _AUTO_CODEX_APP_SERVERS
-    from omnigent.runner.native.orchestration import _is_runner_owned_codex_terminal
+    from omnigent.runner.native.orchestration import (
+        _AUTO_CODEX_BRIDGE_DIRS,
+        _is_runner_owned_codex_terminal,
+    )
     from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE
 
     session_id = "6f2e1d0c9b8a47f6a5e4d3c2b1a09f8e"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
-    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(bridge_id)
+    if rotated:
+        _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
+        if not startup_error:
+            codex_native_bridge.write_bridge_startup_error(
+                codex_native_bridge.prepare_bridge_dir(session_id),
+                "Stale record from an earlier launch.",
+                code="codex_thread_not_started",
+            )
     if startup_error:
         codex_native_bridge.write_bridge_startup_error(
             bridge_dir, "Codex stopped before it could start.", code="codex_thread_not_started"
@@ -4304,6 +4420,21 @@ def test_codex_terminal_reuse_requires_a_live_backend_after_a_startup_failure(
         assert _is_runner_owned_codex_terminal(_Registry(), view) is expected  # type: ignore[arg-type]
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_codex_app_server_teardown_forgets_the_launch_bridge_dir(tmp_path: Path) -> None:
+    """Tearing a session down drops its remembered bridge dir, so the map stays bounded."""
+    from omnigent.runner.native import orchestration
+
+    session_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] = tmp_path
+    try:
+        await orchestration.teardown_codex_native_app_server(session_id)
+        assert session_id not in orchestration._AUTO_CODEX_BRIDGE_DIRS
+    finally:
+        orchestration._AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
 
 
 @pytest.mark.asyncio
@@ -4962,14 +5093,16 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("launch_fails", [False, True])
+@pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
 async def test_codex_tui_recovery_preserves_live_control_plane(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool, rotated: bool
 ) -> None:
     """A lost TUI reattaches to the live app-server without cancelling the forwarder.
 
     The app-server owns thread state and the forwarder owns transcript delivery.
     Replacing only the TUI must not disturb either — even if the new TUI fails to
-    launch.
+    launch. A rotated session's live bridge state sits in its bridge id label's
+    directory, which is where the reattach has to look for it.
     """
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
@@ -4982,10 +5115,11 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
     )
 
     session_id = "tui-recovery-test-session"
+    bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
     server_url = "ws://127.0.0.1:9876"
     thread_id = "thread-live-1234"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
-    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(bridge_id)
     codex_native_bridge.write_bridge_state(
         bridge_dir,
         CodexNativeBridgeState(
@@ -5005,6 +5139,7 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
         fork_source_external_id=None,
         fork_carry_history=False,
         bypass_sandbox=False,
+        bridge_id=_ROTATED_BRIDGE_ID if rotated else None,
     )
     fake_server = SimpleNamespace(
         proc=SimpleNamespace(returncode=None),
@@ -5044,6 +5179,7 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
         assert launch.await_args is not None
         assert launch.await_args.kwargs["app_server"] is fake_server
         assert launch.await_args.kwargs["thread_id"] == thread_id
+        assert launch.await_args.kwargs["bridge_dir"] == bridge_dir
     finally:
         forwarder.cancel()
         with contextlib.suppress(asyncio.CancelledError):
