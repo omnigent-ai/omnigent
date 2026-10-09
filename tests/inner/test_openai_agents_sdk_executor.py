@@ -3429,3 +3429,166 @@ def test_no_compaction_item_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Gemini on the Databricks gateway: MLflow routing + thought-signature relay
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("gateway_url", "model", "expected"),
+    [
+        (
+            "https://ws.example.com/ai-gateway/codex/v1",
+            "system.ai.gemini-3-8-flash",
+            "https://ws.example.com/ai-gateway/mlflow/v1",
+        ),
+        (
+            "https://ws.example.com/ai-gateway/openai/v1/",
+            "databricks-gemini-3-8-flash",
+            "https://ws.example.com/ai-gateway/mlflow/v1",
+        ),
+        (
+            "https://ws.example.com/ai-gateway/codex/v1",
+            "databricks-gpt-6-astra",
+            "https://ws.example.com/ai-gateway/codex/v1",
+        ),
+        (
+            "https://proxy.example.com/v1",
+            "system.ai.gemini-3-8-flash",
+            "https://proxy.example.com/v1",
+        ),
+    ],
+)
+def test_gateway_base_url_routes_only_gemini_to_mlflow(
+    gateway_url: str, model: str, expected: str
+) -> None:
+    """Gemini leaves the GPT-only gateway surfaces; other models and URLs stay put."""
+    from omnigent.inner.openai_agents_sdk_executor import _gateway_base_url_for_model
+
+    assert _gateway_base_url_for_model(gateway_url, model) == expected
+
+
+def test_gateway_thought_signature_messages_moves_google_field() -> None:
+    """The SDK's Google signature becomes the gateway's ``thoughtSignature``."""
+    from omnigent.inner.openai_agents_sdk_executor import _gateway_thought_signature_messages
+
+    signed = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "sig-1"}},
+    }
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [signed]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "18C"},
+    ]
+
+    rewritten = _gateway_thought_signature_messages(messages)
+
+    tool_call = rewritten[1]["tool_calls"][0]
+    assert tool_call["thoughtSignature"] == "sig-1"
+    assert "extra_content" not in tool_call
+    assert rewritten[0] is messages[0] and rewritten[2] is messages[2]
+    assert "extra_content" in signed, "caller's message must not be mutated"
+
+
+def test_reasoning_filter_relays_gemini_thought_signatures() -> None:
+    """``create`` rewrites outgoing signatures and exposes incoming ones to the SDK."""
+    from openai.types.chat import ChatCompletionChunk
+
+    from omnigent.inner.openai_agents_sdk_executor import _ReasoningBlockFilterCompletions
+
+    chunk = ChatCompletionChunk.model_validate(
+        {
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "gemini-3.8-flash",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "get_weather",
+                                "type": "function",
+                                "thoughtSignature": "sig-2",
+                                "function": {"name": "get_weather", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+    captured: dict[str, Any] = {}
+
+    class _Completions:
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+
+            async def _stream():
+                yield chunk
+
+            return _stream()
+
+    outgoing = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "prev",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                    "extra_content": {"google": {"thought_signature": "sig-1"}},
+                }
+            ],
+        }
+    ]
+
+    async def _run_inner() -> list[Any]:
+        stream = await _ReasoningBlockFilterCompletions(_Completions()).create(
+            model="system.ai.gemini-3-8-flash", messages=outgoing, stream=True
+        )
+        return [c async for c in stream]
+
+    chunks = _run(_run_inner())
+
+    assert captured["messages"][0]["tool_calls"][0]["thoughtSignature"] == "sig-1"
+    tool_call = chunks[0].choices[0].delta.tool_calls[0]
+    assert tool_call.extra_content == {"google": {"thought_signature": "sig-2"}}
+
+
+def test_expose_google_thought_signatures_uniquifies_name_ids() -> None:
+    """Gateway Gemini calls reuse the function name as id; each gets a unique one."""
+    from openai.types.chat.chat_completion_chunk import ChoiceDelta
+
+    from omnigent.inner.openai_agents_sdk_executor import _expose_google_thought_signatures
+
+    def _delta(call_id: str) -> ChoiceDelta:
+        return ChoiceDelta.model_validate(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "sys_os_read", "arguments": "{}"},
+                    }
+                ]
+            }
+        )
+
+    first, second, distinct = _delta("sys_os_read"), _delta("sys_os_read"), _delta("call_abc")
+    for delta in (first, second, distinct):
+        _expose_google_thought_signatures(delta)
+
+    first_id = first.tool_calls[0].id
+    assert first_id != "sys_os_read" and first_id.startswith("call_")
+    assert first_id != second.tool_calls[0].id
+    assert distinct.tool_calls[0].id == "call_abc"
