@@ -1,4 +1,4 @@
-"""Routes for listing, installing, and removing agents (``/v1/agents``).
+"""Routes for reading, installing, and removing agents (``/v1/agents``).
 
 Server agents are the long-lived, shared agents the server provides out of
 the box: the seeded ``claude-native-ui`` agent plus anything registered at
@@ -12,6 +12,7 @@ User agents belong to one user (``designs/REUSABLE_USER_AGENTS.md``):
 ``GET /v1/agents?scope=user`` lists the caller's own, and
 ``DELETE /v1/agents/{id}`` removes one. Uploading a bundle with a new
 session (multipart ``POST /v1/sessions``) also creates one.
+``GET /v1/agents/{id}`` reads a server agent or the caller's own user agent.
 """
 
 from __future__ import annotations
@@ -242,7 +243,7 @@ def create_builtin_agents_router(
         removing it; ``None`` skips the check.
     :param auth_provider: Optional auth provider; when set, the caller
         must be authenticated.
-    :returns: A FastAPI router exposing the list, install, and remove routes.
+    :returns: A FastAPI router exposing the list, detail, install, and remove routes.
     """
     router = APIRouter()
 
@@ -302,6 +303,30 @@ def create_builtin_agents_router(
         return PaginatedList(
             data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
         )
+
+    @router.get("/agents/{agent_id}")
+    async def get_agent(request: Request, agent_id: str) -> AgentObject:
+        """Return the list summary for a server agent or the caller's own user agent.
+
+        Missing and inaccessible agents both return 404. Sharing a session
+        does not grant access to its owner's agent through this route.
+
+        :param request: The incoming request (for auth).
+        :param agent_id: Agent to read.
+        :returns: The same redacted :class:`AgentObject` used by the list routes.
+        """
+        user_id = _require_user(request, auth_provider)
+        agent = await asyncio.to_thread(agent_store.get, agent_id)
+        if agent is None or not (
+            agent.operator_authored
+            or (
+                agent_store.supports_user_agents
+                and agent.kind == "user"
+                and agent.created_by == user_id
+            )
+        ):
+            raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
+        return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
 
     # Multipart is CORS-safelisted, so a cross-site form post needs the Origin check.
     @router.post("/agents", dependencies=[Depends(require_trusted_origin)])

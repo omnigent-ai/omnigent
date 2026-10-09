@@ -203,6 +203,8 @@ class ServerInfoResponse(BaseModel):
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
+    # GET /v1/agents/{id}; absent on older servers that only expose listings.
+    agent_detail: bool = True
     branding: BrandingInfo
 
 
@@ -3092,6 +3094,7 @@ def create_app(
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
+                "agent_detail": True,
                 "branding": branding_snapshot.config(),
             }
         )
