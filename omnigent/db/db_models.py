@@ -302,7 +302,6 @@ class SqlAgent(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),
-        Index("ix_agents_created_at", "workspace_id", "created_at", "id"),
         # Template agents have unique names; session-scoped agents (kind=2)
         # may reuse the same name. That "unique only within the template set"
         # rule can't be a partial unique index (MySQL has none), so it is
@@ -311,8 +310,9 @@ class SqlAgent(OmnigentBase):
         # do — kind is included so the seek skips same-named session copies
         # straight to the template row.
         Index("ix_agents_name", "workspace_id", "name", "kind", "id"),
-        # Keyset listing of one user's own agents, newest first: equality on
-        # kind and created_by, order on created_at, primary-key tie-break.
+        # Keyset listing of one user's own agents (or of server agents, whose
+        # created_by is NULL), newest first: equality on kind and created_by,
+        # order on created_at, primary-key tie-break.
         Index(
             "ix_agents_kind_owner_created",
             "workspace_id",

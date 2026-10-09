@@ -16,7 +16,8 @@ from omnigent.db.utils import (
 
 def _downgrade(engine: sa.Engine, db_uri: str, revision: str) -> None:
     config = _build_alembic_config(db_uri)
-    with engine.begin() as connection:
+    # Alembic must own the transaction to leave it for PostgreSQL's concurrent index builds.
+    with engine.connect() as connection:
         config.attributes["connection"] = connection
         command.downgrade(config, revision)
 
