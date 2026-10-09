@@ -2661,6 +2661,41 @@ async def test_connection_error_keeps_connection_error_classification() -> None:
     )
 
 
+def test_connection_error_caused_by_auth_failure_keeps_actionable_message() -> None:
+    """A connection error caused by a Databricks auth failure still reports the sign-in step."""
+    import openai
+
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    auth_message = (
+        "Databricks authentication failed for profile 'dev'. Run: databricks auth login -p dev"
+    )
+    conn_error = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://127.0.0.1:9/v1/responses")
+    )
+    conn_error.__cause__ = DatabricksAuthError(auth_message)
+
+    async def _t() -> None:
+        executor = OpenAIAgentsSDKExecutor(client=object())
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=conn_error)
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s_wrapped_auth"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert [e.message for e in errors] == [auth_message], f"events: {events!r}"
+
+    _run(_t())
+
+
 def test_unclassifiable_error_still_yields_executor_error() -> None:
     """An exception no classifier recognizes keeps the stringified fallback."""
 

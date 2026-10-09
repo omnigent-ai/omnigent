@@ -74,8 +74,9 @@ def _expand_pill(page: Page, pill: Locator) -> tuple[str, str]:
     pill.locator('button[aria-expanded="false"]').first.click()
     message = pill.get_by_test_id("error-message-content")
     expect(message).not_to_be_empty()
-    # Hold the expanded pill so a recording of the journey stays readable.
-    page.wait_for_timeout(1_500)
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR") or os.environ.get("E2E_SCREENSHOT_DIR"):
+        # Hold the expanded pill so a recording of the journey stays readable.
+        page.wait_for_timeout(1_500)
     return headline.inner_text(), message.inner_text()
 
 
@@ -92,9 +93,10 @@ def test_refused_model_connection_keeps_connection_error_code(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
-    runner_id = str(_server_state["runner_id"])
-    session_id = _create_dead_endpoint_session(live_server, runner_id, _unreachable_endpoint())
+    session_id: str | None = None
     try:
+        runner_id = str(_server_state["runner_id"])
+        session_id = _create_dead_endpoint_session(live_server, runner_id, _unreachable_endpoint())
         page: Page = request.getfixturevalue("page")
         try:
             page.goto(f"{live_server}/c/{session_id}")
@@ -131,14 +133,21 @@ def test_refused_model_connection_keeps_connection_error_code(
         assert live_headline == CONNECTION_ERROR_HEADLINE, observed
         assert live_message == "Connection error.", observed
         assert reloaded_headline == CONNECTION_ERROR_HEADLINE, observed
-        assert last_error["code"] == "connection_error", observed
-        assert [item.get("code") for item in items] == ["connection_error"], observed
+        assert reloaded_message == "Connection error.", observed
+        assert (last_error or {}).get("code") == "connection_error", observed
+        assert (last_error or {}).get("message") == "Connection error.", observed
+        assert [(item.get("code"), item.get("message")) for item in items] == [
+            ("connection_error", "Connection error.")
+        ], observed
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except Exception:
-                respawned.kill()
-                respawned.wait(timeout=5)
+        try:
+            if session_id is not None:
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except Exception:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
