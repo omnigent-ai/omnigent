@@ -51,7 +51,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
-from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
 from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.server.schemas import CreateResponseRequest
 
@@ -220,8 +220,12 @@ async def test_abnormal_exit_interrupt_tolerates_codex_moving_past_recorded_turn
             # rejection, which leaves the stale turn_1 recorded (a stale-steer
             # mismatch would instead be recovered by retargeting the live turn).
             fake.steer_failure = {"code": -32603, "message": "internal error"}
-            with pytest.raises(RuntimeError, match="inner executor error"):
+            with pytest.raises(InnerExecutorError, match="Codex native executor error") as refused:
                 await adapter.run_turn(_request("follow up"), _ctx("resp_2"))
+            # Codex answered with a JSON-RPC error, so the follow-up never reached it:
+            # a coded, undelivered failure (still a RuntimeError) the server can settle on.
+            assert refused.value.code == "codex_turn_rejected"
+            assert refused.value.undelivered is True
 
             # The abnormal exit detached the executor and scheduled the
             # bounded interrupt + reap; wait for it to settle.

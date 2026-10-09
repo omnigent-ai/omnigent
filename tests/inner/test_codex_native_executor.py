@@ -364,6 +364,50 @@ def test_overlong_goal_command_fails_clearly_without_reaching_app_server(
     assert "Codex native executor error" not in message
     # The doomed objective never reaches the app-server.
     assert _FakeCodexNativeClient.requests == []
+    # A coded input error, and the message never reached Codex, so the sender's
+    # queued copy settles instead of lingering as a "not delivered" error.
+    assert events[0].code == "input_too_large"
+    assert events[0].title == "Goal is too long for Codex"
+    assert events[0].undelivered is True
+
+
+async def test_overlong_goal_reaches_the_turn_error_as_an_undelivered_input_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Through the harness adapter, an over-long ``/goal`` fails with a coded detail.
+
+    Uncoded, the adapter wraps the error in a bare ``RuntimeError`` and drops the
+    undelivered flag the server settles the queued message on.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_goal", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(
+            CreateResponseRequest(model="test-agent", input="/goal " + "x" * 14_563), ctx
+        )
+    await adapter.on_shutdown()
+
+    detail = adapter._build_error_detail(raised.value)
+    assert detail.code == "input_too_large"
+    assert detail.undelivered is True
+    assert "14563 characters" in detail.message
+    assert "4000" in detail.message
+    assert _FakeCodexNativeClient.requests == []
 
 
 def test_goal_command_at_the_exact_codex_cap_is_sent(
@@ -850,6 +894,287 @@ def test_input_file_zip_is_materialized_without_workspace(
     ]
 
 
+# Codex rejects a turn whose text items total more than this many characters.
+_CODEX_TEXT_LIMIT = 1_048_576
+
+
+def _text_chars(items: list[dict[str, Any]]) -> int:
+    """
+    Count the characters Codex charges against its per-turn text limit.
+
+    :param items: Codex input items.
+    :returns: Total characters across the ``text`` items.
+    """
+    return sum(len(item["text"]) for item in items if item["type"] == "text")
+
+
+def _referenced_file(item: dict[str, Any]) -> Path:
+    """
+    Resolve the file an ``[Attached file: <path>]`` reference item points at.
+
+    :param item: A Codex ``text`` input item.
+    :returns: The referenced path.
+    """
+    text = item["text"]
+    assert text.startswith("[Attached file: ") and text.endswith("]"), text
+    return Path(text[len("[Attached file: ") : -1])
+
+
+def _input_text(text: str) -> dict[str, Any]:
+    """Build an ``input_text`` content block."""
+    return {"type": "input_text", "text": text}
+
+
+def _text_file_block(text: str, filename: str | None = None) -> dict[str, Any]:
+    """
+    Build a ``text/plain`` ``input_file`` block carrying *text*.
+
+    :param text: File content.
+    :param filename: Optional upload name, e.g. ``"server.log"``.
+    :returns: The content block.
+    """
+    block: dict[str, Any] = {
+        "type": "input_file",
+        "file_data": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+    }
+    if filename is not None:
+        block["filename"] = filename
+    return block
+
+
+def test_oversized_text_block_spills_to_an_attachment_file(tmp_path: Path) -> None:
+    """
+    A text block past Codex's input limit is sent as a file reference.
+
+    Codex rejects a turn whose text exceeds 1,048,576 characters, so a huge
+    paste used to fail the turn with ``input_too_large``. The full text now
+    lands in the session's attachment cache and the turn carries only the
+    reference line, like a binary attachment.
+    """
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "HEAD" + "a" * 1_499_992 + "TAIL"
+
+    items = _content_to_input_items([_input_text(text)], tmp_path)
+
+    assert len(items) == 1
+    assert _text_chars(items) < _CODEX_TEXT_LIMIT
+    path = _referenced_file(items[0])
+    assert path.parent == attachment_cache_dir(tmp_path)
+    assert path.read_text(encoding="utf-8") == text
+
+
+def test_oversized_string_content_spills_to_an_attachment_file(tmp_path: Path) -> None:
+    """Plain-string message content is bounded the same way as a text block."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "b" * 1_331_269
+
+    items = _content_to_input_items(text, tmp_path)
+
+    assert len(items) == 1
+    assert _text_chars(items) < _CODEX_TEXT_LIMIT
+    assert _referenced_file(items[0]).read_text(encoding="utf-8") == text
+
+
+def test_oversized_text_file_spills_under_its_own_name(tmp_path: Path) -> None:
+    """An inline ``text/*`` upload past the limit is written out under its filename."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "worker started\n" * 220_000
+
+    items = _content_to_input_items([_text_file_block(text, "server.log")], tmp_path)
+
+    expected = attachment_cache_dir(tmp_path) / "server.log"
+    assert items == [{"type": "text", "text": f"[Attached file: {expected}]"}]
+    assert expected.read_text(encoding="utf-8") == text
+
+
+@pytest.mark.parametrize(
+    ("chars", "spilled"),
+    [(900_000, False), (900_001, True)],
+    ids=["at-threshold", "past-threshold"],
+)
+def test_text_spills_only_past_the_inline_threshold(
+    tmp_path: Path, chars: int, spilled: bool
+) -> None:
+    """Text up to the threshold stays inline; one character more moves to a file."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    text = "c" * chars
+
+    items = _content_to_input_items([_input_text(text)], tmp_path)
+
+    if spilled:
+        assert _referenced_file(items[0]).read_text(encoding="utf-8") == text
+    else:
+        assert items == [{"type": "text", "text": text}]
+        assert not attachment_cache_dir(tmp_path).exists()
+
+
+def test_small_text_and_text_files_are_sent_inline_unchanged(tmp_path: Path) -> None:
+    """Nothing is written to disk for text that fits."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    items = _content_to_input_items(
+        [_input_text("hello"), _text_file_block("line one\nline two\n")], tmp_path
+    )
+
+    assert items == [
+        {"type": "text", "text": "hello"},
+        {"type": "text", "text": "line one\nline two\n"},
+    ]
+    assert not attachment_cache_dir(tmp_path).exists()
+
+
+def test_turn_text_total_stays_under_the_limit_across_blocks(tmp_path: Path) -> None:
+    """
+    Blocks that each fit still share one limit: the largest spill first.
+
+    The question and the smaller blocks stay inline, in their original order.
+    """
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    question = "Which of these logs is the noisy one?"
+
+    items = _content_to_input_items(
+        [
+            _input_text(question),
+            _input_text("A" * 500_000),
+            _input_text("B" * 450_000),
+            _input_text("C" * 400_000),
+        ],
+        tmp_path,
+    )
+
+    assert len(items) == 4
+    assert items[0] == {"type": "text", "text": question}
+    assert _referenced_file(items[1]).read_text(encoding="utf-8") == "A" * 500_000
+    assert items[2] == {"type": "text", "text": "B" * 450_000}
+    assert items[3] == {"type": "text", "text": "C" * 400_000}
+    assert _text_chars(items) <= 900_000
+
+
+def test_text_file_and_message_text_share_the_turn_limit(tmp_path: Path) -> None:
+    """An inlined text file counts toward the same limit as the message text."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    items = _content_to_input_items(
+        [_input_text("d" * 300_000), _text_file_block("e" * 700_000, "data.csv")], tmp_path
+    )
+
+    assert items[0] == {"type": "text", "text": "d" * 300_000}
+    spilled = _referenced_file(items[1])
+    assert spilled == attachment_cache_dir(tmp_path) / "data.csv"
+    assert spilled.read_text(encoding="utf-8") == "e" * 700_000
+
+
+def test_spilled_text_is_reused_when_the_same_message_is_sent_again(tmp_path: Path) -> None:
+    """A retried send points at the file already written instead of adding another."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    content = [_input_text("f" * 1_200_000)]
+
+    first = _content_to_input_items(content, tmp_path)
+    second = _content_to_input_items(content, tmp_path)
+
+    assert first == second
+    assert len(list(attachment_cache_dir(tmp_path).iterdir())) == 1
+
+
+def test_text_stays_inline_when_the_attachment_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed write never drops the user's text; Codex reports the overflow itself."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    monkeypatch.setattr(codex_native_executor, "materialize_text", lambda *_a, **_k: None)
+    text = "g" * 1_200_000
+
+    assert _content_to_input_items([_input_text(text)], tmp_path) == [
+        {"type": "text", "text": text}
+    ]
+
+
+def test_spilling_logs_the_size_and_kind_but_not_the_text(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each spill leaves a structured event with how much moved, never what it said."""
+    from omnigent.debug_logging import record_to_row
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    with caplog.at_level(logging.INFO, logger=codex_native_executor.__name__):
+        _content_to_input_items(
+            [_input_text("SECRETPASTE" * 150_000)], tmp_path, session_id="conv_123"
+        )
+        _content_to_input_items(
+            [_text_file_block("SECRETFILE\n" * 150_000, "notes.txt")],
+            tmp_path,
+            session_id="conv_123",
+        )
+
+    rows = [
+        record_to_row(record, source="runner")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_text_spilled"
+    ]
+    assert [(row["attributes"]["kind"], row["attributes"]["chars"]) for row in rows] == [
+        ("text", "1650000"),
+        ("file", "1650000"),
+    ]
+    assert {row["session_id"] for row in rows} == {"conv_123"}
+    dumped = json.dumps(rows)
+    assert "SECRET" not in dumped
+    assert str(attachment_cache_dir(tmp_path)) not in dumped
+
+
+def test_run_turn_sends_an_oversized_message_as_an_attachment_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The turn Codex receives stays under its limit, so the huge paste no longer fails."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    text = "z" * 1_309_439
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), text)
+
+    assert [type(event) for event in events] == [TurnComplete]
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == "turn/start"
+    assert _text_chars(params["input"]) < _CODEX_TEXT_LIMIT
+    assert _referenced_file(params["input"][0]).read_text(encoding="utf-8") == text
+
+
+def test_steering_sends_an_oversized_message_as_an_attachment_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``turn/steer`` enforces the same limit as ``turn/start``, so it gets the same treatment."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_live")
+    text = "y" * 1_500_000
+
+    steered = asyncio.run(
+        CodexNativeExecutor(bridge_dir=tmp_path).enqueue_session_message("k", [_input_text(text)])
+    )
+
+    assert steered is True
+    method, params = _FakeCodexNativeClient.requests[-1]
+    assert method == "turn/steer"
+    assert _text_chars(params["input"]) < _CODEX_TEXT_LIMIT
+    assert _referenced_file(params["input"][0]).read_text(encoding="utf-8") == text
+
+
 async def test_executor_reaches_app_server_over_ws_transport(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1082,6 +1407,8 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
         else:
             events = _collect_turn_events(executor, "do not duplicate")
             assert [type(event) for event in events] == [ExecutorError]
+            # Only an explicit JSON-RPC refusal proves the steer was not applied.
+            assert events[0].undelivered is isinstance(error, CodexAppServerResponseError)
 
     assert [method for method, _params in _FailingSteerClient.requests] == ["turn/steer"]
     state = read_bridge_state(tmp_path)
@@ -2070,6 +2397,222 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
     assert failure.code is None
     assert failure.message.startswith("Codex native executor error:")
     assert [method for method, _params in _ResetAfterSubmitClient.requests] == ["turn/start"]
+
+
+# What Codex 0.145 answers when a turn's text exceeds its 1,048,576 character limit.
+_INPUT_TOO_LARGE_ERROR = {
+    "code": -32602,
+    "data": {
+        "input_error_code": "input_too_large",
+        "max_chars": 1048576,
+        "actual_chars": 1309439,
+    },
+    "message": "Input exceeds the maximum length of 1048576 characters.",
+}
+
+
+def _install_failing_client(
+    monkeypatch: pytest.MonkeyPatch, *, method: str, error: Exception
+) -> type[_FakeCodexNativeClient]:
+    """
+    Patch in a fake app-server client that fails one JSON-RPC method.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param method: JSON-RPC method to fail, e.g. ``"turn/start"``.
+    :param error: Exception that method raises.
+    :returns: The client class, so a test can read the requests it recorded.
+    """
+
+    class _FailingClient(_FakeCodexNativeClient):
+        """Raise ``error`` for ``method``; behave as the base fake otherwise."""
+
+        async def request(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
+            """
+            Record the request, then fail it when it is the targeted method.
+
+            :param name: JSON-RPC method, e.g. ``"turn/start"``.
+            :param params: JSON-RPC params.
+            :returns: Codex-shaped response payload for other methods.
+            """
+            if name == method:
+                type(self).requests.append((name, params))
+                raise error
+            return await super().request(name, params)
+
+    _FailingClient.requests = []
+    _FailingClient.created = []
+    _FailingClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _FailingClient
+    )
+    return _FailingClient
+
+
+def test_rejected_turn_start_is_reported_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A JSON-RPC error on ``turn/start`` proves Codex never started the turn.
+
+    The message is flagged undelivered, with a code so the harness adapter keeps
+    the flag, and the server settles the sender's queued copy once instead of
+    leaving it to resurface as a false "not recorded" error at the next message.
+    """
+    client = _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(
+            {"code": -32600, "message": "thread not found: thread_123"}
+        ),
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == "codex_turn_rejected"
+    assert failure.title == "Codex rejected this message"
+    assert failure.message.startswith("Codex native executor error:")
+    assert "thread not found" in failure.message
+    assert [method for method, _params in client.requests] == ["turn/start"]
+
+
+def test_input_too_large_rejection_is_a_clear_coded_undelivered_input_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex's own size rejection reads as a limit, not as the raw JSON-RPC payload."""
+    _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(_INPUT_TOO_LARGE_ERROR),
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.code == "input_too_large"
+    assert failure.undelivered is True
+    assert failure.title == "Message too long for Codex"
+    assert "1,309,439" in failure.message
+    assert "1,048,576" in failure.message
+    assert "-32602" not in failure.message
+    assert failure.remediation is not None
+
+
+def test_input_too_large_rejection_without_numbers_still_reads_clearly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rejection that names no limit still gets the coded, undelivered input error."""
+    _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(
+            {"code": -32602, "data": {"input_error_code": "input_too_large"}, "message": "too big"}
+        ),
+    )
+    _start_state(tmp_path)
+
+    failure = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")[0]
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.code == "input_too_large"
+    assert failure.undelivered is True
+    assert "longer than Codex accepts" in failure.message
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(TimeoutError("turn/start timed out"), id="timeout"),
+        pytest.param(
+            ConnectionError("Codex app-server disconnected before responding to turn/start"),
+            id="disconnected",
+        ),
+        pytest.param(ConnectionClosedError(None, None), id="websocket-closed"),
+    ],
+)
+def test_ambiguous_turn_start_failures_are_not_marked_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    """
+    A timeout or dropped connection leaves it unknown whether Codex started the turn.
+
+    Settling the message as undelivered would show it as failed and let the
+    sender re-send it while Codex may already be working on it.
+    """
+    client = _install_failing_client(monkeypatch, method="turn/start", error=error)
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
+    assert failure.message.startswith("Codex native executor error:")
+    assert [method for method, _params in client.requests] == ["turn/start"]
+
+
+def test_rejected_goal_request_is_reported_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex refusing ``thread/goal/set`` delivers nothing, and no turn is started."""
+    client = _install_failing_client(
+        monkeypatch,
+        method="thread/goal/set",
+        error=CodexAppServerResponseError({"code": -32600, "message": "goals are disabled"}),
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "/goal Finish it")
+
+    assert len(events) == 1
+    failure = events[0]
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == "codex_turn_rejected"
+    assert [method for method, _params in client.requests] == ["thread/goal/set"]
+
+
+async def test_rejected_turn_start_reaches_the_turn_error_as_an_undelivered_coded_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Through the harness adapter, a refused ``turn/start`` keeps its undelivered flag.
+
+    The adapter drops the flag from an uncoded error, so the code is what lets
+    the server settle the sender's queued message on the failed response.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    _install_failing_client(
+        monkeypatch,
+        method="turn/start",
+        error=CodexAppServerResponseError(_INPUT_TOO_LARGE_ERROR),
+    )
+    _start_state(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_rejected", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+    await adapter.on_shutdown()
+
+    detail = adapter._build_error_detail(raised.value)
+    assert detail.code == "input_too_large"
+    assert detail.undelivered is True
+    assert "1,048,576" in detail.message
 
 
 def test_run_turn_leaves_non_connection_connect_failures_unclassified(

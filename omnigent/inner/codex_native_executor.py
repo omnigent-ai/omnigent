@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
@@ -67,6 +68,7 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     codex_resize_metadata_path,
     materialize_attachment,
+    materialize_text,
     parse_data_uri,
     requires_filesystem,
     unresolved_attachment_marker,
@@ -88,6 +90,17 @@ _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
+
+# Codex rejects a turn whose text items total over 1,048,576 characters;
+# text beyond this moves to an attachment file, with headroom to spare.
+_MAX_INLINE_TEXT_CHARS = 900_000
+
+# Error code for input Codex will not take, from either Omnigent's own checks
+# or Codex's rejection.
+_INPUT_TOO_LARGE_CODE = "input_too_large"
+
+# Error code for a request Codex refused with a JSON-RPC error response.
+_TURN_REJECTED_CODE = "codex_turn_rejected"
 
 
 async def _wait_for_bridge_state(
@@ -445,7 +458,9 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
-        input_items = _content_to_input_items(content, self._bridge_dir)
+        input_items = _content_to_input_items(
+            content, self._bridge_dir, session_id=self._request_session_id
+        )
         if not input_items:
             return False
         # Serialized against run_turn so the read-decide-RPC-write below
@@ -597,15 +612,23 @@ class CodexNativeExecutor(Executor):
         goal_objective = goal_objective_from_content(latest_user_content)
         if goal_objective is not None:
             # Reject over-long objectives here so the app-server's raw
-            # JSON-RPC -32600 error never reaches the user.
+            # JSON-RPC -32600 error never reaches the user. Nothing was sent,
+            # so the queued message settles instead of lingering.
             length_error = goal_objective_length_error(goal_objective)
             if length_error is not None:
-                yield ExecutorError(message=length_error)
+                yield ExecutorError(
+                    message=length_error,
+                    code=_INPUT_TOO_LARGE_CODE,
+                    title="Goal is too long for Codex",
+                    undelivered=True,
+                )
                 return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
             if goal_objective is not None
-            else _content_to_input_items(latest_user_content, self._bridge_dir)
+            else _content_to_input_items(
+                latest_user_content, self._bridge_dir, session_id=self._request_session_id
+            )
         )
         if not input_items:
             yield ExecutorError(message="Codex native turn had no user input to send")
@@ -751,6 +774,12 @@ class CodexNativeExecutor(Executor):
                             ),
                         )
                         error_msg = f"Codex native executor error: {exc}"
+                        if isinstance(exc, CodexAppServerResponseError):
+                            # A JSON-RPC error response means Codex refused the request, so
+                            # the turn never started; a timeout or dropped connection can't.
+                            startup_failure = _rejected_request_failure(exc)
+                            error_msg = startup_failure.message
+                            undelivered = True
                         # Name the servers a still-unsettled MCP startup is
                         # blocked on — the most common cause of an injection
                         # failure this early in the session's life.
@@ -767,11 +796,44 @@ class CodexNativeExecutor(Executor):
                 title=startup_failure.title if startup_failure is not None else None,
                 remediation=startup_failure.remediation if startup_failure is not None else None,
                 # A failure once the app-server was asked to start the turn is
-                # ambiguous: Codex may have accepted the message.
+                # ambiguous (Codex may have accepted the message) unless it refused it.
                 undelivered=undelivered,
             )
         else:
             yield TurnComplete(response=None)
+
+
+def _rejected_request_failure(error: CodexAppServerResponseError) -> CodexStartupFailure:
+    """
+    Describe a request Codex refused with a JSON-RPC error response.
+
+    :param error: The structured error Codex answered with. For oversized input
+        its data names the limit, e.g. ``{"input_error_code": "input_too_large",
+        "max_chars": 1048576, "actual_chars": 1309439}``.
+    :returns: A coded failure. ``input_too_large`` states the limit when Codex
+        reports it; any other refusal keeps Codex's error text.
+    """
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    if isinstance(data, dict) and data.get("input_error_code") == _INPUT_TOO_LARGE_CODE:
+        max_chars = data.get("max_chars")
+        actual_chars = data.get("actual_chars")
+        detail = (
+            f"This message has {actual_chars:,} characters of text; Codex accepts at most "
+            f"{max_chars:,} per message, so it was not sent."
+            if isinstance(max_chars, int) and isinstance(actual_chars, int)
+            else "This message is longer than Codex accepts, so it was not sent."
+        )
+        return CodexStartupFailure(
+            message=detail,
+            code=_INPUT_TOO_LARGE_CODE,
+            title="Message too long for Codex",
+            remediation="Shorten the message, or send it in smaller parts.",
+        )
+    return CodexStartupFailure(
+        message=f"Codex native executor error: {error}",
+        code=_TURN_REJECTED_CODE,
+        title="Codex rejected this message",
+    )
 
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
@@ -868,7 +930,28 @@ def _latest_user_content(messages: list[Message]) -> object:
     return None
 
 
-def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
+@dataclass(frozen=True)
+class _InlineText:
+    """
+    One inline text item that can move to an attachment file.
+
+    :param kind: ``"text"`` for message text, ``"file"`` for an inlined ``text/*`` file.
+    :param text: The inline text.
+    :param block: The ``input_file`` block for a ``"file"``, so the original upload is what
+        gets written; ``None`` for message text.
+    """
+
+    kind: Literal["text", "file"]
+    text: str
+    block: Mapping[str, object] | None = None
+
+
+def _content_to_input_items(
+    content: object,
+    bridge_dir: Path,
+    *,
+    session_id: str | None = None,
+) -> list[dict[str, object]]:
     """
     Normalize executor content into Codex app-server input items.
 
@@ -878,18 +961,49 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     URI inline as text would blow past the app-server's 1 MiB input
     limit. Files inline their decoded text when they are textual;
     binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    item so the model can open them with its tools. The same limit
+    caps the turn's total text, so past :data:`_MAX_INLINE_TEXT_CHARS`
+    the largest text moves to a file the same way.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
         ``{"type": "input_image", "image_url": "data:image/png;base64,..."}``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param session_id: Omnigent session id that log events are attributed to,
+        e.g. ``"conv_abc123"``.
     :returns: Codex input item dicts.
     """
+    items, inline = _collect_input_items(content, bridge_dir)
+    _spill_oversized_text(items, inline, bridge_dir, session_id)
+    return items
+
+
+def _collect_input_items(
+    content: object,
+    bridge_dir: Path,
+) -> tuple[list[dict[str, object]], dict[int, _InlineText]]:
+    """
+    Build the input items for *content* before any text moves to a file.
+
+    :param content: Message content, as for :func:`_content_to_input_items`.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :returns: The items, and the inline text among them keyed by item index.
+    """
+    items: list[dict[str, object]] = []
+    inline: dict[int, _InlineText] = {}
+
+    def add_text(
+        text: str,
+        kind: Literal["text", "file"],
+        block: Mapping[str, object] | None = None,
+    ) -> None:
+        inline[len(items)] = _InlineText(kind, text, block)
+        items.append({"type": "text", "text": text})
+
     if isinstance(content, str):
-        return [{"type": "text", "text": content}] if content else []
-    if isinstance(content, list):
-        items: list[dict[str, object]] = []
+        if content:
+            add_text(content, "text")
+    elif isinstance(content, list):
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
@@ -901,7 +1015,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
                 if isinstance(text, str) and text:
-                    items.append({"type": "text", "text": text})
+                    add_text(text, "text")
             elif _requires_filesystem(block):
                 # Delivery follows the stored filename, whichever block type the
                 # client chose: a zip declared image/png still needs filesystem tools,
@@ -919,13 +1033,61 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 else:
                     items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
-                file_item = _file_block_to_input_item(block, bridge_dir)
-                if file_item is not None:
-                    items.append(file_item)
-        return items
-    if content is None:
-        return []
-    return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+                file_text = _text_file_contents(block)
+                if file_text is None:
+                    items.append(_file_block_to_input_item(block, bridge_dir))
+                elif file_text:
+                    add_text(file_text, "file", block)
+    elif content is not None:
+        add_text(json.dumps(content, ensure_ascii=True), "text")
+    return items, inline
+
+
+def _spill_oversized_text(
+    items: list[dict[str, object]],
+    inline: Mapping[int, _InlineText],
+    bridge_dir: Path,
+    session_id: str | None,
+) -> None:
+    """
+    Move the largest inline text to attachment files until the turn's text fits.
+
+    Codex counts all of a turn's text against one limit, so the total matters,
+    not any single block. A moved item becomes an ``[Attached file: ...]``
+    reference, as a binary attachment does. Text that cannot be written stays
+    inline, and Codex reports the overflow itself.
+
+    :param items: Input items; a spilled item is replaced in place.
+    :param inline: The inline text items by index in *items*.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param session_id: Omnigent session id that the log event is attributed to.
+    """
+    total = sum(len(text) for item in items if isinstance(text := item.get("text"), str))
+    for index in sorted(inline, key=lambda i: len(inline[i].text), reverse=True):
+        if total <= _MAX_INLINE_TEXT_CHARS:
+            return
+        entry = inline[index]
+        path = (
+            materialize_attachment(entry.block, bridge_dir)
+            if entry.block is not None
+            else materialize_text(entry.text, bridge_dir)
+        )
+        if path is None:
+            continue
+        reference = _attached_file_item(path)
+        total += len(str(reference["text"])) - len(entry.text)
+        items[index] = reference
+        _logger.info(
+            "Codex native spilled oversized text to an attachment: kind=%s chars=%d",
+            entry.kind,
+            len(entry.text),
+            extra=debug_event(
+                "codex_native_text_spilled",
+                session_id=session_id,
+                kind=entry.kind,
+                chars=len(entry.text),
+            ),
+        )
 
 
 def _requires_filesystem(block: Mapping[str, object]) -> bool:
@@ -946,44 +1108,59 @@ def _apply_resize_notice_to_latest_image(
             item["path"] = str(codex_resize_metadata_path(Path(path), source_metadata))
 
 
-def _file_block_to_input_item(
-    block: Mapping[str, object],
-    bridge_dir: Path,
-) -> dict[str, object] | None:
+def _text_file_contents(block: Mapping[str, object]) -> str | None:
     """
-    Convert an ``input_file`` block into a Codex input item.
-
-    The Codex app-server has no native file input item, so a textual
-    file (``text/*``) is inlined as a ``text`` item. A binary file is
-    materialized to disk and referenced by path in a ``text`` item so
-    the model can open it with its tools. This keeps multi-megabyte
-    base64 payloads out of the turn's text input.
+    Decode a textual (``text/*``) ``input_file`` block.
 
     :param block: An ``input_file`` content block, expected to carry a
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
-    :param bridge_dir: Session bridge path identifying the attachment cache.
-    :returns: A Codex ``text`` input item; a visible could-not-load
-        marker item when the file failed to materialize; or ``None``
-        for an empty text file.
+    :returns: The decoded text (empty for an empty file), or ``None`` when the
+        file is not textual or could not be decoded.
     """
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
         try:
             parsed = parse_data_uri(file_data)
             if parsed.mime_type.startswith("text/"):
-                text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
-                return {"type": "text", "text": text} if text else None
+                return base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
         except (ValueError, binascii.Error):
             _logger.warning("Failed to decode input_file data URI", exc_info=True)
+    return None
+
+
+def _file_block_to_input_item(
+    block: Mapping[str, object],
+    bridge_dir: Path,
+) -> dict[str, object]:
+    """
+    Convert a non-textual ``input_file`` block into a Codex input item.
+
+    The Codex app-server has no native file input item, so the file is
+    materialized to disk and referenced by path in a ``text`` item so
+    the model can open it with its tools. This keeps multi-megabyte
+    base64 payloads out of the turn's text input.
+
+    :param block: An ``input_file`` content block, expected to carry a
+        ``file_data`` data URI, e.g.
+        ``"data:application/pdf;base64,JVBERi0="``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :returns: A Codex ``text`` input item referencing the file, or a visible
+        could-not-load marker item when the file failed to materialize.
+    """
     path = materialize_attachment(block, bridge_dir)
     if path is not None:
-        # Marker format is load-bearing: codex echoes this text item back
-        # in the mirrored user message, and title seeding strips lines
-        # matching _ATTACHMENT_MARKER_RE in
-        # omnigent/entities/conversation.py. Keep in sync.
-        return {"type": "text", "text": f"[Attached file: {path}]"}
+        return _attached_file_item(path)
     return {"type": "text", "text": unresolved_attachment_marker(block)}
+
+
+def _attached_file_item(path: Path) -> dict[str, object]:
+    """Text item that points the model at a file it can open with its tools."""
+    # Marker format is load-bearing: codex echoes this text item back
+    # in the mirrored user message, and title seeding strips lines
+    # matching _ATTACHMENT_MARKER_RE in
+    # omnigent/entities/conversation.py. Keep in sync.
+    return {"type": "text", "text": f"[Attached file: {path}]"}
 
 
 def _json_object(value: object) -> dict[str, object] | None:

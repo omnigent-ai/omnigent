@@ -178,7 +178,38 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
     if decoded is None:
         return None
     raw_bytes, filename = decoded
+    return _materialize_bytes(raw_bytes, filename, bridge_dir)
 
+
+def materialize_text(text: str, bridge_dir: Path) -> Path | None:
+    """
+    Write *text* into the session's attachment cache as a UTF-8 ``.txt`` file.
+
+    Takes the same no-follow placement as :func:`materialize_attachment`. The
+    name carries a digest of the text, so sending the same text again reuses
+    the file instead of writing another.
+
+    :param text: Text to store, e.g. a message too long to send inline.
+    :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :returns: Path to the written file, e.g.
+        ``.../attachments/<key>/pasted_text_1a2b3c4d5e6f.txt``, or ``None`` if
+        it could not be written.
+    """
+    # Lone surrogates can't be encoded; replace them rather than lose the text.
+    raw_bytes = text.encode("utf-8", errors="replace")
+    digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+    return _materialize_bytes(raw_bytes, f"pasted_text_{digest}.txt", bridge_dir)
+
+
+def _materialize_bytes(raw_bytes: bytes, filename: str, bridge_dir: Path) -> Path | None:
+    """
+    Place *raw_bytes* as *filename* in the session's attachment cache.
+
+    :param raw_bytes: File content.
+    :param filename: Base filename with no directory components.
+    :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :returns: Path to the file, or ``None`` if it could not be placed safely.
+    """
     if filename in (".", "..") or os.sep in filename:
         return None
 
