@@ -123,3 +123,28 @@ async def test_streamed_stop_reason_override_reaches_message_delta(thinking: str
         ]
         assert [delta["delta"]["stop_reason"] for delta in deltas] == ["max_tokens"]
         assert ('"type": "thinking"' in response.text) == (thinking is not None)
+
+
+async def test_nonstream_stop_reason_override_reaches_message() -> None:
+    """A queued ``stop_reason`` also ends a JSON (non-streaming) reply."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=mock_llm_server.app), base_url="http://mock"
+    ) as client:
+        configured = await client.post(
+            "/mock/configure",
+            json={"responses": [{"text": "Here is the start —", "stop_reason": "max_tokens"}]},
+        )
+        configured.raise_for_status()
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "synthetic-model",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Write the full report."}],
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        message = response.json()
+        assert message["stop_reason"] == "max_tokens"
+        assert message["content"] == [{"type": "text", "text": "Here is the start —"}]

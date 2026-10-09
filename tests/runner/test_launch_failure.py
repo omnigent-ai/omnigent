@@ -324,6 +324,17 @@ def test_output_limit_text_does_not_override_specific_failure_codes(code: str) -
     assert classify_native_turn_error(code, _RAW_OUTPUT_LIMIT_ERROR) == code
 
 
+def test_bridge_output_limit_guidance_is_classified() -> None:
+    """The classifier keys on the bridge's rewrite, so the two must move together."""
+    from omnigent.harnesses.claude_native.bridge import _OUTPUT_TOKEN_LIMIT_REPLACEMENT
+
+    assert _REWRITTEN_OUTPUT_LIMIT_ERROR == _OUTPUT_TOKEN_LIMIT_REPLACEMENT
+    assert (
+        classify_native_turn_error("native_turn_error", _OUTPUT_TOKEN_LIMIT_REPLACEMENT)
+        == "output_limit_exceeded"
+    )
+
+
 def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
     """A real auth failure under codex_reauth_required must not be reclassified."""
     message = (

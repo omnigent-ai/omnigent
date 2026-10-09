@@ -71,8 +71,9 @@ def _wait_for_status(base_url: str, session_id: str, status: str, timeout_s: flo
     """Poll ``GET /v1/sessions/{id}`` until the session reports *status*."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if str(_session_snapshot(base_url, session_id).get("status") or "") == status:
-            return
+        with contextlib.suppress(httpx.HTTPError):
+            if str(_session_snapshot(base_url, session_id).get("status") or "") == status:
+                return
         time.sleep(1.0)
     pytest.fail(f"session never reached status {status!r} within {timeout_s:.0f}s")
 
@@ -94,11 +95,11 @@ def _error_pill_text(page: Page) -> str:
     if pill.count() == 0:
         return ""
     parts: list[str] = []
-    headline = pill.first.locator('[data-testid="error-headline"]')
-    if headline.count() > 0:
-        parts.append(headline.first.get_attribute("title") or "")
-    # Pill may detach mid-read; its text is best-effort.
+    # Pill may detach mid-read; its headline and text are best-effort.
     with contextlib.suppress(Exception):
+        headline = pill.first.locator('[data-testid="error-headline"]')
+        if headline.count() > 0:
+            parts.append(headline.first.get_attribute("title") or "")
         parts.append(pill.first.inner_text(timeout=5_000))
     return " ".join(part for part in parts if part)
 
@@ -234,14 +235,22 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     settled_at: float | None = None
     deadline = time.monotonic() + _FAULT_SETTLE_S
     while time.monotonic() < deadline:
-        snapshot = _session_snapshot(base_url, session_id)
-        hits = _raw_constant_surfaces(page, base_url, session_id, snapshot)
+        try:
+            snapshot = _session_snapshot(base_url, session_id)
+            hits = _raw_constant_surfaces(page, base_url, session_id, snapshot)
+        except httpx.HTTPError:
+            # A transient API blip must not abort the diagnostic poll.
+            time.sleep(2.0)
+            continue
         if hits:
             # Let the mirror and the pill catch up so every affected surface is named.
             time.sleep(_MIRROR_GRACE_S)
             break
-        if settled_at is None and _turn_settled(page, str(snapshot.get("status") or "")):
-            settled_at = time.monotonic()
+        if _turn_settled(page, str(snapshot.get("status") or "")):
+            if settled_at is None:
+                settled_at = time.monotonic()
+        else:
+            settled_at = None
         if settled_at is not None and time.monotonic() - settled_at >= _MIRROR_GRACE_S:
             break
         time.sleep(2.0)
@@ -270,6 +279,14 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     output_dir.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(output_dir / "output-token-limit-chat.png"))
 
+    if settled_at is None and not hits:
+        pytest.fail(
+            f"the output-token-limit turn never reached a terminal state within "
+            f"{_FAULT_SETTLE_S:.0f}s (no failed status, no second assistant "
+            "reply) — the claude-native pipeline did not finish the turn, so "
+            "its output-token handling could not be judged."
+        )
+
     problems: list[str] = []
     if hits:
         where = "; ".join(f"{surface} carried {text!r}" for surface, text in hits)
@@ -278,17 +295,31 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
             f"{where}. Setting CLAUDE_CODE_MAX_OUTPUT_TOKENS on the running CLI is "
             "not available from the Omnigent web chat."
         )
-    if status == "failed" and last_task_error.get("code") != _OUTPUT_LIMIT_CODE:
+    elif status != "failed":
+        # Claude Code fails a max_tokens turn; an idle end means the scripted stop
+        # was not drawn or the CLI now recovers from it — verify the limit was hit.
+        problems.append(
+            f"the fault turn ended with status {status!r} instead of failing on the "
+            "output limit, so the injected max_tokens stop was not demonstrated."
+        )
+    elif last_task_error.get("code") != _OUTPUT_LIMIT_CODE:
         problems.append(
             f"the failed turn was not attributed to {_OUTPUT_LIMIT_CODE!r} "
             f"(last_task_error={last_task_error!r}; server log={log_lines!r}), so the "
             "model's output cap is counted as an Omnigent turn failure instead of an "
             "upstream limit."
         )
-    if status == "failed" and _OUTPUT_LIMIT_GUIDANCE not in _assistant_bubble_text(page):
+    if _OUTPUT_LIMIT_GUIDANCE not in _assistant_bubble_text(page):
         problems.append(
             f"the chat does not show the {_OUTPUT_LIMIT_GUIDANCE!r} guidance for the "
             "failed turn, so the user has nothing to act on."
+        )
+    # The log is only readable for the fixture-spawned server; an external
+    # --ui-base-url server yields no lines and skips this check.
+    if log_lines and not any(f"code={_OUTPUT_LIMIT_CODE}" in line for line in log_lines):
+        problems.append(
+            f"the server's turn-failure log does not attribute the turn to "
+            f"{_OUTPUT_LIMIT_CODE!r}: {log_lines!r}"
         )
     if problems:
         # Hold the failure state on screen so the recording ends on it.
@@ -296,11 +327,4 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
         pytest.fail(
             "a claude-native turn that hit Claude's output-token maximum: "
             + " Also, ".join(problems)
-        )
-    if settled_at is None:
-        pytest.fail(
-            f"the output-token-limit turn never reached a terminal state within "
-            f"{_FAULT_SETTLE_S:.0f}s (no failed status, no second assistant "
-            "reply) — the claude-native pipeline did not finish the turn, so "
-            "its output-token handling could not be judged."
         )

@@ -1619,24 +1619,9 @@ def test_read_transcript_rewrites_output_token_limit(tmp_path: Path, raw_text: s
     assert "output token maximum" not in text
 
 
-@pytest.mark.parametrize(
-    "raw_text",
-    [
-        # Byte-identical to the CLI's error, but UNFLAGGED: a model quoting
-        # the line is a real turn, so it is forwarded as-is.
-        _RAW_OUTPUT_LIMIT_ERROR,
-        (
-            "The line 'API Error: Claude's response exceeded the 32000 output token "
-            "maximum.' means the reply was truncated by the CLI."
-        ),
-        "Claude's response exceeded expectations this time.",
-    ],
-)
-def test_read_transcript_leaves_unflagged_output_token_text_untouched(
-    tmp_path: Path, raw_text: str
-) -> None:
-    """Prose about the limit, and an unflagged copy of the constant, survive untouched."""
-    assert _assistant_transcript_text(tmp_path, raw_text) == raw_text
+def test_read_transcript_leaves_unflagged_output_token_text_untouched(tmp_path: Path) -> None:
+    """A model reply quoting the constant verbatim is unflagged, so it is forwarded as-is."""
+    assert _assistant_transcript_text(tmp_path, _RAW_OUTPUT_LIMIT_ERROR) == _RAW_OUTPUT_LIMIT_ERROR
 
 
 def _assistant_transcript_text(

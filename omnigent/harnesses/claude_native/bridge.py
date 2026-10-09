@@ -8975,6 +8975,8 @@ _OUTPUT_TOKEN_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ``classify_native_turn_error`` keys on "exceeded the model’s maximum output length";
+# keep that phrase if the wording changes.
 _OUTPUT_TOKEN_LIMIT_REPLACEMENT = (
     "Output limit reached — the response exceeded the model’s maximum "
     "output length and was cut off. Ask for a shorter answer, or break "
