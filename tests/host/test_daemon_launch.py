@@ -11,6 +11,10 @@ refused status poll killed ``omnigent run`` with a bare
 
 from __future__ import annotations
 
+import json
+import os
+import sys
+
 import click
 import httpx
 import pytest
@@ -18,8 +22,14 @@ import pytest
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
+    HOST_DAEMON_COMMAND_ENV_VAR,
+    HOST_DAEMON_COMMAND_SUPPORTED,
+    HOST_DAEMON_IDLE_STOP_SUPPORTED,
+    host_daemon_command,
     open_daemon_client,
     runner_is_online,
+    supports_host_daemon_command,
+    supports_host_daemon_idle_stop,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -39,6 +49,102 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *a, **k: None,
     )
     monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
+
+
+@pytest.mark.parametrize(
+    ("server_url", "target_args"),
+    [
+        (None, ["--local"]),
+        ("", ["--local"]),
+        ("https://server.example.com", ["--server", "https://server.example.com"]),
+    ],
+)
+def test_host_daemon_command_default_preserves_target_modes(
+    server_url: str | None,
+    target_args: list[str],
+) -> None:
+    """An unset hook keeps the exact ordinary daemon invocation."""
+    assert host_daemon_command(server_url, env={}) == [
+        sys.executable,
+        "-P",
+        "-m",
+        "omnigent.host._daemon_entry",
+        *target_args,
+    ]
+
+
+def test_host_daemon_command_prepends_json_argv_prefix_without_shell() -> None:
+    """A configured prefix receives the ordinary child argv as separate args."""
+    prefix = ["/opt/host-supervisor", "--label", "managed host"]
+
+    if not HOST_DAEMON_COMMAND_SUPPORTED:
+        with pytest.raises(ValueError, match="POSIX process groups"):
+            host_daemon_command(
+                "https://server.example.com",
+                env={HOST_DAEMON_COMMAND_ENV_VAR: json.dumps(prefix)},
+            )
+        return
+
+    assert host_daemon_command(
+        "https://server.example.com",
+        env={HOST_DAEMON_COMMAND_ENV_VAR: json.dumps(prefix)},
+    ) == [
+        *prefix,
+        sys.executable,
+        "-P",
+        "-m",
+        "omnigent.host._daemon_entry",
+        "--server",
+        "https://server.example.com",
+    ]
+
+
+def test_host_daemon_command_blank_hook_keeps_default() -> None:
+    """Whitespace-only configuration is equivalent to an unset hook."""
+    assert host_daemon_command(
+        None,
+        env={HOST_DAEMON_COMMAND_ENV_VAR: "  \t\n"},
+    ) == [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", "--local"]
+
+
+@pytest.mark.parametrize(
+    "raw_command",
+    [
+        "not-json",
+        "{}",
+        "[]",
+        '[""]',
+        '["   "]',
+        "[1]",
+        '["\\u0000"]',
+    ],
+)
+def test_host_daemon_command_rejects_invalid_json_argv_prefix(raw_command: str) -> None:
+    """Malformed prefixes fail before a child can be spawned."""
+    with pytest.raises(ValueError, match=HOST_DAEMON_COMMAND_ENV_VAR):
+        host_daemon_command(
+            None,
+            env={HOST_DAEMON_COMMAND_ENV_VAR: raw_command},
+        )
+
+
+def test_host_daemon_command_rejects_nul_in_target() -> None:
+    """The eventual subprocess argv cannot contain an OS-invalid NUL."""
+    with pytest.raises(ValueError, match="NUL"):
+        host_daemon_command("https://server.example.com\x00", env={})
+
+
+def test_host_daemon_command_capability_probe_is_stable() -> None:
+    """Downstream launchers can detect the contract without parsing a version."""
+    expected = os.name != "nt"
+    assert HOST_DAEMON_COMMAND_SUPPORTED is expected
+    assert supports_host_daemon_command() is expected
+
+
+def test_host_daemon_idle_stop_capability_probe_is_stable() -> None:
+    """Downstream maintenance can detect guarded host-stop support."""
+    assert HOST_DAEMON_IDLE_STOP_SUPPORTED is True
+    assert supports_host_daemon_idle_stop() is True
 
 
 class _FlakyThenOnline:

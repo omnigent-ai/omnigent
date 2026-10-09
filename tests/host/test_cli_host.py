@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import psutil
 import pytest
 from click.testing import CliRunner
 
 from omnigent import cli as cli_module
 from omnigent.cli import _add_daemon_host_status, _ensure_host_daemon, _host_daemon_alive, cli
+from omnigent.host.daemon_launch import HOST_DAEMON_COMMAND_ENV_VAR
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -62,10 +64,35 @@ def _persist_fake_daemon_claim(
             started_at=int(time.time()),
             host_id=cli_module._load_existing_host_id(),
             config_sig="test-config-signature",
+            launch_id=spawned.launch_id,
         )
     )
     cli_module._HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
     return cli_module._find_daemon_record(target)
+
+
+def _write_host_stop_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pid: int = 4242,
+    launch_id: str | None = "launch-a",
+) -> cli_module._HostDaemonRecord:
+    """Write one isolated remote daemon record for host-stop tests."""
+    target = "https://server.example.com"
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+    record = cli_module._HostDaemonRecord(
+        pid=pid,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=str(tmp_path / "host.log"),
+        started_at=1,
+        host_id="host_abc",
+        launch_id=launch_id,
+    )
+    cli_module._write_daemon_record(record)
+    return record
 
 
 def test_host_pid_path_honors_data_dir_at_import(tmp_path: Path) -> None:
@@ -520,6 +547,172 @@ def test_ensure_host_daemon_writes_pid_file(
             os.kill(p, signal.SIGTERM)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="wrapped daemon cleanup requires POSIX process groups")
+@pytest.mark.parametrize(
+    ("server_url", "target_args"),
+    [
+        (None, ["--local"]),
+        ("https://server.example.com", ["--server", "https://server.example.com"]),
+    ],
+)
+def test_ensure_host_daemon_uses_wrapped_command_and_child_claim_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    target_args: list[str],
+) -> None:
+    """The spawn boundary prepends the wrapper while the child owns the record."""
+    prefix = ["/opt/host-supervisor", "--label", "managed"]
+    raw_command = json.dumps(prefix)
+    daemon_env: dict[str, str] = {}
+    spawned_args: list[list[str]] = []
+    wait_kwargs: dict[str, object] = {}
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv(HOST_DAEMON_COMMAND_ENV_VAR, raw_command)
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+
+    def _spawn(*, args: list[str], env: dict[str, str]) -> cli_module._SpawnedDaemonProcess:
+        spawned_args.append(args)
+        daemon_env.update(env)
+        return cli_module._SpawnedDaemonProcess(pid=4242, log_path=str(tmp_path / "host.log"))
+
+    def _claim(
+        target: str,
+        spawned: cli_module._SpawnedDaemonProcess,
+        **kwargs: object,
+    ) -> cli_module._HostDaemonRecord | None:
+        wait_kwargs.update(kwargs)
+        return _persist_fake_daemon_claim(target, spawned)
+
+    monkeypatch.setattr(cli_module, "_spawn_host_daemon_process", _spawn)
+    monkeypatch.setattr(cli_module, "_wait_for_daemon_claim", _claim)
+
+    _ensure_host_daemon(server_url)
+
+    assert spawned_args == [
+        [*prefix, sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *target_args]
+    ]
+    assert daemon_env[HOST_DAEMON_COMMAND_ENV_VAR] == raw_command
+    assert wait_kwargs == {"timeout_s": cli_module._WRAPPED_DAEMON_CLAIM_TIMEOUT_S}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="wrapped daemon mode is POSIX-only")
+def test_host_daemon_command_malformed_value_is_a_click_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid launcher configuration is user input, not a crash-screen bug."""
+    _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setenv(HOST_DAEMON_COMMAND_ENV_VAR, "not-json")
+
+    result = CliRunner().invoke(cli, ["host", "--background"])
+
+    assert result.exit_code != 0
+    assert HOST_DAEMON_COMMAND_ENV_VAR in result.output
+    assert "must be a JSON array" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="wrapped daemon cleanup requires POSIX process groups")
+def test_spawned_wrapper_timeout_cleanup_stops_descendant_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claim-timeout cleanup must not leave a wrapper-owned child behind."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    marker = tmp_path / "child.pid"
+    wrapper_code = "\n".join(
+        [
+            "import subprocess",
+            "import sys",
+            "import time",
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
+            f"with open({str(marker)!r}, 'w') as marker_file:",
+            "    marker_file.write(str(child.pid))",
+            "time.sleep(60)",
+            "",
+        ]
+    )
+    spawned = cli_module._spawn_host_daemon_process(
+        args=[sys.executable, "-c", wrapper_code],
+        env=dict(os.environ),
+    )
+    assert spawned is not None
+    assert spawned.process is not None
+    try:
+        for _ in range(100):
+            if marker.exists():
+                break
+            time.sleep(0.01)
+        assert marker.exists(), "wrapper did not create its child marker"
+        child_pid = int(marker.read_text())
+
+        cli_module._stop_spawned_host_daemon_process(spawned, grace_timeout=0.2)
+
+        assert spawned.process.poll() is not None
+        assert not cli_module._proc.process_alive(child_pid)
+    finally:
+        if spawned.process.poll() is None:
+            cli_module._stop_spawned_host_daemon_process(spawned, grace_timeout=0.2)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="wrapped daemon cleanup requires POSIX process groups")
+def test_wrapped_supervisor_crash_after_child_spawn_cleans_child_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed wrapper cannot leave its launch-id child running before claim."""
+    wrapper = tmp_path / "crashing_wrapper.py"
+    marker = tmp_path / "crashed_child.pid"
+    wrapper.write_text(
+        "\n".join(
+            [
+                "import os",
+                "import subprocess",
+                "import sys",
+                "from pathlib import Path",
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
+                "Path(os.environ['OMNIGENT_TEST_CRASH_CHILD']).write_text(str(child.pid))",
+                "os._exit(1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_TEST_CRASH_CHILD", str(marker))
+    monkeypatch.setenv(
+        HOST_DAEMON_COMMAND_ENV_VAR,
+        json.dumps([sys.executable, str(wrapper)]),
+    )
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+
+    def _never_claim(
+        target: str,
+        spawned: cli_module._SpawnedDaemonProcess,
+        **_kw: object,
+    ) -> None:
+        del target, spawned
+        deadline = time.monotonic() + 2.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    monkeypatch.setattr(cli_module, "_wait_for_daemon_claim", _never_claim)
+
+    with pytest.raises(click.ClickException, match="did not claim"):
+        _ensure_host_daemon(None)
+
+    assert marker.exists(), "wrapper did not spawn its child before crashing"
+    child_pid = int(marker.read_text())
+    deadline = time.monotonic() + 2.0
+    while cli_module._proc.process_alive(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not cli_module._proc.process_alive(child_pid)
+
+
 def test_ensure_host_daemon_keeps_old_for_different_server(
     tmp_path: Path,
 ) -> None:
@@ -739,6 +932,278 @@ def test_host_stop_drops_stale_foreign_daemon_record(
         "stale foreign daemon record survived stop — a subsequent host start "
         "would be blocked by an 'already running' conflict"
     )
+
+
+@pytest.mark.parametrize("case", ["active", "unknown", "error"])
+def test_host_stop_if_idle_fails_closed_without_stopping_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """Idle guard refuses active, unknown, and unverifiable snapshots."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    if case == "active":
+        sessions = [{"id": "conv_active", "host_id": record.host_id, "status": "running"}]
+        error = None
+        expected = "active host-bound"
+    elif case == "unknown":
+        sessions = [{"id": "conv_unknown", "host_id": record.host_id, "status": "future"}]
+        error = None
+        expected = "status could not be verified"
+    else:
+        sessions = []
+        error = "session list failed (500): server unavailable"
+        expected = "Cannot verify that"
+
+    monkeypatch.setattr(
+        cli_module,
+        "_sessions_for_daemon",
+        lambda _record, **_kwargs: cli_module._DaemonSessionsResult(
+            base_url=record.server_url,
+            sessions=sessions,
+            error=error,
+        ),
+    )
+    terminated: list[int] = []
+    stop_events: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_stop_session_on_server",
+        lambda **_kwargs: stop_events.append("unexpected"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "stop", "--server", record.target, "--if-idle"],
+    )
+
+    assert result.exit_code != 0
+    assert expected in result.output
+    assert terminated == []
+    assert stop_events == []
+
+
+@pytest.mark.parametrize("extra", [["--force"], ["--daemon-only"]])
+def test_host_stop_if_idle_rejects_unsafe_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+) -> None:
+    """The idle guard cannot be combined with force or daemon-only."""
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "stop", "--if-idle", *extra])
+
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+    assert terminated == []
+
+
+def test_host_stop_expected_owner_change_fails_before_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reread owner change prevents signals and record cleanup."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    replacement = cli_module._HostDaemonRecord(
+        pid=5151,
+        target=record.target,
+        mode=record.mode,
+        server_url=record.server_url,
+        log_path=record.log_path,
+        started_at=2,
+        host_id=record.host_id,
+        launch_id="launch-b",
+    )
+
+    def _quiet_then_replace(_record: cli_module._HostDaemonRecord, **_kwargs: object):
+        cli_module._write_daemon_record(replacement)
+        return cli_module._DaemonSessionsResult(
+            base_url=record.server_url,
+            sessions=[],
+            error=None,
+        )
+
+    monkeypatch.setattr(cli_module, "_sessions_for_daemon", _quiet_then_replace)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "host",
+            "stop",
+            "--server",
+            record.target,
+            "--if-idle",
+            "--expected-pid",
+            str(record.pid),
+            "--expected-launch-id",
+            str(record.launch_id),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "owner" in result.output and "changed" in result.output
+    assert terminated == []
+    current = cli_module._read_daemon_record(cli_module._daemon_record_path(record.target))
+    assert current is not None and current.pid == replacement.pid
+
+
+def test_host_stop_if_idle_legacy_pid_owner_can_match_expected_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host.pid-only legacy owner remains guardable by its expected PID."""
+    target = "https://server.example.com"
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+    cli_module._HOST_PID_PATH.write_text(f"4242\n{target}\n")
+    monkeypatch.setattr(
+        cli_module,
+        "_sessions_for_daemon",
+        lambda _record, **_kwargs: cli_module._DaemonSessionsResult(
+            base_url=target,
+            sessions=[],
+            error=None,
+        ),
+    )
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "stop", "--server", target, "--if-idle", "--expected-pid", "4242"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == [4242]
+
+
+def test_host_stop_if_idle_legacy_pid_change_refuses_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed host.pid owner fails closed without a JSON launch token."""
+    target = "https://server.example.com"
+    monkeypatch.setattr(cli_module, "_HOST_PID_PATH", tmp_path / "host.pid")
+    cli_module._HOST_PID_PATH.write_text(f"4242\n{target}\n")
+
+    def _quiet_then_replace(_record: cli_module._HostDaemonRecord, **_kwargs: object):
+        cli_module._HOST_PID_PATH.write_text(f"5151\n{target}\n")
+        return cli_module._DaemonSessionsResult(
+            base_url=target,
+            sessions=[],
+            error=None,
+        )
+
+    monkeypatch.setattr(cli_module, "_sessions_for_daemon", _quiet_then_replace)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append(current.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "stop", "--server", target, "--if-idle", "--expected-pid", "4242"],
+    )
+
+    assert result.exit_code != 0
+    assert "owner" in result.output and "changed" in result.output
+    assert terminated == []
+    assert cli_module._HOST_PID_PATH.read_text() == f"5151\n{target}\n"
+
+
+def test_host_stop_if_idle_quiet_expected_owner_terminates_without_session_rpc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quiet matching owner is terminated directly without stop-session calls."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "_sessions_for_daemon",
+        lambda _record, **_kwargs: cli_module._DaemonSessionsResult(
+            base_url=record.server_url,
+            sessions=[],
+            error=None,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_stop_session_on_server",
+        lambda **_kwargs: pytest.fail("--if-idle must not send stop-session RPCs"),
+    )
+    terminated: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append((current.pid, force)),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "host",
+            "stop",
+            "--server",
+            record.target,
+            "--if-idle",
+            "--expected-pid",
+            str(record.pid),
+            "--expected-launch-id",
+            str(record.launch_id),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == [(record.pid, False)]
+    assert "sessions_stopped=0" in result.output
+
+
+def test_host_stop_default_still_drains_before_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without new options, the existing session-draining path remains intact."""
+    record = _write_host_stop_record(tmp_path, monkeypatch)
+    drained: list[int] = []
+    terminated: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_stop_daemon_sessions",
+        lambda current: drained.append(current.pid) or 2,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_terminate_daemon",
+        lambda current, *, force: terminated.append((current.pid, force)),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "stop", "--server", record.target])
+
+    assert result.exit_code == 0, result.output
+    assert drained == [record.pid]
+    assert terminated == [(record.pid, False)]
+    assert "sessions_stopped=2" in result.output
 
 
 def test_add_daemon_host_status_skips_http_for_dead_process() -> None:

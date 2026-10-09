@@ -148,6 +148,7 @@ def test_concurrent_ensure_host_daemon_does_not_leave_orphaned_record(
                     started_at=0,
                     host_id="host_abc",
                     config_sig=None,
+                    launch_id=env.get(cli.DAEMON_LAUNCH_ID_ENV_VAR),
                 )
             )
             # write_events[0] is now set (write 1 done)
@@ -160,7 +161,11 @@ def test_concurrent_ensure_host_daemon_does_not_leave_orphaned_record(
             # on fixed code or _persist_spawned_daemon on unfixed code) runs
             # deterministically after the winner's _persist_spawned_daemon.
 
-        return cli._SpawnedDaemonProcess(pid=my_pid, log_path=str(tmp_path / "daemon.log"))
+        return cli._SpawnedDaemonProcess(
+            pid=my_pid,
+            log_path=str(tmp_path / "daemon.log"),
+            launch_id=env.get(cli.DAEMON_LAUNCH_ID_ENV_VAR),
+        )
 
     monkeypatch.setattr(cli, "_spawn_host_daemon_process", _racing_spawn)
     # Winner PID is alive; loser PID is dead (exited after losing the election).

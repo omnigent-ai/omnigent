@@ -27,11 +27,15 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pexpect
+import pytest
 
+from omnigent.host.daemon_launch import HOST_DAEMON_COMMAND_ENV_VAR
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _BOOT_TIMEOUT,
     _EXIT_TIMEOUT,
@@ -330,6 +334,211 @@ def _run_background_lifecycle_test(
         if daemon_pid > 0 and _pid_alive(daemon_pid):
             _force_stop_server(daemon_pid)
         if server_pid > 0:
+            _force_stop_server(server_pid)
+
+
+def test_wrapped_background_daemon_registers_and_stops(
+    omnigent_python: Path,
+    omnigent_repo_root: Path,
+    mock_credentials_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A real argv wrapper can launch, register, and stop the real daemon child."""
+    home = tmp_path / "home"
+    marker = tmp_path / "wrapper.json"
+    wrapper = tmp_path / "wrapper.py"
+    wrapper.write_text(
+        "\n".join(
+            [
+                "import json",
+                "import os",
+                "import signal",
+                "import subprocess",
+                "import sys",
+                "from pathlib import Path",
+                "",
+                "child = subprocess.Popen(sys.argv[1:])",
+                "",
+                "def forward(signum, _frame):",
+                "    if child.poll() is None:",
+                "        child.send_signal(signum)",
+                "",
+                "signal.signal(signal.SIGTERM, forward)",
+                "signal.signal(signal.SIGINT, forward)",
+                "Path(os.environ['OMNIGENT_TEST_WRAPPER_MARKER']).write_text(",
+                "    json.dumps({'wrapper_pid': os.getpid(), "
+                "'child_pid': child.pid, 'child_argv': sys.argv[1:]})",
+                ")",
+                "raise SystemExit(child.wait())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = _connect_env(mock_credentials_env, home)
+    env[HOST_DAEMON_COMMAND_ENV_VAR] = json.dumps([str(omnigent_python), str(wrapper)])
+    env["OMNIGENT_TEST_WRAPPER_MARKER"] = str(marker)
+
+    proc = _spawn_background_daemon(omnigent_python, omnigent_repo_root, env)
+    assert proc.returncode == 0, f"wrapped background spawn failed:\n{proc.stderr}"
+
+    daemon_pid = -1
+    wrapper_pid = -1
+    server_pid = -1
+    record: Path | None = None
+    try:
+        record = _wait_for_daemon_record(home / ".omnigent" / "daemons", timeout=_BOOT_TIMEOUT)
+        payload = json.loads(record.read_text())
+        daemon_pid = payload["pid"]
+        wrapper_payload = json.loads(marker.read_text())
+        wrapper_pid = wrapper_payload["wrapper_pid"]
+
+        assert wrapper_payload["child_pid"] == daemon_pid
+        assert wrapper_payload["child_pid"] != wrapper_pid
+        assert wrapper_payload["child_argv"] == [
+            str(omnigent_python),
+            "-P",
+            "-m",
+            "omnigent.host._daemon_entry",
+            "--local",
+        ]
+        assert payload["mode"] == "local"
+        assert payload["target"] == "local"
+        assert isinstance(payload["host_id"], str) and payload["host_id"]
+        assert Path(payload["log_path"]).is_file()
+        assert _pid_alive(wrapper_pid)
+        assert _pid_alive(daemon_pid)
+        _assert_daemon_owns_record(record, daemon_pid)
+
+        server_pid, _port = _read_local_server_record(home)
+        stop = subprocess.run(
+            [str(omnigent_python), "-m", "omnigent", "host", "stop"],
+            env=dict(env),
+            cwd=str(omnigent_repo_root),
+            capture_output=True,
+            text=True,
+            timeout=_BOOT_TIMEOUT,
+        )
+        assert stop.returncode == 0, f"wrapped host stop failed:\n{stop.stdout}\n{stop.stderr}"
+        assert _wait_pid_gone(daemon_pid, timeout=_SELF_TERMINATE_TIMEOUT)
+        assert _wait_pid_gone(wrapper_pid, timeout=_SELF_TERMINATE_TIMEOUT)
+        assert record is not None and not record.exists()
+    finally:
+        for pid in (daemon_pid, wrapper_pid, server_pid):
+            if pid > 0 and _pid_alive(pid):
+                _force_stop_server(pid)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="wrapped daemon cleanup requires POSIX process groups")
+def test_duplicate_wrapped_background_launch_has_one_owner(
+    omnigent_python: Path,
+    omnigent_repo_root: Path,
+    mock_credentials_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """Two wrapped launches elect one child and retire the losing supervisor."""
+    home = tmp_path / "home"
+    marker_dir = tmp_path / "wrapper-markers"
+    marker_dir.mkdir(parents=True)
+    start = tmp_path / "release-wrappers"
+    wrapper = tmp_path / "gated_wrapper.py"
+    wrapper.write_text(
+        "\n".join(
+            [
+                "import json",
+                "import os",
+                "import subprocess",
+                "import sys",
+                "import time",
+                "from pathlib import Path",
+                "marker_dir = Path(os.environ['OMNIGENT_TEST_DUPLICATE_MARKERS'])",
+                "wrapper_pid = os.getpid()",
+                "(marker_dir / f'{wrapper_pid}.ready').write_text('ready')",
+                "start = Path(os.environ['OMNIGENT_TEST_DUPLICATE_START'])",
+                "while not start.exists():",
+                "    time.sleep(0.01)",
+                "child = subprocess.Popen(sys.argv[1:])",
+                "(marker_dir / f'{wrapper_pid}.json').write_text(json.dumps({",
+                "    'wrapper_pid': wrapper_pid,",
+                "    'child_pid': child.pid,",
+                "    'launch_id': os.environ.get('OMNIGENT_HOST_DAEMON_LAUNCH_ID'),",
+                "}))",
+                "raise SystemExit(child.wait())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = _connect_env(mock_credentials_env, home)
+    env["OMNIGENT_CONFIG_HOME"] = str(home / "config")
+    env[HOST_DAEMON_COMMAND_ENV_VAR] = json.dumps([str(omnigent_python), str(wrapper)])
+    env["OMNIGENT_TEST_DUPLICATE_MARKERS"] = str(marker_dir)
+    env["OMNIGENT_TEST_DUPLICATE_START"] = str(start)
+
+    launchers: list[subprocess.Popen[str]] = []
+    wrapper_payloads: list[dict[str, object]] = []
+    record: Path | None = None
+    server_pid = -1
+    try:
+        for _ in range(2):
+            launchers.append(
+                subprocess.Popen(
+                    [str(omnigent_python), "-m", "omnigent", "host", "--background", ""],
+                    env=dict(env),
+                    cwd=str(omnigent_repo_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+
+        deadline = time.monotonic() + _BOOT_TIMEOUT
+        while len(list(marker_dir.glob("*.ready"))) < 2 and time.monotonic() < deadline:
+            _POLL_PAUSE.wait(0.05)
+        assert len(list(marker_dir.glob("*.ready"))) == 2, "both wrappers did not reach the gate"
+        start.write_text("go")
+
+        for launcher in launchers:
+            stdout, stderr = launcher.communicate(timeout=_BOOT_TIMEOUT)
+            assert launcher.returncode == 0, f"duplicate launch failed:\n{stdout}\n{stderr}"
+
+        wrapper_payloads = [json.loads(path.read_text()) for path in marker_dir.glob("*.json")]
+        assert len(wrapper_payloads) == 2
+        record = _wait_for_daemon_record(home / ".omnigent" / "daemons", timeout=_BOOT_TIMEOUT)
+        payload = json.loads(record.read_text())
+        child_pids = {entry["child_pid"] for entry in wrapper_payloads}
+        assert payload["pid"] in child_pids
+        assert payload["launch_id"] in {entry["launch_id"] for entry in wrapper_payloads}
+
+        winner = next(entry for entry in wrapper_payloads if entry["child_pid"] == payload["pid"])
+        loser = next(entry for entry in wrapper_payloads if entry["child_pid"] != payload["pid"])
+        assert _pid_alive(winner["wrapper_pid"])
+        assert _wait_pid_gone(loser["wrapper_pid"], timeout=_SELF_TERMINATE_TIMEOUT)
+
+        server_pid, _port = _read_local_server_record(home)
+        stop = subprocess.run(
+            [str(omnigent_python), "-m", "omnigent", "host", "stop"],
+            env=dict(env),
+            cwd=str(omnigent_repo_root),
+            capture_output=True,
+            text=True,
+            timeout=_BOOT_TIMEOUT,
+        )
+        assert stop.returncode == 0, f"duplicate launch stop failed:\n{stop.stdout}\n{stop.stderr}"
+        assert _wait_pid_gone(winner["wrapper_pid"], timeout=_SELF_TERMINATE_TIMEOUT)
+        assert record is not None and not record.exists()
+    finally:
+        for launcher in launchers:
+            if launcher.poll() is None:
+                launcher.kill()
+                launcher.wait()
+        for entry in wrapper_payloads:
+            for key in ("wrapper_pid", "child_pid"):
+                pid = entry.get(key)
+                if isinstance(pid, int) and _pid_alive(pid):
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGKILL)
+        if server_pid > 0 and _pid_alive(server_pid):
             _force_stop_server(server_pid)
 
 

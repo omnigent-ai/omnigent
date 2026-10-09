@@ -17,8 +17,9 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from importlib import import_module, resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast, get_args
@@ -59,8 +60,13 @@ from omnigent.config import (
     load_local_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.host.daemon_launch import (
+    HOST_DAEMON_COMMAND_ENV_VAR,
+    host_daemon_command,
+)
 from omnigent.host.daemon_lifecycle import (
     DAEMON_CONFIG_SIG_ENV_VAR,
+    DAEMON_LAUNCH_ID_ENV_VAR,
 )
 from omnigent.host.daemon_lifecycle import (
     HostDaemonRecord as _HostDaemonRecord,
@@ -712,6 +718,7 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "GROQ_API_KEY",
         "MISTRAL_API_KEY",
         "OMNIGENT_DATABASE_URI",
+        HOST_DAEMON_COMMAND_ENV_VAR,
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_ORG_ID",
@@ -2684,11 +2691,15 @@ class _SpawnedDaemonProcess:
     :param log_path: Daemon log path, e.g.
         ``"/Users/me/.omnigent/logs/host/host-abc.log"``.
     :param process: Child process handle when this invocation spawned it.
+    :param launch_id: Per-launch owner id for matching the child record.
+    :param process_group_id: Owned POSIX process group for wrapper cleanup.
     """
 
     pid: int
     log_path: str
     process: subprocess.Popen[bytes] | None = None
+    launch_id: str | None = None
+    process_group_id: int | None = None
 
 
 def _normalize_daemon_target(server_url: str | None) -> str:
@@ -2819,6 +2830,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
     host_id = raw.get("host_id")
     resolved_server_url = raw.get("resolved_server_url")
     config_sig = raw.get("config_sig")
+    launch_id = raw.get("launch_id")
     return _HostDaemonRecord(
         pid=pid,
         target=target,
@@ -2833,6 +2845,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
             else None
         ),
         config_sig=config_sig if isinstance(config_sig, str) and config_sig else None,
+        launch_id=launch_id if isinstance(launch_id, str) and launch_id else None,
     )
 
 
@@ -3209,11 +3222,60 @@ def _spawn_host_daemon_process(
                 **_proc.spawn_kwargs(),
                 **logging_kwargs,
             )
+            _proc.remember_process_group(proc)
     except OSError:
         return None
     finally:
         log_fh.close()
-    return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path), process=proc)
+    process_group_id = None
+    if os.name == "posix":
+        # ``_proc.spawn_kwargs()`` requested ``start_new_session=True`` for
+        # this POSIX child. Retain the group id even when a fast wrapper crash
+        # makes ``getpgid`` fail before the parent observes it.
+        process_group_id = proc.pid
+    return _SpawnedDaemonProcess(
+        pid=proc.pid,
+        log_path=str(log_path),
+        process=proc,
+        process_group_id=process_group_id,
+    )
+
+
+def _process_group_has_launch_id(spawned: _SpawnedDaemonProcess) -> bool:
+    """Validate that a live POSIX group still contains this launch's env id."""
+    if os.name != "posix" or spawned.process_group_id is None or spawned.launch_id is None:
+        return False
+    group_id = spawned.process_group_id
+    for candidate in psutil.process_iter(["pid"]):
+        pid = candidate.pid
+        if pid <= 1:
+            continue
+        try:
+            if os.getpgid(pid) != group_id:
+                continue
+            if candidate.environ().get(DAEMON_LAUNCH_ID_ENV_VAR) == spawned.launch_id:
+                return True
+        except (OSError, psutil.Error):
+            continue
+    return False
+
+
+def _signal_spawned_process_group(
+    spawned: _SpawnedDaemonProcess,
+    sig: signal.Signals,
+) -> bool:
+    """Signal a validated wrapper group, including late/reparented children."""
+    deadline = time.monotonic() + 0.25
+    while not _process_group_has_launch_id(spawned):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    assert spawned.process_group_id is not None
+    try:
+        os.killpg(spawned.process_group_id, sig)
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 def _stop_spawned_host_daemon_process(
@@ -3225,12 +3287,15 @@ def _stop_spawned_host_daemon_process(
     proc = spawned.process
     if proc is not None:
         if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=grace_timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            # A configured wrapper may have a supervisor and daemon child of
+            # its own; stop the owned process tree so a claim timeout cannot
+            # strand either descendant after the wrapper exits.
+            _signal_spawned_process_group(spawned, signal.SIGTERM)
+            _proc.terminate_tree(proc, grace=grace_timeout)
+        _signal_spawned_process_group(spawned, getattr(signal, "SIGKILL", signal.SIGTERM))
+        _proc.kill_tree(proc)
+        if proc.poll() is None:
+            proc.wait()
         return
 
     if not _pid_alive(spawned.pid):
@@ -3246,14 +3311,29 @@ def _stop_spawned_host_daemon_process(
         os.kill(spawned.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
+def _daemon_record_belongs_to_spawned_launch(
+    record: _HostDaemonRecord,
+    spawned: _SpawnedDaemonProcess,
+) -> bool:
+    """Return whether *record* belongs to this launch, including legacy records."""
+    if record.launch_id is not None:
+        return spawned.launch_id is not None and record.launch_id == spawned.launch_id
+    # Legacy/default children had no launch id; a matching child PID is the
+    # only compatible ownership signal available for those records.
+    return record.pid == spawned.pid
+
+
 def _delete_spawned_daemon_record(target: str, spawned: _SpawnedDaemonProcess) -> None:
-    """Delete *target*'s record only when the spawned child owns it."""
+    """Delete *target*'s record only when this launch owns it."""
     record = _find_daemon_record(target)
-    if record is not None and record.pid == spawned.pid:
+    if record is not None and _daemon_record_belongs_to_spawned_launch(record, spawned):
         _delete_daemon_record(record)
 
 
 _DAEMON_CLAIM_TIMEOUT_S = 10.0
+# A deployment-owned wrapper may need time to bootstrap its supervisor before
+# it starts the ordinary daemon child. Keep the default claim budget unchanged.
+_WRAPPED_DAEMON_CLAIM_TIMEOUT_S = 60.0
 
 
 def _wait_for_daemon_claim(
@@ -3443,7 +3523,9 @@ def _restore_replaced_daemon_record(
     :param previous: Previous record returned by
         :func:`_claim_foreground_daemon_record`, or ``None``.
     """
-    current = _read_daemon_record(_daemon_record_path(record.target))
+    # Use the rich lookup so older host.pid-only daemons remain guardable
+    # during migration; it returns a synthetic legacy record when needed.
+    current = _find_daemon_record(record.target)
     if current is None:
         return
     if current.pid != record.pid or current.started_at != record.started_at:
@@ -3512,19 +3594,31 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         return False
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    mode_args = ["--local"] if not server_url else ["--server", server_url]
-    # Match runner/zygote startup: keep workspace code out of runtime imports
-    # without changing the caller's working directory or agent workspace.
-    args = [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *mode_args]
     config_sig = server_config_signature(include_features=not server_url)
     daemon_env = _build_host_daemon_env(server_url=server_url)
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
+    launch_id = uuid.uuid4().hex
+    daemon_env[DAEMON_LAUNCH_ID_ENV_VAR] = launch_id
+    try:
+        args = host_daemon_command(server_url, env=daemon_env)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    wrapped_daemon = bool(daemon_env.get(HOST_DAEMON_COMMAND_ENV_VAR, "").strip())
+    claim_timeout_s = (
+        _WRAPPED_DAEMON_CLAIM_TIMEOUT_S if wrapped_daemon else _DAEMON_CLAIM_TIMEOUT_S
+    )
     expected_host_id = _load_existing_host_id()
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
         _record_host_state("start_failed")
         return False
-    claimed = _wait_for_daemon_claim(target, spawned)
+    spawned = replace(spawned, launch_id=launch_id)
+    if not wrapped_daemon:
+        # Keep the ordinary path's exact call/default behavior for existing
+        # callers and tests; wrapped launches opt into the extended budget.
+        claimed = _wait_for_daemon_claim(target, spawned)
+    else:
+        claimed = _wait_for_daemon_claim(target, spawned, timeout_s=claim_timeout_s)
     if claimed is None:
         _record_host_state("start_timeout")
         _stop_spawned_host_daemon_process(spawned)
@@ -3534,12 +3628,19 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         # diagnosable instead of silently absent from `host status`.
         raise click.ClickException(
             f"Host daemon for {target!r} did not claim its registry record within "
-            f"{_DAEMON_CLAIM_TIMEOUT_S:.0f}s and was stopped. See {spawned.log_path}."
+            f"{claim_timeout_s:.0f}s and was stopped. See {spawned.log_path}."
         )
+    claimed_by_this_launch = _daemon_record_belongs_to_spawned_launch(claimed, spawned)
+    if not claimed_by_this_launch:
+        # A live record for another launch is a concurrent winner. Its record
+        # must remain intact, but this launch's supervisor is still ours to stop.
+        _stop_spawned_host_daemon_process(spawned)
+
     expected_host_id = expected_host_id or _load_existing_host_id()
     if expected_host_id is not None and claimed.host_id != expected_host_id:
         _record_host_state("start_identity_mismatch")
-        _stop_spawned_host_daemon_process(spawned)
+        if claimed_by_this_launch:
+            _stop_spawned_host_daemon_process(spawned)
         _delete_spawned_daemon_record(target, spawned)
         actual_host_id = claimed.host_id or "<missing>"
         raise click.ClickException(
@@ -3548,7 +3649,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
             "Check OMNIGENT_HOST_ID, OMNIGENT_HOST_NAME, and OMNIGENT_CONFIG_HOME. "
             f"See {spawned.log_path}."
         )
-    if claimed.pid != spawned.pid:
+    if not claimed_by_this_launch:
         action = "started_concurrently_during_launch"
     elif process_was_running:
         action = "restarted_during_launch"
@@ -3622,6 +3723,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key == HOST_DAEMON_COMMAND_ENV_VAR
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later
@@ -9786,7 +9888,7 @@ def _base_daemon_status_payload(record: _HostDaemonRecord) -> _HostPayload:
     """
     base_url = _daemon_base_url(record)
     host_id = record.host_id or _load_existing_host_id()
-    return {
+    payload: _HostPayload = {
         "target": record.target,
         "mode": record.mode,
         "server_url": base_url,
@@ -9798,6 +9900,9 @@ def _base_daemon_status_payload(record: _HostDaemonRecord) -> _HostPayload:
         "sessions": [],
         "error": None,
     }
+    if record.launch_id is not None:
+        payload["launch_id"] = record.launch_id
+    return payload
 
 
 def _add_daemon_host_status(
@@ -10429,6 +10534,109 @@ def _stop_session_on_server(
         )
 
 
+def _session_status_is_terminal(status: object) -> bool | None:
+    """Classify a session status using the runtime's canonical status sets."""
+    from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
+    from omnigent.runtime.inflight_text import _TERMINAL_STATUS_VALUES
+
+    if not isinstance(status, str):
+        return None
+    if status in _TERMINAL_STATUS_VALUES:
+        return True
+    if status in SESSION_LIVE_STATUS:
+        return False
+    return None
+
+
+def _ensure_daemon_is_idle(record: _HostDaemonRecord) -> None:
+    """Fail closed unless a fresh session snapshot proves *record* is idle."""
+    result = _sessions_for_daemon(record)
+    if result.error is not None or result.base_url is None:
+        detail = result.error or "the daemon server could not be discovered"
+        raise click.ClickException(
+            f"Cannot verify that {_host_display_url(record.target)} is idle: {detail}."
+        )
+
+    active: list[str] = []
+    unknown: list[str] = []
+    for session in result.sessions:
+        session_id = session.get("id")
+        label = session_id if isinstance(session_id, str) and session_id else "<unknown>"
+        terminal = _session_status_is_terminal(session.get("status"))
+        if terminal is None:
+            unknown.append(f"{label}={session.get('status')!r}")
+        elif not terminal:
+            active.append(label)
+    if active:
+        raise click.ClickException(
+            f"Refusing to stop {_host_display_url(record.target)} with active host-bound "
+            f"session(s): {', '.join(active)}."
+        )
+    if unknown:
+        raise click.ClickException(
+            f"Refusing to stop {_host_display_url(record.target)} because session status "
+            f"could not be verified: {', '.join(unknown)}."
+        )
+
+
+def _select_expected_daemon_record(
+    records: list[_HostDaemonRecord],
+    *,
+    expected_pid: int | None,
+    expected_launch_id: str | None,
+) -> list[_HostDaemonRecord]:
+    """Filter owner expectations to exactly one daemon record."""
+    if expected_pid is None and expected_launch_id is None:
+        return records
+    if expected_launch_id is not None and not expected_launch_id.strip():
+        raise click.ClickException("--expected-launch-id must be non-empty.")
+    matches = [
+        record
+        for record in records
+        if (expected_pid is None or record.pid == expected_pid)
+        and (expected_launch_id is None or record.launch_id == expected_launch_id)
+    ]
+    if len(matches) != 1:
+        raise click.ClickException(
+            "Owner expectation did not select exactly one host daemon record "
+            f"(matched {len(matches)})."
+        )
+    return matches
+
+
+def _reread_expected_daemon_record(
+    record: _HostDaemonRecord,
+    *,
+    expected_pid: int | None,
+    expected_launch_id: str | None,
+) -> _HostDaemonRecord:
+    """Reread and validate ownership immediately before daemon termination."""
+    # Use the rich lookup so older host.pid-only daemons remain guardable
+    # during migration; it returns a synthetic legacy record when needed.
+    current = _find_daemon_record(record.target)
+    if current is None:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} changed or disappeared; "
+            "refusing to stop it."
+        )
+    if current.pid != record.pid or current.launch_id != record.launch_id:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} changed; "
+            "refusing to stop it."
+        )
+    if expected_pid is not None and current.pid != expected_pid:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} no longer matches "
+            f"expected pid {expected_pid}; refusing to stop it."
+        )
+    if expected_launch_id is not None and current.launch_id != expected_launch_id:
+        raise click.ClickException(
+            f"Host daemon owner for {_host_display_url(record.target)} no longer matches "
+            "the expected launch id; refusing to stop it."
+        )
+    return current
+
+
 def _stop_daemon_sessions(
     record: _HostDaemonRecord,
 ) -> int:
@@ -10602,6 +10810,22 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     is_flag=True,
     help="Skip session draining and use SIGKILL if needed.",
 )
+@click.option(
+    "--if-idle",
+    is_flag=True,
+    help="Stop only after a fresh snapshot proves all host-bound sessions are terminal.",
+)
+@click.option(
+    "--expected-pid",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Require this positive daemon PID immediately before stopping.",
+)
+@click.option(
+    "--expected-launch-id",
+    default=None,
+    help="Require this daemon launch ownership id immediately before stopping.",
+)
 @click.pass_context
 def host_stop(
     ctx: click.Context,
@@ -10609,6 +10833,9 @@ def host_stop(
     all_targets: bool,
     daemon_only: bool,
     force: bool,
+    if_idle: bool,
+    expected_pid: int | None,
+    expected_launch_id: str | None,
 ) -> None:
     """
     Stop host daemon sessions, then stop daemon processes.
@@ -10619,21 +10846,43 @@ def host_stop(
     :param all_targets: Whether to stop every known daemon target.
     :param daemon_only: Skip server-side session stop calls when ``True``.
     :param force: Skip session draining and use SIGKILL if needed.
+    :param if_idle: Require a fresh quiet-session snapshot; never stop sessions.
+    :param expected_pid: Optional owner PID expectation.
+    :param expected_launch_id: Optional launch ownership expectation.
     """
+    if if_idle and (force or daemon_only):
+        raise click.ClickException("--if-idle cannot be combined with --force or --daemon-only.")
     if server is None:
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=False)
+    records = _select_expected_daemon_record(
+        records,
+        expected_pid=expected_pid,
+        expected_launch_id=expected_launch_id,
+    )
     if not records:
         click.echo("No matching host daemon found.")
         return
+    if if_idle:
+        # Preflight every selected target before terminating any of them.
+        for record in records:
+            _ensure_daemon_is_idle(record)
     for record in records:
         stopped = 0
         if not daemon_only and not force:
-            stopped = _stop_daemon_sessions(record)
-        _terminate_daemon(record, force=force)
+            if not if_idle:
+                stopped = _stop_daemon_sessions(record)
+        current = record
+        if if_idle or expected_pid is not None or expected_launch_id is not None:
+            current = _reread_expected_daemon_record(
+                record,
+                expected_pid=expected_pid,
+                expected_launch_id=expected_launch_id,
+            )
+        _terminate_daemon(current, force=force)
         click.echo(
-            f"Stopped {_host_display_url(record.target)} daemon "
-            f"pid={record.pid}; sessions_stopped={stopped}."
+            f"Stopped {_host_display_url(current.target)} daemon "
+            f"pid={current.pid}; sessions_stopped={stopped}."
         )
 
 
