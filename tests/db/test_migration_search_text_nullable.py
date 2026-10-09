@@ -18,7 +18,7 @@ _PRIOR = "mm1a2b3c4d5e"
 _THIS = "nn1a2b3c4d5e"
 _MIGRATION = "omnigent.db.migrations.versions.nn1a2b3c4d5e_conversation_items_search_text_nullable"
 _CONVERSATION_ID = b"\x01" * 16
-_BACKFILL_UPDATE = "UPDATE conversation_items SET search_text = ''"
+_BACKFILL_UPDATE = "UPDATE conversation_items SET search_text="
 
 
 def _engine_at(uri: str, revision: str) -> Engine:
@@ -159,8 +159,8 @@ def test_downgrade_commits_each_page_and_resumes(db_file: str) -> None:
     """An interrupted downgrade keeps the page it committed and finishes when rerun.
 
     Item ids follow position order, so the first page holds positions below the
-    batch size. Failing the first UPDATE of the second page must leave the first
-    page's backfill committed, the rest NULL, and the column still nullable.
+    batch size. Failing the second page's UPDATE must leave the first page's
+    backfill committed, the rest NULL, and the column still nullable.
     """
     batch = import_module(_MIGRATION)._BACKFILL_BATCH
     engine = _engine_at(db_file, _THIS)
@@ -172,7 +172,7 @@ def test_downgrade_commits_each_page_and_resumes(db_file: str) -> None:
         nonlocal updates
         if statement.startswith(_BACKFILL_UPDATE):
             updates += 1
-            if updates == batch:
+            if updates == 2:
                 raise RuntimeError("interrupted second page")
 
     sa.event.listen(engine, "before_cursor_execute", fail_in_second_page)
