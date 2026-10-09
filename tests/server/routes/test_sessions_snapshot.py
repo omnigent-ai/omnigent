@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
+from omnigent.runtime.harnesses.process_manager import _SPAWN_READY_TIMEOUT_S, HarnessSpawnError
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
     _LABEL_VALUE_MAX_LEN,
@@ -2805,55 +2806,45 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
     )
 
 
+_LONGEST_SPAWN_CONV = "0123456789abcdef0123456789abcdef"
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cause",
+    [
+        "unknown harness 'never-registered-harness'; not registered with this runner",
+        f"harness 'google-antigravity' for conversation '{_LONGEST_SPAWN_CONV}' "
+        "exited with -9 during spawn (see Omnigent stderr)",
+        f"harness 'google-antigravity' for conversation '{_LONGEST_SPAWN_CONV}' "
+        f"did not bind its endpoint within {_SPAWN_READY_TIMEOUT_S:.0f}s",
+    ],
+    ids=["unknown-harness", "exit-during-spawn", "bind-timeout"],
+)
 async def test_persist_error_labels_keeps_spawn_cause_and_log_pointer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, cause: str
 ) -> None:
-    """Every relayed harness-spawn failure persists with its cause and log pointer.
+    """A relayed harness-spawn failure persists with its cause and log pointer.
 
     The runner composes ``harness_spawn_failed: <cause>; see the runner log for
-    details: <path>`` for the failed-turn status. Each curated cause, built by
-    its real producer with the longest realistic inputs, must fit the label
-    column so a reload still shows why the spawn failed and where to look.
+    details: <path>`` for the failed-turn status. Each curated cause (texts
+    pinned by ``tests/runtime/harnesses/test_process_manager.py``) is combined
+    with the longest registered harness name, a full conversation id, and the
+    default home-relative runner log path; the result must fit the label column
+    so a reload still shows why the spawn failed and where to look.
     """
     from omnigent.runner import app_support
-    from omnigent.runtime.harnesses import process_manager as pm_mod
     from omnigent.server.schemas import ErrorDetail
-
-    class _NeverBinds:
-        async def can_connect(self) -> bool:
-            return False
-
-        def harden(self) -> None:
-            raise AssertionError("harden must not run for a failed spawn")
-
-    class _Process:
-        def __init__(self, returncode: int | None) -> None:
-            self.returncode = returncode
-
-        def kill(self) -> None:
-            self.returncode = -9
-
-        async def wait(self) -> int | None:
-            return self.returncode
 
     monkeypatch.setattr(
         app_support,
         "process_log_reference",
         lambda _kind: "~/.omnigent/logs/runner/runner-20261009-190334-548495.log",
     )
-    monkeypatch.setattr(pm_mod, "_SPAWN_READY_TIMEOUT_S", 0.0)
-    harness, conv = "google-antigravity", "0123456789abcdef0123456789abcdef"
-    failures: list[pm_mod.HarnessSpawnError] = []
-    with pytest.raises(pm_mod.HarnessSpawnError) as unknown:
-        pm_mod._resolve_module_path("never-registered-harness")
-    failures.append(unknown.value)
-    with pytest.raises(pm_mod.HarnessSpawnError) as exited:
-        await pm_mod._wait_for_bind(_Process(-9), _NeverBinds(), harness, conv)  # type: ignore[arg-type]
-    failures.append(exited.value)
-    with pytest.raises(pm_mod.HarnessSpawnError) as hung:
-        await pm_mod._wait_for_bind(_Process(None), _NeverBinds(), harness, conv)  # type: ignore[arg-type]
-    failures.append(hung.value)
+    detail = app_support._client_safe_error_detail(
+        HarnessSpawnError(cause), context="harness spawn"
+    )
+    message = f"harness_spawn_failed: {detail}"
 
     captured: dict[str, dict[str, str]] = {}
 
@@ -2861,17 +2852,16 @@ async def test_persist_error_labels_keeps_spawn_cause_and_log_pointer(
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
-    for index, failure in enumerate(failures):
-        detail = app_support._client_safe_error_detail(failure, context="harness spawn")
-        message = f"harness_spawn_failed: {detail}"
-        session_id = f"a1b2c3d4e5f60718293a4b5c6d7e8f9{index}"
-        await _persist_session_status_error_labels(
-            session_id, ErrorDetail(code="runner_error", message=message), _MockStore()
-        )  # type: ignore[arg-type]
-        stored = captured[session_id]["omnigent.last_task_error_message"]
-        assert stored == message, f"spawn failure was truncated on persistence: {stored!r}"
-        assert str(failure) in stored
-        assert stored.endswith("runner-20261009-190334-548495.log")
+    await _persist_session_status_error_labels(
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        ErrorDetail(code="runner_error", message=message),
+        _MockStore(),
+    )  # type: ignore[arg-type]
+
+    stored = captured["a1b2c3d4e5f60718293a4b5c6d7e8f90"]["omnigent.last_task_error_message"]
+    assert stored == message, f"spawn failure was truncated on persistence: {stored!r}"
+    assert cause in stored
+    assert stored.endswith("runner-20261009-190334-548495.log")
 
 
 # ── _runner_reject_detail ────────────────────────────────────────────────────

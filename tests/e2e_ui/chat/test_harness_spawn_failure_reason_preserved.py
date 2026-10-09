@@ -10,6 +10,7 @@ Run::
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from collections.abc import Iterator
 
@@ -62,7 +63,9 @@ def spawn_fail_session(live_server: str, runner_id: str) -> Iterator[tuple[str, 
     try:
         yield (live_server, session_id)
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        # Best-effort cleanup must not mask the test outcome.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
 
 
 @pytest.mark.timeout(180)
@@ -88,16 +91,12 @@ def test_spawn_failure_aborts_turn_and_preserves_reason(
     composer.fill("Reply with the single token OK.")
     page.get_by_role("button", name="Send", exact=True).click()
 
-    # User-visible outcome: the turn fails to start and the error pill appears
-    # with the runner_error headline (the turn was aborted on the host).
     error_pill = page.get_by_test_id("error-pill").first
     expect(error_pill).to_be_visible(timeout=60_000)
     expect(error_pill).to_have_attribute("data-level", "error")
     expect(error_pill).to_contain_text(_RUNNER_ERROR_HEADLINE)
 
-    # Expand the pill so the raw structured reason renders. The turn must be
-    # attributed to the spawn failure AND carry the actual client-safe cause,
-    # not only the generic "see the runner log" pointer.
+    # The structured reason renders only once the pill is expanded.
     error_pill.click()
     expect(error_pill).to_contain_text(_SPAWN_FAILED_CODE, timeout=10_000)
     expect(error_pill).to_contain_text(_SPAWN_FAILURE_CAUSE, timeout=10_000)
