@@ -1058,13 +1058,31 @@ async def test_refused_codex_startup_effort_follows_the_server_rollback_contract
     rollback_on_refusal: bool,
 ) -> None:
     """An older server keeps a refused startup effort for the next turn; a newer one rolls back."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    class _RejectingClient:
+        """App-server double that rejects the update, like a thread still being created."""
+
+        async def connect(self) -> None:
+            pass
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            del params
+            raise codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": f"thread not found for {method}"}
+            )
+
+        async def close(self) -> None:
+            pass
 
     monkeypatch.setattr(
         claude_native_bridge, "post_tools_changed", lambda _bridge_dir, **kwargs: None
     )
-    # No published bridge, so the live update is refused as it is while Codex starts.
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *a, **kw: _RejectingClient()
+    )
     hc = _ScriptedHarnessClient(
         [
             _sse({"type": "response.created", "response": {"id": "resp_1"}}),
@@ -1098,6 +1116,17 @@ async def test_refused_codex_startup_effort_follows_the_server_rollback_contract
     async with _runner_client(app) as client:
         for turn in (1, 2):
             if turn == 2:
+                # A published bridge whose live app-server rejects the update; with no
+                # bridge, or a dead app-server, the update is deferred rather than refused.
+                codex_native_bridge.write_bridge_state(
+                    codex_native_bridge.prepare_bridge_dir(session),
+                    codex_native_bridge.CodexNativeBridgeState(
+                        session_id=session,
+                        socket_path="ws://127.0.0.1:43210",
+                        thread_id="thread_codex",
+                        codex_home=str(tmp_path / "codex-home"),
+                    ),
+                )
                 refused = await client.post(f"/v1/sessions/{session}/events", json=effort_change)
                 assert refused.status_code == 503, refused.text
                 assert refused.json().get("rollback_on_refusal") is (

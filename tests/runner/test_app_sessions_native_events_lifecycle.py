@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import Mock
 
 import pytest
+from websockets.exceptions import InvalidMessage
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
@@ -20,12 +22,14 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.kiro_native import main as kiro_native
 from omnigent.runner import create_runner_app, model_option_routes, subagent_work
 from omnigent.runner.resource_registry import (
+    CODEX_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -37,7 +41,7 @@ from tests.runner.conftest import (
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 from tests.runner.native_helpers import _harness_spec
 
 
@@ -1054,38 +1058,564 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
     assert resp.json()["error"] == "codex_native_settings_update_failed"
 
 
-@pytest.mark.asyncio
-async def test_events_codex_native_model_change_without_bridge_fails_loud(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A model ask with no loaded Codex bridge answers 503, never 204.
+class _FailingCodexAppServerClient(_RecordingCodexAppServerClient):
+    """
+    Codex app-server double that fails at a chosen step.
 
-    Nothing applied the settings, so a silent success would let the row
-    claim a switch the app-server never saw — the server surfaces the 503
-    as the visible not-applied error instead.
+    :param transport: Transport the runner dials, e.g. ``"ws://127.0.0.1:1234"``.
+    :param client_name: App-server client name, e.g. ``"omnigent-codex-native-runner"``.
+    :param connect_error: Raised by :meth:`connect`, like a dead app-server port.
+    :param request_error: Raised by :meth:`request` once the call is recorded.
     """
 
-    conv_id = "624fe55f9d5a7f66fec5c5401a930b85"
+    def __init__(
+        self,
+        transport: str,
+        client_name: str,
+        *,
+        connect_error: Exception | None = None,
+        request_error: Exception | None = None,
+    ) -> None:
+        super().__init__(transport, client_name)
+        self.connect_error = connect_error
+        self.request_error = request_error
+
+    async def connect(self) -> None:
+        """
+        Fail like an unreachable app-server when a connect error is set.
+
+        :returns: None.
+        """
+        if self.connect_error is not None:
+            raise self.connect_error
+        await super().connect()
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Record the call, then fail it when a request error is set.
+
+        :param method: JSON-RPC method, e.g. ``"thread/settings/update"``.
+        :param params: JSON-RPC params for the call.
+        :returns: Empty successful JSON-RPC result when no error is set.
+        """
+        result = await super().request(method, params)
+        if self.request_error is not None:
+            raise self.request_error
+        return result
+
+
+_CODEX_SETTINGS_CONV_ID = "7d5e1c0b9a8f4e3d2c1b0a9f8e7d6c5b"
+
+_CODEX_SETTINGS_EVENTS = pytest.mark.parametrize(
+    "event_payload,setting_keys",
+    [
+        ({"type": "model_change", "model": "gpt-5.6-terra"}, "model"),
+        ({"type": "effort_change", "effort": "high"}, "effort"),
+    ],
+    ids=["model_change", "effort_change"],
+)
+
+
+async def _post_codex_native_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_payload: dict[str, Any],
+    *,
+    client: _RecordingCodexAppServerClient | None = None,
+    pane: bool | None = None,
+) -> tuple[Any, Path]:
+    """
+    Post *event_payload* to a codex-native session the runner knows nothing more about.
+
+    :param monkeypatch: Pytest monkeypatch used to isolate the bridge root.
+    :param tmp_path: Temporary directory for the bridge and the pane stub.
+    :param event_payload: ``/events`` body, e.g. ``{"type": "model_change", "model": "x"}``.
+    :param client: App-server double the bridge state points at; ``None`` leaves no
+        bridge state, like a session that never launched.
+    :param pane: ``True`` seeds a running ``codex:main`` pane, ``False`` a dead one, and
+        ``None`` none at all, like an idle-reaped session.
+    :returns: The runner's response and the session's bridge directory.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(_CODEX_SETTINGS_CONV_ID)
+    if client is not None:
+        codex_native_bridge.write_bridge_state(
+            bridge_dir,
+            codex_native_bridge.CodexNativeBridgeState(
+                session_id=_CODEX_SETTINGS_CONV_ID,
+                socket_path=client.transport,
+                thread_id="thread_codex",
+                codex_home=str(tmp_path / "codex-home"),
+            ),
+        )
+        monkeypatch.setattr(
+            codex_native_app_server,
+            "client_for_transport",
+            lambda transport, *, client_name="omnigent": client,
+        )
 
-    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # Session creation would otherwise launch a terminal and rewrite the bridge state.
+        del args, kwargs
 
-    app, _ = await _build_app_for_spec(codex_native_spec)
-
-    async with _runner_client(app) as client:
-        create_resp = await client.post(
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    terminal_registry = TerminalRegistry()
+    if pane is not None:
+        terminal_registry._by_conversation.setdefault(_CODEX_SETTINGS_CONV_ID, {})[
+            ("codex", "main")
+        ] = make_test_terminal_instance("codex", "main", tmp_path, running=pane)
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native", model="gpt-5.4"), terminal_registry=terminal_registry
+    )
+    async with _runner_client(app) as http:
+        create_resp = await http.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+            json={
+                "session_id": _CODEX_SETTINGS_CONV_ID,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
-        resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "model_change", "model": "gpt-5.6-terra"},
+        resp = await http.post(
+            f"/v1/sessions/{_CODEX_SETTINGS_CONV_ID}/events", json=event_payload
         )
+    return resp, bridge_dir
+
+
+def _deferred_settings_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """
+    Return the ``codex_native_settings_deferred`` rows captured so far.
+
+    :param caplog: Captured runner logs.
+    :returns: The matching log records.
+    """
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_settings_deferred"
+    ]
+
+
+@pytest.mark.asyncio
+@_CODEX_SETTINGS_EVENTS
+@pytest.mark.parametrize("pane", [None, False], ids=["reaped", "dead-but-registered"])
+@pytest.mark.parametrize(
+    "connect_error",
+    [
+        ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 43210)"),
+        InvalidMessage("did not receive a valid HTTP response"),
+    ],
+    ids=["refused", "accept-then-close"],
+)
+async def test_events_codex_native_settings_change_defers_when_the_pane_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    event_payload: dict[str, Any],
+    setting_keys: str,
+    pane: bool | None,
+    connect_error: Exception,
+) -> None:
+    """
+    An idle-reaped pane leaves bridge state on a dead port; the pick is deferred.
+
+    The server has already persisted the pick and the next launch reads it, so
+    the runner answers 204 instead of making the server roll the pick back. With
+    no live pane there is nothing to mark for replacement.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    client = _FailingCodexAppServerClient(
+        "ws://127.0.0.1:43210", "omnigent-codex-native-runner", connect_error=connect_error
+    )
+
+    resp, bridge_dir = await _post_codex_native_event(
+        monkeypatch, tmp_path, event_payload, client=client, pane=pane
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert client.requests == []
+    assert client.closed
+    [event] = _deferred_settings_events(caplog)
+    assert event.session_id == _CODEX_SETTINGS_CONV_ID
+    assert event.attributes == {
+        "harness": "codex-native",
+        "reason": "pane_not_running",
+        "setting_keys": setting_keys,
+    }
+    assert codex_native_bridge.read_bridge_startup_failure(bridge_dir) is None
+
+
+@pytest.mark.asyncio
+@_CODEX_SETTINGS_EVENTS
+async def test_events_codex_native_settings_change_marks_a_live_pane_whose_app_server_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    event_payload: dict[str, Any],
+    setting_keys: str,
+) -> None:
+    """
+    A live pane on a refused app-server defers the pick and is marked for replacement.
+
+    The stop record is what makes the next terminal ensure replace the pane, and
+    that relaunch applies the persisted pick.
+    """
+    from omnigent.runner.native import orchestration
+
+    class _CodexPaneRegistry:
+        """Report the Codex pane as runner-owned, as the resource registry does."""
+
+        def terminal_resource_role(self, _session_id: str, _terminal_id: str) -> str:
+            return CODEX_NATIVE_TERMINAL_ROLE
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    client = _FailingCodexAppServerClient(
+        "ws://127.0.0.1:43210",
+        "omnigent-codex-native-runner",
+        connect_error=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 43210)"),
+    )
+
+    resp, bridge_dir = await _post_codex_native_event(
+        monkeypatch, tmp_path, event_payload, client=client, pane=True
+    )
+
+    assert resp.status_code == 204, resp.text
+    [event] = _deferred_settings_events(caplog)
+    assert event.attributes["reason"] == "app_server_unreachable"
+    assert event.attributes["setting_keys"] == setting_keys
+    assert (
+        codex_native_bridge.read_bridge_startup_failure(bridge_dir)
+        == codex_native_bridge.CODEX_APP_SERVER_STOPPED
+    )
+    pane = SessionResourceView(
+        id="terminal_codex_main", type="terminal", session_id=_CODEX_SETTINGS_CONV_ID, name="Codex"
+    )
+    assert not orchestration._is_runner_owned_codex_terminal(_CodexPaneRegistry(), pane)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@_CODEX_SETTINGS_EVENTS
+async def test_events_codex_native_settings_change_defers_without_a_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    event_payload: dict[str, Any],
+    setting_keys: str,
+) -> None:
+    """
+    A pick with no loaded Codex bridge is kept for the first launch.
+
+    Nothing has launched, so the row's pick is what the launch pins; failing
+    here only made the server roll back a choice nothing contradicted.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    resp, _ = await _post_codex_native_event(monkeypatch, tmp_path, event_payload)
+
+    assert resp.status_code == 204, resp.text
+    [event] = _deferred_settings_events(caplog)
+    assert event.attributes["reason"] == "no_bridge_state"
+    assert event.attributes["setting_keys"] == setting_keys
+
+
+@pytest.mark.asyncio
+@_CODEX_SETTINGS_EVENTS
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(
+            {
+                "request_error": CodexAppServerResponseError(
+                    {"code": -32600, "message": "thread not found"}
+                )
+            },
+            id="rpc-rejection",
+        ),
+        pytest.param(
+            {
+                "connect_error": CodexAppServerResponseError(
+                    {"code": -32600, "message": "Already initialized"}
+                )
+            },
+            id="initialize-rejection",
+        ),
+        pytest.param(
+            {"request_error": ConnectionError("disconnected before responding")},
+            id="dropped-after-send",
+        ),
+        pytest.param(
+            {"connect_error": TimeoutError("connect timed out")},
+            id="connect-timeout",
+        ),
+    ],
+)
+async def test_events_codex_native_settings_change_still_fails_when_a_live_app_server_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    event_payload: dict[str, Any],
+    setting_keys: str,
+    failure: dict[str, Exception],
+) -> None:
+    """
+    Only a failure to connect defers; an answer or a drop once connected is a 503.
+
+    A refusal from a live app-server, or an update that may have been sent, must
+    still surface and roll the pick back. The pane is left unmarked too. A connect
+    that times out is not a refused connection: the app-server may be alive but
+    slow, and ``TimeoutError`` is an ``OSError``, so it must not defer.
+    """
+    del setting_keys
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    client = _FailingCodexAppServerClient(
+        "ws://127.0.0.1:43210", "omnigent-codex-native-runner", **failure
+    )
+
+    resp, bridge_dir = await _post_codex_native_event(
+        monkeypatch, tmp_path, event_payload, client=client, pane=True
+    )
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "codex_native_settings_update_failed"
+    assert _deferred_settings_events(caplog) == []
+    assert codex_native_bridge.read_bridge_startup_failure(bridge_dir) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pane", [None, True], ids=["reaped", "live-pane"])
+async def test_events_codex_native_plan_mode_change_is_not_deferred_when_app_server_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    pane: bool | None,
+) -> None:
+    """
+    A plan-mode toggle fails on an unreachable app-server instead of deferring.
+
+    A relaunch does not restore plan mode and the server records the toggle only on
+    a confirmed 2xx, so a deferral would leave the UI claiming a mode Codex is not in.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    client = _FailingCodexAppServerClient(
+        "ws://127.0.0.1:43210",
+        "omnigent-codex-native-runner",
+        connect_error=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 43210)"),
+    )
+
+    resp, _ = await _post_codex_native_event(
+        monkeypatch,
+        tmp_path,
+        {"type": "plan_mode_change", "enabled": True},
+        client=client,
+        pane=pane,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "codex_native_settings_update_failed"
+    assert _deferred_settings_events(caplog) == []
+
+
+class _ReapedCodexSession(NamedTuple):
+    """A codex-native runner session whose app-server refuses connections, with its doubles."""
+
+    http: Any
+    conv_id: str
+    bridge_dir: Path
+    app_server: _FailingCodexAppServerClient
+    remembered_efforts: dict[str, str]
+
+
+@contextlib.asynccontextmanager
+async def _reaped_codex_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> AsyncIterator[_ReapedCodexSession]:
+    """
+    Run a codex-native session on ``gpt-5.4`` whose app-server refuses connections.
+
+    No pane is registered, like a session the idle reaper closed. The app-server's
+    catalog lists ``low`` through ``xhigh`` for the model, so a live update clamps a
+    higher effort; clearing ``app_server.connect_error`` brings the app-server back.
+
+    :param monkeypatch: Pytest monkeypatch isolating the bridge root and catalog cache.
+    :param tmp_path: Temporary directory for the bridge and the private Codex home.
+    :returns: The session's HTTP client, ids and doubles.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native_controls import NativeControls, build_native_controls
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-5.4"\nmodel_reasoning_effort = "medium"\n'
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    app_server = _FailingCodexAppServerClient(
+        transport,
+        "omnigent-codex-native-runner",
+        connect_error=ConnectionRefusedError(111, "Connect call failed"),
+    )
+    app_server.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.4",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": level}
+                            for level in ("low", "medium", "high", "xhigh")
+                        ],
+                    }
+                ],
+                "nextCursor": None,
+            }
+        }
+    ]
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *a, **kw: app_server
+    )
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        # A launch would rewrite the bridge state this test controls.
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    captured: dict[str, dict[str, str]] = {}
+
+    def capture_controls(**kwargs: Any) -> NativeControls:
+        captured["efforts"] = kwargs["_session_reasoning_effort"]
+        return build_native_controls(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", capture_controls)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+    async with _runner_client(app) as http:
+        created = await http.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        yield _ReapedCodexSession(http, conv_id, bridge_dir, app_server, captured["efforts"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "accepted_body", "setting_keys", "live_update"),
+    [
+        pytest.param(
+            {"type": "effort_change", "effort": "max", "rollback_on_refusal": True},
+            None,
+            "effort",
+            {"threadId": "thread_codex", "effort": "xhigh"},
+            id="effort_change",
+        ),
+        pytest.param(
+            {
+                "type": "model_change",
+                "model": "gpt-5.4",
+                "effort": "max",
+                "rollback_on_refusal": True,
+            },
+            {"codex_settings_applied": True},
+            "effort,model",
+            {"threadId": "thread_codex", "model": "gpt-5.4", "effort": "xhigh"},
+            id="model_and_effort_change",
+        ),
+    ],
+)
+async def test_codex_native_unsupported_effort_is_deferred_as_picked_then_clamped_once_live(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    event: dict[str, Any],
+    accepted_body: dict[str, Any] | None,
+    setting_keys: str,
+    live_update: dict[str, Any],
+) -> None:
+    """
+    An effort the model lacks is deferred as picked, and a live app-server clamps it.
+
+    The clamp reads the model catalog from the app-server, so a reaped pane cannot apply
+    it: the runner answers before any catalog read and keeps the pick for the next launch
+    or turn, which clamps it. The same update against a reachable app-server shows the clamp.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _reaped_codex_session(monkeypatch, tmp_path) as session:
+        url = f"/v1/sessions/{session.conv_id}/events"
+        deferred = await session.http.post(url, json=event)
+        requests_while_gone = list(session.app_server.requests)
+        effort_while_gone = codex_native_bridge.read_codex_config_effort(session.bridge_dir)
+        remembered_while_gone = session.remembered_efforts.get(session.conv_id)
+        session.app_server.connect_error = None  # The next launch brought it back.
+        live = await session.http.post(url, json=event)
+
+    for response in (deferred, live):
+        if accepted_body is None:
+            assert response.status_code == 204, response.text
+        else:
+            assert response.status_code == 200, response.text
+            assert response.json() == accepted_body
+    [row] = _deferred_settings_events(caplog)
+    assert row.attributes["reason"] == "pane_not_running"
+    assert row.attributes["setting_keys"] == setting_keys
+    # Deferred: nothing reached the app-server, so no catalog read and no clamp.
+    assert requests_while_gone == []
+    assert effort_while_gone == "medium"
+    assert remembered_while_gone == "max"
+    # Live: the catalog caps the model at xhigh, and the applied value is what sticks.
+    updates = [
+        params
+        for method, params in session.app_server.requests
+        if method == "thread/settings/update"
+    ]
+    assert updates == [live_update]
+    assert codex_native_bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
+    assert session.remembered_efforts[session.conv_id] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_codex_native_deferred_effort_reset_forgets_the_remembered_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A Default reset deferred for want of an app-server drops the runner's old effort.
+
+    Resolving the model's default needs the catalog, so the reset defers like any other
+    pick rather than failing on it. The session row then carries no effort, so a stale
+    remembered one would be sent as the next turn's effort and contradict the reset.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _reaped_codex_session(monkeypatch, tmp_path) as session:
+        session.remembered_efforts[session.conv_id] = "xhigh"
+        response = await session.http.post(
+            f"/v1/sessions/{session.conv_id}/events",
+            json={"type": "effort_change", "effort": None, "rollback_on_refusal": True},
+        )
+
+    assert response.status_code == 204, response.text
+    assert session.app_server.requests == []
+    assert session.conv_id not in session.remembered_efforts
+    [row] = _deferred_settings_events(caplog)
+    assert row.attributes["setting_keys"] == "effort"
 
 
 @pytest.mark.asyncio

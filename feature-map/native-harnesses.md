@@ -213,9 +213,16 @@ Cross-harness journeys:
   An older server resets the previous model first, even with an updated runner;
   its default is then inherited if the target supports it. On older servers,
   switch models first and select Default as a separate action afterward.
-  While a connected runner is still starting Codex and has no loaded bridge,
-  live settings return a retryable 503 and retain the previous selection.
-  Retry once the terminal is ready; fully offline and silent saves remain deferred.
+  A model or effort pick with no live app-server to take it, because Codex is
+  still starting with no loaded bridge or the idle reaper closed its terminal, is
+  kept rather than refused: the runner answers 204 and logs
+  `codex_native_settings_deferred`, and the next launch or turn applies the pick,
+  clamping an effort to the model's levels then
+  (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_events_codex_native_settings_change_defers_without_a_bridge`,
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_events_codex_native_settings_change_defers_when_the_pane_is_gone`).
+  A live app-server that rejects the update, a dropped update, and plan-mode
+  toggles return a retryable 503 and retain the previous selection; retry once
+  the terminal is ready. Fully offline and silent saves remain deferred.
   An older server keeps such a refused change, so the updated runner applies it
   on the next turn; an older runner keeps it itself, so the updated server keeps
   it too. A hung connect fails after five seconds; a hung update is unconfirmed,

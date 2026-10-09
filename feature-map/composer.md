@@ -125,9 +125,11 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
 - **`model-picker`, `effort-picker`, refused change:** the rollback cases in
   `web/src/store/chatStore.test.ts` and the composer case in
-  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). Manually,
-  pick another effort in a Codex session right after Start session, while the
-  terminal is still starting: the pill keeps the previous effort.
+  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). A pick
+  made while the terminal is still starting, or after the idle reaper closed it,
+  is kept rather than refused: the pill shows the new effort and the next launch
+  or turn applies it. The pill keeps the previous effort only when a live Codex
+  refuses the change.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
