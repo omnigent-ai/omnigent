@@ -3443,6 +3443,22 @@ def test_remote_headers_refreshes_expired_stored_token(
     assert posted == [f"{_REFRESH_SERVER}/oauth/token"]
 
 
+def test_remote_headers_refused_refresh_skips_ambient_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused renewal must not fall through to ambient ~/.databrickscfg credentials."""
+    _store_expired_login(tmp_path, monkeypatch, refresh_status=400)
+
+    def _no_ambient(_profile: object) -> object:
+        raise AssertionError("must not read ambient Databricks creds for an expired login")
+
+    monkeypatch.setattr(chat_module, "_read_databrickscfg", _no_ambient)
+
+    headers = _remote_headers(server_url=_REFRESH_SERVER, host_id=None)
+
+    assert "Authorization" not in headers
+
+
 def test_server_auth_attaches_auth_for_expired_refreshable_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

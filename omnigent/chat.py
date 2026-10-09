@@ -723,15 +723,18 @@ def _remote_headers(
     # Resolve the bearer in the documented precedence order (one credential
     # source per branch), then merge the workspace-routing header.
     headers: dict[str, str] = {}
+    login_refused = False
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if token and (token := token.strip()):
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
     elif server_url:
-        from omnigent.cli_auth import load_or_refresh_token
+        from omnigent.cli_auth import has_refreshable_login, load_or_refresh_token
 
         # 2. Stored OIDC session token from `omnigent login`, renewed if lapsed.
         oidc_token = load_or_refresh_token(server_url)
+        # A login whose renewal was just refused must not borrow ambient credentials.
+        login_refused = oidc_token is None and has_refreshable_login(server_url)
         if oidc_token:
             headers["Authorization"] = f"Bearer {oidc_token}"
         else:
@@ -739,7 +742,7 @@ def _remote_headers(
             record_token = _stored_databricks_record_token(server_url)
             if record_token:
                 headers["Authorization"] = f"Bearer {record_token}"
-    if "Authorization" not in headers:
+    if "Authorization" not in headers and not login_refused:
         # 4. Ambient ~/.databrickscfg credentials.
         creds = _read_databrickscfg(None)
         if creds is not None and creds.token:
