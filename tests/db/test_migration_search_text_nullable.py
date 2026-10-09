@@ -1,10 +1,9 @@
-"""Verify nullable search_text upgrade and downgrade on SQLite.
-
-Upgrade preserves plaintext rows and accepts inserts omitting search_text;
-downgrade backfills NULL to an empty string before restoring NOT NULL."""
+"""Nullable search_text migration: upgrade keeps rows and FTS; downgrade backfills in batches."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -12,11 +11,13 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
 
-from omnigent.db.utils import _build_alembic_config, clear_engine_cache
+from omnigent.db.utils import _build_alembic_config, clear_engine_cache, ensure_fts_table
 
 # Revision ids bounding the migration under test.
 _PRIOR = "mm1a2b3c4d5e"
 _THIS = "nn1a2b3c4d5e"
+_MIGRATION = "omnigent.db.migrations.versions.nn1a2b3c4d5e_conversation_items_search_text_nullable"
+_CONVERSATION_ID = b"\x01" * 16
 
 
 def _engine_at(uri: str, revision: str) -> Engine:
@@ -43,16 +44,20 @@ def _migrate(engine: Engine, revision: str, downgrade: bool) -> None:
     engine.dispose()
 
 
-def _insert_item(engine: Engine, item_id: bytes, search_text: str | None) -> None:
+def _item_id(position: int) -> bytes:
+    return position.to_bytes(16)
+
+
+def _insert_item(engine: Engine, position: int, search_text: str | None) -> None:
     """Insert one conversation_items row, omitting search_text when None."""
     columns = "conversation_id, id, response_id, created_at, status, position, type, data"
     params: dict[str, object] = {
-        "cid": b"\x01" * 16,
-        "iid": item_id,
+        "cid": _CONVERSATION_ID,
+        "iid": _item_id(position),
         "rid": "resp_1",
         "created": 1,
         "status": 1,
-        "pos": int.from_bytes(item_id[-2:]),
+        "pos": position,
         "type": 1,
         "data": "{}",
     }
@@ -66,6 +71,38 @@ def _insert_item(engine: Engine, item_id: bytes, search_text: str | None) -> Non
             sa.text(f"INSERT INTO conversation_items ({columns}) VALUES ({values})"),
             params,
         )
+
+
+def _insert_null_items(engine: Engine, positions: Iterable[int]) -> None:
+    """Bulk-insert rows with a NULL search_text (requires the nullable schema)."""
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversation_items (conversation_id, id, response_id, created_at, "
+                "status, position, type, data, search_text) "
+                "VALUES (:cid, :iid, 'resp_1', 1, 1, :pos, 1, '{}', NULL)"
+            ),
+            [{"cid": _CONVERSATION_ID, "iid": _item_id(p), "pos": p} for p in positions],
+        )
+
+
+def _insert_fts_row(engine: Engine, position: int, search_text: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversation_items_fts (item_id, conversation_id, search_text) "
+                "VALUES (:iid, :cid, :st)"
+            ),
+            {"iid": _item_id(position), "cid": _CONVERSATION_ID, "st": search_text},
+        )
+
+
+def _fts_matches(engine: Engine, query: str) -> int:
+    with engine.begin() as conn:
+        return conn.execute(
+            sa.text("SELECT count(*) FROM conversation_items_fts WHERE search_text MATCH :q"),
+            {"q": query},
+        ).scalar_one()
 
 
 def _stored_search_texts(engine: Engine) -> list[str | None]:
@@ -97,29 +134,35 @@ def test_upgrade_accepts_insert_without_search_text(db_file: str) -> None:
 
     At the prior revision the same INSERT aborts on the NOT NULL constraint
     (the failure a search-text-less store hit on every append); pre-existing
-    plaintext rows must survive the rebuild unchanged.
+    plaintext rows and their FTS index must survive the SQLite table rebuild.
     """
     engine = _engine_at(db_file, _PRIOR)
-    _insert_item(engine, b"\x02" * 16, search_text="hello body")
+    ensure_fts_table(engine)
+    _insert_item(engine, 2, search_text="hello body")
+    _insert_fts_row(engine, 2, "hello body")
     with pytest.raises(sa.exc.IntegrityError, match="search_text"):
-        _insert_item(engine, b"\x03" * 16, search_text=None)
+        _insert_item(engine, 3, search_text=None)
 
     _migrate(engine, _THIS, downgrade=False)
 
-    _insert_item(engine, b"\x04" * 16, search_text=None)
+    _insert_item(engine, 4, search_text=None)
     assert _stored_search_texts(engine) == ["hello body", None]
     assert _search_text_nullable(engine) is True
+    assert _fts_matches(engine, "hello") == 1
     engine.dispose()
 
 
 def test_downgrade_backfills_null_and_restores_not_null(db_file: str) -> None:
-    """Downgrade rewrites NULL rows to ``''`` and reinstates NOT NULL."""
+    """Downgrade rewrites NULL rows to ``''`` across several key pages and reinstates NOT NULL."""
+    batch = import_module(_MIGRATION)._BACKFILL_BATCH
     engine = _engine_at(db_file, _THIS)
-    _insert_item(engine, b"\x02" * 16, search_text="kept text")
-    _insert_item(engine, b"\x03" * 16, search_text=None)
+    _insert_item(engine, 0, search_text="kept text")
+    _insert_null_items(engine, range(1, batch + 3))
 
     _migrate(engine, _PRIOR, downgrade=True)
 
-    assert _stored_search_texts(engine) == ["kept text", ""]
+    texts = _stored_search_texts(engine)
+    assert texts[0] == "kept text"
+    assert texts[1:] == [""] * (batch + 2)
     assert _search_text_nullable(engine) is False
     engine.dispose()

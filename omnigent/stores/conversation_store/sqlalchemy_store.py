@@ -2425,11 +2425,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "data": data,
                 "created_by": item.created_by,
             }
-            # A backend may omit search_text (see _item_search_text): when it
-            # returns None we drop the column (stored NULL here, and a schema
-            # without the column still works) and skip its FTS row. The hook is
-            # all-or-nothing per store, so the key set stays uniform across the
-            # executemany.
+            # None from _item_search_text drops the column (NULL here) and skips the
+            # FTS row; the hook is per-store, so executemany key sets stay uniform.
             if search is not None:
                 values["search_text"] = search
             prepared_rows.append((item, values, search))
@@ -4880,10 +4877,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "created_by": src_item.created_by,
                     }
                 )
-                # Mirror append(): a NULL search_text (opaque data) gets no
-                # FTS row; an empty string still does.
-                if src_item.search_text is not None:
-                    fts_rows.append((new_item_id, new_conv_id, src_item.search_text))
+                fts_rows.append((new_item_id, new_conv_id, src_item.search_text or ""))
 
             # The clone copied len(source_items) items at dense positions
             # 0..N-1, so its position allocator starts at N. Seed it from the

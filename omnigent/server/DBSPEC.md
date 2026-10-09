@@ -183,8 +183,8 @@ Populated by `ConversationStore.append()` before inserting. Extraction by item t
 
 This is a shared code path — both backends populate the same `search_text` column.
 A store that holds `data` opaquely overrides `SqlAlchemyConversationStore._item_search_text`
-to return `None`; its rows are stored with a NULL `search_text`, get no FTS row, and are
-never matched by search.
+to return `None`; its rows are stored with a NULL `search_text` and are never matched by
+search.
 
 #### Backend-specific indexing
 

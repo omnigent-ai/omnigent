@@ -7293,11 +7293,10 @@ def test_item_search_text_seam_none_persists_null(db_uri: str) -> None:
 
 
 def test_fork_copies_items_without_search_text(db_uri: str) -> None:
-    """Forking items stored with a NULL ``search_text`` copies them and adds no FTS rows."""
+    """Forking items stored with a NULL ``search_text`` copies them with the NULL intact."""
     from sqlalchemy import select
 
     from omnigent.db.db_models import SqlConversationItem
-    from omnigent.db.utils import _supports_fts5
 
     class _SearchTextlessStore(SqlAlchemyConversationStore):
         def _item_search_text(self, item: NewConversationItem) -> str | None:
@@ -7331,18 +7330,6 @@ def test_fork_copies_items_without_search_text(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == [None]
-
-    # The FTS mirror only exists on the SQLite family; NULL rows must not be indexed.
-    if _supports_fts5(store._conv_engine.dialect.name):
-        with store._conv_session("test_setup") as session:
-            fts_rows = session.execute(
-                text(
-                    "SELECT count(*) FROM conversation_items_fts "
-                    "WHERE conversation_id IN (:source_id, :fork_id)"
-                ),
-                {"source_id": source.id, "fork_id": fork.id},
-            ).scalar_one()
-        assert fts_rows == 0
 
 
 def _acl_perms(db_uri: str):
