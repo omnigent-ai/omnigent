@@ -505,9 +505,9 @@ Fields:
     bubble so it survives navigation / an SSE rebind. Drained when the
     message round-trips back (the matching `session.input.consumed`
     carries `cleared_pending_id`). Messages still queued when an
-    `interrupt` cancelled the turn are left out, so a reload does not
-    redraw a bubble the person stopped. Empty for non-native sessions,
-    which already carry the message in `items`.
+    `interrupt` or `stop_session` landed are left out, so a reload does
+    not redraw a bubble the person stopped. Empty for non-native
+    sessions, which already carry the message in `items`.
 
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
@@ -964,7 +964,10 @@ Request body matches `SessionEventInput`:
                                   auto-relaunches a runner on a live host
                                   (there is no separate "resume" event).
                                   The conversation transcript is
-                                  preserved. Returns `{queued: false}`.
+                                  preserved. On native-terminal sessions
+                                  the web messages still queued are
+                                  settled as for `interrupt` (see below).
+                                  Returns `{queued: false}`.
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
@@ -1094,13 +1097,14 @@ user-triggered cancel the server emits BOTH `response.incomplete`
 `session.interrupted` (from the route). Co-emitting the
 Responses-style event lets off-the-shelf parsers close cleanly while
 the session-scoped event carries the cancel intent for session-aware
-clients. On native-terminal sessions an `interrupt` the runner accepted
-also settles the web messages still queued at that moment: they leave
-`pending_inputs`, and a later transcript mirror that jumps over one
-drains it without persisting a `native_prompt_not_recorded` error (an
-exact mirror of it still drains it normally, since the agent did record
-it). A message sent after the Stop, or an interrupt the runner did not
-accept, leaves the queue as it was. The internal terminal-observed
+clients. On native-terminal sessions an `interrupt` the runner accepted,
+or a `stop_session` that completed, also settles the web messages still
+queued at that moment: they leave `pending_inputs`, and a later
+transcript mirror that jumps over one drains it without persisting a
+`native_prompt_not_recorded` error (an exact mirror of it still drains
+it normally, since the agent did record it). A message sent after the
+Stop, or an interrupt or stop that did not land, leaves the queue as it
+was. The internal terminal-observed
 envelopes also bypass the queue: `external_conversation_item`
 appends/broadcasts an already-observed item and returns its stored
 `item_id`, while `external_output_text_delta` publishes a transient
