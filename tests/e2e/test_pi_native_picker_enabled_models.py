@@ -53,7 +53,12 @@ import pytest
 import yaml
 
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
-from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.compat import (
+    apply_runner_env,
+    compat_runner_cwd,
+    runner_executable,
+    strip_leaked_runner_env,
+)
 from tests.e2e.helpers import POLL_INTERVAL_S
 from tests.e2e.test_pi_native_unmanaged_model import (
     _UnmanagedPiHost,
@@ -247,6 +252,7 @@ def multi_login_pi_host(
         "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
+    strip_leaked_runner_env(env)
     # Absolute worktree roots on PYTHONPATH: the daemon-spawned runner runs
     # with cwd=<workspace>, so relative entries dangle (see the sibling
     # unmanaged-Pi module for the full rationale).

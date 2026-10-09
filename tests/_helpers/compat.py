@@ -377,3 +377,41 @@ def resolve_server_version(base_url: str) -> str:
     """
     override = os.environ.get(COMPAT_SERVER_VERSION_ENV) or None
     return reconcile_server_version(_fetch_reported_version(base_url), override, source=base_url)
+
+
+# Runner/host identity (and any zygote vars) inherited when the suite itself
+# runs inside a managed runner. Left in a daemon's env they send its spawned
+# runner down the zygote-fork path and hang it, so daemon-spawning fixtures
+# strip them to start a clean runner.
+_LEAKED_RUNNER_ENV = (
+    "OMNIGENT_RUNNER_ID",
+    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
+    "OMNIGENT_RUNNER_TUNNEL_TOKEN",
+    "OMNIGENT_RUNNER_PARENT_PID",
+    "OMNIGENT_RUNNER_ISOLATE_SESSION",
+    "OMNIGENT_RUNNER_WORKSPACE",
+    "OMNIGENT_HOST_ID",
+    "OMNIGENT_HOST_TOKEN",
+    "OMNIGENT_HOST_NAME",
+    "RUNNER_SERVER_URL",
+    "OMNIGENT_REMOTE_AUTH_TOKEN",
+)
+
+
+def strip_leaked_runner_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop inherited runner/host identity so a spawned daemon starts clean.
+
+    A daemon-spawning fixture inherits the suite's own runner/host identity
+    (and any ``OMNIGENT_RUNNER_ZYGOTE*`` var) when the suite runs under a
+    managed runner; left in place they route the daemon's child runner down
+    the zygote-fork path and hang it until the fixture's deadline. Mutates
+    *env* in place and returns it.
+
+    :param env: Environment mapping passed to the spawned daemon.
+    :returns: The same mapping, with leaked runner/host keys removed.
+    """
+    for leaked in _LEAKED_RUNNER_ENV:
+        env.pop(leaked, None)
+    for zygote in [key for key in env if key.startswith("OMNIGENT_RUNNER_ZYGOTE")]:
+        env.pop(zygote, None)
+    return env

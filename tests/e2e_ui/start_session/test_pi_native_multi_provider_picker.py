@@ -57,7 +57,12 @@ from playwright.async_api import Route, async_playwright, expect
 
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
-from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.compat import (
+    apply_runner_env,
+    compat_runner_cwd,
+    runner_executable,
+    strip_leaked_runner_env,
+)
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e_ui.start_session.test_start_session import (
     _open_entry_models,
@@ -85,22 +90,6 @@ pytestmark = [
 # The single model Pi is curated to via settings.json enabledModels; both
 # pickers must scope to exactly this.
 _CURATED_MODEL = "anthropic/claude-sonnet-4-5"
-
-# Leaked runner/zygote env would send the daemon's spawned runner down the
-# zygote-fork path and hang it; strip it so the daemon starts a clean runner.
-_LEAKED_RUNNER_ENV = (
-    "OMNIGENT_RUNNER_ID",
-    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
-    "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-    "OMNIGENT_RUNNER_PARENT_PID",
-    "OMNIGENT_RUNNER_ISOLATE_SESSION",
-    "OMNIGENT_RUNNER_WORKSPACE",
-    "OMNIGENT_HOST_ID",
-    "OMNIGENT_HOST_TOKEN",
-    "OMNIGENT_HOST_NAME",
-    "RUNNER_SERVER_URL",
-    "OMNIGENT_REMOTE_AUTH_TOKEN",
-)
 
 
 def _openrouter_catalog() -> list[dict[str, Any]]:
@@ -286,10 +275,7 @@ def multi_provider_pi_host(
         "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
-    for leaked in _LEAKED_RUNNER_ENV:
-        env.pop(leaked, None)
-    for zygote in [key for key in env if key.startswith("OMNIGENT_RUNNER_ZYGOTE")]:
-        env.pop(zygote, None)
+    strip_leaked_runner_env(env)
     # Absolute worktree roots: the runner the daemon spawns runs with
     # cwd=<workspace>, so any relative PYTHONPATH entry would resolve wrong.
     existing = env.get("PYTHONPATH", "")

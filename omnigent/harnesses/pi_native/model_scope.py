@@ -24,9 +24,9 @@ rejects (e.g. a reversed range ``[z-a]``) makes its pattern match nothing
 rather than raise. Brace expansion and backslash escapes inside ``[...]`` are
 not mirrored; model-id ``enabledModels`` patterns do not use them in practice.
 
-Verified against Pi 0.84.2 (the e2e CI pin in ``.github/ci-deps``) and 0.85.1:
-``core/model-resolver.js`` ``resolveModelScopeFromModels`` (minimatch 10) is
-unchanged between them. Re-verify when the pinned Pi resolver changes.
+Mirrors Pi's ``resolveModelScopeFromModels`` (``core/model-resolver.js``,
+minimatch 10); re-check compatibility when the pinned Pi version in
+``.github/ci-deps`` changes.
 """
 
 from __future__ import annotations
