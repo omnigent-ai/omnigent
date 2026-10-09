@@ -14,8 +14,8 @@ without starting a session, shows their summaries, and deletes owned agents.
 
 ## How to get to it (user POV)
 
-- Desktop: open Settings, then Custom agents in the sidebar.
-- Mobile: open Settings, then Custom agents in the settings navigation.
+- Desktop: open Settings, then Customize → Custom agents in the sidebar.
+- Mobile: open Settings, then Customize → Custom agents in the settings navigation.
 - From the list: Create opens the form; an agent name opens its summary.
 - Direct links: `/settings/custom-agents`, `/settings/custom-agents/new`, and
   `/settings/custom-agents/<agent-id>` open those same pages.
@@ -30,7 +30,9 @@ The server must implement agent installation (PR #8677) and advertise
 `agent_install: true`. Main without that dependency only exercises gating.
 
 - Desktop and mobile: open Settings through navigation and select Custom agents.
-  Confirm server cards and the empty owned state; capture both viewport sizes.
+  Confirm Customize contains Harnesses and Custom agents, and General no longer
+  contains Harnesses. Confirm server cards and the empty owned state; capture
+  both viewport sizes.
 - Create: enter a unique name, a configured model, instructions, and an MCP
   server. Save, verify the summary, reload, and verify persistence through
   `GET /v1/agents?scope=user`. Session count must remain unchanged. Return to
@@ -43,7 +45,8 @@ The server must implement agent installation (PR #8677) and advertise
   deletion reports the count and waits for Remove anyway. Only that action
   should force removal.
 - Gating: remove the feature flag, restart the isolated server, and reload.
-  Custom agents must disappear from navigation and its URLs must show General.
+  Customize must disappear, Harnesses must return to General, and Custom agents
+  URLs must show General.
   Repeat against a server without the installation capability.
 - Component checks for duplicate names, failed save/delete, empty continuation
   pages, and capability gating:

@@ -22,7 +22,7 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
-  customAgentsEnabled: false,
+  customAgentsEnabled: false as boolean | undefined,
   agentInstall: false,
 }));
 
@@ -443,6 +443,7 @@ function routeHook(path: string) {
 
 describe("custom agent settings availability", () => {
   it.each([
+    [undefined, true],
     [false, false],
     [false, true],
     [true, false],
@@ -451,7 +452,16 @@ describe("custom agent settings availability", () => {
     mocks.customAgentsEnabled = flag;
     mocks.agentInstall = api;
     renderBody();
-    expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(flag && api);
+    const enabled = flag === true && api;
+    expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(enabled);
+    expect(!!screen.queryByRole("heading", { name: "Customize" })).toBe(enabled);
+    const group = screen.getByRole("heading", { name: enabled ? "Customize" : "General" });
+    expect(group.parentElement).toContainElement(screen.getByTestId("settings-nav-harnesses"));
+    if (enabled) {
+      expect(group.parentElement).toContainElement(
+        screen.getByTestId("settings-nav-custom-agents"),
+      );
+    }
     for (const suffix of ["", "/new", "/agent-1"]) {
       expect(routeHook(`/settings/custom-agents${suffix}`).section).toBe(
         flag && api ? "custom-agents" : "general",
@@ -459,13 +469,22 @@ describe("custom agent settings availability", () => {
     }
   });
 
-  it("places custom agents after Harnesses and parses embedded detail routes", () => {
+  it("groups Harnesses and Custom agents under Customize and parses embedded detail routes", () => {
     mocks.customAgentsEnabled = true;
     mocks.agentInstall = true;
-    const ids = settingsNavGroups(false, false, false, false, false, true).flatMap((group) =>
-      group.items.map((item) => item.id),
-    );
-    expect(ids.indexOf("custom-agents")).toBe(ids.indexOf("harnesses") + 1);
+    const groups = settingsNavGroups(false, true, false, false, false, true);
+    expect(groups.map((group) => group.title)).toEqual([
+      "General",
+      "Customize",
+      "Desktop",
+      "Archived",
+    ]);
+    expect(
+      groups.find((group) => group.title === "Customize")?.items.map((item) => item.id),
+    ).toEqual(["harnesses", "custom-agents"]);
+    expect(
+      groups.flatMap((group) => group.items).filter((item) => item.id === "harnesses"),
+    ).toHaveLength(1);
     expect(routeHook("/ml/omnigent-embed/settings/custom-agents/agent-1")).toEqual({
       inSettings: true,
       section: "custom-agents",
