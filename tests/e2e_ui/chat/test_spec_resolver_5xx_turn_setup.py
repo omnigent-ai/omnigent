@@ -267,8 +267,6 @@ class _Spec503Proxy:
         t2 = asyncio.ensure_future(backend_to_client())
         try:
             await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-        except Exception:
-            pass
         finally:
             for task in (t1, t2):
                 task.cancel()
