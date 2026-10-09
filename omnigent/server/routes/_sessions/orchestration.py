@@ -41,6 +41,7 @@ from omnigent.entities import (
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
+    TerminalCommandData,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -69,6 +70,11 @@ from omnigent.host.frames import (
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
+from omnigent.native.input_diagnostics import (
+    input_attributes,
+    log_input_event,
+    with_input_attributes,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -798,6 +804,7 @@ async def _stop_host_runner_intentionally(
                 statuses.setdefault(related_id, None)
         statuses.setdefault(session_id, None)
         marked: set[str] = set()
+        stop_targets: set[str] = set()
         completed_stop_relays: dict[str, tuple[_RelayHandle, int]] = {}
         for related_id, persisted_status in statuses.items():
             handle = _runner_relay_tasks.get(related_id)
@@ -807,6 +814,7 @@ async def _stop_host_runner_intentionally(
             # Completed work and earlier task failures keep their existing outcome.
             if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
                 continue
+            stop_targets.add(related_id)
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)
             # Each Stop needs a fresh disconnect window, including repeated requests.
@@ -837,6 +845,30 @@ async def _stop_host_runner_intentionally(
                             handle.intentional_stop_turn_ended = True
                         else:
                             _intentional_stop_sessions.pop(related_id, None)
+        if acknowledged:
+            # Native forwarders can publish activity after the relay closes.
+            # The host acknowledgement confirms those publishers have exited.
+            for related_id in stop_targets:
+                if (
+                    _session_status_cache.get(related_id, statuses[related_id])
+                    not in _MID_TURN_STATUSES
+                ):
+                    continue
+                handle = _runner_relay_tasks.get(related_id)
+                if handle is not None and handle.runner_id != runner_id:
+                    continue
+                settled = await asyncio.wrap_future(
+                    session_live_state.submit(
+                        "settle_intentional_stop",
+                        conversation_store.settle_intentionally_stopped_session,
+                        related_id,
+                        runner_id,
+                    )
+                )
+                handle = _runner_relay_tasks.get(related_id)
+                if settled and (handle is None or handle.runner_id == runner_id):
+                    session_live_state.forget_live_status(related_id)
+                    _publish_status(related_id, "idle", persist_live_status=False)
         return acknowledged
 
 
@@ -2717,19 +2749,31 @@ def _native_mirror_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _shell_command_input(item: NewConversationItem) -> str | None:
+    """Return a mirrored shell input's command, excluding its output half."""
+    if (
+        item.type == "terminal_command"
+        and isinstance(item.data, TerminalCommandData)
+        and item.data.kind == "input"
+    ):
+        return item.data.input or None
+    return None
+
+
 def _drains_pending_inputs(item: NewConversationItem) -> bool:
     """
     Whether a mirrored item settles a queued web message.
 
-    True for a web-composer user message echoed back by the transcript and for
-    a slash command (typed in the web composer as plain text, mirrored as a
-    ``slash_command`` item). Assistant and tool items never touch the queue.
+    User messages, slash commands, and shell-command inputs can settle web
+    submissions. Assistant messages, tool items, and shell outputs cannot.
 
     :param item: The parsed external item.
     :returns: ``True`` when persisting *item* drains a pending-input entry.
     """
     if item.type == "slash_command":
         return isinstance(item.data, SlashCommandData)
+    if item.type == "terminal_command":
+        return _shell_command_input(item) is not None
     return (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2875,6 +2919,7 @@ async def _persist_external_conversation_item_unlocked(
     # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
     drained: pending_inputs.DrainedInput | None = None
+    match_method: str | None = None
     # Every drain below holds its entries in place (``hold=True``): they keep
     # their slot until the append settles, so a failed append restores the
     # queue exactly and a refill meanwhile cannot evict them. Older entries a
@@ -2900,6 +2945,7 @@ async def _persist_external_conversation_item_unlocked(
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
+        match_method = matched.match_method
         if agent_message_candidate:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
@@ -2918,6 +2964,7 @@ async def _persist_external_conversation_item_unlocked(
         if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
+                match_method = "fifo_fallback"
                 # The mirror's true owner may be any entry still queued, so none
                 # of them can be declared undelivered later.
                 pending_inputs.mark_uncertain(session_id)
@@ -2946,15 +2993,24 @@ async def _persist_external_conversation_item_unlocked(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
     elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
-        # A command typed in the web composer was queued as plain text but comes
-        # back as a slash_command item. Drain its own entry so it is not later
-        # mistaken for a lost message; older entries stay in place.
-        command_line = f"/{item.data.name} {item.data.arguments}".strip()
-        matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        # A command typed in the web composer was queued as plain text but comes back
+        # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
+        # ``/<plugin>:simplify``. Drain its own entry so it is not mistaken for a lost message.
+        spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
+        for spelling in spellings:
+            command_line = f"/{spelling} {item.data.arguments}".strip()
+            matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+            if matched.matched is not None:
+                break
         drained = matched.matched
+        match_method = matched.match_method
         if drained is not None:
             cleared_pending_id = drained.pending_id
-        held_older = matched.skipped
+        held_older = [*matched.skipped, *matched.uncertain]
+    elif (shell_command := _shell_command_input(item)) is not None:
+        drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
+        if drained is not None:
+            cleared_pending_id = drained.pending_id
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error) with stable
@@ -3006,10 +3062,51 @@ async def _persist_external_conversation_item_unlocked(
         persisted_user = persisted_items[i * 2]
         persisted_error = persisted_items[i * 2 + 1]
         if not persisted_user.deduplicated:
+            log_input_event(
+                _logger,
+                "native_input_settled",
+                session_id=session_id,
+                attributes=pending_inputs.delivery_attributes(skipped),
+                outcome="skipped_without_native_record",
+                item_id=persisted_user.id,
+                error_item_id=persisted_error.id,
+                response_id=persisted_error.response_id,
+                matched_item_id=persisted.id,
+                matched_response_id=persisted.response_id,
+                matched_pending_id=cleared_pending_id,
+                match_method=match_method,
+            )
             _publish_input_consumed(
                 session_id, persisted_user, cleared_pending_id=skipped.pending_id
             )
             _publish_external_conversation_item(session_id, persisted_error)
+    if drained is not None:
+        log_input_event(
+            _logger,
+            "native_input_settled",
+            session_id=session_id,
+            attributes=pending_inputs.delivery_attributes(drained),
+            outcome=(
+                "native_transcript_fifo_attributed"
+                if match_method == "fifo_fallback"
+                else "native_transcript_matched"
+            ),
+            item_id=persisted.id,
+            response_id=persisted.response_id,
+            match_method=match_method,
+        )
+    for uncertain in uncertain_pending:
+        log_input_event(
+            _logger,
+            "native_input_settled",
+            session_id=session_id,
+            attributes=pending_inputs.delivery_attributes(uncertain),
+            outcome="user_interrupted" if uncertain.interrupted else "prior_fifo_match_uncertain",
+            matched_item_id=persisted.id,
+            matched_response_id=persisted.response_id,
+            matched_pending_id=cleared_pending_id,
+            match_method=match_method,
+        )
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule(expected_seed_title=conv.title)
@@ -3186,6 +3283,17 @@ async def _settle_undelivered_native_input(
         )
         pending_inputs.restore(session_id, drained)
         return
+    if not persisted[0].deduplicated:
+        log_input_event(
+            _logger,
+            "native_input_settled",
+            session_id=session_id,
+            attributes=pending_inputs.delivery_attributes(drained),
+            outcome="reported_undelivered",
+            item_id=persisted[0].id,
+            response_id=persisted[0].response_id,
+            match_method="input_stable_id",
+        )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
 
 
@@ -5536,6 +5644,7 @@ def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
     model_override: str | None = None,
+    input_delivery: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -5549,6 +5658,7 @@ def _build_native_terminal_message_event(
         so the claude-native executor applies ``/model`` and injects the
         message under one lock (no separate racing ``model_change``
         event). ``None`` when routing did not pick a model.
+    :param input_delivery: Queued input identifiers and original enqueue time.
     :returns: Harness ``MessageEvent`` body for the runner-local
         native terminal harness, including ``agent_id`` so the runner
         can resolve the harness spec on the first message.
@@ -5582,6 +5692,7 @@ def _build_native_terminal_message_event(
     raw_stable_id = body.data.get("stable_id")
     if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id):
         event["stable_id"] = raw_stable_id
+    event.update(input_attributes(input_delivery))
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
     # not resolve this turn from the spec and evict the override harness.
@@ -5604,6 +5715,7 @@ async def _forward_native_terminal_message(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
+    input_delivery: Mapping[str, object] | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -5627,12 +5739,22 @@ async def _forward_native_terminal_message(
         in-band on the message so the executor applies ``/model`` and the
         inject under one lock (no separate racing ``model_change``).
         ``None`` when routing did not pick a model.
+    :param input_delivery: Queued input identifiers and original enqueue time.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
+    event = _build_native_terminal_message_event(
+        conv, body, model_override=model_override, input_delivery=input_delivery
+    )
+    log_input_event(
+        _logger,
+        "native_input_forward_started",
+        session_id=session_id,
+        attributes=input_attributes(input_delivery),
+        harness=harness,
+    )
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
@@ -5730,11 +5852,14 @@ async def _forward_native_terminal_message(
         "%s terminal message dispatched for session=%s",
         display_name,
         session_id,
-        extra=debug_event(
-            "turn_dispatched",
-            session_id=session_id,
-            agent=conv.agent_id or "",
-            harness=harness,
+        extra=with_input_attributes(
+            debug_event(
+                "turn_dispatched",
+                session_id=session_id,
+                agent=conv.agent_id or "",
+                harness=harness,
+            ),
+            input_delivery,
         ),
     )
 
@@ -5999,7 +6124,12 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
-def _native_pane_harness(conv: Conversation) -> str | None:
+def _native_pane_harness(
+    conv: Conversation,
+    *,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+) -> str | None:
     """The native harness a pane actually runs, past the ``"auto"`` sentinel.
 
     A forced-auto child keeps ``harness_override="auto"`` until its first
@@ -6009,10 +6139,12 @@ def _native_pane_harness(conv: Conversation) -> str | None:
     names the real harness.
 
     :param conv: Conversation row for the native session.
+    :param agent_store: Optional agent store for resolving the bound spec.
+    :param agent_cache: Optional cache for loading the bound spec.
     :returns: The canonical native harness, e.g. ``"claude-native"``, or
         ``None`` when it cannot be resolved.
     """
-    harness = _resolve_harness(conv)
+    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     if harness is not None and harness != "auto":
         return harness
     native = _native_coding_agent_for_session(conv)
@@ -7012,8 +7144,38 @@ async def _forward_codex_side_chat_turn(
             "codex_side_thread_id": child_thread_id,
         },
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise _codex_side_chat_runner_error(resp)
     return _SessionEventDispatchResult(item_id=None, pending_id=None)
+
+
+def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
+    """
+    Translate a parent runner's refusal of a side-chat turn into a structured error.
+
+    :param resp: Non-2xx response from the parent runner's ``/events``.
+    :returns: An :class:`OmnigentError` carrying the runner's detail message.
+    """
+    detail: str | None = None
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = payload["detail"]
+    except ValueError:
+        pass
+    if resp.status_code == 404:
+        code = ErrorCode.NOT_FOUND
+    elif resp.status_code == 409:
+        code = ErrorCode.CONFLICT
+        detail = detail or "Codex rejected this message."
+        if "multi-agent v2" in detail:
+            detail = f"This Codex sub-agent cannot take direct input ({detail})."
+    else:
+        code = ErrorCode.RUNNER_UNAVAILABLE
+    return OmnigentError(
+        detail or "The Codex side chat could not accept this message right now.",
+        code=code,
+    )
 
 
 async def _dispatch_session_event_to_runner_impl(
@@ -7186,7 +7348,20 @@ async def _dispatch_session_event_to_runner_impl(
                 "omnigent on the host (>= 0.15.0) and reconnect it, then try again.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        queues_message = isinstance(content, list) and bool(content) and not opens_side_chat
+        # A Claude /btw answers in a TUI overlay that never enters the transcript, so nothing
+        # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
+        # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
+        is_btw = (
+            _native_pane_harness(conv) == "claude-native"
+            and isinstance(content, list)
+            and all(
+                isinstance(block, dict) and block.get("type") == "input_text" for block in content
+            )
+            and bool(re.match(r"\s*/btw(\s|$)", _extract_user_text_for_routing(body)))
+        )
+        queues_message = (
+            isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
+        )
         if queues_message and web_stable_id is not None:
             repeated_pending_id = pending_inputs.pending_id_for_stable_id(
                 session_id, web_stable_id
@@ -7201,6 +7376,14 @@ async def _dispatch_session_event_to_runner_impl(
                     session_id,
                     extra={"session_id": session_id},
                 )
+                log_input_event(
+                    _logger,
+                    "native_input_retry_deduplicated",
+                    session_id=session_id,
+                    attributes=pending_inputs.delivery_attributes_for(
+                        session_id, repeated_pending_id
+                    ),
+                )
                 return _SessionEventDispatchResult(item_id=None, pending_id=repeated_pending_id)
         pending_id: str | None = (
             pending_inputs.record(
@@ -7213,6 +7396,18 @@ async def _dispatch_session_event_to_runner_impl(
             if queues_message
             else None
         )
+        input_delivery = (
+            pending_inputs.delivery_attributes_for(session_id, pending_id)
+            if pending_id is not None
+            else {}
+        )
+        if pending_id is not None:
+            log_input_event(
+                _logger,
+                "native_input_enqueued",
+                session_id=session_id,
+                attributes=input_delivery,
+            )
         # ── Server-side routing for native terminal sessions ────────
         # Same logic as the SDK path in _forward_event_to_runner: if
         # the toggle is on and no model_override is set, call the
@@ -7331,6 +7526,8 @@ async def _dispatch_session_event_to_runner_impl(
         # already-running pane.
         forwarded = False
         try:
+            if pending_id is not None:
+                pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
             await _forward_native_terminal_message(
                 runner_client,
                 session_id,
@@ -7343,8 +7540,28 @@ async def _dispatch_session_event_to_runner_impl(
                 model_override=(
                     _native_routed_model if _native_applied_model is not None else None
                 ),
+                input_delivery=input_delivery,
             )
             forwarded = True
+            if pending_id is not None:
+                pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
+            log_input_event(
+                _logger,
+                "native_input_forward_finished",
+                session_id=session_id,
+                attributes=input_attributes(input_delivery),
+                outcome="forward_accepted",
+            )
+        except BaseException as exc:
+            log_input_event(
+                _logger,
+                "native_input_forward_finished",
+                session_id=session_id,
+                attributes=input_attributes(input_delivery),
+                outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                exception_type=type(exc).__name__,
+            )
+            raise
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
@@ -8066,7 +8283,12 @@ async def _relay_runner_stream_once(
                                 "returned",
                                 conversation_store,
                                 turn_id=pending_subagent_return_id,
-                                status=pending_subagent_return_status,
+                                status=(
+                                    "failed"
+                                    if status == "failed"
+                                    else pending_subagent_return_status
+                                ),
+                                from_runner=True,
                             )
                             pending_subagent_return_id = None
                         if status:
@@ -9458,7 +9680,7 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
 
 
 def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -> list[str]:
-    """Which of *harnesses* this host does not back with the workspace AI gateway.
+    """Which of *harnesses* this host does not back with the workspace Unity Gateway.
 
     The external router's picks are gateway catalog ids, so a CLI pointed at
     Bedrock, a personal subscription, or any other provider cannot run one even
@@ -9605,7 +9827,7 @@ def _harness_labels(harnesses: Sequence[str]) -> str:
 def _ungatewayed_auto_routing_error(ungatewayed: Sequence[str]) -> str:
     """Message for a top-level Smart Routing create no router can serve.
 
-    Both arms are on the menu, so one arm off the gateway takes the AI Gateway's
+    Both arms are on the menu, so one arm off the gateway takes the Unity Gateway's
     router off the table for the whole pick. That is only fatal when the server
     has no built-in router either — otherwise the built-in one answers.
 
@@ -9619,14 +9841,14 @@ def _ungatewayed_auto_routing_error(ungatewayed: Sequence[str]) -> str:
         f"{verb} not AI-Gateway-backed, so the workspace router's picks would not be "
         "reachable, and this server has no built-in routing model to fall back on. Pick a "
         "harness directly, configure a server `llm:` block, or point the harness at the "
-        f"workspace AI Gateway (`{cli_invocation()} configure harnesses`)."
+        f"workspace Unity Gateway (`{cli_invocation()} configure harnesses`)."
     )
 
 
 def _ungatewayed_model_routing_error(harness: str) -> str:
     """Message for a routing-on create no router can serve.
 
-    Only reached when the harness is off the AI Gateway AND the server has no
+    Only reached when the harness is off the Unity Gateway AND the server has no
     built-in routing model — either one alone still routes.
 
     :param harness: The session's native harness, e.g. ``"codex-native"``.
@@ -9637,7 +9859,7 @@ def _ungatewayed_model_routing_error(harness: str) -> str:
         f"{_harness_labels([harness])} is not AI-Gateway-backed, so the workspace router's "
         "picks would not be reachable from the pane, and this server has no built-in routing "
         'model to fall back on. Create the session without cost_control_mode_override="on", '
-        "configure a server `llm:` block, or point the harness at the workspace AI Gateway "
+        "configure a server `llm:` block, or point the harness at the workspace Unity Gateway "
         f"(`{cli_invocation()} configure harnesses`)."
     )
 
@@ -9651,7 +9873,7 @@ async def _reject_ungatewayed_model_routing(
 ) -> None:
     """Reject a routing-on create no router can serve.
 
-    A pane off the AI Gateway cannot run the workspace router's picks, but the
+    A pane off the Unity Gateway cannot run the workspace router's picks, but the
     built-in judge names models from the pane's own catalog, so it can. This
     only refuses when neither source is available — otherwise the create
     proceeds and the built-in judge answers.
@@ -12099,6 +12321,7 @@ async def _get_session_snapshot(
     conversation: Conversation | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     include_items: bool = True,
+    include_live_status: bool = True,
     runner_exit_reports: RunnerExitReports | None = None,
     refresh_state: bool = False,
     host_store: HostStore | None = None,
@@ -12139,6 +12362,11 @@ async def _get_session_snapshot(
         and return ``items=[]``. Callers that hydrate the transcript
         through ``GET /sessions/{id}/items`` (the web chat surface)
         pass ``False`` to avoid a redundant history read and serialization.
+    :param include_live_status: When ``False``, skip the live-status probe
+        of the session's bound runner on a status-cache miss and report
+        ``status`` from the cached or persisted value. Runner-owned reads
+        pass ``False`` — the probe targets the very runner waiting on this
+        response.
     :param include_usage: When ``False``, skip subtree usage aggregation and
         return unknown usage with ``usage_included=False``. Launch metadata
         does not need usage; display clients can fetch it separately.
@@ -12223,7 +12451,11 @@ async def _get_session_snapshot(
         # ``_session_status_from_cache`` already collapses the fine-grained
         # relay values (``"waiting"`` → ``"running"``), so the raw cache value
         # is only needed here when it is actually missing (None).
-        if _session_status_cache.get(session_id) is None and runner_client is not None:
+        if (
+            include_live_status
+            and _session_status_cache.get(session_id) is None
+            and runner_client is not None
+        ):
             if (
                 await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
                 is not None

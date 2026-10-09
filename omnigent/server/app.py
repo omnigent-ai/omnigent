@@ -18,6 +18,7 @@ from itertools import batched, groupby
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -53,6 +54,7 @@ from omnigent.errors import (
     ErrorPhase,
     OmnigentError,
     is_cancelled_rpc_error,
+    is_permission_denied_rpc_error,
 )
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
@@ -77,7 +79,12 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode, auth_mode
+from omnigent.server.auth import (
+    AuthProvider,
+    SharingMode,
+    auth_mode,
+    authentication_requires_identity,
+)
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -119,7 +126,12 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
-from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
+from omnigent.server.runner_session_init import (
+    TRANSIENT_REJECTION_STATUSES,
+    RunnerSessionInitializer,
+    is_session_agent_removed,
+    runner_response_error_body,
+)
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -178,6 +190,7 @@ class ServerInfoResponse(BaseModel):
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
+    public_sharing_max_level: Literal["read", "edit"] = "read"
     server_version: str
     smart_routing_enabled: bool
     smart_routing_sources: SmartRoutingSourcesInfo
@@ -1325,6 +1338,7 @@ def create_app(
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
+    public_sharing_max_level: str | Callable[[], str] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
@@ -1447,6 +1461,12 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param public_sharing_max_level: Maximum effective ``__public__`` permission,
+        ``"read"`` (default) or ``"edit"``. Edit requires authenticated multi-user
+        access, including accounts, OIDC and trusted-header deployments.
+        ``None`` uses ``OMNIGENT_PUBLIC_SHARING_MAX_LEVEL`` with a file-backed
+        admin override. A static value or callable is deployment-managed.
+        The live ceiling also limits stored grants, without upgrading Read.
     :param default_public_sessions: Which new sessions start with a public
         read grant: ``"off"`` (all private), ``"sandbox"`` (managed cloud
         sandbox sessions only) or ``"all"``. Same shape as ``public_sharing``:
@@ -1938,8 +1958,37 @@ def create_app(
         _public_static = bool(public_sharing)
         app.state.public_sharing = lambda: _public_static
         app.state.public_sharing_writable = False
+    from omnigent.server.sharing_settings import (
+        DefaultPublicSessions,
+        PublicSharingMaxLevel,
+        PublicSharingPolicyMiddleware,
+        public_sharing_max_level_env_default,
+        read_public_sharing_max_level_override,
+    )
+
+    app.state.public_edit_available = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    _public_max_env = public_sharing_max_level_env_default()
+
+    def _resolve_public_sharing_max_level() -> PublicSharingMaxLevel:
+        from omnigent.server.auth import local_single_user_enabled
+
+        if not app.state.public_edit_available or local_single_user_enabled():
+            return PublicSharingMaxLevel.READ
+        if public_sharing_max_level is None:
+            override = read_public_sharing_max_level_override()
+            return override if override is not None else _public_max_env
+        value = (
+            public_sharing_max_level()
+            if callable(public_sharing_max_level)
+            else public_sharing_max_level
+        )
+        return PublicSharingMaxLevel.coerce(value)
+
+    app.state.public_sharing_max_level = _resolve_public_sharing_max_level
+    app.state.public_sharing_max_level_writable = public_sharing_max_level is None
     # Default-public policy for NEW sessions, same shape as public_sharing.
-    from omnigent.server.sharing_settings import DefaultPublicSessions
 
     if default_public_sessions is None:
         from omnigent.server.sharing_settings import (
@@ -2445,6 +2494,32 @@ def create_app(
                 ),
             )
             return await _handle_omnigent_error(request, cancelled)
+        if is_permission_denied_rpc_error(exc):
+            # An upstream PERMISSION_DENIED (e.g. a proxied workspace-hierarchy
+            # 403) is an access outcome, not a fault: answer the coded 403 naming
+            # the resource instead of an unhandled 500 on every client retry.
+            denied = OmnigentError(
+                f"Access to {request.url.path} was denied by a backing "
+                "service. Verify you still have access to the underlying "
+                "resource, or ask an administrator to grant it.",
+                code=ErrorCode.UPSTREAM_PERMISSION_DENIED,
+            )
+            _logger.warning(
+                "Upstream call denied by a backing service: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="denied",
+                    code=str(denied.code),
+                    http_status=str(denied.http_status),
+                    error_category=denied.category.value,
+                    error_impact=denied.impact.value,
+                    error_phase=denied.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, denied)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real
@@ -2794,8 +2869,13 @@ def create_app(
            ``"none"``. ``"oidc"`` also promises the native loopback sign-in
            (``/auth/login`` native parameters + ``POST /auth/native-token``).
            ``session_cookie`` names the session cookie for ``oidc`` and
-           ``accounts`` and is ``null`` otherwise. A missing ``auth`` (older
-           servers) means "sign in as before".
+           ``accounts`` and is ``null`` otherwise. ``native_redirect_uris``
+           lists the private-use-scheme redirects (e.g. the iOS app's
+           ``ai.omnigent.ios:/oauth/callback``) the native sign-in accepts
+           besides loopback, sorted, for ``oidc``; ``null`` otherwise. The
+           iOS app gates on its URI being listed, because servers that only
+           support loopback answer the custom scheme with 400. A missing
+           ``auth`` (older servers) means "sign in as before".
         6. ``server_name`` (str | null) is the operator's display name for
            this deployment (``branding.server_name``), for clients that list
            several servers. Self-asserted by the server, so clients show it
@@ -2821,6 +2901,12 @@ def create_app(
 
         :returns: The manifest described above.
         """
+        mode = auth_mode(auth_provider)
+        native_redirect_uris: list[str] | None = None
+        if mode == "oidc":
+            from omnigent.server.routes.auth import NATIVE_APP_REDIRECT_URIS
+
+            native_redirect_uris = sorted(NATIVE_APP_REDIRECT_URIS)
         return {
             "manifest_version": WELL_KNOWN_MANIFEST_VERSION,
             "server_version": _server_version(),
@@ -2830,8 +2916,9 @@ def create_app(
             "min_desktop_version": None,
             "ui": {"server_picker": "sidebar"},
             "auth": {
-                "mode": auth_mode(auth_provider),
+                "mode": mode,
                 "session_cookie": getattr(auth_provider, "session_cookie_name", None),
+                "native_redirect_uris": native_redirect_uris,
             },
             "server_name": branding_snapshot.server_name,
         }
@@ -2995,6 +3082,7 @@ def create_app(
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
+                "public_sharing_max_level": app.state.public_sharing_max_level().value,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
@@ -3512,10 +3600,12 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout. An idle
-        top-level session is included for exactly that reason; an idle
-        sub-agent is not, since its work finished on a runner that was
-        already live.
+        instead of spinning on "starting" until a timeout. Only a runner
+        that never connected fails an idle top-level session for that
+        reason: when the host dies after the runner ran, an idle session
+        lost no work and stays idle (offline via liveness). An idle
+        sub-agent is not failed either way, since its work finished on a
+        runner that was already live.
 
         :param host_id: The reporting host's id.
         :param runner_id: The crashed runner's id.
@@ -3530,6 +3620,9 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
+        # A runner this replica saw connect already ran, so its idle sessions lost
+        # no work; a replica that never saw it has no stamp and keeps failing them.
+        runner_ran = session_live_state.last_liveness_stamp(runner_id) is not None
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -3546,13 +3639,11 @@ def create_app(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),
             conversation_store,
-            fail_idle_top_level=True,
+            fail_idle_top_level=not runner_ran,
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
         """Attach bound streams, then recover independent session trees concurrently."""
-        import httpx
-
         from omnigent.entities import Conversation
         from omnigent.server.child_session_recovery import (
             RECOVERY_STORE_CONCURRENCY,
@@ -3621,11 +3712,24 @@ def create_app(
                             routed = runner_router.client_for_session_resources(
                                 conv.id, conversation=conv
                             )
-                        except OmnigentError:
-                            _logger.exception(
-                                "Failed to resolve runner client for session %s on reconnect",
-                                conv.id,
-                            )
+                        except OmnigentError as exc:
+                            if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
+                                # The runner dropped again before we reached this session.
+                                _logger.warning(
+                                    "Runner %s went offline before session %s was re-attached",
+                                    runner_id,
+                                    conv.id,
+                                    extra=debug_event(
+                                        "runner_reconnect_client_offline",
+                                        runner_id=runner_id,
+                                        error_code=exc.code,
+                                    ),
+                                )
+                            else:
+                                _logger.exception(
+                                    "Failed to resolve runner client for session %s on reconnect",
+                                    conv.id,
+                                )
                             continue
                         if routed.runner_id != runner_id:
                             continue
@@ -3691,13 +3795,44 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                         )
-                except Exception:
-                    if tunnel_registry.get(runner_id) is connection:
-                        _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
-                    else:
+                except Exception as exc:
+                    if tunnel_registry.get(runner_id) is not connection:
                         _logger.info(
                             "Stopped recovering session %s: runner tunnel changed", conv.id
                         )
+                    elif isinstance(exc, (ConnectionError, httpx.TransportError)):
+                        # Tunnel dropped mid-request; the next reconnect retries.
+                        _logger.warning(
+                            "Lost runner tunnel re-assigning session %s on reconnect (%s: %s)",
+                            conv.id,
+                            type(exc).__name__,
+                            exc,
+                            extra=debug_event(
+                                "runner_reconnect_reassign_lost_tunnel",
+                                exc_type=type(exc).__name__,
+                            ),
+                        )
+                    elif isinstance(exc, httpx.HTTPStatusError):
+                        body = runner_response_error_body(exc.response)
+                        status = exc.response.status_code
+                        log = (
+                            _logger.warning
+                            if status in TRANSIENT_REJECTION_STATUSES
+                            else _logger.error
+                        )
+                        log(
+                            "Failed to re-assign session %s on reconnect: HTTP %d: %s",
+                            conv.id,
+                            status,
+                            body,
+                            extra=debug_event(
+                                "runner_reconnect_reassign_rejected",
+                                status_code=status,
+                                response_body=body,
+                            ),
+                        )
+                    else:
+                        _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
 
         # A hung initialization delays only its own tree. All tasks are joined and
         # cancelled with this connection; no detached recovery or shared deadline.
@@ -4130,6 +4265,7 @@ def create_app(
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
+    app.add_middleware(PublicSharingPolicyMiddleware, max_level=app.state.public_sharing_max_level)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.

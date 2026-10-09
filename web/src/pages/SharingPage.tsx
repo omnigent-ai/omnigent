@@ -14,6 +14,13 @@ import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type SharingMode, isSingleUserMode } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -136,6 +143,8 @@ export function SharingPage() {
   const editable = state?.editable ?? false;
   const publicEnabled = state?.public_sharing_enabled ?? true;
   const publicEditable = state?.public_sharing_editable ?? false;
+  const publicMaxLevel = state?.public_sharing_max_level ?? "read";
+  const publicMaxEditable = state?.public_sharing_max_level_editable ?? false;
   const defaultPublic = state?.default_public_sessions ?? "off";
   const defaultPublicEditable = state?.default_public_sessions_editable ?? false;
   // Settings a higher-level one overrides are greyed out and show their
@@ -178,8 +187,8 @@ export function SharingPage() {
           <h1 className="settings-page-title text-2xl font-semibold">Session sharing</h1>
           <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
             Control whether users on this server can share sessions with others. Applies server-wide
-            and takes effect immediately. Changes affect only new shares — existing grants
-            (including already-public sessions) keep working until revoked.
+            and takes effect immediately. Sharing mode and visibility defaults affect new shares.
+            The public permission ceiling also applies to existing public grants.
           </p>
         </div>
 
@@ -237,9 +246,9 @@ export function SharingPage() {
                       className="flex-1"
                       description={
                         <>
-                          Allow sharing a session with anyone who has the link (public read access).
-                          When off, the Share dialog&apos;s Public access toggle is hidden and new
-                          public grants are rejected; existing public grants keep working.
+                          Allow sharing a session with anyone who has the link and can sign in. When
+                          off, new public grants are rejected; existing public grants remain
+                          accessible and can be revoked.
                           {!publicEditable && (
                             <span className="mt-1 block">
                               Managed by this deployment and can&apos;t be changed here.
@@ -257,6 +266,48 @@ export function SharingPage() {
                     />
                   </div>
                 </BlockedBy>
+
+                <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
+                  <SettingsLabel
+                    label="Maximum public permission"
+                    className="min-w-0 flex-1"
+                    description={
+                      <>
+                        The maximum access a public link can grant. Lowering this to Read also
+                        limits existing public Edit grants. Raising it does not upgrade Read grants.
+                        {!publicMaxEditable && (
+                          <span className="mt-1 block">Managed by this deployment.</span>
+                        )}
+                      </>
+                    }
+                  />
+                  <Select
+                    value={publicMaxLevel}
+                    onValueChange={(value) => {
+                      setError(null);
+                      setMode.mutate(
+                        { public_sharing_max_level: value as "read" | "edit" },
+                        { onError: (err) => setError(err.message) },
+                      );
+                    }}
+                    disabled={!publicMaxEditable || setMode.isPending}
+                    componentId="settings.sharing.public_max_level"
+                    valueHasNoPii
+                  >
+                    <SelectTrigger
+                      className="h-8 w-28 shrink-0"
+                      aria-label="Maximum public permission"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="read">Read</SelectItem>
+                      {state?.public_sharing_max_level_options?.includes("edit") && (
+                        <SelectItem value="edit">Edit</SelectItem>
+                      )}
+                    </SelectContent>
+                  </Select>
+                </div>
 
                 <div className="mt-4 border-t border-border pt-4">
                   <BlockedBy reason={defaultPublicBlockedReason}>

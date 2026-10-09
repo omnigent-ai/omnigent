@@ -30,6 +30,11 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+// Keep Fork actionable: the restriction hook would otherwise wait on a session
+// snapshot this test never serves.
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: () => ({}),
+}));
 vi.mock("./ForkSessionDialog", () => ({
   ForkSessionDialog: ({ open }: { open: boolean }) => (
     <Dialog open={open}>

@@ -745,7 +745,7 @@ class SysSessionShareTool(Tool):
     (:class:`omnigent.spec.types.SharePolicy`), which is its sole gate:
     ``none`` leaves the tool unregistered, ``non-public`` allows
     granting named users, and ``public`` additionally allows the
-    ``__public__`` sentinel (anonymous read of the full transcript).
+    ``__public__`` sentinel (link access subject to server authentication).
     ``allow_public`` carries that last tier into the tool so it can
     both advertise and refuse public grants when the policy is
     ``non-public``.
@@ -753,9 +753,9 @@ class SysSessionShareTool(Tool):
     ``session_id`` is optional — when omitted, the caller's own session
     is shared, which is the common case ("share this session with X").
     ``user_id`` is the grantee's email, or (when ``allow_public``) the
-    sentinel ``"__public__"`` for anonymous read-only access. ``level``
+    sentinel ``"__public__"`` for link access. ``level``
     is ``"read"`` (default), ``"edit"``, or ``"manage"``; the server
-    caps public grants at read.
+    caps public grants at its configured maximum (read by default, optionally edit).
 
     Runner-dispatched: the runner proxies ``PUT
     /v1/sessions/{id}/permissions`` using its authenticated server
@@ -811,13 +811,13 @@ class SysSessionShareTool(Tool):
         if self._allow_public:
             user_id_desc = (
                 "Grantee's email, e.g. 'alice@example.com', or the "
-                "sentinel '__public__' for anonymous read-only access "
-                "(anyone with the link)."
+                "sentinel '__public__' for anyone with the link who can sign in. "
+                "Public grants are capped at read unless the server permits edit."
             )
         else:
             user_id_desc = (
                 "Grantee's email, e.g. 'alice@example.com'. "
-                "Public/anonymous sharing is not enabled for this agent."
+                "Public link sharing is not enabled for this agent."
             )
         return {
             "type": "function",

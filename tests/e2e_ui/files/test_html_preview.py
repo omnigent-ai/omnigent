@@ -147,11 +147,11 @@ def seeded_html(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
         _cleanup_session_workdir(session_id)
 
 
-def test_html_preview_runs_scripts_and_targets_links(
+def test_html_preview_links_and_sandboxed_popout(
     page: Page,
     seeded_html: tuple[str, str],
 ) -> None:
-    """HTML preview runs JS (#778), opens links in a new tab (#777), scrolls same-page anchors."""
+    """Preview links work inline and in an isolated, sandboxed pop-out."""
     base_url, session_id = seeded_html
     # Keep the viewport wide so the responsive toolbar renders its actions
     # inline (the "Open in new tab" button is found by role, not via overflow).
@@ -203,26 +203,6 @@ def test_html_preview_runs_scripts_and_targets_links(
     popup = popup_info.value
     expect(popup).to_have_url(f"{base_url}/c/other.html")
     popup.close()
-
-
-def test_html_preview_open_in_new_tab_button(
-    page: Page,
-    seeded_html: tuple[str, str],
-) -> None:
-    """The "Open in new tab" button pops the artifact into an isolated, sandboxed tab.
-
-    Security regression guard: the artifact must render inside a *sandboxed*
-    (opaque-origin) iframe in an app-controlled blank tab — NOT at the app's own
-    origin (which a ``blob:``/``data:`` URL would do, exposing the app's storage
-    and credentialed API to untrusted artifact JS).
-    """
-    base_url, session_id = seeded_html
-    page.set_viewport_size({"width": 1600, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
-
-    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer).to_be_visible()
-    expect(file_viewer.locator('iframe[title="HTML preview"]')).to_be_visible(timeout=10_000)
 
     open_btn = file_viewer.get_by_role("button", name="Open in new tab")
     expect(open_btn).to_be_visible()

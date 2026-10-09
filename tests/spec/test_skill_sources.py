@@ -197,25 +197,62 @@ def test_claude_provider_includes_bridged_agents_skills(
 
 def test_claude_portable_skill_names_are_safe_command_basenames(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
-    for index, name in enumerate(
-        (
-            "portable",
-            "nested/name",
-            "nested\\name",
-            "..",
-            "",
-            "/absolute",
-            "display label",
-            "plugin:skill",
-            "x" * 256,
-        )
+    # Unsafe frontmatter names stay labels; only a valid directory name becomes the command.
+    for directory, name in (
+        ("portable", "nested/name"),
+        ("traversal", ".."),
+        ("absolute", "/absolute"),
+        ("display label", "portable"),
+        ("dotted.name", "portable"),
     ):
-        skill = workspace / ".agents" / "skills" / f"source-{index}" / "SKILL.md"
+        skill = workspace / ".agents" / "skills" / directory / "SKILL.md"
         skill.parent.mkdir(parents=True)
         skill.write_text(f"---\nname: {json.dumps(name)}\ndescription: Test skill\n---\nBody.\n")
 
     out = resolve_harness_skills(_ctx(workspace, tmp_path / "home"), "claude-native")
-    assert [skill.name for skill in out] == ["portable"]
+    assert sorted(skill.name for skill in out) == ["absolute", "portable", "traversal"]
+
+
+def test_claude_provider_invokes_skills_by_directory_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code types a skill as ``/<dir>``; the frontmatter name is only its label.
+
+    A spaced frontmatter name used as the command would fail the slash-command
+    shape check and drop the skill from the menu entirely.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    skill = home / ".claude" / "skills" / "asd-ste100"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: Simplified Technical English (ASD-STE100)\ndescription: STE\n---\nbody\n"
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [(s.name, s.display_name) for s in out] == [
+        ("asd-ste100", "Simplified Technical English (ASD-STE100)")
+    ]
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "claude-sdk"])
+@pytest.mark.parametrize("configured", ["review", "code-review"])
+def test_claude_provider_filter_accepts_directory_or_frontmatter_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, configured: str
+) -> None:
+    """A ``skills:`` list naming the frontmatter ``name`` still selects the skill."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    skill = home / ".claude" / "skills" / "review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: code-review\ndescription: Review\n---\nbody\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home, skills_filter=[configured]), harness)
+    assert [(s.name, s.display_name) for s in out] == [("review", "code-review")]
 
 
 def test_claude_provider_sources_user_skills_from_config_dir(

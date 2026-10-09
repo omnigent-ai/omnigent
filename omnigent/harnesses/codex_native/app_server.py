@@ -35,12 +35,15 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
 from omnigent.harnesses.codex_native.bridge import (
+    clear_certificate_failure,
     mirror_applied_codex_settings,
     read_codex_config_model,
     read_codex_home_config_effort,
     read_codex_home_config_model,
     read_unmirrored_codex_settings,
+    record_certificate_failure,
     write_policy_hook_config,
 )
 from omnigent.harnesses.codex_native.launch_args import (
@@ -941,6 +944,12 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+#: Codex ``-32600`` messages for a thread with no active turn at all. The
+#: superseded-turn rejection (``expected active turn id ... but found ...``) is
+#: separate because a newer turn is still live there.
+_NO_ACTIVE_TURN_MESSAGES = frozenset({"no active turn to steer", "no active turn to interrupt"})
+
+
 def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex rejected a turn id that ended or was replaced.
 
@@ -953,19 +962,42 @@ def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
     if error.code != -32600 or error.message is None:
         return False
     message = error.message.strip().casefold()
-    return message in {"no active turn to steer", "no active turn to interrupt"} or (
+    return message in _NO_ACTIVE_TURN_MESSAGES or (
         "expected active turn id" in message and "but found" in message
     )
 
 
+def is_no_active_turn_error(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex rejected because the thread has no active turn at all.
+
+    This is the subset of :func:`is_stale_active_turn_error` where the turn
+    genuinely ended. It excludes the superseded-turn rejection (``expected
+    active turn id ... but found ...``), where a newer turn is still live.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``True`` only when no turn is currently active.
+    """
+    if error.code != -32600 or error.message is None:
+        return False
+    message = error.message.strip().casefold()
+    return message in _NO_ACTIVE_TURN_MESSAGES
+
+
 #: JSON-RPC internal-error code codex returns when its thread-store fails.
 _CODEX_INTERNAL_ERROR_CODE = -32603
+
+#: JSON-RPC invalid-request code codex returns for protocol-level rejections.
+_CODEX_INVALID_REQUEST_CODE = -32600
 
 #: Substring in codex's ``-32603`` message when its thread-store cannot
 #: load/resume a thread's rollout — stable across the wrapper phrasings
 #: different codex versions use (``failed to read thread: …`` vs
 #: ``error resuming thread: …``).
 _CODEX_THREAD_STORE_ERROR = "thread-store internal error"
+
+#: Substring in codex's ``-32600`` message when a thread's paginated-history
+#: lineage points at a source rollout in the older, non-paginated format.
+_CODEX_PAGINATED_LINEAGE_ERROR = "source rollout is not paginated"
 
 
 def is_unreadable_thread_error(exc: BaseException) -> bool:
@@ -976,20 +1008,23 @@ def is_unreadable_thread_error(exc: BaseException) -> bool:
     cannot load or resume a thread's rollout JSONL — e.g. a large transcript
     whose multibyte character straddles a read-buffer boundary is rejected as
     invalid UTF-8 (``failed to read thread: …``), or a rollout record it
-    cannot resume (``error resuming thread: …``). Retrying never resumes such
-    a thread, unlike a refused resume (``-32600``, another writer holds the
-    thread) that clears once the holder exits.
+    cannot resume (``error resuming thread: …``). It answers ``-32600`` with
+    ``source rollout is not paginated`` when the thread's paginated-history
+    lineage points at a rollout in the older format. Retrying never resumes
+    such a thread, unlike any other refused resume (``-32600``, e.g. another
+    writer holds the thread) that clears once the holder exits.
 
     :param exc: The exception raised by the resume request, e.g. a
         :class:`CodexAppServerResponseError`.
     :returns: ``True`` when only a fresh thread can carry the session on.
     """
-    return (
-        isinstance(exc, CodexAppServerResponseError)
-        and exc.code == _CODEX_INTERNAL_ERROR_CODE
-        and exc.message is not None
-        and _CODEX_THREAD_STORE_ERROR in exc.message
-    )
+    if not isinstance(exc, CodexAppServerResponseError) or exc.message is None:
+        return False
+    if exc.code == _CODEX_INTERNAL_ERROR_CODE:
+        return _CODEX_THREAD_STORE_ERROR in exc.message
+    if exc.code == _CODEX_INVALID_REQUEST_CODE:
+        return _CODEX_PAGINATED_LINEAGE_ERROR in exc.message
+    return False
 
 
 class CodexAppServerClient:
@@ -1961,6 +1996,9 @@ class CodexNativeAppServer:
     config_profile: str | None = None
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
+    # First TLS certificate failure the launcher printed; mirrored into the
+    # bridge so the forwarder can fail a stuck turn with the cause.
+    certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
     async def start(self) -> None:
@@ -1977,6 +2015,8 @@ class CodexNativeAppServer:
             )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
+        # A previous launch's certificate record must not fail this launch's turns.
+        clear_certificate_failure(self.bridge_dir)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
             with contextlib.suppress(FileNotFoundError):
                 self.socket_path.unlink()
@@ -2507,6 +2547,11 @@ class CodexNativeAppServer:
                 self.recent_stderr.append(text)
                 if len(self.recent_stderr) > 20:
                     self.recent_stderr.pop(0)
+            if self.certificate_failure is None:
+                failure = detect_certificate_failure(text)
+                if failure is not None:
+                    self.certificate_failure = failure
+                    record_certificate_failure(self.bridge_dir, failure)
             if diagnostics is not None:
                 diagnostics.submit(
                     bytes(pending) + (b"\n" if newline else b""), bytes_omitted=omitted_bytes
@@ -3075,7 +3120,7 @@ class _DatabricksLaunchMaterialization:
     app-server build and the model-options probe so the two cannot drift.
 
     :param config_overrides: ``-c`` overrides routing Codex through the
-        profile's AI Gateway (provider block + auth command + model pin).
+        profile's Unity Gateway (provider block + auth command + model pin).
     :param model: The model the overrides pin, e.g. ``"databricks-gpt-5-4"``
         — the explicit *model* when given, else the catalog default.
     :param host: The profile's workspace origin for ``DATABRICKS_HOST``.
@@ -4033,7 +4078,7 @@ def resolve_native_codex_launch(
             )
             log_info_once(
                 _logger,
-                "native-codex routing: managed connect host — Databricks AI gateway "
+                "native-codex routing: managed connect host — Databricks Unity Gateway "
                 "via the credential broker (host-only [omnigent] profile + sidecar).",
             )
             return NativeCodexLaunch(
@@ -4046,7 +4091,7 @@ def resolve_native_codex_launch(
                 ),
                 model=resolved_model,
                 profile=None,
-                summary="Databricks AI gateway (managed connect host, broker-minted)",
+                summary="Databricks Unity Gateway (managed connect host, broker-minted)",
             )
 
     if entry is None:
