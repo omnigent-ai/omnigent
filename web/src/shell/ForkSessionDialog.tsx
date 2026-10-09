@@ -47,7 +47,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import {
   CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
-  CLAUDE_NATIVE_PERMISSION_MODES,
+  CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES,
   claudePermissionModeFromSession,
 } from "@/lib/claudePermissionMode";
 import {
@@ -519,7 +519,7 @@ function ForkRunConfig({
             <DescribedSelect
               value={permission}
               onValueChange={changePermission}
-              options={CLAUDE_NATIVE_PERMISSION_MODES}
+              options={CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES}
               testId="fork-session-config-permission"
               ariaLabel="Permissions"
               triggerClassName="text-sm"
