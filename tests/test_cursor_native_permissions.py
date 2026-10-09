@@ -596,23 +596,24 @@ async def test_supervise_transcript_fd_exhaustion_rewarns_during_long_episode(
 
 
 @pytest.mark.parametrize(
-    "exc",
+    "make_exc",
     [
-        pytest.param(OSError(errno.EACCES, "denied"), id="non-transient-oserror"),
-        pytest.param(RuntimeError("boom"), id="non-oserror"),
+        pytest.param(lambda: OSError(errno.EACCES, "denied"), id="non-transient-oserror"),
+        pytest.param(lambda: RuntimeError("boom"), id="non-oserror"),
     ],
 )
 async def test_supervise_transcript_non_transient_failures_still_log_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
-    exc: Exception,
+    make_exc: Callable[[], Exception],
 ) -> None:
     """Only fd exhaustion is demoted: any other poll failure keeps its ERROR."""
     caplog.set_level(logging.DEBUG, logger=cnp.__name__)
+    expected = make_exc()
 
     def _discover(*_a: object, **_k: object) -> Path:
-        raise exc
+        raise make_exc()
 
     monkeypatch.setattr(cnp, "_discover_store", _discover)
     monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(object()))
@@ -631,7 +632,9 @@ async def test_supervise_transcript_non_transient_failures_still_log_error(
         if r.levelno == logging.ERROR
         and "cursor transcript elicitation poll failed" in r.getMessage()
     )
-    assert error.exc_info is not None and error.exc_info[1] is exc
+    assert error.exc_info is not None
+    assert type(error.exc_info[1]) is type(expected)
+    assert str(error.exc_info[1]) == str(expected)
     assert not any("degraded by fd exhaustion" in r.getMessage() for r in caplog.records)
 
 

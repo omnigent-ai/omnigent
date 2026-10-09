@@ -59,6 +59,7 @@ _SETTLE_S = 0.3
 _WARMUP_S = 0.5
 _FAULT_HOLD_S = 1.0
 _SURFACE_WAIT_S = 20.0
+_DEGRADED_WAIT_S = 5.0
 
 _RESULT_WAIT_S = 60.0
 _ELICITATION_WAIT_S = 30.0
@@ -82,8 +83,9 @@ import traceback
 from pathlib import Path
 
 BASE_URL, SESSION_ID, WORKSPACE, RESULT_PATH, GATED_COMMAND = sys.argv[1:6]
-POLL_INTERVAL_S, SETTLE_S, WARMUP_S, FAULT_HOLD_S, SURFACE_WAIT_S = (
-    float(v) for v in sys.argv[6:11]
+POLL_FAILED_SIGNATURE = sys.argv[12]
+POLL_INTERVAL_S, SETTLE_S, WARMUP_S, FAULT_HOLD_S, SURFACE_WAIT_S, DEGRADED_WAIT_S = (
+    float(v) for v in sys.argv[6:12]
 )
 
 from omnigent.harnesses.cursor_native import permissions as cnp
@@ -118,6 +120,8 @@ def write_chat(chats_root, chat_name, created_ms, command):
         "content": [
             {
                 "type": "tool-call",
+                # The embedded newline is deliberate: it exercises the
+                # splitlines()[0] sanitising of ids in the supervisor's log lines.
                 "toolCallId": "call_fd_gated\nfc",
                 "toolName": "Shell",
                 "args": {"command": command},
@@ -174,6 +178,7 @@ async def main():
     hoard = []
     hoard_errno = None
     selfcheck_errno = None
+    degraded_observed = False
     try:
         try:
             while True:
@@ -184,6 +189,17 @@ async def main():
             os.listdir(str(chats_root))
         except OSError as exc:
             selfcheck_errno = exc.errno
+        # Keep the fault until the supervisor itself reports it (bounded), then
+        # hold it across many more poll passes.
+        deadline = time.monotonic() + DEGRADED_WAIT_S
+        while time.monotonic() < deadline:
+            if any(
+                r["level"] == "WARNING" and "degraded by fd exhaustion" in r["msg"]
+                for r in records
+            ):
+                degraded_observed = True
+                break
+            await asyncio.sleep(0.05)
         await asyncio.sleep(FAULT_HOLD_S)  # many poll passes under real EMFILE
     finally:
         # Always release the hoard so the child can still report its result.
@@ -205,11 +221,10 @@ async def main():
         await asyncio.sleep(0.05)
 
     # A supervisor that died before polling never logs; report it explicitly.
-    supervisor_error = (
-        repr(supervisor.exception())
-        if supervisor.done() and not supervisor.cancelled()
-        else ""
+    supervisor_exc = (
+        supervisor.exception() if supervisor.done() and not supervisor.cancelled() else None
     )
+    supervisor_error = repr(supervisor_exc) if supervisor_exc is not None else ""
     poll_failed = [
         {"msg": r["msg"], "exc_tail": r["exc"][-800:]}
         for r in records
@@ -219,6 +234,7 @@ async def main():
         {
             "hoard_errno": hoard_errno,
             "selfcheck_errno": selfcheck_errno,
+            "degraded_observed": degraded_observed,
             "warmup_errors": warmup_errors,
             "surfaced": surfaced,
             "supervisor_error": supervisor_error,
@@ -231,11 +247,10 @@ async def main():
     # elicitation open while the parent observes and resolves it; the parent
     # terminates this process.
     await asyncio.sleep(120)
-    supervisor.cancel()
 
 
 asyncio.run(main())
-'''.replace("POLL_FAILED_SIGNATURE", repr(_POLL_FAILED_SIGNATURE))
+'''
 
 
 def test_transient_fd_exhaustion_does_not_emit_poll_failed_errors(
@@ -293,6 +308,8 @@ def test_transient_fd_exhaustion_does_not_emit_poll_failed_errors(
                 str(_WARMUP_S),
                 str(_FAULT_HOLD_S),
                 str(_SURFACE_WAIT_S),
+                str(_DEGRADED_WAIT_S),
+                _POLL_FAILED_SIGNATURE,
             ],
             cwd=str(_REPO_ROOT),
             env=env,
@@ -324,6 +341,13 @@ def test_transient_fd_exhaustion_does_not_emit_poll_failed_errors(
                     f"selfcheck_errno={result['selfcheck_errno']}); "
                     "infrastructure problem, not a verdict on the bug"
                 )
+
+            # The supervisor itself must have met the shortage inside the window;
+            # otherwise a late discovery pass could pass this test vacuously.
+            assert result["degraded_observed"], (
+                "the supervisor never logged the fd-exhaustion WARNING during the "
+                f"fault window; driver errors: {result['error_msgs']}"
+            )
 
             # Behavior guard: the supervisor survived the fault window and the
             # pending gate surfaced — visible on the real server as a pending
