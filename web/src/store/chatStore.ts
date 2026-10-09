@@ -1516,12 +1516,13 @@ async function postAcrossReplicaHandoff<T>(stableId: string, post: () => Promise
       const answerLost = !(err instanceof ApiError) || (err.code === null && err.status >= 500);
       const runnerMoving = err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE;
       // A consumed event already proved delivery; the caller settles the send.
-      const delivered = inFlightSends.get(stableId) === true;
-      if (delivered || !(answerLost || runnerMoving) || Date.now() + 500 > deadline) throw err;
+      const delivered = () => inFlightSends.get(stableId) === true;
+      if (delivered() || !(answerLost || runnerMoving) || Date.now() + 500 > deadline) throw err;
       // oxlint-disable-next-line no-await-in-loop
       await new Promise<void>((resolve) => {
         setTimeout(resolve, 500);
       });
+      if (delivered()) throw err;
     }
   }
 }

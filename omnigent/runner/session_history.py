@@ -21,6 +21,11 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
 
+# Stored item types that become harness input; history ends on the newest of
+# these or on a compaction that replaces everything before it.
+_INPUT_ITEM_TYPES = frozenset({"message", "function_call", "function_call_output", "error"})
+_HISTORY_TAIL_TYPES = _INPUT_ITEM_TYPES | {"compaction"}
+
 
 class _LoadHistoryAsInputFn(Protocol):
     async def __call__(
@@ -37,8 +42,8 @@ class SessionHistory:
     extract_last_assistant_text: Callable[[str], str]
     handle_harness_compaction: Callable[[str, _JsonObject], Coroutine[Any, Any, None]]
     load_history_as_input: _LoadHistoryAsInputFn
-    load_history_with_prompt_id: Callable[
-        [str], Coroutine[Any, Any, tuple[list[_JsonObject], str | None]]
+    load_history_with_prompt_ids: Callable[
+        [str], Coroutine[Any, Any, tuple[list[_JsonObject], list[str]]]
     ]
     seed_last_server_item_id: Callable[[str], Coroutine[Any, Any, None]]
 
@@ -100,14 +105,14 @@ def build_session_history(
         session_id: str,
         drop_item_id: str | None = None,
     ) -> list[_JsonObject]:
-        history, _prompt_id = await _load_history_with_prompt_id(session_id, drop_item_id)
+        history, _prompt_ids = await _load_history_with_prompt_ids(session_id, drop_item_id)
         return history
 
-    async def _load_history_with_prompt_id(
+    async def _load_history_with_prompt_ids(
         session_id: str,
         drop_item_id: str | None = None,
-    ) -> tuple[list[_JsonObject], str | None]:
-        """Load history as harness input, with the id of a user message that ends it."""
+    ) -> tuple[list[_JsonObject], list[str]]:
+        """Load history as harness input, with the ids of the user messages that end it."""
         all_items: list[_JsonObject] = []
         after_cursor: str | None = None
         while True:
@@ -166,10 +171,17 @@ def build_session_history(
                     session_id=session_id,
                     server_client=server_client,
                 )
-        tail: _JsonObject = all_items[-1] if all_items else {}
-        prompt_id = tail.get("id")
-        ends_on_prompt = tail.get("type") == "message" and tail.get("role") == "user"
-        return converted, prompt_id if ends_on_prompt and isinstance(prompt_id, str) else None
+        prompt_ids: list[str] = []
+        for item in reversed(all_items):
+            # Records the converter drops, such as resource events, can follow a prompt.
+            if item.get("type") not in _HISTORY_TAIL_TYPES:
+                continue
+            item_id = item.get("id")
+            if item.get("type") != "message" or item.get("role") != "user":
+                break
+            if isinstance(item_id, str):
+                prompt_ids.append(item_id)
+        return converted, prompt_ids
 
     def _convert_raw_items_to_input(
         items: list[_JsonObject],
@@ -221,12 +233,7 @@ def build_session_history(
         _skipped_types: list[str] = []
         for item in remaining:
             item_type = item.get("type")
-            if item_type not in (
-                "message",
-                "function_call",
-                "function_call_output",
-                "error",
-            ):
+            if item_type not in _INPUT_ITEM_TYPES:
                 _skipped_types.append(str(item_type))
             if item_type == "message":
                 result.append(
@@ -453,6 +460,6 @@ def build_session_history(
         extract_last_assistant_text=_extract_last_assistant_text,
         handle_harness_compaction=_handle_harness_compaction,
         load_history_as_input=_load_history_as_input,
-        load_history_with_prompt_id=_load_history_with_prompt_id,
+        load_history_with_prompt_ids=_load_history_with_prompt_ids,
         seed_last_server_item_id=_seed_last_server_item_id,
     )

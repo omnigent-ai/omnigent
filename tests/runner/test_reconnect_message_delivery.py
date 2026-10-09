@@ -126,13 +126,17 @@ class _HeldReadsServer(_Server):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trailing_record", [False, True])
 @pytest.mark.parametrize("forward_reads_history", [False, True])
 async def test_forward_of_a_prompt_that_a_recovery_turn_replays_runs_it_once(
-    monkeypatch: pytest.MonkeyPatch, forward_reads_history: bool
+    monkeypatch: pytest.MonkeyPatch, forward_reads_history: bool, trailing_record: bool
 ) -> None:
     monkeypatch.delitem(_session_histories_ref, SESSION_ID, raising=False)
     server = _HeldReadsServer()
     server.items = [_user("saved")]
+    if trailing_record:
+        # Session init can record a terminal it created after the prompt was saved.
+        server.items.append({"id": "terminal-created", "type": "resource_event"})
     app, _, harness = _build_sdk_app(server)
     async with _runner_client(app) as client:
         init = asyncio.create_task(
@@ -156,6 +160,30 @@ async def test_forward_of_a_prompt_that_a_recovery_turn_replays_runs_it_once(
 
     assert response.status_code == 202
     assert response.json()["detail"] == "Message already accepted."
+    assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_turn_claims_every_prompt_it_replays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(_session_histories_ref, SESSION_ID, raising=False)
+    server = _Server()
+    server.items = [
+        _user("first"),
+        {**_user("skill"), "is_meta": True},
+        {"id": "terminal-created", "type": "resource_event"},
+    ]
+    app, _, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        init = await client.post(
+            "/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False)
+        )
+        assert init.status_code == 201
+        responses = [await _forward(client, item_id) for item_id in ("first", "skill")]
+        await _settle(app)
+
+    assert [response.status_code for response in responses] == [202, 202]
     assert len(harness.posted_bodies) == 1
 
 

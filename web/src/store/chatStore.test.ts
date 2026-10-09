@@ -5433,7 +5433,8 @@ describe("chatStore — delivered-but-unacked send", () => {
       await vi.advanceTimersByTimeAsync(1000);
       await sending;
 
-      expect(attempts().length).toBeLessThan(4);
+      // The acknowledgement landed during the wait, so no third POST went out.
+      expect(attempts()).toHaveLength(2);
       expect(onError).not.toHaveBeenCalled();
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
       expect(useChatStore.getState().failedSendDraft).toBeNull();

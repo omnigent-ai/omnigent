@@ -2994,7 +2994,7 @@ def create_runner_app(
             else None
         )
         history: list[_JsonObject]
-        prompt_id: str | None = None
+        prompt_ids: list[str] = []
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
@@ -3009,7 +3009,7 @@ def create_runner_app(
             # history because this runner may have missed work on another runner.
             history = []
         else:
-            history, prompt_id = await _load_history_with_prompt_id(session_id)
+            history, prompt_ids = await _load_history_with_prompt_ids(session_id)
         execution_seen = (
             initially_active
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
@@ -3034,8 +3034,8 @@ def create_runner_app(
             ):
                 recovery_turn = "history_resume"
                 _begin_turn_slot(session_id)
-                if prompt_id is not None:
-                    # The server may still forward this saved prompt; that copy must not rerun it.
+                # The server may still forward these saved prompts; those copies must not rerun.
+                for prompt_id in prompt_ids:
                     _remember_accepted_input(session_id, prompt_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -3774,7 +3774,7 @@ def create_runner_app(
     _extract_last_assistant_text = _session_history.extract_last_assistant_text
     _handle_harness_compaction = _session_history.handle_harness_compaction
     _load_history_as_input = _session_history.load_history_as_input
-    _load_history_with_prompt_id = _session_history.load_history_with_prompt_id
+    _load_history_with_prompt_ids = _session_history.load_history_with_prompt_ids
     _seed_last_server_item_id = _session_history.seed_last_server_item_id
 
     _sign_in_watch = build_sign_in_watch(
