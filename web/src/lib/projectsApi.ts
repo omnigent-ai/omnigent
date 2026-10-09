@@ -133,6 +133,21 @@ export async function updateProjectConfig(id: string, config: ProjectConfig): Pr
   return (await res.json()) as Project;
 }
 
+/** Update a project's name and stored defaults in one request. */
+export async function updateProjectSettings(
+  id: string,
+  name: string,
+  config: ProjectConfig,
+): Promise<Project> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, config }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
 /**
  * Delete a project. Only the container is removed; member sessions are kept
  * (never cascade-deleted). Their `project_id` is left dangling server-side, but

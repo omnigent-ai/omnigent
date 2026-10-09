@@ -10,6 +10,7 @@ import {
   listProjects,
   renameProject,
   updateProjectConfig,
+  updateProjectSettings,
 } from "./projectsApi";
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -106,6 +107,22 @@ describe("updateProjectConfig", () => {
     await updateProjectConfig("p_1", {});
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ config: {} });
+  });
+});
+
+describe("updateProjectSettings", () => {
+  it("PATCHes the name and config together", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "p a", name: "Renamed", config: { agent_id: "ag_1" } }),
+    );
+    await updateProjectSettings("p a", "Renamed", { agent_id: "ag_1" });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p%20a");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({
+      name: "Renamed",
+      config: { agent_id: "ag_1" },
+    });
   });
 });
 

@@ -10,12 +10,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectLandingIcon } from "./ProjectIconPicker";
-import { createProject, updateProjectConfig } from "@/lib/projectsApi";
+import { createProject, updateProjectSettings } from "@/lib/projectsApi";
 import type { ProjectConfig } from "@/lib/projectsApi";
 
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
-  updateProjectConfig: vi.fn(),
+  updateProjectSettings: vi.fn(),
   createProject: vi.fn(),
 }));
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
@@ -31,7 +31,7 @@ vi.mock("@emoji-mart/react", () => ({
 }));
 vi.mock("@emoji-mart/data", () => ({ default: {} }));
 
-const updateMock = vi.mocked(updateProjectConfig);
+const updateMock = vi.mocked(updateProjectSettings);
 const createMock = vi.mocked(createProject);
 
 interface Overrides {
@@ -80,7 +80,7 @@ describe("ProjectLandingIcon", () => {
 
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
     // The whole prior config survives; only `icon` is added.
-    expect(updateMock).toHaveBeenCalledWith("p_1", { ...config, icon: "🔥" });
+    expect(updateMock).toHaveBeenCalledWith("p_1", "Work", { ...config, icon: "🔥" });
   });
 
   it("removes the icon while preserving the other defaults", async () => {
@@ -89,7 +89,7 @@ describe("ProjectLandingIcon", () => {
     fireEvent.click(screen.getByTestId("project-icon-remove"));
 
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
-    expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1" });
+    expect(updateMock).toHaveBeenCalledWith("p_1", "Work", { host_id: "h1" });
   });
 
   it("does not write before the config has loaded (guards the data-loss race)", async () => {
@@ -109,10 +109,10 @@ describe("ProjectLandingIcon", () => {
     fireEvent.click(screen.getByTestId("project-icon-tile"));
     fireEvent.click(await screen.findByTestId("pick-fire"));
 
-    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
-    // The label-only folder is promoted (created) first, then the icon is set
-    // on the fresh first-class id.
-    expect(createMock).toHaveBeenCalledWith("Work");
-    expect(updateMock).toHaveBeenCalledWith("p_new", { icon: "🔥" });
+    await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
+    // Promotion creates the first-class project with its initial config in one
+    // request, avoiding a second PATCH against the freshly-created id.
+    expect(createMock).toHaveBeenCalledWith("Work", { icon: "🔥" });
+    expect(updateMock).not.toHaveBeenCalled();
   });
 });
