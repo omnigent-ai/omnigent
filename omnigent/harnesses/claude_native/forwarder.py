@@ -3484,19 +3484,28 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
+def _stop_failure_detail(record: ClaudeHookRecord, *, session_id: str) -> str | None:
     """
     Return the reason a ``StopFailure`` hook gives for its failed turn.
 
-    The hook carries the error text Claude Code rendered, which the transcript
-    mirror can deliver after the failed edge or not at all; without it the
-    server borrows the turn's last prose or reports no detail.
+    When ``error_details`` was absent a WARNING is emitted so the missing
+    field is observable in structured logs; the server can then fall back
+    to the committed API-error text from its own store.
 
     :param record: ``StopFailure`` hook record.
-    :returns: The error text, a category-only fallback, or ``None``.
+    :param session_id: Session id for structured warning logs on fallback.
+    :returns: The error detail, a category-only fallback, or ``None``.
     """
     if record.failure_message is not None:
         return record.failure_message
+    _logger.warning(
+        "StopFailure hook carried no error_details; using fallback detail; "
+        "session=%s event_cursor=%s category=%s",
+        session_id,
+        record.event_cursor,
+        record.failure_category,
+        extra={"session_id": session_id},
+    )
     if record.failure_category is not None:
         return f"Claude Code ended the turn with an API error ({record.failure_category})."
     return None
@@ -3544,7 +3553,7 @@ def _stop_failure_context(
     parent_claude_session_ids: Collection[str],
     diagnostic_health: Callable[[], FailureContext] | None = None,
 ) -> FailureContext:
-    """Preserve hook evidence separately from last-assistant display text."""
+    """Preserve hook evidence separately from the displayed error detail."""
     reason = _subagent_hook_reason(record, parent_claude_session_ids)
     context: dict[str, object] = {
         **(record.failure_context or {}),
@@ -3570,7 +3579,7 @@ def _stop_failure_context(
         "failure_decision": "suppressed" if reason else "session_failed",
         "suppression_reason": reason,
         "detail_source": (
-            "hook_last_assistant_message"
+            "hook_error_details"
             if record.failure_message is not None
             else "hook_error_category"
             if record.failure_category is not None
@@ -4231,7 +4240,9 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
-                failure_detail=_stop_failure_detail(record) if status == "failed" else None,
+                failure_detail=_stop_failure_detail(record, session_id=session_id)
+                if status == "failed"
+                else None,
                 failure_context=failure_context,
             )
         except httpx.HTTPError as exc:

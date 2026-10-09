@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import pytest
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
+    ClaudeHookRecord,
     record_hook_event,
 )
 from tests.harnesses.claude_native.forwarder._support import (
@@ -293,7 +295,11 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
     ("payload_fields", "expected_detail"),
     [
         (
-            {"error": "server_error", "last_assistant_message": "API Error: 500 Overloaded"},
+            {
+                "error": "server_error",
+                "error_details": "API Error: 500 Overloaded",
+                "last_assistant_message": "I am waiting for a background task.",
+            },
             "API Error: 500 Overloaded",
         ),
         (
@@ -305,7 +311,11 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
                 "error": "server_error",
                 "last_assistant_message": "I am waiting for a background task.",
             },
-            "I am waiting for a background task.",
+            "Claude Code ended the turn with an API error (server_error).",
+        ),
+        (
+            {},
+            None,
         ),
     ],
 )
@@ -313,10 +323,10 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
 async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
     tmp_path: Path,
     payload_fields: dict[str, str],
-    expected_detail: str,
+    expected_detail: str | None,
 ) -> None:
     """
-    The failed edge carries the hook's own error text, else its category.
+    The failed edge carries ``error_details`` when present, else its category.
 
     The transcript mirror can land the error after the edge or never, so
     without this the server reports the turn's last prose or no detail.
@@ -360,17 +370,44 @@ async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
 
     # ``failure_detail``, not ``output``: wire output is labeled a Codex error.
     context = request["body"]["data"].pop("failure_context")
-    assert context["native_error_category"] == payload_fields["error"]
+    assert context.get("native_error_category") == payload_fields.get("error")
     assert context["detail_source"] == (
-        "hook_last_assistant_message"
-        if "last_assistant_message" in payload_fields
+        "hook_error_details"
+        if "error_details" in payload_fields
         else "hook_error_category"
+        if "error" in payload_fields
+        else "missing"
     )
     assert "native_api_error_message" not in context
+    expected_data: dict[str, object] = {"status": "failed"}
+    if expected_detail is not None:
+        expected_data["failure_detail"] = expected_detail
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "failed", "failure_detail": expected_detail},
+        "data": expected_data,
     }
+
+
+@pytest.mark.parametrize("failure_category", ["rate_limit", None])
+def test_stop_failure_detail_warns_when_no_error_details(
+    caplog: pytest.LogCaptureFixture,
+    failure_category: str | None,
+) -> None:
+    """A missing ``error_details`` field emits a correlatable warning."""
+    record = ClaudeHookRecord(
+        event_cursor=5,
+        byte_offset=100,
+        event_name="StopFailure",
+        failure_category=failure_category,
+    )
+    with caplog.at_level(logging.WARNING, logger=forwarder.__name__):
+        detail = forwarder._stop_failure_detail(record, session_id="conv_test")
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].session_id == "conv_test"
+    assert "StopFailure" in warnings[0].getMessage()
+    assert "error_details" in warnings[0].getMessage()
+    assert (detail is not None) is (failure_category is not None)
 
 
 @pytest.mark.asyncio
