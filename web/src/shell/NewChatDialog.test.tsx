@@ -4821,6 +4821,22 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("names the offline host in the models submenu instead of a bare empty catalog", () => {
+    // The composer restores the last-picked host even after it went offline.
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    mockHosts([host("offline")]);
+    renderLanding();
+    openAgentModels("a1");
+
+    // The catalog query stays disabled for an offline host, so no request fails.
+    expect(
+      useHostModelOptionsMock.mock.calls.filter(([, h]) => h === "claude-native").at(-1),
+    ).toEqual(["host_1", "claude-native", false, { poll: true }]);
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(models).toHaveTextContent("Models unavailable while the host is offline.");
+    expect(within(models).queryAllByRole("menuitemcheckbox")).toHaveLength(0);
+  });
+
   it("keeps effort details in the aria-label when a model query fails", () => {
     localStorage.setItem(
       HARNESS_OPTIONS_KEY,

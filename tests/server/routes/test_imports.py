@@ -980,8 +980,8 @@ async def test_import_local_live_host_off_replica_is_wrong_replica(
     signal the client re-addresses on — the import failed permanently.
 
     Only a sharded (multi-replica) deployment has an "other replica" to
-    re-address to, so force the sharded signal on — the test host stack has no
-    lakebox module, which auto-detects as single-replica.
+    re-address to, so force the sharded signal on — the test stack leaves
+    ``OMNIGENT_HOST_SHARDED`` unset, which means single-replica.
     """
     from omnigent.server.routes import _host_launch
 
@@ -997,11 +997,16 @@ async def test_import_local_live_host_off_replica_is_wrong_replica(
     assert res.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
 
 
-async def test_import_local_live_host_single_replica_is_conflict(db_uri: str) -> None:
+async def test_import_local_live_host_single_replica_is_conflict(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """On a single-replica deployment a live-but-absent host is a 409, not a
     WRONG_REPLICA the client can never satisfy (no other replica to re-address
-    to). Auto-detection reports single-replica when no lakebox module is present,
-    which is the default in the test stack."""
+    to). Force the sharded signal off so an ambient ``OMNIGENT_HOST_SHARDED``
+    in the developer's shell cannot flip the expectation."""
+    from omnigent.server.routes import _host_launch
+
+    monkeypatch.setattr(_host_launch, "_deployment_is_sharded", lambda: False)
     host_id = "host_0123456789abcdef0123456789abcded"
     HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice@example.com")
     async with _host_import_client(db_uri, HostRegistry()) as client:

@@ -18,7 +18,9 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.routes._host_launch import (
+    HOST_SHARDED_ENV_VAR,
     LAUNCH_TIMEOUT_ENV_VAR,
+    _deployment_is_sharded,
     host_absent_error,
     resolve_host_launch,
     resolve_host_owner,
@@ -295,6 +297,57 @@ class TestHostAbsentError:
         host = _FakeHost(host_id="host_1", status="offline", updated_at=0)
         assert host_absent_error(host, sharded=True).code == ErrorCode.CONFLICT
         assert host_absent_error(host, sharded=False).code == ErrorCode.CONFLICT
+
+
+# ── _deployment_is_sharded (declared by the deployment, not probed) ─────
+
+
+@pytest.fixture(autouse=True)
+def _clear_sharded_cache() -> Iterator[None]:
+    """Drop the cached sharding flag so each case reads its own env value."""
+    _deployment_is_sharded.cache_clear()
+    yield
+    _deployment_is_sharded.cache_clear()
+
+
+class TestDeploymentIsSharded:
+    def test_unset_means_single_replica(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The OSS / single-process default: nothing declared, nothing sharded."""
+        monkeypatch.delenv(HOST_SHARDED_ENV_VAR, raising=False)
+        assert _deployment_is_sharded() is False
+
+    @pytest.mark.parametrize("raw", ["1", "true", "YES"])
+    def test_truthy_flag_declares_sharded(self, monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+        monkeypatch.setenv(HOST_SHARDED_ENV_VAR, raw)
+        assert _deployment_is_sharded() is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "no", "", "  "])
+    def test_falsy_flag_stays_single_replica(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        monkeypatch.setenv(HOST_SHARDED_ENV_VAR, raw)
+        assert _deployment_is_sharded() is False
+
+    def test_flag_is_cached_for_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(HOST_SHARDED_ENV_VAR, "1")
+        assert _deployment_is_sharded() is True
+        monkeypatch.setenv(HOST_SHARDED_ENV_VAR, "0")
+        assert _deployment_is_sharded() is True
+
+    def test_default_classification_follows_the_declared_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A live host missing from this replica re-addresses only on a deployment
+        that declares itself sharded; everywhere else it is a plain 409."""
+        host = _FakeHost(host_id="host_1", status="online", updated_at=now_epoch())
+        monkeypatch.delenv(HOST_SHARDED_ENV_VAR, raising=False)
+        assert host_absent_error(host).code == ErrorCode.CONFLICT
+
+        _deployment_is_sharded.cache_clear()
+        monkeypatch.setenv(HOST_SHARDED_ENV_VAR, "1")
+        err = host_absent_error(host)
+        assert err.code == ErrorCode.WRONG_REPLICA
+        assert err.http_status == 400
 
 
 # ── resolve_launch_timeout_s (operator-tunable launch budget) ─────────

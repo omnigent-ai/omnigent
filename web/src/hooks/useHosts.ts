@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
-import { ApiError } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -100,16 +100,9 @@ async function fetchHostModelOptions(
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
   );
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      const body = (await res.json()) as { detail?: unknown };
-      if (typeof body.detail === "string" && body.detail) detail = body.detail;
-    } catch {
-      // Non-JSON error body — keep the status-line detail.
-    }
-    throw new Error(detail);
-  }
+  // Host-scoped routes answer with either FastAPI's `{detail}` or the
+  // OmnigentError `{error: {code, message}}` envelope (409 "host is offline").
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
   const models = body.models ?? [];
   // Backward compatibility with servers that encoded probe failure in a 200.
@@ -211,16 +204,7 @@ export function useInstallHarness(hostId: string) {
         `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
       );
-      if (!res.ok) {
-        let detail = `${res.status} ${res.statusText}`;
-        try {
-          const err = (await res.json()) as { detail?: string };
-          if (typeof err.detail === "string" && err.detail) detail = err.detail;
-        } catch {
-          // Non-JSON error body — keep the status-line detail.
-        }
-        throw new Error(detail);
-      }
+      if (!res.ok) throw await apiErrorFromResponse(res);
       return (await res.json()) as InstallHarnessResult;
     },
     onSuccess: (result) => {
@@ -305,16 +289,7 @@ export function useStoreCredential(hostId: string) {
           body: JSON.stringify(body),
         },
       );
-      if (!res.ok) {
-        let detail = `${res.status} ${res.statusText}`;
-        try {
-          const err = (await res.json()) as { detail?: string };
-          if (typeof err.detail === "string" && err.detail) detail = err.detail;
-        } catch {
-          // Non-JSON error body — keep the status-line detail.
-        }
-        throw new Error(detail);
-      }
+      if (!res.ok) throw await apiErrorFromResponse(res);
       return (await res.json()) as StoreCredentialResult;
     },
     // This mutation-level onSuccess patches the ["hosts"] cache (badge flip) and
