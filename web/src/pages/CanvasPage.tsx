@@ -13,7 +13,7 @@
  *   `NewProjectButton`, so creating a project here is the same
  *   `POST /v1/projects` the sidebar performs.
  * - Pull requests come through the GitHub panel's query cache
- *   (`fetchGithubInfo`), throttled per session by `usePullRequests`.
+ *   (`fetchPullRequestInfo`), throttled per session by `usePullRequests`.
  * - Card positions live in localStorage (`canvasStorage.ts`), keyed by server
  *   identity and viewer; the server never learns the layout. Every card's spot
  *   is saved once the full list is known — grid slots included — so nothing
@@ -55,6 +55,7 @@ import {
   type CanvasPositions,
 } from "@/canvas/canvasLayout";
 import { useCanvasSessions } from "@/canvas/canvasSessions";
+import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
   EMPTY_CANVAS_LAYOUT,
   readActiveCanvas,
@@ -87,8 +88,6 @@ const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2.5;
 const RESIZE_REFIT_DELAY_MS = 100;
 const EMPTY_PROJECTS: ProjectSummary[] = [];
-/** Query parameter carrying the selected canvas so a reload lands on the same tab. */
-export const CANVAS_QUERY_PARAM = "canvas";
 
 const TAB_CLASS =
   "flex h-7 max-w-[200px] shrink-0 items-center gap-1.5 rounded-md px-2.5 text-ui text-muted-foreground transition-colors hover:bg-muted hover:text-foreground aria-selected:bg-brand-accent/10 aria-selected:text-foreground";
@@ -149,11 +148,11 @@ function CanvasControls({
   );
 }
 
-function CanvasSurface() {
+function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | null }) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { trackClick } = useOmnigentAnalytics();
-  const { fitView } = useReactFlow();
+  const { fitView, getViewport, setViewport } = useReactFlow();
   const viewerId = useViewerId();
   const { sessions, loaded, loadingMore, networkConfirmed, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
@@ -170,6 +169,7 @@ function CanvasSurface() {
   );
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const activeCanvasRef = useRef(activeCanvas);
+  const previousCanvasParam = useRef(searchParams.get(CANVAS_QUERY_PARAM));
   const activeCanvasViewerRef = useRef(viewerId);
   const userSelectedCanvasRef = useRef(false);
   // Loaded per viewer (the store is keyed by server and user) in the positions
@@ -178,9 +178,11 @@ function CanvasSurface() {
   const layoutViewerRef = useRef<string | null | undefined>(undefined);
   // Live positions for every session, including unsaved grid slots.
   const positionsRef = useRef<CanvasPositions>({});
-  // True once the user pans or zooms by hand; auto-fits then leave the view
-  // alone until the canvas changes.
+  // Preserve the view after the user pans, zooms, or opens a card.
+  // Fit and Reset explicitly release that preference.
   const viewportDirtyRef = useRef(false);
+  const viewportsRef = useRef(new Map<string, { viewport: Viewport; dirty: boolean }>());
+  const pendingViewportRef = useRef<Viewport | null>(null);
   // The card set the view was last fitted to; a different set refits.
   const fittedKeyRef = useRef<string | null>(null);
   const pendingProjectNameRef = useRef<string | null>(null);
@@ -233,12 +235,28 @@ function CanvasSurface() {
   const scheduleFit = useCallback(() => {
     viewportDirtyRef.current = false;
     fittedKeyRef.current = null;
+    pendingViewportRef.current = null;
   }, []);
+
+  const prepareCanvasViewport = useCallback(
+    (canvasId: string) => {
+      viewportsRef.current.set(activeCanvasRef.current, {
+        viewport: pendingViewportRef.current ?? getViewport(),
+        dirty: viewportDirtyRef.current,
+      });
+      const remembered = viewportsRef.current.get(canvasId);
+      pendingViewportRef.current = remembered?.dirty ? remembered.viewport : null;
+      viewportDirtyRef.current = remembered?.dirty ?? false;
+      fittedKeyRef.current = null;
+    },
+    [getViewport],
+  );
 
   const openSession = useCallback(
     (sessionId: string) => {
       trackClick("canvas.open-session");
-      navigate(`/c/${encodeURIComponent(sessionId)}`);
+      viewportDirtyRef.current = true;
+      navigate(canvasLocation(activeCanvasRef.current, sessionId));
     },
     [navigate, trackClick],
   );
@@ -264,8 +282,9 @@ function CanvasSurface() {
         },
         selectable: true,
         focusable: false,
+        ...(selectedSessionId !== undefined ? { selected: session.id === selectedSessionId } : {}),
       })),
-    [openSession],
+    [openSession, selectedSessionId],
   );
 
   // Unplaced cards get grid slots whenever the session or project set changes.
@@ -295,11 +314,28 @@ function CanvasSurface() {
     }
   }, [networkConfirmed, persist, projects, projectsQuery.data, sessions, viewerId]);
 
+  // Selection lives on the node objects, and the session list publishes a
+  // fresh array on every poll, focus refresh, and streamed update — so every
+  // rebuild must carry the clicked card's selection over or it flickers away.
+  const rebuildNodes = useCallback(
+    (items: readonly Conversation[], positions: CanvasPositions, requests: CanvasPullRequests) => {
+      setNodes((current) => {
+        const selectedIds = new Set(current.filter((node) => node.selected).map((node) => node.id));
+        return nodesFor(items, positions, requests).map((node) =>
+          selectedSessionId === undefined && selectedIds.has(node.id)
+            ? { ...node, selected: true }
+            : node,
+        );
+      });
+    },
+    [nodesFor, selectedSessionId],
+  );
+
   // Cards follow the active canvas; drags update the node state directly and
   // land in positionsRef on drop, so rebuilding here never loses a move.
   useEffect(() => {
-    setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
-  }, [nodesFor, visibleSessions, pullRequests]);
+    rebuildNodes(visibleSessions, positionsRef.current, pullRequests);
+  }, [rebuildNodes, visibleSessions, pullRequests]);
 
   // Keep every card in view until the user pans or zooms by hand: first paint,
   // tab switches, cards arriving while loading, and Reset layout. Keyed on the
@@ -308,11 +344,21 @@ function CanvasSurface() {
   useEffect(() => {
     // The first render carries an empty node list; wait for real cards.
     if (!loaded || nodes.length === 0) return;
-    const key = nodes.map((node) => node.id).join("\n");
+    if (
+      nodes.length !== visibleSessions.length ||
+      nodes.some((node, i) => node.id !== visibleSessions[i].id)
+    )
+      return;
+    const key = `${activeCanvas}:${nodes.map((node) => node.id).join("\n")}`;
     if (key === fittedKeyRef.current) return;
     fittedKeyRef.current = key;
+    if (pendingViewportRef.current) {
+      void setViewport(pendingViewportRef.current);
+      pendingViewportRef.current = null;
+      return;
+    }
     if (!viewportDirtyRef.current) fitCanvas();
-  }, [fitCanvas, loaded, nodes]);
+  }, [activeCanvas, fitCanvas, loaded, nodes, setViewport, visibleSessions]);
 
   // Mirror the selected canvas into the URL; Main keeps the URL clean.
   const writeCanvasParam = useCallback(
@@ -342,10 +388,14 @@ function CanvasSurface() {
     scheduleFit();
   }, [scheduleFit, searchParams, viewerId]);
 
-  // Keep a restored project in the URL and remember explicit deep links once
-  // the project list confirms they are valid.
+  // Remember valid deep links and restore saved projects on bare visits.
+  // Run before the history effect updates previousCanvasParam, so Back to Main wins.
   useEffect(() => {
-    if (!searchParams.has(CANVAS_QUERY_PARAM) && activeCanvas !== MAIN_CANVAS_ID) {
+    if (
+      !searchParams.has(CANVAS_QUERY_PARAM) &&
+      previousCanvasParam.current === null &&
+      activeCanvas !== MAIN_CANVAS_ID
+    ) {
       writeCanvasParam(activeCanvas);
     }
     if (
@@ -364,18 +414,34 @@ function CanvasSurface() {
       if (activeCanvasRef.current === canvasId) return;
       trackClick("canvas.tab");
       userSelectedCanvasRef.current = true;
+      prepareCanvasViewport(canvasId);
       activeCanvasRef.current = canvasId;
       setActiveCanvas(canvasId);
       writeCanvasParam(canvasId);
-      scheduleFit();
     },
-    [scheduleFit, trackClick, writeCanvasParam],
+    [prepareCanvasViewport, trackClick, writeCanvasParam],
   );
+
+  // Back/Forward can select a different board without unmounting this surface.
+  useEffect(() => {
+    const value = searchParams.get(CANVAS_QUERY_PARAM);
+    if (value === previousCanvasParam.current) return;
+    previousCanvasParam.current = value;
+    const canvasId = value ?? MAIN_CANVAS_ID;
+    if (canvasId === activeCanvasRef.current) return;
+    prepareCanvasViewport(canvasId);
+    activeCanvasRef.current = canvasId;
+    setActiveCanvas(canvasId);
+  }, [prepareCanvasViewport, searchParams]);
 
   // A project canvas whose project was deleted (or a stale URL) falls back to Main.
   useEffect(() => {
-    if (activeCanvas === MAIN_CANVAS_ID || projectsQuery.data === undefined) return;
-    if (projects.some((project) => projectCanvasId(project) === activeCanvas)) return;
+    if (projectsQuery.data === undefined) return;
+    const available = new Set([MAIN_CANVAS_ID, ...projects.map(projectCanvasId)]);
+    for (const canvasId of viewportsRef.current.keys()) {
+      if (!available.has(canvasId)) viewportsRef.current.delete(canvasId);
+    }
+    if (available.has(activeCanvas)) return;
     activeCanvasRef.current = MAIN_CANVAS_ID;
     setActiveCanvas(MAIN_CANVAS_ID);
     writeCanvasParam(MAIN_CANVAS_ID);
@@ -392,21 +458,31 @@ function CanvasSurface() {
     selectCanvas(projectCanvasId(project));
   }, [projects, selectCanvas]);
 
-  // Follow the window: while the view is an auto-fit, keep it fitted as the
-  // container resizes. A hand-panned view is left alone.
+  // Preserve the logical center when the split changes size. Hidden panes
+  // retain their last visible dimensions for focus and narrow-screen returns.
   useEffect(() => {
     const container = flowContainerRef.current;
     if (!container || typeof ResizeObserver === "undefined") return;
-    let first = true;
+    let previous = container.getBoundingClientRect();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const observer = new ResizeObserver(() => {
-      if (first) {
-        first = false;
-        return;
-      }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        if (loaded && !viewportDirtyRef.current) fitCanvas();
+        const next = container.getBoundingClientRect();
+        if (!next.width || !next.height) return;
+        if (loaded && viewportDirtyRef.current && previous.width && previous.height) {
+          const viewport = pendingViewportRef.current ?? getViewport();
+          const centered = {
+            ...viewport,
+            x: viewport.x + (next.width - previous.width) / 2,
+            y: viewport.y + (next.height - previous.height) / 2,
+          };
+          if (pendingViewportRef.current) pendingViewportRef.current = centered;
+          else void setViewport(centered);
+        } else if (loaded && !viewportDirtyRef.current) {
+          fitCanvas();
+        }
+        previous = next;
       }, RESIZE_REFIT_DELAY_MS);
     });
     observer.observe(container);
@@ -414,11 +490,20 @@ function CanvasSurface() {
       if (timer) clearTimeout(timer);
       observer.disconnect();
     };
-  }, [fitCanvas, loaded]);
+  }, [fitCanvas, getViewport, loaded, setViewport]);
 
-  const onNodesChange = useCallback((changes: NodeChange<SessionCardNode>[]) => {
-    setNodes((current) => applyNodeChanges(changes, current));
-  }, []);
+  const onNodesChange = useCallback(
+    (changes: NodeChange<SessionCardNode>[]) => {
+      // In the split view the open session owns selection, even when panning
+      // the board or dragging a different card.
+      const applicable =
+        selectedSessionId === undefined
+          ? changes
+          : changes.filter((change) => change.type !== "select");
+      setNodes((current) => applyNodeChanges(applicable, current));
+    },
+    [selectedSessionId],
+  );
 
   const onNodeDragStop = useCallback(
     (_event: MouseEvent | TouchEvent, node: SessionCardNode) => {
@@ -447,18 +532,15 @@ function CanvasSurface() {
     ) as CanvasPositions;
     positionsRef.current = { ...kept, ...mergeSessionPositions(visibleSessions, {}) };
     scheduleFit();
-    setNodes(nodesFor(visibleSessions, positionsRef.current, pullRequests));
+    rebuildNodes(visibleSessions, positionsRef.current, pullRequests);
     persist(withPositions(layoutRef.current, positionsRef.current));
-  }, [nodesFor, persist, pullRequests, scheduleFit, trackClick, visibleSessions]);
+  }, [persist, pullRequests, rebuildNodes, scheduleFit, trackClick, visibleSessions]);
 
   const newSession = () => {
     trackClick("canvas.new-session");
-    // The composer takes the project by name (`?project=`).
-    navigate(
-      activeProject
-        ? { pathname: "/", search: `?project=${encodeURIComponent(activeProject.name)}` }
-        : "/",
-    );
+    const params = new URLSearchParams({ [CANVAS_QUERY_PARAM]: activeCanvas });
+    if (activeProject) params.set("project", activeProject.name);
+    navigate({ pathname: "/", search: `?${params.toString()}` });
   };
 
   if (!loaded) {
@@ -574,7 +656,7 @@ function CanvasSurface() {
           nodeTypes={nodeTypes}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
-          onNodeDoubleClick={(_event, node) => openSession(node.id)}
+          onNodeClick={(_event, node) => openSession(node.id)}
           onMoveEnd={onMoveEnd}
           nodesDraggable
           nodesConnectable={false}
@@ -619,10 +701,10 @@ function CanvasSurface() {
   );
 }
 
-export function CanvasPage() {
+export function CanvasPage({ selectedSessionId }: { selectedSessionId?: string | null }) {
   return (
     <ReactFlowProvider>
-      <CanvasSurface />
+      <CanvasSurface selectedSessionId={selectedSessionId} />
     </ReactFlowProvider>
   );
 }

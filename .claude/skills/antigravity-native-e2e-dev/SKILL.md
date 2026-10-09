@@ -239,14 +239,14 @@ Key facts:
 
 ```bash
 .venv/bin/python -m pytest \
-  tests/test_antigravity_native.py \
-  tests/test_antigravity_native_bridge.py \
-  tests/test_antigravity_native_launch.py \
-  tests/test_antigravity_native_rpc.py \
-  tests/test_antigravity_native_reader.py \
-  tests/test_antigravity_native_steps.py \
-  tests/test_antigravity_native_interactions.py \
-  tests/test_antigravity_native_audit.py \
+  tests/harnesses/antigravity_native/test_antigravity_native.py \
+  tests/harnesses/antigravity_native/test_antigravity_native_bridge.py \
+  tests/harnesses/antigravity_native/test_antigravity_native_launch.py \
+  tests/harnesses/antigravity_native/test_antigravity_native_rpc.py \
+  tests/harnesses/antigravity_native/test_antigravity_native_reader.py \
+  tests/harnesses/antigravity_native/test_antigravity_native_steps.py \
+  tests/harnesses/antigravity_native/test_antigravity_native_interactions.py \
+  tests/harnesses/antigravity_native/test_antigravity_native_audit.py \
   tests/inner/test_antigravity_native_executor.py -q
 ```
 

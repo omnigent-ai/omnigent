@@ -53,6 +53,28 @@ def test_parse_minimal(agent_dir: Path) -> None:
     assert spec.mcp_servers == []
     assert spec.local_tools == []
     assert spec.sub_agents == []
+    assert spec.model_egress is None
+
+
+def test_parse_model_egress_as_distinct_typed_grant(tmp_path: Path) -> None:
+    rule = "POST workspace.databricks.com/ai-gateway/codex/v1/responses"
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"spec_version": 1, "model_egress": [rule]})
+    )
+
+    spec = parse(tmp_path)
+
+    assert spec.model_egress == [rule]
+
+
+@pytest.mark.parametrize("value", [[], "POST workspace.databricks.com/**", [123]])
+def test_parse_model_egress_rejects_invalid_grants(tmp_path: Path, value: object) -> None:
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"spec_version": 1, "model_egress": value})
+    )
+
+    with pytest.raises(OmnigentError, match="model_egress"):
+        parse(tmp_path)
 
 
 def test_parse_missing_config_yaml(tmp_path: Path) -> None:
@@ -758,6 +780,68 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.skill_dir == skill_dir
     # Absent ``user-invocable`` frontmatter defaults to invocable.
     assert skill.user_invocable is True
+    # A frontmatter name equal to the directory carries no separate label.
+    assert skill.display_name is None
+
+
+def test_parse_skill_name_comes_from_directory(agent_dir: Path) -> None:
+    """The directory is the invocation name; the frontmatter name is a free-form label."""
+    skill_dir = agent_dir / "skills" / "asd-ste100"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Simplified Technical English (ASD-STE100)\n"
+        "description: Write in Simplified Technical English.\n"
+        "---\n"
+        "Body."
+    )
+    skill = parse(agent_dir).skills[0]
+    assert skill.name == "asd-ste100"
+    assert skill.display_name == "Simplified Technical English (ASD-STE100)"
+
+
+def _write_loadable_config(agent_dir: Path) -> None:
+    """Give *agent_dir* the executor that validated ``load()`` requires."""
+    config = {
+        "spec_version": 1,
+        "name": "test-agent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+
+
+def test_load_keeps_frontmatter_name_when_skill_directory_is_invalid(agent_dir: Path) -> None:
+    """A bundle that validated on its frontmatter name still loads under that name."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    for directory, name in (("Code_Review", "code-review"), ("review", "code-review")):
+        skill_dir = agent_dir / "skills" / directory
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Review code.\n---\nBody."
+        )
+
+    skills = load(agent_dir).skills
+    assert [(s.name, s.display_name) for s in skills] == [
+        ("code-review", None),
+        ("review", "code-review"),
+    ]
+
+
+def test_load_rejects_skill_without_any_valid_name(agent_dir: Path) -> None:
+    """The legacy fallback only applies when the frontmatter name is itself valid."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    skill_dir = agent_dir / "skills" / "Code_Review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: Code Review\ndescription: x\n---\nBody.")
+
+    with pytest.raises(OmnigentError, match="skill directory name must match"):
+        load(agent_dir)
 
 
 def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:

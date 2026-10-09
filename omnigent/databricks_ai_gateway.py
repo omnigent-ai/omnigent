@@ -1,4 +1,4 @@
-"""Canonical predicate for recognizing a Databricks AI Gateway base URL.
+"""Canonical predicate for recognizing a Databricks Unity Gateway base URL.
 
 Several surfaces need the same answer — pi-native rewrites a gateway Codex
 base URL to the Anthropic surface, and host-side routing capability checks ask
@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Final
 from urllib.parse import urlparse
 
-# Trusted parent domains for a Databricks-owned host. The AI Gateway lives
+# Trusted parent domains for a Databricks-owned host. The Unity Gateway lives
 # under a per-workspace subdomain of one of these (the canonical form is
 # ``<workspace>.ai-gateway.cloud.databricks.com``); the Azure / GCP control
 # planes serve workspaces under their own parent domains. Written with the
@@ -25,7 +25,7 @@ DATABRICKS_TRUSTED_HOST_SUFFIXES: Final[tuple[str, ...]] = (
     ".gcp.databricks.com",  # GCP Databricks
 )
 
-# A genuine AI Gateway host carries the ``ai-gateway`` DNS label; we require it
+# A genuine Unity Gateway host carries the ``ai-gateway`` DNS label; we require it
 # (alongside a trusted suffix) so a non-gateway Databricks host isn't routed as
 # the gateway's Anthropic surface.
 DATABRICKS_AI_GATEWAY_LABEL: Final[str] = "ai-gateway"
@@ -51,11 +51,11 @@ def _under_trusted_domain(hostname: str) -> bool:
 
 
 def is_databricks_ai_gateway_url(base_url: str) -> bool:
-    """Return ``True`` only for a genuine Databricks AI Gateway base URL.
+    """Return ``True`` only for a genuine Databricks Unity Gateway base URL.
 
     Two URL shapes are accepted:
 
-    1. **Dedicated AI Gateway subdomain** — ``ai-gateway`` is a full DNS label
+    1. **Dedicated Unity Gateway subdomain** — ``ai-gateway`` is a full DNS label
        in the hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``). Used by
        the standard ``isaac configure codex`` setup.
     2. **Workspace-hosted gateway** — the hostname is a plain Databricks
@@ -69,7 +69,7 @@ def is_databricks_ai_gateway_url(base_url: str) -> bool:
 
     :param base_url: An inference base URL, e.g. the codex provider table's
         ``base_url``.
-    :returns: ``True`` iff the URL is an https Databricks AI Gateway endpoint.
+    :returns: ``True`` iff the URL is an https Databricks Unity Gateway endpoint.
     """
     parsed = urlparse(base_url)
     if parsed.scheme != "https":

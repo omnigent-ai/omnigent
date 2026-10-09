@@ -26,14 +26,11 @@ environments.
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import os
 import re
 import shutil
 import subprocess
-import tarfile
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -44,6 +41,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.native_session import create_native_session
+from tests._helpers.session import bind_session_runner
 from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     _server_state,
@@ -77,48 +76,17 @@ def _create_claude_session_in_workspace(base_url: str, runner_id: str, workspace
     :param workspace: The plain non-git directory to launch Claude Code in.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes the spec (no spec_version) through
-        # the omnigent compat translator, matching the conftest fixture.
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    metadata = {
-        "labels": {
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="claude",
+        metadata={
+            "workspace": str(workspace),
+            "terminal_launch_args": ["--permission-mode", "acceptEdits"],
         },
-        "workspace": str(workspace),
-        "terminal_launch_args": ["--permission-mode", "acceptEdits"],
-    }
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("claude-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
     )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
-    patch = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    session_id = str(created["session_id"])
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 
@@ -181,22 +149,15 @@ def test_native_claude_write_lands_in_changes(
         reset_mock_llm(mock_llm_server_url)
         go_token = f"native-write-go-{uuid.uuid4().hex[:6]}"
         write_args = json.dumps({"file_path": str(target), "content": _FILE_CONTENT})
-        # Scripted Write turn for the composer message (matched by go_token);
-        # the extra copy absorbs a background request draining the queue.
         configure_mock_llm(
             mock_llm_server_url,
-            [{"tool_calls": [{"name": "Write", "arguments": write_args}]}] * 2,
+            [
+                {"tool_calls": [{"name": "Write", "arguments": write_args}]},
+                {"text": "created the file"},
+            ],
             key="native-write",
             match=go_token,
-        )
-        # Post-tool requests carry the Write tool_result, which names the
-        # file; that longer match token outranks go_token, so the turn closes
-        # with plain text instead of a second Write.
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": "created the file"}] * 3,
-            key="native-write-done",
-            match=_FILE_NAME,
+            required_tools=["Write"],
         )
         prompt = f"create the report file now {go_token}"
     else:
@@ -246,6 +207,14 @@ def test_native_claude_write_lands_in_changes(
         f"Claude Code's native Write never created {target} — the journey did "
         "not reach the state the changes assertions need."
     )
+
+    if use_mock:
+        expect(
+            page.locator(
+                '[data-testid="message-bubble"][data-role="assistant"]',
+                has_text="created the file",
+            ).last
+        ).to_be_visible(timeout=30_000)
 
     # The file exists on disk, so the session's changed-files view must list
     # it. Open the rail only now, so the panel's first fetch is post-write.
