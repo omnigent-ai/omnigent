@@ -4280,6 +4280,8 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
       sessionHarness: "codex-native",
       sideChatToOpen: null,
       sideChatDrafts: {},
+      sideChatComposers: {},
+      sideChatSelectionTarget: null,
     });
   });
 
@@ -4301,6 +4303,38 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     expect(sideChatDrafts[sideChatToOpen!.childId]).toBe("restore the row on failure");
     expect(textarea()).toHaveValue("");
     expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+  });
+
+  it.each(["pending:visible", "conv_side"])(
+    "adds selections to visible side chat %s",
+    (childId) => {
+      useChatStore.setState({
+        sideChatSelectionTarget: { childId, parentId: "conv_test" },
+        sideChatComposers: { [childId]: { text: "my question", files: [] } },
+      });
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      render(<Composer {...composerProps()} ref={ref} />);
+
+      act(() => ref.current?.startSideChat("first selection"));
+      act(() => ref.current?.startSideChat("second selection"));
+
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
+        text: "my question",
+        files: [],
+        quotes: ["first selection", "second selection"],
+      });
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
+  it("does not add selections to another parent's side chat", () => {
+    useChatStore.setState({ sideChatSelectionTarget: { childId: "conv_side", parentId: "other" } });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.startSideChat("selection"));
+    expect(useChatStore.getState().sideChatToOpen?.childId).toMatch(/^pending:/);
+    expect(useChatStore.getState().sideChatComposers.conv_side).toBeUndefined();
   });
 
   it.each([
