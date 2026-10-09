@@ -846,11 +846,16 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
     return None
 
 
+@dataclass
+class _RecoveryScanLog:
+    """Per-discovery throttling for recovery-scan warnings that would repeat every round."""
+
+    resolver_consulted: bool = False
+    foreign_reported: set[str] = field(default_factory=set)
+
+
 def _recover_placeholder_cascade(
-    bridge_dir: Path,
-    *,
-    warn_fallback: bool = True,
-    reported_foreign: set[str] | None = None,
+    bridge_dir: Path, *, scan_log: _RecoveryScanLog | None = None
 ) -> str | None:
     """
     Adopt agy's TUI-minted cascade while bridge state still holds the placeholder.
@@ -862,12 +867,12 @@ def _recover_placeholder_cascade(
     session's own Gemini dir (a foreign agy writes to its own).
 
     :param bridge_dir: Native Antigravity bridge directory.
-    :param warn_fallback: Passed to the port resolver; ``False`` after the first
-        round so a restricted-``/proc`` fallback is reported once per discovery.
-    :param reported_foreign: Candidates already reported as not locally owned;
-        a repeat refusal of the same cascade logs at DEBUG and the set is updated.
+    :param scan_log: Throttling state shared by one discovery run: the resolver's
+        restricted-``/proc`` fallback and a refused foreign cascade are reported at
+        WARNING once and at DEBUG afterwards. A fresh log when ``None``.
     :returns: The adopted cascade id (persisted), or ``None`` this round.
     """
+    log = scan_log if scan_log is not None else _RecoveryScanLog()
     state = read_bridge_state(bridge_dir)
     if state is None or not is_placeholder_conversation_id(state.conversation_id):
         return None
@@ -880,8 +885,9 @@ def _recover_placeholder_cascade(
         # cannot have delivered a web turn from here); skip this round.
         return None
     port = resolve_cold_start_agy_rpc_port(
-        socket_path, info["tmux_target"], warn_fallback=warn_fallback
+        socket_path, info["tmux_target"], warn_fallback=not log.resolver_consulted
     )
+    log.resolver_consulted = True
     if port is None:
         return None
     try:
@@ -901,16 +907,14 @@ def _recover_placeholder_cascade(
     if cascade_id is None:
         return None
     if not agy_conversation_db(bridge_dir, cascade_id).is_file():
-        repeated = reported_foreign is not None and cascade_id in reported_foreign
         _logger.log(
-            logging.DEBUG if repeated else logging.WARNING,
+            logging.DEBUG if cascade_id in log.foreign_reported else logging.WARNING,
             "agy placeholder recovery: typed cascade %s on port %s is NOT in this "
             "session's Gemini dir (a foreign agy answered the scan); refusing to adopt.",
             cascade_id,
             port,
         )
-        if reported_foreign is not None:
-            reported_foreign.add(cascade_id)
+        log.foreign_reported.add(cascade_id)
         return None
     # The scan above took seconds; a cold-start may have bound a real id meanwhile.
     if not update_conversation_id(bridge_dir, cascade_id, expect_placeholder=True):
@@ -963,20 +967,15 @@ async def _discover(
     :returns: ``(cascade_id, port)`` once both resolve, or ``None`` if ``stop``
         fired before discovery completed.
     """
-    recovery_rounds = 0
-    reported_foreign: set[str] = set()
+    scan_log = _RecoveryScanLog()
     next_recovery_at = 0.0
     while True:
         cascade_id = await asyncio.to_thread(_resolve_cascade_id, bridge_dir)
         if cascade_id is None and time.monotonic() >= next_recovery_at:
             next_recovery_at = time.monotonic() + _PLACEHOLDER_RECOVERY_INTERVAL_S
             cascade_id = await asyncio.to_thread(
-                _recover_placeholder_cascade,
-                bridge_dir,
-                warn_fallback=recovery_rounds == 0,
-                reported_foreign=reported_foreign,
+                _recover_placeholder_cascade, bridge_dir, scan_log=scan_log
             )
-            recovery_rounds += 1
             if cascade_id is not None and on_adopted is not None:
                 await on_adopted(cascade_id)
         if cascade_id is not None:

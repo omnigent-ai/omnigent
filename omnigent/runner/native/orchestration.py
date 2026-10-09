@@ -6938,7 +6938,8 @@ async def _cold_start_agy_conversation(
             return state.conversation_id
         _logger.warning(
             "Antigravity cold-start: could not persist cold-started conversation id %s for "
-            "session %s (no bridge state to update); the reader will stay on the placeholder id.",
+            "session %s (no bridge state to update, or the binding changed concurrently); "
+            "the reader will stay on the placeholder id.",
             cascade_id,
             session_id,
         )
