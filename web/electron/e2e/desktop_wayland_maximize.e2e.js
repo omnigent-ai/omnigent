@@ -56,12 +56,17 @@ async function waitForRawVideo(recordDir, expectedPages, timeout = 15_000) {
       .filter((f) => f.startsWith("page@") && f.endsWith(".webm"))
       .map((f) => fs.statSync(path.join(recordDir, f)).size);
   const deadline = Date.now() + timeout;
+  // Clips still growing at the deadline get a bounded grace period.
+  const hardDeadline = deadline + 30_000;
   let last = -1;
   /* oxlint-disable no-await-in-loop */
-  while (Date.now() < deadline) {
+  for (;;) {
     const sizes = rawClipSizes();
     const total = sizes.reduce((sum, size) => sum + size, 0);
-    if (sizes.length >= expectedPages && total > 0 && total === last) return;
+    const stable = total === last;
+    if (sizes.length >= expectedPages && total > 0 && stable) return;
+    const now = Date.now();
+    if (now >= hardDeadline || (now >= deadline && stable)) return;
     last = total;
     await sleep(400);
   }
@@ -91,6 +96,10 @@ async function startCompositor() {
   proc.on("error", (err) => {
     spawnError = err;
   });
+  const exitedWith = () =>
+    proc.exitCode !== null || proc.signalCode !== null
+      ? `compositor exited (${proc.exitCode ?? proc.signalCode})`
+      : null;
 
   let buffer = "";
   proc.stdout.setEncoding("utf8");
@@ -128,10 +137,13 @@ async function startCompositor() {
   try {
     await pollUntil(
       () => {
-        if (spawnError) throw spawnError;
-        if (proc.exitCode !== null || proc.signalCode !== null) {
-          throw new Error(`compositor exited before ready (${proc.exitCode ?? proc.signalCode})`);
+        if (spawnError) {
+          throw new Error(`compositor failed to start: ${spawnError.message}`, {
+            cause: spawnError,
+          });
         }
+        const reason = exitedWith();
+        if (reason) throw new Error(`${reason} before ready`);
         return fs.existsSync(path.join(controlDir, "ready"));
       },
       { timeout: 15_000, label: "compositor ready" },
@@ -150,7 +162,11 @@ async function startCompositor() {
     fs.writeFileSync(`${file}.tmp`, "");
     fs.renameSync(`${file}.tmp`, file);
     const done = await pollUntil(
-      () => (fs.existsSync(file + ".done") ? fs.readFileSync(file + ".done", "utf8") : null),
+      () => {
+        const reason = exitedWith();
+        if (reason) throw new Error(`${reason} during ${name}`);
+        return fs.existsSync(file + ".done") ? fs.readFileSync(file + ".done", "utf8") : null;
+      },
       { timeout: 10_000, label: `compositor ${name}` },
     );
     return JSON.parse(done);
@@ -221,9 +237,13 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     for (const page of electronApp.windows()) pagesSeen.add(page);
     electronApp.on("window", (page) => pagesSeen.add(page));
 
-    electronApp.process().on("exit", (code, signal) => {
+    const shellProc = electronApp.process();
+    shellProc.on("exit", (code, signal) => {
       exitInfo = { code, signal };
     });
+    if (shellProc.exitCode !== null || shellProc.signalCode !== null) {
+      exitInfo = { code: shellProc.exitCode, signal: shellProc.signalCode };
+    }
 
     // Wait for the main window and the eagerly-created overlay child window to
     // both exist and be visible.
@@ -332,6 +352,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     await stopDisplayCapture().catch(() => {});
     if (compositor) await compositor.stop().catch(() => {});
     if (server) await server.close().catch(() => {});
+    fs.rmSync(tmpDir, { recursive: true, force: true });
     await waitForRawVideo(RECORD_DIR, pagesSeen.size).catch(() => {});
     saveRecording(RECORD_DIR, "wayland-maximize");
   }
