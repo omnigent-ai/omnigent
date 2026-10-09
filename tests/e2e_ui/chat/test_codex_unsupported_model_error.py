@@ -38,14 +38,12 @@ _WORKING = '[data-testid="working-indicator"]'
 
 @pytest.fixture
 def browser_context_args(browser_context_args: dict[str, Any]) -> dict[str, Any]:
-    """Record at the full viewport so the error text stays legible in footage."""
     if "record_video_dir" not in browser_context_args:
         return browser_context_args
     return {**browser_context_args, "record_video_size": {"width": 1280, "height": 720}}
 
 
 def _build_codex_bundle(name: str, model: str) -> bytes:
-    """Build a one-file ``codex`` (app-server) agent bundle pinned to *model*."""
     config = {
         "name": name,
         "prompt": "You are a terse assistant. Answer in as few words as possible.",
@@ -61,7 +59,6 @@ def _build_codex_bundle(name: str, model: str) -> bytes:
 
 
 def _create_codex_session(base_url: str, runner_id: str, model: str) -> str:
-    """Create a runner-bound session for a fresh ``codex`` agent pinned to *model*."""
     name = f"codex-unsupported-{uuid.uuid4().hex[:8]}"
     # A preset title keeps background title inference off the scripted queue.
     create_resp = httpx.post(
@@ -90,7 +87,7 @@ def _send(page: Page, text: str) -> None:
 
 @pytest.mark.timeout(600)
 def test_codex_unsupported_model_rejection_shows_reason_not_raw_json(
-    page: Page,
+    request: pytest.FixtureRequest,
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
@@ -110,6 +107,9 @@ def test_codex_unsupported_model_rejection_shows_reason_not_raw_json(
 
         session_id = _create_codex_session(live_server, runner_id, _UNSUPPORTED_MODEL)
         try:
+            # Create the recorded page only after non-browser setup so the clip
+            # films the journey, not fixture work.
+            page = request.getfixturevalue("page")
             page.goto(f"{live_server}/c/{session_id}")
             _send(page, f"Say hi. {token}")
 

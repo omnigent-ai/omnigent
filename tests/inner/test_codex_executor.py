@@ -2956,6 +2956,26 @@ def test_format_codex_error_params_handles_missing_params() -> None:
     assert "no params" in _format_codex_error_params("not a dict")
 
 
+def test_format_codex_error_params_unwraps_top_level_provider_envelope() -> None:
+    """A provider HTTP error relayed as a stringified JSON envelope in the
+    top-level ``message`` must surface its human-readable reason, not the raw
+    ``{...}`` blob the user cannot act on."""
+    import json
+
+    from omnigent.inner.codex_executor import _format_codex_error_params
+
+    reason = "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."
+    params = {
+        "message": json.dumps({"error": {"message": reason, "type": "invalid_request_error"}}),
+        "code": "invalid_request_error",
+    }
+    result = _format_codex_error_params(params)
+    assert reason in result
+    assert not result.lstrip().startswith("{"), (
+        f"the provider JSON envelope was surfaced verbatim: {result!r}"
+    )
+
+
 def test_unwrap_provider_error_json_extracts_responses_api_envelope() -> None:
     """Unwrap a Responses-API envelope: the reason under ``error.message`` plus its code."""
     from omnigent.inner.codex_executor import _unwrap_provider_error_json
@@ -2981,7 +3001,7 @@ def test_unwrap_provider_error_json_leaves_plain_text_unchanged() -> None:
     assert _unwrap_provider_error_json('{"error": {"type": "x"}}') == ('{"error": {"type": "x"}}')
 
 
-def test_format_codex_error_params_unwraps_top_level_provider_envelope() -> None:
+def test_format_codex_error_params_unwraps_responses_api_envelope_message() -> None:
     """An error frame can carry the provider's stringified envelope as its top-level
     ``message`` (not under ``params["error"]``); the formatter must unwrap that too."""
     from omnigent.inner.codex_executor import _format_codex_error_params
