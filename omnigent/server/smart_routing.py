@@ -761,17 +761,34 @@ def _router_error_detail(body: str) -> str:
 _SELF_CALL_404 = "self-call returned status 404:"
 
 
-def _top_level_message(body: str) -> str:
-    """A JSON body's own ``message`` field; a non-JSON body is its own message."""
-    text = body or ""
+def _gateway_message(body: str) -> str:
+    """The gateway's own human message for *body*, unwrapping the same
+    ``message`` / nested ``error.message`` / doubly-encoded layers as
+    :func:`_router_error_detail`.
+
+    A non-JSON body is its own message; any other JSON shape (a list, or a
+    dict carrying no string message) has none, so a body merely quoting a
+    status in some other field does not read as the gateway's own report.
+    """
+    text = (body or "").strip()
     try:
         parsed = json.loads(text)
     except (ValueError, TypeError):
         return text
-    if isinstance(parsed, dict):
+    for _ in range(4):  # unwrap the gateway's nested message/error layers
+        if not isinstance(parsed, dict):
+            return ""
         message = parsed.get("message")
-        return message if isinstance(message, str) else ""
-    return text
+        if message is None:
+            error = parsed.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+        if not isinstance(message, str):
+            return ""
+        try:
+            parsed = json.loads(message)
+        except (ValueError, TypeError):
+            return message
+    return ""
 
 
 def router_selection_model_unserved(status_code: int, body: str) -> bool:
@@ -779,10 +796,10 @@ def router_selection_model_unserved(status_code: int, body: str) -> bool:
 
     Happens when ``routing.selection_model`` names a model the workspace does
     not serve — or is unset and the router's frozen default does. Every later
-    call fails identically until the deployment config changes. Only a relayed
-    404 in the gateway's own ``message`` qualifies: other relayed statuses may
-    be transient and stay retriable, and the phrase quoted elsewhere in a body
-    is not the gateway reporting it.
+    call fails identically until the deployment config changes, so the client
+    latches. Only a relayed 404 in the gateway's own message qualifies: other
+    relayed statuses may be transient, and the phrase quoted elsewhere in a
+    body is not the gateway reporting it.
 
     :param status_code: The response status.
     :param body: The raw response text.
@@ -790,7 +807,7 @@ def router_selection_model_unserved(status_code: int, body: str) -> bool:
     """
     if status_code != 404:
         return False
-    return _SELF_CALL_404 in _top_level_message(body).lower()
+    return _SELF_CALL_404 in _gateway_message(body).lower()
 
 
 def router_permanently_disabled(status_code: int, body: str) -> bool:

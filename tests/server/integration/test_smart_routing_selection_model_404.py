@@ -10,10 +10,10 @@ not an outage: like the account-level "not enabled" 404, the client must latch
 it — stop re-issuing the doomed call every turn and stop advertising the
 external router — instead of silently re-failing for the life of the process.
 
-This test drives the real user journey (create a Smart-Routing session, send
-messages over ``POST /v1/sessions/{id}/events``, read ``GET /v1/info``) with
-the real :class:`~omnigent.server.smart_routing.ExternalRoutingClient` wired at
-a loopback service returning that 404 body verbatim.
+This test drives the real message path (create a Smart-Routing session, send
+turns over ``POST /v1/sessions/{id}/events``, read ``GET /v1/info``) with the
+real :class:`~omnigent.server.smart_routing.ExternalRoutingClient` wired at a
+loopback service returning that 404 body verbatim.
 """
 
 from __future__ import annotations
@@ -64,6 +64,10 @@ class _Gateway:
     def count(self) -> int:
         with self._lock:
             return len(self.requests)
+
+    def first(self) -> dict[str, Any]:
+        with self._lock:
+            return self.requests[0]
 
 
 @pytest.fixture
@@ -230,7 +234,7 @@ async def test_selection_model_404_latches_instead_of_refailing_every_turn(
     await _send_message(client, session_id, "rename a local variable in one file")
 
     assert gateway_404.count() == 1, "the first turn must reach the router"
-    selector = gateway_404.requests[0].get("route_selector") or {}
+    selector = gateway_404.first().get("route_selector") or {}
     assert selector.get("router_name") == "task_v1"
     assert "config" not in selector, (
         "with routing.selection_model unset the request must pin no extraction "

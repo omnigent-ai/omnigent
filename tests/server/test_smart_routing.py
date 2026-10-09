@@ -1470,15 +1470,20 @@ def test_a_relayed_transient_self_call_4xx_is_not_latched() -> None:
 
 
 def test_the_self_call_404_is_read_from_the_gateways_own_message() -> None:
-    """Only the body's top-level ``message`` relays the self-call: the phrase
-    quoted in another field, or a longer status, does not latch; a plain-text
-    relay is its own message."""
+    """The relayed 404 is read from the gateway's own message, including a
+    nested ``error.message``; the phrase quoted in another field, a longer
+    status, or a non-dict body does not latch, and a plain-text relay is its
+    own message."""
     from omnigent.server.smart_routing import router_permanently_disabled
 
     quoted = {"message": "no route", "details": _SELF_CALL_404_BODY["message"]}
     assert router_permanently_disabled(404, json.dumps(quoted)) is False
     longer = {"message": "responses self-call returned status 4040: odd"}
     assert router_permanently_disabled(404, json.dumps(longer)) is False
+    array_body = json.dumps([_SELF_CALL_404_BODY["message"]])
+    assert router_permanently_disabled(404, array_body) is False
+    nested = {"error": {"message": _SELF_CALL_404_BODY["message"]}}
+    assert router_permanently_disabled(404, json.dumps(nested)) is True
     assert router_permanently_disabled(404, _SELF_CALL_404_BODY["message"]) is True
 
 
@@ -1534,6 +1539,7 @@ async def test_an_unserved_selection_model_404_is_latched_and_asked_exactly_once
     assert client.last_error is not None
     assert "routing.selection_model" in client.last_error
     assert "default selection model" in client.last_error
+    assert "restart the server" in client.last_error
     assert "404" in client.last_error
 
 
