@@ -979,6 +979,39 @@ html[data-electron-mac] .breadcrumb-folder {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
 }
 
+/* At tablet widths the header's companions share its offset: the fade ends at
+ * the header's bottom edge, the first message starts where the fade is opaque,
+ * and the fold row snaps below it. The phone block below refines all three. */
+@media (width >= 48rem) {
+  :is([data-ios-native], [data-android-native]) .chat-scroll-fade {
+    --fade-start: calc(48px + max(0px, var(--omnigent-safe-top) - 0.5rem));
+    mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px),
+      black calc(100% - 32px),
+      transparent 100%
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px),
+      black calc(100% - 32px),
+      transparent 100%
+    );
+  }
+
+  /* Only the top-fading transcript reserves header clearance (pt-20); under a
+     pinned plan the content keeps its pt-4. */
+  :is([data-ios-native], [data-android-native]) .chat-scroll-fade .chat-conversation-content {
+    padding-top: calc(5rem + max(0px, var(--omnigent-safe-top) - 0.5rem));
+  }
+
+  :is([data-ios-native], [data-android-native]) .turn-fold-row {
+    scroll-margin-top: calc(88px + max(0px, var(--omnigent-safe-top) - 0.5rem));
+  }
+}
+
 /* Settings titles join the mobile header row beside the sidebar control. */
 @media (width < 48rem) {
   .settings-mobile-header::before {
@@ -1014,7 +1047,7 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
-/* Remaining native-shell adjustments are specific to the mobile layout. */
+/* Native-shell adjustments specific to the phone layout. */
 @media (width < 48rem) {
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
