@@ -145,6 +145,9 @@ _MAX_SEEN_BTW_KEYS = 64
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+# A child-history POST carries up to 100 items and can outlast the live lane's
+# budget; that lane runs off the latency-sensitive path, so it gets more room.
+_SUBAGENT_POST_TIMEOUT_S = 30.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 # A batch gets a bounded number of attempts before it is split into
@@ -1252,6 +1255,7 @@ async def forward_claude_transcript_to_session(
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    subagent_timeout = httpx.Timeout(_SUBAGENT_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with (
@@ -1267,7 +1271,7 @@ async def forward_claude_transcript_to_session(
             base_url,
             headers=headers,
             auth=auth,
-            timeout=timeout,
+            timeout=subagent_timeout,
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
     ):
@@ -3484,19 +3488,28 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
+def _stop_failure_detail(record: ClaudeHookRecord, *, session_id: str) -> str | None:
     """
     Return the reason a ``StopFailure`` hook gives for its failed turn.
 
-    The hook carries the error text Claude Code rendered, which the transcript
-    mirror can deliver after the failed edge or not at all; without it the
-    server borrows the turn's last prose or reports no detail.
+    When ``error_details`` was absent a WARNING is emitted so the missing
+    field is observable in structured logs; the server can then fall back
+    to the committed API-error text from its own store.
 
     :param record: ``StopFailure`` hook record.
-    :returns: The error text, a category-only fallback, or ``None``.
+    :param session_id: Session id for structured warning logs on fallback.
+    :returns: The error detail, a category-only fallback, or ``None``.
     """
     if record.failure_message is not None:
         return record.failure_message
+    _logger.warning(
+        "StopFailure hook carried no error_details; using fallback detail; "
+        "session=%s event_cursor=%s category=%s",
+        session_id,
+        record.event_cursor,
+        record.failure_category,
+        extra={"session_id": session_id},
+    )
     if record.failure_category is not None:
         return f"Claude Code ended the turn with an API error ({record.failure_category})."
     return None
@@ -3544,7 +3557,7 @@ def _stop_failure_context(
     parent_claude_session_ids: Collection[str],
     diagnostic_health: Callable[[], FailureContext] | None = None,
 ) -> FailureContext:
-    """Preserve hook evidence separately from last-assistant display text."""
+    """Preserve hook evidence separately from the displayed error detail."""
     reason = _subagent_hook_reason(record, parent_claude_session_ids)
     context: dict[str, object] = {
         **(record.failure_context or {}),
@@ -3570,7 +3583,7 @@ def _stop_failure_context(
         "failure_decision": "suppressed" if reason else "session_failed",
         "suppression_reason": reason,
         "detail_source": (
-            "hook_last_assistant_message"
+            "hook_error_details"
             if record.failure_message is not None
             else "hook_error_category"
             if record.failure_category is not None
@@ -4231,7 +4244,9 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
-                failure_detail=_stop_failure_detail(record) if status == "failed" else None,
+                failure_detail=_stop_failure_detail(record, session_id=session_id)
+                if status == "failed"
+                else None,
                 failure_context=failure_context,
             )
         except httpx.HTTPError as exc:
