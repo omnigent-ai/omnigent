@@ -456,12 +456,12 @@ def _plugin_install_paths(
                 continue
             if not any(resolved.is_relative_to(root) for root in plugin_roots):
                 _log.warning(
-                    "Skipping plugin %r: installPath %r is outside the trusted roots %s",
+                    "Skipping entry for plugin %r: installPath %r is outside the trusted roots %s",
                     key,
                     path,
-                    plugin_roots,
+                    ", ".join(str(root) for root in plugin_roots),
                 )
-                break
+                continue
             out[key] = resolved
             break
     return out

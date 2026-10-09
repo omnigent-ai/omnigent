@@ -1012,17 +1012,9 @@ def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
     assert out == []
 
 
-@pytest.mark.parametrize(
-    ("cache_link", "expected"),
-    [
-        # A loop makes the first entry unresolvable; the next scope entry still counts.
-        ("loop", ["multi:plan", "sp:using-superpowers"]),
-        # A dangling target is outside every trusted root, which stays fail-closed.
-        ("dangling", ["sp:using-superpowers"]),
-    ],
-)
+@pytest.mark.parametrize("cache_link", ["loop", "dangling"])
 def test_claude_provider_survives_broken_plugin_cache_link(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_link: str, expected: list[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_link: str
 ) -> None:
     """A looping or dangling ``plugins/cache`` link skips only the entries behind it."""
     home = tmp_path / "home"
@@ -1059,7 +1051,9 @@ def test_claude_provider_survives_broken_plugin_cache_link(
     out = resolve_harness_skills(
         _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
     )
-    assert sorted(s.name for s in out) == expected
+    # The entry behind the link is unresolvable (loop) or outside every root
+    # (dangling); the plugin's next scope entry still counts either way.
+    assert sorted(s.name for s in out) == ["multi:plan", "sp:using-superpowers"]
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(
