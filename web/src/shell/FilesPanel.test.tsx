@@ -53,10 +53,15 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 // real path helpers stay, since other code under test imports them.
 vi.mock("./WorkspacePicker", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspacePickerModule>()),
-  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
-    <button type="button" data-testid="stub-picker-navigate" onClick={() => onNavigate?.("/etc")}>
-      pick /etc
-    </button>
+  WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
+    <>
+      <button type="button" data-testid="stub-picker-navigate">
+        browse /etc
+      </button>
+      <button type="button" data-testid="stub-picker-confirm" onClick={() => onSelect?.("/etc")}>
+        confirm /etc
+      </button>
+    </>
   ),
 }));
 
@@ -313,6 +318,7 @@ describe("FilesPanel header role", () => {
     });
     const changesHeading = screen.getByRole("heading", { name: "Changes" });
     expect(changesHeading).toBeInTheDocument();
+    expect(changesHeading).toHaveClass("pl-1");
     expect(changesHeading.parentElement).toHaveClass("h-11");
     expect(screen.queryByRole("heading", { name: "Working folder" })).toBeNull();
     expect(screen.queryByTestId("browse-location-path")).toBeNull();
@@ -639,6 +645,10 @@ describe("FilesPanel changed files search", () => {
 
     render(<Harness />);
 
+    const drawer = screen.getByTestId("files-panel-drawer");
+    expect(drawer).toHaveClass("shadow-none");
+    expect(drawer).not.toHaveClass("shadow-lg");
+
     const srcFolder = screen.getByRole("button", { name: /src\//i });
     expect(srcFolder).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("App.tsx")).toBeInTheDocument();
@@ -650,6 +660,8 @@ describe("FilesPanel changed files search", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "open drawer" }));
 
+    expect(drawer).toHaveClass("shadow-lg");
+    expect(drawer).not.toHaveClass("shadow-none");
     const drawerSrcFolder = screen.getByRole("button", { name: /src\//i });
     expect(drawerSrcFolder).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("App.tsx")).toBeNull();
@@ -1596,6 +1608,7 @@ describe("FilesPanel browse location", () => {
     );
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     fireEvent.click(screen.getByText("hosts"));
 
@@ -1614,6 +1627,8 @@ describe("FilesPanel browse location", () => {
 
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    expect(useAllFilesMock).not.toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reroot", expect.anything(), "/etc");
     expect(useSearchMock).toHaveBeenLastCalledWith(
@@ -1646,6 +1661,7 @@ describe("FilesPanel browse location", () => {
     });
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     expect(useAllFilesMock).toHaveBeenLastCalledWith(
       "conv_viewer_roundtrip",
       expect.anything(),
@@ -1678,6 +1694,7 @@ describe("FilesPanel browse location", () => {
     });
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     first.unmount();
 
     renderPanel({
@@ -1858,6 +1875,7 @@ describe("FilesPanel header copy path", () => {
 
     fireEvent.click(screen.getByTestId("browse-location-path"));
     fireEvent.click(screen.getByTestId("stub-picker-navigate"));
+    fireEvent.click(screen.getByTestId("stub-picker-confirm"));
 
     fireEvent.click(screen.getByRole("button", { name: "Copy folder path: etc" }));
 

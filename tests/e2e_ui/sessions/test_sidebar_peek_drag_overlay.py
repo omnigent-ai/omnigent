@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import re
 import uuid
 
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 # A visible dot glued to the real pointer so recorded failure footage shows
@@ -31,11 +31,8 @@ _CURSOR_DOT_JS = """
 
 
 def _seed_titled_session(base_url: str, title: str) -> str:
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        timeout=30.0,
+    create = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]

@@ -52,19 +52,27 @@ class OIDCServer:
     idp: FakeIdP
 
 
-def spawn_oidc_server(mock_llm_server_url: str, server_tmp) -> Iterator[OIDCServer]:
+def spawn_oidc_server(
+    mock_llm_server_url: str, server_tmp, *, public_client: bool = False
+) -> Iterator[OIDCServer]:
     """Spawn an OIDC-mode server wired to a fake IdP; yield a handle.
 
-    The fake IdP must be up *before* the server boots, because stock OIDC mode
-    fetches the discovery document at construction time
-    (``OIDCConfig.from_env``). The redirect URI is on the public-loopback alias
+    The fake IdP starts before the server boots. The default profile uses
+    discovery; the public-client profile uses explicit endpoints and a separate
+    canonical issuer. The redirect URI is on the public-loopback alias
     so the session cookie is issued for the browser-visible origin.
 
     :param mock_llm_server_url: Session-scoped mock LLM base (no real creds).
     :param server_tmp: A per-test temp dir (``tmp_path_factory.mktemp(...)``).
+    :param public_client: Exercise secretless PKCE, PS256, and explicit endpoints.
     :yields: An :class:`OIDCServer` handle.
     """
-    with fake_idp() as idp:
+    with fake_idp(
+        client_secret="" if public_client else "e2e-secret",
+        signing_algorithm="PS256" if public_client else "RS256",
+        endpoint_prefix="/custom" if public_client else "",
+        canonical_issuer="https://issuer.example.test" if public_client else None,
+    ) as idp:
         port = _find_free_port()
         log_path = server_tmp / "server.log"
         db_path = server_tmp / "test.db"
@@ -81,7 +89,11 @@ def spawn_oidc_server(mock_llm_server_url: str, server_tmp) -> Iterator[OIDCServ
         pythonpath = f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
 
         server_env = {
-            **os.environ,
+            **{
+                name: value
+                for name, value in os.environ.items()
+                if not name.startswith("OMNIGENT_OIDC_")
+            },
             "PYTHONPATH": pythonpath,
             "OMNIGENT_AUTH_PROVIDER": "oidc",
             "OMNIGENT_AUTH_ENABLED": "1",
@@ -89,12 +101,25 @@ def spawn_oidc_server(mock_llm_server_url: str, server_tmp) -> Iterator[OIDCServ
             "OMNIGENT_OIDC_ISSUER": idp.issuer,
             "OMNIGENT_OIDC_CLIENT_ID": idp.client_id,
             "OMNIGENT_OIDC_CLIENT_SECRET": idp.client_secret,
+            "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD": "none"
+            if public_client
+            else "client_secret_post",
             "OMNIGENT_OIDC_REDIRECT_URI": redirect_uri,
             "OMNIGENT_OIDC_COOKIE_SECRET": secrets.token_hex(32),
             "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
             "OPENAI_API_KEY": "mock-key",
             "ANTHROPIC_API_KEY": "",
         }
+        if public_client:
+            for setting, path in (
+                ("AUTHORIZATION_ENDPOINT", "authorize"),
+                ("TOKEN_ENDPOINT", "token"),
+                ("JWKS_URI", "jwks"),
+            ):
+                server_env[f"OMNIGENT_OIDC_{setting}"] = (
+                    f"{idp.base_url}{idp.endpoint_prefix}/{path}"
+                )
+            server_env["OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT"] += "?p=policy"
 
         log_handle = open(log_path, "w")  # noqa: SIM115 — lives for the Popen; closed in finally
         proc = subprocess.Popen(

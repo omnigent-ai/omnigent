@@ -16,6 +16,7 @@ from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
+from omnigent.runner import subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 
@@ -123,7 +124,7 @@ async def test_wake_post_retries_transient_503_then_succeeds(
         [_wake_response(503, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -154,7 +155,7 @@ async def test_wake_post_carries_dispatch_actor() -> None:
     parent_id = "5a81ef19fce549929c8f9925c2ee034f"
     client = _QueuedResponseServerClient([_wake_response(200, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -173,7 +174,7 @@ async def test_wake_post_retries_without_actor_when_attribution_is_rejected() ->
         [_wake_response(403, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -198,10 +199,10 @@ async def test_wake_post_persistent_503_returns_failure(
     """
     parent_id = "a25887ef53cb74bba721c20edf204d10"
     client = _QueuedResponseServerClient(
-        [_wake_response(503, parent_id) for _ in range(runner_app_mod._WAKE_POST_MAX_ATTEMPTS)]
+        [_wake_response(503, parent_id) for _ in range(subagent_work._WAKE_POST_MAX_ATTEMPTS)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -212,14 +213,14 @@ async def test_wake_post_persistent_503_returns_failure(
     assert delivered is False
     # Attempted exactly the bounded budget — not once (no retry) and not
     # unbounded. The stub would have asserted on a call past the queue.
-    assert len(client.calls) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS, (
-        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, "
+    assert len(client.calls) == subagent_work._WAKE_POST_MAX_ATTEMPTS, (
+        f"Expected {subagent_work._WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, "
         f"got {len(client.calls)}."
     )
     # One backoff fewer than attempts: we don't sleep after the final attempt.
-    assert len(_no_wake_backoff) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1, (
-        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
-        f"{runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
+    assert len(_no_wake_backoff) == subagent_work._WAKE_POST_MAX_ATTEMPTS - 1, (
+        f"Expected {subagent_work._WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
+        f"{subagent_work._WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
     )
 
 
@@ -235,7 +236,7 @@ async def test_wake_post_permanent_4xx_not_retried(
     parent_id = "43cc3eccd350fed1b91854b2adf5ec3e"
     client = _QueuedResponseServerClient([_wake_response(400, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -280,7 +281,7 @@ def test_wake_post_is_retryable_status_classification(
     )
     # Pins which statuses cost a retry vs. fail fast; a wrong verdict here
     # would either waste the budget on permanent errors or give up on a 503.
-    assert runner_app_mod._wake_post_is_retryable(exc) is expected_retryable
+    assert subagent_work._wake_post_is_retryable(exc) is expected_retryable
 
 
 def test_wake_post_transport_error_is_retryable() -> None:
@@ -293,7 +294,7 @@ def test_wake_post_transport_error_is_retryable() -> None:
     request = httpx.Request("POST", "http://test/v1/sessions/p/events")
     exc = httpx.ConnectError("connection refused", request=request)
     # True because a transport failure is not a definitive server rejection.
-    assert runner_app_mod._wake_post_is_retryable(exc) is True
+    assert subagent_work._wake_post_is_retryable(exc) is True
 
 
 @dataclass
@@ -1351,24 +1352,57 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
+@pytest.mark.parametrize(
+    ("resume_error_payload", "expected_error_substring"),
+    [
+        (
+            {
+                "code": -32603,
+                "message": (
+                    "failed to read thread: thread-store internal error: failed to "
+                    "load thread history /codex-home/sessions/rollout.jsonl: "
+                    "stream did not contain valid UTF-8"
+                ),
+            },
+            "stream did not contain valid UTF-8",
+        ),
+        (
+            {
+                "code": -32600,
+                "message": (
+                    "invalid paginated history lineage for "
+                    "019e96aa-0be2-7343-8d3b-6f914d60936d: "
+                    "source rollout is not paginated"
+                ),
+            },
+            "source rollout is not paginated",
+        ),
+    ],
+    ids=["thread_store_error", "unpaginated_lineage"],
+)
 async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    resume_error_payload: dict[str, Any],
+    expected_error_substring: str,
 ) -> None:
     """
     A thread codex cannot read falls back to a fresh thread on the same app-server.
 
-    The large-rollout incident shape: codex's thread-store rejects the
-    persisted rollout (``-32603 failed to read thread … invalid UTF-8``) on
-    every ``thread/resume``, so re-raising failed every turn of the session
-    for good. The fallback must keep the app-server, take the fresh-thread
-    path (discovery listener connected, TUI launched without the thread id,
-    discovery forwarder) and log the Codex-side context it drops.
+    Covers two permanent-mismatch shapes: the large-rollout incident
+    (``-32603 failed to read thread … invalid UTF-8``) and the paginated-lineage
+    mismatch (``-32600 … source rollout is not paginated``). In both cases
+    re-raising fails every turn for good; the fallback must keep the app-server,
+    take the fresh-thread path (discovery listener connected, TUI launched without
+    the thread id, discovery forwarder) and log the Codex-side context it drops.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Log capture for the fallback warning.
+    :param resume_error_payload: JSON-RPC error dict codex returns for the resume.
+    :param expected_error_substring: Substring from the error that must appear in
+        the reset notice surfaced into the session.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
@@ -1483,23 +1517,14 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         cwd: Path | None = None,
     ) -> None:
         """
-        Refuse the resume the way codex's thread-store does for a bad rollout.
+        Refuse the resume with the parametrized error payload.
 
         :param transport: App-server transport URL (ignored).
-        :param loaded_thread_id: Thread id passed to ``thread/resume``.
+        :param loaded_thread_id: Thread id passed to ``thread/resume`` (ignored).
         :raises CodexAppServerResponseError: Always, mirroring the app-server.
         """
-        del transport, terminal_launch_args
-        raise codex_app_mod.CodexAppServerResponseError(
-            {
-                "code": -32603,
-                "message": (
-                    "failed to read thread: thread-store internal error: failed to "
-                    f"load thread history /codex-home/rollout-{loaded_thread_id}.jsonl: "
-                    "stream did not contain valid UTF-8"
-                ),
-            }
-        )
+        del transport, loaded_thread_id, terminal_launch_args
+        raise codex_app_mod.CodexAppServerResponseError(resume_error_payload)
 
     launched_args: list[list[str]] = []
 
@@ -1586,8 +1611,8 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         assert notice["data"]["item_data"]["code"] == "codex_thread_reset"
         assert notice["data"]["item_data"]["level"] == "info"
         # The body names codex as the source and quotes its own error text.
-        assert "Codex reported an internal error" in notice["data"]["item_data"]["message"]
-        assert "stream did not contain valid UTF-8" in notice["data"]["item_data"]["message"]
+        assert "Codex could not load" in notice["data"]["item_data"]["message"]
+        assert expected_error_substring in notice["data"]["item_data"]["message"]
         assert connected == ["omnigent-codex-native-auto"], (
             "the fresh-thread path must connect the discovery listener"
         )

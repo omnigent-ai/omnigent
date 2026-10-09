@@ -52,7 +52,7 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     assert payload["code"] == ErrorCode.SESSION_AGENT_MISSING
     message = payload["message"]
     # Actionable, client-safe wording about the lifecycle condition.
-    assert "agent is no longer available" in message
+    assert "agent no longer exists" in message
     # Must NOT relabel the lifecycle event as a generic startup defect.
     assert "Native Claude terminal failed to start" not in message
     # Must NOT leak the internal resolver detail or the raw agent id.
@@ -64,7 +64,14 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     assert payload["error_id"] == match.group(1)
 
 
-def test_other_causes_keep_generic_startup_failure_code() -> None:
+@pytest.mark.parametrize(
+    "cause",
+    [
+        RuntimeError("tmux server exited before the pane was ready"),
+        FileNotFoundError("missing executable"),
+    ],
+)
+def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> None:
     """A non-lifecycle cause keeps the generic startup-defect code.
 
     The reclassification is scoped to the missing-agent lifecycle condition;
@@ -72,14 +79,47 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     ``native_terminal_start_failed`` terminal-startup defect.
     """
     payload = _native_terminal_start_error_payload(
-        RuntimeError("tmux server exited before the pane was ready"),
+        cause,
         "Claude",
         session_id="conv_1",
     )
 
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
     assert payload["code"] == "native_terminal_start_failed"
-    assert "agent is no longer available" not in payload["message"]
+    assert "agent no longer exists" not in payload["message"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "category"),
+    [
+        (RuntimeError("tmux server exited before the pane was ready"), "unknown"),
+        (OSError(28, "No space left on device"), "host"),
+        (
+            OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
+            "user",
+        ),
+        (
+            OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
+            "user",
+        ),
+    ],
+)
+def test_start_failure_log_row_is_blocking_with_derived_category(
+    caplog: pytest.LogCaptureFixture, exc: Exception, category: str
+) -> None:
+    """Every start failure blocks; its owner comes from the exception, and an
+    unrecognized one stays unknown rather than guessed."""
+    with caplog.at_level(logging.WARNING, logger=orchestration._logger.name):
+        _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_terminal_start_failed"
+    ]
+    attrs = record_to_row(record, source="runner")["attributes"]
+    assert attrs["error_impact"] == "blocking"
+    assert attrs["error_category"] == category
 
 
 def test_generic_cause_names_errno_without_free_form_text() -> None:
@@ -147,6 +187,16 @@ def test_cause_names_omnigent_error_code() -> None:
     assert "internal detail" not in orchestration._native_terminal_start_failure_cause(exc)
 
 
+def test_cause_names_omnigent_error_code_and_cause_type() -> None:
+    """A coded launch-config failure keeps the underlying transport cause visible."""
+    exc = OmnigentError("could not fetch", code=ErrorCode.INTERNAL_ERROR)
+    exc.__cause__ = httpx.ReadTimeout("slow")
+
+    assert orchestration._native_terminal_start_failure_cause(exc) == (
+        f"OmnigentError code {ErrorCode.INTERNAL_ERROR} (cause ReadTimeout)"
+    )
+
+
 def test_codex_early_exit_with_unknown_status_does_not_invent_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -207,20 +257,23 @@ def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
 
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
-    assert "agent is no longer available" not in payload["message"]
+    assert "agent no longer exists" not in payload["message"]
 
 
-@pytest.mark.parametrize("missing_agent", [False, True])
+@pytest.mark.parametrize(
+    "lifecycle_code",
+    [None, ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING],
+)
 def test_startup_failure_diagnostics_belong_to_failing_child(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    missing_agent: bool,
+    lifecycle_code: ErrorCode | None,
 ) -> None:
     """A shared runner's parent must not receive a child's startup failure evidence."""
     monkeypatch.setattr(orchestration, "runner_primary_session_id", lambda: "parent-session")
     private_detail = "private launch configuration"
-    if missing_agent:
-        exc = OmnigentError(private_detail, code=ErrorCode.SESSION_AGENT_MISSING)
+    if lifecycle_code is not None:
+        exc = OmnigentError(private_detail, code=lifecycle_code)
     else:
         exc = RuntimeError(private_detail)
         exc.__cause__ = httpx.ReadTimeout("private upstream URL")
@@ -242,7 +295,7 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
     assert attributes["exception_type"] == type(exc).__name__
     assert private_detail not in str(attributes)
     assert private_detail not in payload["message"]
-    if missing_agent:
+    if lifecycle_code is not None:
         assert row["stack_trace"] is None
     else:
         assert attributes["exception_cause_type"] == "ReadTimeout"
@@ -250,6 +303,23 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
         # The generic startup-defect branch names the direct cause's type as
         # a structured, non-sensitive fact — never the free-form message.
         assert "(cause ReadTimeout)" in payload["message"]
+
+
+@pytest.mark.parametrize("code", [ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING])
+def test_ensure_response_for_a_removed_session_resource_is_410(code: ErrorCode) -> None:
+    """A removed session resource is a lifecycle condition, not a runner failure."""
+    removed = _native_terminal_start_error_response(
+        OmnigentError("resource gone", code=code), "Claude", session_id="conv_1"
+    )
+    assert removed.status_code == 410
+    assert json.loads(removed.body)["error"]["code"] == code
+
+
+def test_ensure_response_for_other_failure_is_500() -> None:
+    other = _native_terminal_start_error_response(
+        OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR), "Claude", session_id="conv_1"
+    )
+    assert other.status_code == 500
 
 
 def test_ensure_response_and_diagnostic_share_error_and_session_ids(

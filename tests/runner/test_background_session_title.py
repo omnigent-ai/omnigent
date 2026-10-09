@@ -32,6 +32,7 @@ from omnigent.runner.background_titles.service import (
     background_title_model,
     build_background_title_instructions,
 )
+from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from tests.runner.helpers import NullServerClient
 
 
@@ -107,6 +108,7 @@ async def _runner_client(app):
 async def test_background_title_uses_isolated_codex_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_SKILLS_DIR", "/ambient-parent-session-skills")
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
 
@@ -114,7 +116,10 @@ async def test_background_title_uses_isolated_codex_process(
         assert kwargs["agent_id"] == "agent_test"
         assert kwargs["session_id"] == "conv_test"
         assert kwargs["model_override"] == "gpt-5.4-mini"
-        return "codex", {"HARNESS_CODEX_MODEL": "gpt-5.4-mini"}
+        return "codex", {
+            "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
+            "HARNESS_CODEX_SKILLS_DIR": "/parent-session-skills",
+        }
 
     monkeypatch.setattr(
         "omnigent.runner.app._resolve_harness_config",
@@ -152,7 +157,9 @@ async def test_background_title_uses_isolated_codex_process(
         "HARNESS_CODEX_MINIMAL_CONFIG": "1",
         "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
         "HARNESS_CODEX_SKILLS_FILTER": '"none"',
+        "HARNESS_CODEX_SKILLS_DIR": "",
     }
+    assert _build_harness_spawn_env(env)["HARNESS_CODEX_SKILLS_DIR"] == ""
     assert process_manager.released == [process_key]
 
     [(url, body)] = harness_client.requests

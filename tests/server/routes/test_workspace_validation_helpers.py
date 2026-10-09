@@ -6,6 +6,8 @@ connection, so we test only the synchronous helpers here.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.server.routes._workspace_validation import (
     _is_relative_cwd,
     _is_subpath_of,
@@ -75,6 +77,21 @@ class TestIsSubpathOf:
 
     def test_windows_mixed_separators(self) -> None:
         assert _is_subpath_of("C:\\Users\\alice\\work", "C:/Users/alice") is True
+
+    @pytest.mark.parametrize(
+        ("workspace", "boundary", "contained"),
+        [
+            (r"\\server\share\repo\web", r"\\server\share\repo", True),
+            (r"\\SERVER\share\repo\web", "//server/share/repo", True),
+            ("//server/share/repo/web", r"\\SERVER\share\repo", True),
+            (r"\\server\share\repo-other\web", r"\\server\share\repo", False),
+            (r"\\server\other-share\repo\web", r"\\server\share\repo", False),
+            (r"\\other-server\share\repo\web", r"\\server\share\repo", False),
+        ],
+    )
+    def test_unc_containment(self, workspace: str, boundary: str, contained: bool) -> None:
+        """UNC containment normalizes separators and case without crossing boundaries."""
+        assert _is_subpath_of(workspace, boundary) is contained
 
 
 class TestRestoreHostFilesystemUrlPath:

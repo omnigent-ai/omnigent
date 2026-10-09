@@ -11,7 +11,7 @@ import pytest
 from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
 from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
-from omnigent.runner.app import _resolve_forwarded_message_content
+from omnigent.runner.app_support import _resolve_forwarded_message_content
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.server.schemas import CreateResponseRequest

@@ -90,6 +90,21 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([undefined, null, "", "manage", 2, true])(
+    "defaults an absent or invalid public ceiling %s to Read",
+    async (value) => {
+      expect((await probe({ public_sharing_max_level: value })).public_sharing_max_level).toBe(
+        "read",
+      );
+    },
+  );
+
+  it("recognizes an explicit public Edit ceiling", async () => {
+    expect((await probe({ public_sharing_max_level: "edit" })).public_sharing_max_level).toBe(
+      "edit",
+    );
+  });
+
   it("keeps the provider list from the probe", async () => {
     // Regression: the probe rebuilds ServerInfo field by field, so a
     // forgotten field is dropped before any component sees it.
@@ -149,6 +164,16 @@ describe("resolveServerInfo release features", () => {
     const parsed = await resolveServerInfo();
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+  });
+});
+
+describe("resolveServerInfo archive_worktree_cleanup", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).archive_worktree_cleanup).toBe(false);
   });
 });
 
@@ -222,4 +247,18 @@ describe("resolveServerInfo branding", () => {
     const malformed = await probe({ branding: "Acme" });
     expect(malformed.branding).toBeNull();
   });
+});
+
+describe("custom agents settings capability", () => {
+  it.each([undefined, false, "true", true])(
+    "requires a boolean install capability: %s",
+    async (install) => {
+      const parsed = await probe({
+        features: { custom_agents_settings_ui: true },
+        agent_install: install,
+      });
+      const { customAgentsSettingsEnabled } = await import("./capabilities");
+      expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
+    },
+  );
 });
