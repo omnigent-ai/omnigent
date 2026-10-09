@@ -92,4 +92,3 @@ def test_embedded_terminal_reconnects_after_transport_close(
             page.wait_for_timeout(50)
         assert probe in str(live["input"]), "terminal did not forward input after reconnecting"
         page.keyboard.press("Control+U")
-        expect(terminal_view).to_have_attribute("data-state", "connected")

@@ -528,31 +528,39 @@ describe("OSS host routing", () => {
     expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_oss");
   });
 
-  it.each(["failed", "hostless"])(
-    "retries a %s OSS host lookup on the next request",
-    async (mode) => {
-      const { setSessionHost } = await import("./sessionHost");
-      const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
-      const resolve = vi
-        .fn()
-        .mockImplementationOnce(async () => {
-          if (mode === "failed") throw new Error("Server restarting");
-        })
-        .mockImplementationOnce(async (id: string) => setSessionHost(id, "host_oss"));
-      setSessionHostResolver(resolve);
-      fetchMock.mockImplementation(async (_url, init: RequestInit) =>
-        new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key") === "host_oss"
-          ? Response.json({})
-          : Response.json({ error: { code: "wrong_replica" } }, { status: 400 }),
-      );
+  it("retries a failed OSS host lookup on the next request", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+    const resolve = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Server restarting"))
+      .mockImplementationOnce(async (id: string) => setSessionHost(id, "host_oss"));
+    setSessionHostResolver(resolve);
+    fetchMock.mockImplementation(async (_url, init: RequestInit) =>
+      new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key") === "host_oss"
+        ? Response.json({})
+        : Response.json({ error: { code: "wrong_replica" } }, { status: 400 }),
+    );
 
-      const url = "/v1/sessions/sess_oss/resources/terminals";
-      expect((await authenticatedFetch(url)).status).toBe(400);
-      expect((await authenticatedFetch(url)).status).toBe(200);
-      expect(resolve).toHaveBeenCalledTimes(2);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    },
-  );
+    const url = "/v1/sessions/sess_oss/resources/terminals";
+    expect((await authenticatedFetch(url)).status).toBe(400);
+    expect((await authenticatedFetch(url)).status).toBe(200);
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("remembers a successful hostless OSS lookup", async () => {
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+    const resolve = vi.fn(async () => {});
+    setSessionHostResolver(resolve);
+    fetchMock.mockResolvedValue(Response.json({}));
+
+    const url = "/v1/sessions/sess_oss/resources/terminals";
+    expect((await authenticatedFetch(url)).status).toBe(200);
+    expect((await authenticatedFetch(url)).status).toBe(200);
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 
   it("keeps the host key when a rollout temporarily returns wrong_replica", async () => {
     const { setSessionHost, isHostKeyless } = await import("./sessionHost");

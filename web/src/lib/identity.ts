@@ -196,14 +196,17 @@ export function resolveSessionHost(
         )
       : resolver(sessionId);
     inFlight = lookup
+      .then(() => {
+        _hostResolveAttempted.add(sessionId);
+      })
       .catch(() => {
         // Best-effort — leave the map unseeded and fall through to modal/keyless.
-      })
-      .finally(() => {
-        // OSS must retry an unresolved lookup after a rollout.
-        if (isDatabricksWorkspace() || getSessionHost(sessionId) !== null) {
+        // Keep managed lookups one-shot; OSS retries on the next request.
+        if (isDatabricksWorkspace()) {
           _hostResolveAttempted.add(sessionId);
         }
+      })
+      .finally(() => {
         pending.delete(sessionId);
       });
     pending.set(sessionId, inFlight);
