@@ -179,6 +179,18 @@ describe("themePalette", () => {
     }
   });
 
+  it.each(PALETTES)("keeps $label links readable on page and table surfaces", (palette) => {
+    for (const mode of ["light", "dark"] as const) {
+      const { link, background, cardSolid } = palette.tokens[mode];
+      for (const surface of [background, cardSolid]) {
+        expect(
+          contrast(parseColor(link).rgb, parseColor(surface).rgb),
+          `${palette.label} ${mode} on ${surface}`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
   it("uses the canonical Solarized backgrounds", () => {
     const solarized = PALETTES.find((palette) => palette.id === "solarized");
     expect(solarized?.tokens.light.background).toBe("#fdf6e3");

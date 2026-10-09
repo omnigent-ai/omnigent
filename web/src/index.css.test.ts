@@ -6,12 +6,18 @@ import { readFileSync } from "node:fs";
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
 import { type ComponentProps, createElement } from "react";
+import { createPortal } from "react-dom";
 import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
 import type * as UseTerminalsModule from "./hooks/useTerminals";
-import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/uiFontPreferences";
+import {
+  UI_FONT_SIZE_DEFAULT,
+  UI_FONT_SIZE_MAX,
+  UI_FONT_SIZE_MIN,
+  UI_FONT_SIZE_MOBILE_DEFAULT,
+} from "./lib/uiFontPreferences";
 import { WorkspacePanel } from "./shell/WorkspacePanel";
 
 // Rendering the real WorkspacePanel below is a layout test: stub its content
@@ -786,41 +792,35 @@ describe("index.css body text tokens", () => {
     expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
     expect(mobileMap).toContain(`--text-sm: calc(var(--mobile-ui-font-size) * ${CAPTION_RATIO})`);
     expect(mobileMap).toContain("--text-ui: var(--mobile-ui-font-size)");
+    expect(mobileMap).toContain("--text-base: var(--mobile-ui-font-size)");
   });
 
-  /* Contract: the Appearance font-size setting applies on mobile.
-   *
-   * The mobile base used to be a hard-coded 14px with zero references to
-   * --desktop-ui-font-size, so the Settings stepper's value was persisted and
-   * set on <html> but never consumed below 48rem — saved but not applied. The
-   * mobile base must scale off the preference. */
+  /* Contract: mobile gets its own unset default, while a saved Appearance
+   * value applies directly instead of being silently rescaled. */
   describe("mobile branch consumes the font-size preference", () => {
-    const MOBILE_BASE_RATIO = 14 / 13;
-
-    it("derives the mobile base from the preference, not a hard-coded px", () => {
+    it("uses the mobile default and aliases the effective body size to the preference", () => {
       expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
-      // A literal `--mobile-ui-font-size: 14px` is the saved-but-not-applied
-      // bug: the preference would be a dead store below 48rem.
-      expect(mobileMap).not.toMatch(/--mobile-ui-font-size:\s*\d/);
-      expect(mobileMap).toContain(
-        "--mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13))",
-      );
+      expect(mobileMap).toContain(`--desktop-ui-font-size: ${UI_FONT_SIZE_MOBILE_DEFAULT}px`);
+      expect(mobileMap).toContain("--mobile-ui-font-size: var(--desktop-ui-font-size)");
+      expect(mobileMap).not.toContain("--mobile-ui-font-size: calc(");
     });
 
-    it("keeps the historical 14px mobile base at the default preference", () => {
-      // The ratio must map the shipped default onto the long-standing mobile
-      // base exactly, so users who never touch the setting see no change.
-      expect(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO).toBe(14);
+    it("keeps the desktop and mobile defaults distinct", () => {
+      expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
     });
 
-    it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX])(
-      "moves the rendered mobile base when the preference is %ipx",
-      (px) => {
-        // The applied size must actually change with the setting — the
-        // user-visible half of the fix.
-        expect(px * MOBILE_BASE_RATIO).not.toBe(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO);
-      },
-    );
+    it("routes inherited body text through the same effective token", () => {
+      expect(cssSource).toContain("font-size: var(--mobile-ui-font-size)");
+      expect(cssSource).not.toContain("font-size: max(16px, var(--text-ui))");
+    });
+
+    it("scales mobile headings from the effective body step", () => {
+      expect(mobileMap).toContain("--ui-ramp-anchor: var(--mobile-ui-font-size)");
+      expect(mobileMap).toContain("--text-lg: calc(var(--ui-ramp-anchor) * 1.125)");
+      expect(mobileMap).toContain("--text-xl: calc(var(--ui-ramp-anchor) * 1.25)");
+      expect(mobileMap).toContain("--text-2xl: calc(var(--ui-ramp-anchor) * 1.5)");
+    });
   });
 
   it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX])(
@@ -919,29 +919,9 @@ describe("index.css mobile sidebar opacity", () => {
   });
 });
 
-/* Regression test for the "mobile floating Settings/Search chip is see-through"
- * bug.
- *
- * The two floating chips (`.sidebar-glass-chip`) frost their fill with
- * `backdrop-filter`, but WebKit drops that filter on mobile once a Radix popper
- * opens. With a purely translucent fill (rgba white) the scrolling session rows
- * then show straight through and the chip reads as transparent. An opaque
- * `--card-solid` base UNDER the tint keeps it a chip whether or not the blur
- * survives.
- */
-describe("index.css mobile sidebar glass chip opacity", () => {
-  const chipRule = cssSource.match(/\.sidebar-glass-chip \{[^}]*\}/)?.[0];
-
-  it("has the glass chip rule this test exists to protect", () => {
-    expect(chipRule, "the .sidebar-glass-chip rule is gone from index.css").toBeDefined();
-  });
-
-  it("bases the chip on an opaque fill so it never goes see-through", () => {
-    // The translucent tint lives on background-image (a layer over the base),
-    // NOT on background-color — that must stay the opaque token, or the chip
-    // turns transparent the moment WebKit drops the backdrop-filter.
-    expect(chipRule).toMatch(/background-color:\s*var\(--card-solid\)/);
-    expect(chipRule).not.toMatch(/background-color:\s*rgba/);
+describe("index.css mobile sidebar actions", () => {
+  it("does not restore the removed circular glass container", () => {
+    expect(cssSource).not.toContain(".sidebar-glass-chip");
   });
 });
 
@@ -954,6 +934,177 @@ describe("index.css text selection colors", () => {
     expect(selectionRule).not.toContain("--sidebar-active");
     expect(selectionRule).not.toContain("--brand-accent");
     expect(cssSource).not.toContain(".dark ::selection");
+  });
+});
+
+describe("index.css mobile settings title", () => {
+  const titleRule = cssSource.match(/\.settings-page-title \{[^}]*\}/)?.[0];
+  const headerFadeRule = cssSource.match(/\.settings-mobile-header::before \{[^}]*\}/)?.[0];
+
+  it("centers the settings title in the fixed mobile header row", () => {
+    expect(headerFadeRule, "the mobile settings header rule is gone").toBeDefined();
+    expect(titleRule, "the mobile settings title rule is gone").toBeDefined();
+    expect(titleRule).toContain("position: fixed");
+    expect(titleRule).toContain("height: var(--omnigent-header-height)");
+    expect(titleRule).toContain("text-align: center");
+  });
+
+  it("fades the settings header into the page like the session header", () => {
+    expect(headerFadeRule).toContain("height: 80px");
+    expect(headerFadeRule).toContain(
+      "background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px)",
+    );
+  });
+});
+
+describe("index.css electron-mac window drag region", () => {
+  const dragRule = cssBlocks
+    .map(([block]) => block)
+    .find((block) => selectorOf(block) === "html[data-electron-mac] .electron-drag-strip");
+  const controlsRule = cssBlocks
+    .map(([block]) => block)
+    .find(
+      (block) =>
+        selectorOf(block).replace(/\s+/g, " ").startsWith("html[data-electron-mac] :is(") &&
+        block.includes("-webkit-app-region: no-drag"),
+    );
+  let dragSelector: string;
+  let controlsSelector: string;
+
+  beforeAll(() => {
+    expect(dragRule, "expected the macOS window drag-strip rule").toBeDefined();
+    expect(controlsRule, "expected the macOS interactive-control exclusions").toBeDefined();
+    dragSelector = selectorOf(dragRule!);
+    controlsSelector = selectorOf(controlsRule!);
+  });
+
+  // The mac shell marks <html> at boot (applyMacElectronShellAttribute).
+  const root = document.documentElement;
+  const markMacShell = () => root.setAttribute("data-electron-mac", "true");
+  const unmarkMacShell = () => root.removeAttribute("data-electron-mac");
+
+  afterEach(() => {
+    cleanup();
+    unmarkMacShell();
+  });
+
+  it("scopes the no-drag exclusions without :has() so DOM edits stay cheap", () => {
+    // `html:has(...)` restyles the whole page on DOM mutations, e.g. every
+    // keystroke in a controlled textarea.
+    expect(controlsSelector).not.toContain(":has(");
+  });
+
+  it("covers the full width and height of the desktop header", () => {
+    expect(dragRule).toContain("inset: 0 0 auto 0");
+    expect(dragRule).toContain("height: 3rem");
+    expect(dragRule).toContain("-webkit-app-region: drag");
+  });
+
+  it.each<[string, ComponentProps<"div">]>([
+    ["a", {}],
+    ["button", {}],
+    ["input", {}],
+    ["textarea", {}],
+    ["select", {}],
+    ["iframe", {}],
+    ["video", {}],
+    ["audio", {}],
+    ["label", {}],
+    ["summary", {}],
+    ["div", { tabIndex: 0 }],
+    ["span", { tabIndex: 1 }],
+    ["div", { className: "no-drag" }],
+    ["div", { role: "button" }],
+    ["div", { role: "link" }],
+    ["div", { role: "tab" }],
+    ["div", { role: "separator" }],
+    ["div", { role: "menuitem" }],
+    ["div", { role: "menuitemcheckbox" }],
+    ["div", { role: "menuitemradio" }],
+    ["div", { role: "combobox" }],
+    ["div", { role: "option" }],
+    ["div", { role: "radio" }],
+    ["div", { role: "checkbox" }],
+    ["div", { role: "switch" }],
+    ["div", { role: "slider" }],
+    ["div", { role: "listbox" }],
+    ["div", { role: "textbox" }],
+    ["div", { role: "searchbox" }],
+    ["div", { role: "spinbutton" }],
+    ["div", { role: "menu" }],
+    ["div", { role: "dialog" }],
+    ["div", { role: "tooltip" }],
+    ["div", { contentEditable: true }],
+  ])("keeps %s %j interactive inside the drag band", (tag, props) => {
+    markMacShell();
+    const { container } = render(createElement("div", {}, createElement(tag, props)));
+    const control = container.firstElementChild!.firstElementChild!;
+    expect(control.matches(controlsSelector)).toBe(true);
+    unmarkMacShell();
+    expect(control.matches(controlsSelector)).toBe(false);
+  });
+
+  it.each(["", "plaintext-only", "TRUE", "True", "PLAINTEXT-ONLY", "PlainText-Only"])(
+    "excludes contenteditable=%j from dragging",
+    (value) => {
+      markMacShell();
+      const { container } = render(createElement("div", {}, createElement("div")));
+      const control = container.firstElementChild!.firstElementChild!;
+      control.setAttribute("contenteditable", value);
+      expect(control.matches(controlsSelector)).toBe(true);
+    },
+  );
+
+  it.each(["menu", "dialog", "tooltip"])("excludes portaled %s containers", (role) => {
+    markMacShell();
+    const { container, getByRole } = render(
+      createElement(
+        "div",
+        { className: "app-shell" },
+        createPortal(createElement("div", { role }), document.body),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    const overlay = getByRole(role);
+    expect(shell.contains(overlay)).toBe(false);
+    expect(overlay.matches(controlsSelector)).toBe(true);
+    unmarkMacShell();
+    expect(overlay.matches(controlsSelector)).toBe(false);
+  });
+
+  it("keeps unfocusable and noneditable content draggable unless explicitly opted out", () => {
+    markMacShell();
+    const { container } = render(
+      createElement(
+        "div",
+        {},
+        createElement("span", { tabIndex: -1 }),
+        createElement("span", { contentEditable: false }),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    expect(shell.firstElementChild!.matches(controlsSelector)).toBe(false);
+    expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
+    shell.firstElementChild!.classList.add("no-drag");
+    expect(shell.firstElementChild!.matches(controlsSelector)).toBe(true);
+  });
+
+  it("leaves noninteractive title-bar space draggable and other platforms unchanged", () => {
+    markMacShell();
+    const { container } = render(
+      createElement(
+        "div",
+        {},
+        createElement("div", { className: "electron-drag-strip" }),
+        createElement("span", {}, "Session title"),
+      ),
+    );
+    const shell = container.firstElementChild!;
+    const strip = shell.firstElementChild!;
+    expect(strip.matches(dragSelector)).toBe(true);
+    expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
+    unmarkMacShell();
+    expect(strip.matches(dragSelector)).toBe(false);
   });
 });
 
@@ -1001,10 +1152,8 @@ describe("index.css electron-mac sidebar header", () => {
     expect(brandRule).toContain("display: none");
   });
 
-  it("collapses the emptied header row instead of leaving a dead band", () => {
-    // Both the wordmark and the cluster are gone from this row on mac, so a
-    // 3rem row would reintroduce the empty strip this change set out to remove.
-    expect(headerRowRule).toContain("height: 2.25rem");
+  it("reserves the entire drag band before the sidebar content", () => {
+    expect(headerRowRule).toContain("height: 3rem");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1044,18 +1193,12 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("floats the peek card below the title-bar controls", () => {
-    // The card's own inset-2 would put its first row level with the lights and
-    // the icon cluster, so it slides up UNDER the window controls. Its top edge
-    // must clear the 2.25rem strip (2.75rem = strip + the same 0.5rem gap the
-    // card's other edges use).
-    expect(peekCardRule).toContain("top: 2.75rem");
+    expect(peekCardRule).toContain("top: 3.5rem");
   });
 
   it("drops the header row inside the peek card", () => {
-    // The row reserves the title-bar strip for the lights and cluster, which
-    // only applies to the docked sidebar starting at y=0. The peek card already
-    // floats clear of all of it, so the row is 2.25rem of empty canvas above the
-    // first entry — the content should line up against the card's own padding.
+    // The peek card already clears the title bar, so its content starts
+    // against its own top padding without another reserved header row.
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
@@ -1068,7 +1211,7 @@ describe("index.css electron-mac sidebar header", () => {
   it("pushes the settings sidebar's Back row below the lights", () => {
     // /settings swaps the header row out entirely; without this its Back row
     // would sit underneath the window controls.
-    expect(settingsHeaderRule).toContain("padding-top: 2.75rem");
+    expect(settingsHeaderRule).toContain("padding-top: 3.5rem");
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
@@ -1107,7 +1250,8 @@ describe("index.css electron-mac sidebar header", () => {
  * (z above the rail) then covers that corner — the lights sit over IT, and the
  * strip starts to the sidebar's right with nothing to clear — so the clearance
  * must drop, or the padding shoves the tabs into the middle. The rule keys off
- * `data-sidebar-open` on the app shell (set by AppShell) to do this; asserted at
+ * `data-sidebar-open` on the app shell (set by AppShell) under the
+ * `data-electron-mac` root (set on <html> at boot); asserted at
  * the CSS level because the lights are painted by macOS OUTSIDE the page, so no
  * DOM test or screenshot can see them. This selector IS the alignment.
  */
@@ -1120,7 +1264,10 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .trim();
 
-  function makeStrip(shellAttrs: Record<string, string>): HTMLElement {
+  afterEach(() => document.documentElement.removeAttribute("data-electron-mac"));
+
+  function makeStrip(macShell: boolean, shellAttrs: Record<string, string> = {}): HTMLElement {
+    if (macShell) document.documentElement.setAttribute("data-electron-mac", "true");
     const shell = document.createElement("div");
     shell.className = "app-shell";
     for (const [k, v] of Object.entries(shellAttrs)) shell.setAttribute(k, v);
@@ -1141,7 +1288,7 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {
-    const strip = makeStrip({ "data-electron-mac": "true" });
+    const strip = makeStrip(true);
     expect(strip.matches(selector)).toBe(true);
     strip.closest(".app-shell")?.remove();
   });
@@ -1149,13 +1296,13 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
   it("drops the clearance once the sidebar is reopened over the maximized rail", () => {
     // The exact bug: sidebar open covers the window corner, so the 10.5rem
     // padding has nothing to clear and would push the tabs into the middle.
-    const strip = makeStrip({ "data-electron-mac": "true", "data-sidebar-open": "true" });
+    const strip = makeStrip(true, { "data-sidebar-open": "true" });
     expect(strip.matches(selector)).toBe(false);
     strip.closest(".app-shell")?.remove();
   });
 
   it("never clears in a plain browser (no lights to avoid)", () => {
-    const strip = makeStrip({});
+    const strip = makeStrip(false);
     expect(strip.matches(selector)).toBe(false);
     strip.closest(".app-shell")?.remove();
   });
