@@ -49,7 +49,7 @@ jobs:
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pattern='^(web/|omnigent/server/|dev/benchmarks/|tests/benchmarks/|\.github/actions/setup-(pnpm|uv)/|\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)'
+          pattern='^(web/|omnigent/(server|stores)/|dev/benchmarks/|tests/benchmarks/|\.github/actions/setup-(pnpm|uv)/|\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)'
           if grep -qE "$pattern" <<< "$files"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
           else

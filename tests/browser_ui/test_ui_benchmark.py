@@ -13,7 +13,12 @@ import pytest
 from playwright.async_api import Browser, BrowserContext, Route, async_playwright
 
 from dev.benchmarks.omnigent.environment import BenchEnvironment
-from dev.benchmarks.ui.run import _MIN_ELEMENTS, _TRANSCRIPT_TURNS, measure_scenario
+from dev.benchmarks.ui.run import (
+    _MIN_ELEMENTS,
+    _TRANSCRIPT_TURNS,
+    measure_scenario,
+    measure_typing,
+)
 from tests._helpers.async_thread import run_in_fresh_loop
 
 # Keep the synchronous suite's event loop alive even when this file runs alone.
@@ -48,7 +53,7 @@ _BODY = (
 )
 
 
-@pytest.mark.parametrize("failure", ["http-404", "network-error"])
+@pytest.mark.parametrize("failure", ["http-404", "network-error", "aborted"])
 def test_measure_scenario_rejects_failed_static_asset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -57,7 +62,7 @@ def test_measure_scenario_rejects_failed_static_asset(
             if failure == "http-404":
                 await route.fulfill(status=404, content_type="text/css", body="")
             else:
-                await route.abort("failed")
+                await route.abort("aborted" if failure == "aborted" else "failed")
         else:
             assert route.request.url.endswith("/c/session")
             await route.fulfill(
@@ -76,6 +81,33 @@ def test_measure_scenario_rejects_failed_static_asset(
 
     run_in_fresh_loop(drive())
     assert (tmp_path / "asset.failed.png").is_file()
+
+
+def test_measure_typing_rejects_lost_keystroke(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(route: Route) -> None:
+        await route.fulfill(
+            content_type="text/html",
+            body="""<textarea aria-label="Message the agent"></textarea><script>
+                let insertions = 0;
+                document.querySelector('textarea').addEventListener('beforeinput', event => {
+                    if (event.inputType === 'insertText' && ++insertions === 2) {
+                        event.preventDefault();
+                    }
+                });
+                </script>""",
+        )
+
+    async def drive() -> None:
+        async with _routed_browser(monkeypatch, handler) as browser:
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto(_ENV.base_url)
+            cdp = await context.new_cdp_session(page)
+            await cdp.send("Performance.enable")
+            with pytest.raises(RuntimeError, match="Composer lost or changed keystroke 2"):
+                await measure_typing(page, cdp, 2)
+
+    run_in_fresh_loop(drive())
 
 
 @pytest.mark.parametrize("mode", ["browser", "mac_css"])

@@ -13,7 +13,9 @@ import yaml
 
 _ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOW = yaml.safe_load((_ROOT / ".github/workflows/benchmark-ui.yml").read_text())
-_DETECT = _WORKFLOW["jobs"]["detect"]["steps"][0]["run"]
+_DETECT = next(
+    step["run"] for step in _WORKFLOW["jobs"]["detect"]["steps"] if step.get("id") == "changes"
+)
 
 
 @pytest.mark.skipif(not shutil.which("bash") or not shutil.which("jq"), reason="Needs bash and jq")
@@ -23,6 +25,7 @@ _DETECT = _WORKFLOW["jobs"]["detect"]["steps"][0]["run"]
         ([], False, "false"),
         ([{"filename": "web/src/index.css"}], False, "true"),
         ([{"filename": "omnigent/server/app.py"}], False, "true"),
+        ([{"filename": "omnigent/stores/file_store/sqlalchemy_store.py"}], False, "true"),
         ([{"filename": "docs/ui.md"}], False, "false"),
         (
             [{"filename": "docs/styles.css", "previous_filename": "web/src/index.css"}],
@@ -42,7 +45,17 @@ _DETECT = _WORKFLOW["jobs"]["detect"]["steps"][0]["run"]
             "true",
         ),
     ],
-    ids=("empty", "ui", "server", "docs", "rename-out", "rename-in", "api-error", "large-pr"),
+    ids=(
+        "empty",
+        "ui",
+        "server",
+        "stores",
+        "docs",
+        "rename-out",
+        "rename-in",
+        "api-error",
+        "large-pr",
+    ),
 )
 def test_detect_ui_benchmark_changes(
     tmp_path: Path, files: list[dict[str, str]], api_failure: bool, expected: str
