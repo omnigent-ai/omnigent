@@ -10,7 +10,7 @@ the generic idle-watcher signature (``omnigent.inner.terminal`` /
 
 No Cursor login is needed: an unauthenticated cursor-agent stays on its "Press
 any key to log in..." screen until it is killed. Cursor sibling of
-``test_pi_main_terminal_tmux_disappears_e2e``; reuses its helpers.
+``test_pi_main_terminal_tmux_disappears_e2e``; shares the e2e log and host helpers.
 
     .venv/bin/python -m pytest tests/e2e/test_cursor_main_terminal_tmux_disappears_e2e.py -v
 """
@@ -36,8 +36,8 @@ import yaml
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests._helpers.native_session import create_native_session
-from tests.e2e.helpers import POLL_INTERVAL_S
-from tests.e2e.test_pi_main_terminal_tmux_disappears_e2e import (
+from tests.e2e.helpers import (
+    POLL_INTERVAL_S,
     _scan_home_logs_for,
     _terminal_resource_present,
     _wait_for_host_online,

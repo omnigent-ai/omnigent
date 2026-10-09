@@ -70,7 +70,12 @@ import yaml
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.e2e.helpers import POLL_INTERVAL_S
+from tests.e2e.helpers import (
+    POLL_INTERVAL_S,
+    _scan_home_logs_for,
+    _terminal_resource_present,
+    _wait_for_host_online,
+)
 from tests.e2e.test_pi_native_unmanaged_model import (
     _OBSERVER_EXTENSION_NAME,
     _OBSERVER_EXTENSION_SOURCE,
@@ -169,19 +174,6 @@ def _capture_terminal_panes() -> str:
     return "\n".join(blocks) if blocks else "<no omnigent tmux terminals present>"
 
 
-def _scan_home_logs_for(home: Path, pattern: re.Pattern[str], *, session_id: str) -> str | None:
-    """Find the signature in this session's runner logs, excluding earlier retries."""
-    for log_path in home.rglob(f"runner-{session_id}-*.log"):
-        try:
-            text = log_path.read_text(errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            if pattern.search(line):
-                return line
-    return None
-
-
 def test_log_scan_ignores_previous_session(tmp_path: Path) -> None:
     """A failed earlier attempt must not contaminate the current session."""
     signature = "tmux unavailable after 3 consecutive probes for terminal pi:main"
@@ -267,46 +259,6 @@ def _seed_pi_home(home: Path) -> str:
         )
     )
     return host_id
-
-
-def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 45.0) -> None:
-    """Poll ``GET /v1/hosts`` until *host_id* is online.
-
-    :param client: HTTP client pointed at the server.
-    :param host_id: Host id to wait for.
-    :param timeout: Max seconds to wait.
-    :raises AssertionError: If the host never appears online.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = client.get("/v1/hosts")
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
-        except httpx.ConnectError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
-
-
-def _terminal_resource_present(client: httpx.Client, session_id: str) -> bool:
-    """Return whether the session currently exposes a ``terminal`` resource.
-
-    The pi:main terminal shows up in ``GET /v1/sessions/{id}/resources`` (the
-    runner-authoritative inventory the web UI renders as the Terminal pane).
-    When the terminal exits it is removed (``session.resource.deleted``), so a
-    transition present -> absent is the user-visible "terminal disappeared".
-
-    :param client: HTTP client pointed at the server.
-    :param session_id: Session/conversation id.
-    :returns: ``True`` while a terminal resource is listed.
-    """
-    resp = client.get(f"/v1/sessions/{session_id}/resources", timeout=30.0)
-    if resp.status_code != 200:
-        return False
-    return any(item.get("type") == "terminal" for item in resp.json().get("data", []))
 
 
 @pytest.fixture(scope="module")
