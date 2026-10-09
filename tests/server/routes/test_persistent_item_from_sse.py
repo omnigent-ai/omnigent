@@ -10,7 +10,10 @@ can't silently reopen the "tool cards vanish on refresh" bug.
 
 from __future__ import annotations
 
-from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+from omnigent.server.routes._sessions.helpers import (
+    _error_item_from_sse,
+    _extract_persistent_item_from_sse,
+)
 
 
 def _output_item_done(item: dict[str, object]) -> dict[str, object]:
@@ -131,3 +134,33 @@ def test_malformed_error_item_is_dropped() -> None:
         )
     )
     assert result is None
+
+
+def test_legacy_notice_fallback_persists_as_a_failed_turn() -> None:
+    """The adapter's fallback for servers without durable notices stays durable.
+
+    When the server cannot keep a notice item, the adapter answers the turn
+    with ``response.failed`` carrying the same guidance; that is the shape the
+    failure-persistence path has always turned into a durable ``error`` item.
+    """
+    result = _error_item_from_sse(
+        {
+            "type": "response.failed",
+            "source": "harness",
+            "response": {
+                "id": "resp_legacy",
+                "status": "failed",
+                "error": {
+                    "code": "claude_native_auth_command",
+                    "message": "Run omni setup on the host to sign in again.",
+                    "undelivered": True,
+                },
+            },
+        },
+        response_id="resp_legacy",
+    )
+    assert result is not None
+    assert result.type == "error"
+    assert result.response_id == "resp_legacy"
+    assert getattr(result.data, "code", None) == "claude_native_auth_command"
+    assert "omni setup" in getattr(result.data, "message", "")

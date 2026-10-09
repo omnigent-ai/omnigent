@@ -558,11 +558,10 @@ async def test_turn_notice_is_a_failed_turn_for_servers_without_durable_notices(
 
     A server older than 0.18.0 drops info-level error output items on persist,
     so the guidance would vanish on reload. The adapter then answers with the
-    ``response.failed`` shape every server keeps, naming the message as never
-    delivered so the queued web input settles too.
+    ``response.failed`` shape every server keeps (see
+    ``test_legacy_notice_fallback_persists_as_a_failed_turn``), naming the
+    message as never delivered so the queued web input settles too.
     """
-    from omnigent.server.routes._sessions.helpers import _error_item_from_sse
-
     conv_id = "conv_notice_legacy"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
@@ -585,10 +584,6 @@ async def test_turn_notice_is_a_failed_turn_for_servers_without_durable_notices(
     assert error["code"] == "mock_notice"
     assert "omni setup" in error["message"]
     assert error["undelivered"] is True
-    # The failed turn is what every server persists across reloads.
-    persisted = _error_item_from_sse(events[-1].data, response_id="resp_legacy")
-    assert persisted is not None and persisted.type == "error"
-    assert "omni setup" in persisted.data.message
 
 
 async def test_provider_auth_required_survives_adapter_and_sse_envelope(

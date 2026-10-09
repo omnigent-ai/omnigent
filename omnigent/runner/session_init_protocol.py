@@ -34,6 +34,13 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     inference_config: dict[str, object] | None = None
 
 
+# Additive capabilities a server advertises to runners, on ``GET /api/version``
+# and in the session-init envelope. An older server omits them, so absent means
+# unsupported and the runner keeps its legacy behaviour for that feature.
+SERVER_CAPABILITY_DURABLE_NOTICES = "durable_notices"
+SERVER_CAPABILITIES: tuple[str, ...] = (SERVER_CAPABILITY_DURABLE_NOTICES,)
+
+
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
     """Metadata a current server can send instead of runner callback reads."""
 
@@ -54,6 +61,7 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # Resume an interrupted child task in its existing native session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
+    server_capabilities: list[str] = Field(default_factory=list)
 
 
 def build_runner_session_init_payload(
@@ -72,6 +80,7 @@ def build_runner_session_init_payload(
     envelope = RunnerSessionInitEnvelope(
         protocol_version=SESSION_INIT_PROTOCOL_VERSION,
         server_version=server_version,
+        server_capabilities=list(SERVER_CAPABILITIES),
         session_id=conversation.id,
         agent_id=conversation.agent_id,
         sub_agent_name=conversation.sub_agent_name,

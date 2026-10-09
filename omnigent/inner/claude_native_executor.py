@@ -193,10 +193,9 @@ class ClaudeNativeExecutor(Executor):
             # reaches the model as a prompt. An expired login answers it with
             # "Login expired · Please run /login" — a loop. Point at the host
             # command that does re-authenticate instead of typing anything.
-            # `omni setup` covers both directions: its harness menu signs in
-            # (`claude auth login --claudeai`) and signs out (`claude auth
-            # logout`), so one pointer serves /login and /logout alike.
-            # Expected, user-remediable dead end: complete the turn instead of failing it.
+            # `omni setup` signs in (`claude auth login --claudeai`) and out
+            # (`claude auth logout`), so one pointer serves both commands. An
+            # expected, user-remediable dead end: complete the turn, don't fail it.
             yield TurnNotice(
                 message=(
                     "Claude Code's sign-in runs in its own terminal, so /login and "

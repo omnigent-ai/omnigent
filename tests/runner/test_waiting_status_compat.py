@@ -1,5 +1,5 @@
 """
-Unit tests for the runner's server-version backwards-compat gates.
+Unit tests for the runner's session.status "waiting" backwards-compat gate.
 
 The runner emits ``session.status: "waiting"`` (PR #930) only to servers new
 enough to serialize it; older servers (< 0.3.0) 500 on ``GET /v1/sessions``, so
@@ -12,10 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.runner.app import (
-    _version_supports_durable_notices,
-    _version_supports_waiting_status,
-)
+from omnigent.runner.app import _version_supports_waiting_status
 
 
 @pytest.mark.parametrize(
@@ -35,20 +32,3 @@ from omnigent.runner.app import (
 )
 def test_version_supports_waiting_status(server_version: str, expected: bool) -> None:
     assert _version_supports_waiting_status(server_version) is expected
-
-
-@pytest.mark.parametrize(
-    ("server_version", "expected"),
-    [
-        ("0.17.0", False),  # drops info-level error output items on persist
-        ("0.17.9", False),
-        ("0.18.0", True),  # first release that persists harness notices
-        ("0.18.0.dev0", True),
-        ("1.0.0", True),
-        (None, False),  # probe not yet answered: fall back to the failed-turn shape
-        ("source", False),
-        ("not-a-version", False),
-    ],
-)
-def test_version_supports_durable_notices(server_version: str | None, expected: bool) -> None:
-    assert _version_supports_durable_notices(server_version) is expected

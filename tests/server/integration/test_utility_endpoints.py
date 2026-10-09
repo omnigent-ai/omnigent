@@ -70,6 +70,8 @@ async def test_version_returns_string(client: httpx.AsyncClient) -> None:
     assert "version" in data
     assert isinstance(data["version"], str)
     assert len(data["version"]) > 0
+    # Additive capabilities runners negotiate on; an older server omits them.
+    assert "durable_notices" in data["capabilities"]
 
 
 # ── GET /v1/info ─────────────────────────────────────────

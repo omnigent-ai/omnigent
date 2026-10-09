@@ -2821,16 +2821,19 @@ def create_app(
         return result
 
     @app.get("/api/version")
-    async def version() -> dict[str, str]:
+    async def version() -> dict[str, object]:
         """
-        Return the installed omnigent package version.
+        Return the installed omnigent package version and server capabilities.
 
-        Used by the web UI to include version info in bug reports.
+        Used by the web UI to include version info in bug reports, and by
+        runners to learn which additive capabilities this server supports.
 
-        :returns: ``{"version": "<semver string>"}``,
-            e.g. ``{"version": "0.1.0"}``.
+        :returns: ``{"version": "<semver string>", "capabilities": [...]}``,
+            e.g. ``{"version": "0.1.0", "capabilities": ["durable_notices"]}``.
         """
-        return {"version": _server_version()}
+        from omnigent.runner.session_init_protocol import SERVER_CAPABILITIES
+
+        return {"version": _server_version(), "capabilities": list(SERVER_CAPABILITIES)}
 
     @app.get("/.well-known/omnigent.json")
     async def well_known_manifest() -> dict[str, object]:

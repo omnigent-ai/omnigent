@@ -352,8 +352,8 @@ class ExecutorAdapter(HarnessApp):
                     config=config,
                 ):
                     if isinstance(event, TurnNotice) and not request.durable_notices:
-                        # The server would drop the notice item on reload; answer
-                        # as the failed turn every server persists instead.
+                        # Older servers drop info notices on reload; downgrade to
+                        # the failed-turn shape they persist.
                         event = ExecutorError(
                             message=event.message, code=event.code, undelivered=True
                         )

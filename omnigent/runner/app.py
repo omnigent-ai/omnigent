@@ -154,6 +154,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.resource_routes import register_resource_routes
 from omnigent.runner.session_history import build_session_history
 from omnigent.runner.session_init_protocol import (
+    SERVER_CAPABILITY_DURABLE_NOTICES,
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
@@ -295,9 +296,6 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
-# Servers before 0.18.0 drop info-level ``error`` output items on persist, so a
-# harness notice would vanish on reload; the harness answers as a failed turn.
-_DURABLE_NOTICE_MIN_SERVER_VERSION = "0.18.0"
 # Published statuses that mean a session's terminal is still working a turn.
 # ``waiting`` is parked on user input, so it keeps the runner alive too.
 _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
@@ -305,6 +303,10 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
+# Capabilities the server advertised (``/api/version`` or the session-init
+# envelope); ``None`` until either arrives. A server that advertises none is
+# treated as supporting none, so older servers get the legacy behaviour.
+_server_capabilities: frozenset[str] | None = None
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -330,31 +332,6 @@ def _invalid_effort_response(effort: object) -> JSONResponse | None:
     )
 
 
-def _server_release_at_least(server_version: str, minimum: str, feature: str) -> bool:
-    """
-    Whether *server_version*'s PEP 440 release tuple is at least *minimum*'s.
-
-    :param server_version: The server's reported version, e.g. ``"0.2.0"`` or
-        ``"0.3.0.dev0"`` (a dev build counts as its release).
-    :param minimum: The first release with the capability, e.g. ``"0.3.0"``.
-    :param feature: Capability name for the warning on a malformed version.
-    :returns: ``True`` iff the release tuple is ``>=``; ``False`` for versions
-        that are not PEP 440 (the capability is treated as unknown).
-    """
-    from packaging.version import InvalidVersion, Version
-
-    try:
-        return Version(server_version).release >= Version(minimum).release
-    except InvalidVersion:
-        _logger.warning(
-            "server version %r is not PEP 440; treating %s support as unknown",
-            server_version,
-            feature,
-            extra={"session_id": runner_primary_session_id()},
-        )
-        return False
-
-
 def _version_supports_waiting_status(server_version: str) -> bool:
     """
     Whether *server_version* can serialize ``session.status: "waiting"``.
@@ -364,26 +341,34 @@ def _version_supports_waiting_status(server_version: str) -> bool:
     :returns: ``True`` iff the server's PEP 440 release tuple is ``>= 0.3.0``
         (the release that added "waiting" to the session-status model).
     """
-    return _server_release_at_least(
-        server_version, _WAITING_STATUS_MIN_SERVER_VERSION, "waiting status"
-    )
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return (
+            Version(server_version).release >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
+        )
+    except InvalidVersion:
+        _logger.warning(
+            "server version %r is not PEP 440; treating waiting status support as unknown",
+            server_version,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return False
 
 
-def _version_supports_durable_notices(server_version: str | None) -> bool:
+def _server_supports(capability: str) -> bool:
     """
-    Whether the server keeps a harness notice across reloads.
+    Whether the server advertised *capability*.
 
-    A notice rides the stream as an info-level ``error`` output item; servers
-    before 0.18.0 drop that item on persist, so the harness answers those (and
-    an unknown version) with a failed turn, which every server persists.
+    Capabilities are additive and negotiated, not inferred from the version: a
+    server built before a feature shipped can report the same release string.
 
-    :param server_version: The server's reported version, or ``None`` when the
-        probe has not succeeded yet.
-    :returns: ``True`` iff the version is known and its release is ``>= 0.18.0``.
+    :param capability: One of the ``SERVER_CAPABILITY_*`` names, e.g.
+        ``"durable_notices"``.
+    :returns: ``True`` iff the server listed it; ``False`` when it did not or no
+        version probe/envelope has arrived yet.
     """
-    return server_version is not None and _server_release_at_least(
-        server_version, _DURABLE_NOTICE_MIN_SERVER_VERSION, "durable notice"
-    )
+    return _server_capabilities is not None and capability in _server_capabilities
 
 
 async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
@@ -398,13 +383,20 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
     :returns: The server's reported version (e.g. ``"0.2.0"``), or ``None`` when
         the probe has not yet succeeded.
     """
-    global _server_version
+    global _server_version, _server_capabilities
     if _server_version is not None:
         return _server_version
     try:
         resp = await server_client.get("/api/version")
         resp.raise_for_status()
-        _server_version = resp.json()["version"]
+        payload = resp.json()
+        raw_capabilities = payload.get("capabilities")
+        _server_capabilities = frozenset(
+            c
+            for c in (raw_capabilities if isinstance(raw_capabilities, list) else [])
+            if isinstance(c, str)
+        )
+        _server_version = payload["version"]
         _logger.info(
             "resolved server version: %s",
             _server_version,
@@ -2118,8 +2110,9 @@ def create_runner_app(
             raise ValueError("session initialization envelope identity mismatch")
         validate_runner_inference_config(envelope.snapshot.inference_config)
 
-        global _server_version
+        global _server_version, _server_capabilities
         _server_version = envelope.server_version
+        _server_capabilities = frozenset(envelope.server_capabilities)
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
@@ -5085,10 +5078,9 @@ def create_runner_app(
             )
         harness_body.update(input_attributes(msg_body))
         # Lets the adapter answer a TurnNotice as a notice item only when this
-        # server persists one; see _version_supports_durable_notices.
-        harness_body["durable_notices"] = _version_supports_durable_notices(
-            await _get_server_version(server_client)
-        )
+        # server persists one; servers that never advertised it get a failed turn.
+        await _get_server_version(server_client)
+        harness_body["durable_notices"] = _server_supports(SERVER_CAPABILITY_DURABLE_NOTICES)
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union

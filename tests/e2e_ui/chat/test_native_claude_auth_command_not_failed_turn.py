@@ -126,8 +126,6 @@ def test_auth_slash_command_is_not_a_failed_turn(
         headline_text = headline.inner_text()
         headline.click()
         detail = pill.get_by_test_id("error-message-content").inner_text()
-        # Keep the expanded guidance on screen long enough for the recording.
-        page.wait_for_timeout(2_000)
         pytest.fail(
             f"{command} surfaced as a failed turn (session status {status!r}): "
             f"destructive error pill {headline_text!r} with the guidance hidden "

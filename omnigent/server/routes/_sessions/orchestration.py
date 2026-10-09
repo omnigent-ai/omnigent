@@ -3236,21 +3236,15 @@ async def _settle_undelivered_native_input(
     response_id: str | None,
     input_stable_id: str | None,
     *,
-    outcome: str = "reported_undelivered",
+    outcome: Literal["reported_undelivered", "answered_by_notice"] = "reported_undelivered",
 ) -> None:
     """
     Commit a native turn's own queued web message as a user item.
 
-    Only native-terminal sessions queue web messages: the transcript forwarder
-    normally mirrors each one back and drains its entry. When the runner names
-    the message a turn carried (``input_stable_id``) on a failure the harness
-    never received, or on a notice that answers the message in the harness's
-    place, an entry still queued under that id will never be mirrored. Left in
-    the queue it lingers for the TTL, keeps the idle session listed as running,
-    and the next mirrored message drains it instead of its own, so the
-    transcript shows the reply above a still-queued bubble and the message
-    vanishes on reload. Settlement is by identity, never by queue order: a turn
-    that fails after its message was mirrored (entry already drained) settles
+    Settles failures and notices by stable input id when they bypass transcript
+    mirroring, so an answered message neither stays queued (listing the idle
+    session as running) nor vanishes on reload. Settlement is by identity, never
+    by queue order: a turn that fails after its message was mirrored settles
     nothing, so a later message still buffered in the runner keeps its own entry.
 
     :param conversation_store: Store to append to; ``None`` skips persistence.
