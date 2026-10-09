@@ -15,6 +15,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
 import * as host from "@/lib/host";
+import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -124,6 +125,8 @@ afterEach(() => {
   act(() => toast.dismiss());
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  setSessionHost("conv_abc", null);
 });
 
 describe("buildAttachPath", () => {
@@ -1360,6 +1363,21 @@ describe("automatic reconnect", () => {
     // callback-ref cleanup, so a missing dispose here means every
     // retry leaks an xterm instance and its listeners.
     expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
+  });
+
+  it("retries a rollout routing miss with the same OSS host key", async () => {
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    setSessionHost("conv_abc", "host_oss");
+    await renderAndAttach();
+    const firstUrl = terminalSessionMock.instances[0].url;
+    expect(new URL(firstUrl).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+
+    closeNewest(4400);
+    await elapse(RECONNECT_BACKOFF_MS[0]);
+
+    expect(terminalSessionMock.instances).toHaveLength(2);
+    expect(terminalSessionMock.instances[1].url).toBe(firstUrl);
+    expect(isHostKeyless("host_oss")).toBe(false);
   });
 
   it("re-dials after a code-less close (1005) — the redeploy-behind-ingress case", async () => {

@@ -17,7 +17,12 @@ import {
   isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
 } from "@/lib/terminalClipboardWriter";
-import { getOmnigentServerIdentity, isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
+import {
+  getOmnigentServerIdentity,
+  isDatabricksWorkspace,
+  isHostRoutingEnabled,
+  resolveWebSocketUrl,
+} from "@/lib/host";
 import {
   canRememberTerminalClipboardPreference,
   readTerminalClipboardPreference,
@@ -543,14 +548,13 @@ export function TerminalView({
         if (superseded()) return;
         // Route this WS to the replica holding the session's runner tunnel
         // (key = the session's host_id). A browser WS can't set request
-        // headers, so the key rides the query string. Only against a
-        // Databricks workspace-hosted server — an unsharded server needs no key,
-        // and a hostless session yields none. The direct URL needs no key: it
-        // bypasses the server entirely.
+        // headers, so the key rides the query string when host routing is on.
+        // A hostless session or direct connection needs no routing key.
         const computedHostId = (() => {
-          if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
+          if (!isHostRoutingEnabled()) return undefined;
+          if (isDatabricksWorkspace() && keylessRef.current) return undefined;
           const h = getSessionHost(sessionId);
-          return h && !isHostKeyless(h) ? h : undefined;
+          return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
         const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
@@ -674,7 +678,7 @@ export function TerminalView({
     // immediately without backoff (the correct route is one handshake away).
     // One-shot: if we're ALREADY keyless and still get 4400, the host is
     // genuinely unreachable from here — stop, don't loop.
-    if (state.code === WS_CLOSE_WRONG_REPLICA) {
+    if (state.code === WS_CLOSE_WRONG_REPLICA && isDatabricksWorkspace()) {
       if (keylessRef.current) {
         setReconnectPending(false);
         return;
@@ -687,7 +691,7 @@ export function TerminalView({
       setConnectAttempt((attempt) => attempt + 1);
       return;
     }
-    if (!isUnexpectedTerminalClose(state.code)) {
+    if (state.code !== WS_CLOSE_WRONG_REPLICA && !isUnexpectedTerminalClose(state.code)) {
       setReconnectPending(false);
       return;
     }

@@ -234,6 +234,11 @@ export function isDatabricksWorkspace(): boolean {
   return hostConfig.fetcher != null || import.meta.env.VITE_DATABRICKS_WORKSPACE === "true";
 }
 
+/** Whether the deployment routes host and runner traffic by host ID. */
+export function isHostRoutingEnabled(): boolean {
+  return isDatabricksWorkspace() || import.meta.env.VITE_OMNIGENT_HOST_ROUTING === "true";
+}
+
 /**
  * The host-provided user search function, or `undefined` when none is
  * configured. Consumers use the absence to stay inert (plain text input).

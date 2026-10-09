@@ -1,0 +1,97 @@
+# Disposable local database. Never use these credentials for a public deployment.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database
+  namespace: omnigent-prototype
+stringData:
+  POSTGRES_PASSWORD: prototype-only
+  DATABASE_URL: postgresql+psycopg://omnigent:prototype-only@postgres:5432/omnigent
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres
+  namespace: omnigent-prototype
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: omnigent-prototype
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          envFrom:
+            - secretRef:
+                name: database
+          env:
+            - name: POSTGRES_USER
+              value: omnigent
+            - name: POSTGRES_DB
+              value: omnigent
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, omnigent]
+            periodSeconds: 2
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: omnigent-prototype
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# Run once before starting the replicas, avoiding concurrent schema creation.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: omnigent-prototype
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: omnigent-server:nginx-prototype
+          imagePullPolicy: Never
+          envFrom:
+            - secretRef:
+                name: database
+          command:
+            - python
+            - -c
+            - "import os; from entrypoint import run_migrations; run_migrations(os.environ['DATABASE_URL'])"
