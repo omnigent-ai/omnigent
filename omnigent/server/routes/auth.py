@@ -511,6 +511,7 @@ def create_auth_router(
         # set_admin UPDATE inside promote_if_listed matches a row.
         if permission_store is not None:
             permission_store.ensure_user(email)
+            permission_store.mark_logged_in(email, int(time.time()))
             promote_if_listed(admin_list, permission_store, email)
 
         # A native sign-in gets a one-time code at its redirect URI;
