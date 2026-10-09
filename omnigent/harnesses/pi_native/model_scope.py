@@ -21,10 +21,12 @@ Patterns that match nothing select nothing; Pi treats an entirely unmatched
 scope as "no curation", so callers should fall back to the unscoped catalog
 when the result is empty. Like minimatch, a character class the regex engine
 rejects (e.g. a reversed range ``[z-a]``) makes its pattern match nothing
-rather than raise.
+rather than raise. Brace expansion and backslash escapes inside ``[...]`` are
+not mirrored; model-id ``enabledModels`` patterns do not use them in practice.
 
-Verified against Pi 0.85.1 (``core/model-resolver.js``, minimatch 10);
-re-verify when the pinned Pi resolver changes.
+Verified against Pi 0.84.2 (the e2e CI pin in ``.github/ci-deps``) and 0.85.1:
+``core/model-resolver.js`` ``resolveModelScopeFromModels`` (minimatch 10) is
+unchanged between them. Re-verify when the pinned Pi resolver changes.
 """
 
 from __future__ import annotations

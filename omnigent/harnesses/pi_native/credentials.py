@@ -502,15 +502,14 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
         scoped = scope_models(patterns, entries)
         if scoped:
             entries = scoped
-    options: dict[str, dict[str, object]] = {
-        entry.reference: {
+    return [
+        {
             "id": entry.reference,
             "model": entry.reference,
             "displayName": entry.name or entry.model_id,
         }
-        for entry in entries
-    }
-    return [options[reference] for reference in sorted(options)]
+        for entry in sorted(entries, key=lambda entry: entry.reference)
+    ]
 
 
 def pi_own_login_model_arg(selection: str) -> str | None:

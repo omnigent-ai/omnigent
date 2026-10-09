@@ -92,11 +92,8 @@ async def _drive_curated_pi_picker(base_url: str, session_id: str) -> None:
                 agents_body=_pi_native_agents_body(),
             )
 
-            # Neutralize agent discovery so only the stubbed built-in Pi shows
-            # (sibling pi-native drivers do the same): the landing picker merges
-            # `/v1/agents` with agents found by scanning the caller's sessions,
-            # and leftover sessions on the shared e2e_ui server would otherwise
-            # leak in and auto-select ahead of Pi.
+            # Stub the agent scan empty so leftover shared-server sessions
+            # don't leak into the landing picker ahead of the stubbed built-in Pi.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,

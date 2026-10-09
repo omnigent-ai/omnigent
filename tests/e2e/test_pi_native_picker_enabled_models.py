@@ -74,9 +74,7 @@ _WORKTREE = Path(__file__).resolve().parents[2]
 # a thousand-row union around it.
 _ENABLED_MODEL = "anthropic/claude-sonnet-4-5"
 
-# The multi-vendor catalog a real openrouter login maintains in
-# models-store.json — the report names "Mercury, Ling, Nex AGI, Mistral
-# `:batch` variants, 'Z.ai: GLM 5.3 (batch)'-style names" among hundreds.
+# Shape of a real openrouter login's multi-vendor models-store.json catalog.
 _OPENROUTER_VENDORS: list[tuple[str, str]] = [
     ("mercury", "Mercury"),
     ("ling", "Ling"),
@@ -219,9 +217,8 @@ def _seed_multi_login_pi_home(home: Path) -> str:
             }
         )
     )
-    # Pi's own curation mechanism: settings.json enabledModels. Pi's Ctrl+P
-    # cycling honors this (interactive-mode -> resolveModelScopeFromModels);
-    # the bug is that neither Omnigent picker does.
+    # settings.json enabledModels is Pi's own curation; both Omnigent pickers
+    # must honor it (as Pi's Ctrl+P cycling does).
     (pi_agent / "settings.json").write_text(json.dumps({"enabledModels": [_ENABLED_MODEL]}))
     return host_id
 

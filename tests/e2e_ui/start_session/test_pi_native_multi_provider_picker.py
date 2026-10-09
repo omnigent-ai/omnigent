@@ -34,6 +34,7 @@ cleanly when any is absent.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -81,8 +82,8 @@ pytestmark = [
     ),
 ]
 
-# The single model the host's Pi is curated to via settings.json enabledModels.
-# A correct picker would scope to this; the bug lists every provider's catalog.
+# The single model Pi is curated to via settings.json enabledModels; both
+# pickers must scope to exactly this.
 _CURATED_MODEL = "anthropic/claude-sonnet-4-5"
 
 # Leaked runner/zygote env would send the daemon's spawned runner down the
@@ -374,10 +375,15 @@ def _launch_pi_session_with_pushed_catalog(host: _MultiProviderPiHost) -> str:
                 if options:
                     break
             time.sleep(1.5)
-    assert options, (
-        f"pi-native session {session_id!r} never pushed a model catalog; "
-        "the in-session Model picker stayed empty"
-    )
+        if not options:
+            # Delete the session before raising; otherwise its pi/tmux tree
+            # lingers until daemon teardown.
+            with contextlib.suppress(httpx.HTTPError):
+                client.delete(f"/v1/sessions/{session_id}", timeout=10.0)
+            raise AssertionError(
+                f"pi-native session {session_id!r} never pushed a model catalog; "
+                "the in-session Model picker stayed empty"
+            )
     return session_id
 
 
@@ -554,4 +560,7 @@ async def _wait_for_rows(rows: Any, *, minimum: int, timeout_s: float = 30.0) ->
     while time.monotonic() < deadline:
         if await rows.count() >= minimum:
             return
-        time.sleep(0.25)
+        # Yield to the event loop so route handlers and in-flight locator work
+        # keep progressing between polls (a blocking sleep would stall them).
+        await asyncio.sleep(0.25)
+    raise AssertionError(f"model picker never rendered {minimum} row(s) within {timeout_s}s")
