@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import threading
 import uuid
@@ -12586,6 +12587,283 @@ async def test_message_forward_failure_surfaces_runner_unavailable(
             f"Expected 503 RUNNER_UNAVAILABLE when runner forward fails, "
             f"got {resp.status_code}: {resp.text}"
         )
+
+
+async def _prepare_reconnect_forward(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    """Create a runner-pinned session and silence the relay heartbeat.
+
+    Shared setup for the message-forward reconnect cases; each test supplies its
+    own runner handler and router patches for the outcome it asserts.
+    """
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(session["id"], "sdk-runner")
+    # A MockTransport runner never emits the relay's ready heartbeat; the relay
+    # has its own coverage.
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    return session["id"]
+
+
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_message_forward_repeats_after_the_runner_tunnel_reconnects(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    drop_kind: str,
+) -> None:
+    """
+    A forward cut by a runner tunnel drop waits for the runner and is repeated, not failed.
+
+    The runner behind a dropped tunnel is usually alive and re-registers within
+    seconds, and the server replays the persisted message on reconnect anyway.
+    Answering the send with 503 ``runner_unavailable`` on the drop therefore
+    showed the user a delivery failure for a message that went through. Both
+    shapes the tunnel transport raises qualify: the bare ``ConnectionError`` of
+    a drop under the in-flight request and the ``httpx.ConnectError`` of a
+    runner already deregistered when the request is sent. The latter never
+    reached the runner, so it is repeated without the dedup-epoch check that
+    guards the in-flight shape.
+    """
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+
+    sid = await _prepare_reconnect_forward(client, db_uri, monkeypatch)
+    forwards: list[dict[str, Any]] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwards.append(json.loads(request.content))
+            if len(forwards) > 1:
+                return httpx.Response(202, json={"status": "accepted"})
+            if drop_kind == "tunnel_closed":
+                # What WSTunnelTransport raises when the tunnel dies under the request.
+                raise ConnectionError("tunnel closed before request completed")
+            raise httpx.ConnectError("runner 'sdk-runner' is offline", request=request)
+        return httpx.Response(200, json={})
+
+    wait_for_runner = AsyncMock(return_value=True)
+    monkeypatch.setattr(RunnerRouter, "wait_for_runner", wait_for_runner)
+    # The reconnected runner advertises forward dedup and keeps the same dedup
+    # epoch, so the process that took the forward is back and the repeat is safe.
+    monkeypatch.setattr(RunnerRouter, "runner_supports", lambda self, rid, cap: True)
+    # A deregistered runner has no registry entry, so the offline shape reads no
+    # epoch before the first post; the reconnected process then advertises one.
+    epochs = iter([None, "boot-1"] if drop_kind == "runner_offline" else ["boot-1", "boot-1"])
+    monkeypatch.setattr(RunnerRouter, "runner_dedup_epoch", lambda self, rid: next(epochs))
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "deliver this across the recycle"}],
+                },
+            },
+        )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["queued"] is True
+    wait_for_runner.assert_awaited_once_with(
+        "sdk-runner", timeout_s=orchestration_module._RUNNER_FORWARD_RECONNECT_GRACE_S
+    )
+    # The repeat carries the same persisted item, which the runner uses to dedupe it.
+    assert [forward["persisted_item_id"] for forward in forwards] == [resp.json()["item_id"]] * 2
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert [item["type"] for item in items] == ["message"]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Message forward lost the runner tunnel" in message for message in messages)
+    assert not any("Forward to runner failed" in message for message in messages)
+
+
+@pytest.mark.parametrize("why", ["runner_lacks_dedup", "runner_restarted", "runner_stays_down"])
+async def test_message_forward_is_not_repeated_when_the_repeat_cannot_be_safe(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    why: str,
+) -> None:
+    """
+    A drop whose repeat cannot be made safe still fails the send as before, after one forward.
+
+    Repeating a forward is safe only while the process that may have taken it
+    is back and can dedup the repeat. Three ways that fails: the reconnected
+    runner predates the forward-dedup capability; a same-id runner restarted
+    within the grace and advertises a fresh dedup epoch over an empty ledger;
+    or the runner never re-registers. Each falls back to 503
+    ``runner_unavailable`` and leaves the persisted message for the reconnect
+    replay, which the runner performs itself, so the turn runs exactly once.
+    """
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+
+    sid = await _prepare_reconnect_forward(client, db_uri, monkeypatch)
+    forwards = 0
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        nonlocal forwards
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwards += 1
+            raise ConnectionError("tunnel closed before request completed")
+        return httpx.Response(200, json={})
+
+    wait_for_runner = AsyncMock(return_value=why != "runner_stays_down")
+    monkeypatch.setattr(RunnerRouter, "wait_for_runner", wait_for_runner)
+    monkeypatch.setattr(
+        RunnerRouter, "runner_supports", lambda self, rid, cap: why != "runner_lacks_dedup"
+    )
+    # The epoch read before the drop and after the reconnect; a restarted
+    # process presents a new one over an empty dedup ledger.
+    epochs = iter(["boot-old", "boot-new"] if why == "runner_restarted" else ["boot-1", "boot-1"])
+    monkeypatch.setattr(RunnerRouter, "runner_dedup_epoch", lambda self, rid: next(epochs))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"]["code"] == "runner_unavailable"
+    wait_for_runner.assert_awaited_once_with(
+        "sdk-runner", timeout_s=orchestration_module._RUNNER_FORWARD_RECONNECT_GRACE_S
+    )
+    # One attempt only; the persisted message remains for the reconnect replay.
+    assert forwards == 1
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert [item["type"] for item in items] == ["message"]
+
+
+@pytest.mark.parametrize("session_kind", ["default", "sub_agent"])
+async def test_message_forward_reconnect_checks_follow_the_runner_the_client_addresses(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    session_kind: str,
+) -> None:
+    """
+    The reconnect wait and dedup checks name the runner the forward actually goes to.
+
+    The send handler resolves the runner client early and refreshes the
+    conversation row later; a host restart, or a sub-agent's parent-binding
+    repair, can rebind the session to another runner in between. The forward
+    still travels through the first client, so waiting on the newly bound
+    runner and reading its capability and epoch would let that runner's dedup
+    guarantee authorize a repeat into the old one. Every check must follow the
+    client's runner, and the mismatch is logged.
+    """
+    from omnigent.runner.routing import RunnerRouter
+
+    store = SqlAlchemyConversationStore(db_uri)
+    sid = await _prepare_reconnect_forward(client, db_uri, monkeypatch)
+    rebound = [sid]
+    if session_kind == "sub_agent":
+        # A child inherits its parent's runner; a parent relaunch repoints both.
+        parent = store.get_conversation(sid)
+        assert parent is not None
+        child = store.create_conversation(
+            kind="sub_agent",
+            title="worker:child",
+            parent_conversation_id=sid,
+            agent_id=parent.agent_id,
+            runner_id="sdk-runner",
+        )
+        rebound.append(child.id)
+        sid = child.id
+    forwards: list[dict[str, Any]] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwards.append(json.loads(request.content))
+            if len(forwards) > 1:
+                return httpx.Response(202, json={"status": "accepted"})
+            raise ConnectionError("tunnel closed before request completed")
+        return httpx.Response(200, json={})
+
+    checked: dict[str, list[str]] = {"wait": [], "supports": [], "epoch": []}
+
+    async def wait_for_runner(self: RunnerRouter, runner_id: str, *, timeout_s: float) -> bool:
+        del self, timeout_s
+        checked["wait"].append(runner_id)
+        return True
+
+    def runner_supports(self: RunnerRouter, runner_id: str, capability: str) -> bool:
+        del self, capability
+        checked["supports"].append(runner_id)
+        return True
+
+    def runner_dedup_epoch(self: RunnerRouter, runner_id: str) -> str:
+        del self
+        checked["epoch"].append(runner_id)
+        return "boot-1"
+
+    monkeypatch.setattr(RunnerRouter, "wait_for_runner", wait_for_runner)
+    monkeypatch.setattr(RunnerRouter, "runner_supports", runner_supports)
+    monkeypatch.setattr(RunnerRouter, "runner_dedup_epoch", runner_dedup_epoch)
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as fake_runner:
+        # The fake stands in for the tunnel client the router hands out for
+        # ``sdk-runner``; the handler holds it before the rebinding lands.
+        monkeypatch.setitem(app.state.runner_router._clients, "sdk-runner", fake_runner)
+
+        async def resolve(
+            session_id: str, runner_router: object, *, conversation: Any = None
+        ) -> httpx.AsyncClient:
+            del runner_router, conversation
+            assert session_id == sid
+            for conv_id in rebound:
+                store.replace_runner_id(conv_id, "runner-b")
+            return fake_runner
+
+        monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", resolve)
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+
+    assert resp.status_code == 202, resp.text
+    # The refresh landed (the row names the new runner), yet every reconnect
+    # check named the runner the client addresses and the repeat went there.
+    refreshed = store.get_conversation(sid)
+    assert refreshed is not None and refreshed.runner_id == "runner-b"
+    assert checked == {
+        "wait": ["sdk-runner"],
+        "supports": ["sdk-runner"],
+        "epoch": ["sdk-runner", "sdk-runner"],
+    }
+    assert [forward["persisted_item_id"] for forward in forwards] == [resp.json()["item_id"]] * 2
+    assert any(
+        "addresses runner sdk-runner while the session is now bound to runner-b"
+        in record.getMessage()
+        for record in caplog.records
+    )
 
 
 async def test_message_forward_rejection_surfaces_failed_with_reason(

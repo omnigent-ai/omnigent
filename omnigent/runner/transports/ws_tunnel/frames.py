@@ -78,6 +78,12 @@ class HelloFrame:
     :param connection_id: Runner-minted identifier for this connection
         attempt, stamped on both ends' tunnel debug-log rows. ``None``
         from runners that predate it.
+    :param dedup_epoch: Opaque token identifying the lifetime of this runner
+        process's in-memory message-forward dedup cache. Stable across tunnel
+        reconnects by the same process and regenerated on restart, so the
+        server repeats a forward only while the advertising process — and its
+        cache — is still on the other end. ``None`` from runners that predate
+        the forward-dedup capability.
     """
 
     runner_version: str
@@ -89,6 +95,7 @@ class HelloFrame:
     direct_attach_token: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    dedup_epoch: str | None = None
 
 
 @dataclass
@@ -206,6 +213,10 @@ class WSCloseFrame:
 # not tunneled HTTP responses or terminal WebSocket channel frames.
 EVENT_INGEST_CAPABILITY = "session-event-ingest-v1"
 
+# Hello capability: this runner deduplicates a repeated message forward by the
+# item's persisted id, so the server may safely retry one across a reconnect.
+FORWARD_DEDUP_CAPABILITY = "message-forward-dedup-v1"
+
 
 @dataclass
 class EventReadyFrame:
@@ -270,6 +281,8 @@ def encode_frame(frame: Frame) -> str:
             payload["capabilities"] = list(frame.capabilities)
         if frame.connection_id:
             payload["connection_id"] = frame.connection_id
+        if frame.dedup_epoch:
+            payload["dedup_epoch"] = frame.dedup_epoch
         # Emitted only when the listener is actually up, so old servers
         # (which ignore unknown keys) and advert-less runners share one
         # wire shape.
@@ -517,6 +530,7 @@ def _decode_hello(msg: _JsonObject) -> HelloFrame:
         direct_attach_token=direct_token,
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_str(msg, "connection_id", "") or None,
+        dedup_epoch=_optional_str(msg, "dedup_epoch", "") or None,
     )
 
 

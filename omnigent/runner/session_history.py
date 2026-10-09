@@ -22,6 +22,36 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 _logger = logging.getLogger("omnigent.runner.app")
 
 
+def pending_user_item_ids(items: list[_JsonObject]) -> list[str]:
+    """Server item ids of the unanswered user messages at the tail of ``items``.
+
+    A reconnect recovery turn answers every user message that trails the last
+    completed turn at once, so dedup must key on all of them, not just the last
+    — otherwise a repeated forward of an earlier pending message reads as new
+    input and runs a second time. Non-input items the history conversion drops
+    (e.g. reasoning) are skipped; an assistant reply, tool call, tool output,
+    error, or compaction ends the pending run.
+    """
+    ids: list[str] = []
+    for item in reversed(items):
+        item_type = item.get("type")
+        if item_type == "message" and item.get("role") == "user":
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                ids.append(item_id)
+            continue
+        if item_type in (
+            "message",
+            "function_call",
+            "function_call_output",
+            "error",
+            "compaction",
+        ):
+            break
+    ids.reverse()
+    return ids
+
+
 class _LoadHistoryAsInputFn(Protocol):
     async def __call__(
         self, session_id: str, drop_item_id: str | None = None
@@ -44,6 +74,7 @@ def build_session_history(
     *,
     _background_tasks: set[asyncio.Task[Any]],
     _last_server_item_id: dict[str, str],
+    _last_server_user_item_id: dict[str, list[str]],
     _persist_cancellation_items: Callable[[str, list[_JsonObject]], Coroutine[Any, Any, None]],
     _session_histories: dict[str, list[_JsonObject]],
     _session_spec_cache: dict[str, _SpecEntry | None],
@@ -139,6 +170,12 @@ def build_session_history(
             if not page.get("has_more", False):
                 break
             after_cursor = last_id
+
+        _pending_user_ids = pending_user_item_ids(all_items)
+        if _pending_user_ids:
+            _last_server_user_item_id[session_id] = _pending_user_ids
+        else:
+            _last_server_user_item_id.pop(session_id, None)
 
         if drop_item_id is not None:
             all_items = [it for it in all_items if it.get("id") != drop_item_id]

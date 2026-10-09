@@ -295,6 +295,55 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
+    def runner_supports(self, runner_id: str, capability: str) -> bool:
+        """
+        Return whether the connected *runner_id* advertised *capability*.
+
+        :param runner_id: Runner UUID, e.g.
+            ``"runner_0123456789abcdef"``.
+        :param capability: A ``HelloFrame`` capability token, e.g.
+            ``"message-forward-dedup-v1"``.
+        :returns: ``True`` when a live session advertised it; ``False``
+            when the runner is offline or predates the capability.
+        """
+        session = self._registry.get(runner_id)
+        return session is not None and capability in session.hello.capabilities
+
+    def runner_dedup_epoch(self, runner_id: str) -> str | None:
+        """
+        Return the connected *runner_id*'s forward-dedup epoch, or ``None``.
+
+        The epoch identifies the lifetime of a runner process's in-memory
+        message-forward dedup cache: it is stable across tunnel reconnects by
+        the same process and changes when the process restarts. A caller can
+        thus tell a reconnect apart from a replacement before repeating a
+        forward the old process may already have taken.
+
+        :param runner_id: Runner UUID, e.g. ``"runner_0123456789abcdef"``.
+        :returns: The advertised epoch, or ``None`` when the runner is offline
+            or predates the forward-dedup capability.
+        """
+        session = self._registry.get(runner_id)
+        return session.hello.dedup_epoch if session is not None else None
+
+    def runner_id_for_client(self, client: httpx.AsyncClient) -> str | None:
+        """
+        Return the runner a client handed out by this router routes to.
+
+        A caller resolves its client before awaits that can rebind the session
+        to another runner, so retry logic asks the client which runner it
+        addresses instead of trusting the refreshed conversation row.
+
+        :param client: A client previously returned by this router.
+        :returns: The runner id the client was created for, or ``None`` for a
+            client this router did not create.
+        """
+        with self._lock:
+            for runner_id, cached in self._clients.items():
+                if cached is client:
+                    return runner_id
+        return None
+
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
         """
         Wait until *runner_id* has a live tunnel or *timeout_s* elapses.

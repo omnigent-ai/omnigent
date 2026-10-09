@@ -6374,6 +6374,10 @@ class _ReconnectWaitRouter:
         self.waits.append((runner_id, timeout_s))
         return self._reconnects
 
+    def runner_id_for_client(self, client: httpx.AsyncClient) -> None:
+        """This fake hands out no clients, so the ensure keys on the session's runner."""
+        del client
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])

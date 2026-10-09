@@ -119,15 +119,31 @@ def test_hello_round_trip_with_direct_attach_advert() -> None:
     assert decoded.direct_attach_token == "tok_abc"
 
 
+def test_hello_dedup_epoch_round_trip() -> None:
+    """The per-process dedup epoch survives the wire; older hellos omit it."""
+    f = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        dedup_epoch="boot-abc123",
+    )
+    wire = json.loads(encode_frame(f))
+    assert wire["dedup_epoch"] == "boot-abc123"
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.dedup_epoch == "boot-abc123"
+
+
 def test_hello_without_advert_omits_direct_attach_keys_on_wire() -> None:
     """Advert-less hellos keep the pre-advert wire shape byte-compatible."""
     wire = json.loads(encode_frame(HelloFrame(runner_version="0.1.2", frame_protocol_version=1)))
     assert "direct_attach_port" not in wire
     assert "direct_attach_token" not in wire
     assert "connection_id" not in wire
+    assert "dedup_epoch" not in wire
     decoded = decode_frame(json.dumps(wire))
     assert isinstance(decoded, HelloFrame)
     assert decoded.connection_id is None
+    assert decoded.dedup_epoch is None
 
 
 def test_hello_decode_drops_half_present_direct_attach_advert() -> None:

@@ -865,11 +865,16 @@ async def test_serve_tunnel_once_sends_bearer_header(
     }
     assert isinstance(captured["sent"], str)
     from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
-    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        FORWARD_DEDUP_CAPABILITY,
+        HelloFrame,
+        decode_frame,
+    )
 
     hello = decode_frame(captured["sent"])
     assert isinstance(hello, HelloFrame)
     assert CAP_FILESYSTEM_ATTACHMENTS in hello.capabilities
+    assert FORWARD_DEDUP_CAPABILITY in hello.capabilities
 
     # A reconnect's row carries the id the loop minted, the streak position
     # and the outage it ended, measured from when the previous connection

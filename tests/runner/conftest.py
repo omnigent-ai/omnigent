@@ -701,11 +701,15 @@ class _BlockingHarnessClient(_ScriptedHarnessClient):
         super().__init__(sse_frames)
         self._gate = gate
         self.post_seen: asyncio.Event = asyncio.Event()
+        # Snapshot each turn's user texts now; ``posted_bodies[i]["content"]``
+        # aliases the live history list, which later drains mutate.
+        self.turn_user_texts: list[list[str]] = []
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Stream that blocks after the first frame until gate is set."""
         del method, url, timeout
         self.posted_bodies.append(json)
+        self.turn_user_texts.append(_ordered_user_texts(json))
         self.post_seen.set()
         frames = self._sse_frames
         gate = self._gate
