@@ -1,20 +1,11 @@
-"""A host pointed at an HTTPS endpoint that accepts tunnels but never answers.
+"""Silent-endpoint escalation through the real ``omnigent host`` CLI.
 
 ``omnigent host --server https://<server>`` against a deployment whose edge
-accepts every WebSocket tunnel upgrade (a valid ``101``) while the backend never
-sends a frame reconnect-loops (each attempt prints ``✓ Connected`` before the
-tunnel dies unanswered). After ``_SILENT_CONNECT_ESCALATE_ATTEMPTS`` consecutive
-accepted-but-silent connections the host escalates: an operator ``⚠`` notice on
-stderr and slow-backoff retries until the server speaks. That silence is the
-server's condition, so the escalation must be recorded as a WARN with server
-attribution, never as an ERROR-level ``omnigent.host.connect`` record, which the
-error-KPI pipeline would count as an Omnigent defect.
-
-The test stands up a TLS endpoint that accepts upgrades and stays silent, points
-a real ``omnigent host`` process at it under a non-loopback https hostname (a
-DNS shim maps the hostname to loopback, so the reconnect loop classifies the
-endpoint as a remote deploy exactly like the field), waits for the escalation,
-and checks the host log and console.
+accepts every WebSocket tunnel upgrade (a valid ``101``) but never sends a frame
+reconnect-loops. After ``_SILENT_CONNECT_ESCALATE_ATTEMPTS`` consecutive
+accepted-but-silent connections the host must record the escalation as a WARN
+with server attribution plus an operator ``⚠`` notice, never as an ERROR-level
+``omnigent.host.connect`` record the error-KPI pipeline would blame on Omnigent.
 
 Run with::
 
@@ -189,8 +180,10 @@ class _SilentHttpsEndpoint:
                 )
                 with self._lock:
                     self._accepted_upgrades += 1
-                # Stay silent and hold the connection open until the host
-                # gives up and disconnects, instead of racing a fixed sleep.
+                # Accept the upgrade but send no frame; close after a short
+                # silent interval so the host logs an accepted-but-silent
+                # connection and reconnects. recv (not a sleep) holds it open.
+                tls.settimeout(3.0)
                 with contextlib.suppress(OSError, ssl.SSLError):
                     while tls.recv(4096):
                         pass
