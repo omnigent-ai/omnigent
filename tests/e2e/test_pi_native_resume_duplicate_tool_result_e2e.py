@@ -7,31 +7,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import secrets
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.server_runner import server_runner
 
 # Every HTTP call targets 127.0.0.1; bypass any CI egress proxy autodetection.
 _http = httpx.Client(trust_env=False)
 
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 # Valid Pi UUID-shaped session id (is_safe_pi_session_id) bound as the prior
 # Pi session -- the state a user resumes into.
@@ -40,7 +27,6 @@ _EXTERNAL_SID = "019efdb8-54c8-7c02-be27-875eb2620635"
 # One tool call whose result is committed twice, in Bedrock's tool_use id shape.
 _CALL_ID = "toolu_bdrk_01DuplicateToolResult"
 
-_HEALTH_TIMEOUT_S = 120.0
 _POLL_S = 1.0
 # Terminal auto-create includes bridge prep + provider probe + tmux boot.
 _RESUME_TIMEOUT_S = 180.0
@@ -49,53 +35,6 @@ pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="pi-native terminals run inside tmux; tmux not installed",
 )
-
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports and no proxy in the way."""
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
 
 
 def _create_pi_native_session(base_url: str) -> str:
@@ -223,15 +162,6 @@ def _tool_result_call_ids(session_file: Path) -> list[str]:
 
 def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> None:
     """Cold resume rebuilds exactly one toolResult for a doubly-committed output."""
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "chat.db"
-    database_uri = f"sqlite:///{db_path}"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    runner_home = tmp_path / "home"
-    runner_home.mkdir()
-
     # Stub Pi CLI: parks so the tmux pane stays alive. The resume JSONL is
     # written before Pi is launched, so no login or real model is needed.
     stub_bin = tmp_path / "bin"
@@ -240,73 +170,14 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
     stub.write_text("#!/bin/sh\nexec sleep 600\n")
     stub.chmod(0o755)
 
-    binding_token = secrets.token_urlsafe(32)
-    from omnigent.runner.identity import token_bound_runner_id
-
-    runner_id = token_bound_runner_id(binding_token)
-
-    server_log = (tmp_path / "server.log").open("w")
-    runner_log = (tmp_path / "runner.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({"OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_ID": runner_id,
-                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                    "RUNNER_SERVER_URL": base_url,
-                    "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                    # Hermetic HOME: the resume JSONL synthesizes under
-                    # ``$HOME/.omnigent/pi-native`` -- keep it off the real HOME.
-                    "HOME": str(runner_home),
-                    # Stub shadows any real pi; belt-and-braces with the env override.
-                    "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-                    "OMNIGENT_PI_PATH": str(stub),
-                }
-            ),
-            stdout=runner_log,
-            stderr=subprocess.STDOUT,
-        )
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            try:
-                status = _http.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2.0)
-                if status.status_code == 200 and status.json().get("online") is True:
-                    online = True
-                    break
-            except httpx.HTTPError:
-                # The server or runner is still starting up; transient connection
-                # and HTTP errors are expected here, so keep polling until the
-                # deadline instead of failing fast.
-                pass
-            time.sleep(_POLL_S)
-        assert online, (
-            f"runner never came online; log:\n{(tmp_path / 'runner.log').read_text()[-3000:]}"
+    with server_runner(tmp_path) as stack:
+        base_url, runner_id = stack.base_url, stack.runner_id
+        database_uri, runner_home = stack.database_uri, stack.runner_home
+        stack.start_runner(
+            env={
+                "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                "OMNIGENT_PI_PATH": str(stub),
+            }
         )
 
         # A prior pi-native conversation with the Pi session id captured and
@@ -369,8 +240,3 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
             f"(Anthropic rejects multiple tool_result blocks for one tool_use id). "
             f"toolResult ids in rebuilt session: {call_ids}"
         )
-    finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
-        server_log.close()
-        runner_log.close()

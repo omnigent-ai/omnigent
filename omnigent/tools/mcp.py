@@ -507,6 +507,10 @@ class McpServerConnection:
 
     config: MCPServerConfig
     cwd: Path | None = None
+    # Explicit harness transports must not be inferred from the URL path.
+    http_transport: str = "auto"
+    # Limited discovery follows pagination without populating the shared full-tool cache.
+    discovery_limit: int | None = None
     # Elicitation callback invoked when the MCP server sends
     # ``elicitation/create`` inline during a ``tools/call``.
     # Receives ``(session_id, params)`` and returns an
@@ -918,7 +922,7 @@ class McpServerConnection:
 
         :returns: List of MCP tool definitions.
         """
-        cached = self._check_cache()
+        cached = self._check_cache() if self.discovery_limit is None else None
         if cached is not None:
             self._discovered_tools = cached
             _logger.debug(
@@ -931,14 +935,26 @@ class McpServerConnection:
         if self._session is None:
             raise RuntimeError("MCP session not initialized — call connect() first")
         tools_result = await self._session.list_tools()
-        self._discovered_tools = tools_result.tools
-        self._update_cache(tools_result.tools)
+        tools = list(tools_result.tools)
+        if self.discovery_limit is not None:
+            seen_cursors: set[str] = set()
+            while tools_result.nextCursor and len(tools) < self.discovery_limit:
+                cursor = tools_result.nextCursor
+                if cursor in seen_cursors:
+                    raise ValueError("MCP discovery repeated a cursor")
+                seen_cursors.add(cursor)
+                tools_result = await self._session.list_tools(cursor=cursor)
+                tools.extend(tools_result.tools)
+            tools = tools[: self.discovery_limit]
+        else:
+            self._update_cache(tools)
+        self._discovered_tools = tools
         _logger.info(
             "MCP server %r: discovered %d tool(s)",
             self.config.name,
-            len(tools_result.tools),
+            len(tools),
         )
-        return tools_result.tools
+        return tools
 
     async def close(self) -> None:
         """
@@ -1168,7 +1184,9 @@ class McpServerConnection:
             )
         timeout = self.config.timeout
         headers = self._resolve_http_headers()
-        if _is_sse_endpoint(self.config.url):
+        if self.http_transport == "sse" or (
+            self.http_transport == "auto" and _is_sse_endpoint(self.config.url)
+        ):
             # Legacy-SSE servers (e.g. crawl4ai's /mcp/sse) hang the
             # Streamable HTTP client in teardown, which would block the
             # except-clause SSE fallback below from ever running. Route
@@ -1182,6 +1200,8 @@ class McpServerConnection:
             # and avoiding the teardown hang takes priority over covering
             # a misnamed-endpoint case that is not known to occur.
             return await self._open_sse_transport(stack, timeout, headers)
+        if self.http_transport == "streamable-http":
+            return await self._open_streamable_http_transport(stack, timeout, headers)
         try:
             return await self._open_streamable_http_transport(stack, timeout, headers)
         except Exception as exc:

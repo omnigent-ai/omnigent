@@ -21,6 +21,15 @@ author runs read only `validation-prompt.md` for deferred body preparation;
 local-only author runs skip this skill. Review-remediation follows its mode's
 exemptions. Load `resolve-handoff` before any interim or final handoff.
 
+A draft proposal with an unresolved design choice follows `resolve-publish`'s
+incomplete handoff exception. Do not enter this readiness loop or promote the
+draft just to satisfy `review_cycle.py`.
+
+When `.omnigent/pr-gate.json` exists, use the checked-publication commands in
+`resolve-publish` for all PR writes, including replies to findings. CI's
+instructions govern reviewer outages and review budgets. Do not use the direct
+write, approval, fork takeover, or token-recovery recipes in this mode.
+
 ## Step 4 — Land the PR: preview, green CI, clean review, hand it to the maintainer
 
 This step applies to **any PR you are driving toward landable** — the one you
@@ -96,8 +105,8 @@ can land a fix depends on where its branch lives:
     is a bot indicator — the maintainer's approval still merges it.)
 
 Throughout, address the PR you're landing by its number `<pr>`. Continue until
-current CI and both independent reviews are settled; there is **no fixed
-review-round cap**. After every push, request both Polly and OCR for the new head
+current CI and both independent reviews are settled; follow the workflow-provided review budget when present; otherwise there is no fixed
+review-round cap. After every push, request both Polly and OCR for the new head
 (Step 4.3), including pushes for CI or conflict repairs. A fork takeover starts
 this loop on the replacement PR. If a concrete blocker or actual execution
 deadline prevents completion, leave a resumable checkpoint and report

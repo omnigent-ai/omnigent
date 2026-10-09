@@ -51,9 +51,10 @@ live facet, the **exact fail reason** — the "from" half of your fail→pass pr
 
 ### 2B.2 — Root-cause
 
-Find *why* the test fails. Read the code the journey and `evidence` point at. Use
-repro-agent's root-cause leads as hypotheses, but confirm them against the code.
-State the root cause concretely before you change anything.
+Apply `resolve-investigate`: match the reported path and configuration, check
+competing explanations, and find the historical rationale. State the supported
+cause before editing. If policy must change, distinguish that proposal from
+repairing an implementation defect and retain unresolved choices for PR review.
 
 ### 2B.3 — Implement the fix
 

@@ -69,10 +69,13 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
@@ -89,13 +92,19 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPluginsFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentFrame,
+    HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
     HostStatFrame,
@@ -529,6 +538,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Discovery and invocation must read the same harness config directories.
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
+        # Forge CLI config selectors must agree across CLI, daemon, and runner.
+        # Forward paths only; bearer-token environment variables remain excluded.
+        "GLAB_CONFIG_DIR",
+        "GH_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]
@@ -648,6 +663,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ssh-agent auth, so git-over-SSH and SSH-cert-authenticated tooling
         # fail with "dial unix: missing address".
         "SSH_AUTH_SOCK",
+        # The user's URL-opener command (e.g. a remote-dev helper that forwards
+        # URLs and OAuth callbacks to the laptop). A command name, not a secret.
+        # Without it, CLI logins in the agent fall back to a local browser.
+        "BROWSER",
         # gcloud Application Default Credentials selectors, same class as
         # KUBECONFIG above: AGY_ADC_AUTH is the boolean the Antigravity CLI
         # (agy) reads to pick ADC auth, GOOGLE_APPLICATION_CREDENTIALS is a
@@ -1067,6 +1086,43 @@ class _RunnerHandle:
     stop_requested: bool = False
 
 
+@dataclass(frozen=True)
+class _HostFrameFailureContext:
+    """Safe metadata retained when a host-frame task fails."""
+
+    frame_kind: str | None = None
+    request_id: str | None = None
+    session_id: str | None = None
+    runner_id: str | None = None
+
+
+def _host_frame_failure_context(raw: str) -> _HostFrameFailureContext:
+    """Decode only correlation metadata for a failure diagnostic.
+
+    This failure-only pass returns no metadata for malformed or partially
+    decoded frames, rather than trusting fields from an invalid payload.
+    """
+    try:
+        frame: HostFrame = decode_host_frame(raw)
+        payload = json.loads(raw)
+        frame_kind = payload.get("kind") if isinstance(payload, dict) else None
+        if not isinstance(frame_kind, str):
+            frame_kind = type(frame).__name__
+    except Exception:  # noqa: BLE001 — failure logging must never fail again
+        return _HostFrameFailureContext()
+
+    def _text_field(name: str) -> str | None:
+        value = getattr(frame, name, None)
+        return value if isinstance(value, str) and value else None
+
+    return _HostFrameFailureContext(
+        frame_kind=frame_kind,
+        request_id=_text_field("request_id"),
+        session_id=_text_field("session_id"),
+        runner_id=_text_field("runner_id"),
+    )
+
+
 class HostRetryableConnectionError(Exception):
     """Server-reported channel failure that should use reconnect backoff."""
 
@@ -1121,6 +1177,9 @@ class HostProcess:
         from omnigent.host.mcp_inventory import HostMcpInventory
 
         self._mcp_inventory = HostMcpInventory()
+        from omnigent.host.mcp_tools import HostMcpTools
+
+        self._mcp_tools = HostMcpTools()
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -3180,6 +3239,20 @@ class HostProcess:
                 error="skill discovery failed; see the host log",
             )
 
+    def _handle_harness_startup(
+        self, frame: HostHarnessStartupFrame
+    ) -> HostHarnessStartupResultFrame:
+        """Read launch metadata locally, keeping config values off the tunnel."""
+        from omnigent.host.harness_startup import describe_harness_startup
+
+        try:
+            return HostHarnessStartupResultFrame(
+                frame.request_id, describe_harness_startup(frame.harness)
+            )
+        except Exception:
+            _logger.exception("Harness launch settings failed")
+            return HostHarnessStartupResultFrame(frame.request_id)
+
     def _handle_mcp_servers(self, frame: HostMcpServersFrame) -> HostMcpServersResultFrame:
         """List user-level MCP servers in a worker thread."""
         try:
@@ -3194,6 +3267,44 @@ class HostProcess:
         return HostMcpServersResultFrame(
             request_id=frame.request_id, status="ok", mcp_servers=servers
         )
+
+    def _handle_plugins(self, frame: HostPluginsFrame) -> HostPluginsResultFrame:
+        """Read installed plugin metadata off the event loop."""
+        from omnigent.host.plugins import discover_plugins
+
+        try:
+            plugins = discover_plugins()
+        except Exception:  # noqa: BLE001 — do not log host file contents
+            return HostPluginsResultFrame(
+                request_id=frame.request_id, status="failed", error="plugin inventory failed"
+            )
+        return HostPluginsResultFrame(request_id=frame.request_id, status="ok", plugins=plugins)
+
+    def _handle_skill_content(self, frame: HostSkillContentFrame) -> HostSkillContentResultFrame:
+        from omnigent.host.skill_content import read_skill_content
+
+        try:
+            skill = read_skill_content(frame.harness, frame.name, source_id=frame.source_id)
+        except Exception:  # noqa: BLE001 — file contents must never enter exception logs
+            return HostSkillContentResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="skill content lookup failed",
+            )
+        return HostSkillContentResultFrame(request_id=frame.request_id, status="ok", skill=skill)
+
+    async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:
+        try:
+            result = await self._mcp_tools.probe(
+                frame.harness, frame.server, frame.plugin, frame.source_id
+            )
+        except BlockingIOError:
+            return HostMcpToolsResultFrame(request_id=frame.request_id, status="busy")
+        except Exception:  # noqa: BLE001 — transport failures must not expose private config
+            return HostMcpToolsResultFrame(
+                request_id=frame.request_id, status="failed", error="MCP tools lookup failed"
+            )
+        return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
 
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
@@ -3498,9 +3609,11 @@ class HostProcess:
         """Serve a workspace-mutating op from the host (runner-offline fallback).
 
         Mirrors :meth:`_handle_fs_request` but for the small set of writes the
-        host can serve — currently the GitHub account/base preference, which
-        touches the host's ``~/.omnigent/config.yaml`` and runs ``gh``/``git`` in
-        the workspace. Called inside a worker thread by the dispatcher.
+        host can serve — currently the pull request panel's account/base
+        preference and PR attach/remove, which touch the host's
+        ``~/.omnigent/config.yaml`` and the session's PR registry and run the git
+        provider's CLI and ``git`` in the workspace. Called inside a worker
+        thread by the dispatcher.
 
         :param frame: The write frame (op + workspace + params).
         :returns: A result frame with the refreshed payload, or an error frame.
@@ -3552,17 +3665,17 @@ class HostProcess:
         op: str,
         params: dict[str, object],
     ) -> dict[str, object]:
-        """Route a write op to its handler. Writes call ``github_resource``
+        """Route a write op to its handler. Writes call ``pr_resource``
         directly (not the read-only ``WorkspaceReader``).
 
         :raises ValueError: On an unknown op.
         """
         from typing import cast
 
-        from omnigent.runner import github_resource
+        from omnigent.runner import pr_resource
 
         if op == "github_set_preference":
-            return github_resource.set_github_preference(
+            return pr_resource.set_pr_preference(
                 workspace,
                 account=cast("str | None", params.get("account")),
                 remote=cast("str | None", params.get("remote")),
@@ -3570,7 +3683,7 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
             )
         if op == "github_prs_update":
-            return github_resource.update_session_pr(
+            return pr_resource.update_session_pr(
                 workspace,
                 str(params["session_id"]),
                 str(params["url"]),
@@ -3843,18 +3956,27 @@ class HostProcess:
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
 
+    @property
+    def lifecycle_lost(self) -> bool:
+        """Whether this daemon lost ownership of its registry record."""
+        return self._lifecycle_lost.is_set()
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
         Connects to the server, sends hello, and enters the
         receive loop. Reconnects with exponential backoff on
-        disconnect. Ctrl-C / SIGTERM exit cleanly.
+        disconnect. Ctrl-C exits cleanly; SIGTERM/SIGHUP are logged and end
+        the process (see :mod:`omnigent.host.crash_reporting`).
 
         :returns: None. Runs until the process is terminated.
         :raises HostConnectError: On a permanent failure — auth /
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
+        from omnigent.host.crash_reporting import host_asyncio_exception_handler
+
+        asyncio.get_running_loop().set_exception_handler(host_asyncio_exception_handler)
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
@@ -4590,14 +4712,30 @@ class HostProcess:
         :param raw: The raw text frame received off the socket.
         :returns: None.
         """
+        started_at = time.monotonic()
         try:
             await self._handle_raw_message(ws, raw)
         except ConnectionClosed:
             # The tunnel died while this frame was in flight; the reconnect
             # loop owns recovery.
             _logger.debug("dropped frame result: tunnel closed mid-handling")
-        except Exception:
-            _logger.exception("host frame handler failed")
+        except Exception as exc:
+            failure_context = _host_frame_failure_context(raw)
+            with runner_log_scope(failure_context.session_id, failure_context.runner_id):
+                # Rebind the frame's IDs after the dispatch scope has unwound.
+                _logger.exception(
+                    "host frame handler failed",
+                    extra=debug_event(
+                        "host_frame_handler_failed",
+                        session_id=failure_context.session_id,
+                        host_id=getattr(getattr(self, "_identity", None), "host_id", None),
+                        request_id=failure_context.request_id,
+                        frame_kind=failure_context.frame_kind,
+                        runner_id=failure_context.runner_id,
+                        error_type=type(exc).__name__,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    ),
+                )
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str
@@ -4728,6 +4866,18 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await ws.send(encode_host_frame(skills_result))
+        elif isinstance(frame, HostPluginsFrame):
+            plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
+            await ws.send(encode_host_frame(plugins_result))
+        elif isinstance(frame, HostSkillContentFrame):
+            content_result = await asyncio.to_thread(self._handle_skill_content, frame)
+            await ws.send(encode_host_frame(content_result))
+        elif isinstance(frame, HostMcpToolsFrame):
+            tools_result = await self._handle_mcp_tools(frame)
+            await ws.send(encode_host_frame(tools_result))
+        elif isinstance(frame, HostHarnessStartupFrame):
+            startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
+            await ws.send(encode_host_frame(startup_result))
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
             await ws.send(encode_host_frame(mcp_result))
@@ -4856,6 +5006,72 @@ def run_host_process(
         "host",
         log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
     )
+    from omnigent.host import crash_reporting
+
+    crash_reporting.install_host_crash_hooks()
+    crash_reporting.set_host_exit_context(daemon_target=daemon_target)
+    # Installed before any startup work, so a stop signal during e.g. the git
+    # credential setup is still reported and drained.
+    restore_signal_handlers = crash_reporting.install_host_signal_handlers()
+    # Report here rather than relying on sys.excepthook: the foreground CLI
+    # catches crashes itself, so the hook never sees them.
+    try:
+        lifecycle_lost = _serve_host_until_exit(
+            server_url,
+            config_path,
+            host_log_path=host_log_path,
+            daemon_target=daemon_target,
+            lifecycle_lock=lifecycle_lock,
+            interactive_shells=interactive_shells,
+        )
+    except BaseException as exc:
+        # A stop signal already being handled owns the exit: never returns then.
+        crash_reporting.await_signal_exit()
+        if isinstance(exc, KeyboardInterrupt):
+            crash_reporting.report_host_exit("interrupted")
+        elif isinstance(exc, SystemExit):
+            code = 0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1
+            crash_reporting.report_host_exit("clean" if code == 0 else "exit", exit_code=code)
+        else:
+            crash_reporting.report_host_exit(
+                "uncaught", exit_code=1, exc_info=(type(exc), exc, exc.__traceback__)
+            )
+        _finish_host_exit(restore_signal_handlers)
+        raise
+    crash_reporting.await_signal_exit()
+    crash_reporting.report_host_exit("lifecycle_lost" if lifecycle_lost else "clean", exit_code=0)
+    _finish_host_exit(restore_signal_handlers)
+
+
+def _finish_host_exit(restore_signal_handlers: Callable[[], None]) -> None:
+    """Drain the reported exit while still protected, then hand signals back.
+
+    A stop signal during the drain waits for it and then dies by the signal;
+    one after the handlers are restored takes its default action, with the
+    exit row already delivered.
+    """
+    from omnigent.host import crash_reporting
+
+    crash_reporting.drain_debug_sink()
+    restore_signal_handlers()
+    crash_reporting.await_signal_exit()
+
+
+def _serve_host_until_exit(
+    server_url: str,
+    config_path: Path | None,
+    *,
+    host_log_path: Path,
+    daemon_target: str | None,
+    lifecycle_lock: DaemonLifecycleLock | None,
+    interactive_shells: list[str] | None,
+) -> bool:
+    """Run the host until it exits; see :func:`run_host_process`.
+
+    :returns: Whether the daemon exited because it lost its registry record.
+    """
+    from omnigent.host import crash_reporting
+
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -4870,12 +5086,17 @@ def run_host_process(
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:
+        crash_reporting.report_host_exit(
+            "identity_error", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
+        )
         print(
             f"\n✗ Could not start host.\n{exc}",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from None
+    crash_reporting.set_host_exit_context(host_id=identity.host_id)
+    crash_reporting.log_host_started()
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
@@ -4921,7 +5142,7 @@ def run_host_process(
 
     # Executor-agnostic Databricks setup: when the owner has linked a workspace,
     # materialize their per-user token as a ``~/.databrickscfg`` profile so the
-    # agent's model serving + MCP route through their Databricks AI Gateway.
+    # agent's model serving + MCP route through their Databricks Unity Gateway.
     # Best-effort; a no-op when Databricks isn't connected/configured.
     from omnigent.host.databricks_credential import configure_host_databricks
 
@@ -4944,9 +5165,13 @@ def run_host_process(
         # instead of the old behavior of reconnecting silently forever.
         # The dedicated code (not a bare 1) tells a supervisor this can never
         # succeed, so it stops retrying instead of looping on a bad credential.
+        crash_reporting.report_host_exit(
+            "fatal_connect", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
+        )
         print(
             f"\n✗ Could not connect to {display_server_url(server_url)}.\n{exc}",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    return host.lifecycle_lost

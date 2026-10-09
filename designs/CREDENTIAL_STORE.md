@@ -231,7 +231,7 @@ selector is an error (no silent precedence), and configuring none disables the s
 The store is the base for two credential needs; the encryption above is shared,
 the delivery differs.
 
-**MCP auth → Databricks AI Gateway (AIGW), primary.** Routing MCP through AIGW
+**MCP auth → Databricks Unity Gateway (AIGW), primary.** Routing MCP through AIGW
 makes per-MCP OAuth *Databricks's* problem, not Omnigent's. The store then holds
 only a small `provider="databricks"` exchange grant (per-user, KMS-encrypted);
 the server performs the omni→databricks token exchange + refresh, and the
