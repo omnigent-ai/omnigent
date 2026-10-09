@@ -10789,7 +10789,7 @@ async def _create_session_from_existing_agent(
             source_bundle,
             body.mcp_registry_services,
             user_id,
-            trusted_template=agent.session_id is None,
+            trusted_template=agent.operator_authored,
         )
 
     # Validate the host workspace before creating a session or worktree.
@@ -11048,7 +11048,7 @@ async def _create_session_from_existing_agent(
                     spec=validate_agent_bundle(
                         registry_bundle,
                         enforce_handler_allowlist=not (
-                            agent.session_id is None or local_single_user_enabled()
+                            agent.operator_authored or local_single_user_enabled()
                         ),
                     ),
                     derive_launch_args=False,

@@ -7,6 +7,7 @@ import pytest
 
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+from omnigent.server.routes.connections_base import ConnectionError
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 from tests.e2e.test_mcp_registry import demo_mcp as demo_mcp
@@ -54,7 +55,8 @@ def app(runtime_init, db_uri, tmp_path, demo_mcp, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_real_http_oauth_refresh_through_gateway(client, app, demo_mcp):
-    store = app.state.mcp_registry.store
+    registry = app.state.mcp_registry
+    store = registry.store
     start = await client.get("/v1/connections/mcp-tracker/connect")
     assert start.status_code in (302, 307), start.text
     fields = {k: v[0] for k, v in parse_qs(urlsplit(start.headers["location"]).query).items()}
@@ -64,6 +66,10 @@ async def test_real_http_oauth_refresh_through_gateway(client, app, demo_mcp):
         )
     callback = await client.get(consent.headers["location"])
     assert "mcp-tracker=connected" in callback.headers["location"]
+    catalog = await client.get("/v1/mcp-registry/services")
+    assert catalog.json()["data"][0]["connected"]
+    connection_test = await client.post("/v1/mcp-registry/services/tracker/test")
+    assert connection_test.json() == {"tools": ["whoami", "read_ticket"]}, connection_test.text
     session = await create_test_session(client, name="http-gateway")
     sid = session["id"]
     attached = await client.post(
@@ -80,6 +86,7 @@ async def test_real_http_oauth_refresh_through_gateway(client, app, demo_mcp):
     assert schemas.tool_names == {"tracker__whoami", "tracker__read_ticket"}
     grant = store.get("local", "mcp:tracker", with_secret=True)
     assert grant is not None
+    # Force the real provider refresh path without waiting for the token TTL.
     store.update_secret("local", "mcp:tracker", secret=grant.secret, metadata={"expires_at": 0})
     result = await proxy.call_tool(spec, "tracker__whoami", {})
     assert "alice@example.test" in result
@@ -88,6 +95,17 @@ async def test_real_http_oauth_refresh_through_gateway(client, app, demo_mcp):
     assert "TEST-123" in await fresh.call_tool(
         spec, "tracker__read_ticket", {"ticket_id": "TEST-123"}
     )
+    # A replacement registry also reuses the persisted account and refreshed grant.
+    replacement = McpRegistry(registry.config, store)
+    result = await replacement.execute(
+        "tracker", "local", app.state, tool="read_ticket", arguments={"ticket_id": "TEST-123"}
+    )
+    assert "TEST-123" in result.content[0].text
+    with pytest.raises(ConnectionError, match="not allowed"):
+        await registry.execute("tracker", "local", app.state, tool="delete_ticket")
     disconnected = await client.delete("/v1/mcp-registry/services/tracker/connection")
     assert disconnected.status_code == 200
     assert "Connect" in await proxy.call_tool(spec, "tracker__whoami", {})
+    with pytest.raises(ConnectionError, match="Connect"):
+        await replacement.execute("tracker", "local", app.state, tool="whoami")
+    assert (await client.get("/v1/mcp-registry/services")).json()["data"][0]["connected"] is False
