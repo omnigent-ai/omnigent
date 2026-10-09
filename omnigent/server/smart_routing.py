@@ -756,22 +756,82 @@ def _router_error_detail(body: str) -> str:
     return text[:300]
 
 
-def router_permanently_disabled(status_code: int, body: str) -> bool:
-    """Whether the router's answer reports a condition no retry can clear.
+# How the gateway relays its own extraction call's failure; only a relayed 404
+# is configuration rather than an outage, so only that status latches.
+_SELF_CALL_404 = "self-call returned status 404:"
 
-    A workspace without the routing API answers ``routes:select`` with a 404
-    saying it is not enabled for the account. That is configuration, not an
-    outage: every later call would 404 identically, so the client latches it
-    and the deployment's other backend answers instead.
+
+def _gateway_message(body: str) -> str:
+    """The gateway's own human message for *body*, unwrapping the same
+    ``message`` / nested ``error.message`` / doubly-encoded layers as
+    :func:`_router_error_detail`.
+
+    A non-JSON body is its own message; any other JSON shape (a list, or a
+    dict carrying no string message) has none, so a body merely quoting a
+    status in some other field does not read as the gateway's own report.
+    """
+    text = (body or "").strip()
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    for _ in range(4):  # unwrap the gateway's nested message/error layers
+        if not isinstance(parsed, dict):
+            return ""
+        message = parsed.get("message")
+        if message is None:
+            error = parsed.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+        if not isinstance(message, str):
+            return ""
+        try:
+            parsed = json.loads(message)
+        except (ValueError, TypeError):
+            return message
+    return ""
+
+
+def router_selection_model_unserved(status_code: int, body: str) -> bool:
+    """Whether the router's own extraction (self-)call 404d on configuration.
+
+    Happens when ``routing.selection_model`` names a model the workspace does
+    not serve — or is unset and the router's frozen default does. Every later
+    call fails identically until the deployment config changes, so the client
+    latches. Only a relayed 404 in the gateway's own message qualifies: other
+    relayed statuses may be transient, and the phrase quoted elsewhere in a
+    body is not the gateway reporting it.
 
     :param status_code: The response status.
     :param body: The raw response text.
-    :returns: ``True`` when the service is disabled for this account.
+    :returns: ``True`` when the selector's model cannot be served.
+    """
+    if status_code != 404:
+        return False
+    return _SELF_CALL_404 in _gateway_message(body).lower()
+
+
+def router_permanently_disabled(status_code: int, body: str) -> bool:
+    """Whether the router's answer reports a condition no retry can clear.
+
+    Two shapes qualify. A workspace without the routing API answers
+    ``routes:select`` with a 404 saying it is not enabled for the account. And
+    a router whose own extraction call cannot run — its selection model is not
+    served here — relays that inner 404 in a 404 body
+    (:func:`router_selection_model_unserved`). Both are configuration, not an
+    outage: every later call would 404 identically, so the client latches it
+    and the deployment's other backend answers instead. Any other 404 stays
+    retriable.
+
+    :param status_code: The response status.
+    :param body: The raw response text.
+    :returns: ``True`` when no retry can get this router to answer.
     """
     if status_code != 404:
         return False
     text = (body or "").lower()
-    return "routes:select" in text and "not enabled" in text
+    if "routes:select" in text and "not enabled" in text:
+        return True
+    return router_selection_model_unserved(status_code, body)
 
 
 # ── Route-options seam ──────────────────────────────────────────────────────
@@ -956,7 +1016,8 @@ class RoutingSettings:
     :param router_name: Router strategy to invoke, e.g. ``"task_v1"``.
     :param selection_model: Model the router should use for its own
         extraction call, sent as ``route_selector.config.model``. ``None``
-        leaves the router's frozen default in place.
+        leaves the router's frozen default in place — which a workspace may
+        not serve, making every ``routes:select`` 404 until one is pinned.
     :param model_prefixes: Prefixes this deployment's catalog attaches to
         model ids that the router keys bare; see :data:`MODEL_ID_PREFIXES`.
     :param menus: Scenario key (``cc`` / ``codex`` / ``both``) → the full arm
@@ -1899,10 +1960,25 @@ class ExternalRoutingClient:
                 f"router returned HTTP {resp.status_code}: {_router_error_detail(resp.text)}"
             )
             if router_permanently_disabled(resp.status_code, resp.text):
+                if router_selection_model_unserved(resp.status_code, resp.text):
+                    # Name the config knob: the raw relay body says nothing
+                    # about WHICH model 404d or how to fix it.
+                    selector = (
+                        f"selection model {self._selection_model!r}"
+                        if self._selection_model
+                        else "the router's default selection model"
+                    )
+                    self.last_error = (
+                        f"{selector} is not served on this workspace "
+                        f"(set routing.selection_model to a served model and "
+                        f"restart the server): {self.last_error}"
+                    )
                 _logger.warning(
-                    "ExternalRoutingClient: %s is not enabled for this account; "
-                    "no further routes:select calls will be made in this process",
+                    "ExternalRoutingClient: %s reported a permanent configuration "
+                    "failure (%s); no further routes:select calls will be made in "
+                    "this process",
                     self._url,
+                    self.last_error,
                 )
                 self.permanently_unavailable = True
                 self._permanent_error = self.last_error
