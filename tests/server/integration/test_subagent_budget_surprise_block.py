@@ -33,28 +33,19 @@ through that journey:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
-from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 import httpx
 import pytest
-import pytest_asyncio
-from fastapi import FastAPI
 
 from omnigent.runtime import session_stream
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
-from tests.server.conftest import ControllableMockClient
+from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -74,113 +65,12 @@ _SPAWN_BUDGET_PAYLOAD: dict[str, Any] = {
 
 
 @pytest.fixture()
-def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    """
-    FastAPI app with a policy store wired in.
-
-    The standard ``app`` fixture from ``conftest.py`` omits the policy
-    store, so the session policy CRUD routes are not mounted. This
-    fixture adds one so ``POST /v1/sessions/{id}/policies`` (the exact
-    call the spawn path makes) and the evaluate endpoint's
-    ``get_policy_store()`` both see session-attached policies.
-
-    :param runtime_init: Fixture that initializes the runtime with a
-        mock LLM.
-    :param db_uri: Test database URI.
-    :param tmp_path: Pytest temporary directory fixture.
-    """
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        policy_store=SqlAlchemyPolicyStore(db_uri),
-    )
-
-
-@pytest_asyncio.fixture()
-async def client(
-    policy_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """
-    Async HTTP client wired to the policy-enabled app.
-
-    Mirrors the shared ``client`` fixture but targets ``policy_app`` so
-    session policy CRUD routes are available, and patches the runtime's
-    ``_policy_store`` global so the evaluate endpoint picks up
-    session-attached policies.
-
-    :param policy_app: The policy-enabled FastAPI app.
-    :param mock_llm: Controllable mock LLM (released on teardown).
-    :param tmp_path: Pytest temporary directory fixture.
-    :param db_uri: Test database URI.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    from omnigent.runtime import _globals, set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    monkeypatch.setattr(_globals, "_policy_store", SqlAlchemyPolicyStore(db_uri))
-
-    transport = httpx.ASGITransport(app=policy_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
+def client(policy_client: httpx.AsyncClient) -> httpx.AsyncClient:
+    """Use the shared policy-enabled runtime client for this module."""
+    return policy_client
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """
-    Create a session bound to an agent and return its id.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
-
-
-def _tool_call_request(
-    tool_name: str = "Bash",
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a PHASE_TOOL_CALL EvaluationRequest.
-
-    :param tool_name: Tool name, e.g. ``"Bash"``.
-    :param arguments: Tool arguments dict.
-    :returns: EvaluationRequest JSON dict.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 async def _drain_elicitation_id(

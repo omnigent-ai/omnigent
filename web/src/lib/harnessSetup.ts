@@ -178,6 +178,11 @@ export function isCodexHarness(harness: string): boolean {
   return harness === "codex" || harness === "codex-native" || harness === "native-codex";
 }
 
+/** Sigil used to invoke a skill in *harness*: `$` for codex-native, `/` for all others. */
+export function skillInvocationPrefix(harness: string | null | undefined): "$" | "/" {
+  return harness === "codex-native" ? "$" : "/";
+}
+
 export function isNativeCursorHarness(harness: string): boolean {
   return harness === "cursor-native" || harness === "native-cursor";
 }

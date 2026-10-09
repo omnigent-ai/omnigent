@@ -48,8 +48,9 @@ Read-only mode
 --------------
 
 When the URL has ``?read_only=true``, binary input frames are dropped
-silently at the server *and* the runner. The tmux control-mode client is also
-marked read-only so tmux refuses input from this attachment.
+silently at the server *and* the runner. The tmux control-mode client is not
+attached with ``-r``: tmux >= 3.7 would then reject the harness's own
+``send-keys`` whenever the viewer is the most recently active client.
 
 Write attach is owner-only
 --------------------------

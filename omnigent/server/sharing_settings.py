@@ -1,6 +1,6 @@
 """File-backed session-sharing settings for the OSS server.
 
-Two server-wide sharing policies default from env vars at boot but can be
+Server-wide sharing policies default from env vars at boot but can be
 overridden at runtime from the Settings → Sharing admin panel, each persisted to
 a plaintext file in :func:`resolve_data_dir` (next to the ``admins`` roster) so
 it survives restarts without a database migration and takes effect without a
@@ -9,7 +9,11 @@ redeploy:
 - the sharing *mode* — ``OMNIGENT_SHARING_MODE`` → ``<data_dir>/sharing_mode``
   (``on`` / ``read_only`` / ``restricted_read_only`` / ``off``);
 - whether *public* (anyone-with-the-link) read access may be granted —
-  ``OMNIGENT_PUBLIC_SHARING`` → ``<data_dir>/public_sharing`` (``on`` / ``off``).
+  ``OMNIGENT_PUBLIC_SHARING`` → ``<data_dir>/public_sharing`` (``on`` / ``off``);
+- the public permission ceiling: ``OMNIGENT_PUBLIC_SHARING_MAX_LEVEL`` →
+  ``<data_dir>/public_sharing_max_level`` (``read`` / ``edit``, default read);
+- which *new* sessions start public: ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` →
+  ``<data_dir>/default_public_sessions`` (``off`` / ``sandbox`` / ``all``).
 
 A missing, empty, or unreadable file means "no override recorded", so the caller
 falls back to the env-var default; an unrecognized value is likewise ignored
@@ -24,15 +28,23 @@ import contextlib
 import logging
 import os
 import tempfile
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar
+from enum import Enum
 from pathlib import Path
+from typing import Any
+
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.server.admin_list import resolve_data_dir
-from omnigent.server.auth import SharingMode
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, SharingMode, workspace_sharing_blocked
 
 logger = logging.getLogger(__name__)
 
 _SHARING_MODE_FILE = "sharing_mode"
 _PUBLIC_SHARING_FILE = "public_sharing"
+_PUBLIC_SHARING_MAX_LEVEL_FILE = "public_sharing_max_level"
+_DEFAULT_PUBLIC_SESSIONS_FILE = "default_public_sessions"
 # Public sharing is enabled unless a value explicitly says otherwise, so a typo
 # or a stray value fails OPEN (never silently disables a working feature).
 _PUBLIC_FALSY = ("0", "false", "no", "off")
@@ -51,6 +63,95 @@ def resolve_sharing_mode_path() -> Path:
 def resolve_public_sharing_path() -> Path:
     """Path of the file holding the admin public-sharing override."""
     return resolve_data_dir() / _PUBLIC_SHARING_FILE
+
+
+class PublicSharingMaxLevel(str, Enum):
+    """Maximum effective public permission, independent of the sign-in provider."""
+
+    READ = "read"
+    EDIT = "edit"
+
+    @property
+    def level(self) -> int:
+        return LEVEL_EDIT if self is PublicSharingMaxLevel.EDIT else LEVEL_READ
+
+    @classmethod
+    def coerce(cls, value: object) -> PublicSharingMaxLevel:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                pass
+        return cls.READ
+
+
+_public_sharing_max_level: ContextVar[Callable[[], PublicSharingMaxLevel]] = ContextVar(
+    "public_sharing_max_level", default=lambda: PublicSharingMaxLevel.READ
+)
+
+
+def effective_public_level(level: int | None) -> int | None:
+    """Apply the live ceiling outside the raw grant cache, including on open streams."""
+    if level is None:
+        return None
+    return min(level, _public_sharing_max_level.get()().level)
+
+
+@contextlib.contextmanager
+def public_sharing_policy_scope(max_level: Callable[[], PublicSharingMaxLevel]) -> Iterator[None]:
+    token = _public_sharing_max_level.set(max_level)
+    try:
+        yield
+    finally:
+        _public_sharing_max_level.reset(token)
+
+
+class PublicSharingPolicyMiddleware:
+    """Keep each application's live public policy in its request/task context."""
+
+    def __init__(self, app: ASGIApp, max_level: Callable[[], PublicSharingMaxLevel]) -> None:
+        self._app = app
+        self._max_level = max_level
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        with public_sharing_policy_scope(self._max_level):
+            await self._app(scope, receive, send)
+
+
+def resolve_default_public_sessions_path() -> Path:
+    """Path of the file holding the admin default-public-sessions override."""
+    return resolve_data_dir() / _DEFAULT_PUBLIC_SESSIONS_FILE
+
+
+class DefaultPublicSessions(str, Enum):
+    """Which newly created sessions get a public (anyone-with-the-link) read grant.
+
+    - ``OFF``: every session starts private (the default).
+    - ``SANDBOX``: sessions running in a server-managed cloud sandbox start
+      public; sessions on a user's own machine stay private.
+    - ``ALL``: every new session starts public.
+
+    Only the creation default: owners can still revoke the public grant.
+    """
+
+    OFF = "off"
+    SANDBOX = "sandbox"
+    ALL = "all"
+
+    @classmethod
+    def coerce(cls, value: object) -> DefaultPublicSessions:
+        """Map a value to a policy, failing closed to ``OFF`` (private) for
+        anything unset or unrecognized so a typo never exposes sessions."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                pass
+        return cls.OFF
 
 
 def _read_override_text(path: Path) -> str | None:
@@ -144,3 +245,93 @@ def read_public_sharing_override() -> bool | None:
 def write_public_sharing_override(enabled: bool) -> None:
     """Persist the admin public-sharing override atomically."""
     _write_override_text(resolve_public_sharing_path(), "on" if enabled else "off")
+
+
+def public_sharing_max_level_env_default() -> PublicSharingMaxLevel:
+    return PublicSharingMaxLevel.coerce(os.environ.get("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL"))
+
+
+def read_public_sharing_max_level_override() -> PublicSharingMaxLevel | None:
+    raw = _read_override_text(resolve_data_dir() / _PUBLIC_SHARING_MAX_LEVEL_FILE)
+    # Invalid overrides must not restore a more permissive boot default.
+    return PublicSharingMaxLevel.coerce(raw) if raw is not None else None
+
+
+def write_public_sharing_max_level_override(level: PublicSharingMaxLevel) -> None:
+    _write_override_text(resolve_data_dir() / _PUBLIC_SHARING_MAX_LEVEL_FILE, level.value)
+
+
+def default_public_sessions_env_default() -> DefaultPublicSessions:
+    """Boot default from ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (``off`` if unset)."""
+    return DefaultPublicSessions.coerce(os.environ.get("OMNIGENT_DEFAULT_PUBLIC_SESSIONS"))
+
+
+def read_default_public_sessions_override() -> DefaultPublicSessions | None:
+    """Return the admin-set default-public-sessions override, or ``None`` when unset.
+
+    Unlike the other overrides, an unrecognized value resolves to ``OFF`` rather
+    than falling back to the env-var default: a corrupted or hand-edited file
+    must never restore a more permissive boot default.
+    """
+    raw = _read_override_text(resolve_default_public_sessions_path())
+    if not raw:
+        return None
+    try:
+        return DefaultPublicSessions(raw.lower())
+    except ValueError:
+        logger.warning("Unrecognized default_public_sessions override %r; using off", raw)
+        return DefaultPublicSessions.OFF
+
+
+def write_default_public_sessions_override(policy: DefaultPublicSessions) -> None:
+    """Persist the admin default-public-sessions override atomically."""
+    _write_override_text(resolve_default_public_sessions_path(), policy.value)
+
+
+def default_public_policy(state: Any) -> DefaultPublicSessions:
+    """The live default-public policy off ``app.state`` (``OFF`` when unwired)."""
+    return DefaultPublicSessions.coerce(
+        getattr(state, "default_public_sessions", lambda: DefaultPublicSessions.OFF)()
+    )
+
+
+def host_is_managed_sandbox(host_registry: Any, host_id: str | None) -> bool:
+    """Whether ``host_id`` is currently connected as a server-provisioned sandbox.
+
+    Keys on the live connection's launch-token provenance, not a persisted
+    ``sandbox_provider`` marker: an owner can reconnect their own machine on a
+    managed host's id under ordinary login, which keeps the marker but is not a
+    sandbox. A genuine sandbox proves itself with its launch token on every
+    connect. Lets a session started on an already-running sandbox count as a
+    sandbox session, not just one that requested a fresh sandbox.
+    """
+    if host_registry is None or host_id is None:
+        return False
+    conn = host_registry.get(host_id)
+    return conn is not None and bool(getattr(conn, "registered_with_managed_token", False))
+
+
+def new_session_starts_public(state: Any, *, managed: bool, workspace: str | None) -> bool:
+    """Whether a just-created session should get the default ``__public__`` grant.
+
+    Combines the default-public policy with the grant gates a manual share would
+    hit (sharing mode, public-access switch, restricted workspaces), so the
+    default never creates a grant an owner could not create by hand. ``state``
+    is ``app.state``; ``getattr`` defaults cover hand-built test apps.
+    """
+    policy = default_public_policy(state)
+    if policy is DefaultPublicSessions.OFF:
+        return False
+    if policy is DefaultPublicSessions.SANDBOX and not managed:
+        return False
+    mode = getattr(state, "sharing_mode", lambda: SharingMode.ON)()
+    if mode == SharingMode.OFF or not getattr(state, "public_sharing", lambda: True)():
+        return False
+    if mode != SharingMode.RESTRICTED_READ_ONLY:
+        return True
+    if workspace:
+        return not workspace_sharing_blocked(workspace)
+    # Unknown cwd (a fork, or a create that binds later): nothing re-checks the
+    # grant at bind time, so fail closed. Server-provisioned sandboxes are exempt;
+    # the server picks their cwd inside a disposable container.
+    return managed
