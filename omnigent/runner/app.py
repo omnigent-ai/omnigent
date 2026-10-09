@@ -8288,9 +8288,18 @@ def create_runner_app(
                 execution_registry=mcp_execution_registry,
             ).call_tool(None, name, arguments)
             try:
-                return cast(_JsonObject, _json.loads(result_str))
+                parsed = cast(_JsonObject, _json.loads(result_str))
             except _json.JSONDecodeError:
                 return {"result": result_str}
+            # CUSTOM PATCH (set5think fork) — clamp inline image payloads before
+            # they reach the native CLI. Native CLIs (kiro-cli) store tool-result
+            # images in their own history and replay them to their backend every
+            # turn; full-res base64 blows the backend's 5 MB/image + aggregate
+            # limits and wedges the session. See omnigent/runner/relay_image_clamp.py
+            # and the omnigent-fork skill manifest.
+            from omnigent.runner.relay_image_clamp import clamp_relay_result_images
+
+            return cast(_JsonObject, clamp_relay_result_images(parsed))
 
         try:
             relay: ClaudeNativeToolRelay = start_tool_relay(

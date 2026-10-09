@@ -1,0 +1,41 @@
+spec_version: 1
+name: gpt-oss
+description: >-
+  General-purpose gpt-oss-120b agent (via Bedrock) with filesystem + shell
+  tools and the ability to spawn sub-agent sessions.
+
+spawn: true
+
+executor:
+  type: omnigent
+  config:
+    harness: openai-agents
+    model: openai.gpt-oss-120b-1:0
+    auth:
+      type: provider
+      name: bedrock-oss
+
+# Register filesystem/shell tools (sys_os_read/write/edit/shell).
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Blast-radius guardrail: deny the catastrophic set, allow everything else
+# without an approval prompt (a headless agent cannot answer one).
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+
+prompt: |
+  You are a helpful, capable assistant running on gpt-oss-120b. You have
+  filesystem and shell access via your sys_os_* tools — use them to read,
+  write, and run things when the task calls for it. Be concise and get the
+  job done.

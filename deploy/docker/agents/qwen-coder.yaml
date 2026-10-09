@@ -1,0 +1,6 @@
+name: qwen-coder
+prompt: You are a helpful, concise assistant.
+executor:
+  harness: openai-agents
+  model: qwen.qwen3-coder-next
+  auth: {type: provider, name: bedrock-oss}

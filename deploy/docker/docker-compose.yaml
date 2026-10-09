@@ -87,6 +87,8 @@ services:
       # dev (many web clients + servers on one machine), NEVER for shared
       # deploys: everyone who can reach the port is the same user.
       OMNIGENT_AUTH_ENABLED: "${OMNIGENT_AUTH_ENABLED:-1}"
+      OMNIGENT_BUILTIN_AGENT_DIRS: "${OMNIGENT_BUILTIN_AGENT_DIRS:-}"
+      AWS_BEARER_TOKEN_BEDROCK: "${AWS_BEARER_TOKEN_BEDROCK:-}"
       # Escape hatch: pin the identity source explicitly. Overrides the
       # AUTH_ENABLED-based resolution above. Leave unset unless you need
       # to force a specific mode:
@@ -151,6 +153,7 @@ services:
       OMNIGENT_ACCOUNTS_AUTO_OPEN: "${OMNIGENT_ACCOUNTS_AUTO_OPEN:-0}"
     volumes:
       - artifact-data:/data
+      - ./agents:/agents:ro
     ports:
       - "${OMNIGENT_PORT:-8000}:8000"
 

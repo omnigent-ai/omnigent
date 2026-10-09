@@ -1,0 +1,6 @@
+name: vision
+prompt: You are a helpful, concise assistant.
+executor:
+  harness: openai-agents
+  model: qwen.qwen3-vl-235b-a22b
+  auth: {type: provider, name: bedrock-oss}
