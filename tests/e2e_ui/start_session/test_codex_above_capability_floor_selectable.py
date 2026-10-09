@@ -32,17 +32,19 @@ from typing import Any
 
 import httpx
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _HOST_ONLINE_TIMEOUT_S = 180.0
-# Above the 0.129.0 policy-hook floor, below the 0.137.0 date-derived floor
-# that once rejected it.
+# Above the native harness's 0.129.0 policy-hook capability floor.
 _STUB_CODEX_VERSION = "0.133.0"
-# Long enough for a recording's sampled frames to catch each picker state.
-_HOLD_MS = 3_000
+# Hold each picker state long enough for a recording to sample it; plain runs skip it.
+_HOLD_MS = 3_000 if os.environ.get("OMNIGENT_E2E_RECORD_DIR") else 0
+# Time for a readiness notice that renders after the selection to appear.
+_SETTLE_MS = 500
 
 _STUB_CODEX = f"""#!/usr/bin/env bash
 if [ "$1" = "--version" ]; then echo "codex-cli {_STUB_CODEX_VERSION}"; fi
@@ -190,7 +192,9 @@ async def _reveal_agent_row(page: Any, agent_id: str) -> Any:
         more = page.get_by_test_id("new-chat-landing-harness-more")
         if await more.count() > 0:
             await more.hover()
-            if await row.count() == 0:
+            try:
+                await row.wait_for(state="visible", timeout=2_000)
+            except PlaywrightTimeoutError:
                 await more.click()
     await row.wait_for(state="visible", timeout=10_000)
     return row
@@ -202,7 +206,7 @@ async def _notice_text(page: Any, test_id: str, *, wait: bool) -> str | None:
     if wait:
         try:
             await notice.wait_for(state="visible", timeout=10_000)
-        except Exception:
+        except PlaywrightTimeoutError:
             return None
     elif not await notice.is_visible():
         return None
@@ -252,6 +256,8 @@ async def _drive_codex_picker(
                 codex_selected = (await row.get_attribute("data-active")) == "true"
                 await page.wait_for_timeout(_HOLD_MS)
                 await page.keyboard.press("Escape")
+                await expect(page.get_by_role("menu").first).to_be_hidden()
+                await page.wait_for_timeout(_SETTLE_MS)
             else:
                 # The row cannot be chosen; land on Codex the way a returning
                 # user does, via the persisted last pick, so the composer's

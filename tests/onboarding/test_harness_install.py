@@ -1459,12 +1459,8 @@ def test_the_codex_floor_is_the_policy_hook_capability_floor(
 ) -> None:
     """A codex at or above the policy-hook floor must read as installed.
 
-    The floor feeds the host readiness map and launch gate, not just setup:
-    a floor above the capability requirement (0.129.0, the hook-trust
-    protocol) makes the picker flag a working codex "outdated" and the host
-    refuse every codex launch. Managed installs pinned between the
-    capability floor and a newer release are exactly the reported case, so
-    pin the floor to the capability, not a date cutoff.
+    The floor also feeds the host readiness map and launch gate, so a floor
+    above the capability requirement flags a working codex "outdated".
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
