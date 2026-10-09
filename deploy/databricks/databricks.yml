@@ -2,7 +2,8 @@
 #
 # Every knob the app exposes lives here. deploy.py wraps `databricks
 # bundle deploy` + `bundle run`; per-app values are passed as `--var`
-# pairs (see deploy.py / README.md).
+# pairs, except `features`, which travels as BUNDLE_VAR_features because
+# the CLI splits `--var` values on commas (see deploy.py / README.md).
 
 bundle:
   name: omnigent
