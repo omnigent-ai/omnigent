@@ -930,3 +930,34 @@ def test_multiple_terminals_per_conversation(tmp_path: Path) -> None:
 
     for (name, key), inst in instances.items():
         assert reg.get("conv_a", name, key) is inst
+
+
+def test_publish_if_registered_runs_only_for_the_registered_instance(tmp_path: Path) -> None:
+    """Publication is skipped once the key belongs to another instance or to none."""
+    reg = TerminalRegistry()
+    mine = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "mine" / "tmux.sock",
+        private_dir=tmp_path / "mine",
+    )
+    successor = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "successor" / "tmux.sock",
+        private_dir=tmp_path / "successor",
+    )
+    reg._by_conversation["conv_publish"] = {("claude", "main"): mine}
+    published: list[str] = []
+
+    assert reg.publish_if_registered(
+        "conv_publish", "claude", "main", mine, lambda: published.append("mine")
+    )
+    reg._by_conversation["conv_publish"] = {("claude", "main"): successor}
+    assert not reg.publish_if_registered(
+        "conv_publish", "claude", "main", mine, lambda: published.append("retired")
+    )
+    assert not reg.publish_if_registered(
+        "conv_missing", "claude", "main", mine, lambda: published.append("missing")
+    )
+    assert published == ["mine"]

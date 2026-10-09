@@ -12555,6 +12555,10 @@ def test_tmux_target_advertised_reports_valid_advertisement(tmp_path: Path) -> N
         tmux_target="main",
     )
     assert claude_native_bridge.tmux_target_advertised(bridge_dir)
+    assert claude_native_bridge.read_tmux_target(bridge_dir) == {
+        "socket_path": str(tmp_path / "tmux.sock"),
+        "tmux_target": "main",
+    }
 
 
 def test_tmux_target_advertised_rejects_invalid_payloads(tmp_path: Path) -> None:

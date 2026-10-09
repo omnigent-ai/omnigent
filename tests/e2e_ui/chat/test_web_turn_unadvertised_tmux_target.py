@@ -7,13 +7,9 @@ import time
 
 import pytest
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 
-from omnigent.harnesses.claude_native.bridge import (
-    _BRIDGE_ROOT,
-    _TMUX_FILE,
-    read_active_session_id,
-)
+from tests._helpers.claude_native_advertisement import remove_tmux_advertisement
 from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _log = logging.getLogger(__name__)
@@ -36,39 +32,16 @@ _DELIVERY_TIMEOUT_S = 200.0
 def _wait_terminal_connected(page: Page, timeout_ms: int) -> None:
     """Wait until the session's terminal pane reports ``connected``.
 
-    Native sessions default to the terminal view, but the ``terminal-view``
-    element stays mounted (hidden) after switching to chat, so this polls its
-    ``data-state`` attribute directly rather than waiting on visibility.
+    The ``terminal-view`` element stays mounted (hidden) after switching to
+    chat, so this asserts its ``data-state`` rather than its visibility.
 
     :param page: The Playwright page on the session surface.
     :param timeout_ms: Milliseconds to wait for the connected state.
     """
-    page.get_by_test_id("view-mode-toggle").wait_for(state="visible", timeout=timeout_ms)
-    deadline = time.monotonic() + timeout_ms / 1000.0
-    while time.monotonic() < deadline:
-        state = page.locator(_TERMINAL_VIEW).last.get_attribute("data-state")
-        if state == "connected":
-            return
-        page.wait_for_timeout(500)
-    raise AssertionError(f"terminal never reached 'connected' within {timeout_ms}ms")
-
-
-def _remove_tmux_advertisement(session_id: str) -> str:
-    """Remove the advertisement owned by the fixture's session.
-
-    :param session_id: Session whose pane should lose its advertisement.
-    :returns: The path of the removed advertisement.
-    """
-    matches = [
-        p
-        for p in _BRIDGE_ROOT.glob(f"*/{_TMUX_FILE}")
-        if read_active_session_id(p.parent) == session_id
-    ]
-    assert len(matches) == 1, "expected exactly one advertisement for the fixture session"
-    target = matches[0]
-    target.unlink()
-    assert not target.exists()
-    return str(target)
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=timeout_ms)
+    expect(page.locator(_TERMINAL_VIEW).last).to_have_attribute(
+        "data-state", "connected", timeout=timeout_ms
+    )
 
 
 def _error_pill_text(page: Page) -> str | None:
@@ -81,12 +54,12 @@ def _error_pill_text(page: Page) -> str | None:
     if pill.count() == 0:
         return None
     content = pill.get_by_test_id("error-message-content")
-    if not content.is_visible():
-        pill.click()  # a click toggles the pill, so expand only a collapsed one
     try:
+        if not content.is_visible():
+            pill.click()  # a click toggles the pill, so expand only a collapsed one
         content.wait_for(state="visible", timeout=10_000)
         return content.inner_text()
-    except PlaywrightError as exc:  # pill not expanded/ready yet
+    except PlaywrightError as exc:  # pill detached or not expanded yet
         _log.debug("error pill not readable yet: %s", exc)
         return None
 
@@ -121,7 +94,7 @@ def test_web_turn_survives_unadvertised_tmux_target(
     _wait_terminal_connected(page, _TERMINAL_READY_TIMEOUT_MS)
 
     # Inject the fault: the tmux target is no longer advertised, pane still alive.
-    removed = _remove_tmux_advertisement(session_id)
+    removed = remove_tmux_advertisement(session_id)
     _log.info("removed tmux advertisement: %s", removed)
 
     # Switch to the chat composer and send a web-chat turn (the user's action).

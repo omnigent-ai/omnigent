@@ -624,8 +624,10 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource_view),
         )
 
-    async def _readvertise_live_claude_pane(conv_id: str, instance: TerminalInstance) -> None:
-        """Restore a live Claude pane's missing ``tmux.json`` before a turn.
+    async def _readvertise_live_claude_pane(
+        conv_id: str, instance: TerminalInstance, terminal_registry: TerminalRegistry
+    ) -> None:
+        """Restore a live Claude pane's missing or stale ``tmux.json`` before a turn.
 
         The relay binding already knows the bridge dir; the session labels
         (a server round trip) are the fallback. Best-effort.
@@ -653,7 +655,11 @@ def register_resource_routes(
                 return
             bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         await asyncio.to_thread(
-            _readvertise_live_claude_tmux_target, bridge_dir, instance, session_id=conv_id
+            _readvertise_live_claude_tmux_target,
+            bridge_dir,
+            instance,
+            terminal_registry=terminal_registry,
+            session_id=conv_id,
         )
 
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
@@ -691,10 +697,10 @@ def register_resource_routes(
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
             if await instance.is_alive():
-                if terminal_name == "claude":
+                if terminal_name == native_terminal_name("claude-native"):
                     # Alive is not deliverable: the advertisement the inject
-                    # waits on may be missing while the pane is up.
-                    await _readvertise_live_claude_pane(conv_id, instance)
+                    # waits on may be missing or stale while the pane is up.
+                    await _readvertise_live_claude_pane(conv_id, instance, terminal_registry)
                 return  # pane is registered and alive — nothing to re-create
             _logger.info(
                 "native pane registered but dead for conv=%s harness=%s; closing stale entry",

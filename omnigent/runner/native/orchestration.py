@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
+    from omnigent.terminals.registry import TerminalRegistry
 
 import click
 import httpx
@@ -175,34 +176,55 @@ def _readvertise_live_claude_tmux_target(
     bridge_dir: Path,
     instance: TerminalInstance,
     *,
+    terminal_registry: TerminalRegistry,
     session_id: str,
 ) -> None:
     """
-    Restore a missing tmux advertisement from the registered live Claude pane.
+    Advertise a registered live Claude pane whose ``tmux.json`` is missing or stale.
 
-    A live pane is not deliverable until ``tmux.json`` names its socket and
-    target. Failures are logged and leave injection to its existing wait.
+    Injection can only reach the pane once the advertisement names its socket
+    and target. Publication runs through
+    :meth:`TerminalRegistry.publish_if_registered`, so a pane closed or
+    replaced since the caller's probe never advertises over its successor.
+    Failures are logged and leave injection to its existing wait.
 
     :param bridge_dir: The session's claude-native bridge directory.
     :param instance: The registered, alive ``claude`` pane instance.
-    :param session_id: Owning session/conversation id, for logging.
+    :param terminal_registry: Registry that holds *instance*.
+    :param session_id: Owning session/conversation id.
     :returns: None.
     """
-    from omnigent.harnesses.claude_native.bridge import tmux_target_advertised, write_tmux_target
+    from omnigent.harnesses.claude_native.bridge import read_tmux_target, write_tmux_target
 
+    expected = {"socket_path": str(instance.socket_path), "tmux_target": instance.tmux_target}
     try:
-        if tmux_target_advertised(bridge_dir):
+        advertised = read_tmux_target(bridge_dir)
+        if advertised == expected:
             return
-        _logger.warning(
-            "live claude pane has no tmux advertisement for conv=%s; re-advertising",
+        published = terminal_registry.publish_if_registered(
             session_id,
-            extra={"session_id": session_id},
+            instance.name,
+            instance.session_key,
+            instance,
+            lambda: write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            ),
         )
-        write_tmux_target(
-            bridge_dir,
-            socket_path=instance.socket_path,
-            tmux_target=instance.tmux_target,
-        )
+        if published:
+            _logger.warning(
+                "live claude pane had %s tmux advertisement for conv=%s; re-advertised",
+                "no" if advertised is None else "a stale",
+                session_id,
+                extra={"session_id": session_id},
+            )
+        else:
+            _logger.info(
+                "claude pane for conv=%s was closed or replaced before re-advertising; skipped",
+                session_id,
+                extra={"session_id": session_id},
+            )
     except Exception:  # noqa: BLE001 — heal is best-effort
         _logger.warning(
             "failed to re-advertise claude tmux target for conv=%s",

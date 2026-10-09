@@ -964,10 +964,14 @@ def build_native_controls(
         # only job is to decide whether the readiness poll below runs at all.
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
-            # A live pane can still lack its tmux advertisement; restore it so
-            # the inject below does not time out against an absent target.
+            # A live pane can still lack its tmux advertisement or hold a stale
+            # one; restore it so the inject below does not time out.
             await asyncio.to_thread(
-                _readvertise_live_claude_tmux_target, bridge_dir, instance, session_id=conv_id
+                _readvertise_live_claude_tmux_target,
+                bridge_dir,
+                instance,
+                terminal_registry=terminal_registry,
+                session_id=conv_id,
             )
             return
         await _ensure_native_terminal_for_turn(conv_id, "claude-native")

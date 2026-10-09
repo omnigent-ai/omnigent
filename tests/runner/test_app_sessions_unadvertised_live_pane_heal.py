@@ -1,9 +1,7 @@
-"""Restore a live Claude pane's missing advertisement before message injection."""
+"""Restore a live Claude pane's missing or stale advertisement before message injection."""
 
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +11,42 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     _TMUX_FILE,
     bridge_dir_for_conversation_id,
+    read_tmux_target,
     tmux_target_advertised,
+    write_tmux_target,
 )
+from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner.native.orchestration import _readvertise_live_claude_tmux_target
+from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import _runner_client
 from tests.runner.test_app_sessions_native_session_change_heal import (
     _open_claude_native_session,
     _plant_live_claude_pane,
 )
+
+
+def _advertisement_of(instance: TerminalInstance) -> dict[str, str]:
+    return {"socket_path": str(instance.socket_path), "tmux_target": instance.tmux_target}
+
+
+def _inject_requiring_advertisement(
+    captured: list[tuple[str, dict[str, str]]],
+):
+    """Stand in for ``inject_slash_command`` while keeping its advertisement wait."""
+
+    def _inject(
+        inject_bridge_dir: Path,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del timeout_s, auto_confirm, confirm_hint
+        info = claude_native_bridge._wait_for_tmux_info(inject_bridge_dir, timeout_s=0.2)
+        captured.append((command, info))
+
+    return _inject
 
 
 @pytest.mark.asyncio
@@ -37,13 +64,7 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     event: dict[str, Any],
     expected_command: str,
 ) -> None:
-    """Live pane + missing tmux.json must re-advertise and inject, not fail.
-
-    ``inject_slash_command`` keeps the real advertisement dependency (it
-    waits on ``tmux.json`` exactly like the production inject), so without
-    the re-advertise heal the handler answers 503 -- the same
-    "tmux target is not advertised" hard-fail the web turn surfaced.
-    """
+    """Restore a live pane's missing advertisement before injecting, without recreating it."""
     conv_id = "e5f60718293a4b5c6d7e8f901a2b3c4d"
     if event["type"] == "effort_change":
         conv_id = "f60718293a4b5c6d7e8f901a2b3c4d5e"
@@ -54,27 +75,11 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     auto_create_calls.clear()
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     instance = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
-    # The fault: the pane is alive but nothing advertises its tmux target.
     (bridge_dir / _TMUX_FILE).unlink()
 
     captured: list[tuple[str, dict[str, str]]] = []
-
-    def _inject_requires_advertisement(
-        inject_bridge_dir: Path,
-        *,
-        command: str,
-        timeout_s: float,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
-        del timeout_s, auto_confirm, confirm_hint
-        # Keep the real inject's advertisement dependency: this raises
-        # TmuxSessionNotAdvertised when tmux.json is still missing.
-        info = claude_native_bridge._wait_for_tmux_info(inject_bridge_dir, timeout_s=0.2)
-        captured.append((command, info))
-
     monkeypatch.setattr(
-        claude_native_bridge, "inject_slash_command", _inject_requires_advertisement
+        claude_native_bridge, "inject_slash_command", _inject_requiring_advertisement(captured)
     )
 
     async with _runner_client(app) as client:
@@ -87,14 +92,88 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
     assert auto_create_calls == [], (
         "a live pane must be re-advertised in place, never torn down and recreated"
     )
-    assert captured == [
-        (
-            expected_command,
-            {"socket_path": str(instance.socket_path), "tmux_target": instance.tmux_target},
-        )
-    ], f"inject must see the live pane's re-advertised target; got {captured!r}"
+    assert captured == [(expected_command, _advertisement_of(instance))], (
+        f"inject must see the live pane's re-advertised target; got {captured!r}"
+    )
     # The heal is durable: the advertisement survives for subsequent injects.
     assert tmux_target_advertised(bridge_dir)
+
+
+@pytest.mark.asyncio
+async def test_stale_advertisement_is_rewritten_for_the_live_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An advertisement naming another socket or target is replaced by the live pane's."""
+    conv_id = "60718293a4b5c6d7e8f901a2b3c4d5e6"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    instance = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    # A stale file left by an earlier pane: valid fields, dead socket.
+    write_tmux_target(
+        bridge_dir, socket_path=tmp_path / "gone" / "tmux.sock", tmux_target="claude:0.0"
+    )
+    assert read_tmux_target(bridge_dir) != _advertisement_of(instance)
+
+    captured: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", _inject_requiring_advertisement(captured)
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert auto_create_calls == []
+    assert captured == [("/model claude-opus-4-7", _advertisement_of(instance))], captured
+
+
+@pytest.mark.asyncio
+async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A repair that cannot write the advertisement leaves the inject's own failure.
+
+    The heal is best-effort: the live pane must not be recreated, and the
+    injection still reports that the target is not advertised.
+    """
+    conv_id = "18293a4b5c6d7e8f901a2b3c4d5e6f70"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    (bridge_dir / _TMUX_FILE).unlink()
+
+    def _write_fails(*_args: object, **_kwargs: object) -> None:
+        raise OSError("bridge directory is read-only")
+
+    monkeypatch.setattr(claude_native_bridge, "write_tmux_target", _write_fails)
+    captured: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", _inject_requiring_advertisement(captured)
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert captured == [], "the inject must have waited on the still-missing advertisement"
+    assert auto_create_calls == [], "a failed repair must not recreate the live pane"
+    assert not tmux_target_advertised(bridge_dir)
 
 
 @pytest.mark.asyncio
@@ -102,7 +181,7 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A live pane whose advertisement is present must not be rewritten."""
+    """An advertisement that already names the live pane must not be rewritten."""
     conv_id = "0718293a4b5c6d7e8f901a2b3c4d5e6f"
     auto_create_calls: list[str] = []
     app, registry = await _open_claude_native_session(
@@ -111,11 +190,9 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     auto_create_calls.clear()
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     instance = _plant_live_claude_pane(registry, conv_id, tmp_path, bridge_dir)
-    # Advertise a valid target up front; the heal must keep it verbatim.
-    claude_native_bridge.write_tmux_target(
-        bridge_dir,
-        socket_path=instance.socket_path,
-        tmux_target=instance.tmux_target,
+    # The planter advertises a different target; publish the pane's own first.
+    write_tmux_target(
+        bridge_dir, socket_path=instance.socket_path, tmux_target=instance.tmux_target
     )
     advertised_before = (bridge_dir / _TMUX_FILE).read_text(encoding="utf-8")
 
@@ -144,55 +221,42 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     )
 
 
-def _browser_test_module():
-    """Import the browser regression lazily; its module needs Playwright."""
-    pytest.importorskip("playwright.sync_api")
-    from tests.e2e_ui.chat import test_web_turn_unadvertised_tmux_target as browser_test
-
-    return browser_test
-
-
-def _advertised_bridge(root: Path, name: str, session_id: str) -> Path:
-    directory = root / name
-    directory.mkdir(parents=True)
-    (directory / claude_native_bridge._CONFIG_FILE).write_text(
-        json.dumps({"active_session_id": session_id}), encoding="utf-8"
-    )
-    target = directory / _TMUX_FILE
-    target.write_text("synthetic advertisement", encoding="utf-8")
-    return target
-
-
-def test_browser_fault_injection_only_removes_its_session_advertisement(
+def test_repair_does_not_overwrite_a_replacement_pane(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    browser_test = _browser_test_module()
+    """A repair paused after its missing-file check must not publish over a successor.
 
-    own = _advertised_bridge(tmp_path, "own", "fixture-session")
-    other = _advertised_bridge(tmp_path, "other", "unrelated-session")
-    os.utime(own, (1, 1))
-    other_content = other.read_bytes()
-    monkeypatch.setattr(browser_test, "_BRIDGE_ROOT", tmp_path)
+    Between the check and the publication, pane A is deleted and pane B is
+    launched and advertised. The publication runs through
+    ``TerminalRegistry.publish_if_registered``, so A's stale target is dropped
+    and B stays advertised.
+    """
+    conv_id = "293a4b5c6d7e8f901a2b3c4d5e6f7081"
+    registry = TerminalRegistry()
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    pane_a = _plant_live_claude_pane(registry, conv_id, tmp_path / "a", bridge_dir)
+    (bridge_dir / _TMUX_FILE).unlink()
+    real_read = claude_native_bridge.read_tmux_target
+    replacement: list[TerminalInstance] = []
 
-    assert browser_test._remove_tmux_advertisement("fixture-session") == str(own)
-    assert not own.exists()
-    assert other.read_bytes() == other_content
+    def _read_then_replace_pane(read_bridge_dir: Path) -> dict[str, str] | None:
+        missing = real_read(read_bridge_dir)
+        # The pause point: A is closed and B launched and advertised before A publishes.
+        pane_b = _plant_live_claude_pane(registry, conv_id, tmp_path / "b", bridge_dir)
+        write_tmux_target(
+            bridge_dir, socket_path=pane_b.socket_path, tmux_target=pane_b.tmux_target
+        )
+        replacement.append(pane_b)
+        return missing
 
+    monkeypatch.setattr(claude_native_bridge, "read_tmux_target", _read_then_replace_pane)
 
-@pytest.mark.parametrize("own_advertisements", [0, 2], ids=["missing", "ambiguous"])
-def test_browser_fault_injection_requires_one_owned_advertisement(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, own_advertisements: int
-) -> None:
-    browser_test = _browser_test_module()
-
-    targets = [_advertised_bridge(tmp_path, "other", "unrelated-session")]
-    targets.extend(
-        _advertised_bridge(tmp_path, f"own-{i}", "fixture-session")
-        for i in range(own_advertisements)
+    _readvertise_live_claude_tmux_target(
+        bridge_dir, pane_a, terminal_registry=registry, session_id=conv_id
     )
-    contents = {target: target.read_bytes() for target in targets}
-    monkeypatch.setattr(browser_test, "_BRIDGE_ROOT", tmp_path)
 
-    with pytest.raises(AssertionError, match="exactly one advertisement"):
-        browser_test._remove_tmux_advertisement("fixture-session")
-    assert {target: target.read_bytes() for target in targets} == contents
+    assert registry.get(conv_id, "claude", "main") is replacement[0]
+    assert real_read(bridge_dir) == _advertisement_of(replacement[0]), (
+        "the retired pane must not advertise over its replacement"
+    )

@@ -6176,7 +6176,7 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _read_tmux_info(bridge_dir: Path) -> dict[str, str] | None:
+def read_tmux_target(bridge_dir: Path) -> dict[str, str] | None:
     """
     Read the ``tmux.json`` advertisement once.
 
@@ -6200,7 +6200,7 @@ def tmux_target_advertised(bridge_dir: Path) -> bool:
     :returns: ``True`` when ``tmux.json`` carries valid ``socket_path``
         and ``tmux_target`` fields.
     """
-    return _read_tmux_info(bridge_dir) is not None
+    return read_tmux_target(bridge_dir) is not None
 
 
 def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
@@ -6216,7 +6216,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         _check_injection_cancelled()
-        info = _read_tmux_info(bridge_dir)
+        info = read_tmux_target(bridge_dir)
         if info is not None:
             return info
         time.sleep(0.05)

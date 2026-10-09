@@ -718,13 +718,7 @@ async def test_turn_readvertises_live_pane_before_forwarding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A turn to a live pane whose tmux.json is gone restores it before forwarding.
-
-    Message delivery into the pane waits on ``tmux.json``; with the pane alive
-    but unadvertised it timed out with "tmux target is not advertised yet".
-    The turn path must rewrite the advertisement from the live registry
-    instance before the harness receives the turn, without recreating the pane.
-    """
+    """Restore a live pane's missing advertisement before forwarding, without recreating it."""
     conv_id = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     harness_client = _AdvertisementProbeHarnessClient(bridge_dir)
