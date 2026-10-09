@@ -811,7 +811,7 @@ def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
 
     The enterprise state (`isaac configure claude`): nothing in omnigent's
     config, no subscription login the probe can see, but Claude Code's managed
-    settings pin an AI Gateway + apiKeyHelper and the CLI applies them itself.
+    settings pin a Unity Gateway + apiKeyHelper and the CLI applies them itself.
     This is the exact "Claude Code isn't configured on <host>" dead end — the
     structural check must go green WITHOUT the `claude auth status` subprocess.
     """
@@ -1205,7 +1205,7 @@ def test_codex_cli_config_provider_does_not_ready_sdk_harnesses(
                 family="openai",
                 source="~/.codex/config.toml",
                 model_provider="Databricks",
-                display_name="Databricks AI Gateway",
+                display_name="Databricks Unity Gateway",
             )
         ],
     )

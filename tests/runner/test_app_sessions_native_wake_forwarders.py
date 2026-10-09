@@ -1352,24 +1352,57 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
+@pytest.mark.parametrize(
+    ("resume_error_payload", "expected_error_substring"),
+    [
+        (
+            {
+                "code": -32603,
+                "message": (
+                    "failed to read thread: thread-store internal error: failed to "
+                    "load thread history /codex-home/sessions/rollout.jsonl: "
+                    "stream did not contain valid UTF-8"
+                ),
+            },
+            "stream did not contain valid UTF-8",
+        ),
+        (
+            {
+                "code": -32600,
+                "message": (
+                    "invalid paginated history lineage for "
+                    "019e96aa-0be2-7343-8d3b-6f914d60936d: "
+                    "source rollout is not paginated"
+                ),
+            },
+            "source rollout is not paginated",
+        ),
+    ],
+    ids=["thread_store_error", "unpaginated_lineage"],
+)
 async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    resume_error_payload: dict[str, Any],
+    expected_error_substring: str,
 ) -> None:
     """
     A thread codex cannot read falls back to a fresh thread on the same app-server.
 
-    The large-rollout incident shape: codex's thread-store rejects the
-    persisted rollout (``-32603 failed to read thread … invalid UTF-8``) on
-    every ``thread/resume``, so re-raising failed every turn of the session
-    for good. The fallback must keep the app-server, take the fresh-thread
-    path (discovery listener connected, TUI launched without the thread id,
-    discovery forwarder) and log the Codex-side context it drops.
+    Covers two permanent-mismatch shapes: the large-rollout incident
+    (``-32603 failed to read thread … invalid UTF-8``) and the paginated-lineage
+    mismatch (``-32600 … source rollout is not paginated``). In both cases
+    re-raising fails every turn for good; the fallback must keep the app-server,
+    take the fresh-thread path (discovery listener connected, TUI launched without
+    the thread id, discovery forwarder) and log the Codex-side context it drops.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Log capture for the fallback warning.
+    :param resume_error_payload: JSON-RPC error dict codex returns for the resume.
+    :param expected_error_substring: Substring from the error that must appear in
+        the reset notice surfaced into the session.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
@@ -1484,23 +1517,14 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         cwd: Path | None = None,
     ) -> None:
         """
-        Refuse the resume the way codex's thread-store does for a bad rollout.
+        Refuse the resume with the parametrized error payload.
 
         :param transport: App-server transport URL (ignored).
-        :param loaded_thread_id: Thread id passed to ``thread/resume``.
+        :param loaded_thread_id: Thread id passed to ``thread/resume`` (ignored).
         :raises CodexAppServerResponseError: Always, mirroring the app-server.
         """
-        del transport, terminal_launch_args
-        raise codex_app_mod.CodexAppServerResponseError(
-            {
-                "code": -32603,
-                "message": (
-                    "failed to read thread: thread-store internal error: failed to "
-                    f"load thread history /codex-home/rollout-{loaded_thread_id}.jsonl: "
-                    "stream did not contain valid UTF-8"
-                ),
-            }
-        )
+        del transport, loaded_thread_id, terminal_launch_args
+        raise codex_app_mod.CodexAppServerResponseError(resume_error_payload)
 
     launched_args: list[list[str]] = []
 
@@ -1587,8 +1611,8 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         assert notice["data"]["item_data"]["code"] == "codex_thread_reset"
         assert notice["data"]["item_data"]["level"] == "info"
         # The body names codex as the source and quotes its own error text.
-        assert "Codex reported an internal error" in notice["data"]["item_data"]["message"]
-        assert "stream did not contain valid UTF-8" in notice["data"]["item_data"]["message"]
+        assert "Codex could not load" in notice["data"]["item_data"]["message"]
+        assert expected_error_substring in notice["data"]["item_data"]["message"]
         assert connected == ["omnigent-codex-native-auto"], (
             "the fresh-thread path must connect the discovery listener"
         )
