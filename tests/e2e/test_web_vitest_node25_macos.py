@@ -81,6 +81,9 @@ def _run_vitest(files: tuple[str, ...], preload: Path) -> tuple[int, str]:
         pytest.skip("web toolchain not installed (run pnpm install first)")
     if shutil.which("node") is None:
         pytest.skip("node is not on PATH")
+    # vitest treats paths as filters, so a renamed file would silently leave the guard.
+    missing = [file for file in files if not (_WEB_DIR / file).exists()]
+    assert not missing, f"guarded web test files were moved or removed: {missing}"
     env = os.environ.copy()
     # Replace ambient NODE_OPTIONS and VITEST so each guard controls the environment it builds.
     env.pop("VITEST", None)
