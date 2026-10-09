@@ -853,7 +853,7 @@ class _RecoveryScanLog:
     """Per-discovery throttling for recovery-scan warnings that would repeat every round."""
 
     port_log: ColdStartPortLog = field(default_factory=ColdStartPortLog)
-    foreign_reported: set[str] = field(default_factory=set)
+    foreign_misses: dict[str, int] = field(default_factory=dict)
 
 
 def _recover_placeholder_cascade(
@@ -870,8 +870,9 @@ def _recover_placeholder_cascade(
 
     :param bridge_dir: Native Antigravity bridge directory.
     :param scan_log: Throttling state shared by one discovery run: the resolver's
-        restricted-``/proc`` fallback and a refused foreign cascade are reported at
-        WARNING once and at DEBUG afterwards. A fresh log when ``None``.
+        restricted-``/proc`` fallback is reported at WARNING once, and a cascade
+        missing from this session's Gemini dir at WARNING on its second miss (the
+        first is usually agy's write lag), DEBUG otherwise. A fresh log when ``None``.
     :returns: The adopted cascade id (persisted), or ``None`` this round.
     """
     log = scan_log if scan_log is not None else _RecoveryScanLog()
@@ -906,14 +907,18 @@ def _recover_placeholder_cascade(
     if cascade_id is None:
         return None
     if not agy_conversation_db(bridge_dir, cascade_id).is_file():
+        # agy writes the db shortly after listing the cascade, so the first miss is
+        # usually that lag; a repeat miss means a foreign agy and is reported once.
+        misses = log.foreign_misses.get(cascade_id, 0)
         _logger.log(
-            logging.DEBUG if cascade_id in log.foreign_reported else logging.WARNING,
-            "agy placeholder recovery: typed cascade %s on port %s is NOT in this "
-            "session's Gemini dir (a foreign agy answered the scan); refusing to adopt.",
+            logging.WARNING if misses == 1 else logging.DEBUG,
+            "agy placeholder recovery: typed cascade %s on port %s is not (yet) in this "
+            "session's Gemini dir (a foreign agy, or agy has not written it yet); "
+            "refusing to adopt.",
             cascade_id,
             port,
         )
-        log.foreign_reported.add(cascade_id)
+        log.foreign_misses[cascade_id] = misses + 1
         return None
     # The scan above took seconds; a cold-start may have bound a real id meanwhile.
     if not update_conversation_id(bridge_dir, cascade_id, expect_placeholder=True):
