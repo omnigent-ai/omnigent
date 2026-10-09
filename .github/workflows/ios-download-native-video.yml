@@ -26,7 +26,9 @@ jobs:
           echo "id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Save fixed implementation
-        run: cp web/ios/Omnigent/OmnigentWebView.swift /tmp/OmnigentWebView.fixed.swift
+        run: |
+          cp web/ios/Omnigent/OmnigentWebView.swift /tmp/OmnigentWebView.fixed.swift
+          cp web/ios/Omnigent.xcodeproj/project.pbxproj /tmp/project.fixed.pbxproj
 
       - name: Record before fix
         env:
@@ -34,6 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           git show 3a845634d^:web/ios/Omnigent/OmnigentWebView.swift > web/ios/Omnigent/OmnigentWebView.swift
+          git show 3a845634d^:web/ios/Omnigent.xcodeproj/project.pbxproj > web/ios/Omnigent.xcodeproj/project.pbxproj
           xcodebuild test \
             -project web/ios/Omnigent.xcodeproj \
             -scheme Omnigent \
@@ -73,6 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           cp /tmp/OmnigentWebView.fixed.swift web/ios/Omnigent/OmnigentWebView.swift
+          cp /tmp/project.fixed.pbxproj web/ios/Omnigent.xcodeproj/project.pbxproj
           xcrun simctl uninstall "$DEVICE_ID" ai.omnigent.ios 2>/dev/null || true
           xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/after.mp4 &
           VIDEO_PID=$!
