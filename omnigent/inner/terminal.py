@@ -465,12 +465,9 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
 
-# The same 16KB imsg cap rejects the one-shot launch invocation. A pane
-# command whose quoted argv exceeds this byte budget (e.g. large agent
-# instructions riding the CLI argv) is materialized into a launcher
-# script inside the private dir, so the ``new-session`` command tmux
-# sees stays small no matter how big the argv grows. Half the cap
-# leaves ample headroom for the option commands sharing the invocation.
+# Quoted argv over this budget launches through a private script (see
+# ``_materialize_launch_script``) so the ``new-session`` command stays
+# small; half tmux's ~16KB cap leaves headroom for its option commands.
 _LAUNCH_COMMAND_BYTES_MAX = 8192
 # Launcher script filename inside the instance's private dir.
 _LAUNCH_SCRIPT_FILENAME = "launch.sh"

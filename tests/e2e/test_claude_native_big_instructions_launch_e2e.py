@@ -37,6 +37,7 @@ Run::
 
 from __future__ import annotations
 
+import atexit
 import io
 import json
 import os
@@ -60,6 +61,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Every HTTP call in this test targets 127.0.0.1; CI shells can carry an
 # egress proxy in the environment, so bypass proxy autodetection entirely.
 _http = httpx.Client(trust_env=False)
+atexit.register(_http.close)
 
 # The runner imports ``omnigent_client`` / ``omnigent_ui_sdk``; in a worktree
 # they resolve from sdks/, in an installed venv from site-packages.
@@ -301,11 +303,9 @@ def test_big_instructions_claude_terminal_launches(tmp_path: Path) -> None:
     runner_home = tmp_path / "home"
     runner_home.mkdir()
 
-    # Stub Claude CLI: records its argv (the launch decision under test) and
-    # parks so the tmux pane stays alive. No Claude login needed. The runner
-    # also runs headless ``claude -p "/model"`` catalog probes against the
-    # stub, so every invocation APPENDS one unit-separator-joined record and
-    # the assertion filters for the interactive terminal launch.
+    # Stub Claude CLI: records its argv and parks so the pane stays alive.
+    # Catalog probes also hit the stub, so each invocation appends one
+    # record and the assertion filters for the interactive launch.
     argv_file = tmp_path / "claude_argv.txt"
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir()
@@ -325,10 +325,8 @@ def test_big_instructions_claude_terminal_launches(tmp_path: Path) -> None:
         """
         if not argv_file.exists():
             return None
-        # Each stub invocation appends every arg with a \x1f terminator,
-        # then a record-ending newline. Args themselves can contain
-        # newlines (the big instructions do), so records split on the
-        # terminator+newline pair, never on bare lines.
+        # Args can contain newlines (the big instructions do), so records
+        # split on the \x1f-terminator+newline pair, never on bare lines.
         for record in argv_file.read_text().split("\x1f\n"):
             argv = record.split("\x1f") if record else []
             if argv and "-p" not in argv:
@@ -405,12 +403,9 @@ def test_big_instructions_claude_terminal_launches(tmp_path: Path) -> None:
         # The user's session on the big-instructions agent.
         session_id = _create_big_prompt_claude_session(base_url)
 
-        # THE LAUNCH: bind the session to the runner (what starting the
-        # session from the web UI does) -> the runner auto-creates the Claude
-        # terminal, composing the CLI argv with --append-system-prompt.
-        # The bind can block on the runner-side terminal bring-up (the model
-        # catalog probe alone holds a 20-30s budget against the parked stub),
-        # so give it the same generous budget as the argv wait.
+        # Binding to the runner auto-creates the Claude terminal (what the
+        # web UI does). The bind can block on terminal bring-up (catalog
+        # probes against the parked stub), so reuse the argv wait's budget.
         _http.patch(
             f"{base_url}/v1/sessions/{session_id}",
             json={"runner_id": runner_id},
