@@ -142,6 +142,25 @@ def _wait_for_completion(
         time.sleep(2.0)
 
 
+def _wait_for_reaction(
+    base_url: str, main_id: str, completion_id: str, *, timeout_s: float
+) -> None:
+    """Wait for the main chat's assistant turn that follows the completion item."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        items = _items(base_url, main_id)
+        ids = [item.get("id") for item in items]
+        if completion_id in ids and any(
+            item.get("type") == "message" and item.get("role") == "assistant"
+            for item in items[ids.index(completion_id) + 1 :]
+        ):
+            return
+        assert time.monotonic() < deadline, (
+            "the agent never reacted to the completion in the main chat"
+        )
+        time.sleep(2.0)
+
+
 def _dump_evidence(
     folder: Path, page: Page, base_url: str, main_id: str, side_id: str, label: str
 ) -> None:
@@ -176,8 +195,10 @@ def _drive_journey(
     evidence: Path,
 ) -> None:
     side_ids: list[str] = []
+    fork_at: list[float] = []
 
     def track_fork(route: Route) -> None:
+        fork_at.append(time.time())
         response = route.fetch()
         if response.ok:
             side_ids.append(response.json()["id"])
@@ -217,10 +238,24 @@ def _drive_journey(
 
     evidence.mkdir(parents=True, exist_ok=True)
     (evidence / "ids.json").write_text(json.dumps({"main": session_id, "side": side_id}))
-    # Let the real completion reach the main chat so both outcomes are on screen,
-    # then let the reacting turn settle before capturing.
-    _wait_for_completion(base_url, session_id, side_id, timeout_s=150.0, until_main=True)
-    time.sleep(20.0)
+    main_hits, _ = _wait_for_completion(
+        base_url, session_id, side_id, timeout_s=150.0, until_main=True
+    )
+    assert main_hits, "sub-agent completion never reached the main chat within 150s"
+    completion = main_hits[0]
+    if side_chat_order == "during_fork":
+        # The reported condition: the clone was taken while the fork was pending.
+        assert int(fork_at[0]) <= completion["created_at"], (
+            "side chat was opened after the fork completed; nothing was pending to inherit"
+        )
+        assert any(
+            item.get("type") == "function_call" and item.get("name") == "Agent"
+            for item in _items(base_url, side_id)
+        ), "side chat clone did not carry the pending Agent launch"
+    # Let the agent's turn reacting to the completion land in the main chat, then
+    # hold a short quiet period so a late leak into the side chat would be seen.
+    _wait_for_reaction(base_url, session_id, completion["id"], timeout_s=120.0)
+    time.sleep(5.0)
     _dump_evidence(evidence, page, base_url, session_id, side_id, "after-completion")
 
     _send(page, prompts.later)
