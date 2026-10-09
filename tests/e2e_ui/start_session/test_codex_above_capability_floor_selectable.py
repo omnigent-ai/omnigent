@@ -1,18 +1,13 @@
 """E2E: a signed-in Codex above the native harness's capability floor stays selectable.
 
-Journey from the bug report: a user's machine has a working, signed-in ``codex``
-whose version sits between the native harness's 0.129.0 policy-hook floor and a
-newer release. They connect it as an ``omnigent host``, open the new-chat screen
-on that host and choose Codex in the harness picker. The daemon's readiness map
-drives the picker, so the test registers a REAL ``omnigent host`` daemon
-(isolated ``HOME`` holding a Codex login, stub-first ``PATH``) against the live
-e2e server rather than stubbing the wire body.
-
-With a floor above the capability requirement the daemon reports the CLI
-``version-too-low``: the Codex row is disabled with a warning badge and the
-composer swaps the remembered agent away with an "outdated" notice. With the
-capability floor the host reads ready, the row is enabled, choosing it keeps
-Codex selected, and no notice appears.
+Journey from the bug report: connect a machine whose signed-in ``codex`` sits
+between the native harness's 0.129.0 policy-hook floor and a newer release as an
+``omnigent host``, open the new-chat screen on that host and choose Codex in the
+harness picker. The daemon's readiness map drives the picker, so the test
+registers a REAL ``omnigent host`` daemon (isolated ``HOME`` holding a Codex
+login, stub-first ``PATH``) against the live e2e server rather than stubbing the
+wire body. Codex must read ready, keep its row enabled, stay selected once
+chosen, and raise no outdated notice.
 
 The async-in-a-fresh-thread shape is inherited from
 ``start_session/test_start_session.py``.
@@ -127,8 +122,16 @@ def signed_in_stub_codex_host(
         deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
         row: dict[str, Any] | None = None
         while time.monotonic() < deadline:
-            row = _fetch_host_row(live_server, host_name)
-            if row is not None:
+            try:
+                candidate = _fetch_host_row(live_server, host_name)
+            except (httpx.HTTPError, ValueError):
+                candidate = None
+            # The daemon can come online before its capability probe finishes
+            # and publish the readiness map in a later refresh frame.
+            if candidate is not None and "codex-native" in (
+                candidate.get("configured_harnesses") or {}
+            ):
+                row = candidate
                 break
             if proc.poll() is not None:
                 raise RuntimeError(
@@ -138,7 +141,7 @@ def signed_in_stub_codex_host(
             time.sleep(1.0)
         if row is None:
             raise RuntimeError(
-                f"stub-codex host never came online:\n{log_path.read_text()[-2000:]}"
+                f"stub-codex host never reported codex readiness:\n{log_path.read_text()[-2000:]}"
             )
         yield row
     finally:
