@@ -1624,12 +1624,18 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
-    # Parent -> the status this runner published for it because a re-armed child
-    # was running, so a settled spurious re-arm can take that status back.
-    _rearm_parent_status: dict[str, str] = {}
+    # Child -> pending settle of a provisional re-arm (see _settle_subagent_rearm_later).
+    _rearm_settle_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _cancel_subagent_rearm_settle(child_id: str) -> None:
+        task = _rearm_settle_tasks.pop(child_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     def _note_subagent_child_activity(child_id: str) -> None:
-        """Re-arm a finished dispatch on new child activity and show an idle parent waiting."""
+        """Re-arm a finished dispatch on new child activity and show an idle SDK parent waiting."""
+        # New activity invalidates a settle scheduled for an earlier idle read.
+        _cancel_subagent_rearm_settle(child_id)
         entry = note_subagent_child_activity(child_id)
         if entry is None:
             return
@@ -1639,16 +1645,15 @@ def create_runner_app(
         # it). No status published in this process means no turn in flight here.
         if parent_id in _active_turns or _native_pane_status.get(parent_id) not in (None, "idle"):
             return
-        before = _native_pane_status.get(parent_id)
         _publish_turn_status(parent_id, "waiting")
-        after = _native_pane_status.get(parent_id)
-        if after is not None and after != before:
-            _rearm_parent_status[parent_id] = after
 
     def _settle_subagent_rearm_later(child_id: str) -> None:
         """Undo a re-arm the file's own ``idle`` contradicts and no ``Stop`` confirms in time."""
         entry = get_subagent_work(child_id)
         if entry is None or not entry.rearmed or entry.status != "running":
+            return
+        pending = _rearm_settle_tasks.get(child_id)
+        if pending is not None and not pending.done():
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1663,11 +1668,12 @@ def create_runner_app(
             if reverted is None:
                 return
             parent_id = reverted.parent_session_id
-            published = _rearm_parent_status.pop(parent_id, None)
+            # The parent reads waiting only because of re-armed children; once the
+            # last of them settles with no turn of its own in flight, it is idle.
             if (
-                published is not None
-                and _native_pane_status.get(parent_id) == published
-                and parent_id not in _active_turns
+                parent_id not in _active_turns
+                and parent_id not in _live_response_id
+                and _native_pane_status.get(parent_id) == _effective_waiting_status()
                 and not any(
                     e.status in ("launching", "running", "waiting")
                     for e in list_subagent_work(parent_id)
@@ -1676,8 +1682,15 @@ def create_runner_app(
                 _publish_turn_status(parent_id, "idle")
 
         task = loop.create_task(_settle(), name=f"subagent-rearm-settle:{child_id}")
+        _rearm_settle_tasks[child_id] = task
         _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+
+        def _drop_settle(done: asyncio.Task[None]) -> None:
+            _background_tasks.discard(done)
+            if _rearm_settle_tasks.get(child_id) is done:
+                _rearm_settle_tasks.pop(child_id, None)
+
+        task.add_done_callback(_drop_settle)
 
     def _publish_session_status(
         session_id: str,
@@ -3568,6 +3581,12 @@ def create_runner_app(
         agent = native_coding_agent_for_harness(_session_harness_name(conv_id))
         return agent is not None and agent.key in _TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS
 
+    def _effective_waiting_status() -> str:
+        """``waiting`` when the server renders it; an older server is shown ``running``."""
+        if _server_version is not None and _version_supports_waiting_status(_server_version):
+            return "waiting"
+        return "running"
+
     def _publish_turn_status(
         conv_id: str,
         status: str,
@@ -3576,10 +3595,8 @@ def create_runner_app(
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
     ) -> None:
-        if status == "waiting" and not (
-            _server_version is not None and _version_supports_waiting_status(_server_version)
-        ):
-            status = "running"
+        if status == "waiting":
+            status = _effective_waiting_status()
         harness = _session_harness_name(conv_id)
         if status != "failed" and harness in {
             "claude-native",

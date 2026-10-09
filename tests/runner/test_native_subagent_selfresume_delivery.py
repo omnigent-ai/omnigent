@@ -24,6 +24,7 @@ from tests.runner.helpers import NullServerClient
 
 PARENT_SESSION_ID = "conv_parent_orchestrator"
 CHILD_SESSION_ID = "conv_child_reviewer"
+SECOND_CHILD_SESSION_ID = "conv_child_reviewer_two"
 
 
 _REGISTRY_MAPS = (
@@ -387,34 +388,6 @@ async def test_selfresumed_worker_counts_as_running_when_the_orchestrator_turn_e
 
 
 @pytest.mark.asyncio
-async def test_selfresume_shows_an_idle_orchestrator_waiting(
-    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An orchestrator already idle when its worker self-resumes is shown waiting on it.
-
-    The orchestrator read round one and its turn ended idle; the worker's
-    re-arming ``running`` edge is the only signal before the self-resumed turn's
-    ``Stop``, so it is what moves the orchestrator to ``waiting``.
-    """
-    monkeypatch.setattr(runner_app, "_server_version", "0.16.0")
-    server = _ChildSnapshotServerClient()
-    app, inbox, _work_id = _dispatch_worker(server)
-    publish_pane_status = _pane_status_publisher(app)
-
-    async with _runner_client(app) as client:
-        await _deliver_and_drain_round_one(client, inbox, server)
-        app.state.native_pane_status[PARENT_SESSION_ID] = "idle"
-        _parent_status_events()
-
-        publish_pane_status(CHILD_SESSION_ID, "running", None)
-        await asyncio.sleep(0)
-
-    assert _parent_status_events() == ["waiting"], (
-        "the orchestrator stayed idle while its self-resumed worker was running"
-    )
-
-
-@pytest.mark.asyncio
 async def test_selfresume_leaves_a_mid_turn_orchestrator_to_its_own_turn_end(
     _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -678,3 +651,151 @@ async def test_selfresume_waiting_edge_follows_the_parent_harness(
         await asyncio.sleep(0)
 
     assert _parent_status_events() == expected
+
+
+@pytest.mark.asyncio
+async def test_new_running_edge_cancels_a_pending_settle(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real turn that starts while a settle is pending must not be reverted.
+
+    Stale ``busy`` -> ``running`` -> file ``idle`` schedules a settle; the real
+    self-resumed turn then publishes ``running`` again and may outlast the grace
+    window, so the earlier settle must be cancelled or its ``Stop`` would meet a
+    restored drain and be answered "already delivered".
+    """
+    held = _HeldSleep()
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", held)
+    server = _ChildSnapshotServerClient()
+    app, inbox, work_id = _dispatch_worker(server)
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        await _deliver_and_drain_round_one(client, inbox, server)
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        publish_pane_status(CHILD_SESSION_ID, "idle", None)
+        await _let_settle_run()
+        assert held.calls == [runner_app._SUBAGENT_REARM_SETTLE_GRACE_S]
+
+        # The real self-resumed turn starts before the grace window elapses.
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        await _let_settle_run()
+        held.release.set()
+        await _let_settle_run()
+        live = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert live is not None and live.status == "running", (
+            "the pending settle reverted a child that is genuinely working again"
+        )
+        assert CHILD_SESSION_ID not in subagent_work._drained_delivered_subagent_children
+
+        r2_idle = await _post_status(
+            client, status="idle", output="round two: should I open the PR?"
+        )
+        assert r2_idle.status_code == 204
+        _assert_fresh_result(_drain_queue(inbox), work_id=work_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settle_first", [CHILD_SESSION_ID, SECOND_CHILD_SESSION_ID])
+async def test_settling_the_last_spurious_rearm_returns_a_waiting_parent_to_idle(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch, settle_first: str
+) -> None:
+    """With two re-armed workers, the parent stays waiting until the last one settles."""
+    monkeypatch.setattr(runner_app, "_server_version", "0.16.0")
+    held = _HeldSleep()
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", held)
+    server = _ChildSnapshotServerClient()
+    app, inbox, _work_id = _dispatch_worker(server)
+    subagent_work.register_child_session(
+        SECOND_CHILD_SESSION_ID,
+        parent_session_id=PARENT_SESSION_ID,
+        title="reviewer:review-two",
+        tool="reviewer",
+        session_name="review-two",
+    )
+    subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=SECOND_CHILD_SESSION_ID,
+        agent="reviewer",
+        title="second review",
+    )
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        await _deliver_and_drain_round_one(client, inbox, server)
+        r = await client.post(
+            f"/v1/sessions/{SECOND_CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "second: done"},
+            },
+        )
+        assert r.status_code == 204
+        assert inbox.qsize() == 1
+        await tool_dispatch._drain_inbox(
+            inbox, server_client=server, conversation_id=PARENT_SESSION_ID
+        )
+        app.state.native_pane_status[PARENT_SESSION_ID] = "idle"
+        _parent_status_events()
+
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        publish_pane_status(SECOND_CHILD_SESSION_ID, "running", None)
+        await asyncio.sleep(0)
+        assert _parent_status_events() == ["waiting"]
+
+        settle_last = (
+            SECOND_CHILD_SESSION_ID if settle_first == CHILD_SESSION_ID else CHILD_SESSION_ID
+        )
+        publish_pane_status(settle_first, "idle", None)
+        await _let_settle_run()
+        held.release.set()
+        await _let_settle_run()
+        assert subagent_work.get_subagent_work(settle_first) is None
+        assert _parent_status_events() == [], "a live sibling keeps the parent waiting"
+
+        held.release.clear()
+        publish_pane_status(settle_last, "idle", None)
+        await _let_settle_run()
+        held.release.set()
+        await _let_settle_run()
+        assert subagent_work.get_subagent_work(settle_last) is None
+        assert _parent_status_events() == ["idle"]
+
+
+@pytest.mark.asyncio
+async def test_settle_returns_a_parent_that_went_waiting_at_its_own_turn_end_to_idle(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent mid-turn during the re-arm derives waiting itself; settling still clears it.
+
+    No status is published for a busy parent when the child re-arms, so the
+    rollback must reconcile the parent from its live work rather than from a
+    marker written at re-arm time.
+    """
+    monkeypatch.setattr(runner_app, "_server_version", "0.16.0")
+    held = _HeldSleep()
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", held)
+    server = _ChildSnapshotServerClient()
+    app, inbox, _work_id = _dispatch_worker(server)
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        await _deliver_and_drain_round_one(client, inbox, server)
+        app.state.native_pane_status[PARENT_SESSION_ID] = "running"
+        app.state.active_turns[PARENT_SESSION_ID] = None
+        _parent_status_events()
+
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        await asyncio.sleep(0)
+        assert _parent_status_events() == [], "a busy parent is left to its own turn end"
+
+        app.state.on_proxy_stream_end(PARENT_SESSION_ID)
+        await asyncio.sleep(0)
+        assert _parent_status_events() == ["waiting"]
+
+        publish_pane_status(CHILD_SESSION_ID, "idle", None)
+        await _let_settle_run()
+        held.release.set()
+        await _let_settle_run()
+        assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
+        assert _parent_status_events() == ["idle"]
