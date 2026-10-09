@@ -32,6 +32,7 @@ and always has content (the Agents tab is unconditional).
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 
 from playwright.sync_api import Page, expect
 
@@ -105,6 +106,8 @@ def test_sidebar_click_cancels_pending_peek(
 ) -> None:
     """A quick press pins the sidebar open instead of losing to the peek timer."""
     base_url, session_id = seeded_session
+    clock_start = datetime.now(UTC)
+    page.clock.install(time=clock_start)
     page.goto(f"{base_url}/c/{session_id}")
 
     conversations = page.locator(_CONVERSATIONS)
@@ -115,12 +118,13 @@ def test_sidebar_click_cancels_pending_peek(
 
     trigger = page.get_by_role("button", name="Open sidebar")
     expect(trigger).to_be_visible()
+    page.clock.pause_at(clock_start + timedelta(hours=1))
     trigger.hover()
-    page.wait_for_timeout(300)
+    page.clock.run_for(300)
 
     page.mouse.down()
     try:
-        page.wait_for_timeout(200)
+        page.clock.run_for(200)
         expect(conversations).to_have_attribute("data-collapsed", "true")
         expect(conversations).not_to_have_class(_PEEK_CLASS)
     finally:
@@ -128,7 +132,7 @@ def test_sidebar_click_cancels_pending_peek(
 
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     expect(conversations).not_to_have_class(_PEEK_CLASS)
-    page.wait_for_timeout(200)
+    page.clock.run_for(200)
     expect(conversations).not_to_have_class(_PEEK_CLASS)
 
 

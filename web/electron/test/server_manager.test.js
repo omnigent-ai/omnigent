@@ -17,6 +17,22 @@ const SERVER = "https://app.example.com";
 const CLI_PATH = "/bin/omnigent";
 
 describe("ensureServerAuth", () => {
+  it("prepares managed-host credentials even when a legacy token passes the probe", async () => {
+    mock.method(cli, "probeServerAuth", async () => ({ authed: true, reachable: true }));
+    const login = mock.method(cli, "loginServer", async () => ({ ok: false, output: "SECRET" }));
+    const command = { executable: "/bin/isaac", prefixArgs: ["omni"], displayName: "Custom label" };
+    const result = await ensureServerAuth(command, "https://account.databricks.com/omnigent?o=123");
+    assert.equal(result.authError, true);
+    assert.equal(login.mock.callCount(), 1);
+    assert.doesNotMatch(result.error, /SECRET/);
+  });
+  it("does not infer managed-host auth from a cosmetic label", async () => {
+    mock.method(cli, "probeServerAuth", async () => ({ authed: true, reachable: true }));
+    const login = mock.method(cli, "loginServer", async () => ({ ok: true }));
+    const command = { executable: CLI_PATH, displayName: "isaac omni" };
+    assert.deepEqual(await ensureServerAuth(command, SERVER), { ok: true });
+    assert.equal(login.mock.callCount(), 0);
+  });
   afterEach(() => {
     mock.restoreAll();
   });
