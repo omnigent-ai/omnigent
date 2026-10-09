@@ -51,7 +51,7 @@ jobs:
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pattern='^(web/|omnigent/(server|stores)/|dev/benchmarks/|tests/(benchmarks|browser_ui)/|\.github/actions/setup-(pnpm|uv)/|(\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)$)'
+          pattern='^(web/|omnigent/|dev/benchmarks/|tests/(benchmarks|browser_ui|_helpers)/|\.github/actions/setup-(pnpm|uv)/|(\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)$)'
           if grep -qE "$pattern" <<< "$files"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
           else
@@ -72,6 +72,7 @@ jobs:
           fetch-depth: 2
 
       - name: Check out base of test merge
+        id: baseline
         if: github.event_name == 'pull_request'
         run: |
           # First parent of the test merge is the exact base it was built on.

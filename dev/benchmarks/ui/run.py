@@ -289,6 +289,8 @@ def make_report(
         harness="chromium-ui",
     )
     report["git_sha"] = revision
+    # A supplied bundle revision does not identify its branch.
+    report["git_branch"] = ""
     report["samples"] = samples
     return report
 

@@ -1,4 +1,4 @@
-"""Exercise the actual changed-path detection shell, including rename sources."""
+"""Exercise the workflow's path detection and shallow-merge baseline selection."""
 
 from __future__ import annotations
 
@@ -29,6 +29,9 @@ pytestmark = pytest.mark.skipif(
         ([{"filename": "tests/browser_ui/test_ui_benchmark.py"}], False, "true"),
         ([{"filename": "omnigent/server/app.py"}], False, "true"),
         ([{"filename": "omnigent/stores/file_store/sqlalchemy_store.py"}], False, "true"),
+        ([{"filename": "omnigent/db/__init__.py"}], False, "true"),
+        ([{"filename": "omnigent/cli_auth.py"}], False, "true"),
+        ([{"filename": "tests/_helpers/compat.py"}], False, "true"),
         ([{"filename": "uv.lock"}], False, "true"),
         (
             [
@@ -65,6 +68,9 @@ pytestmark = pytest.mark.skipif(
         "browser-tests",
         "server",
         "stores",
+        "db",
+        "shared-server-module",
+        "server-test-helper",
         "config",
         "config-backups",
         "docs",
@@ -102,6 +108,61 @@ def test_detect_without_complete_file_list(
     assert called_api == uses_api
 
 
+@pytest.mark.skipif(not shutil.which("git"), reason="Needs git")
+def test_baseline_is_first_parent_of_shallow_test_merge(tmp_path: Path) -> None:
+    env = {
+        "PATH": os.environ["PATH"],
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "UI benchmark test",
+        "GIT_AUTHOR_EMAIL": "benchmark@example.invalid",
+        "GIT_COMMITTER_NAME": "UI benchmark test",
+        "GIT_COMMITTER_EMAIL": "benchmark@example.invalid",
+    }
+
+    def git(directory: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=directory, env=env, text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+    source = tmp_path / "source"
+    source.mkdir()
+    git(source, "init", "--initial-branch=main")
+    git(source, "commit", "--allow-empty", "-m", "initial")
+    git(source, "switch", "-c", "candidate")
+    (source / "candidate.txt").write_text("candidate change\n")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "candidate")
+    git(source, "switch", "main")
+    (source / "base.txt").write_text("base change\n")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "base")
+    expected_base = git(source, "rev-parse", "HEAD")
+    git(source, "merge", "--no-ff", "candidate", "-m", "test merge")
+
+    checkout = tmp_path / "checkout"
+    git(tmp_path, "clone", "--depth=2", source.as_uri(), str(checkout))
+    git(checkout, "checkout", "--detach", "HEAD")
+    assert git(checkout, "rev-parse", "--is-shallow-repository") == "true"
+    script = next(
+        step["run"]
+        for step in _WORKFLOW["jobs"]["benchmark"]["steps"]
+        if step.get("id") == "baseline"
+    )
+    subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=checkout,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    baseline = checkout / "ui-baseline"
+    assert git(baseline, "rev-parse", "HEAD") == expected_base
+    assert (baseline / "base.txt").read_text() == "base change\n"
+    assert not (baseline / "candidate.txt").exists()
+
+
 def _detect_changes(
     tmp_path: Path,
     files: list[dict[str, str]],
@@ -125,7 +186,6 @@ def _detect_changes(
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", _DETECT],
         env={
-            **os.environ,
             "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
             "API_FAILURE": str(api_failure).lower(),
             "CALLED_API": str(called_api),

@@ -13,6 +13,9 @@ opportunities.
 
 ## Run locally
 
+Use macOS or Linux (including WSL2), following the repository's
+[development setup](../../../CONTRIBUTING.md#development-setup).
+
 ```bash
 OMNIGENT_SKIP_WEB_UI=true uv sync --locked --group test
 pnpm install --frozen-lockfile --filter web
@@ -94,7 +97,7 @@ baseline.
 
 ## CI and artifacts
 
-[`benchmark-ui.yml`](../../../.github/workflows/benchmark-ui.yml) runs on UI/server/storage
+[`benchmark-ui.yml`](../../../.github/workflows/benchmark-ui.yml) runs on UI/backend
 PRs ready for review (including forks), nightly, and by manual dispatch. PRs compare the exact
 base of the test merge against the candidate on **one runner**. Filtering is
 at the job level, so `UI performance regression check` can be made a required
@@ -111,6 +114,8 @@ of regressing pairs for each percentile.
 Reports reuse the existing versioned benchmark schema (`harness=chromium-ui`,
 `backend=chromium`) and retain **all raw keystroke samples**, DOM counts,
 browser version, throttle settings, fixture size, and UI/backend revisions.
+A successful sample records `page_errors: []`; browser errors reject the sample
+and are retained in `error.txt` and a failure screenshot.
 An interrupted run may leave partial JSON; incomplete data cannot pass.
 
 To verify sensitivity to the document-wide restyle regression, copy a built

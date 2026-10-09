@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from dev.benchmarks.omnigent import schema
 from dev.benchmarks.ui import run as ui_run
 from dev.benchmarks.ui.run import (
     assess_reports,
@@ -61,9 +62,11 @@ def _report() -> dict:
     return make_report(samples, _args(), "ui-revision", "test-chromium")
 
 
-def test_ui_report_preserves_raw_samples_and_revision() -> None:
+def test_ui_report_preserves_raw_samples_and_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(schema, "git_branch", lambda: "driver-branch")
     report = _report()
     assert report["git_sha"] == "ui-revision"
+    assert report["git_branch"] == ""
     assert report["harness"] == "chromium-ui"
     assert report["config"]["browser_version"] == "test-chromium"
     assert report["config"]["cpu_throttle"] == 4
