@@ -18,7 +18,9 @@ from omnigent.runner.subagent_work import (
     _SUBAGENT_TERMINAL_STATUSES,
     _deliver_subagent_completion,
     _drained_delivered_subagent_children,
+    _drained_subagent_work_ids,
     _recover_subagent_results_from_server,
+    _register_subagent_work_from_child_record,
     _subagent_recovery_done,
     _subagent_recovery_locks,
     _subagent_work_by_child,
@@ -85,6 +87,14 @@ def build_subagent_recovery(
             return existing
         if conv_id in _drained_delivered_subagent_children:
             return None
+        # A child re-armed after a drain keeps its stamped dispatch id, so the
+        # receipt written when this result is drained matches the child's label.
+        work_id = _drained_subagent_work_ids.get(conv_id)
+        # The runner's own child record is authoritative; the server snapshot
+        # is the fallback for a child adopted after a restart.
+        local = _register_subagent_work_from_child_record(conv_id, work_id=work_id)
+        if local is not None:
+            return local
         try:
             snapshot = await _session_snapshot(conv_id)
         except Exception:  # noqa: BLE001 — best-effort recovery
@@ -98,6 +108,7 @@ def build_subagent_recovery(
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            work_id=work_id,
         )
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:

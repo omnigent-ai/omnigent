@@ -463,3 +463,103 @@ async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
         )
     finally:
         subagent_work.unregister_subagent_work(child_id)
+
+
+@pytest.mark.asyncio
+async def test_self_resumed_child_result_is_delivered_after_a_drain() -> None:
+    """A worker Claude Code resumes on its own must still reach the parent.
+
+    Journey at the runner's real ``external_session_status`` route: a
+    claude-native worker finishes a first turn (``running`` -> ``idle``), the
+    parent reads it (drain), then Claude Code resumes the worker on its own
+    after a background task hands back and the worker ends a second turn with a
+    question (``running`` -> ``idle``). The trailing-idle dedup for the *first*
+    turn must stay — a bare ``idle`` after the drain is ignored — but the
+    *second* turn is a new report and must be delivered.
+
+    On the buggy build a ``running`` edge after the drain does not clear the
+    drained-delivery tombstone, so ``_ensure_subagent_work_entry`` returns None
+    and the second turn's ``idle`` is answered "already delivered": the parent
+    is left waiting on a worker that is waiting on it.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    subagent_work.register_child_session(
+        child_id,
+        parent_session_id=parent_id,
+        title="claude:impl",
+        tool="claude",
+        session_name="impl",
+    )
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="claude-native",
+        title="impl",
+    )
+
+    async def _post(client: Any, status: str, output: str | None = None) -> None:
+        data: dict[str, Any] = {"status": status}
+        if output is not None:
+            data["output"] = output
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "external_session_status", "data": data},
+        )
+        assert resp.status_code == 204, resp.text
+
+    try:
+        async with _runner_client(app) as client:
+            # First turn: delivered and read by the parent.
+            await _post(client, "running")
+            await _post(client, "idle", "ROUND ONE: initial review done")
+            assert inbox.qsize() == 1, "the worker's first turn was not delivered to the parent"
+            assert inbox.get_nowait()["status"] == "completed"
+            # The parent drains it, exactly as sys_read_inbox's cleanup does.
+            subagent_work.unregister_subagent_work(child_id, remember_drained_delivery=True)
+            assert subagent_work.get_subagent_work(child_id) is None
+
+            # A bare trailing idle for that same first turn must stay ignored.
+            await _post(client, "idle", "ROUND ONE: initial review done")
+            assert inbox.qsize() == 0, "a trailing idle re-delivered the first turn"
+
+            # Claude Code resumes the worker on its own: a new turn runs and
+            # ends with a question. This is a fresh result and must reach the
+            # parent even though the parent already drained the earlier one.
+            await _post(client, "running")
+            await _post(
+                client,
+                "idle",
+                "ROUND TWO: open the PR at ba891ef, or run one more critique round?",
+            )
+
+        delivered: list[dict[str, Any]] = []
+        while not inbox.empty():
+            delivered.append(inbox.get_nowait())
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_child_session(child_id)
+        subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(child_id, None)
+
+    assert delivered, (
+        "the self-resumed worker's second turn ('ROUND TWO ... open the PR') was "
+        "never delivered to the parent inbox: a running edge after a drain did not "
+        "clear the drained-delivery tombstone, so the idle was answered 'already "
+        "delivered' and the parent was never woken."
+    )
+    assert any("ROUND TWO" in str(d.get("output")) for d in delivered), (
+        f"the delivered result did not carry the self-resumed turn's question: {delivered!r}"
+    )

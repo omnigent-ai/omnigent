@@ -192,6 +192,7 @@ from omnigent.runner.subagent_work import (
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    note_subagent_child_activity,
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
@@ -1618,6 +1619,24 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
+    def _note_subagent_child_activity(child_id: str) -> None:
+        """
+        Track a child's ``running``/``waiting`` edge as a new turn when its
+        last dispatch was already finished, and show an idle parent waiting.
+
+        Only a parent that is idle with no turn in flight is moved: a parent
+        mid-turn computes ``waiting`` itself at its turn end, and a native
+        parent's status is owned by its own terminal (``_publish_turn_status``
+        skips it).
+        """
+        entry = note_subagent_child_activity(child_id)
+        if entry is None:
+            return
+        parent_id = entry.parent_session_id
+        if parent_id in _active_turns or _native_pane_status.get(parent_id) != "idle":
+            return
+        _publish_turn_status(parent_id, "waiting")
+
     def _publish_session_status(
         session_id: str,
         status: str,
@@ -1626,6 +1645,10 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if status in ("running", "waiting"):
+            # The poller and pane watcher publish a claude-native child's
+            # ``running`` here, never on ``/events``.
+            _note_subagent_child_activity(session_id)
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -6543,6 +6566,10 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+            if status in ("running", "waiting"):
+                # New activity from a child whose result was already delivered
+                # or drained is a turn Claude Code started on its own.
+                _note_subagent_child_activity(conversation_id)
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
             interrupt_pending = False
             interrupt_work_id: str | None = None
