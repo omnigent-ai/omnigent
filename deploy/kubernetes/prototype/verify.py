@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import re
+import socket
 import subprocess
 import sys
 import tarfile
@@ -29,6 +30,31 @@ from websockets.exceptions import WebSocketException
 
 ROOT = Path(__file__).resolve().parents[3]
 KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+
+
+def start_mock_server(port, log):
+    """Pass a bound listener to the mock so another process cannot claim its port."""
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "tests.server.integration.mock_llm_server:app",
+                "--fd",
+                str(listener.fileno()),
+                "--log-level",
+                "warning",
+            ],
+            cwd=ROOT,
+            pass_fds=(listener.fileno(),),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        return process, listener.getsockname()[1]
 
 
 async def command(*args: str) -> str:
@@ -50,7 +76,7 @@ async def eventually(check, *, timeout: float = 90):
             result = await check()
             if result:
                 return result
-        except (httpx.HTTPError, OSError, WebSocketException) as exc:
+        except (httpx.HTTPError, OSError, RuntimeError, WebSocketException) as exc:
             last = exc
         await asyncio.sleep(0.25)
     raise TimeoutError(f"Condition did not become true in {timeout}s; last error: {last}")
@@ -109,39 +135,35 @@ async def verify(args) -> None:
     host_id = uuid.uuid4().hex
     container = f"omnigent-prototype-client-{host_id[:8]}"
     marker = uuid.uuid4().hex
-    mock_url = f"http://127.0.0.1:{args.mock_port}"
     report = {"host_id": host_id, "samples": [], "sse_connections": 0}
     sse_text = []
     backfills = []
     tasks = []
     started = time.monotonic()
-    mock_log = (args.output / "mock.log").open("w")
-    mock = subprocess.Popen(
-        [
-            sys.executable,
-            str(ROOT / "tests/server/integration/mock_llm_server.py"),
-            str(args.mock_port),
-        ],
-        stdout=mock_log,
-        stderr=subprocess.STDOUT,
-    )
-    client = httpx.AsyncClient(
-        base_url=args.url,
-        headers={"Origin": "omnigent://internal", KEY_HEADER: host_id},
-        timeout=5,
-        trust_env=False,
-    )
-    llm = httpx.AsyncClient(base_url=mock_url, timeout=5, trust_env=False)
+    mock_log = None
+    mock = None
+    client = None
+    llm = None
     ws = None
     try:
+        mock_log = (args.output / "mock.log").open("w")
+        mock, args.mock_port = start_mock_server(args.mock_port, mock_log)
+        mock_url = f"http://127.0.0.1:{args.mock_port}"
+        client = httpx.AsyncClient(
+            base_url=args.url,
+            headers={"Origin": "omnigent://internal", KEY_HEADER: host_id},
+            timeout=5,
+            trust_env=False,
+        )
+        llm = httpx.AsyncClient(base_url=mock_url, timeout=5, trust_env=False)
 
         async def mock_ready():
+            if mock.poll() is not None:
+                raise RuntimeError(f"Mock server exited; see {args.output / 'mock.log'}")
             response = await llm.get("/stats")
             return response.is_success
 
         await eventually(mock_ready, timeout=15)
-        if mock.poll() is not None:
-            raise RuntimeError("Mock port already in use; choose --mock-port")
 
         async def ingress_ready():
             response = await client.get("/health")
@@ -289,8 +311,8 @@ async def verify(args) -> None:
                                 snapshot.raise_for_status()
                                 backfills.append(snapshot.text)
                                 stream_ready.set()
-                except httpx.HTTPError:
-                    pass
+                except httpx.HTTPError as exc:
+                    report["last_stream_error"] = f"{type(exc).__name__}: {exc}"
                 finally:
                     stream_ready.clear()
                 await asyncio.sleep(0.2)
@@ -447,20 +469,45 @@ async def verify(args) -> None:
             return any(followup in line for line in sse_text)
 
         report["followup_turn_streamed"] = await eventually(followup_streamed, timeout=30)
+
+        async def followup_completed():
+            snapshot = await client.get(f"/v1/sessions/{session_id}")
+            items = await client.get(f"/v1/sessions/{session_id}/items")
+            return snapshot.json().get("status") == "idle" and followup in items.text
+
+        report["followup_turn_completed"] = await eventually(followup_completed, timeout=30)
         report["passed"] = True
         print(
             "PASS: host/runner RPCs recovered, the same shell survived, "
             "the active turn completed, and a new runner launched.",
             flush=True,
         )
+    except BaseException as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         if ws is not None:
             await ws.close()
-        await client.aclose()
-        await llm.aclose()
+        if client is not None:
+            await client.aclose()
+        if llm is not None:
+            await llm.aclose()
+        if mock is not None:
+            mock.terminate()
+            try:
+                await asyncio.to_thread(mock.wait, timeout=5)
+            except subprocess.TimeoutExpired:
+                mock.kill()
+                try:
+                    await asyncio.to_thread(mock.wait, timeout=5)
+                except subprocess.TimeoutExpired as exc:
+                    report["cleanup_error"] = str(exc)
+                    report["passed"] = False
+        if mock_log is not None:
+            mock_log.close()
         for kind in ("host", "runner"):
             samples = [s for s in report["samples"] if s["kind"] == kind]
             report[f"{kind}_statuses"] = dict(Counter(str(s["status"]) for s in samples))
@@ -474,29 +521,30 @@ async def verify(args) -> None:
                     failed_at = None
             report[f"{kind}_longest_observed_outage_seconds"] = round(longest, 3)
             report[f"{kind}_still_failing_at_end"] = failed_at is not None
-        (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-        (args.output / "sse.log").write_text("\n".join(sse_text))
-        (args.output / "backfills.json").write_text(json.dumps(backfills, indent=2) + "\n")
-        with contextlib.suppress(RuntimeError):
+        for name, content in (
+            ("report.json", json.dumps(report, indent=2) + "\n"),
+            ("sse.log", "\n".join(sse_text)),
+            ("backfills.json", json.dumps(backfills, indent=2) + "\n"),
+        ):
+            try:
+                (args.output / name).write_text(content)
+            except OSError as exc:
+                print(f"Could not save {name}: {exc}", file=sys.stderr, flush=True)
+        with contextlib.suppress(RuntimeError, OSError):
             (args.output / "host.log").write_text(await command("docker", "logs", container))
+        with contextlib.suppress(RuntimeError, OSError):
             await command(
                 "docker",
                 "cp",
                 f"{container}:/root/.omnigent/logs",
                 str(args.output / "client-logs"),
             )
+        with contextlib.suppress(RuntimeError, OSError):
             await command("docker", "rm", "-f", container)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, OSError):
             (args.output / "nginx.log").write_text(
                 await command(*kube, "logs", "deployment/nginx", "--since=15m")
             )
-        mock.terminate()
-        try:
-            await asyncio.to_thread(mock.wait, timeout=5)
-        except subprocess.TimeoutExpired:
-            mock.kill()
-            await asyncio.to_thread(mock.wait, timeout=5)
-        mock_log.close()
         print(f"Evidence: {args.output / 'report.json'}", flush=True)
 
 

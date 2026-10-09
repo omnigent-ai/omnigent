@@ -5,6 +5,7 @@ metadata:
   name: artifacts
   namespace: omnigent-prototype
 spec:
+  # ReadWriteOnce works here because all pods share one kind node; use shared storage on multiple nodes.
   accessModes: [ReadWriteOnce]
   resources:
     requests:
@@ -17,7 +18,7 @@ metadata:
   namespace: omnigent-prototype
 spec:
   replicas: 2
-  minReadySeconds: 5
+  minReadySeconds: 10
   strategy:
     rollingUpdate:
       maxSurge: 1

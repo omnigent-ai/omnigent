@@ -74,8 +74,8 @@ ARG NODE_VERSION=22
 #   --build-arg NPM_CONFIG_REGISTRY=https://npm-proxy.example.com
 FROM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
-ARG VITE_OMNIGENT_HOST_ROUTING=false
-ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
+ENV PNPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 WORKDIR /web
 
 # Workspace manifests + lockfile first so the install layer caches across pure
@@ -86,9 +86,10 @@ COPY web/package.json ./web/
 COPY web/electron/package.json ./web/electron/
 
 RUN npm install -g pnpm@11.15.1
-RUN pnpm install --frozen-lockfile --filter web --registry="${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}"
+RUN pnpm install --frozen-lockfile --filter web --registry="${NPM_CONFIG_REGISTRY}"
 
 COPY web/ ./web/
+ARG VITE_OMNIGENT_HOST_ROUTING=false
 RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────

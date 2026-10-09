@@ -1,15 +1,19 @@
 # Multiple Omnigent replicas with NGINX
 
-This example runs two Omnigent server pods behind one NGINX ingress controller
-and checks whether external hosts and runners recover when Kubernetes replaces
-the server pods. It uses [kind](https://kind.sigs.k8s.io/), which runs a local
-Kubernetes cluster in Docker. Postgres and an artifact volume are shared by
-both server pods.
+This example runs two Omnigent server pods behind one NGINX ingress controller.
+It shows how to route a host and its runners to the same server and reconnect
+their tunnels when Kubernetes replaces the server pods. It uses
+[kind](https://kind.sigs.k8s.io/), which runs a local Kubernetes cluster in
+Docker. Postgres and an artifact volume are shared by both server pods.
 
 Two server pods let us test a deployment that normally serves requests from
 more than one replica. One server pod would also support a rolling update
 with a temporary replacement, but would not test steady-state replication.
 Only one NGINX pod is needed for this example.
+
+This demonstrates routing and tunnel reconnection. A message sent during a
+rollout can still fail in the browser. See [Rollout limits](#rollout-limits)
+before using this setup for active conversations.
 
 ## Why requests need a host ID
 
@@ -52,8 +56,8 @@ and external host. The example builds the server from this checkout.
 - Build the browser with `VITE_OMNIGENT_HOST_ROUTING=true`. The Dockerfile accepts
   this as a build argument, and `run.sh up` supplies it. Setting it only in a
   running server pod does not change an already built browser bundle.
-- During a temporary routing error, the OSS browser keeps the host ID when it
-  retries. Dropping the ID could send the next request to a different replica.
+- The browser keeps the host ID on terminal reconnects. Dropping the ID could
+  send the next connection to a different replica.
 
 HTTP clients use the existing `X-Databricks-Omnigent-Slice-Key` header. Browser
 WebSockets use `?omnigent_slice_key=...` because the browser WebSocket API
@@ -71,6 +75,8 @@ which server NGINX chooses for a host, while that host's existing WebSocket
 still connects to the old server.
 
 [server.yaml](server.yaml) sets `maxSurge: 1` and `maxUnavailable: 0`.
+It waits ten seconds after a replacement becomes ready before removing an old
+pod, giving connections time to settle between endpoint changes.
 [ingress.yaml](ingress.yaml) handles the connection change:
 
 1. Kubernetes starts a replacement and marks it ready. The ready pod addresses
@@ -92,6 +98,19 @@ The example also sets `nginx.org/max-fails: "0"` and
 `proxy_next_upstream off`. This leaves pod membership to Kubernetes readiness
 and prevents individual failed requests from choosing a different server
 while their host's tunnel remains elsewhere.
+
+### Rollout limits
+
+Readiness means a server can accept connections. It does not mean that a
+particular host and all of its runners have connected there yet. During that
+gap, a browser request can receive `400 wrong_replica`. An interrupted send
+can also lose its response after the server has saved the prompt. Routing
+alone cannot tell the browser whether that message was accepted.
+
+This example does not add message retries, delivery receipts, or changes to
+the session API. The verification below sends its first message before the
+rollout and its next message after the connections have settled. It does not
+prove that sending continuously during a rollout is free of browser errors.
 
 Use **F5 NGINX Ingress Controller OSS 5.2.1** (`nginx/nginx-ingress`), as pinned
 in the manifest. The community `ingress-nginx` controller updates endpoints
@@ -161,15 +180,7 @@ directory and port for every command; the port mapping is created with the
 cluster. `verify --mock-port 18092` changes the mock model's port, and
 `verify --output /tmp/another-run` writes a separate set of test results.
 
-## Results and limits
-
-A local run on 2026-10-09 with kind 0.31.0 and Kubernetes 1.32.2 passed all the
-checks above. Both server pods were replaced, the shell kept its process ID,
-the active turn completed, and the host launched another runner. Sampling
-file requests every 250 ms, the longest observed failure interval was
-**4.94 seconds for host requests** and **4.89 seconds for runner requests**.
-Requests to both were succeeding consistently at the end. These timings
-describe that run; they do not guarantee a maximum interruption.
+## Deployment limits
 
 This is a local experiment with authentication disabled and disposable
 database credentials. The artifact volume is `ReadWriteOnce`: both server
@@ -177,6 +188,10 @@ pods can share it because they run on the same kind node. A deployment across
 multiple nodes needs shared artifact storage, such as S3 or a `ReadWriteMany`
 volume, along with authentication, TLS, and shared authentication secrets.
 NGINX and Postgres each have one pod in this example.
+
+The controller watches resources in the example's namespace, including
+Secrets; F5's controller requires its Secret informer even without TLS. Keep
+this disposable namespace separate from workloads with real credentials.
 
 The test covers external hosts and a controlled server rollout. Browser
 routing has Vitest coverage, and a Playwright test checks standalone terminal
