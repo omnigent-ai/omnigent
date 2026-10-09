@@ -25,6 +25,9 @@ toggle the simulator's appearance with the keyboard open. On iPad, also check
 the floating keyboard. Finally, return to server setup and focus the URL field
 to verify its keyboard backdrop.
 
+Check that the web content stays visible after focusing a text field. Native
+backgrounds must not make keyboard or effect overlay windows opaque.
+
 ## Scope
 
 The first version provides native setup chrome, recent servers, WKWebView

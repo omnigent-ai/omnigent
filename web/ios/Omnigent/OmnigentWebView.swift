@@ -1941,6 +1941,7 @@ final class ThemeController: ObservableObject {
 
   static func apply(_ source: ThemeSource, to window: UIWindow) {
     window.overrideUserInterfaceStyle = source.userInterfaceStyle
+    guard window.windowLevel == .normal else { return }
     window.backgroundColor = DesignTokens.nativeBackground
     window.rootViewController?.view.backgroundColor = DesignTokens.nativeBackground
   }

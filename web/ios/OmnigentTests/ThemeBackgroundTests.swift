@@ -39,6 +39,21 @@ final class ThemeBackgroundTests: XCTestCase {
     try assertBackgrounds(window, scheme: .dark)
   }
 
+  func testOverlayWindowsKeepTheirTransparentBackgrounds() {
+    let window = makeWindow()
+    window.windowLevel = UIWindow.Level(rawValue: UIWindow.Level.normal.rawValue + 1)
+    window.backgroundColor = .clear
+    window.rootViewController?.view.backgroundColor = .clear
+
+    for source in ThemeSource.allCases {
+      ThemeController.apply(source, to: window)
+
+      XCTAssertEqual(window.overrideUserInterfaceStyle, source.userInterfaceStyle)
+      XCTAssertEqual(window.backgroundColor, .clear)
+      XCTAssertEqual(window.rootViewController?.view.backgroundColor, .clear)
+    }
+  }
+
   private func makeWindow() -> UIWindow {
     let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
     window.rootViewController = UIHostingController(rootView: Color.clear)
