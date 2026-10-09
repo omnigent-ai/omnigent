@@ -100,9 +100,7 @@ _ANTIGRAVITY_FAMILY_HARNESSES: frozenset[str] = frozenset(
 # The native agy harness is deliberately absent above: it passes the override to
 # ``agy --model`` and the CLI's catalog is the signed-in account's (Gemini plus
 # Claude/GPT), so only ``databricks-`` gateway ids are unroutable for it.
-_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"antigravity-native", "native-antigravity"}
-)
+_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset({"antigravity-native"})
 # A ``databricks-`` gateway prefix marks an id bound to the Databricks gateway,
 # which neither antigravity harness reaches — a definitive mismatch on its own.
 _DATABRICKS_GATEWAY_PREFIX = "databricks-"
