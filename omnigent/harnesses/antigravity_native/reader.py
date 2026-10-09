@@ -81,6 +81,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 )
 from omnigent.harnesses.antigravity_native.rpc import (
     AntigravityRpcError,
+    ColdStartPortLog,
     _candidate_agy_rpc_ports,
     _conversation_matches,
     get_all_cascade_trajectories,
@@ -858,7 +859,7 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
 class _RecoveryScanLog:
     """Per-discovery throttling for recovery-scan warnings that would repeat every round."""
 
-    resolver_consulted: bool = False
+    port_log: ColdStartPortLog = field(default_factory=ColdStartPortLog)
     foreign_reported: set[str] = field(default_factory=set)
 
 
@@ -892,10 +893,7 @@ def _recover_placeholder_cascade(
         # A socket that is not on this host cannot scope the scan (and its pane
         # cannot have delivered a web turn from here); skip this round.
         return None
-    port = resolve_cold_start_agy_rpc_port(
-        socket_path, info["tmux_target"], warn_fallback=not log.resolver_consulted
-    )
-    log.resolver_consulted = True
+    port = resolve_cold_start_agy_rpc_port(socket_path, info["tmux_target"], log=log.port_log)
     if port is None:
         return None
     try:

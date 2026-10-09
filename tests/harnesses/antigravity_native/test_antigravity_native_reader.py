@@ -3927,13 +3927,18 @@ async def test_discover_records_an_adoption_before_the_port_resolves(
 async def test_discover_reports_the_resolver_fallback_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only the first recovery round asks the port resolver to warn about its
-    restricted-/proc fallback; later rounds keep it at debug level."""
+    """One ``ColdStartPortLog`` is shared by every recovery round of a discovery
+    run, so the resolver's fallback is warned about once and demoted afterwards."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     warn_flags: list[bool] = []
 
-    def _resolver(_s: object, _t: object, *, warn_fallback: bool = True) -> int | None:
-        warn_flags.append(warn_fallback)
+    def _resolver(
+        _s: object, _t: object, *, log: reader.ColdStartPortLog | None = None
+    ) -> int | None:
+        # Stand in for the resolver taking its fallback branch.
+        assert log is not None
+        warn_flags.append(not log.fallback_reported)
+        log.fallback_reported = True
         return None
 
     monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _resolver)
@@ -3953,8 +3958,12 @@ async def test_discover_fallback_warning_waits_for_a_round_that_reaches_the_reso
     bridge_dir = _placeholder_bridge_dir(tmp_path, with_pane=False)
     warn_flags: list[bool] = []
 
-    def _resolver(_s: object, _t: object, *, warn_fallback: bool = True) -> int | None:
-        warn_flags.append(warn_fallback)
+    def _resolver(
+        _s: object, _t: object, *, log: reader.ColdStartPortLog | None = None
+    ) -> int | None:
+        assert log is not None
+        warn_flags.append(not log.fallback_reported)
+        log.fallback_reported = True
         return None
 
     sleeps = 0
