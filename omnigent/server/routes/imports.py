@@ -133,7 +133,7 @@ class LocalImportRequest(BaseModel):
     # A specific harness, or "all" to import from every supported harness on
     # the host in one batch (each imported session keeps its own source).
     source: ImportSource | Literal["all"]
-    limit: int = Field(default=10, ge=1, le=100)
+    limit: int = Field(default=10, ge=1, le=1000)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("session_id")
@@ -271,9 +271,15 @@ async def _stream_local_sessions_from_host(
             request_id=request_id,
             source=source,
             session_id=session_id,
+            allow_session_chunks=True,
         )
         if session_id is not None
-        else HostImportLocalFrame(request_id=request_id, source=source, limit=limit)
+        else HostImportLocalFrame(
+            request_id=request_id,
+            source=source,
+            limit=limit,
+            allow_session_chunks=True,
+        )
     )
     frame = encode_host_frame(request_frame)
     queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
@@ -295,6 +301,8 @@ async def _stream_local_sessions_from_host(
                     f"(no session within {_HOST_IMPORT_TIMEOUT_S:.0f}s)",
                     code=ErrorCode.CONFLICT,
                 ) from exc
+            if kind == "progress":
+                continue
             if kind == "session":
                 yield data
             else:  # "done"
