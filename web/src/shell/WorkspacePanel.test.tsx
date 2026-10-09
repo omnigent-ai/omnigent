@@ -1109,3 +1109,50 @@ describe("WorkspacePanel mobile side chats", () => {
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
   });
 });
+
+describe("WorkspacePanel panel picker", () => {
+  it("selects a file by full path, distinguishing duplicate basenames", () => {
+    const { openFileViewer } = renderWorkspace({
+      openFiles: ["src/index.ts", "tests/index.ts"],
+      selectedFilePath: "src/index.ts",
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "src/index.ts" })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "tests/index.ts" }));
+    expect(openFileViewer).toHaveBeenCalledWith("tests/index.ts");
+  });
+
+  it("lists available permanent panels and switches to them", () => {
+    const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    for (const name of ["Changes", "Pull Requests", "Agents"]) {
+      expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pull Requests" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("github");
+  });
+
+  it("selects an open terminal", () => {
+    const { openTerminalTab } = renderWorkspace({ openTerminals: ["terminal:zsh"] });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "zsh" }));
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
+  });
+
+  it("selects browser and side-chat tabs", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-one"],
+      openSideChats: ["pending:one"],
+    });
+    const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Browser 1" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+  });
+});
