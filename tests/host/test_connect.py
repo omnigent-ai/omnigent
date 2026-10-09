@@ -8171,12 +8171,12 @@ async def test_handle_import_local_recovered_skip_logs_below_error(
         {"external_session_id": "bad", "source": "claude", "reason": reason}
     ]
 
+    # One WARNING diagnostic naming the cause, with the traceback kept at DEBUG.
     skip_records = [r for r in caplog.records if "id='bad'" in r.getMessage()]
-    assert skip_records, caplog.text
-    over_warning = [r for r in skip_records if r.levelno > logging.WARNING]
-    assert not over_warning, [f"{r.levelname}: {r.getMessage()}" for r in over_warning]
-    # Below ERROR, the diagnostic still names the cause.
-    assert any(type(error).__name__ in r.getMessage() for r in skip_records)
+    assert [r.levelno for r in skip_records] == [logging.WARNING, logging.DEBUG], caplog.text
+    diagnostic, traceback_record = skip_records
+    assert f"({type(error).__name__}: {error})" in diagnostic.getMessage()
+    assert traceback_record.exc_info is not None and traceback_record.exc_info[1] is error
 
 
 async def test_handle_import_local_send_failure_skips_only_that_session(

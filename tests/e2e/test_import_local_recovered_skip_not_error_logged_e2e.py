@@ -13,7 +13,8 @@ import pytest
 
 from tests.e2e.test_host_e2e import _spawn_host_daemon, _wait_for_host_online
 
-pytestmark = [pytest.mark.timeout(180)]
+# Older pinned hosts in the compat matrix still log these skips at ERROR.
+pytestmark = [pytest.mark.timeout(180), pytest.mark.min_runner_version("0.18.0")]
 
 _GOOD_ID = "6f0d9f4e-2f0f-4bde-9b6e-2f6a0f6c1a01"
 _DEEP_ID = "bad0bad0-c0de-4bad-9dad-badbadbadbad"
@@ -66,10 +67,13 @@ def test_recovered_import_skips_are_not_logged_as_errors(
     http_client: httpx.Client,
     tmp_path: Path,
     mock_llm_server_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Unreadable transcripts are skipped and counted without ERROR records, which
     reach the host terminal and the debug-log sink's session-reliability KPI."""
     _write_claude_transcripts(tmp_path, str(tmp_path))
+    # The skip traceback is kept at DEBUG on purpose; assert the default level's output.
+    monkeypatch.setenv("OMNIGENT_LOG_LEVEL", "INFO")
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path,
         live_server=live_server,
