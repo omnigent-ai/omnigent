@@ -277,6 +277,20 @@ An agent that fails during its `initialize` handshake for no obvious reason is
 worth checking against this first; the ACP executor logs a hint pointing back at
 this field.
 
+> **How the start probe is evaluated.** `enforce_sandbox` runs when the runner
+> replays your tool-call policies over a synthetic `sys_agent_start` probe at
+> launch. Only a transform takes effect there: a policy that ALLOWs the probe
+> and returns a replacement payload (preserving the `name` and `arguments`
+> fields) reshapes the launch, chaining through later policies. A plain `DENY`
+> or `ASK` verdict on this probe does **not** block agent start — it is logged
+> and ignored, so a general-purpose tool allowlist or cost gate that happens to
+> reject the `sys_agent_start` name will not stop the agent from launching. The
+> runner only refuses to start (fails closed) when a policy cannot be evaluated
+> at all — it raised, could not be resolved, or returned a transform that drops
+> the probe's `name`/`arguments` shape — because then its intended sandbox
+> transform is unknown. Do not rely on a tool-call `DENY` to gate which agents
+> may launch; there is no agent-start policy phase today.
+
 #### `deny_pii_in_llm_request`
 
 Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, phone).

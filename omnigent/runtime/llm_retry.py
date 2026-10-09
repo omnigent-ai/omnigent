@@ -23,6 +23,7 @@ from omnigent.llms.errors import (
     LLMErrorDetail,
     PermanentLLMError,
     RetryableLLMError,
+    detect_request_size_overflow,
 )
 from omnigent.spec.types import RetryPolicy
 
@@ -62,6 +63,9 @@ def _detect_context_overflow(body: str) -> _OverflowTokens | None:
       ``"prompt is too long: {actual} tokens > {limit} maximum"``
     - **Gemini**: ``"input token count ({actual}) exceeds the
       maximum number of tokens allowed ({limit})"``
+    - **Databricks front door**: ``"exceeds maximum allowed content
+      length. RequestSize(bytes): {actual}, Limit(bytes): {limit}"``
+      (byte sizes, reported as approximate token counts)
 
     :param body: The raw HTTP response body string from the provider.
     :returns: Parsed token counts, or ``None`` if the body does not
@@ -114,6 +118,16 @@ def _detect_context_overflow(body: str) -> _OverflowTokens | None:
         return _OverflowTokens(
             max_context_tokens=int(gemini_match.group(2)),
             actual_tokens=int(gemini_match.group(1)),
+        )
+
+    # Deployment byte cap (e.g. the Databricks Apps front door) rejected the
+    # request before the model saw it. Sizes are bytes, not tokens — carried
+    # as approximate tokens; the raw body stays in the error detail.
+    size_overflow = detect_request_size_overflow(body)
+    if size_overflow is not None:
+        return _OverflowTokens(
+            max_context_tokens=size_overflow.approx_limit_tokens,
+            actual_tokens=size_overflow.approx_request_tokens,
         )
 
     return None
@@ -171,8 +185,8 @@ def _classify_http_error(
     """
     Classify an HTTP status error as retryable or permanent.
 
-    HTTP 400 is checked for context-window overflow before the
-    generic retryable/permanent split. This allows the executor's
+    HTTP 400 and 413 are checked for context-window overflow before
+    the generic retryable/permanent split. This allows the executor's
     retry logic to surface ``ContextWindowExceededError`` so the
     workflow can compact and retry.
 
@@ -188,9 +202,9 @@ def _classify_http_error(
     code = str(status)
     message = f"LLM returned HTTP {status}: {body}"
 
-    # HTTP 400 may be a context-window overflow — check before
-    # the generic split so the workflow can compact-retry.
-    if status == 400:
+    # HTTP 400, or a 413 byte-cap rejection from the edge, may be a context
+    # overflow — check before the generic split so the workflow can compact.
+    if status in (400, 413):
         overflow = _detect_context_overflow(body)
         if overflow is not None:
             return ContextWindowExceededError(
