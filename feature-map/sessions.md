@@ -371,6 +371,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested
   dialog with Escape preserves conversation focus and that resizing respects
   both panes' minimum widths; double-click restores and saves the default split.
+  It also checks that the sidebar menu stays usable while the board is loading.
   `web/src/pages/CanvasPage.test.tsx` checks viewport
   translation across successive resizes, hiding, and restoring the pane,
   refitting untouched boards after card changes, and preserving queued viewports
@@ -396,8 +397,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_rail_matches_expanded_navigation`.
   The journey compares destinations and clicks Canvas with a project selected,
   then reloads to confirm the selected project remains remembered.
-  macOS title-bar clearance, rail expansion, and conversation focus/return at wide
-  and narrow widths run in
+  macOS title-bar clearance, sidebar opening from the desktop rail or mobile
+  hamburger, and conversation focus/return at wide and narrow widths run in
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`.
   This Chromium journey emulates the macOS preload bridge and user agent; it
   verifies the app's layout around the title bar, not native traffic-light rendering.
