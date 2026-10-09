@@ -33,6 +33,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import ConversationUpdateResult
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -486,6 +487,121 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
         conversation_store.update_conversation("c55a64c3f6f954fe0fc8738ba3f45f26", title="x")
         is None
     )
+
+
+def test_update_conversation_with_changes_reports_effort_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert isinstance(first, ConversationUpdateResult)
+    assert first.conversation.reasoning_effort == "high"
+    assert first.reasoning_effort_changed is True
+    assert first.model_override_changed is False
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert no_op is not None
+    assert no_op.reasoning_effort_changed is False
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="low")
+    assert changed is not None
+    assert changed.conversation.reasoning_effort == "low"
+    assert changed.reasoning_effort_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.reasoning_effort is None
+    assert cleared.reasoning_effort_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.reasoning_effort_changed is False
+
+    unrelated = conversation_store.update_conversation_with_changes(conv.id, title="Renamed")
+    assert unrelated is not None
+    assert unrelated.reasoning_effort_changed is False
+    assert unrelated.model_override_changed is False
+
+
+def test_update_conversation_with_changes_reports_model_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert first is not None
+    assert first.conversation.model_override == "model-a"
+    assert first.reasoning_effort_changed is False
+    assert first.model_override_changed is True
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert no_op is not None
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(
+        conv.id, model_override="model-b"
+    )
+    assert changed is not None
+    assert changed.conversation.model_override == "model-b"
+    assert changed.model_override_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.model_override is None
+    assert cleared.model_override_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.model_override_changed is False
+
+
+def test_update_conversation_with_changes_missing_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    assert (
+        conversation_store.update_conversation_with_changes(
+            "c55a64c3f6f954fe0fc8738ba3f45f26",
+            reasoning_effort="high",
+            model_override="model-a",
+        )
+        is None
+    )
+
+
+def test_update_conversation_with_changes_retries_commit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
+    conversation_store._conv_session_immediate = retrying_maker
+
+    result = conversation_store.update_conversation_with_changes(
+        conv.id,
+        reasoning_effort="high",
+        model_override="model-a",
+    )
+
+    assert retrying_maker.attempts == 2
+    assert result is not None
+    assert result.reasoning_effort_changed is True
+    assert result.model_override_changed is True
+    assert result.conversation.reasoning_effort == "high"
+    assert result.conversation.model_override == "model-a"
+
+    committed = conversation_store.get_conversation(conv.id)
+    assert committed is not None
+    assert committed.reasoning_effort == "high"
+    assert committed.model_override == "model-a"
 
 
 def test_reported_model_round_trips_beside_the_request(
@@ -2571,6 +2687,90 @@ def test_append_bumps_updated_at(
     assert fetched.updated_at == 2000, (
         f"Expected updated_at to advance to 2000 after append, got {fetched.updated_at}."
     )
+
+
+def _deleted_terminal_event(conversation_id: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="resource_event",
+        response_id=conversation_id,
+        data=ResourceEventData(
+            event_type="session.resource.deleted",
+            resource_id="terminal_codex_main",
+            resource_type="terminal",
+        ),
+    )
+
+
+def test_resource_event_only_append_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operational resource cleanup must not look like new conversation activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [_deleted_terminal_event(conv.id)])
+
+    assert [item.type for item in appended] == ["resource_event"]
+    assert [item.type for item in conversation_store.list_items(conv.id).data] == [
+        "resource_event"
+    ]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
+
+
+def test_mixed_resource_and_message_append_bumps_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed batch remains real activity when it contains a new message."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_mixed",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+
+    conversation_store.append(conv.id, [_deleted_terminal_event(conv.id), message])
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 2000
+
+
+def test_resource_event_with_duplicate_message_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resource event plus a deduplicated message contains no new activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_duplicate",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ab" * 16,
+    )
+    conversation_store.append(conv.id, [message])
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [message, _deleted_terminal_event(conv.id)])
+
+    assert appended[0].deduplicated is True
+    assert [item.type for item in appended] == ["message", "resource_event"]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
 
 
 def test_update_title_bumps_updated_at(

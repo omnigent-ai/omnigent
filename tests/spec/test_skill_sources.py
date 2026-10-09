@@ -156,24 +156,103 @@ def test_none_harness_falls_back_to_generic_host_walk(
     assert [s.name for s in out] == ["ws-skill"]
 
 
-def test_claude_provider_excludes_agents_skills_dirs(
+@pytest.mark.parametrize(
+    "skills_filter,expected",
+    [
+        ("all", {"native", "shared", "ancestor", "home"}),
+        ("none", set()),
+        (["ancestor", "native", "hidden", "missing"], {"ancestor", "native"}),
+    ],
+)
+def test_claude_provider_includes_bridged_agents_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skills_filter: str | list[str],
+    expected: set[str],
+) -> None:
+    """Portable skills keep nearest-root precedence and yield to native skills."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ancestor = tmp_path / "project"
+    workspace = ancestor / "ws"
+    for root, names in (
+        (workspace, ("shared", "native")),
+        (ancestor, ("shared", "ancestor")),
+        (home, ("shared", "ancestor", "home")),
+    ):
+        for name in names:
+            _write_skill(root / ".agents" / "skills", name)
+    _write_skill(ancestor / ".claude" / "skills", "native")
+    _write_skill(workspace / ".agents" / "skills", "hidden", user_invocable=False)
+    selected = {
+        "native": ancestor / ".claude" / "skills" / "native",
+        "shared": workspace / ".agents" / "skills" / "shared",
+        "ancestor": ancestor / ".agents" / "skills" / "ancestor",
+        "home": home / ".agents" / "skills" / "home",
+    }
+
+    out = resolve_harness_skills(_ctx(workspace, home, skills_filter), "claude-native")
+    assert {s.name: s.skill_dir for s in out} == {name: selected[name] for name in expected}
+
+
+def test_claude_portable_skill_names_are_safe_command_basenames(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    # Unsafe frontmatter names stay labels; only a valid directory name becomes the command.
+    for directory, name in (
+        ("portable", "nested/name"),
+        ("traversal", ".."),
+        ("absolute", "/absolute"),
+        ("display label", "portable"),
+        ("dotted.name", "portable"),
+    ):
+        skill = workspace / ".agents" / "skills" / directory / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: {json.dumps(name)}\ndescription: Test skill\n---\nBody.\n")
+
+    out = resolve_harness_skills(_ctx(workspace, tmp_path / "home"), "claude-native")
+    assert sorted(skill.name for skill in out) == ["absolute", "portable", "traversal"]
+
+
+def test_claude_provider_invokes_skills_by_directory_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Claude Code does not read ``.agents/skills``, so its menu must not.
+    """Claude Code types a skill as ``/<dir>``; the frontmatter name is only its label.
 
-    A claude-family session's ``/name`` is expanded by the Claude CLI
-    itself; listing a skill it never discovers surfaces a command that
-    fails when invoked (the terminal/web parity gap).
+    A spaced frontmatter name used as the command would fail the slash-command
+    shape check and drop the skill from the menu entirely.
     """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    skill = home / ".claude" / "skills" / "asd-ste100"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: Simplified Technical English (ASD-STE100)\ndescription: STE\n---\nbody\n"
+    )
     workspace = tmp_path / "ws"
-    _write_skill(workspace / ".claude" / "skills", "claude-tier-skill")
-    _write_skill(workspace / ".agents" / "skills", "workspace-agents-skill")
-    _write_skill(home / ".agents" / "skills", "home-agents-skill")
+    workspace.mkdir()
 
     out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
-    assert [s.name for s in out] == ["claude-tier-skill"]
+    assert [(s.name, s.display_name) for s in out] == [
+        ("asd-ste100", "Simplified Technical English (ASD-STE100)")
+    ]
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "claude-sdk"])
+@pytest.mark.parametrize("configured", ["review", "code-review"])
+def test_claude_provider_filter_accepts_directory_or_frontmatter_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, configured: str
+) -> None:
+    """A ``skills:`` list naming the frontmatter ``name`` still selects the skill."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    skill = home / ".claude" / "skills" / "review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: code-review\ndescription: Review\n---\nbody\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home, skills_filter=[configured]), harness)
+    assert [(s.name, s.display_name) for s in out] == [("review", "code-review")]
 
 
 def test_claude_provider_sources_user_skills_from_config_dir(
@@ -200,15 +279,7 @@ def test_claude_provider_sources_user_skills_from_config_dir(
 def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The terminal-matching resolution is native-only; SDK keeps the generic walk.
-
-    A ``claude-native`` session types ``/name`` into the CLI as plaintext, so
-    its menu must mirror the tiers the CLI loads: ``.claude/skills`` plus the
-    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``. The in-process
-    ``claude-sdk`` harness has no such terminal, so it stays on the generic host
-    walk it used before this scoping — which lists ``.agents/skills`` and ignores
-    ``$CLAUDE_CONFIG_DIR``. The same seeded tree must diverge by harness.
-    """
+    """Both modes include portable skills; only native honors the config-dir tier."""
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     (home / ".claude" / "skills").mkdir(parents=True)  # empty default user tier
@@ -226,8 +297,7 @@ def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
     assert "agents-only-skill" in sdk
     assert "claude-dir-skill" in sdk
     assert "user-cfg-skill" not in sdk
-    # Native: mirrors the CLI — .agents excluded, config-dir user tier sourced.
-    assert native == {"claude-dir-skill", "user-cfg-skill"}
+    assert native == {"claude-dir-skill", "agents-only-skill", "user-cfg-skill"}
 
 
 def test_codex_native_and_sdk_agree_without_a_configured_codex_home(

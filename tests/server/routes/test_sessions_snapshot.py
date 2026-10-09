@@ -600,6 +600,46 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ('API Error: 499 {"error_code":"CANCELLED","message":""}', "transient_upstream_error"),
+        (
+            'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+            'version 2.1.280 or newer is required."}',
+            "client_update_required",
+        ),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+    message: str,
+    expected_code: str,
+) -> None:
+    """Failures saved as generic native errors pick up the new codes on reload."""
+    session_id = "7c1f0a52d3b94e6c8a5d2e9f4b6a1c30"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": "native_turn_error",
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_native_error", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == "native_turn_error"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 
@@ -732,6 +772,47 @@ class _GatedRunnerClient:
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_skips_runner_status_probe_when_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``include_live_status=False`` reports cached/persisted status without probing.
+
+    Runner-owned session reads pass the flag because the probe targets the
+    very runner waiting on this response.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "3db1c2a4e5f60718293a4b5c6d7e8f90"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _RunningRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RunningRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    trimmed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        include_live_status=False,
+    )
+    assert runner_client.get_calls == []
+    assert trimmed.status == "idle"
+
+    # Same cold cache without the flag: the probe fires and reports.
+    full = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert full.status == "running"
 
 
 @pytest.mark.asyncio

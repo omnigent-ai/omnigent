@@ -778,7 +778,10 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse mode={isTextStreaming ? "streaming" : "static"}>
+          <FilePathAwareMessageResponse
+            className="chat-markdown"
+            mode={isTextStreaming ? "streaming" : "static"}
+          >
             {item.text}
           </FilePathAwareMessageResponse>
           {item.previewInterrupted && item.itemId?.startsWith("live:") && (

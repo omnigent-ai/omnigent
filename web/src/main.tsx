@@ -20,6 +20,7 @@ import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
+import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
@@ -59,7 +60,9 @@ initChatStore(queryClient);
 // Let a host-scoped request resolve its session's routing host on demand,
 // walking a hostless sub-agent child up to its host-bound ancestor (a cold
 // /c/<child> open) before the request is keyed.
-setSessionHostResolver((sessionId) => prefetchSessionHostChain(queryClient, sessionId));
+setSessionHostResolver((sessionId, options) =>
+  prefetchSessionHostChain(queryClient, sessionId, options),
+);
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
@@ -78,6 +81,9 @@ const bootIdentity = resolveIdentity();
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
+
+// Scope the macOS frameless-window CSS from <html> before first paint.
+applyMacElectronShellAttribute();
 
 // The Chat/Terminal switcher lives in the header (ViewModeToggle) on every
 // shell; assert the iOS shell's legacy bottom pill hidden before the router

@@ -103,6 +103,7 @@ from omnigent.stores.conversation_store import (
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
+    ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
     SessionConnectivity,
@@ -2487,9 +2488,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if item.stable_id is not None
                     ]
 
-            # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if conv_row is not None:
+            has_new_conversation_activity = any(
+                item.type != "resource_event"
+                and (item.stable_id is None or item.stable_id not in existing_by_id)
+                for item in items
+            )
+            if conv_row is not None and has_new_conversation_activity:
                 conv_row.updated_at = now
 
             # Allocate item positions from the conversation's maintained
@@ -3290,7 +3295,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         descending_scan = is_desc if forward else not is_desc
         return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
 
-    def update_conversation(
+    def update_conversation_with_changes(
         self,
         conversation_id: str,
         title: str | None = None,
@@ -3308,7 +3313,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
-    ) -> Conversation | None:
+    ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
 
@@ -3353,8 +3358,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             append). JSON-encoded into the column.
         :param archived: New archived state. ``True`` archives,
             ``False`` unarchives, ``None`` leaves unchanged.
-        :returns: The updated :class:`Conversation`, or ``None``
-            if the conversation does not exist.
+        :returns: The updated conversation and requested model-setting change
+            flags, or ``None`` if the conversation does not exist.
         """
         now = now_epoch()
         encoded_terminal_launch_args = (
@@ -3365,7 +3370,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # binding + per-session override blob) and Omnigent (metadata).
         def update_ap(
             ap_sess: Session,
-        ) -> tuple[SqlConversation, dict[str, str]] | None:
+        ) -> tuple[SqlConversation, dict[str, str], bool, bool] | None:
             row_query = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id(),
                 SqlConversation.id == conversation_id,
@@ -3383,16 +3388,22 @@ class SqlAlchemyConversationStore(ConversationStore):
             # preserve keys changed by another writer. It is deterministic on replay.
             overrides = _decode_session_overrides(row.session_overrides)
             overrides_changed = False
+            reasoning_effort_changed = False
+            model_override_changed = False
             if _unset_reasoning_effort:
+                reasoning_effort_changed = overrides["reasoning_effort"] is not None
                 overrides["reasoning_effort"] = None
                 overrides_changed = True
             elif reasoning_effort is not None:
+                reasoning_effort_changed = overrides["reasoning_effort"] != reasoning_effort
                 overrides["reasoning_effort"] = reasoning_effort
                 overrides_changed = True
             if _unset_model_override:
+                model_override_changed = overrides["model_override"] is not None
                 overrides["model_override"] = None
                 overrides_changed = True
             elif model_override is not None:
+                model_override_changed = overrides["model_override"] != model_override
                 overrides["model_override"] = model_override
                 overrides_changed = True
             if reported_model is not None:
@@ -3447,7 +3458,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)
-            return row, labels
+            return row, labels, reasoning_effort_changed, model_override_changed
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -3456,7 +3467,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return None
-        row, labels = ap_result
+        row, labels, reasoning_effort_changed, model_override_changed = ap_result
         if terminal_launch_args is not None:
             recreated_metadata_kind = encode_conversation_kind(
                 "sub_agent" if row.parent_conversation_id else "default"
@@ -3491,7 +3502,93 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         else:
             meta = self._get_meta(conversation_id)
-        return _to_conversation(row, meta, labels)
+        return ConversationUpdateResult(
+            conversation=_to_conversation(row, meta, labels),
+            reasoning_effort_changed=reasoning_effort_changed,
+            model_override_changed=model_override_changed,
+        )
+
+    def update_conversation(
+        self,
+        conversation_id: str,
+        title: str | None = None,
+        reasoning_effort: str | None = None,
+        _unset_reasoning_effort: bool = False,
+        model_override: str | None = None,
+        _unset_model_override: bool = False,
+        cost_control_mode_override: str | None = None,
+        _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
+        harness_override: str | None = None,
+        _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
+        terminal_launch_args: list[str] | None = None,
+        archived: bool | None = None,
+        reported_model: str | None = None,
+    ) -> Conversation | None:
+        """Update a conversation, preserving the legacy return contract."""
+        result = self.update_conversation_with_changes(
+            conversation_id=conversation_id,
+            title=title,
+            reasoning_effort=reasoning_effort,
+            _unset_reasoning_effort=_unset_reasoning_effort,
+            model_override=model_override,
+            _unset_model_override=_unset_model_override,
+            cost_control_mode_override=cost_control_mode_override,
+            _unset_cost_control_mode_override=_unset_cost_control_mode_override,
+            subagent_routing_override=subagent_routing_override,
+            _unset_subagent_routing_override=_unset_subagent_routing_override,
+            harness_override=harness_override,
+            _unset_harness_override=_unset_harness_override,
+            share_workspace_files=share_workspace_files,
+            terminal_launch_args=terminal_launch_args,
+            archived=archived,
+            reported_model=reported_model,
+        )
+        return result.conversation if result is not None else None
+
+    def restore_session_settings_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        previous: Conversation,
+        attempted: Conversation,
+        restore_effort: bool = True,
+        restore_model: bool = False,
+    ) -> None:
+        """Roll back refused settings under the row lock, retaining newer field values."""
+        settings: dict[str, tuple[str | None, str | None]] = {}
+        if restore_effort:
+            settings["reasoning_effort"] = (attempted.reasoning_effort, previous.reasoning_effort)
+        if restore_model:
+            settings["model_override"] = (attempted.model_override, previous.model_override)
+        if not settings:
+            return
+
+        def restore(session: Session) -> None:
+            query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                query = query.with_for_update()
+            row = session.scalar(query)
+            if row is None:
+                return
+            overrides = _decode_session_overrides(row.session_overrides)
+            changed = False
+            for key, (expected, original) in settings.items():
+                if overrides.get(key) == expected and expected != original:
+                    overrides[key] = original
+                    changed = True
+            if changed:
+                row.session_overrides = _encode_session_overrides(overrides)
+                row.updated_at = now_epoch()
+
+        run_write_transaction(
+            self._conv_session_immediate, "restore_session_settings_if_matches", restore
+        )
 
     def clear_model_override_if_matches(
         self,

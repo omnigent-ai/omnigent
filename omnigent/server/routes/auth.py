@@ -6,13 +6,15 @@ endpoints that implement the full OIDC authorization code flow with
 PKCE. The ``cli-login`` / ``cli-poll`` pair supports the ``omnigent
 login`` CLI command.
 
-Native apps (the desktop shell) sign in through the system browser with
-an RFC 8252 loopback redirect: ``/auth/login`` accepts a loopback
+Native apps sign in through the system browser with an RFC 8252
+redirect: a loopback (the desktop shell) or an allowlisted private-use
+scheme (the iOS app's ``ai.omnigent.ios:/oauth/callback``, see
+:data:`NATIVE_APP_REDIRECT_URIS`). ``/auth/login`` accepts that
 ``native_redirect_uri`` plus a PKCE ``code_challenge``, the callback
-redirects the browser to that loopback with a one-time code, and the
-app exchanges the code and its verifier at ``/auth/native-token``. The
-code only reaches the machine whose browser signed in, and is useless
-without the verifier held by the app that started the flow.
+redirects the browser to it with a one-time code, and the app exchanges
+the code and its verifier at ``/auth/native-token``. The code only
+reaches the device whose browser signed in, and is useless without the
+verifier held by the app that started the flow.
 
 See ``designs/OIDC_AUTH.md`` for the complete design.
 
@@ -62,11 +64,15 @@ _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
 # A native sign-in code is exchanged by the app right after the browser
-# hands it over, so it only needs to outlive one loopback round trip.
+# hands it over, so it only needs to outlive one redirect round trip.
 _NATIVE_CODE_TTL_SECONDS = 60
 # RFC 8252 §7.3 loopback literals. ``localhost`` is excluded (§8.3): its
 # resolution can be redirected away from this machine.
 _NATIVE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+# RFC 8252 §7.1 private-use-scheme redirects of first-party apps, matched
+# exactly. The well-known manifest lists them so an app can tell whether
+# this server accepts its redirect before opening the browser.
+NATIVE_APP_REDIRECT_URIS: frozenset[str] = frozenset({"ai.omnigent.ios:/oauth/callback"})
 _NATIVE_PARAMS = ("native_redirect_uri", "native_state", "code_challenge", "code_challenge_method")
 # RFC 7636: an S256 challenge is a 43-char base64url SHA-256 digest, and a
 # verifier is 43-128 unreserved characters.
@@ -108,7 +114,7 @@ class _CliTicket:
 
 @dataclass
 class _NativeCode:
-    """A one-time code issued to a native app's loopback redirect.
+    """A one-time code issued to a native app's redirect.
 
     Created by ``/auth/callback`` for a native sign-in and consumed by
     ``POST /auth/native-token``.
@@ -116,7 +122,7 @@ class _NativeCode:
     :param user_id: The authenticated user's email.
     :param code_challenge: The PKCE S256 challenge the app sent to
         ``/auth/login``; the exchange must present its verifier.
-    :param redirect_uri: The loopback URI the code was delivered to; the
+    :param redirect_uri: The redirect URI the code was delivered to; the
         exchange must name the same URI.
     :param created_at: Unix timestamp when the code was issued.
     """
@@ -195,7 +201,7 @@ def create_auth_router(
     # In-memory store for CLI login tickets. Tickets are short-lived
     # (5 min) and single-use. Keyed by ticket ID.
     _cli_tickets: dict[str, _CliTicket] = {}
-    # One-time codes for native (loopback) sign-ins. Single-use, 60 s.
+    # One-time codes for native sign-ins. Single-use, 60 s.
     _native_codes: dict[str, _NativeCode] = {}
 
     def _verified_state(request: Request, state: str | None) -> dict[str, object] | None:
@@ -210,7 +216,7 @@ def create_auth_router(
         return payload if payload.get("state") == state else None
 
     def _native_failure(native: Mapping[str, str], error: str, description: str) -> Response:
-        """Report a failed native sign-in to the app's loopback listener."""
+        """Report a failed native sign-in to the app's redirect URI."""
         response = _native_redirect(native, {"error": error, "error_description": description})
         response.delete_cookie(
             key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
@@ -246,7 +252,7 @@ def create_auth_router(
         # Optional CLI login ticket — threaded through the state
         # cookie so the callback can fulfill it.
         ticket = request.query_params.get("ticket")
-        # Optional native (loopback) sign-in — also threaded through the
+        # Optional native sign-in — also threaded through the
         # signed state, so the callback knows where to deliver the code.
         try:
             native = _parse_native_sign_in(request.query_params)
@@ -346,7 +352,7 @@ def create_auth_router(
         state = request.query_params.get("state")
         if not code or not state:
             # An IdP error (e.g. the user declined) arrives without a code.
-            # A native sign-in hears about it at its loopback listener.
+            # A native sign-in hears about it at its redirect URI.
             early_native = _native_from_state(_verified_state(request, state))
             if early_native is not None:
                 return _native_failure(
@@ -384,7 +390,7 @@ def create_auth_router(
         native = _native_from_state(state_payload)
 
         def fail(status_code: int, message: str, error: str = "access_denied") -> Response:
-            # A native sign-in hears about failures at its loopback listener
+            # A native sign-in hears about failures at its redirect URI
             # instead of waiting out its timeout.
             if native is not None:
                 return _native_failure(native, error, message)
@@ -507,7 +513,7 @@ def create_auth_router(
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
 
-        # A native sign-in gets a one-time code at its loopback listener;
+        # A native sign-in gets a one-time code at its redirect URI;
         # the session is minted when the app exchanges it with its verifier.
         # The browser gets no session cookie: it never asked for one.
         if native is not None:
@@ -759,14 +765,14 @@ def create_auth_router(
             content["refresh_token"] = refresh_token
         return JSONResponse(status_code=200, content=content)
 
-    # ── Native (loopback) sign-in ───────────────────────────────────────────
+    # ── Native sign-in ──────────────────────────────────────────────────────
 
     @router.post("/native-token")
     async def native_token(request: Request) -> Response:
         """Exchange a native sign-in code for a session token.
 
-        The form carries ``code`` (delivered to the app's loopback
-        listener by ``/auth/callback``), the PKCE ``code_verifier`` whose
+        The form carries ``code`` (delivered to the app's redirect URI
+        by ``/auth/callback``), the PKCE ``code_verifier`` whose
         S256 digest the app sent to ``/auth/login``, and the same
         ``redirect_uri``. A code is consumed by its first exchange
         attempt, whatever the outcome.
@@ -949,7 +955,9 @@ def _parse_native_sign_in(params: Mapping[str, str]) -> dict[str, str] | None:
     challenge = params.get("code_challenge", "")
     if (
         params.get("code_challenge_method") != "S256"
-        or not _is_loopback_redirect_uri(redirect_uri)
+        or not (
+            redirect_uri in NATIVE_APP_REDIRECT_URIS or _is_loopback_redirect_uri(redirect_uri)
+        )
         or not _NATIVE_STATE_RE.fullmatch(native_state)
         or not _S256_CHALLENGE_RE.fullmatch(challenge)
     ):
@@ -974,12 +982,12 @@ def _native_from_state(state_payload: Mapping[str, object] | None) -> dict[str, 
 
 
 def _native_redirect(native: Mapping[str, str], params: dict[str, str]) -> RedirectResponse:
-    """Redirect the browser to a native app's loopback listener.
+    """Redirect the browser to a native app's redirect URI.
 
     :param native: The native sign-in from :func:`_native_from_state`.
     :param params: Query parameters to deliver, e.g. ``{"code": ...}``;
         the app's ``state`` is appended.
-    :returns: A 302 to the loopback redirect URI.
+    :returns: A 302 to the native redirect URI.
     """
     query = urlencode({**params, "state": native["state"]})
     return RedirectResponse(url=f"{native['redirect_uri']}?{query}", status_code=302)

@@ -4,9 +4,11 @@
 Usage:
     uv run --no-sync dev/benchmarks/omnigent/compare.py \\
         --baseline nightly.json --candidate pr.json [--threshold 0.20] \\
+        [--threshold-p95 0.40] \\
         [--output-markdown report.md] [--backend sqlite]
 
-Exits 0 if no regression, 1 if regression detected.
+Exits 0 if no regression, 1 if regression detected, 3 if a ``--require``d
+journey was not measured on both sides.
 """
 
 from __future__ import annotations
@@ -23,12 +25,43 @@ from rich.table import Table
 
 console = Console()
 
+# Below this many samples per run, a ceil-index P95 is exactly the slowest
+# sample, so it tracks one-off outliers instead of a tail. Such journeys gate on P50 only.
+_MIN_P95_SAMPLES = 20
+_UNGATED_P95_NOTE = (
+    f"† P95 not gated: fewer than {_MIN_P95_SAMPLES} samples per run, so it is the slowest sample."
+)
+
+
+def _min_run_samples(data: dict) -> int | None:
+    """Return the smallest per-run sample count, or ``None`` if no run records it.
+
+    Runs with no successful samples are ignored, as in the run medians.
+    """
+    counts = [
+        run["n_success"]
+        for run in (data.get("runs") or [])
+        if isinstance(run.get("n_success"), int) and run["n_success"] > 0
+    ]
+    return min(counts) if counts else None
+
+
+def _all_runs_failed(data: dict) -> bool:
+    """Whether the journey has runs but not one successful sample in any of them."""
+    runs = data.get("runs") or []
+    return bool(runs) and all(run.get("n_success") == 0 for run in runs)
+
 
 def _comparison_metric(data: dict, run_key: str, summary_key: str) -> float | None:
-    """Return the median run metric, falling back for summary-only reports."""
+    """Return the median run metric, falling back for summary-only reports.
+
+    Runs with no successful samples are ignored: their latency fields are 0.0
+    placeholders, not measurements.
+    """
     values = [
         float(value)
         for run in (data.get("runs") or [])
+        if run.get("n_success") != 0
         if isinstance((value := run.get(run_key)), (int, float)) and math.isfinite(value)
     ]
     if values:
@@ -71,6 +104,7 @@ def compare_reports(
     candidate: dict,
     threshold: float,
     backend: str | None = None,
+    threshold_p95: float | None = None,
 ) -> tuple[bool, list[dict]]:
     """Compare journeys between two reports.
 
@@ -78,9 +112,12 @@ def compare_reports(
     :param candidate: Parsed candidate JSON report.
     :param threshold: Regression threshold as a fraction (e.g. 0.20 = 20%).
     :param backend: If set, only compare journeys whose ``backend`` key matches.
+    :param threshold_p95: Separate threshold for P95, which is noisier than
+        P50 even with enough samples. ``None`` uses *threshold*.
     Run-level medians drive latency comparisons so one noisy timed run cannot
     dominate a three-run report. Summary averages remain the fallback for
-    legacy reports that did not retain per-run metrics.
+    legacy reports that did not retain per-run metrics. P95 is reported but not
+    gated when either side has fewer than ``_MIN_P95_SAMPLES`` samples per run.
 
     :returns: ``(passed, rows)`` where *rows* hold per-journey comparison data.
     """
@@ -97,17 +134,21 @@ def compare_reports(
         c_p50 = _comparison_metric(c_data, "p50_ms", "avg_p50_ms")
         c_p95 = _comparison_metric(c_data, "p95_ms", "avg_p95_ms")
 
-        # A skipped journey (or one whose runs all failed) carries no metric
-        # keys. Report it as its own status instead of computing a delta off a
-        # missing value (which would read as a spurious -100% improvement).
+        # A journey whose every op failed (e.g. all HTTP 500s) is a failure, not
+        # a 0.0 ms measurement. A skipped journey (errored out of measurement)
+        # carries no metric keys at all. Neither gets a delta computed off a
+        # missing value, which would read as a spurious -100% improvement.
         c_req = c_summary.get("avg_http_requests_per_op")
-        if c_p50 is None:
+        c_failed = _all_runs_failed(c_data)
+        if c_failed or c_p50 is None:
+            if c_failed:
+                passed = False
             b_journey = baseline_journeys.get(name, {})
             b_j_summary = b_journey.get("summary", {})
             rows.append(
                 {
                     "journey": name,
-                    "status": "skipped",
+                    "status": "failed" if c_failed else "skipped",
                     "b_p50": _comparison_metric(b_journey, "p50_ms", "avg_p50_ms"),
                     "c_p50": None,
                     "b_p95": _comparison_metric(b_journey, "p95_ms", "avg_p95_ms"),
@@ -157,16 +198,38 @@ def compare_reports(
             continue
 
         b_summary = b_data.get("summary", {})
+        b_req = b_summary.get("avg_http_requests_per_op")
+        if _comparison_metric(b_data, "p50_ms", "avg_p50_ms") is None:
+            # The baseline never measured it (e.g. every op failed): nothing to compare.
+            rows.append(
+                {
+                    "journey": name,
+                    "status": "new",
+                    "b_p50": None,
+                    "c_p50": c_p50,
+                    "b_p95": None,
+                    "c_p95": c_p95,
+                    "delta_p50": None,
+                    "delta_p95": None,
+                    "b_req": b_req,
+                    "c_req": c_req,
+                }
+            )
+            continue
         b_p50 = _comparison_metric(b_data, "p50_ms", "avg_p50_ms") or 0.0
         b_p95 = _comparison_metric(b_data, "p95_ms", "avg_p95_ms") or 0.0
-        b_req = b_summary.get("avg_http_requests_per_op")
 
         c_p50 = c_p50 or 0.0
         c_p95 = c_p95 or 0.0
         delta_p50 = (c_p50 - b_p50) / b_p50 if b_p50 > 0 else 0.0
         delta_p95 = (c_p95 - b_p95) / b_p95 if b_p95 > 0 else 0.0
 
-        regression = delta_p50 > threshold or delta_p95 > threshold
+        p95_gated = not any(
+            n is not None and n < _MIN_P95_SAMPLES
+            for n in (_min_run_samples(b_data), _min_run_samples(c_data))
+        )
+        p95_limit = threshold if threshold_p95 is None else threshold_p95
+        regression = delta_p50 > threshold or (p95_gated and delta_p95 > p95_limit)
         if regression:
             passed = False
 
@@ -180,6 +243,7 @@ def compare_reports(
                 "b_p95": b_p95,
                 "c_p95": c_p95,
                 "delta_p95": delta_p95,
+                "p95_gated": p95_gated,
                 "b_req": b_req,
                 "c_req": c_req,
             }
@@ -188,14 +252,49 @@ def compare_reports(
     return passed, rows
 
 
+def _measured(row: dict) -> bool:
+    """Whether both sides produced a real P50 (0.0 is a no-success placeholder)."""
+    if row["status"] == "failed":  # the candidate was measured as unusable
+        return True
+    return row["status"] in ("ok", "regression") and bool(row["b_p50"]) and bool(row["c_p50"])
+
+
+def unmeasured_journeys(rows: list[dict], required: list[str]) -> list[str]:
+    """Return the *required* journeys this comparison could not measure.
+
+    Used to confirm a regression flagged elsewhere: a re-check that never
+    measured the flagged journey on both sides cannot clear it.
+    """
+    by_name = {row["journey"]: row for row in rows}
+    return [name for name in required if name not in by_name or not _measured(by_name[name])]
+
+
 def _status_style(status: str) -> str:
-    return {"regression": "red", "new": "cyan", "ok": "green", "skipped": "yellow"}.get(status, "")
+    return {
+        "regression": "red",
+        "failed": "red",
+        "new": "cyan",
+        "ok": "green",
+        "skipped": "yellow",
+    }.get(status, "")
 
 
-def print_table(rows: list[dict], threshold: float) -> None:
+def _threshold_text(threshold: float, threshold_p95: float | None, bold: str = "") -> str:
+    """Describe the thresholds, e.g. ``"30% on run-median P50, 60% on P95"``."""
+    if threshold_p95 is None or threshold_p95 == threshold:
+        return f"{bold}{threshold * 100:.0f}%{bold} on run-median P50 or P95"
+    return (
+        f"{bold}{threshold * 100:.0f}%{bold} on run-median P50, "
+        f"{bold}{threshold_p95 * 100:.0f}%{bold} on P95"
+    )
+
+
+def print_table(rows: list[dict], threshold: float, threshold_p95: float | None = None) -> None:
     """Render the comparison rows as a rich table."""
+    p95_limit = threshold if threshold_p95 is None else threshold_p95
     table = Table(
-        title=f"Benchmark comparison (regression threshold: {threshold * 100:.0f}%)",
+        title="Benchmark comparison (regression threshold: "
+        f"{_threshold_text(threshold, threshold_p95)})",
         show_header=True,
         header_style="bold cyan",
         box=None,
@@ -217,11 +316,14 @@ def print_table(rows: list[dict], threshold: float) -> None:
         delta_p50_str = _fmt_delta(row["delta_p50"])
         delta_p95_str = _fmt_delta(row["delta_p95"])
 
+        p95_gated = row.get("p95_gated", True)
         if row["status"] == "regression":
             if row["delta_p50"] is not None and row["delta_p50"] > threshold:
                 delta_p50_str = f"[red]{delta_p50_str}[/red]"
-            if row["delta_p95"] is not None and row["delta_p95"] > threshold:
+            if p95_gated and row["delta_p95"] is not None and row["delta_p95"] > p95_limit:
                 delta_p95_str = f"[red]{delta_p95_str}[/red]"
+        if not p95_gated:
+            delta_p95_str = f"[dim]{delta_p95_str} †[/dim]"
 
         table.add_row(
             row["journey"],
@@ -237,15 +339,19 @@ def print_table(rows: list[dict], threshold: float) -> None:
 
     console.print()
     console.print(table)
+    if any(not row.get("p95_gated", True) for row in rows):
+        console.print(f"[dim]{_UNGATED_P95_NOTE}[/dim]")
     console.print()
 
 
-def build_markdown(rows: list[dict], threshold: float, passed: bool) -> str:
+def build_markdown(
+    rows: list[dict], threshold: float, passed: bool, threshold_p95: float | None = None
+) -> str:
     """Render the comparison rows as a GitHub-flavoured markdown table."""
     lines = [
         "## Benchmark comparison",
         "",
-        f"Regression threshold: **{threshold * 100:.0f}%** on run-median P50 or P95.",
+        f"Regression threshold: {_threshold_text(threshold, threshold_p95, bold='**')}.",
         "",
         "| Journey | Status | Base run-med P50 ms | Cand run-med P50 ms | Δ P50"
         " | Base run-med P95 ms | Cand run-med P95 ms | Δ P95 | Req/op |",
@@ -254,22 +360,30 @@ def build_markdown(rows: list[dict], threshold: float, passed: bool) -> str:
 
     for row in rows:
         status = row["status"]
-        emoji = {"regression": "🔴", "new": "🆕", "ok": "✅", "skipped": "⚠️"}.get(status, status)
+        emoji = {"regression": "🔴", "failed": "❌", "new": "🆕", "ok": "✅", "skipped": "⚠️"}.get(
+            status, status
+        )
         b_p50 = _fmt_ms(row["b_p50"])
         c_p50 = _fmt_ms(row["c_p50"])
         d_p50 = _fmt_delta(row["delta_p50"])
         b_p95 = _fmt_ms(row["b_p95"])
         c_p95 = _fmt_ms(row["c_p95"])
         d_p95 = _fmt_delta(row["delta_p95"])
+        if not row.get("p95_gated", True):
+            d_p95 += " †"
         lines.append(
             f"| {row['journey']} | {emoji} {status} "
             f"| {b_p50} | {c_p50} | {d_p50} "
             f"| {b_p95} | {c_p95} | {d_p95} | {_fmt_req(row)} |"
         )
 
+    if any(not row.get("p95_gated", True) for row in rows):
+        lines += ["", _UNGATED_P95_NOTE]
     lines.append("")
     verdict = (
-        "**PASS** — no regressions detected." if passed else "**FAIL** — regression(s) detected."
+        "**PASS** — no regressions detected."
+        if passed
+        else "**FAIL** — regression(s) or failed journey(s) detected."
     )
     lines.append(verdict)
     lines.append("")
@@ -289,6 +403,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Regression threshold as a fraction (default 1.0 = 100%%, checks P50 and P95)",
     )
     parser.add_argument(
+        "--threshold-p95",
+        type=float,
+        default=None,
+        help="Separate P95 threshold as a fraction (default: same as --threshold)",
+    )
+    parser.add_argument(
         "--output-markdown",
         type=Path,
         metavar="FILE",
@@ -297,6 +417,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--backend",
         help="Filter to journeys for this backend only (e.g. sqlite, postgres)",
+    )
+    parser.add_argument(
+        "--require",
+        type=lambda s: [p.strip() for p in s.split(",") if p.strip()],
+        default=[],
+        metavar="A,B",
+        help="Journeys that must be measured on both sides; exit 3 if any is not",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        metavar="FILE",
+        help="Write {passed, rows, unmeasured} as JSON to FILE",
     )
     args = parser.parse_args(argv)
 
@@ -311,15 +444,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.backend:
         console.print(f"[bold]Backend filter:[/bold] {args.backend}")
 
-    passed, rows = compare_reports(baseline, candidate, args.threshold, backend=args.backend)
+    passed, rows = compare_reports(
+        baseline, candidate, args.threshold, backend=args.backend, threshold_p95=args.threshold_p95
+    )
+    unmeasured = unmeasured_journeys(rows, args.require)
+
+    if args.output_json:
+        args.output_json.write_text(
+            json.dumps({"passed": passed, "rows": rows, "unmeasured": unmeasured}, indent=2)
+        )
 
     if not rows:
         console.print("[yellow]No journeys found to compare.[/yellow]")
-        return 0
+        if unmeasured and args.output_markdown:
+            args.output_markdown.write_text(
+                "No journeys found to compare.\n\n"
+                f"**INCOMPLETE** — not measured on both sides: {', '.join(unmeasured)}.\n"
+            )
+        return 3 if unmeasured else 0
 
-    print_table(rows, args.threshold)
+    print_table(rows, args.threshold, args.threshold_p95)
 
     regressions = [r for r in rows if r["status"] == "regression"]
+    failed = [r for r in rows if r["status"] == "failed"]
     new_journeys = [r for r in rows if r["status"] == "new"]
     skipped = [r for r in rows if r["status"] == "skipped"]
 
@@ -331,21 +478,35 @@ def main(argv: list[str] | None = None) -> int:
         names = ", ".join(r["journey"] for r in skipped)
         console.print(f"[yellow]Skipped (no candidate metrics):[/yellow] {names}")
 
+    if failed:
+        names = ", ".join(r["journey"] for r in failed)
+        console.print(f"[red bold]FAILED[/red bold] (every candidate op failed): {names}")
+
     if regressions:
         console.print(
             f"[red bold]REGRESSION DETECTED[/red bold] in "
             f"{len(regressions)} journey(s): "
             f"{', '.join(r['journey'] for r in regressions)}"
         )
-    else:
+    elif not failed:
         console.print("[green bold]PASS[/green bold] — no regressions detected.")
 
+    if unmeasured:
+        console.print(
+            f"[red bold]INCOMPLETE[/red bold] — required journey(s) not measured on both sides: "
+            f"{', '.join(unmeasured)}"
+        )
+
     if args.output_markdown:
-        md = build_markdown(rows, args.threshold, passed)
+        md = build_markdown(rows, args.threshold, passed, args.threshold_p95)
+        if unmeasured:
+            md += f"\n**INCOMPLETE** — not measured on both sides: {', '.join(unmeasured)}.\n"
         args.output_markdown.write_text(md)
         console.print(f"Markdown report written to {args.output_markdown}")
 
-    return 0 if passed else 1
+    if not passed:
+        return 1
+    return 3 if unmeasured else 0
 
 
 if __name__ == "__main__":

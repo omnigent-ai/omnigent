@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
@@ -26,6 +29,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
+    read_certificate_failure,
     read_codex_config_effort,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -33,6 +37,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_policy_hook_config,
     record_app_server_stopped,
+    record_certificate_failure,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -503,15 +508,22 @@ def test_clear_active_turn_id_if_matches(
 
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
     """
-    With no bridge state on disk, clearing is a no-op that reports cleared.
+    With no bridge state on disk, clearing reports cleared and runs ``on_cleared``.
 
     A missing state file means there is no turn to protect, so the helper
-    returns True (nothing to ignore). A failure (returning False) would
-    make the forwarder treat a normal terminal as stale and never post
-    idle, hanging the spinner.
+    returns True (nothing to ignore) and still fires the idle publish. A
+    failure (returning False) would make the forwarder treat a normal
+    terminal as stale and never post idle, hanging the spinner.
     """
     # bridge_dir exists (fixture) but no state.json was written.
-    assert clear_active_turn_id_if_matches(bridge_dir, "turn_1") is True
+    calls: list[str] = []
+    assert (
+        clear_active_turn_id_if_matches(
+            bridge_dir, "turn_1", on_cleared=lambda: calls.append("cleared")
+        )
+        is True
+    )
+    assert calls == ["cleared"]
 
 
 def test_active_turn_compare_and_clear_is_atomic_with_concurrent_update(
@@ -561,6 +573,129 @@ def test_active_turn_compare_and_clear_is_atomic_with_concurrent_update(
     assert not clear_thread.is_alive()
     assert not update_thread.is_alive()
     assert clear_result == [True]
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id == "turn_b"
+
+
+def test_clear_active_turn_id_on_cleared_runs_only_when_turn_is_cleared(
+    bridge_dir: Path,
+) -> None:
+    """``on_cleared`` fires for a real clear and is skipped for a preserved turn.
+
+    The stale-interrupt reconciler publishes idle through ``on_cleared``, so it
+    must run only when the matching turn is actually cleared. A superseded turn
+    left intact must never trigger that idle.
+
+    :param bridge_dir: Isolated bridge directory fixture.
+    :returns: None.
+    """
+    _seed_active_turn(bridge_dir, "turn_b")
+    calls: list[str] = []
+
+    # A stale terminal for the old id finds the newer turn, so it is refused and
+    # the idle publish does not run.
+    assert (
+        clear_active_turn_id_if_matches(
+            bridge_dir, "turn_a", on_cleared=lambda: calls.append("preserved")
+        )
+        is False
+    )
+    assert calls == []
+
+    # The matching terminal clears the turn and runs the idle publish once.
+    assert (
+        clear_active_turn_id_if_matches(
+            bridge_dir, "turn_b", on_cleared=lambda: calls.append("cleared")
+        )
+        is True
+    )
+    assert calls == ["cleared"]
+
+
+def test_clear_active_turn_id_logs_on_cleared_error_without_propagating(
+    bridge_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``on_cleared`` is logged, not propagated, after the clear lands.
+
+    The clear is already written when the callback runs, so a retry could not
+    re-run it; the reconciler keeps the cleared turn and returns success rather
+    than surface the callback's failure.
+
+    :param bridge_dir: Isolated bridge directory fixture.
+    :param caplog: Captures the swallowed-callback warning.
+    :returns: None.
+    """
+    _seed_active_turn(bridge_dir, "turn_a")
+
+    def boom() -> None:
+        raise RuntimeError("idle publish failed")
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.bridge"):
+        cleared = clear_active_turn_id_if_matches(bridge_dir, "turn_a", on_cleared=boom)
+
+    assert cleared is True
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id is None
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "cleared-turn callback raised" in r.getMessage()
+    ]
+    assert warnings
+
+
+def test_clear_active_turn_id_publishes_idle_before_a_newer_turn_can_land(
+    bridge_dir: Path,
+) -> None:
+    """The idle publish holds the state lock, so a newer turn cannot slip in first.
+
+    A separate harness process can record a ``turn/started`` right after the old
+    turn clears. Because ``on_cleared`` runs under the state lock, that update is
+    serialized after the idle publish and can never be masked by it.
+
+    :param bridge_dir: Isolated bridge directory fixture.
+    :returns: None.
+    """
+    _seed_active_turn(bridge_dir, "turn_a")
+    observed_during_publish: list[str | None] = []
+    callback_failures: list[str] = []
+    update_attempting = threading.Event()
+    update_finished = threading.Event()
+
+    def record_newer_turn() -> None:
+        """Record turn B the way a concurrent forwarder process would."""
+        update_attempting.set()
+        update_active_turn_id(bridge_dir, "turn_b")
+        update_finished.set()
+
+    update_thread = threading.Thread(target=record_newer_turn)
+
+    def publish_idle() -> None:
+        """Stand in for the runner's idle publish, still under the state lock."""
+        state = read_bridge_state(bridge_dir)
+        observed_during_publish.append(state.active_turn_id if state is not None else None)
+        update_thread.start()
+        # Record failures instead of asserting: the production clear wraps this
+        # callback in a broad ``except`` that would otherwise swallow them.
+        if not update_attempting.wait(timeout=5.0):
+            callback_failures.append("competing thread never attempted its update")
+        elif update_finished.wait(timeout=0.1):
+            callback_failures.append(
+                "turn B landed while the idle publish still held the state lock"
+            )
+
+    cleared = clear_active_turn_id_if_matches(bridge_dir, "turn_a", on_cleared=publish_idle)
+    update_thread.join(timeout=5.0)
+
+    assert callback_failures == []
+    assert cleared is True
+    # The clear applied before the publish observed it, and B was blocked until
+    # the lock released, so the publish could not overwrite a live newer turn.
+    assert observed_during_publish == [None]
+    assert update_finished.is_set()
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.active_turn_id == "turn_b"
@@ -1020,3 +1155,117 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_mirror_applied_codex_settings_records_failed_writes_until_the_config_changes(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write stays recorded beside the config, and a later rewrite supersedes it."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "low"\n')
+    write_model = codex_native_bridge.write_codex_config_model
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", lambda *_: False)
+
+    failed = codex_native_bridge.mirror_applied_codex_settings(
+        bridge_dir, {"effort": "high", "model": "gpt-6-sol"}
+    )
+
+    assert failed == {"model": "gpt-6-sol"}
+    assert read_codex_config_effort(bridge_dir) == "high"
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {"model": "gpt-6-sol"}
+    # A later effort write keeps the model it does not replace recorded.
+    assert codex_native_bridge.mirror_applied_codex_settings(bridge_dir, {"effort": "xhigh"}) == {}
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {"model": "gpt-6-sol"}
+    # Another writer replacing the config, such as a terminal /model, supersedes it.
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", write_model)
+    assert write_model(bridge_dir, "gpt-5.5")
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+
+
+@pytest.mark.posix_only
+def test_mirror_applied_codex_settings_holds_its_lock_while_writing(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process cannot interleave between the record's read and its stamp."""
+    import fcntl
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model_reasoning_effort = "low"\n')
+    write_effort = codex_native_bridge.write_codex_config_effort
+    held: list[bool] = []
+
+    def probing_write(target: Path, effort: str) -> bool:
+        fd = os.open(target / "unmirrored_settings.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            held.append(True)
+        else:
+            held.append(False)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return write_effort(target, effort)
+
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_effort", probing_write)
+
+    assert codex_native_bridge.mirror_applied_codex_settings(bridge_dir, {"effort": "high"}) == {}
+    assert held == [True]
+    assert read_codex_config_effort(bridge_dir) == "high"
+
+
+def test_unmirrored_codex_settings_need_a_readable_config(bridge_dir: Path) -> None:
+    """Without a readable config, no revision can show a later rewrite, so nothing is trusted."""
+    codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
+
+    codex_native_bridge.write_unmirrored_codex_settings(bridge_dir, {"effort": "high"})
+
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+    assert not (bridge_dir / "unmirrored_settings.json").exists()
+
+
+def test_mirror_applied_codex_settings_ignores_values_codex_rewrote_after_them(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unlocked Codex rewrite between our writes and the stamp supersedes the record."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "low"\n')
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", lambda *_: False)
+    record = codex_native_bridge.write_unmirrored_codex_settings
+
+    def terminal_switch_then_record(*args: Any, **kwargs: Any) -> None:
+        # An in-terminal /model replaces the config before the record is stamped.
+        replacement = config.with_name("config.toml.terminal")
+        replacement.write_text('model = "gpt-5.5"\n')
+        os.replace(replacement, config)
+        record(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_native_bridge, "write_unmirrored_codex_settings", terminal_switch_then_record
+    )
+
+    failed = codex_native_bridge.mirror_applied_codex_settings(
+        bridge_dir, {"model": "gpt-6-sol", "effort": "high"}
+    )
+
+    assert failed == {"model": "gpt-6-sol"}
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+
+
+def test_clear_bridge_state_removes_egress_certificate_failure(tmp_path: Path) -> None:
+    """A relaunch must not inherit the previous launcher's certificate evidence."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_certificate_failure(
+        bridge_dir, CertificateFailure(evidence="certificate expired", expired=True)
+    )
+    assert read_certificate_failure(bridge_dir) is not None
+
+    clear_bridge_state(bridge_dir)
+
+    assert read_certificate_failure(bridge_dir) is None
