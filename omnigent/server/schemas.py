@@ -270,14 +270,13 @@ class AgentObject(BaseModel):
         when given ``session_id``, merges the session's bundled skills.
         Empty list when the spec
         bundles no skills or when the bundle cannot be loaded.
-    :param terminals: Terminal names declared in the spec's
-        ``terminals:`` block, in declaration order, e.g.
-        ``["shell"]``. The Web UI gates its "new terminal"
-        affordance on this list (creation is only offered for
-        agents with terminal access) and offers these names as
-        the launchable choices. Empty list when the spec
-        declares no terminals or when the bundle cannot be
-        loaded.
+    :param terminals: Terminal names a user may open for this
+        agent, in offer order: the spec's declared ``terminals:``
+        (e.g. ``["shell"]``), or the default shell (``["bash"]``)
+        when the spec declares none. The Web UI gates its "new
+        terminal" affordance on this list and offers these names
+        as the launchable choices. Empty list when the bundle
+        cannot be loaded.
     :param builtin: Whether this is a server-*seeded* built-in
         agent (deterministic, name-derived id) as opposed to an
         operator/user-registered template (random id, e.g. via

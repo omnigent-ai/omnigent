@@ -827,7 +827,8 @@ export function AppShell() {
   const clearShellCreatePending = useCallback(() => {
     pendingShellCreateRef.current = null;
   }, []);
-  // Whether the agent's spec declares shell access (a ``terminals:`` block).
+  // Whether the session offers user shells (declared ``terminals:``, or the
+  // server's default shell when the agent declares none).
   // The desktop rail's Shells TAB shows only once a shell exists (creation is
   // via the tab-strip "+" menu), but the MOBILE Shells drawer — which has no
   // "+" menu — must be reachable at zero shells so its "+ New shell" row is the

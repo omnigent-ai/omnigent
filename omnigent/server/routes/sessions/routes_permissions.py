@@ -69,6 +69,7 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.terminals.user_shells import user_shell_terminals
 
 
 class _PermissionListResponse(TypedDict):
@@ -421,13 +422,14 @@ def _to_agent_object(
             harness = loaded.spec.executor.harness_kind
             if description is None:
                 description = loaded.spec.description
-            # Declared terminal names, in spec order — the Web UI
-            # gates its "new terminal" affordance on this list.
+            # Terminal names a user may open, in offer order: the declared
+            # ``terminals:``, or the default shell when the spec declares
+            # none. The Web UI gates its "new terminal" affordance on this list.
             terminals = (
                 list(terminals_override)
                 if terminals_override is not None
                 and native_coding_agent_for_agent_name(loaded.spec.name) is not None
-                else list(loaded.spec.terminals or {})
+                else list(user_shell_terminals(loaded.spec))
             )
             # Bundled suggestions stay available while the host catalog loads.
             skills = [

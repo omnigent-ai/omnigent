@@ -68,6 +68,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.user_shells import user_shell_terminals
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -509,11 +510,11 @@ def register_resource_routes(
         agent_spec = await _resolve_session_agent_spec(session_id)
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
-        declared_terminal = None
-        terminals_map = {}
-        if agent_spec is not None:
-            terminals_map = getattr(agent_spec, "terminals", None) or {}
-            declared_terminal = terminals_map.get(terminal_name)
+        # The declared ``terminals:``, or the default user shell when the agent
+        # declares none. An offered name launches with its own spec below; the
+        # body's spec only shapes undeclared names, which the server gates.
+        terminals_map = user_shell_terminals(agent_spec)
+        declared_terminal = terminals_map.get(terminal_name)
 
         if (
             declared_terminal is None

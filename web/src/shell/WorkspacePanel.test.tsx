@@ -683,6 +683,29 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
   });
 
+  it("reports a failed shell create with the server's reason", async () => {
+    // The menu closes on launch, so a failed create (e.g. a runner without
+    // tmux) must surface its reason somewhere the user can see it.
+    declaresShell();
+    const reason = "Native terminal harnesses (tmux/PTY) are not supported on Windows.";
+    const mutate = vi.fn((_name: string, opts?: { onError?: (err: Error) => void }) =>
+      opts?.onError?.(new Error(reason)),
+    );
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+
+    expect(toast.error).toHaveBeenCalledWith(reason);
+    expect(openTerminalTab).not.toHaveBeenCalled();
+  });
+
   it("names the current default in the Shell item and launches it on click when several are declared", async () => {
     // Multiple declared terminals → the "Shell" item names the default inline
     // ("Shell (zsh)") and clicking it launches that default; the OTHER types

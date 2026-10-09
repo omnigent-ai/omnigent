@@ -106,6 +106,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.terminals.user_shells import user_shell_terminals
 
 
 class _RunnerStreamResponse(StreamingResponse):
@@ -1347,9 +1348,10 @@ def register_resources_routes(
         already-running ``(terminal, session_key)`` returns the
         existing resource.
 
-        User-initiated creates are gated on the agent's terminal
-        access: the requested ``terminal`` must be one of the names
-        declared in the agent spec's ``terminals:`` block. Native
+        User-initiated creates are gated on the terminals the agent
+        offers its users: the names declared in the agent spec's
+        ``terminals:`` block, or the default user shell when the spec
+        declares none (see ``user_shell_terminals``). Native
         harness bootstrap requests (marked ``ensure_native_terminal``
         or ``bridge_inject_dir`` — the ``omnigent claude`` / ``codex``
         wrappers launching the session's own CLI terminal) are exempt:
@@ -1366,8 +1368,8 @@ def register_resources_routes(
             ``session_key``.
         :returns: The terminal resource object.
         :raises OmnigentError: 400 when the requested terminal is not
-            declared by the agent spec (or the agent has no
-            ``terminals:`` block at all).
+            offered by the agent spec (or no spec resolves for the
+            session).
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
@@ -1378,7 +1380,7 @@ def register_resources_routes(
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-            declared = list(spec.terminals or {}) if spec is not None else []
+            offered = list(user_shell_terminals(spec))
             if (
                 spec is not None
                 and conv.host_id is not None
@@ -1391,13 +1393,14 @@ def register_resources_routes(
                     runner_router=runner_router or get_server_runner_router(),
                 )
                 if reported:
-                    declared = reported
-            if body.get("terminal") not in declared:
+                    offered = reported
+            if body.get("terminal") not in offered:
                 raise OmnigentError(
                     (
-                        f"Terminal {body.get('terminal')!r} is not declared by this "
-                        f"agent. Terminals can only be created for agents whose spec "
-                        f"declares them; this agent declares: {declared or 'none'}."
+                        f"Terminal {body.get('terminal')!r} is not offered by this "
+                        f"agent. Terminals can only be created from the agent's "
+                        f"declared terminals, or its default shell when it declares "
+                        f"none; this agent offers: {offered or 'none'}."
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )

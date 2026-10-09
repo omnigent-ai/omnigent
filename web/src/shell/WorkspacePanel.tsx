@@ -198,8 +198,9 @@ function NewTabMenu({
   const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
   // Controlled so a launch can force the menu closed on select.
   const [menuOpen, setMenuOpen] = useState(false);
-  // Shell access mirrors NewTerminalButton's gate: the agent's spec must
-  // declare a non-empty ``terminals:`` block.
+  // Shell access mirrors NewTerminalButton's gate: the server reports the
+  // shells this session's user may open (declared ``terminals:``, or its
+  // default shell when the agent declares none).
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
   if (!canOpenShell && !onOpenBrowser && !onOpenSideChat) return null;
@@ -218,7 +219,12 @@ function NewTabMenu({
     onCreateStart?.();
     create.mutate(name, {
       onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: () => onCreateError?.(),
+      onError: (err) => {
+        onCreateError?.();
+        // Surface the server's reason (e.g. no tmux on this runner); the menu
+        // has already closed, so nothing else shows the failure.
+        toast.error(err.message);
+      },
     });
   };
 

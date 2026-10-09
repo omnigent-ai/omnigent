@@ -1528,12 +1528,12 @@ async def test_create_terminal_rejects_shell_absent_from_native_host(
 async def test_create_terminal_rejected_without_agent_terminal_access(
     client: httpx.AsyncClient,
 ) -> None:
-    """User creates are rejected when the agent declares no terminals.
+    """User creates are rejected when no agent spec resolves.
 
     The stub agent store resolves no agent, so the session has no
-    spec and therefore no ``terminals:`` block — the iff gate must
-    refuse the create instead of letting the runner synthesize an
-    arbitrary terminal the agent can't see or manage.
+    spec and offers no terminals (not even the default shell) — the
+    gate must refuse the create instead of letting the runner
+    synthesize an arbitrary terminal.
     """
     fake_runner = _FakeRunnerClient(payload={})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
@@ -1573,6 +1573,72 @@ async def test_create_terminal_rejected_for_undeclared_name(
     body = resp.json()
     assert body["error"]["code"] == "invalid_input"
     # The message names the declared set so a UI/user can self-correct.
+    assert "bash" in body["error"]["message"]
+    assert fake_runner.calls == []
+
+
+@pytest.fixture
+def no_terminals_spec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve the session's agent spec to one declaring no ``terminals:``."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.spec.types import AgentSpec
+
+    spec = AgentSpec(spec_version=1)
+    monkeypatch.setattr(
+        sessions_module,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: spec,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_default_shell_allowed_when_agent_declares_none(
+    client: httpx.AsyncClient,
+    no_terminals_spec: None,
+) -> None:
+    """The default user shell passes the gate for an agent without ``terminals:``
+    and reaches the runner."""
+    terminal_resource = {
+        "id": "terminal_bash_u-1",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+        "name": "bash:u-1",
+        "metadata": {"terminal_name": "bash", "session_key": "u-1", "running": True},
+    }
+    fake_runner = _FakeRunnerClient(payload=terminal_resource)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "bash", "session_key": "u-1"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == "terminal_bash_u-1"
+    assert fake_runner.calls == [
+        ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_rejects_other_names_when_agent_declares_none(
+    client: httpx.AsyncClient,
+    no_terminals_spec: None,
+) -> None:
+    """Only the default shell is offered to an agent without ``terminals:``; any
+    other name is refused before reaching the runner."""
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "zsh", "session_key": "u-1"},
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
     assert "bash" in body["error"]["message"]
     assert fake_runner.calls == []
 

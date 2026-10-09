@@ -739,6 +739,12 @@ alias a shared `sandbox:` block so `sys_os_*` and the terminal enforce the same
 policy. Keep `allow_sandbox_override: false` unless you intend to let the
 launcher weaken the sandbox at launch time.
 
+An agent that declares no `terminals:` still lets a user open a default `bash`
+shell from the web UI's workspace rail. That shell inherits the agent's `os_env`
+(including its sandbox) and is not exposed to the agent as a tool. Declaring
+`terminals:` replaces the default with the declared set and registers the
+`sys_terminal_*` tools for the agent.
+
 ## Complete example
 
 ```yaml
