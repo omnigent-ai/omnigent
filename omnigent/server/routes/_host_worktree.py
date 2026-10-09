@@ -18,6 +18,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
+    HostInspectWorktreeFrame,
     HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     encode_host_frame,
@@ -120,6 +121,14 @@ class CreatedWorktree:
     worktree_path: str
     branch: str
     workspace: str | None = None
+
+
+@dataclass(frozen=True)
+class WorktreeInspection:
+    dirty_files: int
+    unpushed_commits: int
+    merged: bool | None
+    default_ref: str | None
 
 
 async def _await_host_worktree_result(
@@ -281,6 +290,56 @@ async def remove_worktree_on_host(
         raise WorktreeProxyError(
             f"worktree removal failed: {result.get('error') or 'host reported no detail'}"
         )
+
+
+async def inspect_worktree_on_host(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    worktree_path: str,
+    branch: str,
+) -> WorktreeInspection:
+    request_id = secrets.token_hex(8)
+    frame = encode_host_frame(
+        HostInspectWorktreeFrame(
+            request_id=request_id,
+            worktree_path=worktree_path,
+            branch=branch,
+        )
+    )
+    result = await _await_host_worktree_result(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        pending=host_conn.pending_inspect_worktrees,
+        request_id=request_id,
+        frame=frame,
+        op="worktree inspection",
+    )
+    if result.get("status") != "ok":
+        raise WorktreeProxyError(
+            f"worktree inspection failed: {result.get('error') or 'host reported no detail'}"
+        )
+    dirty_files = result.get("dirty_files")
+    unpushed_commits = result.get("unpushed_commits")
+    if (
+        not isinstance(dirty_files, int)
+        or isinstance(dirty_files, bool)
+        or dirty_files < 0
+        or not isinstance(unpushed_commits, int)
+        or isinstance(unpushed_commits, bool)
+        or unpushed_commits < 0
+    ):
+        raise WorktreeProxyError("host returned an incomplete worktree inspection")
+    merged = result.get("merged")
+    default_ref = result.get("default_ref")
+    if merged is True and not isinstance(default_ref, str):
+        merged = None
+    return WorktreeInspection(
+        dirty_files=dirty_files,
+        unpushed_commits=unpushed_commits,
+        merged=merged if isinstance(merged, bool) else None,
+        default_ref=default_ref if isinstance(default_ref, str) else None,
+    )
 
 
 async def list_worktrees_on_host(

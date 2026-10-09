@@ -27,6 +27,8 @@ from omnigent.host.frames import (
     HostImportLocalFrame,
     HostImportLocalSessionChunkFrame,
     HostImportLocalSessionFrame,
+    HostInspectWorktreeFrame,
+    HostInspectWorktreeResultFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -1811,6 +1813,37 @@ def test_list_worktrees_result_frame_rejects_non_list() -> None:
         '"status": "ok", "worktrees": "nope"}'
     )
     with pytest.raises(ValueError, match="worktrees"):
+        decode_host_frame(bad)
+
+
+def test_inspect_worktree_frames_round_trip() -> None:
+    request = HostInspectWorktreeFrame(
+        request_id="req_wt_in_1",
+        worktree_path="/repo-worktrees/feature-safety",
+        branch="feature/safety",
+    )
+    result = HostInspectWorktreeResultFrame(
+        request_id="req_wt_in_1",
+        status="ok",
+        dirty_files=2,
+        unpushed_commits=1,
+        merged=False,
+        default_ref="origin/main",
+    )
+
+    decoded_request = decode_host_frame(encode_host_frame(request))
+    decoded_result = decode_host_frame(encode_host_frame(result))
+
+    assert decoded_request == request
+    assert decoded_result == result
+
+
+def test_inspect_worktree_result_rejects_boolean_count() -> None:
+    bad = (
+        '{"kind":"host.inspect_worktree_result","request_id":"r",'
+        '"status":"ok","dirty_files":true,"unpushed_commits":0}'
+    )
+    with pytest.raises(ValueError, match="dirty_files"):
         decode_host_frame(bad)
 
 

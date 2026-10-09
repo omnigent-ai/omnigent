@@ -9710,12 +9710,34 @@ async def _remove_session_worktree_best_effort(
     from omnigent.server.routes._host_worktree import (
         WorktreeHostUnavailableError,
         WorktreeProxyError,
+        inspect_worktree_on_host,
         list_worktrees_on_host,
         recorded_worktree_root,
         remove_worktree_on_host,
         worktree_root_fingerprint,
     )
     from omnigent.server.routes._workspace_validation import _is_subpath_of
+    from omnigent.stores.conversation_store import WORKTREE_KEPT_LABEL_KEY
+
+    async def _record_kept(value: dict[str, Any]) -> None:
+        if (
+            reason != "session-archive"
+            or conversation_store is None
+            or not exclude_conversation_id
+        ):
+            return
+        try:
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                exclude_conversation_id,
+                {WORKTREE_KEPT_LABEL_KEY: json.dumps(value)},
+            )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Failed to record worktree-kept reason for session %s",
+                exclude_conversation_id,
+                exc_info=True,
+            )
 
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
@@ -9729,6 +9751,7 @@ async def _remove_session_worktree_best_effort(
             _logger.warning(
                 "Workspace %s no longer matches its recorded cleanup root", worktree_path
             )
+            await _record_kept({"reason": "unknown"})
             return
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
@@ -9743,6 +9766,7 @@ async def _remove_session_worktree_best_effort(
                 worktree_path,
                 reason,
             )
+            await _record_kept({"reason": "in_use"})
             return
 
     if host_registry is None:
@@ -9751,6 +9775,7 @@ async def _remove_session_worktree_best_effort(
                 "host registry is not configured; cannot delete a worktree",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        await _record_kept({"reason": "host_offline"})
         return
     host_conn = host_registry.get(host_id)
     if host_conn is None:
@@ -9765,6 +9790,7 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             host_id,
         )
+        await _record_kept({"reason": "host_offline"})
         return
     try:
         if conversation_store is not None and exclude_conversation_id is not None:
@@ -9790,8 +9816,37 @@ async def _remove_session_worktree_best_effort(
                 _logger.warning(
                     "No matching linked worktree for %s; skipping cleanup", worktree_path
                 )
+                await _record_kept({"reason": "unknown"})
                 return
             worktree_path = max(roots, key=len)
+        if reason == "session-archive":
+            try:
+                inspection = await inspect_worktree_on_host(
+                    host_registry=host_registry,
+                    host_conn=host_conn,
+                    worktree_path=worktree_path,
+                    branch=branch,
+                )
+            except WorktreeHostUnavailableError:
+                await _record_kept({"reason": "host_offline"})
+                return
+            except WorktreeProxyError:
+                await _record_kept({"reason": "unknown"})
+                return
+            if not (
+                inspection.dirty_files == 0
+                and inspection.unpushed_commits == 0
+                and inspection.merged is True
+            ):
+                await _record_kept(
+                    {
+                        "dirty_files": inspection.dirty_files,
+                        "unpushed_commits": inspection.unpushed_commits,
+                        "merged": inspection.merged,
+                        "default_ref": inspection.default_ref,
+                    }
+                )
+                return
         await remove_worktree_on_host(
             host_registry=host_registry,
             host_conn=host_conn,
@@ -9799,6 +9854,8 @@ async def _remove_session_worktree_best_effort(
             branch=branch,
             delete_branch=delete_branch,
         )
+        if reason == "session-archive":
+            await _record_kept({})
     except WorktreeHostUnavailableError as exc:
         if fail_if_unavailable:
             raise OmnigentError(
@@ -9811,6 +9868,7 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             host_id,
         )
+        await _record_kept({"reason": "host_offline"})
     except WorktreeProxyError:
         _logger.warning(
             "Best-effort worktree removal (%s) failed for %s",
@@ -9818,6 +9876,7 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             exc_info=True,
         )
+        await _record_kept({"reason": "unknown"})
 
 
 def _resolve_subagent_spec(
@@ -10254,7 +10313,10 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if not labels:
         return
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
-    from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
+    from omnigent.stores.conversation_store import (
+        SIDE_CHAT_SOURCE_LABEL_KEY,
+        WORKTREE_KEPT_LABEL_KEY,
+    )
 
     if SIDE_CHAT_SOURCE_LABEL_KEY in labels:
         raise OmnigentError(
@@ -10266,6 +10328,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if WORKTREE_ROOT_LABEL_KEY in labels:
         raise OmnigentError(
             f"label {WORKTREE_ROOT_LABEL_KEY!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if WORKTREE_KEPT_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {WORKTREE_KEPT_LABEL_KEY!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     if _TURN_ACTOR_LABEL in labels:
