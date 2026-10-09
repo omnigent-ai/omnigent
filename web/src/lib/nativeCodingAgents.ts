@@ -70,7 +70,8 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes"
-  | "devin";
+  | "devin"
+  | "bob";
 export type NativeCodingAgentCapability =
   | "permissionMode"
   | "approvalMode"
@@ -272,6 +273,19 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "hermes",
     sortRank: 80,
   },
+  {
+    // IBM Bob Shell (`bob chat`). No licensed brand glyph, so `iconKind: "bob"`
+    // matches no icon branch and falls back to the generic bot icon. Sign-in,
+    // license, trust, model and approvals all live in Bob's own terminal, so no
+    // capability flags are declared.
+    key: "bob",
+    agentName: "bob-native-ui",
+    harness: "bob-native",
+    wrapperLabel: "bob-native-ui",
+    displayName: "IBM Bob",
+    iconKind: "bob",
+    sortRank: 85,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME = new Map<string, NativeCodingAgentSpec>(
@@ -308,6 +322,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-kimi": "kimi-native",
   "native-hermes": "hermes-native",
   "native-opencode": "opencode-native",
+  "native-bob": "bob-native",
 };
 
 // Vendors whose elicitation wire prefix differs from their registry `key`:

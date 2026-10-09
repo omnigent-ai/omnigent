@@ -1,6 +1,6 @@
 # Native harnesses
 
-Omnigent runs twelve vendor coding CLIs as native harnesses. A user can start
+Omnigent runs thirteen vendor coding CLIs as native harnesses. A user can start
 each one from the web new-session picker or from the command line with
 `omnigent <name>`, then chat with it in Omnigent while its own terminal runs
 alongside. The harnesses share one set of user journeys (launch, sign-in state,
@@ -85,6 +85,7 @@ columns name one journey test per harness; "—" means none exists yet.
 | Harness | CLI | Mock | Chat render test | Other journey test | Dev skill |
 |---|---|---|---|---|---|
 | `antigravity-native` | `omnigent antigravity` or `omnigent agy` | no | — | tests/e2e/test_antigravity_native_isolated_hooks_e2e.py::test_dispatched_agy_session_loads_user_hooks | [antigravity-native-e2e-dev](../.claude/skills/antigravity-native-e2e-dev/SKILL.md) |
+| `bob-native` | `omnigent bob` | no | — | tests/e2e/test_bob_native_cli_e2e.py::test_bob_native_cli_smoke | — |
 | `claude-native` | `omnigent claude` | yes | tests/e2e_ui/messages/test_native_claude_render_parity.py::test_native_claude_message_render_parity | tests/e2e/test_claude_native_cli_resume_e2e.py::test_claude_native_cli_resume_restores_history | — |
 | `codex-native` | `omnigent codex` | yes | tests/e2e_ui/messages/test_native_codex_render_parity.py::test_native_codex_message_render_parity | tests/e2e/test_codex_native_cli_resume_e2e.py::test_codex_native_cli_resume_restores_history | — |
 | `cursor-native` | `omnigent cursor` | no | tests/e2e_ui/messages/test_native_cursor_render_parity.py::test_native_cursor_message_render_parity | tests/e2e/test_cursor_native_cli_e2e.py::test_cursor_native_cli_smoke | — |
@@ -333,7 +334,7 @@ Cross-harness journeys:
 - A change to shared native-harness behavior (cleanup, idle handling,
   approvals, sign-in state, resume) must be checked on every harness it claims
   to cover. List the harnesses you actually drove; "all harnesses" means all
-  twelve rows above.
+  thirteen rows above.
 - Approval and permission callbacks come from several harnesses, not only
   Claude. Restricting a gate to one harness breaks the others' approvals.
 - Needing sign-in and not being installed are different states with different
@@ -352,3 +353,7 @@ Cross-harness journeys:
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
+- `bob-native` is terminal-only: Bob's reply appears in its terminal, not as
+  chat items, and Bob's own trust, license, sign-in, and tool-approval prompts
+  are answered in that terminal. Omnigent refuses to type into them, so a web
+  message sent while one is open fails with a "waiting on a prompt" error.

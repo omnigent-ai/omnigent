@@ -42,6 +42,9 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
     }
 )
 _SDK_MODEL_OVERRIDE_HARNESSES = frozenset(model_env_keys())
+# Native harnesses whose CLI has no launch-time model flag, so a persisted
+# override would be silently dropped (IBM Bob Shell 2.x picks its model in-app).
+_NATIVE_HARNESSES_WITHOUT_MODEL_OVERRIDE: frozenset[str] = frozenset({"bob-native"})
 
 
 def validate_model_override(value: str) -> str:
@@ -298,7 +301,7 @@ def harness_supports_model_override(harness: str | None) -> bool:
     """
     if harness is None:
         return False
-    return (
-        is_native_harness(harness)
-        or canonicalize_harness(harness) in _SDK_MODEL_OVERRIDE_HARNESSES
-    )
+    canonical = canonicalize_harness(harness)
+    if canonical in _NATIVE_HARNESSES_WITHOUT_MODEL_OVERRIDE:
+        return False
+    return is_native_harness(harness) or canonical in _SDK_MODEL_OVERRIDE_HARNESSES
