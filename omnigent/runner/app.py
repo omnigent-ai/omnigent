@@ -296,8 +296,43 @@ for _builder_name in (
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
 # Published statuses that mean a session's terminal is still working a turn.
-# ``waiting`` is parked on user input, so it keeps the runner alive too.
-_IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
+_IN_FLIGHT_SESSION_STATUSES = ("running",)
+# ``waiting`` is parked on user input. It holds the idle watchdog open like a
+# running turn, but only for a bounded time (see ``_resolve_human_wait_hold_s``).
+_HUMAN_WAIT_STATUS = "waiting"
+_HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
+# One day, matching the default ASK wait in ``pending_approvals``: a human gate
+# should outlive a user stepping away without pinning the runner forever.
+_DEFAULT_HUMAN_WAIT_HOLD_S = 24 * 60 * 60.0
+
+
+def _resolve_human_wait_hold_s() -> float:
+    """Resolve how long a session parked on a human holds the idle watchdog open.
+
+    Honors :envvar:`OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S` (``0`` keeps the hold
+    unbounded); otherwise one day. An unparseable or negative value logs a
+    warning and falls back to the default so an env typo cannot fail runner boot.
+
+    :returns: Hold in seconds, e.g. ``86400.0``; ``0.0`` means unbounded.
+    """
+    raw = os.environ.get(_HUMAN_WAIT_HOLD_ENV)
+    if not raw:
+        return _DEFAULT_HUMAN_WAIT_HOLD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if value < 0:
+        _logger.warning(
+            "%s=%r is not a non-negative number; using default %ss",
+            _HUMAN_WAIT_HOLD_ENV,
+            raw,
+            _DEFAULT_HUMAN_WAIT_HOLD_S,
+        )
+        return _DEFAULT_HUMAN_WAIT_HOLD_S
+    return value
+
+
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -1414,10 +1449,41 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    _human_wait_hold_s = _resolve_human_wait_hold_s()
+    # Monotonic time the idle watchdog first saw each session parked on a human.
+    _human_wait_since: dict[str, float] = {}
+
+    def _human_wait_holds(session_ids: set[str]) -> bool:
+        """Whether a session parked on a human still holds the idle watchdog open.
+
+        A native dialog nobody answers (a queued-message prompt waiter, or a
+        terminal reporting ``waiting``) is not agent work, so it holds the
+        runner for at most ``_human_wait_hold_s`` from when the watchdog first
+        sees it. ``0`` keeps the old unbounded hold.
+        """
+        waiting = {*_claude_prompt_waiters} | {
+            session_id for session_id in session_ids if _native_awaiting_human(session_id)
+        }
+        for session_id in _human_wait_since.keys() - waiting:
+            del _human_wait_since[session_id]
+        now = time.monotonic()
+        held = False
+        for session_id in waiting:
+            since = _human_wait_since.setdefault(session_id, now)
+            if _human_wait_hold_s <= 0 or now - since < _human_wait_hold_s:
+                held = True
+            else:
+                _logger.info(
+                    "session %s has waited on a human for %.0fs; no longer holding the "
+                    "runner open",
+                    session_id,
+                    now - since,
+                    extra={"session_id": session_id},
+                )
+        return held
+
     def _has_active_work() -> bool:
         if _active_turns:
-            return True
-        if _claude_prompt_waiters:
             return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
@@ -1432,7 +1498,9 @@ def create_runner_app(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
             return True
-        return any(_native_turn_in_flight(session_id) for session_id in session_ids)
+        if any(_native_turn_in_flight(session_id) for session_id in session_ids):
+            return True
+        return _human_wait_holds(session_ids)
 
     def _native_turn_in_flight(session_id: str) -> bool:
         """Whether a native terminal still reports this session's turn as in flight.
@@ -1442,6 +1510,12 @@ def create_runner_app(
         by ``_active_turns`` and need not publish a closing edge.
         """
         if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
+            return False
+        return is_native_harness(_session_harness_name(session_id))
+
+    def _native_awaiting_human(session_id: str) -> bool:
+        """Whether a native terminal reports this session parked on user input."""
+        if _native_pane_status.get(session_id) != _HUMAN_WAIT_STATUS:
             return False
         return is_native_harness(_session_harness_name(session_id))
 
