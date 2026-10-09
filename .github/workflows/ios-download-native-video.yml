@@ -1,0 +1,86 @@
+name: Temporary iOS download native video
+
+on:
+  push:
+    branches: [test/ios-download-native-video]
+
+jobs:
+  record:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select and boot iPhone Simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          DEVICE_ID="$(xcrun simctl list devices available -j | ruby -rjson -e '
+            devices = JSON.parse(STDIN.read).fetch("devices").values.flatten
+            phone = devices.find { |d| d["name"].start_with?("iPhone") && d["isAvailable"] }
+            abort "No available iPhone Simulator" unless phone
+            puts phone.fetch("udid")
+          ')"
+          echo "id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$DEVICE_ID" 2>/dev/null || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+
+      - name: Save fixed implementation
+        run: cp web/ios/Omnigent/OmnigentWebView.swift /tmp/OmnigentWebView.fixed.swift
+
+      - name: Record before fix
+        env:
+          DEVICE_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -euo pipefail
+          git show origin/main:web/ios/Omnigent/OmnigentWebView.swift > web/ios/Omnigent/OmnigentWebView.swift
+          xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/before.mp4 &
+          VIDEO_PID=$!
+          set +e
+          xcodebuild test \
+            -project web/ios/Omnigent.xcodeproj \
+            -scheme Omnigent \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
+            CODE_SIGNING_ALLOWED=NO
+          TEST_STATUS=$?
+          set -e
+          kill -INT "$VIDEO_PID"
+          wait "$VIDEO_PID" || true
+          test "$TEST_STATUS" -eq 0
+
+      - name: Record after fix
+        env:
+          DEVICE_ID: ${{ steps.simulator.outputs.id }}
+        run: |
+          set -euo pipefail
+          cp /tmp/OmnigentWebView.fixed.swift web/ios/Omnigent/OmnigentWebView.swift
+          xcrun simctl uninstall "$DEVICE_ID" ai.omnigent.ios 2>/dev/null || true
+          xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/after.mp4 &
+          VIDEO_PID=$!
+          set +e
+          xcodebuild test \
+            -project web/ios/Omnigent.xcodeproj \
+            -scheme Omnigent \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
+            CODE_SIGNING_ALLOWED=NO
+          TEST_STATUS=$?
+          set -e
+          kill -INT "$VIDEO_PID"
+          wait "$VIDEO_PID" || true
+          test "$TEST_STATUS" -eq 0
+
+      - name: Upload native recordings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-download-native-before-after
+          path: |
+            /tmp/before.mp4
+            /tmp/after.mp4
+          if-no-files-found: warn
