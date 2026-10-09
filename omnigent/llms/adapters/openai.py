@@ -74,18 +74,19 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param api_key_override: API key from ``connection_params``.
             ``None`` means no auth header is added.
         :param extra_headers: Caller-supplied headers from
-            ``connection_params["extra_headers"]``; string entries are
-            merged last and override built headers.
+            ``connection_params["extra_headers"]``, a ``dict[str, str]``
+            that only programmatic callers can pass (agent-spec YAML
+            connections are stringified); string entries are merged last
+            and override built headers.
         :returns: Headers dict with Authorization if an API key is
             provided.
         """
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key_override:
             headers["Authorization"] = f"Bearer {api_key_override}"
-        # Databricks-local divergence (see third_party/sync): merge caller-supplied
-        # headers threaded through connection_params. MAS routes CP serving-endpoint
-        # calls through the Barnacle forward proxy for CP→CP mTLS, which needs a
-        # `host` header + s2s auth headers rather than a bearer token.
+        # Databricks-local divergence (see third_party/sync): caller-supplied headers
+        # win so MAS can reach CP serving endpoints through the Barnacle proxy with a
+        # `host` header plus s2s auth headers instead of a bearer token.
         if isinstance(extra_headers, dict):
             headers.update(
                 {
@@ -146,7 +147,9 @@ class OpenAICompatibleAdapter(BaseAdapter):
         :param stream: Enable streaming.
         :param extra: Additional kwargs.
         :param connection_params: Per-call overrides. Supported keys:
-            ``"api_key"``, ``"base_url"``, ``"extra_headers"``.
+            ``"api_key"``, ``"base_url"``, and ``"extra_headers"`` (a
+            ``dict[str, str]`` for programmatic callers; see
+            :meth:`_build_headers`).
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
         :returns: Response dict or async iterator of chunk dicts.
@@ -492,7 +495,9 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             :class:`ResponseStreamEvent`. If ``False``, return a
             :class:`Response`.
         :param connection_params: Per-call overrides. Supported keys:
-            ``"api_key"``, ``"base_url"``, ``"extra_headers"``.
+            ``"api_key"``, ``"base_url"``, and ``"extra_headers"`` (a
+            ``dict[str, str]`` for programmatic callers; see
+            :meth:`_build_headers`).
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
         :param kwargs: Additional API kwargs (temperature, etc.).

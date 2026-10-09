@@ -1,13 +1,12 @@
-"""E2E: OpenAI Responses requests must carry connection-supplied auth headers.
+"""Connection ``extra_headers`` must reach the provider over real HTTP.
 
 A caller that authenticates an OpenAI-compatible endpoint solely through
 ``connection_params["extra_headers"]`` (the MAS Barnacle proxy route: a ``host``
 header plus s2s headers instead of a bearer ``api_key``) needs those headers on
-``/v1/responses`` as well as ``/v1/chat/completions``; otherwise the endpoint
-rejects the Responses request with 401 and the caller's turn fails.
+``/v1/responses`` as well as ``/v1/chat/completions``.
 
-Drives the real ``omnigent.llms`` client, routing, adapter, and SSE parsing over
-real HTTP against a loopback provider; needs no server, credentials, or network.
+Drives the real ``omnigent.llms`` client, routing, adapter, and SSE parsing
+against a loopback provider; needs no server, credentials, or network.
 """
 
 from __future__ import annotations
@@ -157,8 +156,10 @@ def _connection(provider: _FakeProvider) -> dict[str, object]:
 _INPUT = [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
 
 
-async def _assert_chat_completions_authenticates(provider: _FakeProvider) -> None:
-    """Control: the same connection authenticates on the chat path."""
+async def test_chat_completions_carries_extra_headers_auth(
+    provider: _FakeProvider,
+) -> None:
+    """The Chat Completions call site keeps forwarding the configured auth."""
     adapter = OpenAICompatibleAdapter()
     result = await adapter.chat_completions(
         [{"role": "user", "content": "hi"}],
@@ -176,9 +177,7 @@ async def _assert_chat_completions_authenticates(provider: _FakeProvider) -> Non
 async def test_responses_stream_carries_extra_headers_auth(
     provider: _FakeProvider,
 ) -> None:
-    """Streaming /v1/responses (the ticket's ``_stream_responses`` site)."""
-    await _assert_chat_completions_authenticates(provider)
-
+    """Streaming ``/v1/responses`` authenticates with connection headers alone."""
     client = Client()
     stream = await client.responses.create(
         model="openai/gpt-5",
@@ -187,9 +186,6 @@ async def test_responses_stream_carries_extra_headers_auth(
         connection_params=_connection(provider),  # type: ignore[arg-type]
     )
     assert not isinstance(stream, Response)
-    # Before the fix: iteration raises httpx.HTTPStatusError (401
-    # Unauthorized) because the request went out with no Authorization
-    # header, and omnigent logs "OpenAI Responses API 401: ...".
     events = [event async for event in stream]
 
     assert provider.auth_seen["/v1/responses"] == AUTH_HEADER, (
@@ -202,11 +198,8 @@ async def test_responses_stream_carries_extra_headers_auth(
 async def test_responses_non_streaming_carries_extra_headers_auth(
     provider: _FakeProvider,
 ) -> None:
-    """Non-streaming /v1/responses shares the same header-building defect."""
-    await _assert_chat_completions_authenticates(provider)
-
+    """Non-streaming ``/v1/responses`` authenticates with connection headers alone."""
     client = Client()
-    # Before the fix: raises httpx.HTTPStatusError (401 Unauthorized).
     response = await client.responses.create(
         model="openai/gpt-5",
         input=_INPUT,
