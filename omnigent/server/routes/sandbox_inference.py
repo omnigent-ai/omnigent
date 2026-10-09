@@ -15,6 +15,7 @@ from omnigent.inference_config import (
     normalize_inference_harness,
     parse_inference_config,
     resolve_bound_provider,
+    validate_bound_agent_model,
 )
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -123,6 +124,7 @@ async def prepare_create_inference(
     if not configured_snapshot(snapshot):
         return snapshot, model_override
     assert snapshot is not None
+    validate_bound_agent_model(snapshot["runtime_config"], harness, spec.executor.model)
     resolve_bound_provider(snapshot["runtime_config"], harness, spec.executor.auth)
     if spec.executor.profile:
         raise OmnigentError(
