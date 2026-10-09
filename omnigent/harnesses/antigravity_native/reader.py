@@ -947,14 +947,10 @@ async def _discover(
     that confirms ownership of that cascade. Discovery work (file read + blocking
     httpx TLS probes) runs in a worker thread so the event loop stays responsive.
 
-    While bridge state still holds the ``agy_conv_*`` placeholder — a cold-start
-    that missed its deadline, with nothing else ever writing the real id — the
-    loop additionally runs the placeholder-recovery scan
-    (:func:`_recover_placeholder_cascade`, throttled to
-    :data:`_PLACEHOLDER_RECOVERY_INTERVAL_S`) so the TUI-minted cascade a typed
-    turn creates is adopted in place instead of deadlocking discovery forever.
-    ``on_adopted`` is awaited as soon as that adoption is persisted, before the
-    port resolves, so the (best-effort) resume-id record is attempted at once.
+    While the placeholder persists, the loop retries the recovery scan
+    (:func:`_recover_placeholder_cascade`) every
+    :data:`_PLACEHOLDER_RECOVERY_INTERVAL_S` and awaits ``on_adopted`` as soon as
+    an adoption is persisted, before the port resolves.
 
     Readiness is checked BEFORE ``stop`` each round, so a discovery that resolves
     immediately consumes none of the caller's poll budget — ``stop`` is a
