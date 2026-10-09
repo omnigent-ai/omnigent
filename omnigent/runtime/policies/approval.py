@@ -147,7 +147,10 @@ async def _await_elicitation(
 
     if _is_explicit_decline(raw_verdict):
         raise ElicitationDeclinedError(
-            result.reason or "",
+            # The resolver's rationale wins over the policy's reason:
+            # on a refusal the harness must hear WHY the human said no,
+            # not the question restated as the answer (#7315).
+            _verdict_reason(raw_verdict) or result.reason or "",
             policy_name=result.deciding_policy,
         )
 
@@ -317,6 +320,32 @@ def _is_explicit_decline(raw: str | None) -> bool:
     if not isinstance(parsed, dict):
         return False
     return parsed.get("action") == "decline"
+
+
+def _verdict_reason(raw: str | None) -> str | None:
+    """Extract the resolver-supplied ``reason`` from a raw verdict.
+
+    The rationale a resolver writes when refusing (``decline`` /
+    ``cancel``) rides in the verdict's ``reason`` field — distinct
+    from the MCP-mirrored ``content``, which stays accept-only
+    (#7315). Fail-closed like its siblings: anything that is not a
+    non-empty string yields ``None`` so the caller falls back to the
+    policy's reason.
+
+    :param raw: Raw verdict JSON string, or ``None``.
+    :returns: The ``reason`` string, or ``None`` when absent,
+        empty, wrongly typed, or unparseable.
+    """
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    reason = parsed.get("reason")
+    return reason if isinstance(reason, str) and reason else None
 
 
 def _parse_verdict(raw: str | None) -> bool:
