@@ -31,7 +31,8 @@ command. Omit the after-clip **only**
 for a genuine, named environmental blocker (recorder tooling missing, fixture
 won't come online after the SPA build, `api`-surface facet with nothing to film) —
 and when you omit it, **say which blocker, with the evidence**, in both the PR's
-Demo section and the handoff (a `recordings` prose note, or `maintainer_review`).
+Demo section and the handoff's `recording_unavailable_reason` (never only in
+`maintainer_review` or prose).
 A missing upstream before-clip is never that blocker. Never report an after-clip
 you didn't actually produce, and never drop it silently.
 

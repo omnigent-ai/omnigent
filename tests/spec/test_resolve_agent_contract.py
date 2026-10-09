@@ -354,3 +354,7 @@ def test_handoff_spells_out_footage_or_a_reason_on_every_handoff() -> None:
     fields = output.split("Field meanings:", 1)[1]
     assert "Paths are workspace-relative under `recordings/<slug>/`; never omit this key" in fields
     assert "always include this key; it is non-empty whenever `recordings` is `[]`" in fields
+
+    gate = _normalized_resolve_instructions().split("### 4.5", 1)[1].split("## Output", 1)[0]
+    assert "the handoff's `recording_unavailable_reason`" in gate
+    assert "a `recordings` prose note" not in gate
