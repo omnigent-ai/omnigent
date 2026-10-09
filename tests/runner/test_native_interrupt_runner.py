@@ -163,9 +163,7 @@ async def test_opencode_interrupt_is_handled_not_dropped() -> None:
 class _FakeOpenCodeClient:
     """Records ``abort`` / ``aclose`` for the opencode interrupt handler."""
 
-    def __init__(
-        self, *, abort_result: bool = True, abort_error: Exception | None = None
-    ) -> None:
+    def __init__(self, *, abort_result: bool = True, abort_error: Exception | None = None) -> None:
         self.abort_calls: list[str] = []
         self.closed = False
         self._abort_result = abort_result

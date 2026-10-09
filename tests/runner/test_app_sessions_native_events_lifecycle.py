@@ -2559,9 +2559,7 @@ async def test_events_interrupt_on_opencode_native_aborts_the_native_turn(
         captured.update(base_url=base_url, auth_secret=auth_secret, directory=directory)
         return _FakeOpenCodeClient()
 
-    monkeypatch.setattr(
-        opencode_native_app_server, "client_for_state", _fake_client_for_state
-    )
+    monkeypatch.setattr(opencode_native_app_server, "client_for_state", _fake_client_for_state)
 
     app, _ = await _build_app_for_spec(_harness_spec("opencode-native"))
     async with _runner_client(app) as client:
@@ -2578,8 +2576,7 @@ async def test_events_interrupt_on_opencode_native_aborts_the_native_turn(
         )
 
     assert int_resp.status_code == 204, (
-        f"opencode-native interrupt must return 204; got "
-        f"{int_resp.status_code}: {int_resp.text}"
+        f"opencode-native interrupt must return 204; got {int_resp.status_code}: {int_resp.text}"
     )
     # The native abort ran against OpenCode's own session id, routed by the
     # persisted server URL/auth. An empty list means the handler regressed to

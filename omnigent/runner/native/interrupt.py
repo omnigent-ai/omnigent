@@ -898,9 +898,7 @@ class NativeInterruptRunner:
         if not aborted:
             # The server reports no active work, so the turn already ended and
             # its own terminal edge owns the idle transition; nothing to wake.
-            self._logger.info(
-                "OpenCode-native interrupt found no active turn for %s.", conv_id
-            )
+            self._logger.info("OpenCode-native interrupt found no active turn for %s.", conv_id)
             return Response(status_code=204)
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
