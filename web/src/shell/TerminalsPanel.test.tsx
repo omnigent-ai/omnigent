@@ -72,6 +72,7 @@ function mockTerminalList(terminals: TerminalInfo[]) {
 }
 
 function renderPanel({
+  open = true,
   initialTerminalKey = null,
   readOnly = false,
   terminals = [
@@ -79,6 +80,7 @@ function renderPanel({
     makeTerminal("terminal_worker", "worker", "s2"),
   ],
 }: {
+  open?: boolean;
   initialTerminalKey?: string | null;
   readOnly?: boolean;
   terminals?: TerminalInfo[];
@@ -86,7 +88,7 @@ function renderPanel({
   mockTerminalList(terminals);
   return render(
     <TerminalsPanel
-      open
+      open={open}
       conversationId="conv_terminal"
       initialTerminalKey={initialTerminalKey}
       readOnly={readOnly}
@@ -107,6 +109,25 @@ afterEach(() => {
 });
 
 describe("TerminalsPanel navigation", () => {
+  it("only casts a shadow while visible", () => {
+    const { rerender } = renderPanel({ open: false });
+    const panel = screen.getByTestId("terminals-panel");
+    expect(panel).toHaveClass("shadow-none");
+    expect(panel).not.toHaveClass("shadow-lg");
+
+    rerender(
+      <TerminalsPanel
+        open
+        conversationId="conv_terminal"
+        initialTerminalKey={null}
+        readOnly={false}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(panel).toHaveClass("shadow-lg");
+    expect(panel).not.toHaveClass("shadow-none");
+  });
+
   it("opens to the list view with all terminals visible and no terminal mounted", () => {
     renderPanel();
 

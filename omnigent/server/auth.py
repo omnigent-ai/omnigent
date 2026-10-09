@@ -547,6 +547,19 @@ class UnifiedAuthProvider(AuthProvider):
             return "/login"
         return None
 
+    @property
+    def session_cookie_name(self) -> str | None:
+        """The session cookie this server sets, or ``None`` without one.
+
+        ``__Host-ap_session`` on HTTPS and ``ap_session`` on plain HTTP,
+        for the ``oidc`` and ``accounts`` sources; header mode has none.
+        """
+        if self._source == "oidc" and self._oidc_config is not None:
+            return self._oidc_config.session_cookie_name
+        if self._source == "accounts" and self._accounts_config is not None:
+            return self._accounts_config.session_cookie_name
+        return None
+
     def get_user_id(self, request: HTTPConnection) -> str | None:
         """Extract user identity from the active source.
 
@@ -757,6 +770,34 @@ class UnifiedAuthProvider(AuthProvider):
         if self._local_single_user:
             return RESERVED_USER_LOCAL
         return None
+
+
+def authentication_requires_identity(provider: AuthProvider | None) -> bool:
+    """Whether missing credentials are denied rather than mapped to the local user."""
+    return provider is not None and not (
+        isinstance(provider, UnifiedAuthProvider)
+        and provider._source == "header"
+        and provider._local_single_user
+    )
+
+
+def auth_mode(provider: AuthProvider | None) -> str:
+    """Name the sign-in mode a client should expect from an app's provider.
+
+    :param provider: The app's auth provider, or ``None`` when auth is off.
+    :returns: ``"oidc"``, ``"accounts"``, or ``"header"`` for the built-in
+        sources, ``"custom"`` for an embedding application's own provider,
+        and ``"none"`` when there is no provider.
+    """
+    if provider is None:
+        return "none"
+    if isinstance(provider, UnifiedAuthProvider) and provider._source in (
+        "oidc",
+        "accounts",
+        "header",
+    ):
+        return provider._source
+    return "custom"
 
 
 class AccountAuthorityMiddleware:

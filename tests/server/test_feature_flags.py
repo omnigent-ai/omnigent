@@ -15,24 +15,35 @@ from omnigent.server.feature_flags import (
 )
 
 
-def test_features_default_off() -> None:
-    flags = resolve_feature_flags({})
+@pytest.mark.parametrize("environ", [{}, {FEATURES_ENV_VAR: ""}])
+def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
+    flags = resolve_feature_flags(environ)
 
-    assert flags.enabled_features == frozenset()
+    assert flags.enabled_features == frozenset({Feature.HARNESS_SETTINGS_UI})
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
-        "harness_settings_ui": False,
+        "arca_shutdown_warnings": False,
+        "harness_settings_ui": True,
+        "custom_agents_settings_ui": False,
     }
 
 
-def test_resolves_comma_separated_enabled_set() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: " usage_page, harness_install,usage_page "})
+@pytest.mark.parametrize(
+    "raw",
+    [
+        " usage_page, harness_install,usage_page ",
+        "usage_page,harness_install,harness_settings_ui",
+    ],
+)
+def test_resolves_comma_separated_enabled_set(raw: str) -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: raw})
 
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
-    assert flags.enabled_names() == ("harness_install", "usage_page")
+    assert flags.frontend_dict()["harness_settings_ui"] is True
+    assert flags.enabled_names() == ("harness_install", "harness_settings_ui", "usage_page")
 
 
 def test_empty_entries_are_ignored() -> None:
@@ -55,7 +66,14 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
 
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
-    assert flags.enabled_names() == ("canvas",)
+    assert flags.enabled_names() == ("canvas", "harness_settings_ui")
+
+
+def test_arca_shutdown_warnings_are_frontend_visible() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "arca_shutdown_warnings"})
+
+    assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
+    assert flags.frontend_dict()["arca_shutdown_warnings"] is True
 
 
 def test_unknown_feature_fails_with_known_names() -> None:
@@ -79,9 +97,11 @@ def test_snapshot_is_immutable_and_does_not_follow_environment_mutation() -> Non
         flags.enabled_features = frozenset()  # type: ignore[misc]
 
 
-def test_release_flags_have_lifecycle_metadata_and_default_off() -> None:
+def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
     assert {definition.feature for definition in FEATURE_DEFINITIONS} == set(Feature)
     for definition in FEATURE_DEFINITIONS:
         assert definition.owner
         assert definition.review_by_release
-        assert not FeatureFlags().enabled(definition.feature)
+        assert FeatureFlags().enabled(definition.feature) == (
+            definition.feature is Feature.HARNESS_SETTINGS_UI
+        )

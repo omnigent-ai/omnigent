@@ -504,8 +504,10 @@ Fields:
     here — the client re-hydrates the optimistic "queued message"
     bubble so it survives navigation / an SSE rebind. Drained when the
     message round-trips back (the matching `session.input.consumed`
-    carries `cleared_pending_id`). Empty for non-native sessions, which
-    already carry the message in `items`.
+    carries `cleared_pending_id`). Messages still queued when an
+    `interrupt` cancelled the turn are left out, so a reload does not
+    redraw a bubble the person stopped. Empty for non-native sessions,
+    which already carry the message in `items`.
 
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
@@ -694,7 +696,7 @@ When liveness is wired, each list item includes two orthogonal signals
 ### Get Session (Snapshot)
 
 ```
-GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&refresh_state=false]
+GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&include_live_status=true&refresh_state=false]
 
 200 OK — body matches the `SessionResponse` shape above.
 404 Not Found — no session with that id
@@ -726,6 +728,12 @@ Contract" below.
     spend. Runner metadata reads use this option. The web chat also opts
     out and loads display usage separately, so a slow usage store does not
     block opening the session. Budget enforcement is unchanged.
+
+  include_live_status (query param, boolean, default `true`)
+    When `false`, skip the live-status probe of the session's bound runner
+    on a status-cache miss and report `status` from the cached or persisted
+    value. Runner metadata reads use this option: the probe would target the
+    very runner waiting on the response.
 
   refresh_state (query param, boolean, default `false`)
     When `true`, runner-derived snapshot overlays (for example skills
@@ -1086,10 +1094,16 @@ user-triggered cancel the server emits BOTH `response.incomplete`
 `session.interrupted` (from the route). Co-emitting the
 Responses-style event lets off-the-shelf parsers close cleanly while
 the session-scoped event carries the cancel intent for session-aware
-clients. The internal terminal-observed envelopes also bypass the
-queue: `external_conversation_item` appends/broadcasts an
-already-observed item and returns its stored `item_id`, while
-`external_output_text_delta` publishes a transient
+clients. On native-terminal sessions an `interrupt` the runner accepted
+also settles the web messages still queued at that moment: they leave
+`pending_inputs`, and a later transcript mirror that jumps over one
+drains it without persisting a `native_prompt_not_recorded` error (an
+exact mirror of it still drains it normally, since the agent did record
+it). A message sent after the Stop, or an interrupt the runner did not
+accept, leaves the queue as it was. The internal terminal-observed
+envelopes also bypass the queue: `external_conversation_item`
+appends/broadcasts an already-observed item and returns its stored
+`item_id`, while `external_output_text_delta` publishes a transient
 `response.output_text.delta` event without persisting. Its `data` is
 `{delta: string, message_id?: string, index?: integer, final?: boolean}`:
 `delta` is required; the optional `message_id` / `index` / `final` are
@@ -1362,6 +1376,14 @@ across turns, transient races during reconnect are bounded to the
 in-flight HTTP roundtrip rather than the full turn duration. Clients
 should rely on `session.input.consumed` events and item-id dedupe
 against the snapshot to reconcile accepted inputs.
+
+Native shell-mode inputs (`!cmd`) settle when the matching `terminal_command`
+input is persisted. Its output does not acknowledge an input, and no
+`session.input.consumed` event is emitted for the shell command. Clients should
+remove only the sent bubble matching that command. During a mixed-version
+rollout, an older client can retain that bubble until refreshing its snapshot;
+an older server can still report the command as `native_prompt_not_recorded`.
+Updated clients preserve later bubbles when that older server's receipt arrives.
 
 ### Sessions Typical Flow
 
