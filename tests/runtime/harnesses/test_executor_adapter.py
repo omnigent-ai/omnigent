@@ -13,6 +13,7 @@ elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
@@ -2844,3 +2845,101 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+class _InterruptRecordingExecutor(Executor):
+    """Minimal executor that records ``interrupt_session`` and can stall in it."""
+
+    def __init__(self, *, stopped: bool = True, delay: float = 0.0) -> None:
+        """
+        Record interrupt calls, optionally stalling to model a slow teardown.
+
+        :param stopped: What ``interrupt_session`` reports back.
+        :param delay: Seconds to stall inside ``interrupt_session``.
+        """
+        self.interrupted: list[str] = []
+        self._stopped = stopped
+        self._delay = delay
+
+    async def run_turn(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        """Never driven by these tests."""
+        raise NotImplementedError
+        yield
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        """Record the interrupt and report the configured outcome."""
+        self.interrupted.append(session_key)
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        return self._stopped
+
+
+async def test_interrupt_without_a_runner_turn_still_stops_the_inner_session() -> None:
+    """Pause must reach the vendor when the agent outlived the harness turn.
+
+    The base handler 404s with nothing in ``_in_flight``, which is exactly the
+    state a native agent is in when it keeps generating after ``run_turn``
+    unwound. Letting that 404 escape skipped ``interrupt_session`` entirely, so
+    Pause was a silent no-op that the runner still answered 204 — the vendor
+    never heard about it.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor = _InterruptRecordingExecutor()
+    adapter = ExecutorAdapter(lambda: executor, session_key="conv_no_turn")
+    adapter._executor = executor
+
+    response = await adapter._handle_interrupt_event()
+
+    assert response.status_code == 204, (
+        f"an interrupt that reached the inner session must succeed; got {response.status_code}"
+    )
+    assert executor.interrupted == ["conv_no_turn"], (
+        f"interrupt_session must be called even with no in-flight turn; "
+        f"got {executor.interrupted!r}"
+    )
+
+
+async def test_interrupt_with_neither_turn_nor_executor_still_404s() -> None:
+    """With nothing to stop, the base handler's fail-loud 404 must survive."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(lambda: _InterruptRecordingExecutor(), session_key="conv_empty")
+
+    with pytest.raises(OmnigentError) as excinfo:
+        await adapter._handle_interrupt_event()
+
+    assert excinfo.value.code is ErrorCode.NOT_FOUND, (
+        f"a stray interrupt with no session to stop must 404; got {excinfo.value.code!r}"
+    )
+
+
+async def test_interrupt_response_outlasts_no_slow_inner_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow reap must not hold the Pause response past the runner's POST budget.
+
+    The runner bounds its interrupt POST at 3.0s. ``interrupt_session`` confirms
+    the stop and then reaps the inner process, which can take seconds; blocking
+    on all of it turned every slow teardown into a POST timeout and a spurious
+    "Interrupt forward to harness failed". The teardown is finished in the
+    background instead of being cancelled mid-terminate.
+    """
+    from omnigent.runtime.harnesses import _executor_adapter
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    monkeypatch.setattr(_executor_adapter, "_INTERRUPT_EVENT_SLICE_S", 0.05)
+    executor = _InterruptRecordingExecutor(delay=0.5)
+    adapter = ExecutorAdapter(lambda: executor, session_key="conv_slow")
+    adapter._executor = executor
+
+    started = asyncio.get_running_loop().time()
+    response = await adapter._handle_interrupt_event()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert response.status_code == 204, response.status_code
+    assert elapsed < 0.4, f"interrupt response waited {elapsed:.2f}s on the inner teardown"
+    assert adapter._bg_tasks, "the unfinished teardown must stay tracked, not be cancelled"
+    await asyncio.gather(*adapter._bg_tasks)
+    assert executor.interrupted == ["conv_slow"]

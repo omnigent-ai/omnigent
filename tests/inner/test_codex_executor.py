@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.errors import HarnessTransportClosedError
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
@@ -73,6 +74,11 @@ class _FakeAppSession:
     scripted_turns: list[list[object]]
     closed: bool = False
     interrupted: bool = False
+    # Mirrors the real session's post-turn state: no turn in flight unless a
+    # test sets one, plus whether it confirms that turn stopped on interrupt.
+    active_turn_id: str | None = None
+    confirms_stop: bool = True
+    awaited_stop_for: str | None = None
     calls: list[dict] = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -86,9 +92,17 @@ class _FakeAppSession:
     async def close(self):
         self.closed = True
 
+    def live_turn_id(self):
+        return self.active_turn_id
+
     async def interrupt_turn(self):
         self.interrupted = True
         return True
+
+    async def await_turn_stopped(self, turn_id, *, timeout):
+        del timeout
+        self.awaited_stop_for = turn_id
+        return self.confirms_stop
 
 
 class _FakePipe:
@@ -1341,6 +1355,216 @@ class TestCodexExecutor(unittest.TestCase):
             # fresh thread and replays full history (marker included).
             self.assertTrue(fake_session.closed)
             self.assertEqual(executor._session_states, {})
+
+        _run(_t())
+
+    def test_interrupt_session_waits_for_a_confirmed_stop(self):
+        """Pause must prove Codex stopped, not just that it heard the ask.
+
+        ``turn/interrupt`` returning only means the app server received the
+        request; the turn can still be generating. The interrupt therefore waits
+        for the turn to be observed stopping before it drops the session.
+        """
+
+        async def _t():
+            fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=lambda **kwargs: fake_session,
+            )
+
+            _ = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+            fake_session.active_turn_id = "turn-1"
+
+            self.assertTrue(await executor.interrupt_session("s1"))
+            self.assertEqual(fake_session.awaited_stop_for, "turn-1")
+            self.assertTrue(fake_session.closed)
+
+        _run(_t())
+
+    def test_interrupt_session_reports_an_unconfirmed_stop(self):
+        """An unconfirmed stop returns False so callers can say Pause may not have landed.
+
+        The session is still dropped — that is the floor — but the caller is not
+        told the turn stopped when nothing confirmed it.
+        """
+
+        async def _t():
+            fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=lambda **kwargs: fake_session,
+            )
+
+            _ = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+            fake_session.active_turn_id = "turn-1"
+            fake_session.confirms_stop = False
+
+            self.assertFalse(await executor.interrupt_session("s1"))
+            self.assertTrue(fake_session.interrupted)
+            self.assertTrue(fake_session.closed)
+            self.assertEqual(executor._session_states, {})
+
+        _run(_t())
+
+    def test_app_server_live_turn_id_survives_the_generator_teardown(self):
+        """The interrupt must target the turn the app server still has open.
+
+        ``run_turn``'s ``finally`` clears ``active_turn_id`` the moment the
+        generator unwinds, which is *before* Codex stops generating when Pause
+        tore the runner turn down first. Reading only that attribute left
+        ``interrupt_turn`` with nothing to address, so no ``turn/interrupt`` was
+        ever sent while the app server kept working.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._started = True
+            session.thread_id = "thread-1"
+            session._note_native_activity(
+                {"method": "turn/started", "params": {"turn": {"id": "turn-1"}}}
+            )
+            session.active_turn_id = "turn-1"
+
+            self.assertEqual(session.live_turn_id(), "turn-1")
+
+            # The generator unwinds; the app server has not been told anything.
+            session.active_turn_id = None
+            self.assertEqual(
+                session.live_turn_id(),
+                "turn-1",
+                "a turn the reader saw start and never saw end is still live",
+            )
+            self.assertFalse(
+                session.turn_stopped("turn-1"),
+                "clearing active_turn_id must not confirm a stop by itself",
+            )
+
+            sent = []
+
+            async def _capture(method, params):
+                sent.append((method, params))
+                return {}
+
+            session._request = _capture  # type: ignore[assignment]
+            self.assertTrue(await session.interrupt_turn())
+            self.assertEqual(
+                sent,
+                [("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"})],
+                f"interrupt must address the still-open turn; sent {sent!r}",
+            )
+
+            session._note_native_activity(
+                {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+            )
+            self.assertIsNone(
+                session.live_turn_id(), "a turn the reader saw end is no longer live"
+            )
+            self.assertTrue(session.turn_stopped("turn-1"))
+
+        _run(_t())
+
+    def test_app_server_turn_stopped_reads_the_reader_markers(self):
+        """The stop signal comes off the reader task, not the turn generator.
+
+        Pause can arrive when nothing is consuming ``run_turn`` (the runner
+        already tore its turn down), so a confirmation that depended on the
+        generator advancing would never arrive.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._started = True
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+
+            self.assertFalse(session.turn_stopped("turn-1"))
+
+            # A retrying failure keeps the turn alive, so it is not a stop.
+            session._note_native_activity(
+                {
+                    "method": "turn/failed",
+                    "params": {"willRetry": True, "turn": {"id": "turn-1"}},
+                }
+            )
+            self.assertFalse(session.turn_stopped("turn-1"))
+
+            session._note_native_activity(
+                {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+            )
+            self.assertTrue(session.turn_stopped("turn-1"))
+            self.assertTrue(await session.await_turn_stopped("turn-1", timeout=0.1))
+
+        _run(_t())
+
+    def test_app_server_turn_stopped_on_terminal_failure_and_dead_transport(self):
+        """A terminally failed turn and a dead transport both count as stopped."""
+
+        async def _t():
+            failed = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            failed._started = True
+            failed.active_turn_id = "turn-1"
+            failed._note_native_activity(
+                {"method": "turn/failed", "params": {"turn": {"id": "turn-1"}}}
+            )
+            self.assertTrue(failed.turn_stopped("turn-1"))
+
+            gone = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            gone._started = True
+            gone.active_turn_id = "turn-1"
+            gone._transport_error = HarnessTransportClosedError("gone", replay_safe=False)
+            self.assertTrue(gone.turn_stopped("turn-1"))
+
+        _run(_t())
+
+    def test_app_server_await_turn_stopped_times_out_unconfirmed(self):
+        """A turn that is never observed stopping reports False rather than assuming."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._started = True
+            session.active_turn_id = "turn-1"
+
+            self.assertFalse(await session.await_turn_stopped("turn-1", timeout=0.05))
 
         _run(_t())
 

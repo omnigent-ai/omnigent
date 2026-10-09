@@ -41,6 +41,7 @@ from omnigent.harness_capabilities import (
     InstructionDelivery,
     IntegrationMode,
     ModelFamily,
+    PauseResume,
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
@@ -341,6 +342,7 @@ _MF = ModelFamily
 _AU = AuthModel
 _FH = ForkHistory
 _ID = InstructionDelivery
+_PR = PauseResume
 
 # Bench shell-tool provocation prompts (moved off the bench's hardcoded
 # _NATIVE_TOOL_PROVOCATION table): the generic variant, and a Bash-specific one
@@ -365,6 +367,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
@@ -380,6 +383,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.REBUILD,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
@@ -401,6 +405,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
@@ -417,6 +422,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.PREAMBLE,
         # No shell-tool provocation: cursor-native was intentionally absent from
         # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
@@ -435,6 +441,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.NONE,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
@@ -450,6 +457,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.NONE,
         shell_tool_name="run_command",
         shell_tool_prompt=_SHELL_PROMPT,
@@ -465,6 +473,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.NONE,
         shell_tool_name="developer__shell",
         shell_tool_prompt=_SHELL_PROMPT,
@@ -481,6 +490,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=False,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.REBUILD,
         shell_tool_name="run_shell_command",
         shell_tool_prompt=_SHELL_PROMPT,
@@ -496,6 +506,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.NONE,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
@@ -511,6 +522,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.PREAMBLE,
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
@@ -547,6 +559,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=False,
+        resume_after_pause=_PR.SAME_THREAD,
         steering=True,
         live_queue=True,
         images=True,
@@ -573,6 +586,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         fork_history=_FH.REBUILD,
         shell_tool_name="terminal",
         shell_tool_prompt=_SHELL_PROMPT,
@@ -626,6 +640,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "cursor": _C(
@@ -665,6 +680,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "goose": _C(
@@ -677,6 +693,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "qwen": _C(
@@ -689,6 +706,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "kimi": _C(
@@ -742,6 +760,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
 }
