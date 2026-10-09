@@ -217,6 +217,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _recent_mirrored_tool_calls,
     _RelayHandle,
+    _RelayLiveness,
     _RelayStatusSnapshot,
     _runner_relay_tasks,
     _runner_status_probe_backoff,
@@ -7663,6 +7664,17 @@ class _RelayTransportLost(Exception):
         self.intentional = intentional
         self.stream_ready = stream_ready
 
+    @property
+    def tunnel_gone(self) -> bool:
+        """Whether the runner's tunnel went away, not its endpoint answering badly.
+
+        The tunnel transport reports a closed, retired or replaced tunnel as a
+        ``ConnectionError`` and an absent runner as ``httpx.ConnectError``. An
+        HTTP status, a stream fault or a body that just ended came over a live
+        tunnel, so no disconnect timer will settle that session.
+        """
+        return isinstance(self.__cause__, ConnectionError | httpx.ConnectError)
+
 
 def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
@@ -7813,10 +7825,10 @@ async def _runner_disconnect_requires_failure(
     return decision in ("failed_mid_turn", "failed_before_start")
 
 
-async def _relay_runner_live_elsewhere(
+async def _relay_runner_liveness(
     session_id: str,
     conversation_store: ConversationStore,
-) -> bool:
+) -> _RelayLiveness:
     """
     Check this relay's bound runner using shared runner metadata.
 
@@ -7825,33 +7837,74 @@ async def _relay_runner_live_elsewhere(
     relay's runner binding, falling back to the metadata binding when called
     without a registered relay.
 
+    The row's stamp counts as another replica's only when it is newer than
+    this replica's own last stamp for the runner, sampled at the check.
+
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read runner metadata.
-    :returns: ``True`` when the bound runner is confirmed live on
-        another replica; ``False`` when unbound, unreadable, or not.
+    :returns: What the check saw. ``live_elsewhere`` is ``True`` only when the
+        bound runner is confirmed live on another replica, never when it is
+        unbound, unreadable, or stale.
     """
     try:
         liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
-    except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
+    except Exception:  # noqa: BLE001 — the caller decides without this evidence
         _logger.warning(
             "Relay: runner liveness lookup failed for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return False
+        return _RelayLiveness(lookup="error")
     if liveness is None:
-        return False
+        return _RelayLiveness(lookup="missing")
     bound_runner_id, runner_last_seen = liveness
     handle = _runner_relay_tasks.get(session_id)
     runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
-        return False
+        return _RelayLiveness(
+            lookup="unbound", bound_runner_id=bound_runner_id, runner_last_seen=runner_last_seen
+        )
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
-        stamp=runner_last_seen,
+    return _RelayLiveness(
+        lookup="found",
+        live_elsewhere=bound_runner_id == runner_id
+        and _runner_stamp_is_live_elsewhere(
+            stamp=runner_last_seen,
+            reference_stamp=reference_stamp,
+        ),
+        bound_runner_id=bound_runner_id,
+        runner_last_seen=runner_last_seen,
         reference_stamp=reference_stamp,
     )
+
+
+async def _relay_runner_live_elsewhere(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> bool:
+    """
+    Check whether this relay's bound runner is confirmed live on another replica.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store used to read runner metadata.
+    :returns: ``True`` only on fresh evidence from another replica; ``False``
+        when unbound, unreadable, or not. See :func:`_relay_runner_liveness`.
+    """
+    return (await _relay_runner_liveness(session_id, conversation_store)).live_elsewhere
+
+
+async def _runner_tunnel_registered(runner_client: httpx.AsyncClient) -> bool:
+    """
+    Return whether the runner's tunnel is registered on this replica right now.
+
+    A client without a tunnel transport (in-process tests) has no registry to
+    ask, so it reports no tunnel.
+
+    :param runner_client: HTTP client pointed at the runner.
+    """
+    wait = getattr(getattr(runner_client, "_transport", None), "wait_for_runner", None)
+    return wait is not None and bool(await wait(0.0))
 
 
 async def _relay_runner_stream(
@@ -7880,6 +7933,15 @@ async def _relay_runner_stream(
     other sessions. An idle session had no work to interrupt, so it stays
     idle and the disconnect surfaces through liveness instead.
 
+    A relay that never received the runner's ready heartbeat because the
+    tunnel went away (retired before the stream came up, as when a rollout
+    moves the runner between replicas) saw none of the turn, so it fails
+    nothing (``never_attached``). The replica's per-runner disconnect timer,
+    which sees the runner itself, fails the mid-turn session if the runner is
+    gone. If a live tunnel's stream endpoint answered with an error, or a
+    tunnel is registered again, no timer is coming and the relay decides from
+    the session status.
+
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param runner_client: HTTP client pointed at the runner.
@@ -7896,6 +7958,7 @@ async def _relay_runner_stream(
     outage_runner_id: str | None = None
     outage_turn_id: str | None = None
     retries = 0
+    ever_ready = False
 
     def _on_stream_ready() -> None:
         """Record one ready-confirmed recovery for the active outage."""
@@ -7945,6 +8008,7 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
+            ever_ready = ever_ready or lost.stream_ready
             # A ready heartbeat confirms recovery, even on a brief connection.
             # Its next disconnect starts a new outage with a full grace window.
             if deadline is None or lost.stream_ready or now - started > RUNNER_DISCONNECT_GRACE_S:
@@ -7992,18 +8056,29 @@ async def _relay_runner_stream(
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            liveness: _RelayLiveness | None = None
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
                 decision = "server_shutdown"
-            elif await _relay_runner_live_elsewhere(session_id, conversation_store):
-                decision = "live_elsewhere"
-            elif await _runner_disconnect_requires_failure(
-                session_id, conversation_store, origin="runner_disconnected_mid_turn"
-            ):
-                decision = "failed_mid_turn"
             else:
-                decision = "idle_no_failure"
+                liveness = await _relay_runner_liveness(session_id, conversation_store)
+                if liveness.live_elsewhere:
+                    decision = "live_elsewhere"
+                elif (
+                    not ever_ready
+                    and lost.tunnel_gone
+                    and not await _runner_tunnel_registered(runner_client)
+                ):
+                    # Never subscribed and the tunnel is gone: its disconnect timer
+                    # settles a runner that is really gone. A live tunnel has none.
+                    decision = "never_attached"
+                elif await _runner_disconnect_requires_failure(
+                    session_id, conversation_store, origin="runner_disconnected_mid_turn"
+                ):
+                    decision = "failed_mid_turn"
+                else:
+                    decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
             _logger.warning(
@@ -8026,6 +8101,8 @@ async def _relay_runner_stream(
                     ),
                     retries=retries,
                     telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                    ever_ready=ever_ready,
+                    **(liveness.log_fields() if liveness is not None else {}),
                 ),
             )
             if decision == "intentional_stop":
@@ -8054,6 +8131,15 @@ async def _relay_runner_stream(
                 _relinquish_session_live_state(session_id)
                 _logger.info(
                     "Relay: runner live on another replica for session=%s; no failure to report",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+            elif decision == "never_attached":
+                # The tunnel was retired before this stream came up, so the turn may
+                # be running fine elsewhere; the disconnect timer fails it if not.
+                _logger.info(
+                    "Relay: never attached to the runner stream for session=%s; "
+                    "leaving the outcome to the runner disconnect timer",
                     session_id,
                     extra={"session_id": session_id},
                 )

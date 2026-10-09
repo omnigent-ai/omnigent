@@ -68,12 +68,45 @@ both ends.
   grace window without readiness starts a new outage ID and does not recover
   the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
-  (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
-  `failed_mid_turn`), the matching `outage_id`, loss-time `runner_id`/`turn_id`,
-  `grace_s`, `outage_s`, `retries`, and the schema marker. `outage_s` is the
-  time since the current grace window opened; a reconnect that dropped again
-  within the window does not reset it, so it includes that brief connected
-  stretch and is not cumulative disconnected time.
+  (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `never_attached`,
+  `idle_no_failure` or `failed_mid_turn`), the matching `outage_id`, loss-time
+  `runner_id`/`turn_id`, `grace_s`, `outage_s`, `retries`, `ever_ready`, and the
+  schema marker. `outage_s` is the time since the current grace window opened;
+  a reconnect that dropped again within the window does not reset it, so it
+  includes that brief connected stretch and is not cumulative disconnected
+  time.
+
+  `ever_ready` is whether any attempt of this relay consumed the runner's first
+  `session.heartbeat`, and stays `True` once one did. A relay that never did
+  carried none of the turn and has no evidence it was interrupted: a rollout
+  can move a runner between replicas within seconds, leaving the first
+  replica's relay to time out on a tunnel that was retired before its stream
+  came up, while the turn runs on the replica now holding the runner. When the
+  final loss was the tunnel going away (`exception_cause_type` is
+  `ConnectionError` or `ConnectError`: closed, retired, replaced, or the runner
+  offline), no tunnel for the runner is registered on this replica any more,
+  and no fresh stamp from another replica shows the runner live there
+  (`live_elsewhere`), such a relay gives up as `never_attached`: it publishes
+  no status and leaves the outcome to the replica's per-runner disconnect
+  timer, which still fails a mid-turn session (`origin = runner_offline_sweep`)
+  when the runner is really gone. An unreadable or stale liveness read does not
+  change that. If the final loss was the stream endpoint answering over a live
+  tunnel (`HTTPStatusError`, a `RemoteProtocolError` stream fault, or no cause
+  when the body just ended), or a tunnel is registered again (its superseded
+  predecessor arms no timer), no disconnect timer is coming, so the relay
+  decides from the session status as before. A relay that attached once also
+  decides from the evidence and the session status.
+
+  Except for `intentional_stop` and `server_shutdown`, which skip the check,
+  the row reports what the cross-replica check saw: `liveness_lookup` (`found`,
+  `missing` for an absent session row, `unbound`, or `error` when the read
+  raised), `bound_runner_id` (the runner the session row binds),
+  `runner_last_seen` (its heartbeat stamp, epoch seconds), `reference_stamp`
+  (diagnostic: this replica's own newest stamp for the runner when checked,
+  which the row's stamp must exceed to count as another replica's), and
+  `live_elsewhere_fresh` (the row still binds the relay's runner and its stamp
+  is fresh and newer than the reference, so another replica holds the runner).
+  Attributes without a value are omitted.
 - `runner_disconnect_decision`: a warning explaining the status check in the
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
@@ -136,6 +169,15 @@ The disconnect grace task rechecks the local tunnel after loading bound
 sessions. A reconnect during that read logs `reconnected during offline
 lookup; skipping offline-marking`; an older database snapshot must not turn
 the live runner's sessions into disconnect failures.
+
+That task settles a relay that never attached, so a failing listing (`listing
+its sessions failed (attempt n of m)`) does not end it. It retries the
+listing, and once the quick retries are spent it settles the sessions this
+replica held a relay for when the tunnel dropped, from their own rows, which
+still carry the liveness stamps. It then rereads the listing for the rest at a
+slower pace, and logs `could not be listed after m attempts` once that is
+spent. A reconnect or a shutdown ends the retries, and nothing is failed
+without a row's stamps to check.
 
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =
@@ -236,6 +278,7 @@ uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_serve.py \
   tests/runner/transports/ws_tunnel/test_frames.py \
   tests/server/integration/test_runner_tunnel_route.py \
   tests/server/routes/test_sessions_runner_relay.py \
+  tests/server/routes/test_runner_relay_reconnect_grace.py \
   tests/server/integration/test_sessions_tunnel_three_layer.py \
   tests/server/routes/test_subagent_status.py \
   tests/server/test_runner_session_init.py \
@@ -279,3 +322,13 @@ the fresh row must win (`status_source = persisted`), giving
 `subagent_unobserved` for the Claude subsession; a top-level session or a
 `sys_session_create` child in that state must
 still fail.
+
+For a relay that never attached, the window is too short to hit by hand, so
+the tests above build it deterministically. During a rollout, select
+`runner_stream_disconnected` rows with `ever_ready = False` and an
+`exception_cause_type` of `ConnectionError` or `ConnectError`: none should be
+`failed_mid_turn` or `idle_no_failure`, and their sessions should have no
+`session_turn_failed` with `origin = runner_disconnected_mid_turn`. A session
+whose runner is really gone fails only through the disconnect timer
+(`origin = runner_offline_sweep`). Rows with another cause, such as
+`HTTPStatusError`, still fail a mid-turn session themselves.

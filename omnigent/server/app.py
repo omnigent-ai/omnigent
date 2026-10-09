@@ -154,6 +154,12 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
+# Waits between the disconnect timer's reads of a dropped runner's sessions while the store
+# keeps failing. Once they are spent it settles the sessions this replica relayed from their
+# own rows, then rereads every _OFFLINE_LISTING_REARM_S, at most _OFFLINE_LISTING_REARMS times.
+_OFFLINE_LISTING_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 5.0)
+_OFFLINE_LISTING_REARM_S = 30.0
+_OFFLINE_LISTING_REARMS = 20
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -3415,7 +3421,9 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None
+        runner_id: str,
+        reference_stamp: int | None,
+        relayed_session_ids: tuple[str, ...] = (),
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3444,12 +3452,21 @@ def create_app(
         replica's tunnel is authoritative now, and this one's registry
         only ever knew about its own connections.
 
+        This is the only finalizer for a relay that never attached to the runner, so
+        a store that cannot list the runner's sessions must not end it. The read is
+        retried; once the quick retries are spent the sessions this replica relayed
+        are settled from their own rows, and the listing is retried on for the rest.
+        Nothing is failed without the liveness stamps a row read supplies.
+
         :param runner_id: The disconnected runner's id.
         :param reference_stamp: This replica's own last liveness stamp for
             *runner_id*, captured in :func:`_on_runner_disconnect` before
             the clear — the reference the cross-replica check compares
             against.
+        :param relayed_session_ids: Sessions this replica held a relay for on
+            *runner_id* when it dropped; read one by one if the listing fails.
         """
+        from omnigent.entities import Conversation
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
@@ -3476,6 +3493,60 @@ def create_app(
                 runner_id,
             )
             return
+
+        async def settle(affected: list[Conversation]) -> bool:
+            """Settle the sessions, unless the runner is back; ``False`` when it is."""
+            # The runner may reconnect while the store returns an older snapshot.
+            if tunnel_registry.get(runner_id) is not None:
+                _logger.info(
+                    "Runner %s reconnected during offline lookup; skipping offline-marking",
+                    runner_id,
+                )
+                return False
+            if _runner_live_on_another_replica_from_conversations(
+                affected, runner_id, reference_stamp
+            ):
+                for conv in affected:
+                    _relinquish_session_live_state(conv.id)
+                _logger.info(
+                    "Runner %s is live on another replica; skipping offline-marking",
+                    runner_id,
+                )
+                return True
+            _logger.warning(
+                "Runner %s disconnected; reconciling %d bound session(s)",
+                runner_id,
+                len(affected),
+            )
+            await _mark_runner_sessions_offline(
+                affected,
+                ErrorDetail(
+                    code="runner_disconnected",
+                    message="Runner disconnected unexpectedly.",
+                ),
+                conversation_store,
+            )
+            return True
+
+        async def relayed_rows() -> list[Conversation]:
+            """Read the rows of the sessions relayed here, without the by-runner listing."""
+            rows: list[Conversation] = []
+            for batch in batched(relayed_session_ids, _RECONNECT_BINDING_BATCH_SIZE):
+                try:
+                    current = await asyncio.to_thread(
+                        conversation_store.get_conversations, list(batch)
+                    )
+                except Exception:  # noqa: BLE001 — left for the later listing attempts
+                    _logger.warning(
+                        "Runner %s: could not read %d relayed session(s)",
+                        runner_id,
+                        len(batch),
+                        exc_info=True,
+                    )
+                    continue
+                rows.extend(conv for conv in current.values() if conv.runner_id == runner_id)
+            return rows
+
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -3483,38 +3554,51 @@ def create_app(
         # Archived sessions are included by construction — an archived
         # session can still be runner-bound, and skipping it here would
         # leave it stuck "running" forever.
-        affected = await asyncio.to_thread(
-            conversation_store.list_conversations_by_runner_id, runner_id
+        waits = (
+            0.0,
+            *_OFFLINE_LISTING_RETRY_DELAYS_S,
+            *(_OFFLINE_LISTING_REARM_S,) * _OFFLINE_LISTING_REARMS,
         )
-        # The runner may reconnect while the store returns an older snapshot.
-        if tunnel_registry.get(runner_id) is not None:
-            _logger.info(
-                "Runner %s reconnected during offline lookup; skipping offline-marking",
-                runner_id,
-            )
+        quick_attempts = 1 + len(_OFFLINE_LISTING_RETRY_DELAYS_S)
+        for attempt, wait_s in enumerate(waits, start=1):
+            if wait_s:
+                if await tunnel_registry.wait_for_runner(runner_id, timeout_s=wait_s) is not None:
+                    _logger.info(
+                        "Runner %s reconnected while its sessions could not be listed; "
+                        "skipping offline-marking",
+                        runner_id,
+                    )
+                    return
+                if shutdown_state.server_shutting_down():
+                    _logger.info(
+                        "Runner %s dropped because this server is shutting down; "
+                        "skipping offline-marking",
+                        runner_id,
+                    )
+                    return
+            try:
+                affected = await asyncio.to_thread(
+                    conversation_store.list_conversations_by_runner_id, runner_id
+                )
+            except Exception:  # noqa: BLE001 — a store outage must not strand the runner's sessions
+                _logger.warning(
+                    "Runner %s: listing its sessions failed (attempt %d of %d)",
+                    runner_id,
+                    attempt,
+                    len(waits),
+                    exc_info=attempt == 1,
+                )
+                if attempt == quick_attempts:
+                    rows = await relayed_rows()
+                    if rows and not await settle(rows):
+                        return
+                continue
+            await settle(affected)
             return
-        if _runner_live_on_another_replica_from_conversations(
-            affected, runner_id, reference_stamp
-        ):
-            for conv in affected:
-                _relinquish_session_live_state(conv.id)
-            _logger.info(
-                "Runner %s is live on another replica; skipping offline-marking",
-                runner_id,
-            )
-            return
-        _logger.warning(
-            "Runner %s disconnected; reconciling %d bound session(s)",
+        _logger.error(
+            "Runner %s: its sessions could not be listed after %d attempts; giving up",
             runner_id,
-            len(affected),
-        )
-        await _mark_runner_sessions_offline(
-            affected,
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
-            conversation_store,
+            len(waits),
         )
 
     async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
@@ -3541,6 +3625,8 @@ def create_app(
         :param connection: The closed tunnel whose generation scopes
             initialization cleanup.
         """
+        from omnigent.server.routes.sessions import _runner_relay_tasks
+
         cancelled = runner_session_initializer.invalidate_runner(
             runner_id, generation=connection.generation
         )
@@ -3582,8 +3668,15 @@ def create_app(
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
+        # Relays on this runner give up at the same deadline and leave their sessions to the
+        # timer, which settles them from their own rows if the store cannot list the runner's.
+        relayed = tuple(
+            session_id
+            for session_id, handle in _runner_relay_tasks.items()
+            if handle.runner_id == runner_id
+        )
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id, reference_stamp),
+            _mark_disconnected_runner_failed(runner_id, reference_stamp, relayed),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task

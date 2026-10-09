@@ -844,6 +844,39 @@ class _RelayStatusSnapshot:
     parent_owned: bool = False
 
 
+@dataclass(frozen=True)
+class _RelayLiveness:
+    """
+    What a relay's cross-replica runner check saw, for its decision and log row.
+
+    :param lookup: ``found``, ``missing`` (no session row), ``unbound`` (no
+        runner to compare), or ``error`` (the read raised).
+    :param live_elsewhere: The row binds the relay's runner and its stamp is
+        fresh and newer than this replica's own, so another replica holds it.
+    :param bound_runner_id: Runner the session row is bound to.
+    :param runner_last_seen: The row's heartbeat stamp, epoch seconds.
+    :param reference_stamp: This replica's newest own stamp for the relay's
+        runner when it was checked; the row's stamp must exceed it. Logged next
+        to ``runner_last_seen`` so a row can be read without a store query.
+    """
+
+    lookup: str
+    live_elsewhere: bool = False
+    bound_runner_id: str | None = None
+    runner_last_seen: int | None = None
+    reference_stamp: int | None = None
+
+    def log_fields(self) -> dict[str, Any]:
+        """Return the row's debug attributes; the sink drops the ``None`` ones."""
+        return {
+            "liveness_lookup": self.lookup,
+            "bound_runner_id": self.bound_runner_id,
+            "runner_last_seen": self.runner_last_seen,
+            "reference_stamp": self.reference_stamp,
+            "live_elsewhere_fresh": self.live_elsewhere,
+        }
+
+
 @dataclass
 class _RelayHandle:
     """
@@ -1208,6 +1241,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RelayLiveness",
     "_RelayStatusSnapshot",
     "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
