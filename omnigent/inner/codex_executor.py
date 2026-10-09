@@ -632,21 +632,30 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-_BROKERED_CODEX_VERSION = Version("0.146.0")
+_BROKERED_CODEX_MIN_VERSION = Version("0.146.0")
 
 
 async def _require_brokered_codex_version(codex_path: str) -> None:
-    """Fail closed unless Codex uses the wire version tested for brokered auth."""
+    """Fail closed unless Codex is a stable release at or above the brokered-auth floor.
+
+    The signer rebuilds every request strictly, so a newer Codex that sends an
+    unexpected request fails its turn rather than reaching the model.
+    """
     raw = await _codex_cli_version_text(codex_path)
     try:
         version = Version(raw) if raw is not None else None
     except InvalidVersion:
         version = None
-    if version != _BROKERED_CODEX_VERSION:
+    if (
+        version is None
+        or version.is_prerelease
+        or version.is_postrelease
+        or version < _BROKERED_CODEX_MIN_VERSION
+    ):
         shown = raw or "unparseable"
         raise RuntimeError(
             "unsupported Codex wire version "
-            f"{shown}; brokered authentication requires exactly 0.146.0"
+            f"{shown}; brokered authentication requires a stable Codex 0.146.0 or newer"
         )
 
 
