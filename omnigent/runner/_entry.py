@@ -1279,11 +1279,10 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
-# Backoff schedule for transient agent-bundle fetch failures. A 5xx or a
-# dropped connection on GET /v1/sessions/{id}/agent/contents is usually a
-# server restart or proxy blip; without a short bounded retry, one blip
-# aborts turn setup and surfaces the user's turn as failed.
+# Backoff schedule for transient agent-bundle fetch failures; see _get_agent_contents_with_retry.
 _SPEC_FETCH_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+# The 5xx statuses a retry can plausibly change (restarting backend, intermediary blip).
+_SPEC_FETCH_TRANSIENT_STATUSES: frozenset[int] = frozenset({500, 502, 503, 504})
 
 
 async def _get_agent_contents_with_retry(
@@ -1294,17 +1293,19 @@ async def _get_agent_contents_with_retry(
     """
     GET the agent bundle, retrying transient failures with backoff.
 
-    Retries HTTP 5xx responses and transport errors — the transient classes
-    (a restarting backend, a proxy blip, a dropped connection) — once per
-    delay in :data:`_SPEC_FETCH_RETRY_DELAYS_S`. Any non-5xx response
-    (including the 404 miss the caller maps to ``None``) returns
-    immediately: it is a deterministic answer a retry cannot change.
+    Retries the transient server statuses in
+    :data:`_SPEC_FETCH_TRANSIENT_STATUSES` and transport errors — a
+    restarting backend, a proxy blip, a dropped connection — once per delay
+    in :data:`_SPEC_FETCH_RETRY_DELAYS_S`. Any other response (the 404 miss
+    the caller maps to ``None``, a 4xx, a deterministic 5xx such as 501)
+    returns immediately: it is an answer a retry cannot change.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param path: Bundle route, e.g. ``"/v1/sessions/conv_ab/agent/contents"``.
     :param session_id: Session identifier, for log correlation.
-    :returns: The first non-5xx response, or the final 5xx once the retry
-        budget is exhausted (the caller raises on it).
+    :returns: The first response outside the transient set, or the final
+        transient 5xx once the retry budget is exhausted (the caller raises
+        on it).
     :raises httpx.TransportError: When the final attempt fails at the
         transport level.
     """
@@ -1315,7 +1316,7 @@ async def _get_agent_contents_with_retry(
         except httpx.TransportError as exc:
             failure = repr(exc)
         else:
-            if resp.status_code < 500:
+            if resp.status_code not in _SPEC_FETCH_TRANSIENT_STATUSES:
                 return resp
             failure = f"HTTP {resp.status_code}"
         _logger.warning(

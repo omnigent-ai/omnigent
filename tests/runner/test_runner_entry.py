@@ -2755,23 +2755,24 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [401, 403])
-async def test_resolve_agent_spec_from_server_raises_immediately_for_4xx(
+@pytest.mark.parametrize("status_code", [401, 403, 501])
+async def test_resolve_agent_spec_from_server_raises_immediately_for_non_transient_status(
     tmp_path: Path,
     status_code: int,
 ) -> None:
-    """Deterministic 4xx rejections raise at once, unretried and un-404-like.
+    """Deterministic rejections raise at once, unretried and un-404-like.
 
     :param tmp_path: Temporary spec cache root.
-    :param status_code: Non-404 4xx HTTP status returned by the AP
-        server.
+    :param status_code: Non-404 HTTP status outside the transient set
+        returned by the server: a client-side rejection or a 5xx no retry
+        can change.
     :returns: None.
     """
     requested_paths: list[str] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """
-        Return the parametrized client-side rejection.
+        Return the parametrized deterministic rejection.
 
         :param request: Incoming mocked HTTP request.
         :returns: A response with ``status_code``.
@@ -2791,7 +2792,7 @@ async def test_resolve_agent_spec_from_server_raises_immediately_for_4xx(
     message = str(exc_info.value)
     assert f"HTTP {status_code}" in message
     assert "/v1/sessions/conv_test/agent/contents" in message
-    # A 4xx is a deterministic answer; a retry cannot change it.
+    # A deterministic answer; a retry cannot change it.
     assert requested_paths == ["/v1/sessions/conv_test/agent/contents"]
 
 
@@ -2857,6 +2858,52 @@ async def test_resolve_agent_spec_from_server_retries_transient_5xx(
     assert spec is not None
     assert spec.name == "blip-agent"
     assert len(requested_paths) == 3
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_recovers_on_final_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bundle served only on the last allowed attempt still resolves.
+
+    The final attempt runs outside the retry loop, so pin that a 200 there
+    is parsed like any earlier success rather than treated as exhaustion.
+
+    :param tmp_path: Temporary spec cache root.
+    :param monkeypatch: Used to zero the backoff delays for test speed.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    requested_paths: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve a 503 for every in-loop attempt, then a valid bundle.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A 503 for the first three calls, then a 200 bundle.
+        """
+        requested_paths.append(request.url.path)
+        if len(requested_paths) <= 3:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            content=_minimal_bundle_tar_gz("late-agent"),
+            headers={"X-Agent-Version": "1"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        spec = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_late", session_id="conv_test"
+        )
+
+    assert spec is not None
+    assert spec.name == "late-agent"
+    assert len(requested_paths) == 4
 
 
 @pytest.mark.asyncio

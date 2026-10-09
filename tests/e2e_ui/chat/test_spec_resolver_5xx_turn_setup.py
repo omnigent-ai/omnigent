@@ -41,6 +41,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -61,18 +62,23 @@ _HEALTH_TIMEOUT_S = 120.0
 _OUTCOME_TIMEOUT_MS = 60_000
 
 # Answer this many leading agent-bundle GETs with a synthetic 503, then forward.
-# A no-retry resolver 5xx's on every resolve inside this window and bricks the
-# turn; a retrying resolver exhausts the window and recovers on a later attempt.
-_FAIL_FIRST_N = int(os.environ.get("SPEC_5XX_E2E_FAIL_FIRST_N", "8"))
+# Not a multiple of the resolver's four attempts: session init burns 1-4, so the
+# turn-setup resolve recovers mid-retry instead of exhausting its own budget.
+_FAIL_FIRST_N = int(os.environ.get("SPEC_5XX_E2E_FAIL_FIRST_N", "6"))
 
 _ERROR_PILL = '[data-testid="error-pill"]'
 _ERROR_HEADLINE = '[data-testid="error-headline"]'
 _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
-# Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars that
-# must not intercept loopback requests to the spawned server.
-_client = httpx.Client(trust_env=False)
+
+def _request(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """One-shot request to the spawned server that ignores HTTP(S)_PROXY.
+
+    CI forces an egress proxy through those env vars; it must not intercept
+    loopback traffic.
+    """
+    return httpx.request(method, url, trust_env=False, **kwargs)
 
 
 def _free_port() -> int:
@@ -395,8 +401,10 @@ def spec_5xx_rig(
             if server_proc.poll() is not None or runner_proc.poll() is not None:
                 break
             try:
-                if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
-                    status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
+                if _request("GET", f"{base_url}/health", timeout=2).status_code == 200:
+                    status = _request(
+                        "GET", f"{base_url}/v1/runners/{runner_id}/status", timeout=2
+                    )
                     if status.status_code == 200 and status.json().get("online"):
                         online = True
                         break
@@ -438,7 +446,8 @@ def spec_5xx_rig(
 def _create_hello_world_session(base_url: str) -> str:
     """Upload a ``hello_world`` bundle and return the new session id (unbound)."""
     bundle = _build_hello_world_bundle()
-    create = _client.post(
+    create = _request(
+        "POST",
         f"{base_url}/v1/sessions",
         data={"metadata": json.dumps({})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
@@ -451,7 +460,8 @@ def _create_hello_world_session(base_url: str) -> str:
 def _bind_session_to_runner(base_url: str, session_id: str, runner_id: str) -> None:
     """PATCH-bind *session_id* to *runner_id* (this triggers the runner's
     session-init handshake, the first agent-bundle resolve)."""
-    patch = _client.patch(
+    patch = _request(
+        "PATCH",
         f"{base_url}/v1/sessions/{session_id}",
         json={"runner_id": runner_id},
         timeout=10.0,
@@ -562,4 +572,4 @@ def test_agent_bundle_5xx_during_turn_setup_does_not_brick_the_turn(
         expect(error_pill).to_have_count(0)
     finally:
         with contextlib.suppress(httpx.HTTPError):
-            _client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
+            _request("DELETE", f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)

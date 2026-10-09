@@ -392,8 +392,7 @@ async def test_bg_turn_setup_rides_out_transient_spec_fetch_5xx(
     ``failed`` status is ever surfaced to the UI.
 
     :param monkeypatch: Used to zero the resolver backoff delays for speed.
-        ``raising=False`` keeps the failure mode behavioral on trees where
-        the retry schedule does not exist yet.
+        ``raising=False`` tolerates a build without that constant.
     :returns: None.
     """
     monkeypatch.setattr(
@@ -444,8 +443,7 @@ async def test_bg_turn_setup_persistent_spec_fetch_5xx_surfaces_failed_to_ui(
     is logged for operators but genericized out of the client-facing message.
 
     :param monkeypatch: Used to zero the resolver backoff delays for speed.
-        ``raising=False`` keeps the failure mode behavioral on trees where
-        the retry schedule does not exist yet.
+        ``raising=False`` tolerates a build without that constant.
     :param caplog: Pytest log capture, used to confirm the canonical
         broken-turn log lines emit and the raw cause is logged, not relayed.
     :returns: None.
