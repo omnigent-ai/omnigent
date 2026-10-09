@@ -20,13 +20,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.errors import ErrorCategory
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
+from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
     "describe_failure_code",
+    "diagnose_client_update_required",
 ]
 
 
@@ -223,10 +225,13 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "rate limit is set to 0",
 )
 # Claude Code's output-token-limit error, raw ("Claude's response exceeded the
-# 32000 output token maximum...") or as the claude-native bridge rewrites it
-# ("Output limit reached — ..."): the model's output cap, not an Omnigent fault.
+# 32000 output token maximum..."), as the claude-native bridge rewrites it
+# ("Output limit reached — ..."), or as the forwarder's category-only fallback
+# names it when the StopFailure hook carries no error_details ("... API error
+# (max_output_tokens)."): the model's output cap, not an Omnigent fault.
 _OUTPUT_LIMIT_ERROR = re.compile(
-    r"response exceeded the [\d,]+ output token maximum|\boutput limit reached\b",
+    r"response exceeded the [\d,]+ output token maximum|\boutput limit reached\b"
+    r"|\bAPI error \(max_output_tokens\)",
     re.IGNORECASE,
 )
 # Mid-stream upstream failures the gateway usually recovers from on its own;
@@ -236,15 +241,29 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "connection lost mid-response",
     "overloaded",
 )
-_TRANSIENT_UPSTREAM_STATUSES = {"500", "502", "503", "504", "529"}
+# 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
+_TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
+# The gateway's CANCELLED error envelope, which can arrive without a parseable status.
+_UPSTREAM_CANCELLED_ENVELOPE = re.compile(r'"error_code"\s*:\s*"CANCELLED"', re.IGNORECASE)
+# Claude Code's refusal when its installed version predates the selected model, e.g.
+# "Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required".
+_CLIENT_UPDATE_REQUIRED = re.compile(
+    r"(?:Claude Code\s+(?P<installed>\S+)\s+)?does not support this model;"
+    r"\s+version\s+(?P<required>\S+)\s+or newer is required",
+    re.IGNORECASE,
+)
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies the cause.
 
     Recognizes rate limits and transient upstream model-gateway failures so
-    the web UI can offer a one-click retry instead of a terminal error. Also
-    corrects ``codex_reauth_required`` when the message reveals that the real
+    the web UI can offer a one-click retry instead of a terminal error, a
+    Claude Code too old for the selected model, a content-length cap
+    rejection (a request carrying an oversized transcript, refused by the
+    deployment's byte cap before the model sees it), and a reply cut off by
+    the model's output-token cap. Also corrects
+    ``codex_reauth_required`` when the message reveals that the real
     cause is a budget/usage-limit exhaustion (older runners misclassify the
     gateway's 403 as auth; the server fixes it on deploy).
 
@@ -257,6 +276,10 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
+    if _CLIENT_UPDATE_REQUIRED.search(message):
+        return "client_update_required"
+    if detect_request_size_overflow(message) is not None:
+        return "context_length_exceeded"
     if _OUTPUT_LIMIT_ERROR.search(message):
         return "output_limit_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
@@ -265,11 +288,36 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if status == "429" or _RATE_LIMIT_ERROR.search(message):
         return "rate_limit_exceeded"
-    if status in _TRANSIENT_UPSTREAM_STATUSES or any(
-        fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS
+    if (
+        status in _TRANSIENT_UPSTREAM_STATUSES
+        or _UPSTREAM_CANCELLED_ENVELOPE.search(message)
+        or any(fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS)
     ):
         return "transient_upstream_error"
     return code
+
+
+def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
+    """Explain Claude Code's refusal of a model its installed version predates.
+
+    :param message: Turn error text, e.g. ``"API Error: 400 ... Claude Code
+        2.1.217 does not support this model; version 2.1.280 or newer is required"``.
+    :returns: A diagnosis naming the installed and required versions and the
+        update command, or ``None`` when *message* is not that refusal.
+    """
+    match = _CLIENT_UPDATE_REQUIRED.search(message)
+    if match is None:
+        return None
+    installed = match.group("installed")
+    client = f"Claude Code {installed}" if installed else "Claude Code"
+    return FailureDiagnosis(
+        title="Claude Code needs an update",
+        cause=(
+            f"{client} on the host doesn't support this model; "
+            f"version {match.group('required')} or newer is required."
+        ),
+        remediation="Run `claude update` on the host, then start a new session.",
+    )
 
 
 # --- failure-code English fallbacks -------------------------------------------
@@ -314,6 +362,11 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The AI gateway refused this turn because a spending budget or usage limit is "
         "exhausted. Contact an admin to raise it, or use a different budget."
     ),
+    "client_update_required": (
+        "The agent CLI on the host is too old for the selected model. Update it on the "
+        "host, then start a new session."
+    ),
+    "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 
 

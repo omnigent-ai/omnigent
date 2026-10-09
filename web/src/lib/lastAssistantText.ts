@@ -58,6 +58,44 @@ export function extractAssistantText(item: unknown): string | undefined {
 }
 
 /**
+ * Extract a failed turn's headline from a raw `error` item — the classified
+ * `title` when present, else the raw `message`. Info-level notices yield
+ * `undefined`: they don't mean the turn failed.
+ *
+ * :param item: One raw item from `GET /v1/sessions/{id}/items`.
+ * :returns: The error text, or `undefined`.
+ */
+export function extractErrorText(item: unknown): string | undefined {
+  if (item === null || typeof item !== "object") return undefined;
+  const record = item as Record<string, unknown>;
+  if (record.type !== "error" || record.level === "info") return undefined;
+  for (const value of [record.title, record.message]) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return undefined;
+}
+
+/**
+ * Preview of a session's latest output for the Inbox: the newest assistant
+ * text or error headline, whichever comes last, condensed via
+ * {@link previewText}.
+ *
+ * :param items: Raw session items, oldest-to-newest.
+ * :param maxChars: Preview character budget (default 160).
+ * :returns: The preview, or `undefined` when no item carries output text.
+ */
+export function latestOutputPreview(
+  items: readonly unknown[],
+  maxChars: number = DEFAULT_MAX_CHARS,
+): string | undefined {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const text = extractAssistantText(items[i]) ?? extractErrorText(items[i]);
+    if (text !== undefined) return previewText(text, maxChars);
+  }
+  return undefined;
+}
+
+/**
  * Condense raw assistant text into a short notification body: the first few
  * non-empty lines, capped at a character budget with an ellipsis.
  *

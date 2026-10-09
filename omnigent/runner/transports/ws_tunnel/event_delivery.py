@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 from websockets.exceptions import ConnectionClosed
 
+from omnigent.errors import ErrorCode
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
@@ -50,11 +51,21 @@ class RunnerEventDispatcher:
         self._locks: dict[str, asyncio.Lock] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._outstanding = 0
+        self._last_dispatch_at: float | None = None
 
     @property
     def has_pending(self) -> bool:
         """Keep the runner alive while durable source events await an ACK."""
         return self._outstanding > 0
+
+    @property
+    def last_dispatch_at(self) -> float | None:
+        """Loop time of the last server-acknowledged batch, if any.
+
+        The runner idle watchdog reads this so an actively forwarding native
+        sub-agent counts as runner work while its parent session is idle.
+        """
+        return self._last_dispatch_at
 
     def _set_state(self, state: str) -> None:
         self._state = state
@@ -193,6 +204,12 @@ class RunnerEventDispatcher:
                 continue
             finally:
                 self._pending.pop(batch_id, None)
+                # A disconnect may fail the future after its waiter stopped; mark it retrieved.
+                if future.done() and not future.cancelled():
+                    future.exception()
+            # Only an acknowledged batch counts: a send that never reached the
+            # server must not look like forwarder progress to the watchdog.
+            self._last_dispatch_at = asyncio.get_running_loop().time()
             if ack.applied < 0 or ack.applied > len(remaining):
                 raise ValueError("invalid event acknowledgement")
             remaining = remaining[ack.applied :]
@@ -272,8 +289,15 @@ class TunnelEventClient(httpx.AsyncClient):
             return await self._synthetic_response(503, request=request)
         if ack.applied == len(events):
             return await self._synthetic_response(202, request=request, json={"queued": False})
+        if ack.retryable:
+            status = 503
+        elif ack.error == ErrorCode.FORBIDDEN:
+            # Wrong-runner refusal (session moved to another host), not a malformed event.
+            status = 403
+        else:
+            status = 422
         return await self._synthetic_response(
-            503 if ack.retryable else 422,
+            status,
             json={"detail": ack.error or "event batch was not accepted"},
             request=request,
         )

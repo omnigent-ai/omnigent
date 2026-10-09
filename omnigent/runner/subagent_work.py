@@ -132,6 +132,10 @@ class _SubagentWorkEntry:
         the parent's inbox.
     :param cancellation_confirmed: Whether a native terminal edge confirmed
         an abort, rather than an interrupt merely being requested.
+    :param launch_timed_out: Whether the recorded ``failed`` came from the
+        launch-liveness reaper rather than from the child itself. Such a
+        failure is a guess ("no start acknowledgment"), so a genuine
+        terminal edge from the child afterwards must replace it.
     """
 
     parent_session_id: str
@@ -147,6 +151,7 @@ class _SubagentWorkEntry:
     completed_at: float | None = None
     delivered: bool = False
     cancellation_confirmed: bool = False
+    launch_timed_out: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -667,6 +672,14 @@ def mark_subagent_work_terminal(
             entry.completed_at = time.time()
             entry.delivered = False
             return _deliver_subagent_completion(entry)
+        # A child-reported terminal state supersedes the reaper's provisional failure.
+        if entry.launch_timed_out and status in ("completed", "failed"):
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            entry.launch_timed_out = False
+            return _deliver_subagent_completion(entry)
         if entry.delivered:
             return _SubagentDeliveryAck(
                 entry=entry,
@@ -791,6 +804,7 @@ def reap_stalled_subagent_launches(
             entry.parent_session_id,
             entry.child_session_id,
         )
+        entry.launch_timed_out = True
         deliver(
             entry.child_session_id,
             status="failed",
