@@ -29,7 +29,7 @@ from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
-from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
@@ -1507,6 +1507,68 @@ def _build_session_response(
     )
 
 
+_WARNED_UNCONFIGURED_PRICING_PROVIDERS: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
+
+def _resolve_session_provider_entry(
+    conv: Any,
+) -> Any | None:
+    """Return the ProviderEntry for the session's actual named provider, if any.
+
+    When a session's agent declares ``executor.auth: {type: provider, name: X}``,
+    the pricing path must use provider X's configured rates rather than the
+    harness default's rates. This helper loads the agent spec via the agent
+    cache and returns the named entry when the auth is a ProviderAuth, else
+    None so the caller falls back to the default-provider lookup.
+
+    Errors are silenced and return None so a broken spec never breaks cost
+    accounting — the caller falls back to catalog or default-provider pricing.
+    """
+    if conv is None or not getattr(conv, "agent_id", None):
+        return None
+    try:
+        from omnigent.onboarding.provider_config import load_config, load_providers
+        from omnigent.runtime import get_agent_cache, get_agent_store
+        from omnigent.spec.types import ProviderAuth
+
+        agent = get_agent_store().get(conv.agent_id)
+        if agent is None:
+            return None
+        agent_cache = get_agent_cache()
+        # Gate env expansion on operator_authored, not session_id: a user bundle
+        # can have no session yet still be tenant input whose ${VAR} must not expand.
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+        # Sub-agent sessions price on their own executor; resolve the child
+        # spec recursively (as the policy builder does) so nested sub-agents
+        # and the synthesized web_fetch researcher use their own provider.
+        executor = loaded.spec.executor
+        if conv.sub_agent_name:
+            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+            if sub is not None and sub is not loaded.spec:
+                executor = sub.executor
+        auth = executor.auth if executor else None
+        if not isinstance(auth, ProviderAuth):
+            return None
+        providers = load_providers(load_config())
+        entry = providers.get(auth.name)
+        if entry is None and auth.name not in _WARNED_UNCONFIGURED_PRICING_PROVIDERS:
+            # A declared provider absent from config silently reverts to
+            # default-provider pricing; warn once per name so persistent
+            # mispricing is visible without spamming this per-event path.
+            _WARNED_UNCONFIGURED_PRICING_PROVIDERS.add(auth.name)
+            _logger.warning(
+                "session executor names provider %r but it is not configured; "
+                "pricing falls back to the default provider",
+                auth.name,
+            )
+        return entry
+    except Exception:  # noqa: BLE001 — broken spec must never break cost accounting
+        _logger.debug("named-provider lookup failed for pricing", exc_info=True)
+        return None
+
+
 def _sane_relay_token_count(value: object) -> int:
     """
     Coerce a runner-reported token count to a trusted non-negative int.
@@ -1641,8 +1703,15 @@ def _accumulate_session_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual provider the session was launched with so
+            # sessions on a non-default named provider are priced at their
+            # configured rate rather than the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                llm_model, provider_config=provider_config, harness=harness
+                llm_model,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             priced = pricing is not None
             if pricing is not None:
@@ -1900,8 +1969,14 @@ def _persist_native_cumulative_usage(
             provider_config = load_config()
             # Resolve harness from conversation (agent spec + overrides)
             harness = _resolve_harness(conv) if conv else None
+            # Resolve the actual named provider so non-default sessions are
+            # priced at their configured rate, not the harness default's rate.
+            provider_entry = _resolve_session_provider_entry(conv)
             pricing = fetch_model_pricing_with_provider(
-                model_name, provider_config=provider_config, harness=harness
+                model_name,
+                provider_config=provider_config,
+                harness=harness,
+                provider_entry=provider_entry,
             )
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.

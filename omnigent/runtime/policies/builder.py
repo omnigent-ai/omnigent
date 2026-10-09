@@ -833,8 +833,41 @@ def build_policy_engine(
         harness = (
             conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
+        # Price sessions on non-default providers at their configured rate,
+        # not the harness default's. A sub-agent session runs the CHILD
+        # spec's executor, so its auth decides the provider identity.
+        from omnigent.spec.types import ProviderAuth
+
+        _executor = child_spec.executor if child_spec is not None else spec.executor
+        _provider_entry = None
+        if (
+            isinstance(_executor.auth, ProviderAuth)
+            and _executor.auth.name
+            and harness is not None
+        ):
+            try:
+                from omnigent.onboarding.provider_config import load_providers
+
+                _providers = load_providers(provider_config)
+                _provider_entry = _providers.get(_executor.auth.name)
+                if _provider_entry is None:
+                    # A declared provider absent from config silently reverts
+                    # to default-provider pricing; surface the misconfiguration.
+                    _logger.warning(
+                        "session executor names provider %r but it is not "
+                        "configured; pricing falls back to the default provider",
+                        _executor.auth.name,
+                    )
+            except Exception:
+                # Provider resolution must never break policy pricing; fall back
+                # to the default-provider lookup. Warn, not debug: this runs once
+                # per policy build, so a broken config is worth surfacing.
+                _logger.warning("named-provider lookup failed for pricing", exc_info=True)
         token_pricing = fetch_model_pricing_with_provider(
-            initial_model, provider_config=provider_config, harness=harness
+            initial_model,
+            provider_config=provider_config,
+            harness=harness,
+            provider_entry=_provider_entry,
         )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
