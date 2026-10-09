@@ -145,6 +145,7 @@ async def verify(args) -> None:
     client = None
     llm = None
     ws = None
+    container_created = False
     try:
         mock_log = (args.output / "mock.log").open("w")
         mock, mock_port = start_mock_server(args.mock_port, mock_log)
@@ -192,8 +193,7 @@ async def verify(args) -> None:
         report["initial_backends"] = sorted(backends)
         await command(
             "docker",
-            "run",
-            "-d",
+            "create",
             "--name",
             container,
             "--network",
@@ -215,6 +215,8 @@ async def verify(args) -> None:
             args.url,
             "--non-interactive",
         )
+        container_created = True
+        await command("docker", "start", container)
         await command(
             "docker",
             "exec",
@@ -483,12 +485,6 @@ async def verify(args) -> None:
             return snapshot.json().get("status") == "idle" and followup in items.text
 
         report["followup_turn_completed"] = await eventually(followup_completed, timeout=30)
-        report["passed"] = True
-        print(
-            "PASS: host/runner RPCs recovered, the same shell survived, "
-            "the active turn completed, and a new runner launched.",
-            flush=True,
-        )
     except BaseException as exc:
         report["error"] = f"{type(exc).__name__}: {exc}"
         raise
@@ -496,25 +492,53 @@ async def verify(args) -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        if ws is not None:
-            await ws.close()
-        if client is not None:
-            await client.aclose()
-        if llm is not None:
-            await llm.aclose()
+        cleanup_errors = []
+        for name, close in (
+            ("terminal", ws.close if ws is not None else None),
+            ("HTTP client", client.aclose if client is not None else None),
+            ("model client", llm.aclose if llm is not None else None),
+        ):
+            if close is not None:
+                try:
+                    await close()
+                except (httpx.HTTPError, OSError, RuntimeError, WebSocketException) as exc:
+                    cleanup_errors.append(f"Could not close {name}: {exc}")
         if mock is not None:
-            mock.terminate()
             try:
-                await asyncio.to_thread(mock.wait, timeout=5)
-            except subprocess.TimeoutExpired:
-                mock.kill()
+                mock.terminate()
                 try:
                     await asyncio.to_thread(mock.wait, timeout=5)
-                except subprocess.TimeoutExpired as exc:
-                    report["cleanup_error"] = str(exc)
-                    report["passed"] = False
+                except subprocess.TimeoutExpired:
+                    mock.kill()
+                    await asyncio.to_thread(mock.wait, timeout=5)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                cleanup_errors.append(f"Could not stop mock model: {exc}")
         if mock_log is not None:
-            mock_log.close()
+            with contextlib.suppress(OSError):
+                mock_log.close()
+        if container_created:
+            with contextlib.suppress(RuntimeError, OSError):
+                (args.output / "host.log").write_text(await command("docker", "logs", container))
+            with contextlib.suppress(RuntimeError, OSError):
+                await command(
+                    "docker",
+                    "cp",
+                    f"{container}:/root/.omnigent/logs",
+                    str(args.output / "client-logs"),
+                )
+            try:
+                await command("docker", "rm", "-f", container)
+            except (RuntimeError, OSError) as exc:
+                cleanup_errors.append(
+                    f"Could not remove temporary host container {container}: {exc}"
+                )
+        with contextlib.suppress(RuntimeError, OSError):
+            (args.output / "nginx.log").write_text(
+                await command(*kube, "logs", "deployment/nginx", "--since=15m")
+            )
+        report["passed"] = "error" not in report and not cleanup_errors
+        if cleanup_errors:
+            report["cleanup_error"] = "; ".join(cleanup_errors)
         for kind in ("host", "runner"):
             samples = [s for s in report["samples"] if s["kind"] == kind]
             report[f"{kind}_statuses"] = dict(Counter(str(s["status"]) for s in samples))
@@ -537,22 +561,17 @@ async def verify(args) -> None:
                 (args.output / name).write_text(content)
             except OSError as exc:
                 print(f"Could not save {name}: {exc}", file=sys.stderr, flush=True)
-        with contextlib.suppress(RuntimeError, OSError):
-            (args.output / "host.log").write_text(await command("docker", "logs", container))
-        with contextlib.suppress(RuntimeError, OSError):
-            await command(
-                "docker",
-                "cp",
-                f"{container}:/root/.omnigent/logs",
-                str(args.output / "client-logs"),
-            )
-        with contextlib.suppress(RuntimeError, OSError):
-            await command("docker", "rm", "-f", container)
-        with contextlib.suppress(RuntimeError, OSError):
-            (args.output / "nginx.log").write_text(
-                await command(*kube, "logs", "deployment/nginx", "--since=15m")
-            )
         print(f"Evidence: {args.output / 'report.json'}", flush=True)
+        if cleanup_errors:
+            message = f"Required cleanup failed: {report['cleanup_error']}"
+            print(message, file=sys.stderr, flush=True)
+            if "error" not in report:
+                raise RuntimeError(message)
+    print(
+        "PASS: host/runner RPCs recovered, the same shell survived, "
+        "the active turn completed, and a new runner launched.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

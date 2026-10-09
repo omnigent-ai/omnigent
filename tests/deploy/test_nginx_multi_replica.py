@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import subprocess
+from itertools import cycle
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -21,29 +22,85 @@ ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "deploy/kubernetes/multi_replica"
 
 
-@pytest.mark.parametrize("failed_command", ["logs", "cp", "write", "missing-binary", "mock-wait"])
-async def test_evidence_failure_still_removes_host_container(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_command: str
-) -> None:
+@pytest.fixture
+def verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Complete the rollout with fake transports so cleanup failures are deterministic."""
     spec = importlib.util.spec_from_file_location("nginx_verify", EXAMPLE / "verify.py")
     assert spec is not None and spec.loader is not None
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
     monkeypatch.setattr(verifier.uuid, "uuid4", lambda: SimpleNamespace(hex="cleanup-test"))
     process = Mock()
-    if failed_command == "mock-wait":
-        process.wait.side_effect = subprocess.TimeoutExpired("mock", 5)
-    monkeypatch.setattr(verifier.subprocess, "Popen", Mock(return_value=process))
+    process.poll.return_value = None
+    monkeypatch.setattr(verifier, "start_mock_server", lambda *_: (process, 18082))
+    backends = cycle(("server-a", "server-b"))
+
+    def response(*_args, **_kwargs):
+        return httpx.Response(
+            200,
+            request=httpx.Request("GET", "http://localhost"),
+            headers={"x-omnigent-upstream": next(backends)},
+            json={"id": "session", "data": [{"agent_id": "agent"}], "released": 1},
+        )
+
+    async def lines():
+        yield "data: connected"
+        await asyncio.Event().wait()
+
+    stream = Mock()
+    stream.aiter_lines = lines
+    client = AsyncMock()
+    client.get.side_effect = response
+    client.post.side_effect = response
+    client.stream = Mock(return_value=AsyncMock())
+    client.stream.return_value.__aenter__.return_value = stream
+    monkeypatch.setattr(verifier.httpx, "AsyncClient", lambda **_: client)
+    ws = AsyncMock(close_code=1006)
+    ws.response = SimpleNamespace(headers={"x-omnigent-upstream": "server-c"})
+    monkeypatch.setattr(verifier, "connect", AsyncMock(return_value=ws))
     monkeypatch.setattr(
-        verifier, "eventually", AsyncMock(side_effect=RuntimeError("host setup failed"))
+        verifier, "terminal_reply", AsyncMock(return_value=SimpleNamespace(group=lambda _: "39"))
     )
 
+    async def ready(check, **_kwargs):
+        if check.__name__ in {"mock_ready", "ingress_ready", "reattach_terminal"}:
+            return await check()
+        return True
+
+    monkeypatch.setattr(verifier, "eventually", ready)
+    pods = json.dumps({"items": [{"metadata": {"name": name}} for name in ("pod-a", "pod-b")]})
+    commands = AsyncMock(return_value=pods)
+    monkeypatch.setattr(verifier, "command", commands)
+    args = argparse.Namespace(
+        url="http://localhost:18081",
+        kubeconfig=tmp_path / "kubeconfig",
+        output=tmp_path / "evidence",
+        mock_port=0,
+    )
+    return SimpleNamespace(verifier=verifier, args=args, commands=commands, process=process)
+
+
+@pytest.mark.parametrize("failed_command", ["logs", "cp", "write", "missing-binary", "mock-wait"])
+async def test_evidence_failure_still_removes_host_container(
+    verification, monkeypatch: pytest.MonkeyPatch, failed_command: str
+) -> None:
+    verifier, args, commands, process = (
+        verification.verifier,
+        verification.args,
+        verification.commands,
+        verification.process,
+    )
+    if failed_command == "mock-wait":
+        process.wait.side_effect = subprocess.TimeoutExpired("mock", 5)
+
     async def command(*args: str) -> str:
+        if args[:2] == ("docker", "exec"):
+            raise RuntimeError("host setup failed")
         if failed_command == "missing-binary" and args[:2] == ("docker", "logs"):
             raise FileNotFoundError("docker is unavailable")
         if args[:2] == ("docker", failed_command):
             raise RuntimeError("evidence is unavailable")
-        return ""
+        return commands.return_value
 
     original_write = Path.write_text
 
@@ -53,14 +110,7 @@ async def test_evidence_failure_still_removes_host_container(
         return original_write(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", write)
-    commands = AsyncMock(side_effect=command)
-    monkeypatch.setattr(verifier, "command", commands)
-    args = argparse.Namespace(
-        url="http://localhost:18081",
-        kubeconfig=tmp_path / "kubeconfig",
-        output=tmp_path / "evidence",
-        mock_port=0,
-    )
+    commands.side_effect = command
     with pytest.raises(RuntimeError, match="host setup failed"):
         await verifier.verify(args)
 
@@ -70,6 +120,30 @@ async def test_evidence_failure_still_removes_host_container(
     assert "host setup failed" in report["error"]
     assert report["mock_port"] > 0
     assert args.mock_port == 0
+
+
+@pytest.mark.parametrize("failure", ["container-removal", "mock-wait"])
+async def test_cleanup_failure_fails_successful_verification(verification, capsys, failure):
+    async def command(*args: str) -> str:
+        if failure == "container-removal" and args[:2] == ("docker", "rm"):
+            raise RuntimeError("Docker daemon unavailable")
+        return verification.commands.return_value
+
+    verification.commands.side_effect = command
+    if failure == "mock-wait":
+        verification.process.wait.side_effect = subprocess.TimeoutExpired("mock", 5)
+
+    with pytest.raises(RuntimeError, match="Required cleanup failed"):
+        await verification.verifier.verify(verification.args)
+
+    report = json.loads((verification.args.output / "report.json").read_text())
+    assert report["followup_turn_completed"] is True
+    assert report["passed"] is False
+    assert report["cleanup_error"]
+    assert "PASS:" not in capsys.readouterr().out
+    verification.commands.assert_any_await(
+        "docker", "rm", "-f", "omnigent-prototype-client-cleanup-"
+    )
 
 
 async def test_transient_pod_query_failure_is_retried() -> None:
