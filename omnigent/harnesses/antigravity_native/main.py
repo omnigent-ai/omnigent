@@ -1314,12 +1314,9 @@ async def _cold_start_agy_conversation(
             exc_info=True,
         )
         return
-    # Persist the real id (replacing the placeholder) so ``read_bridge_state``
-    # returns it and the reader/executor address the cold-started conversation.
-    # This cold-start runs CONCURRENTLY with the reader on the CLI path, whose
-    # placeholder recovery may have adopted agy's TUI-minted cascade already, so
-    # the write refuses to replace a real id: the headless StartCascade phantom
-    # must never overwrite that binding. Offloaded (file I/O).
+    # The reader runs concurrently on this path and its placeholder recovery may
+    # have adopted agy's TUI-minted cascade meanwhile; never replace a real id
+    # with the headless StartCascade phantom. Offloaded (file I/O).
     if not await asyncio.to_thread(
         update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
     ):

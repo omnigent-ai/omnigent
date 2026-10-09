@@ -834,7 +834,7 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
     return None
 
 
-def _recover_placeholder_cascade(bridge_dir: Path) -> str | None:
+def _recover_placeholder_cascade(bridge_dir: Path, *, warn_fallback: bool = True) -> str | None:
     """
     Adopt agy's TUI-minted cascade while bridge state still holds the placeholder.
 
@@ -845,6 +845,8 @@ def _recover_placeholder_cascade(bridge_dir: Path) -> str | None:
     session's own Gemini dir (a foreign agy writes to its own).
 
     :param bridge_dir: Native Antigravity bridge directory.
+    :param warn_fallback: Passed to the port resolver; ``False`` after the first
+        round so a restricted-``/proc`` fallback is reported once per discovery.
     :returns: The adopted cascade id (persisted), or ``None`` this round.
     """
     state = read_bridge_state(bridge_dir)
@@ -858,7 +860,9 @@ def _recover_placeholder_cascade(bridge_dir: Path) -> str | None:
         # A socket that is not on this host cannot scope the scan (and its pane
         # cannot have delivered a web turn from here); skip this round.
         return None
-    port = resolve_cold_start_agy_rpc_port(socket_path, info["tmux_target"])
+    port = resolve_cold_start_agy_rpc_port(
+        socket_path, info["tmux_target"], warn_fallback=warn_fallback
+    )
     if port is None:
         return None
     try:
@@ -902,9 +906,10 @@ async def _discover(
     *,
     poll_interval_s: float,
     stop: StopPredicate,
-) -> tuple[str, int, bool] | None:
+    on_adopted: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, int] | None:
     """
-    Resolve ``(cascade_id, port, adopted)``, polling until ready or asked to stop.
+    Resolve ``(cascade_id, port)``, polling until ready or asked to stop.
 
     Two stages, each "poll until ready, never guess": first the real cascade id
     from bridge state (past the launcher placeholder), then the connect-RPC port
@@ -917,6 +922,8 @@ async def _discover(
     (:func:`_recover_placeholder_cascade`, throttled to
     :data:`_PLACEHOLDER_RECOVERY_INTERVAL_S`) so the TUI-minted cascade a typed
     turn creates is adopted in place instead of deadlocking discovery forever.
+    ``on_adopted`` is awaited as soon as that adoption is persisted, before the
+    port resolves, so a reader restart in between cannot lose it.
 
     Readiness is checked BEFORE ``stop`` each round, so a discovery that resolves
     immediately consumes none of the caller's poll budget — ``stop`` is a
@@ -927,19 +934,24 @@ async def _discover(
     :param poll_interval_s: Seconds to wait between discovery polls.
     :param stop: Predicate consulted only when a round did NOT resolve; when it
         returns ``True`` the discovery loop gives up (the runner owns restart).
-    :returns: ``(cascade_id, port, adopted)`` once both resolve — ``adopted`` is
-        ``True`` when the placeholder-recovery scan wrote the id (the caller then
-        records it as the session's external id, since no rotation-based first
-        adoption will run for it) — or ``None`` if ``stop`` fired first.
+    :param on_adopted: Awaited once with the cascade id the recovery scan adopted;
+        the caller records it as the session's external id, since no
+        rotation-based first adoption will run for it.
+    :returns: ``(cascade_id, port)`` once both resolve, or ``None`` if ``stop``
+        fired before discovery completed.
     """
-    adopted = False
+    recovery_rounds = 0
     next_recovery_at = 0.0
     while True:
         cascade_id = await asyncio.to_thread(_resolve_cascade_id, bridge_dir)
         if cascade_id is None and time.monotonic() >= next_recovery_at:
             next_recovery_at = time.monotonic() + _PLACEHOLDER_RECOVERY_INTERVAL_S
-            cascade_id = await asyncio.to_thread(_recover_placeholder_cascade, bridge_dir)
-            adopted = adopted or cascade_id is not None
+            cascade_id = await asyncio.to_thread(
+                _recover_placeholder_cascade, bridge_dir, warn_fallback=recovery_rounds == 0
+            )
+            recovery_rounds += 1
+            if cascade_id is not None and on_adopted is not None:
+                await on_adopted(cascade_id)
         if cascade_id is not None:
             port = await asyncio.to_thread(_resolve_rpc_port, cascade_id)
             if port is not None:
@@ -949,7 +961,7 @@ async def _discover(
                     cascade_id,
                     port,
                 )
-                return cascade_id, port, adopted
+                return cascade_id, port
         if stop():
             return None
         await _sleep(poll_interval_s)
@@ -1139,15 +1151,17 @@ async def supervise_reader(
     """
     should_stop: StopPredicate = stop if stop is not None else (lambda: False)
 
-    discovered = await _discover(bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop)
+    async def _record_adopted(adopted_cascade_id: str) -> None:
+        # Placeholder recovery binds the TUI-minted conversation directly, so no
+        # rotation-based first adoption will record it for --resume.
+        await _record_external_session_id(client, session_id, adopted_cascade_id)
+
+    discovered = await _discover(
+        bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop, on_adopted=_record_adopted
+    )
     if discovered is None:
         return None
-    cascade_id, port, adopted = discovered
-    if adopted:
-        # Placeholder recovery bound the TUI-minted conversation directly, so no
-        # rotation-based first adoption will run for it; record it for --resume
-        # here, exactly as run_reader_with_bridge does on that path.
-        await _record_external_session_id(client, session_id, cascade_id)
+    cascade_id, port = discovered
 
     # One set of cross-poll/cross-frame trackers per reader run, shared by BOTH
     # the stream path and the poll fallback so a fall-through after a partial
