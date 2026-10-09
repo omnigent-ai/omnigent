@@ -4793,6 +4793,10 @@ async def _auto_create_codex_terminal(
     import socket as _socket
     from pathlib import Path
 
+    # A relaunch after an in-place upgrade must not import new code into an
+    # old process: the first launch loads the resume/fork module graph too.
+    import omnigent.harnesses.codex_native.main as _codex_native_main  # noqa: F401
+    import omnigent.harnesses.codex_native.process_registry as _process_registry  # noqa: F401
     from omnigent.harnesses.codex_native.app_server import (
         CodexAppServerClient,
         CodexAppServerResponseError,
