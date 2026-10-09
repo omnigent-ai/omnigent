@@ -388,8 +388,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
     scheduleFit();
   }, [scheduleFit, searchParams, viewerId]);
 
-  // Keep a restored project in the URL and remember explicit deep links once
-  // the project list confirms they are valid.
+  // Remember valid deep links and restore saved projects on bare visits.
+  // Run before the history effect updates previousCanvasParam, so Back to Main wins.
   useEffect(() => {
     if (
       !searchParams.has(CANVAS_QUERY_PARAM) &&
@@ -471,12 +471,14 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
         const next = container.getBoundingClientRect();
         if (!next.width || !next.height) return;
         if (loaded && viewportDirtyRef.current && previous.width && previous.height) {
-          const viewport = getViewport();
-          void setViewport({
+          const viewport = pendingViewportRef.current ?? getViewport();
+          const centered = {
             ...viewport,
             x: viewport.x + (next.width - previous.width) / 2,
             y: viewport.y + (next.height - previous.height) / 2,
-          });
+          };
+          if (pendingViewportRef.current) pendingViewportRef.current = centered;
+          else void setViewport(centered);
         } else if (loaded && !viewportDirtyRef.current) {
           fitCanvas();
         }

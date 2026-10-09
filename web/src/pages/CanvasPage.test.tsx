@@ -524,6 +524,53 @@ describe("CanvasPage", () => {
     await waitFor(() => expect(flowSetViewport).toHaveBeenLastCalledWith(alphaViewport));
   });
 
+  it("keeps a queued board centered when the pane resizes before its cards return", async () => {
+    let notifyResize: () => void = () => {};
+    let width = 1000;
+    let height = 800;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      () => new DOMRect(0, 0, width, height),
+    );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: () => void) {
+          notifyResize = callback;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    const rows = [conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })];
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
+    const { rerender } = render(pageTree("/canvas", true));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
+    flowApi.getViewport.mockReturnValue({ x: -80, y: 24, zoom: 0.75 });
+    act(() =>
+      (flowProps.current!.onMoveEnd as (event: MouseEvent) => void)(new MouseEvent("mouseup")),
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(2));
+    flowApi.getViewport.mockReturnValue({ x: 200, y: -100, zoom: 1.25 });
+
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows.slice(1)));
+    rerender(pageTree("/canvas", true));
+    fireEvent.click(screen.getByRole("tab", { name: "Main" }));
+    expect(flowSetViewport).not.toHaveBeenCalled();
+    vi.useFakeTimers();
+    width = 600;
+    height = 600;
+    act(() => {
+      notifyResize();
+      vi.advanceTimersByTime(100);
+    });
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
+    rerender(pageTree("/canvas", true));
+    expect(flowSetViewport).toHaveBeenLastCalledWith({ x: -280, y: -76, zoom: 0.75 });
+    expect(flowFitView).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps the panned center through successive resizes and hiding the pane", async () => {
     let notifyResize: () => void = () => {};
     let width = 1000;
