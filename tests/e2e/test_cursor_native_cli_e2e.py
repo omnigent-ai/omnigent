@@ -7,7 +7,7 @@ runner-owned tmux pane, and each web-UI turn is injected into that pane
 (bracketed paste + Enter) by
 :class:`omnigent.inner.cursor_native_executor.CursorNativeExecutor`. The TUI's
 own conversation store is tailed by
-:mod:`omnigent.cursor_native_forwarder`, which mirrors ``cursor-agent``'s
+:mod:`omnigent.harnesses.cursor_native.forwarder`, which mirrors ``cursor-agent``'s
 replies back onto the Omnigent conversation as assistant items.
 
 These tests drive the full stack the way a user does — spawn ``omnigent
@@ -69,7 +69,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.cursor_native_bridge import bridge_dir_for_session_id, kill_session
+from omnigent.harnesses.cursor_native.bridge import bridge_dir_for_session_id, kill_session
 from tests.e2e._native_resume_helpers import (
     PtyHandle,
     cli_env,

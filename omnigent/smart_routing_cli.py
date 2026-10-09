@@ -37,7 +37,7 @@ import httpx
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import builtin_agent_id
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
 #: Provenance label on a CLI-routed session. The server merges the wrapper's
 #: own presentation labels (``omnigent.ui`` / ``omnigent.wrapper``) over it.
@@ -153,7 +153,7 @@ def check_smart_routing_available(
         if state is None or state is True:
             continue
         if sources["oss"]:
-            # Off the gateway the AI Gateway's router cannot be applied here,
+            # Off the gateway the Unity Gateway's router cannot be applied here,
             # but the server's built-in one still answers.
             click.echo(
                 f"{harness} is not AI-Gateway-backed on this host — routing with the "
@@ -166,7 +166,7 @@ def check_smart_routing_available(
             f"Smart Routing is unavailable for {harness} on this host: its inference "
             f"is not AI-Gateway-backed ({reason}), so a routed model would not be "
             "reachable from the pane. Re-run without --smart-routing, or point the "
-            f"harness at the workspace AI Gateway (`{cli_invocation()} configure harnesses`)."
+            f"harness at the workspace Unity Gateway (`{cli_invocation()} configure harnesses`)."
         )
 
 

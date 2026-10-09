@@ -109,6 +109,9 @@ _ALT_COVERED: frozenset[str] = frozenset(
         "deep-research",
         # Covered by tests/e2e/omnigent/test_repl_overview_terminal_visibility.py.
         "terminal_workers",
+        # Covered by tests/e2e/test_subagent_tool_limit_e2e.py. Hyphenated
+        # name, so it can't use the ``test_example_<name>.py`` convention.
+        "subagent-tool-limit",
         # Pre-existing coverage gaps — ``chat_model`` is exercised
         # by ``web/``'s integration flow (``web/README.md`` leads
         # the dev-server README with it) and ``coding_supervisor_openai``
@@ -199,10 +202,13 @@ _ALT_COVERED: frozenset[str] = frozenset(
         "workspace-file-writer",
         # sdk-chat-builtin: single-YAML fixture loaded by name as the
         # fork-switch target in the native→SDK e2e tests
-        # (test_host_claude_native_fork_e2e.py, test_switch_agent_e2e.py,
-        # test_switch_agent_native_e2e.py, test_sessions_fork_e2e.py).
+        # (test_host_claude_native_fork_e2e.py, test_sessions_fork_e2e.py).
         "sdk-chat-builtin",
         "sandbox-deps-os-env",
+        # spawn-bounds-dispatch: parent+worker bundle loaded by
+        # tests/e2e/test_spawn_bounds_subagent_dispatch_e2e.py. Hyphenated
+        # name, so it can't use the ``test_example_<name>.py`` convention.
+        "spawn-bounds-dispatch",
     }
 )
 

@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.reasoning_effort import (
+from omnigent.util.reasoning_effort import (
     ANTHROPIC_EFFORTS,
     CODEX_EFFORTS,
     CODEX_NATIVE_EFFORTS,
@@ -237,7 +237,7 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     returns ``None`` (callers cannot classify it, so a filter must pass the
     value through rather than drop what a plugin harness might accept).
     """
-    from omnigent.reasoning_effort import GEMINI_EFFORTS, efforts_for_harness
+    from omnigent.util.reasoning_effort import GEMINI_EFFORTS, efforts_for_harness
 
     assert efforts_for_harness("claude-sdk") == ANTHROPIC_EFFORTS
     assert efforts_for_harness("claude-native") == ANTHROPIC_EFFORTS
@@ -245,6 +245,11 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     # pi declares its own family, so it resolves to a real vocabulary.
     assert efforts_for_harness("pi") == PI_EFFORTS
     assert efforts_for_harness("pi-native") == PI_EFFORTS
+    # codex-native drives the real codex process, which takes Sol's max/ultra;
+    # sharing the SDK codex family (capped at xhigh) dropped a session created
+    # at ultra to Codex's default before its first turn.
+    assert efforts_for_harness("codex-native") == CODEX_NATIVE_EFFORTS
+    assert efforts_for_harness("codex") == CODEX_EFFORTS
     # Known, but declared EffortFamily.NONE.
     assert efforts_for_harness("opencode-native") == frozenset()
     # Not in the registry at all — unclassifiable, not unsupported.
@@ -255,7 +260,7 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
 def test_efforts_for_harness_resolves_aliases() -> None:
     """An alias resolves to the same vocabulary as its canonical name."""
     from omnigent.harness_aliases import canonicalize_harness
-    from omnigent.reasoning_effort import efforts_for_harness
+    from omnigent.util.reasoning_effort import efforts_for_harness
 
     canonical = canonicalize_harness("claude-code") or "claude-code"
     assert efforts_for_harness("claude-code") == efforts_for_harness(canonical)

@@ -1,3 +1,11 @@
+> **Historical.** The built-in `devin-acp` row and its `omnigent.inner.devin`
+> dialect were removed in 0.14, replaced by the native wrap (`devin-native`, see
+> `docs/devin-native.md`). This document is kept for the design rationale: the
+> `AcpExtension` seam it describes is still the way a vendor layers an ACP
+> dialect, and the dialect itself is recoverable from git history — it was shaped
+> to lift into an `omnigent-devin` community plugin. A **user-configured**
+> `acp:devin` still works and is unaffected.
+
 # Devin (`acp:devin`) — architecture, state of the world, and follow-ups
 
 Devin (Cognition's `devin acp`) runs through Omnigent's **generic ACP harness** —

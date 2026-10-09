@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the Inbox page (`/inbox`) — the cross-session list of pending
 // approval prompts and unseen file comments.
 //
@@ -14,13 +18,17 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InboxPage } from "./InboxPage";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
+import {
+  isExplicitlyUnread,
+  resetReadStateForTests,
+  seedReadState,
+} from "@/hooks/useUnseenConversations";
 
 // Minimal ApprovalCard stub: renders the message and an Accept button that
 // forwards to the page's submit handler. The real card's form/preview UX is
@@ -30,18 +38,28 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     elicitationId,
     message,
     status,
+    allowAutoMode,
     onSubmit,
   }: {
     elicitationId: string;
     message: string;
     status: string;
-    onSubmit: (id: string, action: "accept" | "decline") => void;
+    allowAutoMode?: boolean;
+    onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
   }) => (
     <div data-testid="approval-card" data-status={status}>
       <span>{message}</span>
       <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
         Stub Accept
       </button>
+      {allowAutoMode && (
+        <button
+          type="button"
+          onClick={() => onSubmit(elicitationId, "accept", { allow_auto_mode: true })}
+        >
+          Stub Auto Mode
+        </button>
+      )}
     </div>
   ),
 }));
@@ -51,7 +69,11 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({ getSession: vi.fn(), approve: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  getSession: vi.fn(),
+  approve: vi.fn(),
+  fetchSessionItemsPage: vi.fn(),
+}));
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
@@ -106,9 +128,11 @@ function renderPage() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
-        <InboxPage />
-      </MemoryRouter>
+      <SidebarDataProvider>
+        <MemoryRouter>
+          <InboxPage />
+        </MemoryRouter>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -122,12 +146,46 @@ beforeEach(() => {
   vi.mocked(sessionsApi.approve).mockResolvedValue(
     {} as Awaited<ReturnType<typeof sessionsApi.approve>>,
   );
+  vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({ items: [], hasMore: false });
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  resetReadStateForTests();
+  localStorage.clear();
 });
+
+/** A finished session whose latest turn the viewer hasn't opened yet. */
+function unreadConversation(overrides: Partial<Conversation> = {}): Conversation {
+  const row = conversation({
+    id: "sess_unread",
+    title: "Unread Session",
+    status: "idle",
+    pending_elicitations_count: 0,
+    updated_at: 1_700_000_100,
+    ...overrides,
+  });
+  // Last seen before the turn finished — the sidebar dot's condition.
+  seedReadState([{ id: row.id, viewer_last_seen: row.updated_at - 100 }]);
+  return row;
+}
+
+function assistantReply(text: string) {
+  return {
+    id: "item_reply",
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text }],
+  } as unknown as Awaited<ReturnType<typeof sessionsApi.fetchSessionItemsPage>>["items"][number];
+}
+
+function selectTab(name: string) {
+  // Radix tabs activate on focus; jsdom's click doesn't move focus.
+  const tab = screen.getByRole("tab", { name });
+  fireEvent.focus(tab);
+  fireEvent.click(tab);
+}
 
 describe("InboxPage states", () => {
   it("shows a loading state while the session list is still loading", () => {
@@ -147,18 +205,17 @@ describe("InboxPage states", () => {
     expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
   });
 
-  it("does not show the empty state while more pages are still draining", () => {
+  it("offers manual loading when older sessions remain", () => {
     // WHY: `hasNextPage` keeps the inbox in the assembling state — an empty
     // `items` then only means "not done paging", so no empty state.
     vi.mocked(conversationsHook.useConversations).mockReturnValue(
       conversationsStub([], { hasNextPage: true }),
     );
     renderPage();
-    expect(screen.queryByText("Nothing waiting on you")).not.toBeInTheDocument();
-    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load more sessions" })).toBeInTheDocument();
   });
 
-  it("drains remaining list pages while mounted", () => {
+  it("loads additional scope pages only after a click", async () => {
     // WHY: an awaiting session may sit below the first page, so the inbox
     // calls fetchNextPage whenever another page is available.
     const fetchNextPage = vi.fn();
@@ -166,7 +223,9 @@ describe("InboxPage states", () => {
       conversationsStub([], { hasNextPage: true, fetchNextPage }),
     );
     renderPage();
-    expect(fetchNextPage).toHaveBeenCalled();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Load more sessions" }));
+    await waitFor(() => expect(fetchNextPage).toHaveBeenCalled());
   });
 });
 
@@ -240,6 +299,29 @@ describe("InboxPage approval items", () => {
     );
   });
 
+  it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
+    const row = conversation({ id: "parent" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_auto", "Claude needs permission", {
+          target_session_id: "child",
+          allow_auto_mode: true,
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Auto Mode" }));
+    await waitFor(() =>
+      expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_auto", {
+        action: "accept",
+        content: { allow_auto_mode: true },
+      }),
+    );
+    expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded");
+  });
+
   it("rolls back the optimistic verdict when approve() rejects", async () => {
     // WHY: a failed resolve POST deletes the responded entry so the card
     // returns to pending and the user can retry.
@@ -274,9 +356,11 @@ describe("InboxPage approval items", () => {
     });
     const { rerender } = render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <InboxPage />
-        </MemoryRouter>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -296,9 +380,11 @@ describe("InboxPage approval items", () => {
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([updatedRow]));
     rerender(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <InboxPage />
-        </MemoryRouter>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -329,8 +415,8 @@ describe("InboxPage approval items", () => {
 
 describe("InboxPage comments and errors", () => {
   it("renders unseen file comments with author, path, and body", async () => {
-    // WHY: the comment side of the inbox renders each unseen comment with its
-    // author pill, file path, and body, and counts it in the header summary.
+    // WHY: an unseen comment collapses to one row naming its author; expanding
+    // it shows the file path, body, and the deep link that marks it seen.
     vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
       commentInboxStub({
         items: [
@@ -351,11 +437,21 @@ describe("InboxPage comments and errors", () => {
     );
     renderPage();
 
-    expect(await screen.findByTestId("inbox-comment")).toBeInTheDocument();
-    expect(screen.getByText("alice")).toBeInTheDocument();
-    expect(screen.getByText("src/app.ts")).toBeInTheDocument();
-    expect(screen.getByText("Please reconsider this line.")).toBeInTheDocument();
-    expect(screen.getByText(/1 comment/)).toBeInTheDocument();
+    const item = await screen.findByTestId("inbox-comment");
+    expect(item).toHaveAttribute("data-expanded", "false");
+    // Collapsed: the author's avatar tile plus "author: body" in the preview.
+    expect(item).toHaveTextContent("alice: Please reconsider this line.");
+    expect(within(item).getByRole("img", { name: "Unread" })).toBeInTheDocument();
+    expect(screen.getByText("1 comment")).toBeInTheDocument();
+
+    fireEvent.click(within(item).getByRole("button", { name: /Comment: My Session/ }));
+    expect(item).toHaveAttribute("data-expanded", "true");
+    expect(within(item).getByText("src/app.ts")).toBeInTheDocument();
+    expect(within(item).getByText("Please reconsider this line.")).toBeInTheDocument();
+    expect(within(item).getByRole("link", { name: /Open file/ })).toHaveAttribute(
+      "href",
+      "/c/sess_1?file=src%2Fapp.ts&comment=cm_1",
+    );
   });
 
   it("shows the load-error banner and retries failed sources on click", async () => {
@@ -373,5 +469,225 @@ describe("InboxPage comments and errors", () => {
     expect(retryFailed).toHaveBeenCalled();
     // The error path also suppresses the empty state.
     expect(screen.queryByText("Nothing waiting on you")).not.toBeInTheDocument();
+  });
+});
+
+describe("InboxPage unread sessions", () => {
+  it("lists a session with unseen output, previewing its latest reply", async () => {
+    // WHY: agents often finish with output that needs follow-up but raise no
+    // approval; the inbox surfaces the same sessions the sidebar dots.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({
+      items: [assistantReply("Refactor finished; 3 files changed.")],
+      hasMore: false,
+    });
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    expect(item).toHaveAttribute("data-kind", "done");
+    expect(within(item).getByText("Unread Session")).toBeInTheDocument();
+    expect(
+      await within(item).findByText(/Refactor finished; 3 files changed\./),
+    ).toBeInTheDocument();
+    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledWith("sess_unread", { limit: 12 });
+    expect(screen.getByText("1 unread")).toBeInTheDocument();
+    expect(screen.queryByText("Nothing waiting on you")).not.toBeInTheDocument();
+  });
+
+  it("labels a failed unseen turn as an error", async () => {
+    const row = unreadConversation({ status: "failed" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    expect(item).toHaveAttribute("data-kind", "error");
+    expect(within(item).getByText("Error")).toBeInTheDocument();
+  });
+
+  it("leaves sessions the viewer has already read out of the inbox", async () => {
+    const row = conversation({ id: "sess_read", status: "idle", pending_elicitations_count: 0 });
+    seedReadState([{ id: row.id, viewer_last_seen: row.updated_at }]);
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
+    expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument();
+  });
+
+  it("expands to the session actions and drops the row on Mark as read", async () => {
+    // WHY: marking read writes the shared read-state mirror, which the page
+    // subscribes to — the row must clear at once, not on the next list poll.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    expect(item).toHaveAttribute("data-expanded", "false");
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    expect(item).toHaveAttribute("data-expanded", "true");
+    expect(within(item).getByRole("link", { name: /Open session/ })).toHaveAttribute(
+      "href",
+      "/c/sess_unread",
+    );
+
+    fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+    expect(screen.getByText("Nothing waiting on you")).toBeInTheDocument();
+  });
+
+  it("clears an explicitly marked-unread session when opened from the inbox", async () => {
+    // WHY: a freshly mounted chat keeps an explicit "Mark as unread" override,
+    // so Open session must mark the session read itself or the row lingers.
+    const row = conversation({
+      id: "sess_flagged",
+      title: "Flagged Session",
+      status: "idle",
+      pending_elicitations_count: 0,
+    });
+    seedReadState([{ id: row.id, viewer_last_seen: row.updated_at - 1, viewer_unread: true }]);
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Flagged Session/ }));
+    fireEvent.click(within(item).getByRole("link", { name: /Open session/ }));
+
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+    expect(isExplicitlyUnread("sess_flagged")).toBe(false);
+  });
+
+  it("re-surfaces a row collapsed after it was expanded and marked read", async () => {
+    // WHY: the expand toggle is dropped on read, so a later reply on the same
+    // session lands collapsed like any new unread row.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={queryClient}>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
+
+    const item = await screen.findByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+
+    // A new reply lands after the read baseline (which is anchored at "now").
+    const replied = { ...row, updated_at: Math.floor(Date.now() / 1000) + 60 };
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([replied]));
+    rerender(tree());
+
+    expect(await screen.findByTestId("inbox-unread")).toHaveAttribute("data-expanded", "false");
+  });
+
+  it("keeps the row usable when its preview fetch fails", async () => {
+    // WHY: a missing preview isn't a load failure — the row still renders
+    // without one, raises no error banner, and can be marked read.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockRejectedValue(new Error("boom"));
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    // The preview query retries once before settling into its error state.
+    await waitFor(() => expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(2), {
+      timeout: 3_000,
+    });
+    expect(item).toHaveTextContent("Unread Session");
+    expect(item).not.toHaveTextContent("—");
+    expect(screen.queryByTestId("inbox-load-error")).not.toBeInTheDocument();
+
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+  });
+});
+
+describe("InboxPage recency groups", () => {
+  it("interleaves kinds newest first under recency headers", async () => {
+    // WHY: items of every kind share one timeline, so a fresh reply sits
+    // above an older approval — the approval still opens by default.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const approvalRow = conversation({
+      id: "sess_approval",
+      title: "Approval Session",
+      updated_at: nowSeconds - 3 * 86_400,
+    });
+    const unreadRow = unreadConversation({ updated_at: nowSeconds - 30 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([approvalRow, unreadRow]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    await screen.findByTestId("inbox-item");
+    const regions = screen.getAllByRole("region");
+    expect(regions.map((r) => r.getAttribute("aria-label"))).toEqual(["Just now", "This week"]);
+    expect(within(regions[0]).getByTestId("inbox-unread")).toBeInTheDocument();
+    expect(within(regions[1]).getByTestId("inbox-item")).toHaveAttribute("data-expanded", "true");
+    // The header pill totals every kind; its label spells out the breakdown.
+    expect(screen.getByText("1 approval · 1 unread")).toBeInTheDocument();
+  });
+});
+
+describe("InboxPage filter tabs", () => {
+  function renderMixedInbox() {
+    const approvalRow = conversation({ id: "sess_approval", title: "Approval Session" });
+    const unreadRow = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([approvalRow, unreadRow]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+  }
+
+  it("shows every kind under All, then narrows to one kind per tab", async () => {
+    renderMixedInbox();
+    expect(await screen.findByTestId("inbox-item")).toBeInTheDocument();
+    expect(screen.getByTestId("inbox-unread")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
+
+    selectTab("Awaiting response");
+    expect(screen.getByTestId("inbox-item")).toBeInTheDocument();
+    expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument();
+
+    selectTab("Unread");
+    expect(screen.getByTestId("inbox-unread")).toBeInTheDocument();
+    expect(screen.queryByTestId("inbox-item")).not.toBeInTheDocument();
+    // The header still totals every kind, so other tabs' contents stay visible.
+    expect(screen.getByText("1 approval · 1 unread")).toBeInTheDocument();
+  });
+
+  it("restores the persisted tab on the next visit", async () => {
+    renderMixedInbox();
+    await screen.findByTestId("inbox-item");
+    selectTab("Unread");
+    expect(localStorage.getItem("omnigent:inbox-filter")).toBe("unread");
+    cleanup();
+
+    renderMixedInbox();
+    expect(screen.getByRole("tab", { name: "Unread" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByTestId("inbox-unread")).toBeInTheDocument();
+    expect(screen.queryByTestId("inbox-item")).not.toBeInTheDocument();
+  });
+
+  it("shows a tab-specific empty state", async () => {
+    renderPage();
+    await screen.findByText("Nothing waiting on you");
+    selectTab("Unread");
+    expect(screen.getByText("You’re all caught up")).toBeInTheDocument();
+    selectTab("Awaiting response");
+    expect(screen.getByText("No approvals waiting")).toBeInTheDocument();
   });
 });

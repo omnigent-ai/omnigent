@@ -10,10 +10,20 @@ from pathlib import Path
 from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.artifacts import RankedIssue, rank_issues
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.classification import Classification, Classifier
-from issue_prioritization.comments import build_triage_comment
+from issue_prioritization.classification import (
+    MAX_BUG_REVIEW_CHARACTERS,
+    Classification,
+    Classifier,
+)
+from issue_prioritization.comments import build_code_only_comment, build_triage_comment
 from issue_prioritization.config import ScoringConfig
-from issue_prioritization.github import GitHubClient, GitHubMutationSink
+from issue_prioritization.duplicates import rank_candidates
+from issue_prioritization.github import (
+    DUPLICATE_COMMENT_MARKER,
+    GitHubClient,
+    GitHubMutationSink,
+)
+from issue_prioritization.intake import IntakePlan, plan_intake, read_maintainers
 from issue_prioritization.labels import LabelManifest
 from issue_prioritization.model_serving import serving_endpoint_classifier
 from issue_prioritization.mutations import (
@@ -25,6 +35,33 @@ from issue_prioritization.mutations import (
 )
 from issue_prioritization.pipeline import PipelineMode, PipelineRun
 from issue_prioritization.scoring import ScoreEngine
+
+_CLOSURE_EXEMPT_LABELS = {"security", "duplicate", "pinned"}
+
+
+def apply_code_only_closure(client: GitHubClient, classification: Classification) -> str:
+    if not classification.source_only_quote:
+        raise ValueError("Closure requires a code-only assessment")
+    number = classification.issue_number
+    for comment_posted in (False, True):
+        live = client.open_issue(number, full_author_history=True)
+        if (
+            live is None
+            or live.content().content_hash != classification.content_hash
+            or _CLOSURE_EXEMPT_LABELS.intersection(label.casefold() for label in live.labels)
+        ):
+            if comment_posted:
+                client.upsert_issue_comment(
+                    number, build_code_only_comment(classification, skipped=True)
+                )
+            return "skipped_stale"
+        if not comment_posted:
+            client.upsert_issue_comment(number, build_code_only_comment(classification))
+    client.close_issue(number)
+    # Keep reply-driven triage active until closure succeeds.
+    if "needs-info" in live.labels:
+        client.apply_labels(number, (), ("needs-info",))
+    return "applied"
 
 
 class MemoryBotStateRepository:
@@ -105,6 +142,7 @@ def write_event_artifacts(
     model_endpoint: str,
     source_revision: str,
     labels_before: tuple[str, ...],
+    intake_plan: IntakePlan | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(json.dumps(config.as_dict(), indent=2) + "\n")
@@ -116,6 +154,7 @@ def write_event_artifacts(
         source_revision,
         labels_before,
         status="planned",
+        intake_plan=intake_plan,
     )
 
 
@@ -132,6 +171,7 @@ def write_event_status(
     plan: MutationPlan | None = None,
     decision: RankedIssue | None = None,
     applied_bot_state: BotState | None = None,
+    intake_plan: IntakePlan | None = None,
 ) -> None:
     plan = plan or run.mutations[0]
     decision = decision or run.ranked[0]
@@ -178,6 +218,7 @@ def write_event_status(
         ),
         "labels_before": list(labels_before),
         "labels_after": list(labels_after) if labels_after is not None else None,
+        "intake": _intake_payload(intake_plan) if intake_plan is not None else None,
     }
     (output_dir / "event.json").write_text(json.dumps(payload, indent=2) + "\n")
     (output_dir / "mutations.json").write_text(
@@ -236,6 +277,20 @@ def _bot_state_payload(state: BotState) -> dict[str, object]:
     }
 
 
+def _intake_payload(plan: IntakePlan) -> dict[str, object]:
+    return {
+        "labels_add": list(plan.labels_add),
+        "labels_remove": list(plan.labels_remove),
+        "assignee": plan.assignee,
+        "duplicate_decision": plan.duplicate_decision,
+        "duplicate_of": plan.duplicate_of,
+        "similar_issues": list(plan.similar_issues),
+        "duplicate_confidence": plan.duplicate_confidence,
+        "post_duplicate_comment": bool(plan.duplicate_comment),
+        "close_as_duplicate": plan.close_as_duplicate,
+    }
+
+
 def _write_skip_artifact(output_dir: Path, run_id: str, issue_number: int, reason: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -260,6 +315,10 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--source-revision", default="")
     parser.add_argument("--mode", choices=list(PipelineMode), default=PipelineMode.DRY_RUN)
+    parser.add_argument("--intake", action="store_true")
+    parser.add_argument("--maintainers", type=Path)
+    parser.add_argument("--close-duplicates", action="store_true")
+    parser.add_argument("--post-duplicate-comments", action="store_true")
     args = parser.parse_args()
     if args.issue_number <= 0:
         raise ValueError("issue_number must be positive")
@@ -268,24 +327,115 @@ def main() -> None:
     if not token:
         raise RuntimeError("GITHUB_TOKEN is required")
     client = GitHubClient(token, args.github_repo)
-    issue = client.open_issue(args.issue_number)
+    issue = client.open_issue(args.issue_number, full_author_history=True)
     if issue is None:
         _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, "issue_not_open")
         print(f"Skipping #{args.issue_number}: issue is not open")
+        return
+    if len(issue.title) + len(issue.body) > MAX_BUG_REVIEW_CHARACTERS:
+        _write_skip_artifact(args.output_dir, args.run_id, issue.number, "bug_review_too_large")
+        print(f"Skipping #{issue.number}: report exceeds the review limit; manual review required")
         return
     config = ScoringConfig.default()
     areas = AreaCatalog.from_json(args.areas)
     manifest = LabelManifest.from_json(args.label_manifest)
     mode = PipelineMode(args.mode)
+    if args.intake and args.maintainers is None:
+        raise ValueError("--maintainers is required with --intake")
+    # Reclassification needs the same related-issue context as initial intake.
+    try:
+        corpus = list(client.issue_corpus())
+    except Exception as error:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "event.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source": "github_actions",
+                    "run_id": args.run_id,
+                    "mode": mode.value,
+                    "status": "failed",
+                    "issue_number": issue.number,
+                    "source_revision": args.source_revision,
+                    "operation": "fetch_related_issues",
+                    "error_type": type(error).__name__,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        raise
+    duplicate_candidates = tuple(
+        rank_candidates(
+            {"number": issue.number, "title": issue.title, "body": issue.body},
+            corpus,
+            repository=args.github_repo,
+        )
+    )
     run, classification, planner, states = prioritize_issue(
         issue,
-        serving_endpoint_classifier(args.model_endpoint, areas),
+        serving_endpoint_classifier(
+            args.model_endpoint,
+            areas,
+            duplicate_candidates=duplicate_candidates,
+            review_bugs=True,
+        ),
         config,
         areas,
         manifest,
         args.run_id,
         mode,
     )
+    if classification.source_only_quote:
+        status = (
+            "skipped_exempt"
+            if _CLOSURE_EXEMPT_LABELS.intersection(label.casefold() for label in issue.labels)
+            else "planned"
+        )
+        try:
+            if status == "planned" and mode == PipelineMode.APPLY:
+                status = "apply_unknown"
+                status = apply_code_only_closure(client, classification)
+        finally:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            (args.output_dir / "event.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "source": "github_actions",
+                        "run_id": args.run_id,
+                        "mode": mode.value,
+                        "status": status,
+                        "issue_number": issue.number,
+                        "model_endpoint": args.model_endpoint,
+                        "source_revision": args.source_revision,
+                        "content_hash": classification.content_hash,
+                        "operation": "close_as_not_planned",
+                        "reasoning": classification.reasoning,
+                        "source_only_quote": classification.source_only_quote,
+                        "proposed_comment": build_code_only_comment(classification),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        print(f"Issue #{issue.number}: code-only closure {status}, mode={mode.value}")
+        return
+    intake_plan = None
+    if args.intake:
+        live_issue = client.issue_data(issue.number)
+        intake_plan = plan_intake(
+            issue,
+            classification,
+            areas,
+            duplicate_candidates,
+            _label_names(live_issue),
+            _assignee_names(live_issue),
+            read_maintainers(args.maintainers),
+            client.assignee_load(),
+            close_duplicates=args.close_duplicates,
+            post_duplicate_comments=args.post_duplicate_comments,
+        )
     write_event_artifacts(
         args.output_dir,
         run,
@@ -294,6 +444,7 @@ def main() -> None:
         args.model_endpoint,
         args.source_revision,
         issue.labels,
+        intake_plan,
     )
     decision = run.ranked[0]
     if mode == PipelineMode.APPLY:
@@ -323,6 +474,8 @@ def main() -> None:
             ).apply_with_plans(run)
             if len(applied_plans) != 1:
                 raise RuntimeError("targeted apply must produce exactly one mutation plan")
+            if intake_plan is not None:
+                _apply_intake(client, issue.number, intake_plan)
             labels_after = client.issue_labels(issue.number)
         except Exception:
             write_event_status(
@@ -335,6 +488,7 @@ def main() -> None:
                 status="apply_unknown",
                 plan=applied_plans[0] if applied_plans else None,
                 applied_bot_state=states.load().get(issue.number),
+                intake_plan=intake_plan,
             )
             raise
         decision = _rank_issue(
@@ -356,6 +510,7 @@ def main() -> None:
             plan=applied_plans[0],
             decision=decision,
             applied_bot_state=states.load().get(issue.number),
+            intake_plan=intake_plan,
         )
     print(
         f"Issue #{issue.number}: impact={decision.issue.impact.value}, "
@@ -369,6 +524,48 @@ def _planned_labels_after(item: RankedIssue, plan: MutationPlan) -> tuple[str, .
     labels = {current_priority.value} if current_priority else set()
     labels = (labels - set(plan.labels_remove)) | set(plan.labels_add)
     return tuple(sorted(labels))
+
+
+def _apply_intake(client: GitHubClient, issue_number: int, plan: IntakePlan) -> None:
+    if plan.labels_add or plan.labels_remove:
+        client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
+    if plan.duplicate_comment:
+        client.comment_on_issue_once(
+            issue_number,
+            DUPLICATE_COMMENT_MARKER,
+            plan.duplicate_comment,
+        )
+    live_issue = client.issue_data(issue_number)
+    if live_issue.get("state") != "open":
+        return
+    if plan.assignee and not _assignee_names(live_issue):
+        client.assign_issue(issue_number, plan.assignee)
+    if (
+        plan.close_as_duplicate
+        and plan.duplicate_of is not None
+        and client.issue_data(issue_number).get("state") == "open"
+    ):
+        client.close_as_duplicate(issue_number, plan.duplicate_of)
+
+
+def _label_names(issue: dict[str, object]) -> tuple[str, ...]:
+    labels = issue.get("labels", [])
+    if not isinstance(labels, list):
+        return ()
+    return tuple(
+        str(label["name"]) for label in labels if isinstance(label, dict) and label.get("name")
+    )
+
+
+def _assignee_names(issue: dict[str, object]) -> tuple[str, ...]:
+    assignees = issue.get("assignees", [])
+    if not isinstance(assignees, list):
+        return ()
+    return tuple(
+        str(assignee["login"])
+        for assignee in assignees
+        if isinstance(assignee, dict) and assignee.get("login")
+    )
 
 
 if __name__ == "__main__":

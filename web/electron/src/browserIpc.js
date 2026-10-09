@@ -256,7 +256,13 @@ function makeDesignModeInputHandler(gestureState) {
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  */
-function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent }) {
+function registerBrowserIpc({
+  ipcMain,
+  isPinnedOriginSender,
+  getRegistryForEvent,
+  getAgentContextForEvent = () => null,
+  getAgentNavigationHintForEvent = () => null,
+}) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -291,7 +297,13 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    const r = g.registry.openOrNavigate(conversationId, url, bounds, {
+      force: !!opts?.force,
+      agent: !!opts?.agent,
+      // The first-party renderer supplies the source-session host; main owns
+      // the target and eligibility. Caller exception flags never establish identity.
+      agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+    });
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
@@ -302,7 +314,12 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    return { ok: r.ok, created: r.created ?? false, error: r.error };
+    const hint = !r.ok && opts?.agent ? getAgentNavigationHintForEvent(event, url) : null;
+    return {
+      ok: r.ok,
+      created: r.created ?? false,
+      error: hint ? `${r.error} ${hint}` : r.error,
+    };
   });
 
   // Attach the named conversation's view to the host window (detaching the
@@ -323,6 +340,21 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const r = g.registry.setSuppressed(!!args?.suppressed);
     return { ok: r.ok, error: r.error };
+  });
+
+  // Intercept embedded-page Ctrl+Tab only while a compatible renderer is
+  // subscribed; older server UIs must retain ownership of the shortcut.
+  ipcMain.handle("omnigent:browser-set-recent-session-switch-supported", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.setRecentSessionSwitchSupported(!!args?.supported);
+  });
+
+  // A supported renderer can still decline the gesture when no sessions exist.
+  ipcMain.handle("omnigent:browser-cancel-recent-session-switch", (event) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.cancelRecentSessionSwitch();
   });
 
   // Reposition the active conversation's view to freshly-measured bounds.
@@ -381,7 +413,13 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     const g = gateRegistry(event);
     if (g.error) return { exists: false };
     const { conversationId } = args ?? {};
-    return { exists: typeof conversationId === "string" && g.registry.has(conversationId) };
+    const entry = typeof conversationId === "string" ? g.registry.get(conversationId) : null;
+    if (!entry) return { exists: false };
+    return {
+      exists: true,
+      url: entry.view.webContents.getURL(),
+      ...readNavState(entry.view.webContents),
+    };
   });
 
   // Destroy the conversation's view (explicit close — unmount only detaches).

@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   DEFAULT_SUBMIT_WITH_MOD_ENTER,
+  isComposerAltNewlineKey,
   isComposerSendKey,
+  isComposerSteerAllKey,
   parseSubmitWithModEnter,
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
@@ -65,5 +67,49 @@ describe("isComposerSendKey", () => {
       false,
     );
     expect(isComposerSendKey({ key: "Enter", metaKey: true }, true, true)).toBe(false);
+  });
+});
+
+describe("isComposerAltNewlineKey", () => {
+  it("is Alt/Option+Enter, with or without Shift", () => {
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true })).toBe(true);
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, shiftKey: true })).toBe(true);
+    expect(isComposerAltNewlineKey({ key: "Enter" })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "Enter", shiftKey: true })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "a", altKey: true })).toBe(false);
+  });
+
+  it("leaves Ctrl/Cmd chords (including AltGr) and composition alone", () => {
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, ctrlKey: true })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, metaKey: true })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, isComposing: true })).toBe(false);
+  });
+});
+
+describe("isComposerSteerAllKey", () => {
+  it("is Command/Ctrl+Enter in default mode", () => {
+    expect(isComposerSteerAllKey({ key: "Enter" }, false, false)).toBe(false);
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, false, false)).toBe(true);
+    expect(isComposerSteerAllKey({ key: "Enter", ctrlKey: true }, false, false)).toBe(true);
+    expect(
+      isComposerSteerAllKey({ key: "Enter", ctrlKey: true, shiftKey: true }, false, false),
+    ).toBe(false);
+  });
+
+  it("moves to Command/Ctrl+Shift+Enter when Mod+Enter already sends", () => {
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, true, false)).toBe(false);
+    expect(
+      isComposerSteerAllKey({ key: "Enter", metaKey: true, shiftKey: true }, true, false),
+    ).toBe(true);
+  });
+
+  it("never fires from composition, Alt chords, or mobile", () => {
+    expect(
+      isComposerSteerAllKey({ key: "Enter", metaKey: true, isComposing: true }, false, false),
+    ).toBe(false);
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true, altKey: true }, false, false)).toBe(
+      false,
+    );
+    expect(isComposerSteerAllKey({ key: "Enter", metaKey: true }, false, true)).toBe(false);
   });
 });

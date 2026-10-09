@@ -1,3 +1,9 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the optimistic delete-session flow in the sidebar. The
 // contract: clicking "Delete" in the confirm dialog fires the mutation,
 // closes the dialog, and leaves the row alone — the mutation itself
@@ -9,7 +15,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Controllable delete mutation, declared via vi.hoisted so the vi.mock
@@ -25,37 +30,10 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => mocks.del,
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  // Rename/archive are wired on the row but not exercised here; minimal
-  // stubs keep the row from crashing on mount.
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return { ...conversationHooksMock(), useStopAndDeleteConversation: () => mocks.del };
+});
 
 // Heavy sibling widgets in the sidebar pull their own hooks/providers;
 // stub them so this test stays scoped to the conversation row.
@@ -79,40 +57,8 @@ const CONV: Conversation = {
 };
 
 function mockConversations(conversations: Conversation[]) {
-  const dataResult = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
-  // The sidebar fetches a single undifferentiated session list.
-  useConvMock.mockImplementation(() => dataResult);
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
-    </QueryClientProvider>,
-  );
+  const result = conversationPage(conversations);
+  useConvMock.mockImplementation(() => result);
 }
 
 /** Open the row's action dropdown and click the "Delete" menu item. */
@@ -262,14 +208,16 @@ function renderSidebarRouted(path: string) {
   );
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[path]}>
-          <Routes>
-            <Route path="/" element={tree} />
-            <Route path="/c/:conversationId" element={tree} />
-          </Routes>
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[path]}>
+            <Routes>
+              <Route path="/" element={tree} />
+              <Route path="/c/:conversationId" element={tree} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

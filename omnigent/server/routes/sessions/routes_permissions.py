@@ -12,11 +12,13 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.db.account_authority import target_account_scope
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -168,16 +170,18 @@ def register_permissions_routes(
                     "Public access is limited to read-only (level 1)",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
-        if existing is not None and existing.level == LEVEL_OWNER:
-            raise OmnigentError(
-                "Cannot modify owner permissions",
-                code=ErrorCode.FORBIDDEN,
+        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
+        with target_account_scope(body.user_id, target.account_generation if target else None):
+            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+            if existing is not None and existing.level == LEVEL_OWNER:
+                raise OmnigentError(
+                    "Cannot modify owner permissions",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
+            perm = await asyncio.to_thread(
+                permission_store.grant, body.user_id, session_id, body.level
             )
-        await asyncio.to_thread(permission_store.ensure_user, body.user_id)
-        perm = await asyncio.to_thread(
-            permission_store.grant, body.user_id, session_id, body.level
-        )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
@@ -371,7 +375,13 @@ def _policy_description(spec: PolicySpec) -> str | None:
     return None
 
 
-def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
+def _to_agent_object(
+    agent: Agent,
+    cache: AgentCache | None,
+    *,
+    mcp_servers_editable: bool,
+    terminals_override: list[str] | None = None,
+) -> AgentObject:
     """
     Convert a runtime :class:`Agent` entity to an API-layer
     :class:`AgentObject`.
@@ -385,6 +395,10 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
 
     :param agent: The runtime agent entity.
     :param cache: Agent cache, or ``None`` in test setups.
+    :param terminals_override: Selected host's shell inventory. Applied only
+        when the loaded spec is a recognized native wrapper.
+    :param mcp_servers_editable: Whether the authenticated caller may mutate
+        MCP configuration for the session serving this object.
     :returns: An :class:`AgentObject` for the API response.
     """
     mcp_servers: list[MCPServerSummary] = []
@@ -402,18 +416,24 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
     if cache is not None:
         try:
             loaded = cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             )
             harness = loaded.spec.executor.harness_kind
             if description is None:
                 description = loaded.spec.description
             # Declared terminal names, in spec order — the Web UI
             # gates its "new terminal" affordance on this list.
-            terminals = list(loaded.spec.terminals or {})
-            # Bundled skills only (mirrors GET /v1/agents); the merged
-            # bundled + host-discovered set lives on the session snapshot.
+            terminals = (
+                list(terminals_override)
+                if terminals_override is not None
+                and native_coding_agent_for_agent_name(loaded.spec.name) is not None
+                else list(loaded.spec.terminals or {})
+            )
+            # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description) for s in loaded.spec.skills
+                SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
+                for s in loaded.spec.skills
+                if s.user_invocable
             ]
             mcp_servers = [
                 MCPServerSummary(
@@ -458,7 +478,9 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
         harness=harness,
         mcp_servers=mcp_servers,
         mcp_servers_editable=(
-            agent.session_id is not None and not (harness or "").endswith("-native")
+            mcp_servers_editable
+            and agent.session_id is not None
+            and not (harness or "").endswith("-native")
         ),
         policies=policies,
         skills=skills,

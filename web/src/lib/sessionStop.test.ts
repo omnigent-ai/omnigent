@@ -73,4 +73,26 @@ describe("isSessionStoppable", () => {
     // No label, no host → hidden; undefined labels must not throw.
     expect(isSessionStoppable({ labels: undefined, hostId: null, runnerId: null })).toBe(false);
   });
+
+  it("is true for a devin-native session with a local runner", () => {
+    // devin rides the runner's uniform stop map, which kills its tmux pane, so
+    // Stop works without a host to kill the runner through.
+    expect(
+      isSessionStoppable({
+        labels: { "omnigent.wrapper": "devin-native-ui" },
+        hostId: null,
+        runnerId: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("is false for a devin-native sub-agent (parent owns the kill)", () => {
+    expect(
+      isSessionStoppable({
+        labels: { "omnigent.wrapper": "devin-native-ui-subagent" },
+        hostId: null,
+        runnerId: null,
+      }),
+    ).toBe(false);
+  });
 });

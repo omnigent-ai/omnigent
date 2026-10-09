@@ -91,7 +91,12 @@ SELF_EXCLUSIONS = {"omnigent"}
 # The upstream macOS wheels statically link re2 and abseil, so they need no build
 # toolchain and no brewed `abseil` (whose ABI breaks on most releases, which
 # would force a formula `revision` bump every time it moved).
-WHEEL_REQUIRED = {"google-re2"}
+#
+# pillow's sdist needs libjpeg/zlib headers at build time, and the formula
+# declares no jpeg `depends_on`, so a source build always dies in Homebrew's
+# superenv ("RequiredDependencyException: ... jpeg"). A wheel miss must fail
+# generation loudly rather than pin an sdist that breaks every `brew install`.
+WHEEL_REQUIRED = {"google-re2", "pillow"}
 
 # Compiled extensions we PREFER to take as an upstream wheel, falling back to the
 # sdist when no compatible wheel exists (e.g. right after a python@X.Y bump,
@@ -111,7 +116,6 @@ PREFER_WHEEL = {
     "grpcio",
     "httptools",
     "markupsafe",
-    "pillow",
     "protobuf",
     "pyyaml",
     "regex",

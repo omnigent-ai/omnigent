@@ -15,6 +15,7 @@
  * into a login redirect.
  */
 
+import { stripBasePath, withBasePath } from "./basePath";
 import { getCachedServerInfo } from "./capabilities";
 import { getOmnigentHostConfig, hostFetch, isDatabricksWorkspace } from "./host";
 import {
@@ -37,12 +38,8 @@ let currentUserId: string | null = null;
 // must carry that host_id to reach the replica holding the tunnel.
 const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
 
-// Server error code (errors.py ErrorCode.WRONG_REPLICA) returned when a keyed
-// request reached a replica that doesn't hold the session's host tunnel — the
-// key doesn't match where the tunnel lives. The request is valid, just
-// misrouted, so we re-address it ONCE without the key and route by the default.
-// Distinct from "runner_unavailable" (the runner is offline everywhere), which
-// no re-addressing can fix.
+// The request is valid but reached a replica without its host tunnel.
+// Unlike runner_unavailable, wrong_replica can recover by re-addressing.
 const WRONG_REPLICA_CODE = "wrong_replica";
 
 /**
@@ -56,11 +53,12 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  *   {@link getSessionHost}; ``hostId`` is ``null`` when the session hasn't been
  *   loaded yet → send NO key (the modal host would be a wrong guess for a
  *   specific session; a keyless miss re-addresses instead).
+ * - ``/v1/skills`` → the query's ``host_id`` or the host for ``session_id``.
  * - everything else (session lists, ``/v1/sessions/updates``, ``/health``) is a
  *   cross-host / DB-backed read → ``{scoped: false}``, where the modal host is a
  *   legitimate cache-affinity hint.
  *
- * The two host-scoped families are an ALLOWLIST of what exists today (verified:
+ * The host-scoped families are an ALLOWLIST of what exists today (verified:
  * ``/v1/sessions/{id}/agent`` is under the sessions prefix, and
  * ``/v1/runners/{id}`` isn't called from the client). A new host-scoped route
  * must be added here to key by its own host; the regression test pins the known
@@ -68,7 +66,20 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  */
 type UrlHostScope = { scoped: true; hostId: string | null } | { scoped: false };
 
+function skillsParamsForUrl(url: string): URLSearchParams | null {
+  const match = url.match(/\/v1\/skills(?:\?([^#]*))?(?:#.*)?$/);
+  return match ? new URLSearchParams(match[1] ?? "") : null;
+}
+
 function hostScopeForUrl(url: string): UrlHostScope {
+  const skills = skillsParamsForUrl(url);
+  if (skills) {
+    const sessionId = skills.get("session_id");
+    return {
+      scoped: true,
+      hostId: sessionId ? getSessionHost(sessionId) : skills.get("host_id") || null,
+    };
+  }
   const hostMatch = url.match(/\/v1\/hosts\/([^/?#]+)/);
   if (hostMatch) return { scoped: true, hostId: decodeURIComponent(hostMatch[1]) };
   const sessionMatch = url.match(/\/v1\/sessions\/([^/?#]+)/);
@@ -100,8 +111,16 @@ function hostScopeForUrl(url: string): UrlHostScope {
 // imported) so identity.ts keeps no import dependency on sessionsApi.ts, which
 // imports `authenticatedFetch` from here — importing back would be a cycle.
 
-/** Seeds the session→host map for one session id (registered at bootstrap). */
-type SessionHostResolver = (sessionId: string) => Promise<void>;
+/** Options for resolving a session's routing host. */
+export interface SessionHostResolveOptions {
+  /** Refresh a hostless snapshot after a managed host has been assigned. */
+  force?: boolean;
+}
+
+type SessionHostResolver = (
+  sessionId: string,
+  options?: SessionHostResolveOptions,
+) => Promise<void>;
 let _sessionHostResolver: SessionHostResolver | null = null;
 
 /**
@@ -120,11 +139,9 @@ export function setSessionHostResolver(resolver: SessionHostResolver | null): vo
 // share ONE in-flight resolve (cleared on settle) rather than each firing a
 // snapshot.
 const _hostResolveInFlight = new Map<string, Promise<void>>();
-// Sessions already bootstrapped this page (success OR failure). A genuinely
-// hostless session keeps `getSessionHost(id) === null` forever, and a bad-id /
-// transient failure would too — so without this guard every later sub-path
-// request would re-resolve. host_id is fixed for a session's life, so one attempt
-// per session per page load is enough.
+const _hostRefreshInFlight = new Map<string, Promise<void>>();
+// Avoid repeated lookups for hostless sessions. A managed launch can assign
+// its host later, so an explicit routing miss may force a fresh lookup.
 const _hostResolveAttempted = new Set<string>();
 
 // A session SUB-path: /v1/sessions/{id}/<something>. The `\/[^?#]` after the id
@@ -140,10 +157,9 @@ const SESSION_SUBPATH_RE = /\/v1\/sessions\/([^/?#]+)\/[^?#]/;
  * keys correctly on the first attempt. Returns the in-flight resolve to await,
  * or `null` when there's nothing to do — callers only await a non-null result.
  *
- * No-op (returns `null`) unless a host fetcher is installed AND a resolver is
- * registered, or when the host is already known / was already attempted this
- * page. Best-effort: a resolver throw (bad id / transient) leaves the map
- * unseeded and callers fall through to their modal/keyless path.
+ * Normal lookups require an embedded fetcher and run once per session/page.
+ * A routing miss may force a fresh hostless lookup, including workspace dev
+ * mode. Known hosts are reused; resolver failures remain best-effort.
  *
  * Concurrent callers in one tick share ONE resolve: the first creates the
  * promise synchronously through the `.set()`, the rest read and await it. Both
@@ -151,25 +167,48 @@ const SESSION_SUBPATH_RE = /\/v1\/sessions\/([^/?#]+)\/[^?#]/;
  * WS route through here, so a terminal that mounts alongside its first HTTP
  * request joins that request's resolve rather than firing a second snapshot.
  */
-export function resolveSessionHost(sessionId: string): Promise<void> | null {
-  if (!getOmnigentHostConfig().fetcher || _sessionHostResolver === null) return null;
-  // Host already known (warm map from the list-seed / a prior resolve), or we
-  // already tried once this page — nothing to do.
-  if (getSessionHost(sessionId) !== null || _hostResolveAttempted.has(sessionId)) return null;
-  let inFlight = _hostResolveInFlight.get(sessionId);
+export function resolveSessionHost(
+  sessionId: string,
+  options: SessionHostResolveOptions = {},
+): Promise<void> | null {
+  if (
+    _sessionHostResolver === null ||
+    (!getOmnigentHostConfig().fetcher && !(options.force && isDatabricksWorkspace()))
+  )
+    return null;
+  if (getSessionHost(sessionId) !== null) return null;
+  const refresh = _hostRefreshInFlight.get(sessionId);
+  if (refresh !== undefined) return refresh;
+  if (!options.force && _hostResolveAttempted.has(sessionId)) return null;
+  const pending = options.force ? _hostRefreshInFlight : _hostResolveInFlight;
+  let inFlight = pending.get(sessionId);
   if (inFlight === undefined) {
     const resolver = _sessionHostResolver;
-    inFlight = resolver(sessionId)
+    // A pre-provisioning lookup may still be running; finish it before forcing
+    // a fresh read, while concurrent routing misses share this refresh.
+    const lookup = options.force
+      ? Promise.resolve(_hostResolveInFlight.get(sessionId)).then(() =>
+          resolver(sessionId, { force: true }),
+        )
+      : resolver(sessionId);
+    inFlight = lookup
       .catch(() => {
         // Best-effort — leave the map unseeded and fall through to modal/keyless.
       })
       .finally(() => {
         _hostResolveAttempted.add(sessionId);
-        _hostResolveInFlight.delete(sessionId);
+        pending.delete(sessionId);
       });
-    _hostResolveInFlight.set(sessionId, inFlight);
+    pending.set(sessionId, inFlight);
   }
   return inFlight;
+}
+
+function sessionIdForHostResolve(url: string): string | null {
+  const skillsSessionId = skillsParamsForUrl(url)?.get("session_id");
+  if (skillsSessionId) return skillsSessionId;
+  const match = url.match(SESSION_SUBPATH_RE);
+  return match === null ? null : decodeURIComponent(match[1]);
 }
 
 /**
@@ -180,25 +219,32 @@ export function resolveSessionHost(sessionId: string): Promise<void> | null {
  * microtask hop (a fetch still dispatches synchronously, as before the gate).
  */
 function beginSessionHostResolve(url: string): Promise<void> | null {
-  const match = url.match(SESSION_SUBPATH_RE);
-  if (match === null) return null;
-  return resolveSessionHost(decodeURIComponent(match[1]));
+  const sessionId = sessionIdForHostResolve(url);
+  return sessionId === null ? null : resolveSessionHost(sessionId);
 }
 
+// Requests whose target host lives in a JSON body, not the URL, so
+// {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
+// and the host-mediated local import (POST /v1/imports/local[/stream]).
+const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
+
 /**
- * The create endpoint (``POST /v1/sessions``) carries its target host_id in the
- * request body, not the URL, so {@link hostScopeForUrl} can't see it. Left unkeyed,
- * the create round-robins and can miss the replica holding the host's runner
- * tunnel — the server notifies the runner inline over that pod-local tunnel, so
- * an off-replica create fails with "runner is offline". Recover the host_id from
- * a JSON create body so the create is pinned like every other host-scoped
- * request. Bundled (multipart) creates are hostless here — they only write rows
- * and bind the runner via a separate ``POST /v1/hosts/{id}/runners`` — and a
- * sandbox create carries ``host_type`` but no ``host_id``; both yield null.
+ * Recover the target host_id from a JSON request body for a body-host-keyed
+ * request ({@link isBodyHostKeyedRequest}), or null when the body names none.
+ *
+ * These requests carry the host in the body, not the URL, so left unkeyed they
+ * round-robin and can miss the replica holding that host's runner tunnel. A
+ * session create fails "runner is offline" (the server notifies the runner
+ * inline over its pod-local tunnel); an import fails "host is not connected"
+ * (the import reads the host's transcripts over that same tunnel). Keying by the
+ * body host_id pins both to the right replica like every other host-scoped
+ * request. Bundled (multipart) creates are hostless here (non-string body) and a
+ * managed-sandbox create carries ``host_type`` but no ``host_id``; both yield
+ * null → unkeyed (see {@link isBodyHostKeyedRequest}).
  */
-function hostIdForCreateBody(url: string, body: BodyInit | null | undefined): string | null {
+function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
   if (typeof body !== "string") return null;
-  if (!/\/v1\/sessions(?:\?|$)/.test(url)) return null;
+  if (!BODY_HOST_KEYED_RE.test(url)) return null;
   try {
     const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
@@ -208,29 +254,25 @@ function hostIdForCreateBody(url: string, body: BodyInit | null | undefined): st
 }
 
 /**
- * Whether this request is a session create keyable only by its own body host_id.
+ * Whether this request is keyable only by its own body host_id, never the modal.
  *
- * A MANAGED SANDBOX create should never ride the modal host. The modal is a
- * cache-affinity hint for reads, but a create has a side effect pinned to a
- * replica: the managed launch task it spawns lives on whichever pod served it,
- * and that task needs the new host's tunnel in its LOCAL registry to send
- * ``host.launch_runner``. A managed create carries no ``host_id`` (the host does
- * not exist yet), so keying it to the modal host routes the launch task to a
- * replica unrelated to the session — the sandbox boots, its tunnel registers on
- * the default replica, and the launch task never sees it, so no runner is ever
- * spawned. Unkeyed, the create lands on the same default replica the host will
- * dial back to.
+ * The modal host is a cache-affinity hint for reads, but these requests have a
+ * side effect pinned to a replica and must key by their OWN target host:
  *
- * A create that NAMES a host in its body keeps its key (see
- * {@link hostIdForCreateBody}) — that host is a real target whose runner the
- * server notifies inline over its pod-local tunnel, so an off-replica create
- * would fail. A bundled (multipart) create has a non-string body and so is not
- * matched here: it only writes rows and binds the runner via a separate
- * ``POST /v1/hosts/{id}/runners`` (which keys itself from the URL), so it spawns
- * no replica-pinned launch task and may keep riding the modal.
+ * - A managed create has no host_id yet and stays unkeyed. If the new host
+ *   connects elsewhere, its first message must resolve the assigned host and
+ *   re-address after wrong_replica. A create that names a host keeps that key.
+ * - A local import reads the chosen host's transcripts over its tunnel, which is
+ *   registered on the replica keyed by that host_id — never the importing user's
+ *   modal host (null / a different host for a fresh user), which is why an
+ *   unkeyed import lands off-replica and 409s "host is not connected".
+ *
+ * A bundled (multipart) create has a non-string body and is not matched: it only
+ * writes rows and binds the runner via a separate ``POST /v1/hosts/{id}/runners``
+ * (keyed from the URL), so it spawns no replica-pinned work and may ride the modal.
  */
-function isSessionCreate(url: string, body: BodyInit | null | undefined): boolean {
-  return typeof body === "string" && /\/v1\/sessions(?:\?|$)/.test(url);
+function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
+  return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -265,7 +307,7 @@ function redirectToLogin(loginUrl: string): boolean {
   if (loginRedirectPending) return false;
   loginRedirectPending = true;
   const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
-  window.location.href = `${loginUrl}?return_to=${returnTo}`;
+  window.location.href = `${withBasePath(loginUrl)}?return_to=${returnTo}`;
   return true;
 }
 
@@ -295,7 +337,10 @@ export function isLoginRedirectPending(): boolean {
  * every mode.
  */
 function isOnLoginPath(): boolean {
-  const path = window.location.pathname;
+  // Compare against base-relative paths so the guard still recognizes the
+  // login/register pages when served under a subpath proxy (e.g.
+  // `/proxy/6767/login`).
+  const path = stripBasePath(window.location.pathname);
   return path === "/login" || path === "/register" || path.startsWith("/auth/login");
 }
 
@@ -440,14 +485,15 @@ export async function authenticatedFetch(
     // host isn't known yet must send NO key rather than the modal — the modal
     // is the wrong guess for a SPECIFIC session, so it would route to a replica
     // that doesn't hold the tunnel; a keyless miss re-addresses instead. Only
-    // an unscoped route (list / updates) may ride the modal — a JSON create may
-    // not (see {@link isSessionCreate}): it is keyable ONLY by its own body
-    // host_id, so a managed sandbox create (no host_id yet) stays unkeyed.
+    // an unscoped route (list / updates) may ride the modal — a JSON request
+    // whose target host is in the body may not (see {@link isBodyHostKeyedRequest}):
+    // it is keyable ONLY by that body host_id (a managed create with none stays
+    // unkeyed).
     const scope = hostScopeForUrl(url);
     if (scope.scoped) {
       derivedHostId = scope.hostId;
-    } else if (isSessionCreate(url, init?.body)) {
-      derivedHostId = hostIdForCreateBody(url, init?.body);
+    } else if (isBodyHostKeyedRequest(url, init?.body)) {
+      derivedHostId = hostIdFromBody(url, init?.body);
     } else {
       derivedHostId = modalHostId();
     }
@@ -491,15 +537,35 @@ export async function authenticatedFetch(
       headers: retryHeaders,
       cache: "no-store",
     });
-    // Sticky demotion: the keyless re-address PROVED this host routes keyless
-    // (the keyed attempt returned wrong_replica, the keyless one didn't).
-    // Remember it so every later request for this host — including the control
-    // paths with no server-side wrong-replica guard — goes keyless from the
-    // start. Evidence-based: we demote only on a keyless SUCCESS, so a
-    // correctly-keyed host having a transient blip (whose keyless re-address
-    // would also fail) is never stranded.
-    if (derivedHostId && !(await _isWrongReplica(res))) {
+    // Only a successful keyless retry proves this host uses the default replica.
+    // Failed retries must preserve the host key for subsequent requests.
+    if (derivedHostId && res.ok) {
       markHostKeyless(derivedHostId);
+    }
+  } else if (
+    derivedHostId === null &&
+    !headers.has(SLICE_KEY_HEADER) &&
+    isDatabricksWorkspace() &&
+    (await _isWrongReplica(res))
+  ) {
+    // The first managed message can outlive provisioning and acquire a host.
+    // Refresh its original hostless lookup, then retry once on that host.
+    const sessionId = sessionIdForHostResolve(url);
+    if (sessionId !== null) {
+      init?.signal?.throwIfAborted();
+      await resolveSessionHost(sessionId, { force: true });
+      init?.signal?.throwIfAborted();
+      const hostId = getSessionHost(sessionId);
+      if (hostId !== null) {
+        clearHostKeyless(hostId);
+        const retryHeaders = new Headers(headers);
+        retryHeaders.set(SLICE_KEY_HEADER, hostId);
+        res = await hostFetch(url, {
+          ...init,
+          headers: retryHeaders,
+          cache: "no-store",
+        });
+      }
     }
   } else if (
     derivedHostId &&

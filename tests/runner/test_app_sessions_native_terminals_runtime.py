@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import json
+import logging
+import shlex
 import shutil
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -14,19 +18,18 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from omnigent import (
-    codex_native_bridge,
-    cursor_native_bridge,
-    kiro_native_bridge,
-)
-from omnigent.antigravity_native_bridge import (
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.antigravity_native.bridge import (
     is_placeholder_conversation_id as bridge_mod_is_placeholder,
 )
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
 )
-from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -37,6 +40,10 @@ from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+)
+from omnigent.runner.session_init_protocol import (
+    RunnerSessionInitEnvelope,
+    RunnerSessionInitSnapshot,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
@@ -158,6 +165,11 @@ async def test_create_session_threads_workspace_to_pi_cwd(
 ) -> None:
     """Pi pre-spawn receives the session workspace, not the bundle dir."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
+    # which on a multi-profile Databricks dev box otherwise 400s the create
+    # with "match <host>; use --profile" (issue #4279).
+    monkeypatch.setenv("HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "config-home"))
     session_id = "18f39ab73f49285e4dab0c80ff7b8455"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
@@ -226,6 +238,11 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
 ) -> None:
     """Pi pre-spawn falls back to runner workspace when session workspace is empty."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    # Isolate $HOME too: ambient provider detection reads ~/.databrickscfg,
+    # which on a multi-profile Databricks dev box otherwise 400s the create
+    # with "match <host>; use --profile" (issue #4279).
+    monkeypatch.setenv("HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "config-home"))
     session_id = "3f1d20a97a7d0ba93e02cf17aeb92367"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
@@ -315,7 +332,14 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
+            del timeout, params
             return httpx.Response(200, json=session_json, request=httpx.Request("GET", url))
 
     assert (
@@ -325,9 +349,87 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
 
 
 @pytest.mark.asyncio
+async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocking builder dependency must not stop the runner's event loop."""
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+
+    loop = asyncio.get_running_loop()
+    lookup_started = asyncio.Event()
+    lookup_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        loop.call_soon_threadsafe(lookup_started.set)
+        loop_progressed.append(lookup_release.wait(timeout=1.0))
+
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _bridge_dir: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "codex")
+    monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
+    monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
+    monkeypatch.setattr(codex_app_mod, "_databricks_gateway_host", resolve_host)
+    monkeypatch.setattr(
+        codex_app_mod,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
+            [], model, "test-profile"
+        ),
+    )
+
+    task = asyncio.create_task(
+        _auto_create_codex_terminal(
+            uuid.uuid4().hex,
+            cast(SessionResourceRegistry, object()),
+            lambda _session_id, _event: None,
+            server_client=cast(httpx.AsyncClient, NullServerClient()),
+        )
+    )
+    try:
+        await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
+        lookup_release.set()
+        with pytest.raises(OSError, match="profile 'test-profile'"):
+            await task
+    finally:
+        lookup_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert loop_progressed == [True], "profile resolution blocked the runner's event loop"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "permission_args", "retain_subscription"),
+    [
+        ((0, 153, 1), ["--config", "approval_policy=on-request"], False),
+        ((0, 154, 0), [], True),
+        (None, [], True),
+    ],
+)
+@pytest.mark.parametrize("cancel_launch", [False, True])
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int, int] | None,
+    permission_args: list[str],
+    retain_subscription: bool,
+    cancel_launch: bool,
+    use_envelope: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Runner-owned Codex launch consumes persisted args and thread id.
@@ -344,7 +446,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harness_startup_config as startup_config_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
@@ -354,7 +457,35 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    session_reap_calls: list[Path] = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda bridge_dir: session_reap_calls.append(bridge_dir),
+    )
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    caplog.set_level(logging.INFO, logger="omnigent.runner.native.orchestration")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+    launch_snapshot = RunnerSessionInitSnapshot(
+        created_at=10,
+        updated_at=11,
+        terminal_launch_args=["--config", "approval_policy=on-request"],
+        model_override="gpt-5.4-mini",
+        reasoning_effort="high",
+        external_session_id=thread_id,
+    ).model_dump(mode="json")
+    session_init = (
+        RunnerSessionInitEnvelope.model_validate(
+            {
+                "protocol_version": 2,
+                "server_version": "test",
+                "session_id": session_id,
+                "agent_id": "agent_codex",
+                "snapshot": launch_snapshot,
+            }
+        )
+        if use_envelope
+        else None
+    )
     codex_native_bridge.write_bridge_state(
         bridge_dir,
         codex_native_bridge.CodexNativeBridgeState(
@@ -396,16 +527,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     request=httpx.Request("GET", url),
                 )
             assert url == f"/v1/sessions/{session_id}", kwargs
+            assert not use_envelope, "Codex init must use the supplied launch metadata"
             return httpx.Response(
                 200,
-                json={
-                    "terminal_launch_args": [
-                        "--config",
-                        "approval_policy=on-request",
-                    ],
-                    "model_override": "gpt-5.4-mini",
-                    "external_session_id": thread_id,
-                },
+                json=launch_snapshot,
                 request=httpx.Request("GET", url),
             )
 
@@ -413,7 +538,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
-        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+        codex_cli_version = version
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -421,6 +546,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
             self.started = False
+            self.closed = False
             # Provider/model -c overrides the runner forwards to the
             # --remote TUI; empty here (no profile in this test).
             self.config_overrides: list[str] = []
@@ -435,9 +561,18 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         async def close(self) -> None:
             """:returns: None."""
+            self.closed = True
 
     app_server = _FakeCodexAppServer()
     build_calls: list[dict[str, Any]] = []
+    resolve_calls: list[dict[str, Any]] = []
+    real_resolve_launch = codex_app_mod.resolve_native_codex_launch
+
+    def _recording_resolve_launch(**kwargs: Any) -> codex_app_mod.NativeCodexLaunch:
+        resolve_calls.append(kwargs)
+        return real_resolve_launch(**kwargs)
+
+    monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", _recording_resolve_launch)
 
     def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
         """
@@ -446,6 +581,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         :param kwargs: Keyword arguments passed by the runner helper.
         :returns: Fake app-server.
         """
+        assert session_reap_calls == [bridge_dir]
         build_calls.append(kwargs)
         app_server.codex_home = kwargs["codex_home"]
         return app_server
@@ -478,6 +614,13 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         async def close(self) -> None:
             """:returns: None."""
 
+    class _RetainedClient:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    retained_client = _RetainedClient()
     launched_specs: list[Any] = []
 
     class _FakeResourceRegistry:
@@ -507,7 +650,16 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert terminal_name == "codex"
             assert session_key == "main"
             assert resource_role == CODEX_NATIVE_TERMINAL_ROLE
+            assert not retained_client.closed
+            assert effort_calls == [(thread_id, "high", None)], (
+                "settings controls must not see the bridge until resume effort is applied"
+            )
+            preloaded_state = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert preloaded_state is not None
+            assert preloaded_state.thread_id == thread_id
             launched_specs.append(spec)
+            if cancel_launch:
+                raise asyncio.CancelledError
             return SessionResourceView(
                 id="terminal_codex_main",
                 type="terminal",
@@ -518,13 +670,23 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str, list[str] | None]] = []
+    effort_calls: list[tuple[str, str, object]] = []
+
+    async def _fake_apply_effort(
+        transport: str, loaded_thread_id: str, effort: str, **kwargs: Any
+    ) -> None:
+        effort_calls.append(
+            (loaded_thread_id, effort, codex_native_bridge.read_bridge_state(bridge_dir))
+        )
 
     async def _fake_preload_thread(
         transport: str,
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
-    ) -> None:
+        retain_client: bool = False,
+        cwd: Path | None = None,
+    ) -> Any:
         """
         Record preloading of the known Codex thread.
 
@@ -537,6 +699,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "loaded the resume thread"
         )
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
+        assert isinstance(cwd, Path)
+        assert retain_client is retain_subscription
+        return retained_client if retain_client else None
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """
@@ -554,7 +719,18 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    monkeypatch.setattr(codex_app_mod, "apply_codex_thread_effort", _fake_apply_effort)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_config",
+        lambda _cfg: (None, {"codex-native": {"command": "codex-wrapper"}}),
+    )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_args",
+        lambda _harness, args, *, cfg: ["codex", "--", *args],
+    )
 
     agent_spec = AgentSpec(
         spec_version=1,
@@ -567,12 +743,28 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
 
     try:
+        if cancel_launch:
+            with pytest.raises(asyncio.CancelledError):
+                await _auto_create_codex_terminal(
+                    session_id,
+                    _FakeResourceRegistry(),  # type: ignore[arg-type]
+                    lambda _sid, event: published_events.append(event),
+                    agent_spec=agent_spec,
+                    server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+                    session_init=session_init,
+                )
+            assert retained_client.closed is retain_subscription
+            assert app_server.closed
+            assert not forward_calls
+            assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            return
         terminal_view = await _auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, event: published_events.append(event),
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+            session_init=session_init,
         )
         await asyncio.sleep(0)
     finally:
@@ -587,24 +779,54 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
+    assert build_calls[0]["reconcile_process_registry"] is False
     assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    # Persisted pass-through args must reach launch resolution (--profile layering).
+    assert resolve_calls and all(
+        call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
+        for call in resolve_calls
+    )
     assert len(launched_specs) == 1
     launched = launched_specs[0]
-    assert launched.command == "/opt/codex/bin/codex"
-    assert launched.args[0] == "--dangerously-bypass-hook-trust"
-    assert launched.args[1:4] == [
-        "--config",
-        "approval_policy=on-request",
+    assert launched.command == "codex-wrapper"
+    # Older TUIs still need permission flags; Codex 0.154+ rejects them.
+    assert launched.args == [
+        "codex",
+        "--",
+        "-c",
+        "check_for_update_on_startup=false",
+        "--dangerously-bypass-hook-trust",
+        *permission_args,
         "resume",
+        "--remote",
+        app_server.listen_url,
+        thread_id,
     ]
-    assert launched.args[4] == "--remote"
-    assert launched.args[5].startswith("ws://127.0.0.1:")
-    assert launched.args[6] == thread_id
+    assert app_server.listen_url is not None
+    assert app_server.listen_url.startswith("ws://127.0.0.1:")
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
+    # A kept pane is what lets the exit event carry Codex's exit status and
+    # final screen; without it an early exit is just "no server running".
+    assert launched.keep_alive_after_exit is True
+    launch_events = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "codex_terminal_launch"
+    ]
+    assert len(launch_events) == 1
+    assert launch_events[0].session_id == session_id
+    assert launch_events[0].attributes["command"] == "codex-wrapper"
+    assert launch_events[0].attributes["resume"] is True
+    from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
+
+    assert launch_events[0].attributes["args"] == shlex.join(
+        redact_codex_launch_args(launched.args)
+    )
+    from omnigent.harnesses.codex_native.app_server import _format_codex_version
+
+    assert launch_events[0].attributes["codex_cli_version"] == _format_codex_version(version)
     assert preload_calls == [
         (
             app_server.listen_url,
@@ -626,6 +848,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "bridge_dir": bridge_dir,
             "codex_ws_url": app_server.listen_url,
             "thread_id": thread_id,
+            "client": retained_client if retain_subscription else None,
+            # The forwarder tears down only the app-server this launch started.
+            "app_server": app_server,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
@@ -636,6 +861,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     # Codex executor starts turns with the runner process's own cwd, so
     # web-driven shell tools run from the wrong directory.
     assert bridge_state.cwd == str(tmp_path / "workspace")
+    # Resume state is published before the configured wrapper starts, so the
+    # executor never needs a startup-timeout marker for this path.
+    assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) is None
+    assert "bridge state is preloaded" in caplog.text
+    assert "no bridge-state wait extension is needed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -657,9 +887,12 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
-    from omnigent import codex_native
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.codex_native import main as codex_native
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
     from omnigent.runner import app as runner_app_mod
     from omnigent.stores.conversation_store import (
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -708,16 +941,29 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     class _ForkSnapshotClient:
         """Server client returning a forked clone snapshot (no thread id)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Return the clone's snapshot carrying fork labels but no thread id.
 
             :param url: Request path, e.g. ``"/v1/sessions/8aedf63f5e4046ae21b35fec5b35da50"``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: HTTP 200 response with fork labels.
             """
             del timeout
             assert url == f"/v1/sessions/{session_id}"
+            assert params == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
             return httpx.Response(
                 200,
                 json={
@@ -730,16 +976,26 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
                 request=httpx.Request("GET", url),
             )
 
-        async def patch(self, url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        async def patch(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Record the pre-set external_session_id PATCH.
 
             :param url: Request path.
             :param json: PATCH body, e.g. ``{"external_session_id": "..."}``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot response projection flags.
             :returns: HTTP 200 response.
             """
             del timeout
+            assert url == f"/v1/sessions/{session_id}"
+            assert params == {"include_usage": "false"}
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -837,6 +1093,8 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -915,29 +1173,36 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "source_thread",
-    [None, "019e96aa-0be2-7343-8d3b-6f914d60936b"],
-    ids=["sdk-source", "missing-codex-rollout"],
+    ("source_thread", "forked"),
+    [(None, True), ("019e96aa-0be2-7343-8d3b-6f914d60936b", True), (None, False)],
+    ids=["sdk-source", "missing-codex-rollout", "cli-import"],
 )
 async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_resumes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source_thread: str | None,
+    forked: bool,
 ) -> None:
-    """A forked codex clone builds from items when its source rollout is unavailable.
+    """A carry-history codex session builds from items when no source rollout exists.
 
-    This covers both a non-Codex source with no source thread id and an imported
-    Codex source whose rollout lives outside Omnigent's private ``CODEX_HOME``.
+    This covers a non-Codex source with no source thread id, an imported Codex
+    source whose rollout lives outside Omnigent's private ``CODEX_HOME``, and a
+    ``session import`` copy that has import labels but no fork source.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param source_thread: Optional unavailable source Codex thread id.
+    :param forked: Whether the session is a fork clone or a CLI import copy.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
-    from omnigent import codex_native
-    from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.harnesses.codex_native import main as codex_native
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
     from omnigent.runner import app as runner_app_mod
+    from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -974,15 +1239,22 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
             :param url: Request path — the session snapshot or its items.
             :param timeout: Request timeout (snapshot fetch).
-            :param params: Query params (items fetch pagination).
+            :param params: Snapshot flags or items fetch pagination.
             :returns: HTTP 200 response.
             """
             del timeout
             if url == f"/v1/sessions/{session_id}":
-                labels = {
-                    FORK_SOURCE_LABEL_KEY: source_id,
-                    FORK_CARRY_HISTORY_LABEL_KEY: "1",
+                assert params == {
+                    "include_items": "false",
+                    "include_liveness": "false",
+                    "include_usage": "false",
+                    "include_live_status": "false",
                 }
+                labels = {FORK_CARRY_HISTORY_LABEL_KEY: "1"}
+                if forked:
+                    labels[FORK_SOURCE_LABEL_KEY] = source_id
+                else:
+                    labels[IMPORT_SOURCE_LABEL_KEY] = "codex"
                 if source_thread is not None:
                     labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = source_thread
                 return httpx.Response(
@@ -1010,16 +1282,26 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
                 request=httpx.Request("GET", url),
             )
 
-        async def patch(self, url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        async def patch(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Record the pre-set external_session_id PATCH.
 
             :param url: Request path.
             :param json: PATCH body, e.g. ``{"external_session_id": "..."}``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot response projection flags.
             :returns: HTTP 200 response.
             """
             del timeout
+            assert url == f"/v1/sessions/{session_id}"
+            assert params == {"include_usage": "false"}
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -1108,6 +1390,8 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -1199,7 +1483,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harness_startup_config as startup_config_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner import app as runner_app_mod
 
@@ -1230,20 +1515,28 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             codex_home=str(tmp_path / "stale-codex-home"),
         ),
     )
+    codex_native_bridge.write_bridge_startup_timeout(bridge_dir, 120.0)
 
     class _WorktreeSnapshotClient:
         """Server client whose session snapshot carries a worktree workspace."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """
             Return the session snapshot with a worktree ``workspace``.
 
             :param url: Request path, e.g.
                 ``"/v1/sessions/54e4d4410c43954c11e702f5a8646483"``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: HTTP 200 response carrying the worktree workspace.
             """
-            del timeout
+            del timeout, params
             assert url == f"/v1/sessions/{session_id}"
             return httpx.Response(
                 200,
@@ -1308,6 +1601,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         async def close(self) -> None:
             """:returns: None."""
 
+    discovery_observations: list[tuple[dict[str, Any], Any, float | None]] = []
+
     async def _fake_discover_thread_and_forward(**kwargs: Any) -> None:
         """
         Stand in for the fresh-session discovery forwarder.
@@ -1315,10 +1610,12 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         :param kwargs: Forwarder keyword arguments.
         :returns: None.
         """
-        assert kwargs["bridge_dir"] == bridge_dir
-        assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
-            "fresh Codex launch must clear stale bridge state before the "
-            "discovery forwarder publishes the new thread"
+        discovery_observations.append(
+            (
+                kwargs,
+                codex_native_bridge.read_bridge_state(bridge_dir),
+                codex_native_bridge.read_bridge_startup_timeout(bridge_dir),
+            )
         )
 
     launch_captured: dict[str, Any] = {}
@@ -1369,6 +1666,16 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "_codex_discover_thread_and_forward",
         _fake_discover_thread_and_forward,
     )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_config",
+        lambda _cfg: (None, {}),
+    )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_args",
+        lambda _harness, args, *, cfg: list(args),
+    )
 
     # agent_spec is a ResolvedSpec whose workdir is the bundle dir — the
     # exact value the old code wrongly used as the cwd. Its os_env declares
@@ -1405,6 +1712,16 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     finally:
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
+    assert len(discovery_observations) == 1
+    discover_kwargs, observed_state, observed_timeout = discovery_observations[0]
+    assert discover_kwargs["bridge_dir"] == bridge_dir
+    assert observed_state is None, (
+        "fresh Codex launch must clear stale bridge state before the "
+        "discovery forwarder publishes the new thread"
+    )
+    assert observed_timeout is None
+    assert discover_kwargs["thread_start_timeout_seconds"] is None
+
     # The Codex app-server cwd must be the worktree (resolved — the launch
     # config normalizes with expanduser().resolve()). A failure here means
     # the workspace resolution regressed: the bundle dir means the old
@@ -1431,13 +1748,250 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     # session behind Codex's terminal-only hook review screen. Omnigent's
     # supported Codex floor is newer than the release that added this flag.
     assert app_server.codex_cli_version is None
-    assert launch_captured["spec"].args[0] == "--dangerously-bypass-hook-trust"
+    assert launch_captured["spec"].args[:3] == [
+        "-c",
+        "check_for_update_on_startup=false",
+        "--dangerously-bypass-hook-trust",
+    ]
 
 
 @pytest.mark.asyncio
+async def test_auto_create_codex_terminal_fresh_launch_loads_relaunch_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh Codex launch loads the module graph a later relaunch needs.
+
+    The runner process is long-lived and upgraded in place. A resume/fork
+    relaunch that imports a module for the first time after the files on
+    disk changed pulls NEW code into the OLD process and dies on names the
+    old graph lacks (ImportError at launch). Loading the graph on the first
+    launch — which takes no resume branch — keeps the relaunch on modules
+    the process already holds.
+
+    :param tmp_path: Temporary directory for isolated bridge state.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.harness_startup_config as startup_config_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.runner import app as runner_app_mod
+
+    session_id = "3f5b8d1e2a4c6b7d8e9f0a1b2c3d4e5f"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    class _FreshSnapshotClient:
+        """Server client whose snapshot describes a brand-new session."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return a session snapshot with no native thread to resume.
+
+            :param url: Request path, e.g.
+                ``"/v1/sessions/3f5b8d1e2a4c6b7d8e9f0a1b2c3d4e5f"``.
+            :param kwargs: Request keyword arguments.
+            :returns: HTTP 200 response carrying a fresh launch config.
+            """
+            del kwargs
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "model_override": None,
+                    "external_session_id": None,
+                },
+                request=httpx.Request("GET", url),
+            )
+
+    class _FakeCodexAppServer:
+        """Minimal app-server object used by ``codex_terminal_env``."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
+
+        def __init__(self) -> None:
+            """:returns: None."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "codex-home"
+            self.listen_url: str | None = None
+            self.config_overrides: list[str] = []
+
+        async def start(self) -> None:
+            """:returns: None."""
+
+        async def close(self) -> None:
+            """:returns: None."""
+
+    app_server = _FakeCodexAppServer()
+
+    class _FakeDiscoveryClient:
+        """App-server client for the fresh-thread discovery path."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """:returns: None."""
+
+        async def close(self) -> None:
+            """:returns: None."""
+
+    class _FakeResourceRegistry:
+        """Resource registry that accepts the launched terminal."""
+
+        async def launch_auxiliary_terminal(self, **kwargs: Any) -> SessionResourceView:
+            """
+            Return a terminal resource view for the launch.
+
+            :param kwargs: Launch keyword arguments.
+            :returns: Terminal resource view.
+            """
+            return SessionResourceView(
+                id="terminal_codex_main",
+                type="terminal",
+                session_id=kwargs["session_id"],
+                name="Codex",
+            )
+
+    async def _fake_discover_thread_and_forward(**kwargs: Any) -> None:
+        """
+        Stand in for the fresh-session discovery forwarder.
+
+        :param kwargs: Forwarder keyword arguments.
+        :returns: None.
+        """
+        del kwargs
+
+    monkeypatch.setattr(codex_app_mod, "build_codex_native_server", lambda **kwargs: app_server)
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _FakeDiscoveryClient)
+    monkeypatch.setattr(
+        runner_app_mod,
+        "_codex_discover_thread_and_forward",
+        _fake_discover_thread_and_forward,
+    )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_config",
+        lambda _cfg: (None, {}),
+    )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_args",
+        lambda _harness, args, *, cfg: list(args),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5-default"},
+        ),
+    )
+
+    main_module_name = "omnigent.harnesses.codex_native.main"
+    codex_native_pkg = sys.modules["omnigent.harnesses.codex_native"]
+    original_module = sys.modules.pop(main_module_name, None)
+    original_attr = codex_native_pkg.__dict__.get("main")
+    try:
+        await _auto_create_codex_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _event: None,
+            agent_spec=agent_spec,
+            server_client=_FreshSnapshotClient(),  # type: ignore[arg-type]
+        )
+        assert main_module_name in sys.modules, (
+            "a fresh Codex launch must load the resume/fork module graph so a "
+            "relaunch after an in-place upgrade never imports new code"
+        )
+    finally:
+        sys.modules.pop(main_module_name, None)
+        if original_module is not None:
+            sys.modules[main_module_name] = original_module
+        if original_attr is not None:
+            codex_native_pkg.__dict__["main"] = original_attr
+        else:
+            codex_native_pkg.__dict__.pop("main", None)
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+
+def test_auto_create_codex_terminal_imports_branch_codex_native_modules_at_entry() -> None:
+    """Every codex_native module the function imports loads unconditionally.
+
+    A branch-local import can fire for the first time on a relaunch; after an
+    in-place upgrade that pulls NEW files into the OLD process (ImportError
+    on names the old graph lacks). A function-level import runs on the first
+    launch, so the relaunch reuses modules the process already holds.
+
+    :returns: None.
+    """
+    import omnigent.runner.native.orchestration as orchestration_mod
+
+    source = Path(cast(str, orchestration_mod.__file__)).read_text()
+    tree = ast.parse(source)
+    fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_auto_create_codex_terminal"
+    )
+    entry_modules: set[str] = set()
+    for stmt in fn.body:
+        if isinstance(stmt, ast.ImportFrom) and stmt.module:
+            entry_modules.add(stmt.module)
+        elif isinstance(stmt, ast.Import):
+            entry_modules.update(alias.name for alias in stmt.names)
+    entry_imports = {
+        id(stmt) for stmt in fn.body if isinstance(stmt, (ast.Import, ast.ImportFrom))
+    }
+    branch_modules: set[str] = set()
+    for node in ast.walk(fn):
+        if id(node) in entry_imports:
+            continue
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.startswith("omnigent.harnesses.codex_native"):
+                branch_modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            branch_modules.update(
+                alias.name
+                for alias in node.names
+                if alias.name.startswith("omnigent.harnesses.codex_native")
+            )
+    missing = branch_modules - entry_modules
+    assert not missing, (
+        "codex_native modules imported only inside branches of "
+        f"_auto_create_codex_terminal: {sorted(missing)}; a relaunch after an "
+        "in-place upgrade would import them into the old process for the first time"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("marker_write_fails", "login_required"),
+    [
+        pytest.param(False, False, id="marker-published"),
+        pytest.param(True, False, id="marker-write-fails"),
+        pytest.param(False, True, id="login-required"),
+    ],
+)
 async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    marker_write_fails: bool,
+    login_required: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The tool relay is started at session creation, non-blocking.
 
@@ -1459,7 +2013,8 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harness_startup_config as startup_config_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "de154ca6405fb8912623984a14a2b044"
@@ -1468,13 +2023,24 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _bridge_dir: pytest.fail("fresh Codex launch ran stale-writer recovery"),
+    )
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
 
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """:returns: HTTP 200 fresh-session snapshot."""
-            del timeout, url
+            del timeout, url, params
             return httpx.Response(
                 200,
                 json={
@@ -1541,15 +2107,48 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
                 name="Codex",
             )
 
+    discover_calls: list[dict[str, Any]] = []
+
     async def _fake_discover(**kwargs: Any) -> None:
         """:returns: None — stands in for the discovery forwarder."""
-        del kwargs
+        discover_calls.append(kwargs)
 
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", lambda **k: _FakeCodexAppServer()
     )
+    monkeypatch.setattr(
+        codex_app_mod,
+        "resolve_native_codex_launch",
+        lambda **_kwargs: codex_app_mod.NativeCodexLaunch(
+            config_overrides=[],
+            model="gpt-5-default",
+            profile=None,
+            summary="test route",
+            login_required=login_required,
+        ),
+    )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _FakeDiscoveryClient)
     monkeypatch.setattr(runner_app_mod, "_codex_discover_thread_and_forward", _fake_discover)
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_config",
+        lambda _cfg: (None, {"codex-native": {"command": "codex-wrapper"}}),
+    )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_args",
+        lambda _harness, args, *, cfg: list(args),
+    )
+    if marker_write_fails:
+
+        def _raise_marker_write_error(_bridge_dir: Path, _timeout: float) -> None:
+            raise OSError("read-only bridge directory")
+
+        monkeypatch.setattr(
+            codex_native_bridge,
+            "write_bridge_startup_timeout",
+            _raise_marker_write_error,
+        )
 
     relay_calls: list[dict[str, Any]] = []
 
@@ -1587,6 +2186,19 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         session_id
     )
     assert relay_calls[0]["await_notify"] is False
+    assert len(discover_calls) == 1
+    # A failed marker write falls the forwarder back to the legacy timeout
+    # too, keeping it aligned with the executor's unextended legacy wait.
+    expected_timeout = None if marker_write_fails or login_required else 120.0
+    assert discover_calls[0]["thread_start_timeout_seconds"] == expected_timeout
+    assert codex_native_bridge.read_bridge_startup_timeout(
+        codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+    ) == (None if marker_write_fails or login_required else 120.0)
+    if login_required:
+        assert "requires interactive login" in caplog.text
+        assert "preserving the unbounded sign-in wait" in caplog.text
+    else:
+        assert "configured command 'codex-wrapper' gets a 120s thread-start budget" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1594,37 +2206,7 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """First claude-native turn dispatches without waiting on a cold bridge.
-
-    A UI-launched (never pre-warmed) claude-native session starts the comment
-    relay lazily on the first turn. The ``tools/list_changed`` delivery
-    (``post_tools_changed``) blocks until the bridge publishes ``server.json``
-    — up to ``_TOOLS_CHANGED_READY_TIMEOUT_S`` (30s) on a still-cold bridge.
-    The turn must NOT be gated on that: the claude-native first-turn caller
-    passes ``await_notify=False``, so the relay starts and the notification is
-    fired in a background task while the turn dispatches immediately.
-
-    This holds ``post_tools_changed`` open on a never-released event (a cold
-    bridge that never publishes ``server.json``) and asserts:
-
-    (a) the notification was actually attempted — the relay genuinely started
-        and reached the delivery step. Without this, (b) passes vacuously: a
-        relay that bailed early (failed socket bind, unresolved spec) never
-        blocks, so the turn was never at risk.
-    (b) the harness still received the turn while the notification is blocked.
-
-    A regression to ``await_notify=True`` would await ``post_tools_changed``
-    inline, parking ``_run_turn_bg`` at the relay-start step until the event
-    is released, so the harness would never see the turn within the poll
-    budget and (b) fails.
-
-    :param tmp_path: Temp dir backing the runner workspace (the bridge tree
-        itself must live under the real ``/tmp`` trusted parent —
-        ``_ensure_secure_dir`` rejects a bridge dir anywhere else, so the
-        bridge root is NOT redirected into ``tmp_path``).
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
+    """A cold bridge does not block dispatch or strand a cancelled worker."""
     session_id = uuid.uuid4().hex
     # claude-native pins the bridge tree under /tmp (see _ensure_secure_dir);
     # use the real per-user bridge dir like tests/runner/test_comment_relay.py
@@ -1634,29 +2216,29 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     # create it — mirror the client's prepare_bridge_dir before launch.
     prepare_bridge_dir(session_id, workspace=tmp_path)
 
-    notify_started = threading.Event()
-    notify_release = threading.Event()
+    polling_started = threading.Event()
+    worker_finished = threading.Event()
+    cancellation_event: threading.Event | None = None
+    notification_task: asyncio.Task[Any] | None = None
+    read_json = claude_native_bridge._read_json_file
+    post_tools_changed = claude_native_bridge.post_tools_changed
 
-    def _blocking_post_tools_changed(*args: Any, **kwargs: Any) -> None:
-        """Stand in for a cold bridge: signal entry, then block until released.
+    def _observe_read(path: Path) -> dict[str, Any]:
+        result = read_json(path)
+        if path == bridge_dir / "server.json":
+            polling_started.set()
+        return result
 
-        Runs in the default thread-pool executor (``post_tools_changed`` is
-        synchronous), so a threading.Event is the right primitive.
+    def _observe_notification(target: Path, *, cancelled: threading.Event) -> None:
+        nonlocal cancellation_event
+        cancellation_event = cancelled
+        try:
+            post_tools_changed(target, cancelled=cancelled)
+        finally:
+            worker_finished.set()
 
-        :param args: Positional args from the call site (``bridge_dir``).
-        :param kwargs: Keyword args (none expected).
-        :returns: None.
-        """
-        del args, kwargs
-        notify_started.set()
-        notify_release.wait()
-
-    # The runner imports post_tools_changed from this module at call time, so
-    # patching the module attribute is picked up by _ensure_comment_relay_started.
-    monkeypatch.setattr(
-        "omnigent.claude_native_bridge.post_tools_changed",
-        _blocking_post_tools_changed,
-    )
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", _observe_read)
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", _observe_notification)
 
     spec = AgentSpec(
         spec_version=1,
@@ -1696,24 +2278,15 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
             )
             assert resp.status_code == 202, f"{resp.status_code} {resp.text}"
 
-            # (a) The relay started and reached the notification: post_tools_changed
-            # is now parked on notify_release. If start_tool_relay or the spec
-            # resolve had bailed, this never fires — making (b) vacuous.
+            # Observe the real readiness poll, not merely submission to the executor.
             for _ in range(300):
-                if notify_started.is_set():
+                if polling_started.is_set():
                     break
                 await asyncio.sleep(0.01)
-            assert notify_started.is_set(), (
-                "post_tools_changed was never invoked: the relay did not start or "
-                "did not reach the notify step, so the no-block assertion below "
-                "would be vacuous."
-            )
+            assert polling_started.is_set(), "notification never reached bridge readiness polling"
+            assert not worker_finished.is_set()
 
-            # (b) The harness received the turn even though post_tools_changed is
-            # still blocked (notify_release is NOT set). An unbounded await on the
-            # notification would park _run_turn_bg at relay-start, leaving
-            # posted_bodies empty until release — that is the ~15-30s first-turn
-            # stall this change removes.
+            # The absent bridge must not prevent the first turn reaching the harness.
             for _ in range(300):
                 if hc.posted_bodies:
                     break
@@ -1723,14 +2296,30 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                 "tools/list_changed delivery was blocked — the turn is gated on a "
                 "cold-bridge notification."
             )
-            # Sanity: we never unblocked delivery, so (b) proves a bounded wait,
-            # not that the bridge came up.
-            assert not notify_release.is_set()
+            assert not (bridge_dir / "server.json").exists()
+            assert not worker_finished.is_set()
+
+            tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"tools-changed:{session_id}"
+            ]
+            assert len(tasks) == 1
+            notification_task = tasks[0]
+            notification_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await notification_task
+            assert await asyncio.to_thread(worker_finished.wait, 1.0), (
+                "cancelling the notification task left its readiness worker running"
+            )
     finally:
-        # Unblock the parked executor thread BEFORE teardown so the loop's
-        # shutdown_default_executor(wait=True) does not hang joining it, then
-        # close the relay socket/thread by deleting the session.
-        notify_release.set()
+        # Release a worker after a failed assertion, without masking a broken cancel path.
+        if cancellation_event is not None:
+            cancellation_event.set()
+        if notification_task is not None:
+            notification_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await notification_task
         with contextlib.suppress(httpx.HTTPError):
             async with _runner_client(app) as cleanup_client:
                 await cleanup_client.delete(f"/v1/sessions/{session_id}")
@@ -1785,10 +2374,10 @@ async def _run_antigravity_auto_create(
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2019,10 +2608,10 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     as plain ``kimi``, and every risky tool call parks on an approval prompt
     no headless pane can answer.
     """
-    import omnigent.kimi_native as kimi_mod
-    import omnigent.kimi_native_credentials as kimi_creds_mod
-    import omnigent.kimi_native_forwarder as kimi_fwd_mod
-    from omnigent import kimi_native_bridge as kimi_bridge_mod
+    import omnigent.harnesses.kimi_native.credentials as kimi_creds_mod
+    import omnigent.harnesses.kimi_native.forwarder as kimi_fwd_mod
+    import omnigent.harnesses.kimi_native.main as kimi_mod
+    from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
     from omnigent.runner import app as runner_app_mod
     from omnigent.runner.app import _auto_create_kimi_terminal
     from omnigent.runner.resource_registry import KIMI_NATIVE_TERMINAL_ROLE
@@ -2311,8 +2900,8 @@ async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_st
     early-return BEFORE probing for a port or calling ``StartCascade`` — so even a
     future caller that forgets the resume gate cannot cold-start over a real id.
     """
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2370,8 +2959,8 @@ async def test_cold_start_agy_conversation_waits_for_model_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """StartCascade runs only after models appear and the settling delay passes."""
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner.native import orchestration as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2445,8 +3034,8 @@ async def test_cold_start_agy_conversation_model_timeout_keeps_placeholder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bound RPC port without models never receives StartCascade."""
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner.native import orchestration as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2530,13 +3119,13 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
       with ``{elicitation_id, params}``, then — on the human verdict — delivers
       the answer to agy via ``handle_user_interaction`` (the bridge default).
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
-    from omnigent import antigravity_native_interactions as interactions_mod
-    from omnigent.antigravity_native_interactions import agy_elicitation_id
-    from omnigent.antigravity_native_steps import pending_interaction
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
+    from omnigent.harnesses.antigravity_native import interactions as interactions_mod
+    from omnigent.harnesses.antigravity_native.interactions import agy_elicitation_id
+    from omnigent.harnesses.antigravity_native.steps import pending_interaction
     from omnigent.runner import app as runner_app_mod
 
     session_id = "b68c3f1da613f48fb4126e965ab594a3"
@@ -2714,10 +3303,10 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
       env does not override ``HOME``, so agy keeps platform auth such as macOS
       Keychain but loads the bridge-scoped config.
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "1fd85439049bbfc88cbf04221bad5079"
@@ -2812,7 +3401,12 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     assert mcp_config.is_file()
     payload = json.loads(mcp_config.read_text(encoding="utf-8"))
     server = payload["mcpServers"]["omnigent"]
-    assert server["args"][:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
+    assert server["args"][:4] == [
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.bridge",
+        "serve-mcp",
+    ]
     assert str(bridge_dir) in server["args"]
     assert "sys_session_create" in server["enabledTools"]
     # The bridge token the shared relay needs was written into the bridge dir.
@@ -2851,10 +3445,10 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     argv is preserved verbatim. This guards that invariant against a future change
     to the argv-composition line in ``_auto_create_antigravity_terminal``.
     """
-    import omnigent.antigravity_native_launch as launch_mod
-    import omnigent.antigravity_native_reader as reader_mod
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.launch as launch_mod
+    import omnigent.harnesses.antigravity_native.reader as reader_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "976793baf55bcdf96830aa376e394f80"
@@ -2977,15 +3571,22 @@ async def test_codex_subagent_always_needs_runner_terminal(
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """
             Return child then parent session snapshots.
 
             :param url: Omnigent session snapshot URL.
             :param timeout: HTTP timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: Fake Omnigent session response.
             """
-            del timeout
+            del timeout, params
             if url.endswith("/ff5cac23d0beb79fad914046049f32ff"):
                 return httpx.Response(
                     200,
@@ -3027,6 +3628,235 @@ async def test_codex_session_needs_runner_terminal_false_without_client() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "setup_error", "forward_error", "cancelled"])
+async def test_codex_known_thread_forwarder_closes_retained_subscription(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """Ownership transfer must close the preload client on every forwarder exit."""
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.runner import _entry
+    from omnigent.runner.native import orchestration
+
+    closed: list[str] = []
+
+    class _Client:
+        async def close(self) -> None:
+            closed.append("client")
+
+    class _AppServer:
+        async def close(self) -> None:
+            closed.append("server")
+
+    client = _Client()
+
+    def server_url(_name: str) -> str:
+        if outcome == "setup_error":
+            raise RuntimeError("setup failed")
+        return "http://127.0.0.1:8000"
+
+    async def forward(**kwargs: Any) -> None:
+        assert kwargs["client"] is client
+        assert not closed
+        if outcome == "forward_error":
+            raise RuntimeError("forward failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(orchestration, "_required_runner_env", server_url)
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", forward)
+    session_id = "conv_test_retained_preload"
+    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()  # type: ignore[assignment]
+    operation = orchestration._codex_forward_known_thread(
+        session_id=session_id,
+        bridge_dir=tmp_path,
+        codex_ws_url="ws://127.0.0.1:9876",
+        thread_id="thread_test",
+        client=client,  # type: ignore[arg-type]
+    )
+    if outcome == "success":
+        await operation
+    else:
+        error = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+        with pytest.raises(error):
+            await operation
+    assert closed == ["client", "server"]
+    assert session_id not in orchestration._AUTO_CODEX_APP_SERVERS
+
+
+class _CodexPaneRegistry:
+    """Report the Codex pane as runner-owned, as the resource registry does."""
+
+    def terminal_resource_role(self, _session_id: str, _terminal_id: str) -> str:
+        return CODEX_NATIVE_TERMINAL_ROLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["success", "setup_error", "forward_error", "cancelled", "superseded"]
+)
+async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """
+    A forwarder that ends on its own closes the session's app-server, so the pane
+    on it stops counting as reusable and the next ensure replaces it. A deliberate
+    cancel (teardown or re-create) records nothing. Neither does a forwarder whose
+    app-server a newer launch has already replaced: that launch keeps its registry
+    entry, and only the retiring forwarder's own server is closed.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+    from omnigent.runner import _entry
+    from omnigent.runner.native import orchestration
+
+    closed: list[str] = []
+
+    class _AppServer:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def close(self) -> None:
+            closed.append(self.name)
+
+    launched, successor = _AppServer("launched"), _AppServer("successor")
+
+    def server_url(_name: str) -> str:
+        if outcome == "setup_error":
+            raise RuntimeError("setup failed")
+        return "http://127.0.0.1:8000"
+
+    async def forward(**_kwargs: Any) -> None:
+        if outcome == "forward_error":
+            raise RuntimeError("forward failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+
+    session_id = "6f2e1d0c9b8a47f6a5e4d3c2b1a09f8e"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    monkeypatch.setattr(orchestration, "_required_runner_env", server_url)
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(codex_forwarder, "supervise_forwarder", forward)
+    registered = successor if outcome == "superseded" else launched
+    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = registered  # type: ignore[assignment]
+    try:
+        operation = orchestration._codex_forward_known_thread(
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9876",
+            thread_id="thread_test",
+            app_server=launched,  # type: ignore[arg-type]
+        )
+        if outcome in ("success", "superseded"):
+            await operation
+        else:
+            error = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+            with pytest.raises(error):
+                await operation
+        slot_after = orchestration._AUTO_CODEX_APP_SERVERS.get(session_id)
+        view = SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+        )
+        reusable = orchestration._is_runner_owned_codex_terminal(_CodexPaneRegistry(), view)  # type: ignore[arg-type]
+    finally:
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # The retiring forwarder closes its own server, and only that one.
+    assert closed == ["launched"]
+    recorded = codex_native_bridge.read_bridge_startup_failure(bridge_dir)
+    if outcome == "superseded":
+        assert slot_after is successor
+        assert recorded is None
+        assert reusable is True
+    elif outcome == "cancelled":
+        assert slot_after is None
+        assert recorded is None
+        assert reusable is True
+    else:
+        assert slot_after is None
+        assert recorded == codex_native_bridge.CODEX_APP_SERVER_STOPPED
+        assert reusable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["returns", "raises", "cancelled", "superseded"])
+async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """
+    A fresh-session forwarder that ends on its own records that its app-server is
+    gone. A cancel records nothing, and neither does a forwarder whose app-server a
+    newer launch has already replaced: that launch owns the bridge now.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    real_async_client = httpx.AsyncClient
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(200)), **kwargs
+        )
+
+    async def _fake_wait(*_args: object, **_kwargs: object) -> str:
+        return "019e96aa-abcd-7343-8d3b-6f914d60936b"
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        if outcome == "raises":
+            raise RuntimeError("forward failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+
+    session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
+    launched = _AppServer()
+    successor = _AppServer()
+    _AUTO_CODEX_APP_SERVERS[session_id] = successor if outcome == "superseded" else launched
+    try:
+        operation = _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+            app_server=launched,  # type: ignore[arg-type]
+        )
+        if outcome in ("raises", "cancelled"):
+            error = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+            with pytest.raises(error):
+                await operation
+        else:
+            await operation
+        assert (_AUTO_CODEX_APP_SERVERS.get(session_id) is successor) is (outcome == "superseded")
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    recorded = codex_native_bridge.read_bridge_startup_failure(tmp_path)
+    if outcome in ("returns", "raises"):
+        assert recorded == codex_native_bridge.CODEX_APP_SERVER_STOPPED
+    else:
+        assert recorded is None
+
+
+@pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3036,7 +3866,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     Otherwise each failed host-spawned codex session orphans an app-server
     subprocess (and a dangling listener) for the runner's lifetime.
     """
-    from omnigent import codex_native_forwarder
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
     from omnigent.runner.app import (
         _AUTO_CODEX_APP_SERVERS,
         _codex_discover_thread_and_forward,
@@ -3052,7 +3882,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
         async def close(self) -> None:
             closed["app_server"] = True
 
-    async def _raise_no_thread(*_args: object, **_kwargs: object) -> str:
+    async def _raise_no_thread(_client: object) -> str:
         raise TimeoutError("no thread/started observed")
 
     # The helper lazily imports wait_for_thread_started from the forwarder
@@ -3083,11 +3913,13 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exc", "expected_cause"),
+    ("exc", "thread_start_timeout_seconds", "expected_cause"),
     [
-        (TimeoutError("no thread/started observed"), "startup timed out"),
+        (TimeoutError("no thread/started observed"), None, "startup timed out after 30s"),
+        (TimeoutError("no thread/started observed"), 120.0, "startup timed out after 120s"),
         (
             RuntimeError("event stream ended"),
+            None,
             "event stream ended before a thread was created",
         ),
     ],
@@ -3096,6 +3928,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     exc: Exception,
+    thread_start_timeout_seconds: float | None,
     expected_cause: str,
 ) -> None:
     """
@@ -3103,8 +3936,11 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     reads as "startup timed out", while a RuntimeError (TUI exited / event
     stream ended) must NOT be mislabeled as a timeout.
     """
-    from omnigent import codex_native_forwarder
-    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.harnesses.codex_native.bridge import (
+        read_bridge_startup_error,
+        read_bridge_startup_failure,
+    )
     from omnigent.runner.app import (
         _AUTO_CODEX_APP_SERVERS,
         _codex_discover_thread_and_forward,
@@ -3134,6 +3970,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
+            thread_start_timeout_seconds=thread_start_timeout_seconds,
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
@@ -3145,6 +3982,328 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     # A RuntimeError must never be described as a timeout.
     if not isinstance(exc, TimeoutError):
         assert "timed out" not in recorded
+    # A hard startup failure carries its own code so the turn error is not a
+    # bare exception class name.
+    failure = read_bridge_startup_failure(tmp_path)
+    assert failure is not None
+    assert failure.code == "codex_thread_not_started"
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected_code", "expected_title"),
+    [
+        (
+            "dbexec: launcher 1.2.3\nSign in to continue:\n"
+            "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...\n",
+            "databricks_sign_in_pending",
+            "Codex can't start until you sign in to Databricks",
+        ),
+        ("Loading configuration...\n", "agent_startup_pending", "Codex is still starting"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    screen: str,
+    expected_code: str,
+    expected_title: str,
+) -> None:
+    """
+    A thread-start deadline with a live pane records a pending cause and keeps waiting.
+
+    A launcher wrapper can park the pane on a sign-in prompt for longer than
+    the thread-start budget. Tearing the backend down there strands the user:
+    the pane cannot connect once the sign-in completes, and every send fails
+    fast on the saved error until the terminal is recreated. Instead the
+    runner records why chat turns cannot run yet (lifting the sign-in link
+    from the pane when it shows one), waits without a deadline, and clears the
+    record once the thread starts.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
+    timeline: list[str] = []
+    wait_calls: list[dict[str, object]] = []
+    pending_seen: list[codex_native_bridge.CodexStartupFailure | None] = []
+    record_at_forwarding: list[str | None] = []
+    real_async_client = httpx.AsyncClient
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+            **kwargs,
+        )
+
+    async def _fake_wait(*_args: object, **kwargs: object) -> str:
+        wait_calls.append(kwargs)
+        if len(wait_calls) == 1:
+            raise TimeoutError
+        pending_seen.append(codex_native_bridge.read_bridge_startup_failure(tmp_path))
+        timeline.append("thread_started")
+        return thread_id
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        record_at_forwarding.append(codex_native_bridge.read_bridge_startup_error(tmp_path))
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            timeline.append("app_server_closed")
+
+    class _Terminal:
+        diagnostic_id = "terminal-1"
+        reads = 0
+        joined_reads = 0
+
+        async def is_alive(self) -> bool:
+            return True
+
+        async def read(
+            self, scrollback: int = 0, *, join_wrapped: bool = False
+        ) -> dict[str, object]:
+            del scrollback
+            self.reads += 1
+            self.joined_reads += int(join_wrapped)
+            return {"screen": screen}
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+
+    session_id = "3c0a9d4e6b8f4a2c9e1d7b5a3f6c8e0d"
+    app_server = _AppServer()
+    terminal = _Terminal()
+    _AUTO_CODEX_APP_SERVERS[session_id] = app_server  # type: ignore[assignment]
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="Databricks ucode profile 'oss'",
+            app_server=app_server,  # type: ignore[arg-type]
+            terminal_instance=terminal,  # type: ignore[arg-type]
+            thread_start_timeout_seconds=120.0,
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # One bounded wait, then an open-ended one once the pending cause is recorded.
+    assert wait_calls == [{"timeout": 120.0}, {"timeout": None}]
+    # Read once, with wrapped rows joined so a wide address comes back whole.
+    assert (terminal.reads, terminal.joined_reads) == (1, 1)
+    (pending,) = pending_seen
+    assert pending is not None
+    assert pending.code == expected_code
+    assert pending.title == expected_title
+    assert pending.remediation is not None
+    # The transcript never carries the one-time address or code; the card
+    # fetches the live link from the host when clicked.
+    assert "http" not in pending.remediation
+    if expected_code == "databricks_sign_in_pending":
+        assert pending.remediation.startswith("Open the sign-in link and sign in. Codex continues")
+    # The backend outlived the deadline and closed only after forwarding ended.
+    assert timeline == ["thread_started", "app_server_closed"]
+    # The thread start cleared the pending record and published bridge state.
+    assert record_at_forwarding == [None]
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == thread_id
+
+
+@pytest.mark.parametrize(
+    ("screen", "expect_early"),
+    [
+        (
+            "dbcert: Logging in via SSO...\n"
+            "dbcert: If the browser does not open automatically, please open the following URL:\n"
+            "https://databricks.okta.com/oauth2/v1/authorize?client_id=abc&state=xyz\n",
+            True,
+        ),
+        ("Codex requirements updated at /etc/codex/requirements.toml\n", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    screen: str,
+    expect_early: bool,
+) -> None:
+    """
+    A stable sign-in prompt on the pane is recorded as soon as it is seen, not at the budget.
+
+    The chat turn fails fast on the record, so the card with the sign-in step
+    appears seconds after the send instead of two minutes later. Ordinary
+    startup output is never mistaken for a prompt: that pane still waits for
+    the full budget before the generic pending cause is recorded.
+    """
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+    from omnigent.runner.native import orchestration
+
+    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
+    wait_calls: list[dict[str, object]] = []
+    at_deadline: list[codex_native_bridge.CodexStartupFailure | None] = []
+    pending_seen: list[codex_native_bridge.CodexStartupFailure | None] = []
+    record_at_forwarding: list[str | None] = []
+    real_async_client = httpx.AsyncClient
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+            **kwargs,
+        )
+
+    async def _fake_wait(*_args: object, **kwargs: object) -> str:
+        wait_calls.append(kwargs)
+        if len(wait_calls) == 1:
+            # The budgeted wait: a prompt must interrupt it, anything else runs
+            # it out (shortened here) with no record made in the meantime.
+            await asyncio.sleep(3600.0 if expect_early else 0.2)
+            at_deadline.append(codex_native_bridge.read_bridge_startup_failure(tmp_path))
+            raise TimeoutError
+        pending_seen.append(codex_native_bridge.read_bridge_startup_failure(tmp_path))
+        return thread_id
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        record_at_forwarding.append(codex_native_bridge.read_bridge_startup_error(tmp_path))
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    class _Terminal:
+        diagnostic_id = "terminal-1"
+        reads = 0
+
+        async def is_alive(self) -> bool:
+            return True
+
+        async def read(
+            self, scrollback: int = 0, *, join_wrapped: bool = False
+        ) -> dict[str, object]:
+            del scrollback, join_wrapped
+            self.reads += 1
+            return {"screen": screen}
+
+    monkeypatch.setattr(orchestration, "_CODEX_SIGN_IN_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+
+    session_id = "4d1b0e5f7c9a4b3d8f2e6c0a1b3d5f7e"
+    app_server = _AppServer()
+    terminal = _Terminal()
+    _AUTO_CODEX_APP_SERVERS[session_id] = app_server  # type: ignore[assignment]
+    try:
+        await asyncio.wait_for(
+            _codex_discover_thread_and_forward(
+                session_id=session_id,
+                bridge_dir=tmp_path,
+                codex_ws_url="ws://127.0.0.1:1",
+                codex_home=tmp_path / "codex-home",
+                workspace=str(tmp_path / "workspace"),
+                event_client=_Client(),  # type: ignore[arg-type]
+                routing_summary="Databricks ucode profile 'oss'",
+                app_server=app_server,  # type: ignore[arg-type]
+                terminal_instance=terminal,  # type: ignore[arg-type]
+                thread_start_timeout_seconds=120.0,
+            ),
+            timeout=10.0,
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # The budgeted wait, then the open-ended one once the cause is recorded.
+    assert wait_calls == [{"timeout": 120.0}, {"timeout": None}]
+    (pending,) = pending_seen
+    assert pending is not None
+    if expect_early:
+        # Two matching reads of the prompt, then the record's own read.
+        assert terminal.reads >= 3
+        assert at_deadline == []
+        assert pending.code == "databricks_sign_in_pending"
+    else:
+        assert at_deadline == [None]
+        assert pending.code == "agent_startup_pending"
+    # The thread start cleared the record either way.
+    assert record_at_forwarding == [None]
+
+
+@pytest.mark.parametrize(
+    ("role", "backend_alive", "startup_error", "expected"),
+    [
+        # A healthy runner-owned pane is reused as before.
+        ("codex-native", True, False, True),
+        ("codex-native", False, False, True),
+        # Backend alive but startup still pending (e.g. a sign-in prompt): reuse.
+        ("codex-native", True, True, True),
+        # Backend gone after a recorded startup failure: replace on the next ensure.
+        ("codex-native", False, True, False),
+        # A generic terminal that merely shares the id is never the native TUI.
+        ("generic", True, False, False),
+    ],
+)
+def test_codex_terminal_reuse_requires_a_live_backend_after_a_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    role: str,
+    backend_alive: bool,
+    startup_error: bool,
+    expected: bool,
+) -> None:
+    """
+    After a recorded startup failure, a registered Codex pane with no live
+    app-server is not reusable: every send would fail fast on the saved error,
+    so the ensure must close it and launch again (which clears the record).
+    """
+    from omnigent.runner.app import _AUTO_CODEX_APP_SERVERS
+    from omnigent.runner.native.orchestration import _is_runner_owned_codex_terminal
+    from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE
+
+    session_id = "6f2e1d0c9b8a47f6a5e4d3c2b1a09f8e"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    if startup_error:
+        codex_native_bridge.write_bridge_startup_error(
+            bridge_dir, "Codex stopped before it could start.", code="codex_thread_not_started"
+        )
+
+    class _Registry:
+        def terminal_resource_role(self, _session_id: str, _terminal_id: str) -> str | None:
+            return CODEX_NATIVE_TERMINAL_ROLE if role == "codex-native" else None
+
+    view = SessionResourceView(
+        id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+    )
+    if backend_alive:
+        _AUTO_CODEX_APP_SERVERS[session_id] = object()  # type: ignore[assignment]
+    try:
+        assert _is_runner_owned_codex_terminal(_Registry(), view) is expected  # type: ignore[arg-type]
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
 @pytest.mark.asyncio
@@ -3161,7 +4320,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     own working directory (the runner service's cwd), so web-driven shell
     commands run from the wrong directory instead of the selected workspace.
     """
-    from omnigent import codex_native_forwarder
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
     from omnigent.runner.app import (
         _AUTO_CODEX_APP_SERVERS,
         _codex_discover_thread_and_forward,
@@ -3169,8 +4328,19 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
 
     thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "selected-workspace"
+    wait_calls: list[dict[str, object]] = []
+    patch_requests: list[httpx.Request] = []
+    real_async_client = httpx.AsyncClient
 
-    async def _fake_wait(*_args: object, **_kwargs: object) -> str:
+    def _handle_patch(request: httpx.Request) -> httpx.Response:
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(_handle_patch), **kwargs)
+
+    async def _fake_wait(*_args: object, **kwargs: object) -> str:
+        wait_calls.append(kwargs)
         return thread_id
 
     async def _fake_supervise(**_kwargs: object) -> None:
@@ -3188,8 +4358,10 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
 
     session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
+    codex_native_bridge.write_bridge_startup_timeout(tmp_path, 120.0)
     _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
     try:
         await _codex_discover_thread_and_forward(
@@ -3200,14 +4372,27 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
             workspace=str(workspace),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
+            thread_start_timeout_seconds=120.0,
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
+    assert len(patch_requests) == 1
+    patch_request = patch_requests[0]
+    assert patch_request.method == "PATCH"
+    assert patch_request.url.copy_with(query=None) == httpx.URL(
+        f"http://ap.example/v1/sessions/{session_id}"
+    )
+    assert dict(patch_request.url.params) == {"include_usage": "false"}
+    assert json.loads(patch_request.content) == {"external_session_id": thread_id}
+
     state = codex_native_bridge.read_bridge_state(tmp_path)
     assert state is not None
+    assert state.session_id == session_id
     assert state.thread_id == thread_id
     assert state.cwd == str(workspace)
+    assert wait_calls == [{"timeout": 120.0}]
+    assert codex_native_bridge.read_bridge_startup_timeout(tmp_path) == 120.0
 
 
 @pytest.mark.asyncio
@@ -3225,8 +4410,8 @@ async def test_cold_start_agy_conversation_rejects_a_foreign_agy_cascade(
     never arrive. Refusing leaves the placeholder, which the reader's own
     discovery later resolves correctly.
     """
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -3263,8 +4448,8 @@ async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The happy path still persists: our own agy wrote the conversation here."""
-    import omnigent.antigravity_native_rpc as rpc_mod
-    from omnigent import antigravity_native_bridge as bridge_mod
+    import omnigent.harnesses.antigravity_native.rpc as rpc_mod
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
     from omnigent.runner import app as runner_app_mod
     from omnigent.runner.native import orchestration as orchestration_mod
 
@@ -3327,8 +4512,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     import os
     import time
 
-    import omnigent.codex_native_app_server as codex_app_mod
-    from omnigent import model_catalog_store
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.models import model_catalog_store
     from omnigent.runner import app as runner_app_mod
     from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
 
@@ -3345,21 +4530,26 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
-        lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
             config_overrides=[], model=model, profile=None
         ),
     )
     monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
     refreshed = [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
 
-    async def _fake_probe(*, codex_path: str | None = None) -> list[dict[str, object]]:
+    async def _fake_probe(
+        *,
+        codex_path: str | None = None,
+        launch: codex_app_mod.NativeCodexLaunch | None = None,
+    ) -> list[dict[str, object]]:
         """
         Stand in for the real codex probe on the background refresh path.
 
         :param codex_path: Ignored executable override.
+        :param launch: Ignored provider launch shape.
         :returns: The refreshed catalog rows.
         """
-        del codex_path
+        del codex_path, launch
         return refreshed
 
     monkeypatch.setattr(codex_app_mod, "probe_codex_model_options", _fake_probe)
@@ -3469,6 +4659,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -3555,3 +4747,306 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             await task
         # The background re-probe healed the store for the next launch.
         assert model_catalog_store.read_catalog("codex-native", fingerprint) == refreshed
+
+
+@pytest.mark.asyncio
+async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A persisted override in the gateway spelling still resolves the catalog.
+
+    The override is stored as the servable id ``databricks-gpt-5-6-sol`` while
+    the catalog lists codex's own slug ``gpt-5.6-sol``. The launch translates
+    between the two, so the pre-launch check must match by codex's vocabulary,
+    not string equality — a raw membership test refuses a model this host serves.
+    """
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    from omnigent.models import model_catalog_store
+    from omnigent.runner import app as runner_app_mod
+    from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
+
+    session_id = "5b0c7e2a9d1f4c3b8e6a7d5f4c3b2a1e"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60937f"
+    override = "databricks-gpt-5-6-sol"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    monkeypatch.setattr(
+        codex_app_mod,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
+            config_overrides=[], model=model, profile=None
+        ),
+    )
+    monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
+
+    async def _fake_probe(
+        *,
+        codex_path: str | None = None,
+        launch: codex_app_mod.NativeCodexLaunch | None = None,
+    ) -> list[dict[str, object]]:
+        """Stand in for the real codex probe; unused on a store hit."""
+        del codex_path, launch
+        return [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}]
+
+    monkeypatch.setattr(codex_app_mod, "probe_codex_model_options", _fake_probe)
+    fingerprint = codex_app_mod.codex_catalog_fingerprint(
+        codex_app_mod.resolve_native_codex_launch(model=None)
+    )
+    # A fresh catalog carrying codex's own slug, not the gateway spelling.
+    model_catalog_store.write_catalog(
+        "codex-native",
+        fingerprint,
+        [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}],
+    )
+
+    class _SnapshotServerClient:
+        """Server client returning a resume snapshot with the gateway override."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return the session snapshot / item history the helper reads.
+
+            :param url: Request path.
+            :param kwargs: Request keyword arguments.
+            :returns: HTTP 200 response.
+            """
+            del kwargs
+            if url == f"/v1/sessions/{session_id}/items":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "b1649a5cbfec3f92bec12275c14f4b61",
+                                "response_id": "codex_turn_1",
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "remember this"}],
+                            }
+                        ],
+                        "has_more": False,
+                    },
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"model_override": override, "external_session_id": thread_id},
+                request=httpx.Request("GET", url),
+            )
+
+    class _FakeCodexAppServer:
+        """Minimal app-server object used by ``codex_terminal_env``."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+
+        def __init__(self) -> None:
+            """Initialize the fake app-server state."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.listen_url: str | None = None
+            self.started = False
+            self.config_overrides: list[str] = []
+
+        async def start(self) -> None:
+            """Mark the fake app-server started."""
+            self.started = True
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    app_server = _FakeCodexAppServer()
+    build_calls: list[dict[str, Any]] = []
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
+        """
+        Capture app-server construction.
+
+        :param kwargs: Keyword arguments passed by the runner helper.
+        :returns: Fake app-server.
+        """
+        build_calls.append(kwargs)
+        app_server.codex_home = kwargs["codex_home"]
+        return app_server
+
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """Fail if the resume path tries to discover a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
+
+        async def close(self) -> None:
+            """No-op close."""
+
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
+    ) -> None:
+        """Accept preloading of the known Codex thread."""
+        del transport, loaded_thread_id, terminal_launch_args
+
+    async def _fake_forward_known_thread(**kwargs: Any) -> None:
+        """Accept the known-thread forwarder invocation."""
+        del kwargs
+
+    class _FakeResourceRegistry:
+        """Resource registry that accepts the terminal launch."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Accept the terminal launch request."""
+            del terminal_name, session_key, spec, resource_role, parent_os_env
+            return SessionResourceView(
+                id="terminal_codex_main",
+                type="terminal",
+                session_id=session_id,
+                name="Codex",
+            )
+
+    monkeypatch.setattr(
+        codex_app_mod, "build_codex_native_server", _fake_build_codex_native_server
+    )
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+    try:
+        await _auto_create_codex_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            agent_spec=agent_spec,
+            server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+    finally:
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # The gateway-spelled override was accepted (not refused) and passed
+    # through to the launch, which translates it to codex's slug downstream.
+    assert build_calls, "a servable override was refused as unknown"
+    assert build_calls[0]["model"] == override
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launch_fails", [False, True])
+async def test_codex_tui_recovery_preserves_live_control_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool
+) -> None:
+    """A lost TUI reattaches to the live app-server without cancelling the forwarder.
+
+    The app-server owns thread state and the forwarder owns transcript delivery.
+    Replacing only the TUI must not disturb either — even if the new TUI fails to
+    launch.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.runner.native import orchestration as native
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _CodexNativeTuiLaunch,
+    )
+
+    session_id = "tui-recovery-test-session"
+    server_url = "ws://127.0.0.1:9876"
+    thread_id = "thread-live-1234"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=server_url,
+            thread_id=thread_id,
+            codex_home=str(tmp_path),
+        ),
+    )
+    config = _CodexNativeLaunchConfig(
+        workspace=tmp_path,
+        policy_server_url="http://localhost",
+        terminal_launch_args=None,
+        model_override=None,
+        external_session_id=thread_id,
+        fork_source_id=None,
+        fork_source_external_id=None,
+        fork_carry_history=False,
+        bypass_sandbox=False,
+    )
+    fake_server = SimpleNamespace(
+        proc=SimpleNamespace(returncode=None),
+        listen_url=server_url,
+        codex_home=tmp_path,
+    )
+    forwarder = asyncio.create_task(asyncio.Event().wait())
+    monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, session_id, fake_server)
+    monkeypatch.setitem(native._AUTO_FORWARDER_TASKS, session_id, forwarder)
+    monkeypatch.setattr(native, "_codex_native_launch_config", AsyncMock(return_value=config))
+    cancel = AsyncMock()
+    monkeypatch.setattr(native, "_cancel_auto_forwarder_task", cancel)
+    fake_view = SessionResourceView(
+        id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+    )
+    launch_result = _CodexNativeTuiLaunch(fake_view, None, None)
+    launch = AsyncMock(
+        side_effect=RuntimeError("TUI launch failed") if launch_fails else None,
+        return_value=launch_result,
+    )
+    monkeypatch.setattr(native, "_launch_codex_native_tui", launch)
+    try:
+        if launch_fails:
+            with pytest.raises(RuntimeError, match="TUI launch failed"):
+                await native._auto_create_codex_terminal(
+                    session_id, cast(Any, None), lambda *_: None
+                )
+        else:
+            result = await native._auto_create_codex_terminal(
+                session_id, cast(Any, None), lambda *_: None
+            )
+            assert result is fake_view
+        cancel.assert_not_awaited()
+        assert not forwarder.done()
+        assert native._AUTO_CODEX_APP_SERVERS.get(session_id) is fake_server
+        assert launch.await_count == 1
+        assert launch.await_args is not None
+        assert launch.await_args.kwargs["app_server"] is fake_server
+        assert launch.await_args.kwargs["thread_id"] == thread_id
+    finally:
+        forwarder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await forwarder
+        native._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        native._AUTO_FORWARDER_TASKS.pop(session_id, None)

@@ -150,22 +150,3 @@ export const McpServersStarting: Story = {
   ],
   render: () => <McpStartupIndicator />,
 };
-
-export const McpStartupIncomplete: Story = {
-  decorators: [
-    (Story) => (
-      <ChatStoreSeed
-        seed={{
-          mcpStartup: {
-            github: { status: "failed", error: "Authentication failed" },
-            jira: { status: "ready", error: null },
-            storage: { status: "cancelled", error: null },
-          },
-        }}
-      >
-        <Story />
-      </ChatStoreSeed>
-    ),
-  ],
-  render: () => <McpStartupIndicator />,
-};

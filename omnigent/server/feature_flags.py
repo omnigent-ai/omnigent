@@ -1,6 +1,6 @@
 """Deployment-wide release feature management.
 
-Release features are enabled as a comma-separated set in
+Additional release features are enabled as a comma-separated set in
 ``OMNIGENT_FEATURES``. The set is resolved once when an application or route
 factory is built, so every request handled by that process sees one immutable
 snapshot.
@@ -22,6 +22,9 @@ class Feature(StrEnum):
 
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    CANVAS = "canvas"
+    ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
+    HARNESS_SETTINGS_UI = "harness_settings_ui"
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,25 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="onboarding",
         review_by_release="0.11.0",
     ),
+    FeatureDefinition(
+        feature=Feature.CANVAS,
+        description="Web Canvas page: sessions as draggable cards grouped by project",
+        owner="web",
+        review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.ARCA_SHUTDOWN_WARNINGS,
+        description="Weekday Arca shutdown warning in the web UI",
+        owner="web",
+        review_by_release="0.20.0",
+        frontend_visible=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.HARNESS_SETTINGS_UI,
+        description="Web Harnesses settings page with per-harness MCPs, skills, and plugins",
+        owner="web",
+        review_by_release="0.15.0",
+    ),
 )
 
 
@@ -55,7 +77,8 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
 class FeatureFlags:
     """Immutable feature values for one server process."""
 
-    enabled_features: frozenset[Feature] = frozenset()
+    # Older clients still gate Harnesses settings on this value.
+    enabled_features: frozenset[Feature] = frozenset({Feature.HARNESS_SETTINGS_UI})
 
     def enabled(self, feature: Feature) -> bool:
         """Return whether *feature* is enabled in this snapshot."""
@@ -78,8 +101,9 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
     """Resolve ``OMNIGENT_FEATURES`` into an immutable feature snapshot.
 
     The variable is a comma-separated enabled set, for example
-    ``usage_page,harness_install``. Unset or empty means every release feature
-    is off. Unknown names fail startup instead of silently applying a typo.
+    ``usage_page,harness_install``. These are added to the defaults, which enable
+    Harnesses settings for older clients. Unknown names fail startup instead of
+    silently applying a typo.
 
     :param environ: Environment mapping; defaults to :data:`os.environ`.
     :returns: Resolved immutable feature values.
@@ -96,7 +120,7 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
     raw = source.get(FEATURES_ENV_VAR, "")
     names = [name.strip() for name in raw.split(",") if name.strip()]
 
-    enabled: set[Feature] = set()
+    enabled = set(FeatureFlags().enabled_features)
     unknown: list[str] = []
     for name in names:
         try:

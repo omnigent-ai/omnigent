@@ -24,7 +24,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -93,8 +93,9 @@ async def test_publish_without_subscriber_is_silent_noop() -> None:
     session_stream.publish("conv_unknown", {"type": "x", "i": 1})
     # If publish were silently creating a slot, the registry would
     # have grown. The contract: only ``subscribe`` adds slots.
-    assert session_stream._subscribers == {}, (
-        f"publish must NOT create subscriber slots. State: {session_stream._subscribers!r}"
+    assert session_stream._subscribers.all_values() == [], (
+        f"publish must NOT create subscriber slots. "
+        f"State: {session_stream._subscribers.all_values()!r}"
     )
 
 
@@ -129,6 +130,58 @@ async def test_single_subscriber_receives_events_in_order() -> None:
         f"A mismatch indicates either reordering inside publish or "
         f"a missed event during fan-out."
     )
+
+
+@pytest.mark.asyncio
+async def test_publish_drops_closed_loop_without_disturbing_healthy_subscriber() -> None:
+    """A closed subscriber loop is removed while healthy peers still receive events."""
+    conversation_id = "conv_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=1))
+    await asyncio.sleep(0)
+
+    assert session_stream.publish(conversation_id, {"type": "event"}) == 1
+    assert stale_subscriber not in session_stream._subscribers[conversation_id]
+    assert await asyncio.wait_for(task, timeout=2.0) == [{"type": "event"}]
+
+
+@pytest.mark.asyncio
+async def test_close_drops_closed_loop_and_terminates_healthy_subscriber() -> None:
+    """Closing ignores a stale loop and still terminates healthy subscribers."""
+    conversation_id = "conv_close_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=0))
+    await asyncio.sleep(0)
+
+    session_stream.close(conversation_id)
+
+    assert await asyncio.wait_for(task, timeout=2.0) == []
+    assert conversation_id not in session_stream._subscribers
+
+
+def test_schedule_delivery_does_not_count_already_removed_subscriber() -> None:
+    """A slot removed after a publisher snapshot is no longer deliverable."""
+    conversation_id = "conv_removed_before_schedule"
+    loop = asyncio.new_event_loop()
+    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    subscriber = (queue, loop)
+    try:
+        assert not session_stream._schedule_delivery(
+            conversation_id, subscriber, {"type": "event"}
+        )
+        assert queue.empty()
+    finally:
+        loop.close()
 
 
 @pytest.mark.asyncio
@@ -275,6 +328,31 @@ async def test_has_subscribers_tracks_live_subscription() -> None:
     session_stream.publish("conv_probe", {"type": "a"})
     await asyncio.wait_for(task, timeout=2.0)
     assert session_stream.has_subscribers("conv_probe") is False
+
+
+@pytest.mark.asyncio
+async def test_subscribers_are_isolated_across_workspaces() -> None:
+    """The same conversation id in two workspaces has independent subscribers.
+
+    Regression for OMNI-7361: conversation ids collide across workspaces
+    (imported sessions), so a subscriber registered in one tenant's workspace
+    must not be seen — or fed — by a publish in another's, even for the same id.
+    """
+    from omnigent.db.db_models import workspace_scope
+
+    conv = "conv_shared"
+    with workspace_scope(1):
+        task = asyncio.create_task(_collect(conv, expected=1))
+        await asyncio.sleep(0)  # let the subscriber register under workspace 1
+        assert session_stream.has_subscribers(conv) is True
+    with workspace_scope(2):
+        # Same id, other workspace: no subscriber, and a publish reaches nobody.
+        assert session_stream.has_subscribers(conv) is False
+        assert session_stream.publish(conv, {"type": "ws2-only"}) == 0
+    with workspace_scope(1):
+        assert session_stream.publish(conv, {"type": "ws1-only"}) == 1
+    events = await asyncio.wait_for(task, timeout=2.0)
+    assert events == [{"type": "ws1-only"}]
 
 
 @pytest.mark.asyncio
@@ -770,6 +848,58 @@ async def test_inflight_replay_via_pre_ready_snapshot_does_not_duplicate_window_
 # ── SSE-event debug logging ───────────────────────────────────────────────────
 
 
+def test_sse_retains_nested_delivery_ids_without_consumed_content() -> None:
+    assert session_stream._sse_safe_attributes(
+        {
+            "type": "session.input.consumed",
+            "data": {
+                "item_id": "item_saved",
+                "cleared_pending_id": "pending_" + "a" * 32,
+                "data": {"content": [{"text": "private prompt"}]},
+                "created_by": "person@example.com",
+            },
+        }
+    ) == {"item_id": "item_saved", "cleared_pending_id": "pending_" + "a" * 32}
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "error_saved", "type": "error", "response_id": "resp_nested"},
+    }
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "resp_nested"
+    event["item"]["response_id"] = "x" * 256
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "x" * 256
+    event["item"]["response_id"] = "x" * 257
+    assert "response_id" not in session_stream._sse_safe_attributes(event)
+    event["item"]["response_id"] = "resp_nested"
+    event["response_id"] = "resp_envelope"
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "resp_envelope"
+    event["response"] = {"id": "resp_object"}
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "resp_object"
+    failed = {
+        "type": "response.failed",
+        "response": {"id": "resp_failed", "error": {"message": "private failure"}},
+        "input_stable_id": "a" * 32,
+    }
+    assert session_stream._sse_safe_attributes(failed) == {
+        "response_id": "resp_failed",
+        "input_stable_id": "a" * 32,
+    }
+    failed["input_stable_id"] = "private prompt"
+    assert session_stream._sse_safe_attributes(failed) == {"response_id": "resp_failed"}
+
+
+def test_sse_consumed_id_extraction_is_event_specific_and_type_checked() -> None:
+    data = {"item_id": {"text": "private prompt"}, "cleared_pending_id": "x" * 257}
+    assert (
+        session_stream._sse_safe_attributes({"type": "session.input.consumed", "data": data}) == {}
+    )
+    assert (
+        session_stream._sse_safe_attributes(
+            {"type": "response.output_text.delta", "data": {"item_id": "private prompt"}}
+        )
+        == {}
+    )
+
+
 def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
     # The whitelist captures identifiers/dimensions and NEVER content — no model
     # text, tool arguments/outputs, message data, error messages, or the
@@ -834,6 +964,134 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+def test_sse_child_creation_preserves_relationship_without_content() -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {
+            "type": "session.created",
+            "conversation_id": "parent",
+            "parent_session_id": "parent",
+            "child_session_id": "child",
+            "agent_id": "agent",
+            "title": "private task description",
+            "data": {"prompt": "private prompt"},
+        }
+    )
+    assert attrs == {
+        "parent_session_id": "parent",
+        "child_session_id": "child",
+        "agent_id": "agent",
+    }
+
+
+def test_sse_safe_attributes_captures_level_and_code_for_error_items() -> None:
+    # Level and code on an error item must be captured so dashboards can
+    # exclude info-level notices from error-rate metrics.
+    info_event = {
+        "type": "response.output_item.done",
+        "item": {
+            "id": "item_notice",
+            "type": "error",
+            "source": "execution",
+            "code": "pi_native_effort_ignored",
+            "message": "effort ignored for gateway-routed model: thinking disabled",
+            "level": "info",
+        },
+    }
+    attrs = session_stream._sse_safe_attributes(info_event)
+    assert attrs["item_type"] == "error"
+    assert attrs["item_level"] == "info"
+    assert attrs["item_code"] == "pi_native_effort_ignored"
+    # message text must never reach the debug table
+    assert "message" not in attrs
+    flat = repr(attrs).lower()
+    assert "effort ignored" not in flat
+    assert "thinking disabled" not in flat
+
+
+def test_sse_safe_attributes_omits_level_and_code_for_non_error_items() -> None:
+    # level/code are error-item-specific; they must not appear for other types.
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_msg", "type": "message", "level": "info", "code": "some_code"},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert attrs["item_type"] == "message"
+    assert "item_level" not in attrs
+    assert "item_code" not in attrs
+
+
+def test_sse_safe_attributes_omits_oversized_code() -> None:
+    # codes longer than 64 chars are not captured (guard against free-form text).
+    long_code = "x" * 65
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_e", "type": "error", "code": long_code},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert "item_code" not in attrs
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_destructive_error() -> None:
+    # A destructive error item (no level) built through the real to_api_dict()
+    # serializer must have item_code and item_source captured, and item_level
+    # must be absent (the dashboard treats missing as "error").
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_destruct",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="native_terminal_start_failed",
+            message="terminal failed to start; do not log this",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_code"] == "native_terminal_start_failed"
+    assert attrs["item_source"] == "execution"
+    # No level means the dashboard should count this as a failure.
+    assert "item_level" not in attrs
+    # message text must never reach the debug table
+    assert "message" not in attrs
+    flat = repr(attrs).lower()
+    assert "terminal failed" not in flat
+    assert "do not log" not in flat
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_info_notice() -> None:
+    # An info-level notice built through the real to_api_dict() serializer must
+    # have item_level="info", item_code, and item_source captured.
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_notice",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="managed_sandbox_workspace_reset",
+            message="workspace reset notice; do not log this",
+            level="info",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_level"] == "info"
+    assert attrs["item_code"] == "managed_sandbox_workspace_reset"
+    assert attrs["item_source"] == "execution"
+    assert "message" not in attrs
+
+
 @contextlib.contextmanager
 def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
     """Attach a capturing handler to the SSE logger for the duration of the block."""
@@ -856,7 +1114,7 @@ def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
 
 
 def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event(
             "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}, "delta": "text"}
@@ -880,7 +1138,7 @@ def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch
 
 
 def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: False)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: False)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event("conv_1", {"type": "response.completed"})
     assert records == []
@@ -909,6 +1167,7 @@ def _capturing_audit_logger() -> Iterator[list[logging.LogRecord]]:
 def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     # A terminal SSE event emits one first-class turn_finished audit row carrying
     # the outcome + safe ids; a non-terminal event emits none.
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_audit_logger() as records:
         session_stream._log_sse_event(
@@ -926,4 +1185,83 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
     assert completed.attributes == {"outcome": "completed", "response_id": "resp_1"}
     failed = records[1]
     assert failed.levelno == logging.WARNING
-    assert failed.attributes == {"outcome": "failed", "error_code": "timeout"}  # no message text
+    # A failed turn is the authoritative blocking signal; error_impact rides the
+    # same row so "sessions actually blocked" is a direct query. No message text.
+    assert failed.attributes == {
+        "outcome": "failed",
+        "error_code": "timeout",
+        "error_impact": "blocking",
+        "error_phase": "turn",
+    }
+
+
+@pytest.mark.parametrize("legacy_error", [False, True])
+@pytest.mark.parametrize("source", ["llm", "execution", "tool", "harness"])
+def test_failed_event_logs_nested_error_code_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_error: bool,
+    source: Literal["llm", "execution", "tool", "harness"],
+) -> None:
+    """Typed harness failures retain their code in both diagnostic streams."""
+    from omnigent.server.schemas import ErrorDetail, FailedEvent, ResponseObject
+
+    event = FailedEvent(
+        type="response.failed",
+        source=source,
+        response=ResponseObject(
+            id="resp_failed",
+            status="failed",
+            model="test-agent",
+            created_at=1,
+            error=ErrorDetail(code="runner_error", message="private failure detail"),
+            output=[{"text": "private assistant output"}],
+        ),
+    ).model_dump(mode="json", exclude_none=True)
+    if legacy_error:
+        event["error"] = {
+            "code": "legacy_error",
+            "source": "execution",
+            "message": "private legacy detail",
+        }
+    expected_code = "legacy_error" if legacy_error else "runner_error"
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
+        session_stream._log_sse_event("conv_failed", event)
+
+    assert len(sse_records) == len(audit_records) == 1
+    assert sse_records[0].attributes == {
+        "response_id": "resp_failed",
+        "error_code": expected_code,
+        "error_source": source,
+    }
+    assert audit_records[0].attributes == {
+        "outcome": "failed",
+        "response_id": "resp_failed",
+        "error_code": expected_code,
+        "error_source": source,
+        "error_impact": "blocking",
+        "error_phase": "turn",
+    }
+    for record in [*sse_records, *audit_records]:
+        assert record.session_id == "conv_failed"
+        assert record.levelno == logging.WARNING
+        assert "private" not in record.getMessage()
+
+
+@pytest.mark.parametrize("source", [None, "private provider text", {"private": "data"}, []])
+def test_failed_event_logs_omit_unrecognized_sources(
+    monkeypatch: pytest.MonkeyPatch, source: object
+) -> None:
+    """Unvalidated source data must not enter diagnostics or suppress the failure log."""
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
+        session_stream._log_sse_event(
+            "conv_failed",
+            {"type": "response.failed", "source": source, "error": {"code": "failed"}},
+        )
+    assert len(sse_records) == len(audit_records) == 1
+    for record in [*sse_records, *audit_records]:
+        assert record.attributes["error_code"] == "failed"
+        assert "error_source" not in record.attributes

@@ -44,6 +44,7 @@ on:
       - "tests/e2e/**"
       - "tests/e2e_ui/**"
       - "tests/_helpers/compat.py"
+      - "tests/helpers/**"
       - ".github/actions/compat-smoke-run/**"
       - ".github/actions/compat-smoke-ui-run/**"
       - ".github/workflows/server-compat.yml"
@@ -99,7 +100,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run compat smoke (Config 1)
         uses: ./.github/actions/compat-smoke-run
@@ -116,7 +116,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run compat smoke (Config 2)
         uses: ./.github/actions/compat-smoke-run
@@ -133,7 +132,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run UI compat smoke (Config A)
         uses: ./.github/actions/compat-smoke-ui-run
@@ -150,7 +148,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
       - name: Run UI compat smoke (Config B)
         uses: ./.github/actions/compat-smoke-ui-run

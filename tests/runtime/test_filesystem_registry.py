@@ -789,7 +789,19 @@ def test_untracked_cache_enable_helper_sets_repo_config(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
 
     registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    # The probe runs git in this process; a repository's fsmonitor hook (which
+    # an agent can configure) must not run with it.
+    marker = tmp_path / "hook_ran"
+    hook = tmp_path / "hook.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    subprocess.run(
+        ["git", "config", "core.fsmonitor", str(hook)], cwd=tmp_path, check=True, env=_git_env()
+    )
+
     registry._enable_untracked_cache()
+
+    assert not marker.exists(), "the untracked-cache probe ran the repository's fsmonitor hook"
 
     result = subprocess.run(
         ["git", "config", "--get", "core.untrackedCache"],
@@ -990,7 +1002,7 @@ def test_untracked_cache_not_enabled_when_probe_fails(tmp_path: Path, monkeypatc
     real_run = subprocess.run
 
     def _probe_fails_run(args, *a, **kw):
-        if args[:2] == ["git", "update-index"]:
+        if "update-index" in args:
             return subprocess.CompletedProcess(
                 args=args, returncode=1, stdout=b"", stderr=b"mtime unreliable"
             )
@@ -1113,6 +1125,14 @@ def test_normalize_path_relative_dotdot_within_cwd_is_normalized(tmp_path: Path)
 # ── create_filesystem_registry factory ───────────────────────────────────────
 
 
+def _init_fake_git_repo(repo: Path) -> None:
+    """Give *repo* the minimal .git layout repo validation requires."""
+    git_dir = repo / ".git"
+    (git_dir / "objects").mkdir(parents=True)
+    (git_dir / "refs").mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+
 def test_create_filesystem_registry_git_workspace(tmp_path: Path) -> None:
     """A directory with a .git subdirectory yields :class:`GitFilesystemRegistry`.
 
@@ -1120,7 +1140,7 @@ def test_create_filesystem_registry_git_workspace(tmp_path: Path) -> None:
     workspaces would fall back to the plain agent-edit registry, losing
     git-backed baseline support.
     """
-    (tmp_path / ".git").mkdir()
+    _init_fake_git_repo(tmp_path)
     registry = create_filesystem_registry(tmp_path)
     assert isinstance(registry, GitFilesystemRegistry), (
         f"Expected GitFilesystemRegistry for a git workspace, got {type(registry).__name__}. "
@@ -1147,7 +1167,7 @@ def test_create_filesystem_registry_nested_git_workspace(tmp_path: Path) -> None
     workspaces (agent sandboxes inside a repo) would incorrectly use the
     plain agent-edit registry and lose git-backed baseline support.
     """
-    (tmp_path / ".git").mkdir()
+    _init_fake_git_repo(tmp_path)
     nested = tmp_path / "subdir" / "workspace"
     nested.mkdir(parents=True)
     registry = create_filesystem_registry(nested)
@@ -1155,6 +1175,94 @@ def test_create_filesystem_registry_nested_git_workspace(tmp_path: Path) -> None
         f"Expected GitFilesystemRegistry for a nested git workspace, "
         f"got {type(registry).__name__}. "
         "_find_git_root may not be walking parent directories."
+    )
+
+
+def test_create_filesystem_registry_bogus_git_dir(tmp_path: Path) -> None:
+    """A stray .git directory that is not a repository must not count as one.
+
+    Regression test: a workspace under an ancestor with a leftover ``.git``
+    dir (e.g. one holding only an untracked-cache lock file) was given a
+    :class:`GitFilesystemRegistry` rooted at that ancestor; every git command
+    then failed, and the working-folder changed-files view returned 502.
+
+    Failure means _find_git_root is accepting directories that lack the
+    HEAD/objects/refs layout git itself requires.
+    """
+    bogus_home = tmp_path / "home"
+    (bogus_home / ".git").mkdir(parents=True)
+    (bogus_home / ".git" / "omnigent-untracked-cache.lock").write_text("", encoding="utf-8")
+    workspace = bogus_home / "project"
+    workspace.mkdir()
+    registry = create_filesystem_registry(workspace)
+    assert isinstance(registry, AgentEditFilesystemRegistry), (
+        f"Expected AgentEditFilesystemRegistry under a bogus .git ancestor, "
+        f"got {type(registry).__name__}. "
+        "_find_git_root may be treating any .git directory as a repository."
+    )
+
+
+def test_create_filesystem_registry_bogus_git_dir_below_real_repo(tmp_path: Path) -> None:
+    """An invalid .git dir between the workspace and a real repo is skipped.
+
+    Mirrors git's own discovery: a ``.git`` directory that fails validation
+    is treated as absent and the walk continues upward.
+
+    Failure means a stray .git dir shadows the real repository above it.
+    """
+    _init_fake_git_repo(tmp_path)
+    nested = tmp_path / "subdir" / "workspace"
+    nested.mkdir(parents=True)
+    (nested / ".git").mkdir()
+    registry = create_filesystem_registry(nested)
+    assert isinstance(registry, GitFilesystemRegistry), (
+        f"Expected GitFilesystemRegistry rooted at the real repo above a bogus "
+        f".git dir, got {type(registry).__name__}. "
+        "_find_git_root may be stopping at invalid .git directories."
+    )
+
+
+def test_create_filesystem_registry_broken_gitlink(tmp_path: Path) -> None:
+    """A .git file pointing at a nonexistent git dir yields the plain registry.
+
+    Git itself treats a broken gitlink as fatal rather than walking past it,
+    so the workspace must be handled as non-git.
+
+    Failure means _find_git_root accepts gitlinks whose target is missing.
+    """
+    (tmp_path / ".git").write_text("gitdir: /nonexistent/gitdir\n", encoding="utf-8")
+    registry = create_filesystem_registry(tmp_path)
+    assert isinstance(registry, AgentEditFilesystemRegistry), (
+        f"Expected AgentEditFilesystemRegistry for a broken gitlink, "
+        f"got {type(registry).__name__}. "
+        "_find_git_root may be accepting gitlinks without validating the target."
+    )
+
+
+def test_create_filesystem_registry_linked_worktree(tmp_path: Path) -> None:
+    """A valid worktree gitlink still yields :class:`GitFilesystemRegistry`.
+
+    Worktree git dirs carry HEAD but keep objects/refs in the common dir, so
+    validation must follow ``commondir`` rather than demanding them inline.
+
+    Failure means worktree workspaces lose git-backed baseline support.
+    """
+    common_dir = tmp_path / "repo" / ".git"
+    (common_dir / "objects").mkdir(parents=True)
+    (common_dir / "refs").mkdir()
+    (common_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    worktree_git_dir = common_dir / "worktrees" / "feature"
+    worktree_git_dir.mkdir(parents=True)
+    (worktree_git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    (worktree_git_dir / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
+    workspace = tmp_path / "feature"
+    workspace.mkdir()
+    (workspace / ".git").write_text(f"gitdir: {worktree_git_dir}\n", encoding="utf-8")
+    registry = create_filesystem_registry(workspace)
+    assert isinstance(registry, GitFilesystemRegistry), (
+        f"Expected GitFilesystemRegistry for a linked worktree, "
+        f"got {type(registry).__name__}. "
+        "_is_git_repo may not be resolving commondir for worktree git dirs."
     )
 
 
@@ -1387,3 +1495,89 @@ def test_git_line_counts_numstat_failure_degrades_but_status_intact(
     assert rec["status"] == "modified"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
+
+
+def test_git_list_tracked_files_is_relative_to_the_requested_subdir(tmp_path: Path) -> None:
+    """Search relies on the index for repos too big to walk, so the listing must
+    cover every tracked file, ignore untracked ones, and re-root under a scoped
+    directory the way the walk reports paths."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "src" / "app").mkdir(parents=True)
+    (tmp_path / "src" / "app" / "main.py").write_text("x")
+    (tmp_path / "README.md").write_text("y")
+    (tmp_path / "untracked.txt").write_text("z")
+    subprocess.run(
+        ["git", "add", "src", "README.md"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert reg.list_tracked_files() == ["README.md", "src/app/main.py"]
+    assert reg.list_tracked_files("src") == ["app/main.py"]
+    # Anchored at the repository root, a missing directory is just an empty
+    # scope, not a git failure.
+    assert reg.list_tracked_files("missing-dir") == []
+    # A scope that cannot be resolved (a symlink loop) is a failure the caller
+    # falls back from, not an exception that would abort the search.
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    assert reg.list_tracked_files("loop") is None
+
+
+def test_agent_edit_registry_has_no_index_to_consult(
+    registry: AgentEditFilesystemRegistry,
+) -> None:
+    """A non-git workspace offers neither listing, so search keeps walking."""
+    assert registry.list_tracked_files() is None
+    assert registry.last_changed_files() is None
+
+
+def test_git_last_changed_files_snapshots_the_paths_still_on_disk(tmp_path: Path) -> None:
+    """Search reuses the latest ``git status`` for untracked files. The snapshot
+    must exist only after a run, keep modified and new paths, drop deleted ones,
+    and hold every path git reported regardless of the returned page's limit."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "kept.txt").write_text("a")
+    (tmp_path / "gone.txt").write_text("b")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (tmp_path / "kept.txt").write_text("changed")
+    (tmp_path / "gone.txt").unlink()
+    (tmp_path / "new.txt").write_text("c")
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    assert reg.last_changed_files() is None
+
+    # limit=1 caps the page returned, not what the snapshot retains.
+    reg.list_changed_files("conv", limit=1)
+    assert sorted(reg.last_changed_files() or []) == ["kept.txt", "new.txt"]
+
+
+def test_git_list_tracked_files_never_runs_a_nested_repositorys_hooks(tmp_path: Path) -> None:
+    """A sandboxed agent can create ``sub/.git`` and point its ``core.fsmonitor``
+    at any command; the scoped index read runs in this unsandboxed process, so
+    it must stay anchored at the workspace's own repository and never let git
+    discover the nested one. Also checks the scope still narrows correctly."""
+    env = _git_env()
+
+    def git(*args: str, cwd: Path) -> None:
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, env=env)
+
+    git("init", "-q", cwd=tmp_path)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.txt").write_text("a")
+    (tmp_path / "top.txt").write_text("t")
+    git("add", "-A", cwd=tmp_path)
+    git("commit", "-q", "-m", "init", cwd=tmp_path)
+    marker = tmp_path / "hook_ran"
+    hook = tmp_path / "hook.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    git("init", "-q", cwd=tmp_path / "sub")
+    git("config", "core.fsmonitor", str(hook), cwd=tmp_path / "sub")
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert reg.list_tracked_files("sub") == ["a.txt"]
+    assert reg.list_tracked_files() == ["sub/a.txt", "top.txt"]
+    assert not marker.exists(), "git discovered the nested repository and ran its hook"

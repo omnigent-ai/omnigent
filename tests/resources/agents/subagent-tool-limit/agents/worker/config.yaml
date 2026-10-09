@@ -1,0 +1,31 @@
+spec_version: 1
+name: worker
+description: >
+  Worker child agent with a STRICTER tool-call limit than its parent. Its
+  calculate tool ships as Python source under tools/python/ so the server
+  loads it from the unpacked bundle.
+
+executor:
+  type: omnigent
+  model: mock-child-model
+  config:
+    harness: openai-agents
+
+prompt: |
+  You are a careful worker. Use the calculate tool for every requested
+  calculation, one call per calculation.
+
+# Child limit: 3 tool calls. Stricter than the parent's 10 above -- the
+# child's 4th tool call must be denied.
+guardrails:
+  policies:
+    child_tool_limit:
+      type: function
+      function:
+        path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+        arguments:
+          limit: 3
+
+os_env:
+  type: caller_process
+  cwd: .

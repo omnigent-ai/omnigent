@@ -1,0 +1,9 @@
+{
+  "include": [
+    ".github/**",
+    "tests/**/*.py",
+    "**/test_*.py",
+    "**/*.test.{js,jsx,ts,tsx}",
+    "**/*.spec.{js,jsx,ts,tsx}"
+  ]
+}

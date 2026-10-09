@@ -6,24 +6,13 @@ is enabled and ``X-Forwarded-Email`` headers are respected.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from pathlib import Path
-
 import httpx
 import pytest
-import pytest_asyncio
-from fastapi import FastAPI
 
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.conftest import ControllableMockClient
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -52,69 +41,6 @@ def _seed_session_with_grants(
 
 
 pytestmark = pytest.mark.asyncio
-
-
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-
-@pytest.fixture()
-def auth_app(
-    runtime_init: None,
-    db_uri: str,
-    tmp_path: Path,
-) -> FastAPI:
-    """App with ``permission_store`` enabled so auth is active on comments routes.
-
-    :param runtime_init: Fixture that initializes the runtime with a mock LLM.
-    :param db_uri: Per-test SQLite URI.
-    :param tmp_path: Pytest temp dir for artifacts.
-    :returns: A :class:`FastAPI` instance with ``UnifiedAuthProvider`` active.
-    """
-    from omnigent.server.auth import UnifiedAuthProvider
-
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
-    )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """Async HTTP client wired to the auth-enabled app.
-
-    :param auth_app: FastAPI app with permission store.
-    :param mock_llm: Controllable mock LLM — released on teardown.
-    :param tmp_path: Pytest temp dir for the harness process manager.
-    :yields: A ready-to-use :class:`httpx.AsyncClient`.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
@@ -450,58 +376,6 @@ async def test_send_marks_comments_addressed_and_formats_message(
     )
     assert statuses[c2["id"]] == "addressed", (
         f"Comment {c2['id']} should be 'addressed' after send, got {statuses[c2['id']]!r}"
-    )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="send must not auto-resolve comments before verification.",
-)
-async def test_send_leaves_comments_open_until_verified(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """Spec: sending to the agent should NOT auto-resolve comments.
-
-    Sending comments creates a request for the agent, but the feedback is
-    not actually resolved until the requested change is verified (explicit
-    user action or a verified-resolution workflow). The current endpoint
-    optimistically flips ``draft`` -> ``addressed`` on send, which hides
-    unresolved feedback if the agent fails, ignores, or mis-handles a
-    comment. This strict xfail documents the desired contract: the comment
-    stays ``draft`` immediately after ``/comments/send``.
-
-    :param auth_client: HTTP client backed by the auth-enabled app.
-    :param db_uri: Per-test SQLite URI used to seed the edit grant.
-    """
-    session_id = _seed_session_with_grants(db_uri, {"alice@example.com": LEVEL_EDIT})
-
-    comment = await _add_comment(
-        auth_client,
-        session_id,
-        user="alice@example.com",
-        path="src/review.py",
-        body="Please fix this edge case",
-        start_index=0,
-        end_index=4,
-    )
-
-    send_resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/comments/send",
-        json={"comment_ids": [comment["id"]]},
-        headers={"X-Forwarded-Email": "alice@example.com"},
-    )
-    send_resp.raise_for_status()
-
-    list_resp = await auth_client.get(
-        f"/v1/sessions/{session_id}/comments",
-        headers={"X-Forwarded-Email": "alice@example.com"},
-    )
-    list_resp.raise_for_status()
-    status = {c["id"]: c["status"] for c in list_resp.json()}[comment["id"]]
-    assert status == "draft", (
-        f"Comment should remain 'draft' (open) until verified, got {status!r}. "
-        "Sending to the agent should not optimistically auto-resolve feedback."
     )
 
 

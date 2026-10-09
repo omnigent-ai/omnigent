@@ -1,12 +1,18 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import * as sessionsApi from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
+import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -29,8 +35,10 @@ vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
-  BrowserPane: ({ conversationId }: { conversationId: string }) => (
-    <div data-testid="browser-pane-stub">{conversationId}</div>
+  BrowserPane: ({ conversationId, active }: { conversationId: string; active?: boolean }) => (
+    <div data-testid="browser-pane-stub" data-active={String(active)}>
+      {conversationId}
+    </div>
   ),
 }));
 // The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
@@ -50,6 +58,15 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+// A side chat's pane is covered by its own suite; the stub just names its child.
+vi.mock("@/components/chat/SideChatPane", () => ({
+  SideChatPane: ({ childId }: { childId: string }) => (
+    <div data-testid="side-chat-pane-stub">{childId}</div>
+  ),
+}));
+const isMobileMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);
@@ -57,7 +74,10 @@ const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   vi.clearAllMocks();
+  isMobileMock.mockReturnValue(false);
+  Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
     mutate: vi.fn(),
@@ -86,25 +106,44 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    pending?: boolean;
+    open?: boolean;
+    animateVisibility?: boolean;
+    resizing?: boolean;
+    inert?: boolean;
+    mobileSideChatsOpen?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
+  const onBrowserTabOpened = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
-  render(
+  const onMobileSideChatsOpenChange = vi.fn();
+  const view = render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId="conv_ws"
         width={360}
-        handleProps={{ tabIndex: 0 }}
+        open={overrides.open}
+        animateVisibility={overrides.animateVisibility}
+        resizing={overrides.resizing}
+        inert={overrides.inert}
+        handleProps={{
+          tabIndex: 0,
+          role: "separator",
+          "aria-label": "Resize panel",
+          onMouseDown: vi.fn(),
+          onKeyDown: vi.fn(),
+        }}
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
+        onBrowserTabOpened={onBrowserTabOpened}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
@@ -127,6 +166,9 @@ function renderWorkspace(
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
+        pending={overrides.pending}
+        mobileSideChatsOpen={overrides.mobileSideChatsOpen}
+        onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
       />
     </TooltipProvider>,
   );
@@ -134,9 +176,12 @@ function renderWorkspace(
     openFileViewer,
     onCloseFile,
     onRightRailTabChange,
+    onBrowserTabOpened,
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
+    onMobileSideChatsOpenChange,
+    view,
   };
 }
 
@@ -147,6 +192,20 @@ describe("WorkspacePanel surface presentation", () => {
     const panel = screen.getByRole("complementary", { name: "Workspace" });
     expect(panel).toHaveClass("md:border-l", "md:border-border");
     expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
+    expect(panel).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
+    expect(panel).toHaveAttribute("data-state", "open");
+    expect(panel).not.toHaveAttribute("data-animate-visibility");
+  });
+
+  it("marks explicit visibility motion separately from resizing", () => {
+    renderWorkspace({ open: false, animateVisibility: true, resizing: true, inert: true });
+
+    const panel = document.querySelector('aside[aria-label="Workspace"]');
+    expect(panel).not.toBeNull();
+    expect(panel).toHaveAttribute("data-state", "closed");
+    expect(panel).toHaveAttribute("data-animate-visibility", "true");
+    expect(panel).toHaveAttribute("data-resizing", "true");
+    expect(panel).toHaveAttribute("aria-hidden", "true");
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
@@ -161,6 +220,113 @@ describe("WorkspacePanel surface presentation", () => {
     expect(filesTab).not.toHaveAttribute("title");
     expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it.each([
+    ["files", ["Files", "Changes", "Pull Requests", "Agents 1"]],
+    ["changes", ["Changes", "Files", "Pull Requests", "Agents 1"]],
+    ["github", ["Pull Requests", "Files", "Changes", "Agents 1"]],
+    ["subagents", ["Agents 1", "Files", "Changes", "Pull Requests"]],
+  ] as const)("places the %s default first without reordering the remaining tabs", (tab, order) => {
+    writeDefaultWorkspaceTab(tab);
+    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "files" });
+
+    expect(screen.getAllByRole("tab").map((item) => item.getAttribute("aria-label"))).toEqual(
+      order,
+    );
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("moves keyboard focus through the displayed order", async () => {
+    writeDefaultWorkspaceTab("changes");
+    const { onRightRailTabChange } = renderWorkspace({
+      showGithubTab: true,
+      rightRailTab: "changes",
+    });
+
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Changes" }), { key: "ArrowRight" });
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
+    expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("selects permanent tabs by their visible number while the tab strip is focused", () => {
+    writeDefaultWorkspaceTab("changes");
+    const { onRightRailTabChange } = renderWorkspace({
+      showGithubTab: true,
+      showBrowserTab: true,
+      rightRailTab: "changes",
+    });
+    const changes = screen.getByRole("tab", { name: "Changes" });
+
+    expect(changes).toHaveAttribute("aria-keyshortcuts", "1");
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-keyshortcuts", "2");
+    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute("aria-keyshortcuts", "4");
+
+    fireEvent.keyDown(changes, { key: "2" });
+    fireEvent.keyDown(changes, { key: "5" });
+    fireEvent.keyDown(changes, { key: "4" });
+
+    const windowKeyDown = vi.fn();
+    window.addEventListener("keydown", windowKeyDown);
+    try {
+      fireEvent.keyDown(changes, { key: "2", code: "Digit2", ctrlKey: true, altKey: true });
+      expect(windowKeyDown).toHaveBeenCalledOnce();
+      expect(windowKeyDown.mock.calls[0][0].defaultPrevented).toBe(false);
+    } finally {
+      window.removeEventListener("keydown", windowKeyDown);
+    }
+
+    expect(onRightRailTabChange).toHaveBeenNthCalledWith(1, "files");
+    expect(onRightRailTabChange).toHaveBeenNthCalledWith(2, "subagents");
+    expect(onRightRailTabChange).toHaveBeenCalledTimes(2);
+  });
+
+  it("compresses numeric positions around unavailable permanent tabs", () => {
+    writeDefaultWorkspaceTab("github");
+    const { onRightRailTabChange } = renderWorkspace({ showGithubTab: false });
+    const files = screen.getByRole("tab", { name: "Files" });
+
+    expect(files).toHaveAttribute("aria-keyshortcuts", "1");
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-keyshortcuts", "2");
+    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute("aria-keyshortcuts", "3");
+
+    fireEvent.keyDown(files, { key: "3" });
+    expect(onRightRailTabChange).toHaveBeenCalledWith("subagents");
+  });
+
+  it("keeps the remaining order when the default tab is unavailable", () => {
+    writeDefaultWorkspaceTab("github");
+    renderWorkspace({ showGithubTab: false });
+
+    expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual([
+      "Files",
+      "Changes",
+      "Agents 1",
+    ]);
+  });
+
+  it("shows inert workspace chrome while a temporary session is pending", () => {
+    renderWorkspace({ pending: true });
+
+    for (const name of ["Files", "Changes", "Pull Requests", "Agents"]) {
+      expect(screen.getByRole("tab", { name: new RegExp(name) })).toBeDisabled();
+    }
+    expect(screen.getByText("Starting workspace…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    expect(screen.queryByTestId("subagents-stub")).toBeNull();
+    expect(useCreateTerminalMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Full screen" })).toBeDisabled();
+    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute(
+      "tabindex",
+      "-1",
+    );
   });
 
   it("has no static Shells nav tab — shells open only as closable soft tabs", () => {
@@ -178,16 +344,24 @@ describe("WorkspacePanel surface presentation", () => {
   });
 
   it.each([
-    { tabName: "Files", tooltip: "Files" },
-    { tabName: "Changes", tooltip: "Changes" },
-    { tabName: "Agents 1", tooltip: "Agents" },
-  ])("explains the $tabName pane icon with a hover tooltip", async ({ tabName, tooltip }) => {
-    renderWorkspace();
+    { tabName: "Files", tooltip: "Files", shortcut: "1" },
+    { tabName: "Changes", tooltip: "Changes", shortcut: "2" },
+    { tabName: "Agents 1", tooltip: "Agents", shortcut: "3" },
+  ])(
+    "explains the $tabName pane icon and its number with a hover tooltip",
+    async ({ tabName, tooltip, shortcut }) => {
+      renderWorkspace();
 
-    const tab = screen.getByRole("tab", { name: tabName });
-    fireEvent.pointerMove(tab.parentElement!, { pointerType: "mouse" });
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(tooltip);
-  });
+      const tab = screen.getByRole("tab", { name: tabName });
+      fireEvent.pointerMove(tab.parentElement!, { pointerType: "mouse" });
+      const tip = await screen.findByRole("tooltip");
+      expect(tip).toHaveTextContent(tooltip);
+      expect(
+        Array.from(tip.querySelectorAll('[data-slot="kbd"]')).map((key) => key.textContent),
+      ).toEqual([MOD_KEY, ALT_KEY, "]", shortcut]);
+      expect(tip.textContent?.match(/\+/g)).toHaveLength(1);
+    },
+  );
 });
 
 describe("WorkspacePanel open-file tabs", () => {
@@ -331,7 +505,7 @@ describe("WorkspacePanel shell tabs", () => {
     expect(shellTab).not.toHaveClass("h-[32px]");
   });
 
-  it("surfaces the active shell's xterm in the content slot", () => {
+  it("surfaces the active shell's xterm in the content slot", async () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
       openTerminals: [termKey],
@@ -340,7 +514,9 @@ describe("WorkspacePanel shell tabs", () => {
 
     // The selected shell tab owns the single content slot — its terminal id is
     // attached, and neither the files scope view nor a file viewer mounts.
-    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    // findByTestId waits for the lazy TerminalView chunk to resolve through
+    // its Suspense boundary.
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
   });
@@ -379,12 +555,31 @@ describe("WorkspacePanel shell tabs", () => {
     // e.g. the Files tab never look selected at once.
     expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("data-state", "inactive");
   });
+
+  it("keeps an active shell selected when the last background browser closes", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { onRightRailTabChange } = renderWorkspace({
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openTerminals: [termKey],
+      selectedTerminalKey: termKey,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+    );
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+  });
 });
 
 describe('WorkspacePanel "+" new-tab menu', () => {
-  // The "+" gates purely on shell access — the agent's declared terminals.
-  // (The embedded browser is one view per conversation, reached via its own
-  // pinned tab, so it isn't offered here.)
   const declaresShell = () =>
     useSessionAgentMock.mockReturnValue({ data: { terminals: ["zsh"] } } as unknown as ReturnType<
       typeof useSessionAgent
@@ -392,8 +587,38 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
   it("is hidden when the agent has no terminal access", () => {
     // No declared terminals (default mock: data undefined) → nothing to open.
-    renderWorkspace({ showBrowserTab: true });
+    renderWorkspace({ showBrowserTab: false });
     expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+  });
+
+  it("shows the Browser and Shell shortcuts as keycaps", async () => {
+    declaresShell();
+    renderWorkspace({ showBrowserTab: true });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const browser = await screen.findByRole("menuitem", { name: "Browser" });
+    const shell = screen.getByRole("menuitem", { name: /shell \(zsh\)/i });
+    const keycaps = (item: HTMLElement) =>
+      Array.from(item.querySelectorAll("kbd"), (key) => key.textContent);
+
+    expect(keycaps(browser)).toEqual(["Ctrl", "Alt", "B"]);
+    expect(keycaps(shell)).toEqual(["Ctrl", "Alt", "T"]);
+  });
+
+  it("ignores number shortcuts from the portalled menu", async () => {
+    const { onRightRailTabChange } = renderWorkspace({
+      showBrowserTab: true,
+      openFiles: ["src/App.tsx"],
+      selectedFilePath: "src/App.tsx",
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const browser = await screen.findByRole("menuitem", { name: "Browser" });
+    browser.focus();
+    fireEvent.keyDown(browser, { key: "1", code: "Digit1" });
+
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
   });
 
   it("renders exactly one '+' — after the nav tabs with no open tabs, trailing the tabs otherwise", () => {
@@ -417,6 +642,19 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
     expect(tabsRegion).not.toContainElement(plus);
   });
+
+  it.each([false, true])(
+    "excludes the scrolling tabs from window dragging without excluding the whole toolbar (maximized=%s)",
+    (maximized) => {
+      renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"], maximized });
+      const toolbar = screen.getByRole("toolbar", { name: "Workspace tabs" });
+      const viewport = toolbar.querySelector(".overflow-x-auto");
+      expect(viewport).not.toBeNull();
+      expect(viewport).toHaveClass("no-drag");
+      expect(viewport).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+      expect(toolbar).not.toHaveClass("no-drag");
+    },
+  );
 
   it("offers Shell (gated on declared terminals), creating one and opening it as a tab", async () => {
     // Agent declares a shell; creating it resolves to a terminal whose tab key
@@ -445,10 +683,10 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     await waitFor(() => expect(screen.queryByRole("menuitem", { name: /shell/i })).toBeNull());
   });
 
-  it("launches the default shell from the top 'Shell' item when several are declared", async () => {
-    // Multiple declared terminals → a top "Shell" item launches the default
-    // (declared[0] with no prior pick); the types live in the "More shells"
-    // flyout below.
+  it("names the current default in the Shell item and launches it on click when several are declared", async () => {
+    // Multiple declared terminals → the "Shell" item names the default inline
+    // ("Shell (zsh)") and clicking it launches that default; the OTHER types
+    // live behind a separate "Other shells" chevron.
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
@@ -464,9 +702,10 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
 
-    // Open the "+" menu and click the top "Shell" item (not "More shells").
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /^shell$/i }));
+    // The default's type is shown inline in the row's label.
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    fireEvent.click(shellItem);
 
     // Launches the default (first-declared) shell without a further pick.
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
@@ -480,7 +719,31 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
-  it("remembers the flyout-picked shell type as the new default (persisted)", async () => {
+  it("does not launch on the multi-shell row when the session is offline", async () => {
+    // The row is disabled on an offline session. Its click handler is a
+    // sub-trigger's onClick (which Radix runs before its own disabled check), so
+    // the handler guards on shellDisabled itself — a click must not fire create.
+    useSessionAgentMock.mockReturnValue({
+      data: { terminals: ["zsh", "bash", "fish"] },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    const mutate = vi.fn();
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    renderWorkspace({ liveness: { kind: "local_stranded" } });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    expect(shellItem).toHaveTextContent(/offline/i);
+    expect(shellItem).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shellItem);
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("lists only the OTHER types in the flyout and remembers a pick as the new default (persisted)", async () => {
     window.localStorage.removeItem("omnigent:preferred-shell");
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
@@ -494,18 +757,26 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     renderWorkspace({ showBrowserTab: false });
 
-    // Open the "More shells" flyout (ArrowRight) and pick "bash", which persists
-    // as the preferred type under the app-global key.
+    // Open the flyout off the "Shell (zsh)" row (ArrowRight reveals the
+    // submenu). It lists only the non-default types — zsh is already named in
+    // the row itself.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const moreShells = await screen.findByRole("menuitem", { name: /more shells/i });
-    moreShells.focus();
-    fireEvent.keyDown(moreShells, { key: "ArrowRight" });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /^bash$/i }));
+    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
+    shellItem.focus();
+    fireEvent.keyDown(shellItem, { key: "ArrowRight" });
+    expect(await screen.findByText("Other shells")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^Other shells$/i })).toBeNull();
+    expect(await screen.findByRole("menuitem", { name: /^bash$/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^fish$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^zsh$/i })).toBeNull();
+
+    // Pick "bash": launches it and persists as the preferred type (app-global).
+    fireEvent.click(screen.getByRole("menuitem", { name: /^bash$/i }));
     expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
     expect(window.localStorage.getItem("omnigent:preferred-shell")).toBe("bash");
 
-    // A fresh menu seeds its default from the persisted pick — the top "Shell"
-    // item now launches bash.
+    // A fresh menu seeds its default from the persisted pick — the row now reads
+    // "Shell (bash)" and launches bash on click.
     cleanup();
     mutate.mockClear();
     useSessionAgentMock.mockReturnValue({
@@ -513,7 +784,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     } as unknown as ReturnType<typeof useSessionAgent>);
     renderWorkspace({ showBrowserTab: false });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /^shell$/i }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /shell \(bash\)/i }));
     expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
 
     window.localStorage.removeItem("omnigent:preferred-shell");
@@ -579,7 +850,9 @@ describe("WorkspacePanel maximize", () => {
   it("shows a full-screen toggle pinned to the right and fires onToggleMaximized", () => {
     const { onToggleMaximized } = renderWorkspace();
 
-    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    const toggle = screen.getByRole("button", { name: "Full screen" });
+    expect(toggle).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    fireEvent.click(toggle);
 
     expect(onToggleMaximized).toHaveBeenCalledTimes(1);
   });
@@ -667,21 +940,187 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
-  it("renders the Browser tab only when showBrowserTab is set", () => {
-    renderWorkspace({ showBrowserTab: true });
-    expect(screen.getByRole("tab", { name: /browser/i })).toBeInTheDocument();
+  it("opens a browser tab with Ctrl+Alt+B", () => {
+    const { onRightRailTabChange, onBrowserTabOpened } = renderWorkspace({
+      showBrowserTab: true,
+    });
+
+    fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+
+    expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+    expect(onBrowserTabOpened).toHaveBeenCalledOnce();
   });
 
-  it("omits the Browser tab when showBrowserTab is false", () => {
+  it("offers browsers without shell access and creates multiple closable tabs", async () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    const openBrowser = async () => {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    };
+    await openBrowser();
+    const firstView = screen.getByTestId("browser-pane-stub").textContent;
+    await openBrowser();
+    expect(screen.getAllByRole("tab", { name: /^Browser \d/ })).toHaveLength(2);
+    expect(screen.getByTestId("browser-pane-stub").textContent).not.toBe(firstView);
+    fireEvent.click(screen.getByRole("tab", { name: "Browser 1" }));
+    expect(screen.getByTestId("browser-pane-stub")).toHaveTextContent(firstView!);
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() =>
+      expect(screen.getAllByRole("tab", { name: /^Browser \d/ })).toHaveLength(1),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() => expect(screen.queryByTestId("browser-pane-stub")).not.toBeInTheDocument());
+    expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
+  });
+
+  it("offers Browser only from the new-tab menu, without a permanent tab", async () => {
+    renderWorkspace({ showBrowserTab: true });
+    expect(screen.queryByRole("tab", { name: /^Browser$/i })).toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(await screen.findByRole("menuitem", { name: "Browser" })).toBeInTheDocument();
+  });
+
+  it("omits Browser entirely when showBrowserTab is false", () => {
     renderWorkspace({ showBrowserTab: false });
     expect(screen.queryByRole("tab", { name: /browser/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
   });
 
-  it("mounts the browser pane when the browser tab is selected", () => {
+  it("mounts the browser pane when a browser soft tab is selected", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
     renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
     // The content slot swaps to the embedded browser pane (stubbed here).
     expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+
+  it("deactivates the browser pane while the persistent rail is closed", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser", open: false, inert: true });
+
+    expect(screen.getByTestId("browser-pane-stub")).toHaveAttribute("data-active", "false");
+  });
+
+  it("shows an error when a native browser close fails", async () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+
+    Object.assign(window, {
+      omnigentDesktop: { browserClose: vi.fn().mockRejectedValue(new Error("disconnected")) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
+    );
+  });
+});
+
+describe("WorkspacePanel mobile side chats", () => {
+  const openTabs = () =>
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b"],
+      selectedSideChatId: "conv_side_b",
+    });
+
+  it.each([false, true])(
+    "keeps a side chat and draft when close fails (mobile=%s)",
+    async (mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      openTabs();
+      const stop = vi.spyOn(sessionsApi, "stopSession").mockRejectedValueOnce(new Error("offline"));
+      useChatStore.setState({ sideChatDrafts: { conv_side_b: "Keep this question" } });
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+      const surface = mobile
+        ? screen.getByTestId("side-chats-panel-drawer")
+        : screen.getByRole("complementary", { name: "Workspace" });
+      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith("Couldn't close side chat. Try again."),
+      );
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+      expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBe("Keep this question");
+
+      stop.mockResolvedValueOnce({ queued: false });
+      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
+      );
+      expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
+      expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();
+      stop.mockRestore();
+    },
+  );
+
+  it("shows the selected side chat in the drawer, not the hidden rail", () => {
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    const { onMobileSideChatsOpenChange } = renderWorkspace({
+      rightRailTab: "sidechat",
+      mobileSideChatsOpen: true,
+    });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(screen.getAllByTestId("side-chat-pane-stub").map((el) => el.textContent)).toEqual([
+      "conv_side_b",
+    ]);
+    expect(drawer).toContainElement(screen.getByTestId("side-chat-pane-stub"));
+
+    fireEvent.click(within(drawer).getByRole("tab", { name: "Side chat 1" }));
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("renders the drawer inside the app subtree, beside the hidden rail", () => {
+    // The embed scopes its stylesheet to its own root, and native shells scope
+    // safe-area insets to the app shell, so a drawer portaled to the body
+    // would render unstyled there.
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    const { view } = renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(view.container).toContainElement(drawer);
+    expect(
+      screen.getByRole("complementary", { name: "Workspace", hidden: true }),
+    ).not.toContainElement(drawer);
+  });
+
+  it("keeps the side chat mounted while the drawer is closed", () => {
+    // Dismissing the drawer must not unmount the pane: a seeded `/side`
+    // question still waiting on the child's agent binding has to go out, and
+    // unsent composer text has to survive — as behind a collapsed desktop rail.
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: false });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+
+  it("keeps the side chat in the rail on desktop", () => {
+    openTabs();
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
   });
 });

@@ -607,6 +607,7 @@ _MODEL_PROVIDER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^qwen(?:\d|-)", re.IGNORECASE), "dashscope"),
     (re.compile(r"^llama-", re.IGNORECASE), "meta_llama"),
     (re.compile(r"^mistral-", re.IGNORECASE), "mistral"),
+    (re.compile(r"^kimi-", re.IGNORECASE), "moonshot"),
 )
 
 
@@ -622,6 +623,10 @@ _BEDROCK_ANTHROPIC_PATTERN = re.compile(
     r"^(?:[a-z0-9-]{2,8}\.)?anthropic\.(?P<model>claude-.+?)(?:-v\d+)?$",
     re.IGNORECASE,
 )
+
+# Databricks Unity Catalog system models (``system.ai.<model>``): the same
+# model the workspace serves as its ``databricks-<model>`` endpoint.
+_DATABRICKS_SYSTEM_AI_PREFIX = "system.ai."
 
 
 def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
@@ -640,6 +645,13 @@ def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
         _add("anthropic", bare)
         _add(_inferred_catalog_provider(bare), bare)
         _add("openrouter", normalized)
+        return targets
+
+    if normalized.lower().startswith(_DATABRICKS_SYSTEM_AI_PREFIX):
+        bare = normalized[len(_DATABRICKS_SYSTEM_AI_PREFIX) :]
+        _add("databricks", f"databricks-{bare}")
+        _add(_inferred_catalog_provider(bare), bare)
+        _add("openrouter", bare)
         return targets
 
     if "/" in normalized:

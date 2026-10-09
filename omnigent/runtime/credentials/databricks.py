@@ -314,13 +314,14 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
     except ValueError as exc:
         # INFO (not WARNING): expired tokens raise here. WARNING would
         # surface via root's lastResort handler to stderr, drowning the
-        # clean ClickException. INFO still lands in cli-*.log.
+        # clean ClickException. INFO still lands in cli-*.log; frames are
+        # debug-only so a TTY-mirrored host console stays concise.
         _logger.info(
             "databricks-sdk Config(profile=%r).authenticate() failed: %s — "
             "falling through to configparser path.",
             sdk_profile,
             exc,
-            exc_info=True,
+            exc_info=_logger.isEnabledFor(logging.DEBUG),
         )
         return None
 

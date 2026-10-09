@@ -22,7 +22,6 @@ Two surfaces:
 
 from __future__ import annotations
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -42,6 +41,7 @@ from omnigent.onboarding.provider_config import (
     provider_families,
     set_default_provider,
 )
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 # The families auto-default resolution walks, in a stable order. ``gemini``
 # is included so a detected-only GEMINI_API_KEY (the antigravity-sdk harness's
@@ -169,7 +169,7 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
             # matching the interactive wizard / non-interactive onboarding /
             # ``provider_selection._read_credentials_from_env``). Without
             # this, an env key pointed at an OpenAI-compatible gateway (e.g.
-            # the Databricks AI gateway) is synthesized against
+            # the Databricks Unity Gateway) is synthesized against
             # ``api.openai.com`` and every request 401s — the credential is a
             # gateway token, not an OpenAI key. Scoped to the openai family's
             # canonical vendor (not a third-party endpoint, handled above).

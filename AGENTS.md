@@ -24,7 +24,8 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
 
 When you open a pull request, fill in the repo's PR template at
 `.github/pull_request_template.md` (case-sensitive on Linux — note the lowercase
-filename). Keep every section and checkbox row so reviewers can skim them.
+filename). Keep every section and checkbox row so reviewers can skim them,
+except the optional Changelog section as described below.
 
 - **Summary** — what changed and why.
 - **Test Plan** — how you verified it.
@@ -36,10 +37,32 @@ filename). Keep every section and checkbox row so reviewers can skim them.
   each).
 - **Coverage notes** — required if you checked "Manual verification completed"
   or "Not applicable".
+- **Release notes** — choose exactly one Yes/No checkbox and keep both rows.
+  Choose Yes only for outstanding user-facing features, bug fixes, UX changes,
+  and breaking changes. Breaking changes must choose Yes. Features behind a
+  feature flag are eligible only once the flag is enabled for users. Choose No
+  for small fixes or improvements, features behind disabled flags, and internal
+  changes with no user impact. This is the author's recommendation for
+  maintainers curating the release notes.
+- **Changelog** — if Release notes is Yes, write one line describing the change
+  for users, including compatibility impact for breaking changes. If No, delete
+  this section; the complete changelog still credits the PR using its title.
 
 Generate the description from the actual diff and this session's context — lead
 with the motivation, then the change. Don't pass a `--body` that skips these
 sections.
+
+### Demo media
+
+Do not commit screenshots or recordings created only as PR or issue evidence.
+Upload them as GitHub attachments and embed the attachment URLs in the PR's
+Demo section or issue comments. Keep local captures outside the tracked tree,
+and redact private data before uploading.
+
+Commit media only when it serves maintained documentation, product assets, or
+test baselines, not merely to obtain a public demo URL. If attachment upload is
+unavailable, explain the limitation and ask for help instead of committing the
+files as a workaround.
 
 ## Finishing a task
 
@@ -49,6 +72,9 @@ verify the result themselves. Prefer verification that is best performed by a
 human, such as concrete manual behavior checks, rather than only listing unit
 test commands. Don't leave the user guessing how to confirm the work — tell
 them exactly what to do.
+
+To drive the app yourself and prove a user-facing change on every entry point a
+user can reach, start with `feature-map/README.md`, then read the relevant maps and linked skills.
 
 ## Deprecating features
 

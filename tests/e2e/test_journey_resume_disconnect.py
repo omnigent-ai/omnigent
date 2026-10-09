@@ -15,7 +15,6 @@ Usage::
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 import httpx
 
@@ -29,23 +28,6 @@ from tests.e2e.conftest import (
 )
 
 _CODEWORD = "crystal-panda-99"
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """Concatenate all assistant output_text blocks from a response body.
-
-    :param body: The terminal response body from
-        :func:`poll_session_until_terminal`.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def test_resume_session_after_disconnect(
@@ -207,7 +189,7 @@ def test_session_list_shows_existing_sessions(
 
     # "Disconnect" — fresh client
     with httpx.Client(base_url=live_server, timeout=300) as new_client:
-        list_resp = new_client.get("/v1/sessions", params={"limit": 100})
+        list_resp = new_client.get("/v1/sessions", params={"visibility": "all", "limit": 100})
         list_resp.raise_for_status()
         sessions = list_resp.json()["data"]
 

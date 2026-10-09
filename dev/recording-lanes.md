@@ -15,30 +15,51 @@ Everything else below — which surface to drive, how to stand the recorder up, 
 the per-surface mechanics — is identical for both. Each agent's own AGENTS.md says
 which clip `kind` it produces and where it goes; this file is the how.
 
-## What is expected to yield a recording
+The recording driver may be an existing test or a temporary journey script,
+separate from the selected regression coverage. Retain its source and command
+as evidence for before/after replay. Recording does not require committing the
+driver as a permanent test.
 
-A `web` / `mobile` / `terminal` / `cli` / `desktop` facet is expected to yield a recording:
-drive it on that surface and film it. Only an `api` facet — a failure no user
-observes on any surface (a wrong value in a response, an internal state a pytest
-asserts) — legitimately has no recording; `recordings: []` is correct there and is
-not a gap. Tests may drive and verify the journey, but the clip itself must show
-the product surface and user-visible outcome, never the test process, pytest
-output, assertions, logs, or a synthetic evidence-summary slide.
+## When to record
 
-**One verdict-appropriate clip per facet — nothing else.** Every recording must
-correspond to a facet, and its `kind` must match that facet's verdict. Do **not**
-add a "contrast"/"control" clip of a *different*, working journey next to a
-reproduced facet — an unrequested extra video with no facet behind it only
-confuses the reader.
+Record the user action and the product's response:
 
-Recording is **best-effort**: if the tooling below is missing, or a user-facing
-facet's state is genuinely unreachable in this harness, keep `recordings: []` for
-that facet and **name the specific blocker** in `recording_unavailable_reason` —
-an empty recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must
-always come with a concrete reason, never a silent skip. Never let recording block
-or distort the work itself, and never fabricate a hollow journey that doesn't
-reach the failure just to produce a video. Missing or rejected footage never
-blocks the verdict, fix, or PR.
+- **Web, mobile, or desktop:** show the user interacting with the product and
+  the result on screen.
+- **CLI or terminal output:** record the real command and its output, even if the
+  output is only an error message, hint, or status line.
+- **Internal/API-only results:** written evidence is enough when no user
+  interface shows the result. Set `recordings: []`, describe what you observed,
+  and explain how you checked it.
+
+For example, if `omnigent host` prints the wrong error after login expires,
+record running that command with an expired login and showing its output. See
+the `cli` section below for setup steps.
+
+## What the clip must show
+
+- Show the actual product behavior. Tests may drive the interaction and verify
+  the result, but the clip must show the product itself.
+- Do not substitute a video of pytest output, assertions, test source, debug
+  logs, or a slide describing what happened. Do not invent a different journey
+  just to produce a video.
+- Record one clip per facet, with a `kind` that matches its verdict. Do not add
+  unrelated working examples as extra clips.
+
+## If recording is blocked
+
+Recording is **best-effort**:
+
+- If a required tool is missing or the product cannot reach the state you need
+  to show, set `recordings: []` for that facet. Name the specific blocker in
+  `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
+  that cannot start.
+- Text-only CLI output is not a reason to skip recording. A missing recording
+  from an earlier run is not a reason either.
+- Do not block the verdict, fix, or PR because footage is missing or rejected.
+  Explain the gap and continue with the available evidence.
+
+## File names and capture modes
 
 Every declared recording includes `capture_mode`, which records how the product
 surface was filmed. Use `playwright_ui` for browser-page capture, `electron` for
@@ -107,7 +128,7 @@ cause is named from what you observed rather than guessed.
 
 ## `web` facets
 
-Run the authored Playwright test with recording on.
+Run the selected Playwright journey driver with recording on.
 
 **Record via `OMNIGENT_E2E_RECORD_DIR`, not `--video on`.** `--video on` only
 instruments pytest-playwright's own `page` fixture. Many e2e_ui tests (e.g. the
@@ -116,19 +137,67 @@ whole `tests/e2e_ui/start_session/` suite) drive Playwright *manually* —
 the `page` fixture, and `--video on` records **nothing** for those: the flag never
 sees their browser, so you get a green/red test but an empty `recordings/`.
 Setting `OMNIGENT_E2E_RECORD_DIR` makes the e2e_ui conftest inject
-`record_video_dir` into every page/context the test opens, so the journey is
+`record_video_dir` into pytest-playwright's `page`/`context` fixtures and into
+every page/context the test opens through the async or sync API, so the journey is
 filmed no matter how the test opened the browser. Playwright writes the `.webm` (a
 random hash name) into that dir when the context closes. (If a test already
 hard-codes its own `record_video_dir` — some authored reproductions do — that
 explicit dir wins and the video lands there instead; check both locations.)
+For pytest-playwright fixtures, `--video` takes precedence over the environment
+variable: clips go to its output directory, and `--video retain-on-failure`
+discards passing-test videos.
+
+**The clip ends with the test body, not with fixture teardown.** Playwright
+writes the video when the recorded context closes, and pytest tears fixtures
+down in reverse setup order: the `context` behind `page` is set up before the
+session fixtures a test lists after it, so it closes *last* — after those
+fixtures have deleted the session or stopped the runner. A clip that keeps
+rolling through teardown ends on the SPA's teardown state instead of the state
+the test asserted: an `after` clip on the pane greyed out behind "Bridge closed:
+terminal session ended", a `before` clip on a search palette that drops to "No
+results found" as the fixture deletes the sessions it had just listed. When
+recording is requested (`OMNIGENT_E2E_RECORD_DIR`, `--video`, or a
+`record_video_dir` in `browser_context_args`), the e2e_ui conftest therefore
+closes the pytest-playwright context as soon as the test body finishes, before
+any fixture teardown runs. A test that opens its
+own pages or contexts must close them itself before its body returns, for the
+same reason, and a fixture that touches `page` after `yield` must skip that
+work when `page.is_closed()`. Recording configured with a
+`@pytest.mark.browser_context_args(record_video_dir=...)` marker follows the
+same stop point.
 
 **Move the emitted clip to a stable name.** The video lands under
 `OMNIGENT_E2E_RECORD_DIR` (or the test's own dir) as a random hash name; **move**
 it (do not copy) to a stable `recordings/<slug>/<kind>-<facet>.webm` and delete
 the leftover raw dir, so the same footage isn't collected twice. If that dir has
 **no** `.webm` after the run, the recording genuinely didn't happen (the test
-errored before opening a page, or the fixture never came online) — capture the
-reason per the empty-recordings rule; never report a clip you didn't produce.
+errored before opening a page, or the fixture never came online). For a test
+using the `page` fixture, retry with `--video on` and check pytest's `--output`
+directory before declaring the lane unfilmable. A clip there indicates a recorder
+configuration problem. Then capture the reason per the empty-recordings rule;
+never report a clip you didn't produce.
+
+**Don't poll clipped or element screenshots while filming.** Chromium takes
+`page.screenshot(clip=…)` and `locator.screenshot()` by resizing the view to the
+clip for the capture, and the recorder films that resized view: a pixel probe
+polled during the journey leaves the footage mostly grey with a shrunken or
+magnified strip of the page. The `tests/e2e_ui/` conftest turns a clipped
+`page.screenshot` on a recorded Chromium page into a full-viewport capture
+cropped to the clip, so viewport clip probes there are safe. `full_page=True`
+captures are not covered and can still resize the recorded view. For element
+screenshots, or a Playwright script outside that suite, read pixels via
+`page.evaluate` (e.g. a canvas
+`toDataURL()`) or capture from a second, unrecorded context instead.
+
+Clipped JPEGs on recorded Chromium pages are encoded with Pillow, so they are
+not byte-identical to Chromium's native JPEG output. Unsupported formats and
+malformed screenshot options use Playwright's native validation and errors.
+
+**Maintenance:** Context closure before fixture teardown and screenshot crop
+rounding rely on pytest-playwright and Chromium internals; after Playwright,
+pytest-playwright, or Chromium upgrades, rerun
+`tests/e2e_ui/test_recorded_page_clip_screenshots.py` and
+`tests/e2e_ui/test_recording_stops_before_teardown.py` as canaries.
 
 ## `mobile` facets
 
@@ -159,7 +228,8 @@ can't show — iOS safe-area / Dynamic Island insets, the system-browser OIDC ho
 the native setup screen. Those need a real simulator/emulator screen recording,
 which no CI path provisions today; keep `recordings: []` for such a facet and name
 the missing device toolchain in your evidence (a real environment limit, not a
-`not_reproduced`). The authored test still ships.
+`not_reproduced`). Keep the available test evidence and selected regression
+coverage; missing footage does not change which tests belong in the PR.
 
 ## `terminal` facets
 
@@ -171,7 +241,7 @@ alongside as machine-checkable evidence.
 **For a native-harness pane** (claude/codex/cursor/goose/hermes/kiro/… — the bug
 is in a real harness CLI's output), don't hand-roll the launch: the existing
 render-parity tests already drive the *real* CLI against the mock LLM with the
-terminal view shown, so **copy the closest one**
+terminal view shown, so **reuse or adapt the closest one**
 (`tests/e2e_ui/messages/test_native_<harness>_render_parity.py`, which use the
 `native_<harness>_session` / `native_<harness>_mock_session` fixtures in
 `tests/e2e_ui/conftest.py`) and adapt its scripted turns to your journey. These
@@ -213,8 +283,8 @@ tape and note that rendering was skipped.
   won't render (server boot times out, `ttyd` missing, VHS unavailable), do
   **not** substitute a recording of `pytest … FAILS` / an `AssertionError`. That
   films the regression artifact, not the failure a user sees. Keep
-  `recordings: []` and name the blocker; the authored test still ships, it just
-  isn't the video.
+  `recordings: []` and name the blocker. Keep the test evidence separately and
+  commit only the selected permanent regression coverage.
 
 ## `desktop` facets (Electron shell)
 
@@ -246,6 +316,13 @@ state, bad output, error) for a `before` recording, or the correct end state for
 `fixed`/`after` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif`
 are fine otherwise. Recordings are workspace artifacts exactly like the test —
 leave them uncommitted; in CI the artifact bundle collects them.
+
+Check the clip's last frame before captioning it. Every clip must stop on the
+demonstrated state its caption describes — the failure for a `before` clip, the
+healthy state for a `fixed`/`after` clip; a final frame that shows teardown — the
+pane greyed out behind "Bridge closed: terminal session ended", a deleted
+session, a result list emptied by fixture cleanup — means the recording outlived
+the test body. Fix the stop point and re-record; do not caption around it.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

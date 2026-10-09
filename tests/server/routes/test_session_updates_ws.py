@@ -861,3 +861,28 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
 
     # Sub-agent spend must appear in Alice's daily rollup via the root fallback.
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.75)
+
+
+def test_projects_changed_event_forwards_to_client(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """A ``projects_changed`` discovery event reaches the connected client.
+
+    Project rows aren't sessions, so the watch-set diff can never surface a
+    project create/rename/delete made in another client; the stream must
+    forward the discovery event as its own frame for the client to refresh its
+    projects cache. A regression here leaves other open clients (another tab,
+    the mobile app) showing a stale folder name until a full reload.
+    ``fast_rescan`` shrinks the heartbeat cadence so a dropped forward fails
+    fast on exhausted heartbeats instead of blocking.
+    """
+    s1 = _seed_session(stores, owner=ALICE, title="watched")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        _recv_until(ws, {"snapshot"})
+        # A project mutation elsewhere announces on Alice's discovery channel.
+        sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
+        frame = _recv_until(ws, {"projects_changed"})
+        assert frame["type"] == "projects_changed"

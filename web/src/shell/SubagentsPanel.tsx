@@ -19,83 +19,56 @@ import type { ComponentType, SVGProps } from "react";
 import {
   BookOpenIcon,
   BotIcon,
+  CheckIcon,
+  CircleAlertIcon,
+  CircleDotIcon,
+  CircleHelpIcon,
   Code2Icon,
   CompassIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CornerDownRightIcon,
+  EllipsisIcon,
   FileTextIcon,
   FlaskConicalIcon,
   ListIcon,
   NetworkIcon,
+  PauseIcon,
   PlusIcon,
   ScanSearchIcon,
   SearchIcon,
+  UnplugIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
-import { Badge } from "@/components/ui/badge";
-import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
-import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
-import { CodexIcon } from "@/components/icons/CodexIcon";
-import { CursorIcon } from "@/components/icons/CursorIcon";
-import { GooseIcon } from "@/components/icons/GooseIcon";
-import { HermesIcon } from "@/components/icons/HermesIcon";
-import { KimiIcon } from "@/components/icons/KimiIcon";
-import { KiroIcon } from "@/components/icons/KiroIcon";
-import { NessieIcon } from "@/components/icons/NessieIcon";
-import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
-import { OttoIcon } from "@/components/icons/OttoIcon";
-import { PiIcon } from "@/components/icons/PiIcon";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
-import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import {
-  activityDotClassName,
-  childStatus,
-  sessionStatus,
-  type AgentActivity,
-  type AgentStatus,
-} from "./subagentStatus";
+  CLAUDE_NATIVE_SUBAGENT_WRAPPER,
+  nativeCodingAgentForWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
+import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
-// Session-scoped URL params that the file viewer / Files panel write
-// for one session and AppShell's restore effect re-reads on the next.
-// Stripping these on rail navigation prevents a sticky ``?file=`` from
-// the previous session yanking the user into the file viewer of the
-// next one. Other params (e.g. ``?debug=1`` for ``useDebugMode``) are
-// global and must be preserved across navigation.
-const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
 const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
+const CODEX_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.codex_native.agent_role";
+const ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.antigravity_native.agent_role";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
-
-/**
- * Build a rail-link search string from the current URL, dropping the
- * session-scoped params and keeping anything else.
- *
- * @param search - The current ``location.search`` string,
- *   e.g. ``"?file=foo.txt&debug=1"``.
- * @returns A search string suitable for a ``<Link to={{ search }}>``,
- *   e.g. ``"?debug=1"`` or ``""`` when nothing remains.
- */
-function railLinkSearch(search: string): string {
-  const params = new URLSearchParams(search);
-  for (const key of SESSION_SCOPED_PARAMS) params.delete(key);
-  const next = params.toString();
-  return next ? `?${next}` : "";
-}
 
 interface SubagentsPanelProps {
   /** The conversation currently rendered in main. Used only to
@@ -123,15 +96,21 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   // show alongside the "main" row.
   if (isLoading && children.length === 0) {
     return (
-      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground bg-card">
-        Loading…
+      <div className="flex h-full min-h-0 flex-col bg-card">
+        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <div className="flex flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground">
+          Loading…
+        </div>
       </div>
     );
   }
   if (error && children.length === 0) {
     return (
-      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground bg-card">
-        Failed to load agents.
+      <div className="flex h-full min-h-0 flex-col bg-card">
+        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <div className="flex flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground">
+          Failed to load agents.
+        </div>
       </div>
     );
   }
@@ -165,13 +144,14 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         <PlusIcon className="size-3.5 shrink-0" />
         Add agent
       </button>
-      <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
+      <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child) => (
+        {children.map((child, index) => (
           <SubagentRow
             key={child.id}
             child={child}
             depth={1}
+            rootGuideContinues={index < children.length - 1}
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
@@ -195,52 +175,36 @@ function ViewModeToggle({
   onViewModeChange: (mode: ViewMode) => void;
 }) {
   return (
-    <div className="flex shrink-0 items-center justify-end gap-0.5 border-b px-2 py-1">
-      <Button
-        variant={viewMode === "list" ? "secondary" : "ghost"}
-        size="icon-xs"
-        onClick={() => onViewModeChange("list")}
-        aria-label="List view"
-        title="List view"
-        data-testid="view-mode-list"
-      >
-        <ListIcon className="size-3.5" />
-      </Button>
-      <Button
-        variant={viewMode === "graph" ? "secondary" : "ghost"}
-        size="icon-xs"
-        onClick={() => onViewModeChange("graph")}
-        aria-label="Graph view"
-        title="Graph view"
-        data-testid="view-mode-graph"
-      >
-        <NetworkIcon className="size-3.5" />
-      </Button>
+    <div className="flex h-11 shrink-0 items-center gap-0.5 border-b px-2">
+      <h2 className="pl-1 font-medium text-ui">Agents</h2>
+      <div className="ml-auto flex items-center gap-0.5">
+        <Button
+          variant={viewMode === "list" ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={() => onViewModeChange("list")}
+          aria-label="List view"
+          title="List view"
+          data-testid="view-mode-list"
+        >
+          <ListIcon className="size-3.5" />
+        </Button>
+        <Button
+          variant={viewMode === "graph" ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={() => onViewModeChange("graph")}
+          aria-label="Graph view"
+          title="Graph view"
+          data-testid="view-mode-graph"
+        >
+          <NetworkIcon className="size-3.5" />
+        </Button>
+      </div>
     </div>
   );
 }
 
-// Quiet states show only an indicator — the word lives in the tooltip — so the
-// row stays clean. Working is quiet too: the pulsing pink dot already reads as
-// "active", so the redundant "Working" label is dropped. The eye still lands on
-// agents that need input or are in trouble, which keep their word.
-const QUIET_STATE: Record<AgentActivity, boolean> = {
-  launching: false,
-  working: true,
-  awaiting: false,
-  failed: false,
-  // Quiet — show only the grey dot (the word lives in the tooltip), like the
-  // idle/done/working dot states. The colored dot is enough to flag the
-  // liveness loss without adding label text to the row.
-  disconnected: true,
-  other: false,
-  done: true,
-  idle: true,
-};
-
 // Settled states are de-emphasized (dimmed) so live agents dominate the list.
-// Kept separate from QUIET_STATE: ``working`` is quiet (no label word) but must
-// NOT be dimmed — an actively-working agent should stay full-strength.
+// Working is not dimmed — an actively-working agent should stay full-strength.
 const SETTLED_STATE: Record<AgentActivity, boolean> = {
   launching: false,
   working: false,
@@ -259,7 +223,7 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
  * role at a glance (Claude Code spawns many same-type "Explore" agents — the
  * icon distinguishes roles; the preview line below distinguishes instances).
  * Category icons are monochrome — the row applies the muted color; the
- * fallback is the full-color Otto (starfish) mascot.
+ * fallback is the generic bot icon.
  *
  * @param tool - The agent type, e.g. ``"Explore"`` or ``"researcher"``;
  *   ``null`` when the child carries no type.
@@ -282,119 +246,97 @@ export function iconForAgentType(tool: string | null): AgentRowIcon {
   ) {
     return Code2Icon;
   }
-  return OttoIcon;
+  return BotIcon;
 }
 
 /**
- * Pick a brand glyph for coding child sessions when the summary carries
- * enough identity metadata. Native children identify via their wrapper
- * label (authoritative — a custom scaffold agent merely *named* "codex"
- * must not get the Codex logo). Pi children are scaffold sessions with
- * no wrapper label, so the exact agent name ``"pi"`` is the signal.
+ * Pick the harness identity for coding child sessions when the summary
+ * carries enough metadata. The shared harness-selector icon component uses
+ * this identity to render the same color variant in the Agents panel.
  *
- * Only full native sessions get the brand glyph. *Sub-agent* wrapper
+ * Only full native sessions get the harness glyph. *Sub-agent* wrapper
  * children (``…-subagent``) deliberately fall through to the role icons
- * (and the Otto fallback) — a native session's sub-agents are all the
+ * (and the generic bot fallback) — a native session's sub-agents are all the
  * same brand, so repeating the logo down the tree says nothing, while
  * role icons distinguish what each one is doing.
  *
  * @param child - One child-session summary from the poll or stream.
- * @returns The Claude/Codex/pi glyph component, or ``null`` for generic agents.
+ * @returns The agent identity used by the harness selector, or ``null``.
  */
-function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
+function harnessAgentForChild(
+  child: ChildSessionInfo,
+): { name: string; harness: string | null } | null {
   const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
-  if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
-  if (nativeAgent?.iconKind === "codex") return CodexIcon;
-  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
-  if (nativeAgent?.iconKind === "pi") return PiIcon;
-  if (nativeAgent?.iconKind === "cursor") return CursorIcon;
-  if (nativeAgent?.iconKind === "kiro") return KiroIcon;
-  if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
-  if (nativeAgent?.iconKind === "goose") return GooseIcon;
-  if (nativeAgent?.iconKind === "kimi") return KimiIcon;
-  if (nativeAgent?.iconKind === "hermes") return HermesIcon;
+  if (nativeAgent) {
+    return { name: nativeAgent.agentName, harness: nativeAgent.harness };
+  }
   // Exact match — substring checks would false-match names like "pipeline".
-  if (child.tool === PI_AGENT_NAME) return PiIcon;
+  if (child.tool === PI_AGENT_NAME) {
+    return { name: "pi-native-ui", harness: "pi-native" };
+  }
   return null;
 }
 
 /**
- * Indicator + optional label shared by the main and child rows. The working
- * state reuses the sidebar's RunningDot in the same grey tone, so
- * "active" reads identically across the app; other states are a single
- * tokenized dot.
+ * Resolve the semantic role that chooses a sub-agent's category icon.
  *
- * The indicator is rendered last (label first) so that, with the indicator
- * right-aligned in the row, every row's dot lands in the same column
- * regardless of label width or whether the label is shown — otherwise a
- * wide label like "Failed" pushes its dot left of a bare "Idle" dot.
- *
- * @param status - The resolved activity + label to render.
+ * Native runtimes may give an instance a friendly nickname (for example,
+ * Codex's "Archimedes") while carrying its functional role separately. The
+ * nickname remains the row label; the role drives iconography.
  */
-function StatusIndicator({ activity, label, details }: AgentStatus) {
+function iconRoleForChild(child: ChildSessionInfo): string | null {
+  const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
+  if (wrapper === CODEX_NATIVE_SUBAGENT_WRAPPER) {
+    return child.labels?.[CODEX_NATIVE_SUBAGENT_ROLE_LABEL] ?? child.tool;
+  }
+  if (wrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER) {
+    return child.labels?.[ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL] ?? child.tool;
+  }
+  return child.tool;
+}
+
+const STATUS_AVATAR_CLASS: Record<AgentActivity, string> = {
+  launching: "bg-muted text-muted-foreground",
+  working: "bg-muted text-muted-foreground",
+  awaiting: "bg-warning/15 text-warning",
+  failed: "bg-destructive/10 text-destructive",
+  disconnected: "bg-muted text-muted-foreground",
+  other: "bg-muted text-muted-foreground",
+  done: "bg-success/10 text-success",
+  idle: "bg-muted text-muted-foreground",
+};
+
+const STATUS_AVATAR_ICON: Record<AgentActivity, AgentRowIcon | null> = {
+  launching: null,
+  working: null,
+  awaiting: CircleHelpIcon,
+  failed: CircleAlertIcon,
+  disconnected: UnplugIcon,
+  other: EllipsisIcon,
+  done: CheckIcon,
+  idle: PauseIcon,
+};
+
+/** Compact state tile shown before each agent avatar. */
+function StatusAvatar({ activity, label, details }: AgentStatus) {
   const title = details ? `${label}: ${details}` : label;
-  // Awaiting renders the exact same "Needs response" tag as the sidebar
-  // (SessionStateBadge) so the approval affordance reads identically across
-  // the app. The tag carries its own copy, so the row's separate label word
-  // is omitted to avoid duplicating the text.
-  if (activity === "awaiting") {
-    return (
-      <span
-        aria-label={title}
-        title={title}
-        data-testid="subagent-status-dot"
-        className="inline-flex shrink-0 items-center text-sm"
-      >
-        <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
-      </span>
-    );
-  }
-  if (activity === "failed") {
-    return (
-      <span
-        aria-label={title}
-        title={title}
-        data-testid="subagent-status-dot"
-        className="inline-flex shrink-0 items-center gap-1 text-destructive text-sm"
-      >
-        <span>{label}</span>
-        <span
-          className={cn(
-            "inline-block size-2 shrink-0 rounded-full",
-            activityDotClassName("failed"),
-          )}
-        />
-      </span>
-    );
-  }
-  // ``disconnected`` falls through to the quiet default below: it's a
-  // QUIET_STATE, so only the grey --muted-foreground dot renders (no inline
-  // word) — the cause stays in the tooltip / aria-label. Distinct from the
-  // red "Failed" pill above, without repurposing the shared amber --warning.
-  //
-  // Launching's inline word reads in the blue --session-active hue to match
-  // its dot; every other state here keeps the neutral muted text — the verbatim
-  // "other" word stays grey, and idle/done/disconnected show no word at all.
-  const wrapperTextClass =
-    activity === "launching" ? "text-session-active" : "text-muted-foreground";
+  const Icon = STATUS_AVATAR_ICON[activity];
   return (
     <span
       aria-label={title}
       title={title}
-      data-testid="subagent-status-dot"
-      className={cn("inline-flex shrink-0 items-center gap-1 text-sm", wrapperTextClass)}
+      data-testid="subagent-status-avatar"
+      data-activity={activity}
+      className={cn(
+        "flex size-6 shrink-0 items-center justify-center rounded-md",
+        STATUS_AVATAR_CLASS[activity],
+      )}
     >
-      {!QUIET_STATE[activity] && <span>{label}</span>}
-      {activity === "working" ? (
-        <RunningDot />
+      {Icon ? (
+        <Icon aria-hidden="true" className="size-3.5" />
       ) : (
-        <span
-          className={cn(
-            "inline-block size-2 shrink-0 rounded-full",
-            activityDotClassName(activity),
-          )}
-        />
+        <RunningDot className="size-3.5 text-current" />
       )}
     </span>
   );
@@ -419,7 +361,8 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
   const isNativeSubagent =
     childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
     childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER;
+    childWrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER ||
+    childWrapper === CLAUDE_NATIVE_SUBAGENT_WRAPPER;
   if (isNativeSubagent && !isUserAdded) {
     return child.tool ?? child.title ?? child.id;
   }
@@ -487,41 +430,14 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-/**
- * Resolve a session's brand icon from its native-wrapper ``iconKind``
- * (authoritative for native-terminal sessions) with a harness-substring
- * fallback for plain SDK sessions that carry no wrapper label — e.g.
- * ``omni --harness kimi``, whose ``harness: "kimi"`` would otherwise fall
- * through to the generic bot. Mirrors ``iconForAgent`` in ``AgentCard.tsx``.
- */
-function iconForWrapperOrHarness(
-  iconKind: string | undefined,
-  harness: string | null | undefined,
-  isNessie: boolean,
-): AgentRowIcon {
-  if (iconKind === "claude" || harness?.includes("claude")) return ClaudeIcon;
-  if (iconKind === "codex" || harness?.includes("codex")) return CodexIcon;
-  if (iconKind === "opencode" || harness?.includes("opencode")) return OpenCodeIcon;
-  if (iconKind === "cursor" || harness?.includes("cursor")) return CursorIcon;
-  if (iconKind === "kiro" || harness?.includes("kiro")) return KiroIcon;
-  if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
-  if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
-  if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
-  // Exact match — a substring check would false-match e.g. "openapi".
-  if (iconKind === "pi" || harness === "pi") return PiIcon;
-  if (isNessie) return NessieIcon;
-  return BotIcon;
-}
-
 function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
   const { session } = useSession(rootSessionId);
-  const search = railLinkSearch(useLocation().search);
+  const search = sessionNavigationSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
   // TerminalFirstContext to decide a session is claude/codex-native.
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
-  const Icon = iconForWrapperOrHarness(nativeAgent?.iconKind, session?.harness, isNessie);
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
@@ -529,13 +445,18 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const label = nativeAgent?.displayName ?? session?.agentName ?? "main";
   const preview = mainMessagePreview(session?.items);
   return (
-    <li>
+    <li className="relative">
+      <span
+        aria-hidden="true"
+        style={{ left: ROOT_GUIDE_CENTER_PX }}
+        className="pointer-events-none absolute bottom-0 top-10 z-10 border-l border-dashed border-border/70"
+      />
       <Link
         // Drop session-scoped params (``file``, ``diff``, ``comment``,
-        // ``view``) when navigating in the rail — those are tied to
+        // ``view``, ``message``) when navigating in the rail — those are tied to
         // one session's file-viewer state and must not bleed into the
         // next. Global params like ``?debug=1`` are preserved by
-        // ``railLinkSearch`` so debug mode stays on across navigation.
+        // ``sessionNavigationSearch`` so debug mode stays on across navigation.
         to={{ pathname: `/c/${rootSessionId}`, search }}
         data-testid="subagent-main-row"
         data-root-session-id={rootSessionId}
@@ -543,44 +464,63 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
           nativeAgent != null ? `${nativeAgent.key}-native` : isNessie ? "nessie" : "agent"
         }
         className={cn(
-          "flex w-full flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-accent/60",
-          isActive && "bg-accent",
+          "flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left",
+          isActive ? "bg-accent" : "hover:bg-muted",
         )}
       >
-        <div className="flex w-full items-center gap-1">
-          <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-          <span className="shrink-0 truncate text-sm font-medium">{label}</span>
-          <span className="flex-1" />
-          <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
+        <div className="flex w-full items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-[2px]">
+              <span
+                data-testid="subagent-main-harness-icon"
+                className="flex size-8 shrink-0 items-center justify-center rounded-xl border border-border bg-background"
+              >
+                <ComposerAgentIcon
+                  agent={{
+                    name: session?.agentName ?? nativeAgent?.agentName ?? "",
+                    harness: session?.harness ?? nativeAgent?.harness ?? null,
+                  }}
+                  className="size-5"
+                />
+              </span>
+              <span className="min-w-0 truncate text-base font-semibold">{label}</span>
+            </div>
+            {preview && (
+              <p
+                data-testid="subagent-main-preview"
+                className="truncate text-sm text-muted-foreground"
+              >
+                {preview}
+              </p>
+            )}
+          </div>
         </div>
-        {preview && (
-          // Indented to align with the title text above: 14px icon + 4px gap.
-          <p
-            data-testid="subagent-main-preview"
-            className="truncate pl-[18px] text-sm text-muted-foreground"
-          >
-            {preview}
-          </p>
-        )}
       </Link>
     </li>
   );
 }
 
-// Indentation: depth 1 keeps the original 24px gutter (pl-6); each
-// further level steps in by another 14px so the connector glyphs read
-// as a tree.
-const ROW_BASE_PADDING_PX = 24;
-const ROW_DEPTH_STEP_PX = 14;
-const ROW_TOGGLE_SIZE_PX = 16;
+const ROOT_GUIDE_CENTER_PX = 26;
+
+// The root harness avatar's center sits at 26px (10px row inset + 16px).
+// Center direct children on that guide. Align the nested connector container
+// with its parent's title container, then preserve that step at deeper levels.
+const ROW_BASE_PADDING_PX = 14;
+const ROW_DEPTH_STEP_PX = 90;
+const SUBAGENT_ROW_OFFSET_PX = 26;
+const ROW_VERTICAL_PADDING_PX = 4;
+const ROW_CONNECTOR_SIZE_PX = 24;
 
 function rowPaddingLeft(depth: number): number {
-  return ROW_BASE_PADDING_PX + (depth - 1) * ROW_DEPTH_STEP_PX;
+  return (
+    ROW_BASE_PADDING_PX + (depth - 1) * ROW_DEPTH_STEP_PX - (depth > 1 ? SUBAGENT_ROW_OFFSET_PX : 0)
+  );
 }
 
 function SubagentRow({
   child,
   depth,
+  rootGuideContinues,
   conversationId,
   collapsedRows,
   onToggleCollapsed,
@@ -588,6 +528,8 @@ function SubagentRow({
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
   depth: number;
+  /** Whether the root guide must continue to a later first-level sibling. */
+  rootGuideContinues: boolean;
   /** The conversation currently rendered in main, for row highlighting. */
   conversationId: string;
   collapsedRows: Record<string, boolean>;
@@ -595,8 +537,9 @@ function SubagentRow({
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
-  const search = railLinkSearch(useLocation().search);
-  const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
+  const search = sessionNavigationSearch(useLocation().search);
+  const harnessAgent = harnessAgentForChild(child);
+  const RoleIcon = iconForAgentType(iconRoleForChild(child));
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
@@ -610,15 +553,43 @@ function SubagentRow({
   const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
   return (
     <>
-      <li className="relative">
+      <li className="group/agent relative">
+        {depth === 1 ? (
+          <>
+            <span
+              aria-hidden="true"
+              data-root-guide-segment="upper"
+              style={{ left: ROOT_GUIDE_CENTER_PX, height: ROW_VERTICAL_PADDING_PX }}
+              className="pointer-events-none absolute top-0 border-l border-dashed border-border/70"
+            />
+            {rootGuideContinues && (
+              <span
+                aria-hidden="true"
+                data-root-guide-segment="lower"
+                style={{
+                  left: ROOT_GUIDE_CENTER_PX,
+                  top: ROW_VERTICAL_PADDING_PX + ROW_CONNECTOR_SIZE_PX,
+                }}
+                className="pointer-events-none absolute bottom-0 border-l border-dashed border-border/70"
+              />
+            )}
+          </>
+        ) : rootGuideContinues ? (
+          <span
+            aria-hidden="true"
+            data-root-guide-segment="continuation"
+            style={{ left: ROOT_GUIDE_CENTER_PX }}
+            className="pointer-events-none absolute inset-y-0 border-l border-dashed border-border/70"
+          />
+        ) : null}
         {hasGrandchildren && (
           <button
             type="button"
             data-testid="subagent-collapse-toggle"
             aria-expanded={!collapsed}
             aria-label={collapsed ? "Expand subagents" : "Collapse subagents"}
-            style={{ left: rowPaddingLeft(depth) - ROW_TOGGLE_SIZE_PX }}
-            className="absolute top-2 z-10 flex size-4 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            style={{ left: rowPaddingLeft(depth) }}
+            className="absolute top-1 z-10 flex size-6 items-center justify-center rounded-md bg-transparent text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             onClick={(event) => {
               event.stopPropagation();
               onToggleCollapsed(child.id);
@@ -639,47 +610,67 @@ function SubagentRow({
           // under its parent, signaling where it sits in the tree.
           style={{ paddingLeft: rowPaddingLeft(depth) }}
           className={cn(
-            "flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left hover:bg-accent/60",
-            isActive && "bg-accent",
-            dim && "opacity-60 hover:opacity-100",
+            "flex w-full flex-col gap-0.5 rounded-md py-1 pr-1 text-left",
+            isActive ? "bg-accent" : "group-hover/agent:bg-muted",
+            dim && "opacity-60 group-hover/agent:opacity-100",
           )}
         >
-          <div className="flex w-full items-center gap-1">
+          <div className="flex w-full items-start gap-2">
             {hasGrandchildren ? (
-              <span aria-hidden="true" className="-ml-3 size-3 shrink-0" />
+              <span aria-hidden="true" className="size-6 shrink-0" />
             ) : (
-              <CornerDownRightIcon
-                // Decorative nesting connector — the role icon beside it carries
-                // the meaning, so hide this from the accessibility tree.
-                aria-hidden="true"
-                className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
-              />
-            )}
-            <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
-            {child.routed_model ? (
-              // Model the intelligent router picked for this sub-agent — the
-              // per-subagent half of routing visibility.
               <span
-                data-testid="subagent-routed-model"
-                title={`Smart routing picked ${child.routed_model}`}
-                className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
+                aria-hidden="true"
+                className="flex size-6 shrink-0 items-center justify-center rounded-md bg-transparent"
               >
-                {shortModelName(child.routed_model)}
+                {depth === 1 ? (
+                  <CircleDotIcon
+                    data-subagent-connector
+                    className="size-4 text-muted-foreground/60"
+                  />
+                ) : (
+                  <CornerDownRightIcon
+                    // Decorative nesting connector — the role icon beside it carries
+                    // the meaning, so hide this from the accessibility tree.
+                    data-subagent-connector
+                    className="size-4 text-muted-foreground/60"
+                  />
+                )}
               </span>
-            ) : null}
-            <span className="flex-1" />
-            <StatusIndicator {...status} />
+            )}
+            <StatusAvatar {...status} />
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-[2px]">
+                <span
+                  data-testid="subagent-agent-avatar"
+                  className="flex size-6 shrink-0 items-center justify-center"
+                >
+                  {harnessAgent ? (
+                    <ComposerAgentIcon agent={harnessAgent} className="size-4" />
+                  ) : (
+                    <RoleIcon className="size-4 text-muted-foreground" />
+                  )}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">{primary}</span>
+                {child.routed_model ? (
+                  // Model the intelligent router picked for this sub-agent — the
+                  // per-subagent half of routing visibility.
+                  <span
+                    data-testid="subagent-routed-model"
+                    title={`Smart routing picked ${child.routed_model}`}
+                    className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
+                  >
+                    {shortModelName(child.routed_model)}
+                  </span>
+                ) : null}
+              </div>
+              {child.last_message_preview && (
+                <p className="mt-0.5 truncate text-sm text-muted-foreground">
+                  {child.last_message_preview}
+                </p>
+              )}
+            </div>
           </div>
-          {child.last_message_preview && (
-            // Preview indented to align with the title text on the row
-            // above: 12px connector - 12px (-ml-3) + 4px gap + 14px bot
-            // icon + 4px gap = 22px. Relative to the row's own padding,
-            // so it tracks the depth-stepped gutter automatically.
-            <p className="truncate pl-[22px] text-sm text-muted-foreground">
-              {child.last_message_preview}
-            </p>
-          )}
         </Link>
       </li>
       {!collapsed &&
@@ -688,6 +679,7 @@ function SubagentRow({
             key={grandchild.id}
             child={grandchild}
             depth={depth + 1}
+            rootGuideContinues={rootGuideContinues}
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={onToggleCollapsed}

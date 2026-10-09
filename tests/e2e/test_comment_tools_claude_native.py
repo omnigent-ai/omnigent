@@ -45,7 +45,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native.bridge import (
     augment_claude_args,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
@@ -79,7 +79,7 @@ _NESTED_SESSION_ENV = "CLAUDECODE"
 # first-run onboarding/trust gates are version- and environment-dependent and
 # block headless startup in CI (the MCP bridge never initializes). The relay
 # wiring is covered deterministically by tests/runner/test_comment_relay.py and
-# tests/test_claude_native_bridge.py; this test is the full round-trip, run
+# tests/harnesses/claude_native/test_claude_native_bridge.py; this test is the full round-trip, run
 # on demand where an authenticated claude is available.
 _RUN_GATE_ENV = "OMNIGENT_E2E_CLAUDE_NATIVE_COMMENTS"
 
@@ -378,8 +378,8 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
             "first-run onboarding/trust gates are version- and "
             "environment-dependent and block headless startup in CI; the relay "
             "wiring is covered by tests/runner/test_comment_relay.py and "
-            "tests/test_claude_native_bridge.py. Verified end-to-end locally "
-            "via --profile oss with this gate set."
+            "tests/harnesses/claude_native/test_claude_native_bridge.py. "
+            "Verified end-to-end locally via --profile oss with this gate set."
         )
     if shutil.which("claude") is None:
         pytest.skip("'claude' CLI is not on PATH. Install Claude Code to run this test.")

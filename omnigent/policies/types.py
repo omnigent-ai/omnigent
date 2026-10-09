@@ -201,6 +201,16 @@ class EvaluationContext:
         ``llm:`` config. The client is shared across all policies
         in one engine; each call should pass ``model`` and
         ``connection_params`` from the engine's resolved config.
+    :param conversation_id: The conversation this evaluation belongs
+        to. Surfaced as ``event["context"]["conversation_id"]``.
+        ``None`` only in contexts with no engine.
+    :param turn_final: On ``RESPONSE``, the runner relay sets ``True`` for
+        the final text segment of a successful turn and ``False`` for
+        intermediate segments or failed, cancelled, and incomplete turns.
+        ``None`` on other phases and paths that don't distinguish; response
+        policies should skip only explicit ``False`` to preserve those
+        callers. The relay skips empty and whitespace-only segments.
+        Surfaced as ``event["context"]["turn_final"]``.
     """
 
     phase: Phase
@@ -211,11 +221,13 @@ class EvaluationContext:
     session_state: dict[str, object] | None = None
     usage: dict[str, float] | None = None
     subtree_usage: dict[str, float] | None = None
-    user_daily_cost: dict[str, float | str] | None = None
+    user_daily_cost: list[dict[str, float | str | None]] | None = None
     model: str | None = None
     harness: str | None = None
     labels: dict[str, str] | None = None
     llm_client: PolicyLLMClient | None = None
+    conversation_id: str | None = None
+    turn_final: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -272,6 +284,13 @@ class PolicyResult:
         denied ASK must leave no trace). ``None`` means "no
         state changes." e.g.
         ``[StateUpdate(key="call_count", action=StateUpdateAction.INCREMENT, value=1)]``.
+    :param deciding_policy_workspace_id: Databricks workspace id
+        that owns the deciding policy (``deciding_policies[0]``).
+        Engine-set on DENY / ASK when the deciding policy is a
+        workspace-scoped stored row; ``None`` for YAML /
+        agent-spec policies (not workspace-scoped) and on ALLOW.
+        Surfaced so a denial can be attributed to the owning
+        workspace in logs.
     """
 
     action: PolicyAction
@@ -280,6 +299,7 @@ class PolicyResult:
     deciding_policies: list[str] | None = None
     data: object | None = None
     state_updates: list[StateUpdate] | None = None
+    deciding_policy_workspace_id: int | None = None
 
     @property
     def deciding_policy(self) -> str | None:

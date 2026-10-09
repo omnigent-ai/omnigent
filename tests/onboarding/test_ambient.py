@@ -13,6 +13,9 @@ count, so a wrong field turns the test red.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from omnigent.onboarding import ambient
@@ -478,14 +481,14 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
 
-# The exact shape `isaac configure codex` writes (AI Gateway mode): a custom
+# The exact shape `isaac configure codex` writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
 _ISAAC_STYLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -508,7 +511,7 @@ _ISAAC_STYLE_DETECTION = DetectedProvider(
     family="openai",
     source="~/.codex/config.toml provider 'Databricks'",
     model_provider="Databricks",
-    display_name="Databricks AI Gateway",
+    display_name="Databricks Unity Gateway",
 )
 
 
@@ -952,7 +955,7 @@ def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monk
 @pytest.mark.parametrize(
     "payload,expected",
     [
-        (_ISAAC_CLAUDE_SETTINGS, "Databricks AI Gateway"),
+        (_ISAAC_CLAUDE_SETTINGS, "Databricks Unity Gateway"),
         (
             {
                 "env": {"ANTHROPIC_BASE_URL": "https://llm.corp.example.com/v1"},
@@ -990,3 +993,25 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
     assert ambient.claude_managed_gateway() == (None, False)
+
+
+def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:
+    path = tmp_path / "managed-settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "modelPicker": {
+                    "options": [
+                        {"model": "gateway-opus", "label": "Opus"},
+                        {"model": "gateway-sonnet", "label": "Sonnet"},
+                    ],
+                    "replaceBuiltInOptions": True,
+                }
+            }
+        )
+    )
+
+    assert ambient.claude_managed_model_picker((path,)) == (
+        ("gateway-opus", "Opus"),
+        ("gateway-sonnet", "Sonnet"),
+    )

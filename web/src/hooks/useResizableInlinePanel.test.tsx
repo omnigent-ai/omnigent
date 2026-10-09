@@ -96,6 +96,21 @@ describe("useResizableInlinePanel persistence", () => {
 });
 
 describe("useResizableInlinePanel reserved width (sidebar)", () => {
+  it("fits beside a Canvas conversation without losing the preferred panel width", () => {
+    setInnerWidth(1440);
+    const { result, rerender } = renderHook(
+      ({ reserved }) => useResizableInlinePanel(SESSION, undefined, reserved, true, 380),
+      { initialProps: { reserved: 0 } },
+    );
+    const preferred = nudgeWiderOnce(result);
+    rerender({ reserved: 750 });
+    expect(result.current.panelWidth).toBe(302);
+    expect(result.current.preferredContentWidth).toBe(preferred + 380 + 8);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(preferred);
+    rerender({ reserved: 0 });
+    expect(result.current.panelWidth).toBe(preferred);
+  });
+
   // `reservedPx` is the open sidebar's width. It must tighten the ceiling
   // (keeping the chat at its 480px minimum) without overwriting the user's
   // preferred width, so collapsing the sidebar gives the width straight back.
@@ -240,11 +255,13 @@ describe("useResizableInlinePanel drag overlay", () => {
     act(() =>
       result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
     );
+    expect(result.current.isDragging).toBe(true);
     const overlay = overlaySelector();
     expect(overlay).not.toBeNull();
     expect(overlay?.style.cursor).toBe("col-resize");
 
     act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(result.current.isDragging).toBe(false);
     expect(overlaySelector()).toBeNull();
     unmount();
   });

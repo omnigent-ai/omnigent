@@ -91,8 +91,9 @@ def test_roundtrip_reversible_on_sqlite(tmp_path: Path) -> None:
 @pytest.mark.databricks
 def test_trgm_indexes_present_on_postgres(db_uri: str) -> None:
     """
-    On Postgres both trigram GIN indexes exist at head, on the lowercased
-    expressions the search query filters on.
+    On Postgres the title trigram GIN index exists at head. The obsolete item
+    content index is absent because content search intentionally uses raw
+    ILIKE with a conversation-correlated b-tree probe.
 
     Asserts the migration's contract structurally — index type ``gin`` with
     ``gin_trgm_ops`` over a ``lower(...)`` expression — rather than a query plan,
@@ -126,7 +127,7 @@ def test_trgm_indexes_present_on_postgres(db_uri: str) -> None:
             ),
             {"items": _ITEMS_INDEX, "title": _TITLE_INDEX},
         ).fetchall()
-    assert set(defs) == {_ITEMS_INDEX, _TITLE_INDEX}, defs
+    assert set(defs) == {_TITLE_INDEX}, defs
     for definition in defs.values():
         lowered = definition.lower()
         assert "gin" in lowered and "gin_trgm_ops" in lowered and "lower(" in lowered, definition

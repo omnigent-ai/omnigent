@@ -17,10 +17,13 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
     _agent_cache_dest,
+    _apply_host_interactive_shells,
+    _host_interactive_shells_from_env,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
@@ -34,6 +37,7 @@ from omnigent.runner._entry import (
     _resolve_agent_spec_from_server,
     _run_inactivity_monitor,
     _run_parent_death_killer,
+    _runner_last_activity,
     _runner_parent_pid_from_env,
     _runner_threadpool_max_workers,
     _runner_tunnel_binding_token_from_env,
@@ -44,7 +48,14 @@ from omnigent.runner._entry import (
 )
 from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+)
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.runner.transports.ws_tunnel.frames import (
+    EventAckFrame,
+    EventBatchFrame,
+    decode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
@@ -54,6 +65,39 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 # here (via import_module, so there is no bound-but-unused import) resolves and
 # caches it with the real type.
 importlib.import_module("mcp.client.streamable_http")
+
+
+def test_host_interactive_shells_from_env_normalizes_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner wiring accepts only supported, ordered shell basenames."""
+    monkeypatch.setenv(
+        RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+        '["zsh", "bash", "zsh", "not-a-shell"]',
+    )
+    assert _host_interactive_shells_from_env() == ["zsh", "bash"]
+
+
+def test_apply_host_interactive_shells_only_replaces_native_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom agent terminals remain authored while native fallbacks change."""
+    from types import SimpleNamespace
+
+    from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["zsh", "bash"]')
+    native = SimpleNamespace(name=CLAUDE_NATIVE_AGENT_NAME, terminals={"bash": object()})
+    custom_terminal = object()
+    custom = SimpleNamespace(name="custom", terminals={"project": custom_terminal})
+
+    _apply_host_interactive_shells(native)
+    _apply_host_interactive_shells(custom)
+
+    assert list(native.terminals) == ["zsh", "bash"]
+    assert native.terminals["zsh"].command is not None
+    assert native.terminals["zsh"].command.endswith("zsh")
+    assert custom.terminals == {"project": custom_terminal}
 
 
 class _TrackingTerminalRegistry:
@@ -197,6 +241,47 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
     )
 
     assert _make_auth_token_factory() is None
+
+
+def test_make_auth_token_factory_re_resolves_when_reused_sdk_auth_goes_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factory replaces stale SDK auth before retrying a mint."""
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.stale = False
+
+        def authenticate(self) -> dict[str, str]:
+            if self.stale:
+                raise FileNotFoundError("baked CLI binary path was deleted")
+            return {"Authorization": f"Bearer {self.token}"}
+
+    cfgs: list[_Cfg] = []
+
+    def _resolve(profile: str | None = None) -> tuple[_DatabricksBearerAuth, str]:
+        cfgs.append(_Cfg(f"cli-token-{len(cfgs) + 1}"))
+        return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
+
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)  # skip OIDC branch
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _resolve,
+    )
+
+    factory = _make_auth_token_factory()
+    assert factory is not None
+    assert factory() == "cli-token-1"
+
+    cfgs[0].stale = True
+
+    assert factory() == "cli-token-2", (
+        "the factory kept the stale SDK auth instead of re-resolving, so a "
+        "live session stays fail-closed after a CLI upgrade"
+    )
+    assert len(cfgs) == 2
 
 
 def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
@@ -413,6 +498,134 @@ def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
     assert factory is not None
     assert factory() == "workspace-token"
     assert mint_calls == [1]
+
+
+def _refuse_mint(calls: list[str | None]) -> Any:
+    """Build a mint stand-in that records its proxy bearer and answers HTTP 400."""
+
+    def _mint(
+        mint_url: str, server_url: str, binding_token: str, *, proxy_bearer: str | None = None
+    ) -> tuple[str, float]:
+        del server_url, binding_token
+        calls.append(proxy_bearer)
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "400", request=request, response=httpx.Response(400, request=request)
+        )
+
+    return _mint
+
+
+def test_delegated_refusal_is_not_reprobed_by_the_managed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that refused the delegated mint isn't asked again with the same token.
+
+    No-auth and header-mode servers answer the mint with a definitive 400. The
+    managed-sandbox fallback would resend the identical bare request.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    calls: list[str | None] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_mint(calls))
+
+    assert _make_auth_token_factory() is None
+    assert calls == [None]
+
+
+def test_managed_fallback_still_probes_after_a_proxy_bearer_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bare fallback is a different request when the delegated probe carried a bearer."""
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _no_sdk(profile: str | None = None) -> tuple[Any, str]:
+        raise DatabricksAuthError("no Databricks credentials configured")
+
+    calls: list[str | None] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse_mint(calls))
+
+    factory = _make_auth_token_factory(_allow_initial_token=False, _proxy_bearer="host-bearer")
+
+    assert factory is None
+    assert calls == ["host-bearer", None]
+
+
+@pytest.mark.parametrize(("auth_resolved", "expected_resolutions"), [(True, 0), (False, 1)])
+def test_create_app_reuses_a_resolved_no_credential_result(
+    monkeypatch: pytest.MonkeyPatch, auth_resolved: bool, expected_resolutions: int
+) -> None:
+    """Boot hands its finished resolution to create_app, which must not redo it.
+
+    Re-resolving right after boot repeats the managed-mint probes and SDK
+    discovery for the same answer.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    class _FakeProcessManager:
+        instance_dir = Path("/tmp/omnigent-test/ap-test")
+
+    resolutions: list[int] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakeProcessManager
+    )
+    monkeypatch.setattr("omnigent.terminals.TerminalRegistry", _TrackingTerminalRegistry)
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _TrackingAsyncClient)
+    monkeypatch.setattr(entry_mod.httpx, "Client", _TrackingSyncClient)
+    monkeypatch.setattr(
+        entry_mod, "_make_auth_token_factory", lambda: resolutions.append(1) or None
+    )
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+
+    entry_mod.create_app(auth_token_factory=None, auth_resolved=auth_resolved)
+
+    assert len(resolutions) == expected_resolutions
+
+
+@pytest.mark.asyncio
+async def test_tunnel_boot_hands_its_auth_resolution_to_create_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot marks its credential resolution final, so create_app doesn't redo it."""
+    import omnigent.runner._entry as entry_mod
+
+    class _Stop(Exception):
+        """Ends the boot sequence once create_app is reached."""
+
+    seen: dict[str, object] = {}
+
+    def _capture_create_app(**kwargs: object) -> None:
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(entry_mod, "_runner_auth_factory", None)
+    monkeypatch.setattr(entry_mod, "_server_url_from_env", lambda: "http://runner.test")
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_tunnel_binding_token_from_env", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_parent_pid_from_env", lambda: None)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+    monkeypatch.setattr(entry_mod, "create_app", _capture_create_app)
+
+    with pytest.raises(_Stop):
+        await entry_mod._run_tunnel_from_env()
+
+    assert seen == {"auth_token_factory": None, "auth_resolved": True}
 
 
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
@@ -1936,6 +2149,113 @@ async def test_inactivity_monitor_honors_activity_reset() -> None:
     assert shutdowns == ["shutdown"]
 
 
+def test_runner_last_activity_picks_the_newest_clock() -> None:
+    """The combined reader returns the latest non-``None`` activity stamp.
+
+    :returns: None.
+    """
+    assert _runner_last_activity(10.0, None, None) == 10.0
+    assert _runner_last_activity(10.0, 12.5, None) == 12.5
+    assert _runner_last_activity(10.0, None, 30.0) == 30.0
+    assert _runner_last_activity(40.0, 12.5, 30.0) == 40.0
+
+
+@pytest.mark.asyncio
+async def test_inactivity_monitor_counts_forwarder_posts_as_activity() -> None:
+    """A native forwarder still posting holds off the idle shutdown.
+
+    Mirrors the mirrored-sub-agent scenario: the tunnel sees no server→runner
+    traffic, but the in-process forwarder keeps POSTing the child's items.
+    While posts land inside the idle window the monitor waits; one full idle
+    window after the last post it shuts the runner down.
+
+    :returns: None.
+    """
+    loop = asyncio.get_running_loop()
+    dispatcher = RunnerEventDispatcher()
+    tunnel_activity = loop.time()
+    native_forwarder_health.clear()
+    shutdowns: list[str] = []
+
+    def _last_activity() -> float:
+        return _runner_last_activity(
+            tunnel_activity,
+            dispatcher.last_dispatch_at,
+            native_forwarder_health.last_post_at(),
+        )
+
+    task = asyncio.create_task(
+        _run_inactivity_monitor(
+            idle_timeout_s=0.08,
+            get_last_activity=_last_activity,
+            has_active_work=lambda: False,
+            request_shutdown=lambda: shutdowns.append("shutdown"),
+            poll_interval_s=0.005,
+        )
+    )
+    try:
+        # Forwarder posts every ~20ms keep the runner alive past several windows.
+        for _ in range(8):
+            native_forwarder_health.note_post_success()
+            await asyncio.sleep(0.02)
+        assert shutdowns == []
+        assert not task.done()
+        # Once the child stops streaming, the next idle window exits the runner.
+        await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        native_forwarder_health.clear()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert shutdowns == ["shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_inactivity_monitor_counts_dispatched_events_as_activity() -> None:
+    """A tunnel-acknowledged event batch also refreshes the activity clock.
+
+    :returns: None.
+    """
+    loop = asyncio.get_running_loop()
+    dispatcher = RunnerEventDispatcher()
+    tunnel_activity = loop.time() - 100.0
+    shutdowns: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    ack = await dispatcher.submit(
+        "session-a",
+        [
+            {
+                "type": "external_conversation_item",
+                "data": {"source_id": "record-1", "item_type": "message", "item_data": {}},
+            }
+        ],
+    )
+    assert ack.applied == 1
+
+    task = asyncio.create_task(
+        _run_inactivity_monitor(
+            idle_timeout_s=0.05,
+            get_last_activity=lambda: _runner_last_activity(
+                tunnel_activity, dispatcher.last_dispatch_at, None
+            ),
+            has_active_work=lambda: False,
+            request_shutdown=lambda: shutdowns.append("shutdown"),
+            poll_interval_s=0.005,
+        )
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.03)
+    assert shutdowns == []
+    await asyncio.wait_for(task, timeout=1.0)
+    assert shutdowns == ["shutdown"]
+
+
 def test_parent_process_is_alive_detects_current_process() -> None:
     """The liveness helper recognizes the current process id.
 
@@ -2123,6 +2443,40 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
     assert reasons == ["received SIGTERM"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_marks_shutting_down() -> None:
+    """A shutdown signal marks the runner shutting-down state before teardown.
+
+    ``_publish_terminal_exit`` reads this state to tell an intentional stop
+    (SIGTERM/SIGINT, whose teardown races the terminal watcher) from a real
+    terminal crash — it must be set as soon as the signal is handled, not
+    after any teardown. Delivers a real SIGTERM to this process.
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _install_signal_handlers
+
+    stop_event = asyncio.Event()
+    marked: list[bool] = []
+    _install_signal_handlers(
+        stop_event,
+        mark_shutting_down=lambda: marked.append(True),
+    )
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+    assert marked == [True]
+
+
 def test_install_crash_logging_is_idempotent() -> None:
     """Installing the crash hook twice does not stack wrappers.
 
@@ -2143,9 +2497,15 @@ def test_install_crash_logging_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_owns_global_cleanup", "expected_sweep_orphans"),
+    [(True, False), (False, True)],
+)
 async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    host_owns_global_cleanup: bool,
+    expected_sweep_orphans: bool,
 ) -> None:
     """The --server local runner shuts down terminal-owned resources.
 
@@ -2155,7 +2515,6 @@ async def test_runner_shutdown_closes_terminal_registry(
     startup/shutdown hooks directly and verifies shutdown includes the
     TerminalRegistry, not just harness subprocesses and MCPs.
     """
-    import omnigent.inner.terminal as terminal_mod
     import omnigent.runner._entry as entry_mod
 
     process_managers: list[_FakeProcessManager] = []
@@ -2163,14 +2522,18 @@ async def test_runner_shutdown_closes_terminal_registry(
     mcp_managers: list[_TrackingMcpManager] = []
     async_clients: list[_TrackingAsyncClient] = []
     sync_clients: list[_TrackingSyncClient] = []
+    terminal_sweeps: list[int] = []
+    bridge_sweeps: list[int] = []
 
     class _FakeProcessManager:
         def __init__(self) -> None:
             self.started = False
             self.shutdown_called = False
+            self.instance_dir = Path("/tmp/omnigent-test/ap-test")
             process_managers.append(self)
 
-        async def start(self) -> None:
+        async def start(self, *, sweep_orphans: bool = True) -> None:
+            assert sweep_orphans is expected_sweep_orphans
             self.started = True
 
         async def shutdown(self) -> None:
@@ -2204,10 +2567,18 @@ async def test_runner_shutdown_closes_terminal_registry(
         return client
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
-    # create_app() performs its production orphan sweep during construction.
-    # Keep this lifecycle unit test away from terminals owned by other local
-    # runners and test sessions.
-    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    if host_owns_global_cleanup:
+        monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
+    else:
+        monkeypatch.delenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", raising=False)
+    monkeypatch.setattr(
+        "omnigent.inner.terminal.reap_orphaned_terminals",
+        lambda: terminal_sweeps.append(1) or 0,
+    )
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: bridge_sweeps.append(1) or 0,
+    )
     monkeypatch.setattr(
         "omnigent.runtime.harnesses.process_manager.HarnessProcessManager",
         _FakeProcessManager,
@@ -2229,7 +2600,10 @@ async def test_runner_shutdown_closes_terminal_registry(
     async with app.router.lifespan_context(app):
         pass
 
-    assert process_managers and process_managers[0].shutdown_called
+    assert process_managers and process_managers[0].started
+    assert process_managers[0].shutdown_called
+    assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])
+    assert bridge_sweeps == ([] if host_owns_global_cleanup else [1])
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are
@@ -2328,66 +2702,56 @@ async def test_resolve_agent_spec_from_server_returns_none_for_404(
 
 
 @pytest.mark.asyncio
-async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
+async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     tmp_path: Path,
 ) -> None:
-    """A successful bundle fetch is cached under agent id and version.
+    """An unchanged bundle reuses its extracted directory; another bundle under the
+    same version (an agent removed and added again restarts at 1) gets its own.
 
     :param tmp_path: Temporary spec cache root.
     :returns: None.
     """
-    config_bytes = (
-        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
-    )
-    bundle_buf = io.BytesIO()
-    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config_bytes)
-        tf.addfile(info, io.BytesIO(config_bytes))
 
+    def _bundle(name: str) -> bytes:
+        config = f"spec_version: 1\nname: {name}\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            info = tarfile.TarInfo(name="config.yaml")
+            info.size = len(config)
+            tf.addfile(info, io.BytesIO(config.encode()))
+        return buf.getvalue()
+
+    original = _bundle("cached-agent")
+    served = [original, original, _bundle("re-added")]
     requested_paths: list[str] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """
-        Return a valid bundle once, then invalid bytes for the cached version.
-
-        :param request: Incoming mocked HTTP request.
-        :returns: A mocked successful bundle response.
-        """
         requested_paths.append(request.url.path)
-        if len(requested_paths) == 1:
-            content = bundle_buf.getvalue()
-        else:
-            content = b"not a tarball"
-        return httpx.Response(
-            200,
-            content=content,
-            headers={"X-Agent-Version": "7"},
-        )
+        return httpx.Response(200, content=served.pop(0), headers={"X-Agent-Version": "1"})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler),
         base_url="http://server.test",
     ) as client:
-        first = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_cached", session_id="conv_test"
-        )
-        second = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_cached", session_id="conv_test"
-        )
+        resolved = [
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_cached", session_id="conv_test"
+            )
+            for _ in range(3)
+        ]
 
-    assert first is not None
-    assert second is not None
-    assert first.name == "cached-agent"
-    assert second.name == "cached-agent"
-    assert requested_paths == [
-        "/v1/sessions/conv_test/agent/contents",
-        "/v1/sessions/conv_test/agent/contents",
+    assert [spec.name for spec in resolved if spec is not None] == [
+        "cached-agent",
+        "cached-agent",
+        "re-added",
     ]
-    cache_dir = tmp_path / "ag_cached-v7"
-    assert cache_dir.is_dir()
-    assert (cache_dir / "config.yaml").read_text() == config_bytes.decode()
-    assert [path.name for path in tmp_path.iterdir()] == ["ag_cached-v7"]
+    assert requested_paths == ["/v1/sessions/conv_test/agent/contents"] * 3
+    assert resolved[0] is not None and resolved[1] is not None
+    assert resolved[0].workdir == resolved[1].workdir
+    assert sorted(path.name.startswith("ag_cached-v1-") for path in tmp_path.iterdir()) == [
+        True,
+        True,
+    ]
 
 
 @pytest.mark.asyncio
@@ -2785,24 +3149,22 @@ def test_auth_token_factory_refreshes_expired_oidc_token(
     assert refresh_calls, "the refresh path must have run"
 
 
-def test_create_app_wires_native_bridge_dir_startup_sweep() -> None:
-    """The runner startup path must invoke the native bridge-dir sweep.
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [(None, False), ("0", False), ("1", True)],
+)
+def test_runner_global_cleanup_ownership_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: bool,
+) -> None:
+    """Only host-launched runners delegate machine-global cleanup."""
+    from omnigent.runner._entry import _runner_host_owns_global_cleanup_from_env
+    from omnigent.runner.identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
 
-    The prune logic is dead unless ``create_app`` actually calls
-    ``reap_orphaned_native_bridge_dirs`` — the highest-risk path in the
-    bridge-dir-reaping change. A full ``create_app()`` call needs heavy
-    server/token/process-manager scaffolding, so the wiring is guarded by
-    inspecting the factory's source: the sweep must be present and must run
-    after the terminal reap (the placement the design requires).
+    if raw_value is None:
+        monkeypatch.delenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raw_value)
 
-    :returns: None.
-    """
-    import inspect
-
-    from omnigent.runner._entry import create_app
-
-    src = inspect.getsource(create_app)
-
-    assert "reap_orphaned_native_bridge_dirs()" in src
-    # The native bridge-dir sweep runs after the terminal reap.
-    assert src.index("reap_orphaned_terminals()") < src.index("reap_orphaned_native_bridge_dirs()")
+    assert _runner_host_owns_global_cleanup_from_env() is expected

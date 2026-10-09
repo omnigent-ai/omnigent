@@ -50,6 +50,10 @@ def main() -> None:
 
     log_path = configure_process_logging("host", force=True)
 
+    from omnigent.host.crash_reporting import install_host_crash_hooks, set_host_exit_context
+
+    install_host_crash_hooks(enable_faulthandler=True)
+
     if args.local == bool(args.server):
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
@@ -63,6 +67,7 @@ def main() -> None:
     )
 
     daemon_target = normalize_daemon_target(None if args.local else args.server)
+    set_host_exit_context(daemon_target=daemon_target)
     lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     claim = lifecycle_lock.try_acquire()
     if claim is False:
@@ -72,9 +77,9 @@ def main() -> None:
         return
 
     try:
-        from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
+        from omnigent.host.identity import load_or_create_host_identity
 
-        identity = load_or_create_host_identity(CONFIG_PATH)
+        identity = load_or_create_host_identity()
         mode = "local" if args.local else "server"
         record = HostDaemonRecord(
             pid=os.getpid(),

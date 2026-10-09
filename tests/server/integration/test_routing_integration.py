@@ -626,7 +626,7 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
     applied — under the gateway's own ``system.ai.glm-5-2`` model route, which
     is the only name that serves.
     """
-    from omnigent.model_override import model_family_mismatch
+    from omnigent.models.model_override import model_family_mismatch
     from omnigent.server import smart_routing as smart_routing_module
     from omnigent.server.routes import sessions as sessions_facade
 

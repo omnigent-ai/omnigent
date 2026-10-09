@@ -32,11 +32,9 @@ Run (spawns its own local server + runner; build the SPA first)::
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import re
-import tarfile
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -45,6 +43,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     _server_state,
@@ -198,28 +197,16 @@ def catalog_session(
     runner_id = str(_server_state["runner_id"])
 
     yaml_bytes = _orchestrator_yaml(mock_llm_server_url).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Non-config.yaml arcname routes the bundle through the omnigent
-        # compat adapter, whose loader parses the inline `type: agent` tool.
-        info = tarfile.TarInfo(name=f"{_PARENT_NAME}.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
+    # Non-config.yaml arcname routes the bundle through the omnigent
+    # compat adapter, whose loader parses the inline `type: agent` tool.
+    bundle_bytes = bundle_files({f"{_PARENT_NAME}.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield _CatalogSession(
@@ -243,24 +230,28 @@ def catalog_session(
 
 
 def _expand_list_models_tool_call(page: Page) -> None:
-    """Expand the ``sys_list_models`` tool call in the transcript.
-
-    A lone call renders directly as a ``sys_list_models(...)`` trigger;
-    completed multi-step turns fold calls into a collapsed "Called N tools"
-    group — expand groups when present, then click the call trigger so its
-    output preview (the catalog JSON) is on screen.
+    """Expand the completed turn, tool group, and model-listing output.
 
     :param page: The Playwright page, on the parent session.
     """
-    direct = page.get_by_role("button", name=re.compile(r"^sys_list_models\("))
-    if not direct.count():
-        groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
-        expect(groups.first).to_be_visible(timeout=30_000)
-        for group in groups.all():
-            group.click()
-        direct = page.get_by_role("button", name=re.compile(r"sys_list_models"))
-    expect(direct.first).to_be_visible(timeout=30_000)
-    direct.first.click()
+    worked = page.get_by_test_id("turn-worked-fold")
+    expect(worked).to_be_visible(timeout=30_000)
+    worked_trigger = worked.get_by_role("button", name=re.compile(r"^Worked"))
+    # The fold mounts open to animate shut after idle; wait before opening it.
+    expect(worked_trigger).to_have_attribute("aria-expanded", "false", timeout=30_000)
+    worked_trigger.click()
+    expect(worked_trigger).to_have_attribute("aria-expanded", "true")
+
+    group = worked.get_by_role("button", name="Called 1 tool", exact=True)
+    expect(group).to_be_visible(timeout=30_000)
+    expect(group).to_have_attribute("aria-expanded", "false")
+    group.click()
+    expect(group).to_have_attribute("aria-expanded", "true")
+
+    direct = worked.get_by_role("button", name=re.compile(r"^sys_list_models"))
+    expect(direct).to_be_visible(timeout=30_000)
+    direct.click()
+    expect(direct).to_have_attribute("aria-expanded", "true")
 
 
 def _cursor_catalog_row(base_url: str, session_id: str) -> dict[str, object]:
@@ -324,9 +315,7 @@ def test_cursor_native_worker_row_not_source_none(
     expect(
         page.locator(_ASSISTANT, has_text=f"Catalog reported. Marker: {chat.routing_token}").first
     ).to_be_visible(timeout=_TURN_TIMEOUT_MS)
-    # The final text item can render just before the terminal response settles
-    # the turn and folds its tool calls. Wait for the authoritative session
-    # status UI to go idle so the trigger cannot be replaced mid-click.
+    # The completed-turn fold appears after the working indicator clears.
     expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=30_000)
 
     # Put the catalog on screen the way a user reads it (and the video shows it).

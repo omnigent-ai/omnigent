@@ -8,10 +8,13 @@ import {
 } from "react";
 import {
   ArchiveIcon,
+  ArchiveRestoreIcon,
   ChevronLeftIcon,
+  DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
+  GitForkIcon,
   InfoIcon,
   MailIcon,
   PencilIcon,
@@ -20,7 +23,10 @@ import {
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -40,6 +46,10 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   PINNED_LABEL_KEY,
   type Conversation,
@@ -53,9 +63,11 @@ import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { Link, useNavigate } from "@/lib/routing";
+import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
-import { showToast } from "@/components/ui/toast";
+import { showArchiveUndoToast } from "./archiveUndoToast";
+import { unpinWithUndo } from "./unpinUndoToast";
+import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -64,48 +76,50 @@ interface HeaderConversationMenuProps {
   conversation: Conversation;
   currentProject: string | null;
   canShare: boolean;
+  canFork: boolean;
+  forkDisabledReason?: string;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   onShare: () => void;
+  onFork: () => void;
   hasAgentInfo?: boolean;
   onAgentInfo?: () => void;
+  /**
+   * Mobile Chat/Terminal view switch (ViewModeMenuItems) — leads the menu on
+   * terminal-first sessions and carries its own trailing separator. `null`
+   * otherwise.
+   */
+  viewItems?: ReactNode;
   /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
   workspaceItems?: ReactNode;
-}
-
-function ArchivedToast() {
-  return (
-    <span>
-      View archived sessions in{" "}
-      <Link to="/settings/archived" className="font-medium text-primary hover:underline">
-        Settings
-      </Link>
-    </span>
-  );
-}
-
-function showArchivedToast() {
-  showToast(<ArchivedToast />);
 }
 
 export function HeaderConversationMenu({
   conversation,
   currentProject,
   canShare,
+  canFork,
+  forkDisabledReason,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
+  onFork,
   hasAgentInfo = false,
   onAgentInfo,
+  viewItems = null,
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
+  // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
+  const pinSaving = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
@@ -115,6 +129,7 @@ export function HeaderConversationMenu({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isArchived = conversation.archived === true;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
@@ -171,26 +186,60 @@ export function HeaderConversationMenu({
     });
   };
 
+  const exportConversation = async () => {
+    try {
+      const jsonl = await exportSessionTranscript(conversation.id);
+      triggerBrowserDownload(
+        new Blob([jsonl], { type: "application/jsonl" }),
+        `${conversation.id}.jsonl`,
+      );
+    } catch {
+      toast.error("Export failed");
+    }
+  };
+
   const archiveConversation = () => {
     closeMenu();
+    if (isArchived) {
+      // Unarchiving keeps the user on the session — no redirect home and no
+      // Undo toast (mirrors the sidebar row's Unarchive).
+      archive.mutate({ id: conversation.id, archived: false });
+      return;
+    }
+    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+      archiveNow(deleteWorktreeIds.has(conversation.id)),
+    );
+  };
+
+  const archiveNow = (deleteWorktree: boolean) => {
     // The row leaves the sidebar optimistically (useArchiveConversation flips
     // the cached `archived` flag in onMutate), and we're viewing the session
     // being archived, so leave its chat surface now — synchronously, like
     // confirmDelete — rather than in an onSuccess callback that fires a
     // round-trip later with a stale active session.
     navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true });
+    archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
     // and per-call mutate callbacks don't fire once their observer unmounts.
-    showArchivedToast();
+    // The Undo toast is driven by module state + the app-level Toaster, so it
+    // survives this menu unmounting.
+    showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
   const mainItems = (
     <>
+      {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
+          renders its own trailing separator (null on other sessions). */}
+      {viewItems}
       <DropdownMenuItem
         data-testid="header-pin-conversation"
         className={itemClass}
-        onSelect={() => togglePinned.mutate({ id: conversation.id, pinned: !isPinned })}
+        disabled={pinSaving}
+        onSelect={() =>
+          isPinned
+            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+            : togglePinned.mutate({ id: conversation.id, pinned: true })
+        }
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
         {isPinned ? "Unpin" : "Pin"}
@@ -214,6 +263,25 @@ export function HeaderConversationMenu({
           Share
         </DropdownMenuItem>
       )}
+      {canFork && (
+        <SessionActionMenuItem
+          data-testid="header-fork-conversation"
+          disabledReason={forkDisabledReason}
+          className={itemClass}
+          onSelect={onFork}
+        >
+          <GitForkIcon className="size-3.5" />
+          Fork
+        </SessionActionMenuItem>
+      )}
+      <DropdownMenuItem
+        data-testid="header-export-conversation"
+        className={itemClass}
+        onSelect={() => void exportConversation()}
+      >
+        <DownloadIcon className="size-3.5" />
+        Export
+      </DropdownMenuItem>
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"
@@ -291,8 +359,12 @@ export function HeaderConversationMenu({
         className={itemClass}
         onSelect={archiveConversation}
       >
-        <ArchiveIcon className="size-3.5" />
-        Archive
+        {isArchived ? (
+          <ArchiveRestoreIcon className="size-3.5" />
+        ) : (
+          <ArchiveIcon className="size-3.5" />
+        )}
+        {isArchived ? "Unarchive" : "Archive"}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"
@@ -329,9 +401,9 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
-            <EllipsisIcon className={isMobile ? "size-4" : "size-3.5"} />
+            <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -344,8 +416,9 @@ export function HeaderConversationMenu({
         >
           {isMobile && !projectPickerOpen && (
             <>
-              <DropdownMenuLabel className="truncate px-2.5 pb-1.5 text-foreground">
-                {label}
+              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
+                <span className="min-w-0 flex-1 truncate">{label}</span>
+                <PresenceAvatars />
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
             </>
@@ -372,6 +445,7 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
+      {archiveWorktreePrompt.dialog}
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <form onSubmit={submitRename}>

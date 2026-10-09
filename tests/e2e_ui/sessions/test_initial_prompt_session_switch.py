@@ -42,48 +42,23 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
-from typing import Any
 
+import httpx
 from playwright.async_api import Route, async_playwright
+
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Unique sentinels so each POST body is unambiguously identifiable.
 _PROMPT = "sentinel-initprompt-7b3e initial prompt bound to session A"
 _FOLLOWUP = "sentinel-followup-2d9a live send into session B"
+_SESSION_B_TITLE = "e2e-initial-prompt-destination"
 
 _EVENTS_RE = re.compile(r"/v1/sessions/([^/]+)/events$")
 # Bare create endpoint: ``/v1/sessions`` with an optional query, but NOT
 # ``/v1/sessions/{id}/...`` — so the GET list and per-session reads pass
 # through to the real server while only the POST create is faked.
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright **sync** tests in the same
-    session; once one has run, pytest-asyncio can't start a loop on the main
-    thread. Running the coroutine from a fresh thread via :func:`asyncio.run`
-    sidesteps that. Any exception (including assertion failures) is captured
-    and re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises BaseException: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, BaseException] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except BaseException as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
@@ -113,6 +88,12 @@ def test_initial_prompt_stays_bound_to_origin_session_after_switch(
     A→B switch commit.
     """
     base_url, session_a, session_b = seeded_session_pair
+    response = httpx.patch(
+        f"{base_url}/v1/sessions/{session_b}",
+        json={"title": _SESSION_B_TITLE},
+        timeout=10.0,
+    )
+    response.raise_for_status()
     _run_in_fresh_loop(_drive_initial_prompt_switch(base_url, session_a, session_b))
 
 
@@ -204,6 +185,7 @@ async def _drive_initial_prompt_switch(base_url: str, session_a: str, session_b:
 
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, "host_e2e")
             await page.route("**/v1/agents", handle_agents)
             await page.route(_SESSIONS_RE, handle_sessions)
 
@@ -250,6 +232,11 @@ async def _drive_initial_prompt_switch(base_url: str, session_a: str, session_b:
             # client-side navigation that preserves the JS module state.
             await page.locator(f'a[href="/c/{session_b}"]').click()
             await page.wait_for_url(re.compile(rf"/c/{re.escape(session_b)}"))
+            await (
+                page.locator("header.chat-header")
+                .get_by_text(_SESSION_B_TITLE, exact=True)
+                .wait_for(state="visible", timeout=15_000)
+            )
 
             # Drive a real follow-up send into B. It MUST land in B, and it
             # acts as a barrier: once it is observed the A→B switch commit

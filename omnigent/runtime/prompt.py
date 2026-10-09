@@ -14,11 +14,16 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
-from omnigent.runtime.tool_result_replay import image_omitted_placeholder
+from omnigent.inner.native_attachments import expand_framework_notices
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.runtime.tool_result_replay import (
+    image_omitted_placeholder,
+    strip_unparseable_image_output,
+)
 from omnigent.spec import AgentSpec
 
 # Shape of the wake notice the runner posts into a parent session when a
-# dispatched sub-agent finishes (``omnigent.runner.app._format_subagent_wake_notice``).
+# dispatched sub-agent finishes (``omnigent.runner.subagent_work._format_subagent_wake_notice``).
 # Quoted verbatim wherever the model is told what to expect, so the notice
 # reads as a known runtime signal rather than a user-typed instruction.
 SUBAGENT_WAKE_NOTICE_SHAPE = (
@@ -37,6 +42,23 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
     "approval) are routine runtime status messages in the same way."
 )
 
+# Steers models toward the embedded browser they are handed: the browser_*
+# tools are auto-registered for every agent (ToolManager._register_browser_tools),
+# but a tool description alone loses to a model's native web tooling, so the
+# composed system prompt must carry the preference explicitly.
+EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
+    "Embedded browser: the browser_navigate / browser_snapshot / "
+    "browser_click / browser_type / browser_screenshot tools drive the "
+    "Omnigent app's embedded browser pane, which the user can watch "
+    "alongside the chat. When asked to look at, open, or interact with a "
+    "web page, prefer these embedded-browser tools over your own web "
+    "tooling (a built-in web fetch/search tool, shell commands like curl, "
+    "or launching a separate browser) so the user sees the page as you "
+    "work. Fall back to other web tooling only when the embedded browser "
+    "is unavailable (its tools fail because no Omnigent app window is "
+    "attached) or for non-interactive bulk fetching."
+)
+
 
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
@@ -48,13 +70,19 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
     built-in web researcher through the same path.
 
+    The embedded-browser priority guidance applies to every agent,
+    mirroring the unconditional ``browser_*`` registration
+    (``ToolManager._register_browser_tools``).
+
     :param spec: The parsed AgentSpec.
-    :returns: The applicable spec-level framework instructions, possibly empty.
+    :returns: The applicable spec-level framework instructions, never empty.
     """
+    instructions: list[str] = []
     dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
     if spec.tools.agents or spec.spawn or dispatches_web_researcher:
-        return [SUBAGENT_WAKE_NOTICE_INSTRUCTION]
-    return []
+        instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
+    instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+    return instructions
 
 
 def append_framework_instructions(
@@ -159,6 +187,9 @@ def build_instructions_nullable(
     the fabricated ``"You are a helpful assistant."`` fallback when there is
     truly nothing to compose (no author text, no per-request text, no skills
     hint, no applicable spec-level or per-turn framework instructions).
+    With the embedded-browser guidance applying to every agent, a real spec
+    always carries at least one framework instruction, so callers should
+    expect text rather than ``None`` in practice.
 
     Delivery channels that must not leak the fallback literal (e.g. a warn
     check, or a first-user-turn prefix) call this instead of comparing
@@ -223,10 +254,8 @@ def _strip_output_annotations(
 def _strip_output_image_data(value: Any) -> Any:
     """Rewrite inline base64 image blocks to a text placeholder.
 
-    Walks a tool result's decoded content and replaces any Anthropic
-    ``{"type": "image", "source": {"type": "base64", ...}}`` block with a
-    short text block, dropping the base64 ``data``. Non-image content is
-    returned unchanged.
+    Walks decoded content and replaces Anthropic image blocks or images in a
+    recognized MCP envelope with text placeholders. Other content is retained.
 
     :param value: Decoded ``function_call_output`` content (list, dict, or
         scalar).
@@ -235,6 +264,20 @@ def _strip_output_image_data(value: Any) -> Any:
     if isinstance(value, list):
         return [_strip_output_image_data(item) for item in value]
     if isinstance(value, dict):
+        image_result = decode_mcp_image_result(value)
+        if image_result is not None:
+            blocks = [
+                {
+                    "type": "text",
+                    "text": image_omitted_placeholder(str(block["mimeType"])),
+                }
+                if block["type"] == "image"
+                else block
+                for block in image_result.content
+            ]
+            if image_result.is_error:
+                blocks.insert(0, {"type": "text", "text": "Error:"})
+            return blocks
         source = value.get("source")
         if value.get("type") == "image" and isinstance(source, dict):
             return {
@@ -272,10 +315,9 @@ def _dedupe_tool_output_images(output: str) -> str:
     resume cleanly without a store migration. Plain-text outputs (the common
     case) are returned unchanged.
 
-    Two forms are handled: well-formed JSON (parsed, walked, reserialized) and
-    JSON that was truncated at the conversation-store byte cap — the exact shape
-    that wedges resume — which no longer parses, so a regex fallback rewrites the
-    ``{"type":"image","source":{...base64...}}`` block in place.
+    Well-formed JSON is parsed, walked, and reserialized. Store-clipped MCP
+    envelopes recover their complete blocks; other clipped Anthropic image
+    sources use the regex fallback.
 
     :param output: The persisted ``function_call_output.output`` string.
     :returns: The output with any inline base64 image data replaced by a
@@ -289,6 +331,10 @@ def _dedupe_tool_output_images(output: str) -> str:
     try:
         decoded = json.loads(output)
     except (ValueError, TypeError):
+        normalized = strip_unparseable_image_output(output)
+        if normalized != output:
+            return _dedupe_tool_output_images(normalized)
+
         # Truncated/invalid JSON (e.g. clipped at the store byte cap): fall back
         # to an in-place regex rewrite of any image source block.
         def _replace(match: re.Match[str]) -> str:
@@ -304,6 +350,8 @@ def _dedupe_tool_output_images(output: str) -> str:
 
 def history_to_input_items(
     items: list[ConversationItem],
+    *,
+    preserve_framework_notices: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Convert persisted ConversationItems into Responses API input items.
@@ -315,6 +363,7 @@ def history_to_input_items(
     kept as separate items rather than embedded in assistant messages.
 
     :param items: Persisted conversation items in chronological order.
+    :param preserve_framework_notices: Keep structured notices for native transports.
     :returns: A list of Responses API input item dicts suitable for
         ``client.responses.create(input=...)``.
     """
@@ -329,12 +378,7 @@ def history_to_input_items(
             # the LLM. The text description survives and gives
             # the LLM context about files it previously produced.
             content = _strip_output_annotations(item.data.content)
-            result.append(
-                {
-                    "role": item.data.role,
-                    "content": content,
-                }
-            )
+            result.append({"role": item.data.role, "content": content})
 
         elif item.type == "function_call":
             assert isinstance(item.data, FunctionCallData)
@@ -379,4 +423,4 @@ def history_to_input_items(
             # before being prepended to history.
             pass
 
-    return result
+    return result if preserve_framework_notices else expand_framework_notices(result)

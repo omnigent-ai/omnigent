@@ -555,8 +555,8 @@ def test_run_no_longer_advertises_smart_routing() -> None:
 @pytest.mark.parametrize(
     ("command", "launcher"),
     [
-        ("claude", "omnigent.claude_native.run_claude_native"),
-        ("codex", "omnigent.codex_native.run_codex_native"),
+        ("claude", "omnigent.harnesses.claude_native.main.run_claude_native"),
+        ("codex", "omnigent.harnesses.codex_native.main.run_codex_native"),
     ],
 )
 def test_a_subcommand_arms_the_session_and_launches_bare(
@@ -596,7 +596,9 @@ def test_an_explicit_model_survives_arming(
     _mock_create(harness="codex-native")
     captured: dict[str, Any] = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.run_codex_native", lambda **kw: captured.update(kw)
+    )
 
     result = CliRunner().invoke(cli, ["codex", "--smart-routing", "--model", "gpt-5.4"])
 
@@ -615,7 +617,7 @@ def test_a_subcommand_falls_back_to_a_fresh_session(
     captured: dict[str, Any] = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
+        "omnigent.harnesses.claude_native.main.run_claude_native", lambda **kw: captured.update(kw)
     )
 
     result = CliRunner().invoke(cli, ["claude", "--smart-routing"])
@@ -646,7 +648,7 @@ def test_a_create_rejected_for_a_non_routing_reason_says_so_and_still_launches(
     captured: dict[str, Any] = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
+        "omnigent.harnesses.claude_native.main.run_claude_native", lambda **kw: captured.update(kw)
     )
 
     result = CliRunner().invoke(cli, ["claude", "--smart-routing"])
@@ -673,7 +675,9 @@ def test_an_unavailable_preflight_blocks_the_launch(
         raise AssertionError("wrapper launched despite unavailable routing")
 
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _must_not_launch)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.run_claude_native", _must_not_launch
+    )
 
     result = CliRunner().invoke(cli, ["claude", "--smart-routing"])
 
@@ -684,7 +688,7 @@ def test_an_unavailable_preflight_blocks_the_launch(
 # ── credential-provider gating, end to end ───────────────────────────────
 #
 # The shape a Databricks user actually has: Claude Code pointed at the workspace
-# AI Gateway, Codex signed in to a personal ChatGPT subscription. Routing is
+# Unity Gateway, Codex signed in to a personal ChatGPT subscription. Routing is
 # applied by rewriting the launch model to a gateway catalog id, so only the
 # Claude pane can honour it — a routed launch into Codex must fail fast.
 
@@ -710,7 +714,7 @@ def test_claude_route_survives_codex_being_on_a_subscription() -> None:
     ("args", "gateway"),
     [
         (["codex", "--smart-routing"], _CODEX_ON_SUBSCRIPTION),
-        # No AI Gateway anywhere: every entry point errors, Claude included.
+        # No Unity Gateway anywhere: every entry point errors, Claude included.
         (["claude", "--smart-routing"], _NO_GATEWAY_AT_ALL),
         (["codex", "--smart-routing"], _NO_GATEWAY_AT_ALL),
     ],
@@ -728,8 +732,10 @@ def test_smart_routing_entry_points_error_on_an_ungatewayed_harness(
         raise AssertionError("wrapper launched despite ungatewayed inference")
 
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _must_not_launch)
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _must_not_launch)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.run_claude_native", _must_not_launch
+    )
+    monkeypatch.setattr("omnigent.harnesses.codex_native.main.run_codex_native", _must_not_launch)
 
     result = CliRunner().invoke(cli, args)
 

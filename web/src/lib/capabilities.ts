@@ -57,7 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "arca_shutdown_warnings";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -114,6 +114,16 @@ export interface ServerInfo {
    * ``sandbox_provider`` row. Read via :func:`sandboxProviderOptions`.
    */
   sandbox_providers?: string[];
+  /**
+   * UI-relevant capability flags per launch-capable provider, e.g.
+   * ``{ agent_sandbox: { multi_repo: true } }``. The new-session repo picker
+   * branches on these (multi-repo list vs single). A provider absent from the
+   * map, or the map absent entirely, defaults every flag off.
+   */
+  sandbox_provider_capabilities?: Record<
+    string,
+    { multi_repo?: boolean; inference_models?: boolean }
+  >;
   /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
@@ -186,6 +196,18 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /**
+   * True when the archive PATCH accepts ``delete_worktree``. Older servers
+   * reject the unknown field, so the archive worktree prompt and setting are
+   * hidden there. Fails to ``false``.
+   */
+  archive_worktree_cleanup?: boolean;
+  /**
+   * True when the server stores user agents (``omnigent agent add``,
+   * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
+   * and the Import bundle button. Absent on older servers (off).
+   */
+  agent_install?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -231,6 +253,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
   sandbox_providers: [],
+  sandbox_provider_capabilities: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -243,6 +266,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  archive_worktree_cleanup: false,
   branding: null,
 };
 
@@ -316,6 +340,14 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           sandbox_providers: Array.isArray(data.sandbox_providers)
             ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
             : [],
+          // Plain-object guard only; consumers read `?.[p]?.multi_repo === true`,
+          // so any stray shape reads as "unset" (off) rather than throwing.
+          sandbox_provider_capabilities:
+            data.sandbox_provider_capabilities !== null &&
+            typeof data.sandbox_provider_capabilities === "object" &&
+            !Array.isArray(data.sandbox_provider_capabilities)
+              ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
+              : {},
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
@@ -336,6 +368,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

@@ -33,6 +33,7 @@ export const themePalettes = [
   "github",
   "catppuccin",
   "gruvbox",
+  "solarized",
   "nord",
 ] as const;
 
@@ -69,7 +70,10 @@ export interface PaletteTokens {
   popover: string;
   popoverForeground: string;
   primary: string;
+  link: string;
   primaryForeground: string;
+  selectionBackground: string;
+  selectionForeground: string;
   secondary: string;
   secondaryForeground: string;
   muted: string;
@@ -107,7 +111,10 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   popover: "popover",
   popoverForeground: "popover-foreground",
   primary: "primary",
+  link: "link",
   primaryForeground: "primary-foreground",
+  selectionBackground: "selection-background",
+  selectionForeground: "selection-foreground",
   secondary: "secondary",
   secondaryForeground: "secondary-foreground",
   muted: "muted",
@@ -143,6 +150,7 @@ type PaletteTokenInput = Pick<
   | "cardSolid"
   | "primary"
   | "primaryForeground"
+  | "selectionBackground"
   | "secondary"
   | "muted"
   | "mutedForeground"
@@ -159,6 +167,11 @@ type PaletteTokenInput = Pick<
 
 function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
   return {
+    // Selection is a translucent wash of the palette's accent under the page
+    // foreground, never an opaque block. Dark alphas are tuned per accent: a
+    // saturated one reads heavy at low alpha, a pastel needs more; light
+    // variants use the lightest alpha that stays visible.
+    selectionForeground: tokens.foreground,
     cardForeground: tokens.foreground,
     tray: tokens.card,
     popover: tokens.cardSolid,
@@ -177,6 +190,7 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarActive: "color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar))",
     sidebarActiveForeground: "var(--sidebar-foreground)",
     sidebarBackground: "var(--sidebar)",
+    link: tokens.ring,
     ...tokens,
   };
 }
@@ -219,7 +233,12 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#ffffff",
         popoverForeground: "#11171c",
         primary: "#11171c",
+        link: "#1967b5",
         primaryForeground: "#ffffff",
+        // Selection is the brand tint that also marks the sidebar's active
+        // row, not an opaque primary block (near-black on this palette).
+        selectionBackground: "rgba(240, 1, 150, 0.1)",
+        selectionForeground: "#651249",
         secondary: "#eceef1",
         muted: "#0000000f",
         mutedForeground: "#71717a",
@@ -246,7 +265,12 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#181f25",
         popover: "rgba(26, 33, 41, 0.8)",
         primary: "#e8ecf0",
+        link: "#72b7f5",
         primaryForeground: "#11171c",
+        // pink-300 rather than the sidebar's pink-400 so selected text stays
+        // >= 4.5:1 over the tinted code and muted surfaces.
+        selectionBackground: "rgba(240, 1, 150, 0.15)",
+        selectionForeground: "#f9a8d4",
         secondary: "#1f272d",
         secondaryForeground: "#e8ecf0",
         muted: "color-mix(in srgb, #92a4b3 15%, #262f36)",
@@ -291,6 +315,7 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#f7f5fd",
+        selectionBackground: "rgba(124, 58, 237, 0.15)",
         foreground: "#1e1a2b",
         card: "#ffffff",
         cardSolid: "#ffffff",
@@ -311,11 +336,13 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282a36",
+        selectionBackground: "rgba(189, 147, 249, 0.33)",
         foreground: "#f8f8f2",
         card: "rgba(68, 71, 90, 0.5)",
         cardSolid: "#343746",
         popover: "rgba(33, 34, 44, 0.92)",
         primary: "#bd93f9",
+        link: "#be95f9",
         primaryForeground: "#282a36",
         secondary: "#343746",
         muted: "#3b3d4d",
@@ -348,10 +375,12 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#f6f8fa",
+        selectionBackground: "rgba(31, 136, 61, 0.15)",
         foreground: "#1f2328",
         card: "#ffffff",
         cardSolid: "#ffffff",
         primary: "#1f883d",
+        link: "#0968d9",
         primaryForeground: "#ffffff",
         secondary: "#eaeef2",
         muted: "#eaeef2",
@@ -367,6 +396,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#0d1117",
+        selectionBackground: "rgba(35, 134, 54, 0.39)",
         foreground: "#e6edf3",
         card: "rgba(22, 27, 34, 0.72)",
         cardSolid: "#161b22",
@@ -403,10 +433,12 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#eff1f5",
+        selectionBackground: "rgba(136, 57, 239, 0.15)",
         foreground: "#4c4f69",
         card: "#ffffff",
         cardSolid: "#ffffff",
         primary: "#8839ef",
+        link: "#8739ec",
         primaryForeground: "#ffffff",
         secondary: "#e6e9ef",
         muted: "#e6e9ef",
@@ -423,6 +455,10 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#1e1e2e",
+        // The body text sits at the 4.5:1 edge over the wash; rosewater is the
+        // lightest Catppuccin text.
+        selectionBackground: "rgba(203, 166, 247, 0.26)",
+        selectionForeground: "#f5e0dc",
         foreground: "#cdd6f4",
         card: "rgba(49, 50, 68, 0.6)",
         cardSolid: "#282938",
@@ -459,10 +495,12 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#fbf1c7",
+        selectionBackground: "rgba(214, 93, 14, 0.18)",
         foreground: "#3c3836",
         card: "#fffdf2",
         cardSolid: "#fffdf2",
         primary: "#d65d0e",
+        link: "#9d360a",
         primaryForeground: "#ffffff",
         secondary: "#ebdbb2",
         muted: "#ebdbb2",
@@ -478,6 +516,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#282828",
+        selectionBackground: "rgba(254, 128, 25, 0.34)",
         foreground: "#ebdbb2",
         card: "rgba(60, 56, 54, 0.6)",
         cardSolid: "#32302f",
@@ -500,6 +539,79 @@ export const PALETTES: readonly PaletteMeta[] = [
     },
   },
   {
+    id: "solarized",
+    label: "Solarized",
+    blurb: "Precision colors in Solarized Light & Dark.",
+    light: {
+      bg: "#fdf6e3",
+      card: "#eee8d5",
+      accent: "#268bd2",
+      border: "#93a1a1",
+      text: "#657b83",
+    },
+    dark: {
+      bg: "#002b36",
+      card: "#073642",
+      accent: "#268bd2",
+      border: "#586e75",
+      text: "#839496",
+    },
+    tokens: {
+      light: paletteTokens({
+        background: "#fdf6e3",
+        selectionBackground: "rgba(38, 139, 210, 0.15)",
+        // base02: the body text (base00) is too light over the wash.
+        selectionForeground: "#073642",
+        foreground: "#657b83",
+        card: "#eee8d5",
+        cardSolid: "#eee8d5",
+        primary: "#268bd2",
+        link: "#026287",
+        primaryForeground: "#fdf6e3",
+        secondary: "#eee8d5",
+        // Keep interactive rows visible over the base2 popover surface.
+        muted: "#d6d4c6",
+        mutedForeground: "#586e75",
+        codeBackground: "#eee8d5",
+        accent: "#eee8d5",
+        accentForeground: "#268bd2",
+        border: "#93a1a1",
+        borderStrong: "#839496",
+        ring: "#268bd2",
+        brandAccent: "#6c71c4",
+        sidebar: "#eee8d5",
+        shellBackground: "#fdf6e3",
+      }),
+      dark: paletteTokens({
+        background: "#002b36",
+        selectionBackground: "rgba(38, 139, 210, 0.42)",
+        // base2, for the same reason as light mode.
+        selectionForeground: "#eee8d5",
+        foreground: "#839496",
+        card: "#073642",
+        cardSolid: "#073642",
+        popover: "#073642",
+        primary: "#268bd2",
+        link: "#6ab8d0",
+        primaryForeground: "#fdf6e3",
+        secondary: "#073642",
+        // Keep interactive rows visible over the base02 popover surface.
+        muted: "#1d474f",
+        mutedForeground: "#93a1a1",
+        codeBackground: "#073642",
+        accent: "#073642",
+        accentForeground: "#2aa198",
+        border: "#586e75",
+        borderStrong: "#657b83",
+        ring: "#268bd2",
+        brandAccent: "#6c71c4",
+        sidebar: "#073642",
+        sidebarPrimaryForeground: "#fdf6e3",
+        shellBackground: "#002b36",
+      }),
+    },
+  },
+  {
     id: "nord",
     label: "Nord",
     blurb: "Arctic frost blues over polar-night neutrals.",
@@ -514,10 +626,12 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#eceff4",
+        selectionBackground: "rgba(94, 129, 172, 0.25)",
         foreground: "#2e3440",
         card: "#e5e9f0",
         cardSolid: "#e5e9f0",
         primary: "#5e81ac",
+        link: "#355e86",
         primaryForeground: "#eceff4",
         secondary: "#d8dee9",
         muted: "#d8dee9",
@@ -534,11 +648,15 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#2e3440",
+        // The body text, already the lightest Nord colour, only stays at 4.5:1
+        // over the muted surface up to here.
+        selectionBackground: "rgba(136, 192, 208, 0.25)",
         foreground: "#eceff4",
         card: "rgba(59, 66, 82, 0.6)",
         cardSolid: "#3b4252",
         popover: "rgba(46, 52, 64, 0.92)",
         primary: "#88c0d0",
+        link: "#8fc4d3",
         primaryForeground: "#2e3440",
         secondary: "#3b4252",
         muted: "#434c5e",

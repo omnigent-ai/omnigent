@@ -1,19 +1,16 @@
-"""E2E regression test for unbounded ``~/.omnigent`` growth from orphaned dirs.
+"""E2E regression test for Codex bridge retention after unclean death.
 
 Per-session codex-native directories under ``~/.omnigent/codex-native/`` are
-created when a host-bound ``codex-native-ui`` session launches, but the only
-cleanup path is the runner-side ``_delete_native_bridge_dirs`` invoked on a
-clean session delete. A session whose host/runner dies uncleanly (crash,
-SIGKILL, host restart mid-run) leaves its directory behind forever — nothing
-reaps orphaned dirs on host restart or on any periodic sweep, so the tree
-grows without bound (28 GB / 273 dirs observed on one developer host).
+created when a host-bound ``codex-native-ui`` session launches. A session whose
+host/runner dies uncleanly leaves bridge credentials, sockets, and hook state
+behind alongside the ``codex-home`` rollout that Codex needs to resume the
+original thread. Host restart must retain recent bridges, then reclaim the
+whole directory after 7 days of inactivity.
 
 This test drives the real user journey: connect a host, create a
 codex-native session on it (the per-session dir appears), kill the host
-daemon and its runner uncleanly, restart the host, and assert the orphaned
-per-session directory is reclaimed within a grace period. On the current
-build the directory survives forever, so this test FAILS until a dead-owner
-reaper / retention GC lands.
+daemon and its runner uncleanly, restart the host to verify the recent bridge
+survives intact, then age its activity and restart again to verify expiration.
 
 Run::
 
@@ -35,27 +32,34 @@ import httpx
 import psutil
 import pytest
 
-from omnigent.codex_native_bridge import bridge_dir_for_bridge_id
-from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 
-# How long the harness gets to reclaim an orphaned per-session dir after the
-# host restarts. Generous so a slow startup sweep still passes; the bug is
-# that no sweep exists at all, so today the dir survives indefinitely.
+# How long the host gets to reclaim an expired bridge after restart.
 _GC_GRACE_S = 90.0
 
 
-def _spawn_host_daemon(*, log_path: Path, live_server: str) -> subprocess.Popen[bytes]:
+def _spawn_host_daemon(
+    *,
+    home_dir: Path,
+    log_path: Path,
+    live_server: str,
+) -> subprocess.Popen[bytes]:
     """
     Spawn an ``omnigent host`` daemon bound to the test server.
 
+    :param home_dir: Isolated home containing only this test's bridge state.
     :param log_path: File that captures the daemon's stderr.
     :param live_server: Test server base URL.
     :returns: The spawned daemon subprocess handle.
     """
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
+    codex_home_source = env.get("CODEX_HOME") or str(Path.home() / ".codex")
+    env["HOME"] = str(home_dir)
+    env["CODEX_HOME"] = codex_home_source
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
     with open(log_path, "w") as log_fh:
         return subprocess.Popen(
@@ -68,9 +72,29 @@ def _spawn_host_daemon(*, log_path: Path, live_server: str) -> subprocess.Popen[
             ],
             env=apply_runner_env(env),
             cwd=compat_runner_cwd(),
-            stdout=subprocess.DEVNULL,
+            stdout=log_fh,
             stderr=log_fh,
         )
+
+
+def _wait_for_host_connection(
+    proc: subprocess.Popen[bytes],
+    log_path: Path,
+    timeout: float = 45.0,
+) -> None:
+    """Wait until this daemon logs that its own tunnel connected."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"Host daemon exited with {proc.returncode}:\n"
+                f"{log_path.read_text(encoding='utf-8', errors='replace')}"
+            )
+        with contextlib.suppress(OSError):
+            if "✓ Connected as" in log_path.read_text(encoding="utf-8"):
+                return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Host daemon did not connect within {timeout}s")
 
 
 def _online_host_id(client: httpx.Client, timeout: float = 45.0) -> str:
@@ -138,39 +162,60 @@ def _kill_tree_uncleanly(proc: subprocess.Popen[bytes]) -> None:
             straggler.kill()
 
 
+def _expire_codex_bridge_activity(bridge_dir: Path) -> None:
+    """Age bridge preparation and rollout activity beyond Codex retention."""
+    expired_at = time.time() - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 60
+    activity_paths = [bridge_dir / "owner.pid"]
+    sessions_dir = bridge_dir / "codex-home" / "sessions"
+    if sessions_dir.is_dir():
+        activity_paths.extend(sessions_dir.rglob("rollout-*.jsonl"))
+    for activity_path in activity_paths:
+        if activity_path.exists():
+            os.utime(activity_path, (expired_at, expired_at))
+
+
 @pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
     reason=(
         "codex-native dir GC e2e needs `codex` on PATH and OMNIGENT_E2E_CODEX_NATIVE=1 to run"
     ),
 )
-def test_orphaned_codex_native_dir_is_reclaimed_after_host_restart(
+def test_host_restart_retains_recent_codex_bridge_then_reclaims_it(
     live_server: str,
     http_client: httpx.Client,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    A codex-native session dir orphaned by an unclean death gets reclaimed.
+    An unclean host death retains recent state and later reclaims it whole.
 
     Journey: connect host -> create a codex-native session (its per-session
     dir appears under ``~/.omnigent/codex-native/``) -> SIGKILL the host
-    daemon and its runner tree (crash) -> restart the host -> the orphaned
-    per-session dir must be garbage-collected within a grace period.
-
-    Today nothing reclaims it (cleanup only runs on clean session delete,
-    inside the now-dead runner), so this test fails until a dead-owner
-    reaper runs on host restart.
+    daemon and its runner tree (crash) -> restart the host -> the recent bridge
+    remains intact -> crash again, age it past retention, and restart -> the
+    old bridge is removed wholesale.
     """
     workspace = tmp_path / "codex_ws"
     workspace.mkdir()
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setattr(
+        codex_native_bridge,
+        "_BRIDGE_ROOT",
+        home_dir / ".omnigent" / "codex-native",
+    )
 
+    daemon_a_log = tmp_path / "host-daemon-a.log"
     daemon = _spawn_host_daemon(
-        log_path=tmp_path / "host-daemon-a.log",
+        home_dir=home_dir,
+        log_path=daemon_a_log,
         live_server=live_server,
     )
     session_id: str | None = None
     daemon_b: subprocess.Popen[bytes] | None = None
+    daemon_c: subprocess.Popen[bytes] | None = None
     try:
+        _wait_for_host_connection(daemon, daemon_a_log)
         host_id = _online_host_id(http_client)
         agent_id = _codex_native_agent_id(http_client)
 
@@ -189,7 +234,7 @@ def test_orphaned_codex_native_dir_is_reclaimed_after_host_restart(
         # The runner prepares the per-session bridge dir (keyed on the
         # session id unless rotated — a fresh session is un-rotated) under
         # ~/.omnigent/codex-native/<sha256(session_id)[:32]>.
-        session_dir = bridge_dir_for_bridge_id(session_id)
+        session_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
         deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline and not session_dir.is_dir():
             time.sleep(POLL_INTERVAL_S)
@@ -197,6 +242,12 @@ def test_orphaned_codex_native_dir_is_reclaimed_after_host_restart(
             f"per-session codex-native dir {session_dir} never appeared — "
             "cannot exercise the GC journey"
         )
+        codex_home = session_dir / "codex-home"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        persistent_sentinel = codex_home / "transcript-preserved.txt"
+        persistent_sentinel.write_text("keep", encoding="utf-8")
+        stale_runtime = session_dir / "stale-runtime.txt"
+        stale_runtime.write_text("keep-until-expiry", encoding="utf-8")
 
         # Unclean death: crash the host daemon and every runner it spawned.
         # No session delete, no graceful shutdown — the orphan scenario.
@@ -205,25 +256,47 @@ def test_orphaned_codex_native_dir_is_reclaimed_after_host_restart(
             "sanity: the crash itself must not remove the dir (nothing ran cleanup)"
         )
 
-        # Host restart after the crash — the moment a dead-owner reaper /
-        # startup GC pass should notice the orphaned dir and reclaim it.
+        # A normal replacement-runner boundary is recent activity, so the
+        # first restart must retain both persistent and runtime bridge state.
+        daemon_b_log = tmp_path / "host-daemon-b.log"
         daemon_b = _spawn_host_daemon(
-            log_path=tmp_path / "host-daemon-b.log",
+            home_dir=home_dir,
+            log_path=daemon_b_log,
             live_server=live_server,
         )
+        _wait_for_host_connection(daemon_b, daemon_b_log)
         _online_host_id(http_client)
+        assert persistent_sentinel.read_text(encoding="utf-8") == "keep"
+        assert stale_runtime.read_text(encoding="utf-8") == "keep-until-expiry"
 
+        # Once the whole bridge is inactive beyond retention, the next host
+        # restart should remove it. The session may immediately relaunch and
+        # recreate an empty bridge, so sentinel removal proves the old tree was
+        # reclaimed rather than requiring the directory to stay absent.
+        _kill_tree_uncleanly(daemon_b)
+        assert session_dir.is_dir()
+        _expire_codex_bridge_activity(session_dir)
+        daemon_c_log = tmp_path / "host-daemon-c.log"
+        daemon_c = _spawn_host_daemon(
+            home_dir=home_dir,
+            log_path=daemon_c_log,
+            live_server=live_server,
+        )
+        _wait_for_host_connection(daemon_c, daemon_c_log)
+        _online_host_id(http_client)
         gc_deadline = time.monotonic() + _GC_GRACE_S
-        while time.monotonic() < gc_deadline and session_dir.is_dir():
+        while time.monotonic() < gc_deadline and persistent_sentinel.exists():
             time.sleep(1.0)
 
-        assert not session_dir.is_dir(), (
-            f"orphaned per-session dir {session_dir} for crashed session "
-            f"{session_id} was not garbage-collected within {_GC_GRACE_S:.0f}s "
-            "of the host restarting — ~/.omnigent grows without bound"
+        assert not persistent_sentinel.exists(), (
+            f"expired bridge for crashed session {session_id} was not "
+            f"reclaimed within {_GC_GRACE_S:.0f}s of the host restarting"
+        )
+        assert not stale_runtime.exists(), (
+            "whole-directory expiration must remove runtime state with the transcript"
         )
     finally:
-        for proc in (daemon, daemon_b):
+        for proc in (daemon, daemon_b, daemon_c):
             if proc is not None and proc.poll() is None:
                 _kill_tree_uncleanly(proc)
         # Best-effort server-side delete so the test leaves no session rows
@@ -231,4 +304,7 @@ def test_orphaned_codex_native_dir_is_reclaimed_after_host_restart(
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
                 http_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
-            shutil.rmtree(bridge_dir_for_bridge_id(session_id), ignore_errors=True)
+            shutil.rmtree(
+                codex_native_bridge.bridge_dir_for_bridge_id(session_id),
+                ignore_errors=True,
+            )

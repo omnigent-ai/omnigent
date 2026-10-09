@@ -15,7 +15,7 @@ from omnigent.harness_plugins import (
     background_title_generators,
     load_object,
 )
-from omnigent.model_fallbacks import (
+from omnigent.models.model_fallbacks import (
     BACKGROUND_TITLE_CLAUDE_ECONOMY_MODEL,
     BACKGROUND_TITLE_CODEX_ECONOMY_MODEL,
 )
@@ -41,7 +41,7 @@ BACKGROUND_TITLE_INSTRUCTIONS = (
 )
 
 #: Economy-tier title model per canonical harness, armed from the owned
-#: fallback records (see ``omnigent.model_fallbacks``). Title calls are tiny
+#: fallback records (see ``omnigent.models.model_fallbacks``). Title calls are tiny
 #: (<=64 output tokens, no tools, low effort), so they always run on the
 #: family's cheapest arm regardless of the session's model.
 _BACKGROUND_TITLE_MODELS: dict[str, str] = {

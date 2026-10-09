@@ -37,9 +37,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import cast
 
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, and_, select, text, update
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from omnigent.db.db_models import (
     SqlAccountToken,
@@ -52,6 +52,36 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.query_context import query_name_scope
 from omnigent.server.auth import _RESERVED_USERS
+
+
+def _lock_host_collisions_and_check_tombstones(
+    session: Session,
+    old_id: str,
+    new_id: str,
+) -> bool:
+    """Lock same-name host collisions and detect cleanup tombstones."""
+    old_host = aliased(SqlHost)
+    new_host = aliased(SqlHost)
+    collisions = session.execute(
+        select(old_host, new_host)
+        .join(
+            new_host,
+            and_(
+                new_host.workspace_id == old_host.workspace_id,
+                new_host.user_id == new_id,
+                new_host.name == old_host.name,
+            ),
+        )
+        .where(
+            old_host.workspace_id == current_workspace_id(),
+            old_host.user_id == old_id,
+        )
+        .with_for_update()
+    ).all()
+    return any(
+        old_row.deleted_at is not None or new_row.deleted_at is not None
+        for old_row, new_row in collisions
+    )
 
 
 @dataclass
@@ -159,6 +189,8 @@ def remap_identities(
         query_name_scope("omnigent.identity_migration.remap_identities"),
         Session(engine) as session,
     ):
+        if engine.dialect.name == "sqlite":
+            session.execute(text("BEGIN IMMEDIATE"))
         for old_id, new_id in mapping.items():
             if old_id == new_id:
                 continue
@@ -173,6 +205,12 @@ def remap_identities(
                 if not force:
                     report.refused.append(f"{old_id} -> {new_id}")
                     continue
+
+            if _lock_host_collisions_and_check_tombstones(session, old_id, new_id):
+                report.refused.append(f"{old_id} -> {new_id}")
+                continue
+
+            if new_user is not None:
                 # Merge: the surviving (new) row gains admin if either had it.
                 new_user.is_admin = new_user.is_admin or old_user.is_admin
                 report._bump("users")  # merged

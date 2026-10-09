@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -52,6 +54,15 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
+
+# Skip anything that reaches real bwrap resolution/execution when bwrap is not
+# available (macOS, Windows, or a bwrap-less Linux box) — the backend hard-errors
+# off Linux by design. Defined here at module top so it can decorate tests
+# throughout the file, including the resolver tests below (issue #4279: it was
+# previously defined *after* those tests, so it never gated them).
+pytestmark_bwrap = pytest.mark.skipif(
+    not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +257,7 @@ def _repo_root() -> Path:
 # ---------------------------------------------------------------------------
 
 
+@pytestmark_bwrap
 def test_resolve_default_keeps_cwd_read_only() -> None:
     """
     ``write_paths`` omitted (the common case) leaves ``write_roots``
@@ -273,6 +285,7 @@ def test_resolve_default_keeps_cwd_read_only() -> None:
     assert policy.read_roots is None  # No spec-supplied read_paths.
 
 
+@pytestmark_bwrap
 def test_resolve_write_paths_dot_makes_cwd_writable() -> None:
     """
     Setting ``write_paths: ["."]`` flips cwd to writable. This is the
@@ -289,6 +302,7 @@ def test_resolve_write_paths_dot_makes_cwd_writable() -> None:
     assert policy.write_roots == [Path.cwd().resolve(strict=False)]
 
 
+@pytestmark_bwrap
 def test_resolve_default_cwd_allow_hidden_is_dot_venv() -> None:
     """
     ``cwd_allow_hidden=None`` in the spec resolves to the documented
@@ -310,6 +324,7 @@ def test_resolve_default_cwd_allow_hidden_is_dot_venv() -> None:
     )
 
 
+@pytestmark_bwrap
 def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     """
     An explicit ``cwd_allow_hidden`` in the spec replaces the default
@@ -571,6 +586,47 @@ def test_wrap_launcher_argv_nested_write_mount_follows_read_parent(
     assert read_index is not None
     assert write_index is not None
     assert read_index < write_index
+
+
+@pytest.mark.parametrize("exposure", ["cwd", "read-root", "root-alias", "implicit", "system"])
+def test_launcher_rejects_visible_credential_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exposure: str
+) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    private = (tmp_path / "private").resolve()
+    private.mkdir()
+    policy = _make_policy(cwd)
+    source = private / "token"
+    source.write_text("secret")
+    if exposure == "cwd":
+        source = cwd / "token"
+    elif exposure == "read-root":
+        policy.read_roots = [private]
+    elif exposure == "root-alias":
+        alias = tmp_path / "alias"
+        alias.symlink_to(private, target_is_directory=True)
+        policy.read_roots = [alias]
+    elif exposure == "implicit":
+        monkeypatch.setattr(
+            bwrap_sandbox,
+            "_ensure_executable_visible",
+            lambda argv, cwd: ["--ro-bind", str(private), "/runtime"],
+        )
+    else:
+        source = Path("/usr/lib/private-token")
+    policy.credential_source_paths = [source]
+    with pytest.raises(ValueError, match="sandbox-visible mounts"):
+        _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+
+
+def test_launcher_accepts_private_credential_source(tmp_path: Path) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    policy = _make_policy(cwd)
+    policy.credential_source_paths = [(tmp_path / "private-token").resolve()]
+    argv = _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+    assert argv[-3:] == ["/bin/sh", "-c", "true"]
 
 
 def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
@@ -886,6 +942,24 @@ def test_wrap_launcher_argv_target_none_no_extra_binds(
     assert without_target == with_none, (
         "Passing target=None must produce identical argv to omitting the parameter."
     )
+
+
+@pytest.mark.parametrize("target", ["/bin/bash", "/sbin/tool", "/workspace/tool"])
+def test_covered_executable_does_not_expose_parent_directories(target: str) -> None:
+    assert (
+        bwrap_sandbox._interpreter_chain_binds(
+            [target], [Path("/bin"), Path("/sbin"), Path("/workspace")]
+        )
+        == []
+    )
+
+
+def test_shallow_executable_never_exposes_the_host_root() -> None:
+    assert bwrap_sandbox._interpreter_chain_binds(["/opt/tool"], [Path("/usr")]) == [
+        "--ro-bind-try",
+        "/opt",
+        "/opt",
+    ]
 
 
 def test_wrap_launcher_argv_target_already_in_default_mounts(
@@ -1288,6 +1362,124 @@ def test_read_write_overlap_scanned_once(tmp_path: Path) -> None:
     assert count == 1, f"Expected a single .env mask across overlapping grants, got {count}."
 
 
+def test_write_root_missing_on_host_is_created(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` root that doesn't exist on the
+    host yet must be created before the ``--bind-try`` is emitted.
+
+    ``--bind-try`` silently skips a missing source, so without this the
+    grant would bind to nothing and the agent's first write would fail
+    with a bare "Read-only file system" error, well after the policy
+    layer already approved the write.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    missing_root = cwd / "docs" / "specs"
+    assert not missing_root.exists()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[missing_root])
+    backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert missing_root.is_dir(), "write_paths root must be created so bind-try has a real source"
+
+
+def test_write_root_missing_on_host_logs_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Regression: creating a missing write_paths root must be
+    logged at a visible level, and the log must state the path and the
+    permissions it ended up with, not create it silently.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    missing_root = cwd / "docs" / "specs"
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[missing_root])
+    with caplog.at_level(logging.WARNING):
+        backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    matching = [r for r in caplog.records if str(missing_root) in r.getMessage()]
+    all_messages = [r.getMessage() for r in caplog.records]
+    assert matching, f"Expected a warning naming {missing_root}, got: {all_messages}"
+    message = matching[0].getMessage()
+    assert "did not exist" in message
+    assert re.search(r"permissions\s+0o[0-7]+", message), (
+        f"Expected the log to state the created directory's permissions, got: {message!r}"
+    )
+
+
+def test_write_root_already_present_is_not_touched(tmp_path: Path) -> None:
+    """
+    A write_paths root that already exists on the host must not be
+    recreated or logged about — the fallback only applies to the
+    genuinely-missing case.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    existing_root = tmp_path / "shared"
+    existing_root.mkdir()
+    before_mtime = existing_root.stat().st_mtime_ns
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[existing_root])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert existing_root.stat().st_mtime_ns == before_mtime
+    assert "--bind-try" in argv
+    assert str(existing_root) in argv
+
+
+def test_write_root_uncreatable_warns_instead_of_failing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A missing write_paths root whose creation fails (e.g. an unwritable
+    parent) must not abort the whole sandbox wrap: merged-in optional
+    write roots (harness-internal dirs under an unwritable ``/home``)
+    would otherwise degrade the helper to running unwrapped. The wrap
+    keeps the old skip-the-bind behavior for that root and warns loudly.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    uncreatable_root = tmp_path / "locked" / "child" / "grandchild"
+
+    real_mkdir = Path.mkdir
+
+    def _mkdir(self: Path, *args: object, **kwargs: object) -> None:
+        # Simulate an unwritable parent regardless of runner privileges
+        # (mode-based enforcement doesn't hold when tests run as root).
+        if self == uncreatable_root:
+            raise PermissionError(13, "Permission denied", str(self))
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _mkdir)
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, write_roots=[uncreatable_root])
+    with caplog.at_level(logging.WARNING):
+        argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
+
+    assert not uncreatable_root.exists()
+    matching = [r for r in caplog.records if str(uncreatable_root) in r.getMessage()]
+    assert matching, "Expected a warning about the uncreatable write root"
+    assert "could not be created" in matching[0].getMessage()
+    # The full bind triple is still emitted; bwrap's --bind-try skips
+    # the missing source safely instead of failing the spawn.
+    triples = [
+        (argv[i], argv[i + 1], argv[i + 2])
+        for i, a in enumerate(argv)
+        if a == "--bind-try" and i + 2 < len(argv)
+    ]
+    assert ("--bind-try", str(uncreatable_root), str(uncreatable_root)) in triples, (
+        f"expected a --bind-try triple for {uncreatable_root}, got {triples}"
+    )
+
+
 def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
     """
     Regression: a ``write_paths`` grant nested below a ``read_paths``
@@ -1555,11 +1747,6 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Seccomp profile (real bwrap subprocess required)
 # ---------------------------------------------------------------------------
-
-
-pytestmark_bwrap = pytest.mark.skipif(
-    not BWRAP_AVAILABLE, reason="bwrap not installed on this host"
-)
 
 
 @pytestmark_bwrap
@@ -2049,3 +2236,137 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_bwrap(tmp_path: Path
     assert "TMPOK" in completed.stdout, (
         f"target did not reach the scratch-write marker. stdout={completed.stdout!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Harness-staged codex skill exposure
+# ---------------------------------------------------------------------------
+
+
+def _stage_codex_skills_root(tmproot: Path) -> tuple[Path, Path]:
+    """Create a staged codex home under *tmproot* posing as the temp dir.
+
+    :returns: ``(home, skills)`` — the staged home and its skills subdir.
+    """
+    from omnigent.inner.codex_staging import CODEX_HOME_PREFIX
+
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    root = tmproot / f"omnigent-codex-homes{suffix}"
+    root.mkdir(mode=0o700)
+    home = root / f"{CODEX_HOME_PREFIX}test"
+    skills = home / "skills" / "demo-skill"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("methodology body\n")
+    (home / "auth.json").write_text('{"secret": "never-expose"}')
+    return home, home / "skills"
+
+
+def _bind_triples(argv: list[str], op: str) -> list[tuple[str, str]]:
+    """All ``(src, dst)`` pairs emitted for mount option *op* in *argv*."""
+    return [(argv[i + 1], argv[i + 2]) for i, tok in enumerate(argv) if tok == op]
+
+
+def test_wrap_launcher_argv_exposes_staged_codex_skills_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The skills subtree of a staged codex home is re-exposed read-only,
+    and nothing else from the home is mounted.
+
+    The wrapped codex executor publishes ``$CODEX_HOME/skills/...`` paths
+    in the model's skill manifest; without this bind the ``--tmpfs /tmp``
+    default leaves those paths dangling inside the namespace. The home's
+    siblings (``auth.json``) carry bridged credentials and must never
+    appear as a mount source.
+    """
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd, read_roots=[skills]), cwd
+    )
+
+    ro_pairs = _bind_triples(argv, "--ro-bind-try")
+    assert (str(skills), str(skills)) in ro_pairs, (
+        "staged codex skills subtree is not re-exposed; the paths codex "
+        "publishes in its skill manifest dangle inside the namespace"
+    )
+    # Fail-closed on the rest of the home: neither the home itself nor its
+    # credential files may be mounted by any bind flavor.
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try", "--dev-bind"):
+        for src, _dst in _bind_triples(argv, op):
+            assert src != str(home), f"{op} mounts the whole staged home"
+            assert "auth.json" not in src, f"{op} mounts a credential file"
+
+
+def test_wrap_launcher_argv_staged_codex_skills_dedupe_with_read_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skills dir already granted via ``read_paths`` is bound once."""
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    _home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"],
+        _make_policy(cwd, read_roots=[skills]),
+        cwd,
+    )
+
+    pair = (str(skills), str(skills))
+    assert _bind_triples(argv, "--ro-bind-try").count(pair) == 1
+
+
+def test_wrap_launcher_argv_does_not_discover_other_sessions_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staged home is not a read grant for an unrelated sandbox."""
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    argv = _make_backend().wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd), cwd
+    )
+
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try"):
+        assert (str(skills), str(skills)) not in _bind_triples(argv, op)
+        assert (str(home), str(home)) not in _bind_triples(argv, op)
+
+
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a depth-2 POSIX binary")
+def test_wrap_launcher_argv_never_binds_the_filesystem_root(tmp_path: Path) -> None:
+    """A depth-2 executable (``/bin/sh``) must not drag in ``--ro-bind / /``.
+
+    The interpreter-visibility walk binds each hop's parent and
+    grandparent; for ``/bin/sh`` the grandparent is ``/``, and binding it
+    would re-expose the entire host read-only — defeating the hermetic
+    default view ($HOME included).
+    """
+    backend = _make_backend()
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    argv = backend.wrap_launcher_argv(["/bin/sh", "-c", "true"], _make_policy(cwd), cwd)
+
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try"):
+        assert ("/", "/") not in _bind_triples(argv, op), (
+            f"{op} / / re-exposes the whole host inside the sandbox"
+        )

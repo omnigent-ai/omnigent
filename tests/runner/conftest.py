@@ -14,11 +14,13 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import claude_native, codex_native_app_server
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
+from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import NullServerClient
 
 # The real store-backed catalog resolver, captured before the autouse fixture
@@ -26,7 +28,9 @@ from tests.runner.helpers import NullServerClient
 # attribute back to this. (An assignment, not an alias import, so lint
 # autofixes can't strip it as unused.)
 REAL_CLAUDE_LAUNCH_CATALOG = claude_native.claude_launch_catalog
+REAL_CLAUDE_REPROBED_LAUNCH_CATALOG = claude_native.claude_reprobed_launch_catalog
 REAL_CODEX_LAUNCH_CATALOG = codex_native_app_server.codex_launch_catalog
+REAL_CODEX_REPROBED_LAUNCH_CATALOG = codex_native_app_server.codex_reprobed_launch_catalog
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -42,18 +46,26 @@ def _isolated_model_catalog_store(
     a miss, probe the REAL harness CLIs — which a unit test must never do
     (a real ``claude`` boot takes ~6 s and writes the developer's real
     ``~/.omnigent`` store). Redirect the store's directory seam per test
-    and stub both launch-catalog resolvers to "no catalog" (the
+    and stub the launch-catalog resolvers to "no catalog" (the
     pre-catalog behavior); a test exercising catalogs re-patches them
     explicitly.
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
-    monkeypatch.setattr("omnigent.model_catalog_store._data_dir", lambda: store_dir)
+    monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
 
     async def _no_catalog(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _no_catalog)
-    monkeypatch.setattr("omnigent.codex_native_app_server.codex_launch_catalog", _no_catalog)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _no_catalog)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_reprobed_launch_catalog", _no_catalog
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.codex_launch_catalog", _no_catalog
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.codex_reprobed_launch_catalog", _no_catalog
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -251,6 +263,9 @@ class _FakeProcessManager:
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []
         self.activity_noted: list[str] = []
+        # Every release call with its idle-cutoff guard, including calls the
+        # guard suppressed; ``released`` records only completed releases.
+        self.release_calls: list[tuple[str, float | None]] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -291,8 +306,21 @@ class _FakeProcessManager:
         self.cancelled.append(conversation_id)
         return True
 
-    async def release(self, conversation_id: str) -> None:
-        """Record a release and remove the session."""
+    async def release(
+        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+    ) -> None:
+        """Record a release and remove the session.
+
+        Mirrors the real manager's conditional release: with a cutoff, an
+        entry with a turn in flight is left alone.
+
+        :param conversation_id: Session/conversation id being released.
+        :param only_if_idle_cutoff: Idle-reap cutoff; when given, a
+            conversation with an active turn is not torn down.
+        """
+        self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
+            return
         self.released.append(conversation_id)
         self._sessions.discard(conversation_id)
 
@@ -328,6 +356,20 @@ async def _spec_resolver_returning(spec: AgentSpec) -> Any:
         return spec
 
     return _resolve
+
+
+async def _build_app_for_spec(
+    spec: AgentSpec, *, terminal_registry: TerminalRegistry | None = None
+) -> tuple[FastAPI, _FakeProcessManager]:
+    """Build the real runner app with an idle harness and one fixed agent spec."""
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    return app, pm
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -783,7 +825,7 @@ def _no_wake_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def _record(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr("omnigent.runner.app._wake_retry_sleep", _record)
+    monkeypatch.setattr("omnigent.runner.subagent_work._wake_retry_sleep", _record)
     return recorded
 
 

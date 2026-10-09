@@ -88,6 +88,37 @@ def test_pi_spawn_env_threads_cwd_separately_from_bundle_dir(tmp_path: Path) -> 
     assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
 
 
+@pytest.mark.parametrize("enabled", [None, True, False])
+def test_pi_spawn_env_sets_context_files(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool | None
+) -> None:
+    """The spec controls discovery even when the parent environment disagrees."""
+    spec = _make_spec()
+    if enabled is not None:
+        spec.executor.config["context_files"] = enabled
+    monkeypatch.setenv("HARNESS_PI_CONTEXT_FILES", "true" if enabled is False else "false")
+
+    env = _build_pi_spawn_env(spec)
+
+    assert env["HARNESS_PI_CONTEXT_FILES"] == ("false" if enabled is False else "true")
+
+
+@pytest.mark.parametrize("mode", [None, "append", "replace"])
+def test_pi_spawn_env_sets_system_prompt_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str | None
+) -> None:
+    spec = _make_spec()
+    if mode is not None:
+        spec.executor.config["system_prompt_mode"] = mode
+    monkeypatch.setenv(
+        "HARNESS_PI_SYSTEM_PROMPT_MODE", "append" if mode == "replace" else "replace"
+    )
+
+    env = _build_pi_spawn_env(spec)
+
+    assert env["HARNESS_PI_SYSTEM_PROMPT_MODE"] == (mode or "append")
+
+
 def _ucode_state_for_pi(
     monkeypatch: pytest.MonkeyPatch, *, model: str | None, with_pi_entry: bool
 ):

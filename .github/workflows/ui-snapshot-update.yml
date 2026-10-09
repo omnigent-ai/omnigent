@@ -94,7 +94,7 @@ jobs:
           standalone: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -121,19 +121,22 @@ jobs:
           pnpm --filter web run build:storybook
 
       - name: Compare and verify the regenerated baselines
-        # Deliberately NOT --update-snapshots: that rewrites EVERY PNG, churning
-        # baselines that already pass. Under GitHub Actions, plain compare mode
-        # updates only drifting/missing PNGs in place. The first run may therefore
-        # fail by design. The second must pass, distinguishing expected baseline
-        # updates from Storybook/index/server/render failures.
+        # CI compare updates only drifting/missing PNGs and fails those cases.
+        # Allow resized captures on the first pass, then verify failed cases
+        # with strict sizes. Clear old failures so selection is run-local.
         run: |
+          status=0
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures \
-            --ui-skip-build || true
+            -p no:rerunfailures --ignore-size-diff --cache-clear \
+            --ui-skip-build || status=$?
+          # Only test failures (1) need verification; propagate other exit codes.
+          if [[ "$status" -ne 1 ]]; then
+            exit "$status"
+          fi
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures \
+            -p no:rerunfailures --last-failed \
             --ui-skip-build
 
       # Tar the snapshots tree (paths intact) so the commit job can restore it

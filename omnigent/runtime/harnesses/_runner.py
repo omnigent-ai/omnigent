@@ -44,6 +44,7 @@ package shape and §Process management.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import os
 import signal
@@ -378,6 +379,7 @@ def _create_uvicorn_config(
             app,
             uds=socket_path,
             log_level=_UVICORN_LOG_LEVEL,
+            log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
         )
     if bind:
@@ -387,6 +389,7 @@ def _create_uvicorn_config(
             host=host,
             port=int(port),
             log_level=_UVICORN_LOG_LEVEL,
+            log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
         )
     sys.exit("runner: exactly one of --socket or --bind is required")
@@ -461,6 +464,13 @@ def main(argv: list[str] | None = None) -> None:
             _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
     config = _create_uvicorn_config(app, args.socket, args.bind)
+    # Move the now-static import graph out of GC's tracked set, so a full
+    # collection mid-session no longer walks it (a ~50 ms pause on a warm turn).
+    # The executor's lazily imported SDK is frozen after the first turn.
+    gc.freeze()
+    from omnigent.runtime.harnesses._scaffold import arm_gc_freeze_after_first_turn
+
+    arm_gc_freeze_after_first_turn()
     _HardExitServer(config).run()
 
 

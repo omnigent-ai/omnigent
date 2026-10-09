@@ -16,7 +16,7 @@ import type {
   ToolResultBlock,
   UserMessageBlock,
 } from "./blocks";
-import type { ConversationItem } from "./conversationItems";
+import type { ConversationItem, ErrorItem } from "./conversationItems";
 import { itemsToBlocks } from "./itemsToBlocks";
 
 function userMessage(responseId: string, text: string, id = "msg_user"): ConversationItem {
@@ -105,7 +105,7 @@ describe("itemsToBlocks — flat shape", () => {
     ]);
   });
 
-  it("hides legacy Claude task notifications that predate is_meta", () => {
+  it("hides a Claude subagent task notification between real messages", () => {
     const items: ConversationItem[] = [
       userMessage("resp_before", "visible before", "msg_before"),
       userMessage(
@@ -132,7 +132,43 @@ describe("itemsToBlocks — flat shape", () => {
     expect(texts).toEqual(["visible before", "visible after"]);
   });
 
-  it("hides legacy Claude Monitor task notifications with optional fields omitted", () => {
+  it("re-labels an is_meta task notification (bridge-marked) as a system marker", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg_wake",
+        response_id: "resp_wake",
+        type: "message",
+        status: "completed",
+        role: "user",
+        is_meta: true,
+        content: [
+          {
+            type: "input_text",
+            text: [
+              "<task-notification>",
+              "<task-id>b3f9a2c1d</task-id>",
+              "<status>failed</status>",
+              "<summary>Background command exited 1</summary>",
+              "</task-notification>",
+            ].join("\n"),
+          },
+        ],
+      },
+    ];
+
+    const blocks = itemsToBlocks(items);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.type).toBe("user_message");
+    expect((blocks[0] as UserMessageBlock).content).toEqual([
+      {
+        type: "input_text",
+        text: "[System: background task b3f9a2c1d failed]\nBackground command exited 1",
+      },
+    ]);
+  });
+
+  it("re-labels a Claude Monitor task notification with optional fields omitted", () => {
     const items: ConversationItem[] = [
       userMessage(
         "resp_task",
@@ -147,7 +183,49 @@ describe("itemsToBlocks — flat shape", () => {
       ),
     ];
 
-    expect(itemsToBlocks(items)).toEqual([]);
+    const blocks = itemsToBlocks(items);
+
+    expect(blocks).toHaveLength(1);
+    expect((blocks[0] as UserMessageBlock).content).toEqual([
+      {
+        type: "input_text",
+        text:
+          "[System: background task b1mhekpmy finished]\n" +
+          'Monitor event: "PR 2086 E2E UI + npm test CI results"',
+      },
+    ]);
+  });
+
+  it.each([
+    '<teammate-message teammate_id="reviewer">Review this</teammate-message>',
+    '<agent-message from="reviewer">Review this</agent-message>',
+  ])("preserves a human's bare envelope after reload: %s", (text) => {
+    for (const authorship of [{ created_by: "alice@example.com" }, { user_authored: true }]) {
+      const item = { ...userMessage("resp_user", text), ...authorship };
+      expect(itemsToBlocks([item])).toMatchObject([
+        { type: "user_message", content: [{ type: "input_text", text }] },
+      ]);
+      expect(itemsToBlocks([{ ...item, is_meta: true }])).toEqual([]);
+    }
+  });
+
+  it("keeps legacy teammate handbacks out of the transcript while preserving user discussion", () => {
+    const envelope =
+      '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';
+    const blocks = itemsToBlocks([
+      userMessage("resp_1", "Review this change", "msg_before"),
+      userMessage("resp_2", envelope, "msg_teammate"),
+      userMessage("resp_2", '<agent-message from="reviewer">Ready</agent-message>', "msg_report"),
+      userMessage("resp_3", `Another Claude session sent a message:\n${envelope}`, "msg_peer"),
+      assistantMessage("resp_3", "The review is complete."),
+      userMessage("resp_4", `What does ${envelope} mean?`, "msg_after"),
+    ]);
+
+    expect(blocks.map((block) => block.ctx.itemId)).toEqual([
+      "msg_before",
+      "msg_asst",
+      "msg_after",
+    ]);
   });
 
   it("user + assistant items produce [UserMessageBlock, TextDone] in order", () => {
@@ -263,6 +341,27 @@ describe("itemsToBlocks — flat shape", () => {
     expect(error.message).toBe("Native Codex requires the 'codex' CLI on PATH.");
   });
 
+  it("error items keep their title and remediation on reload", () => {
+    // The card's headline and sign-in link come from history after a reload,
+    // not from the live stream, so the persisted item must carry them.
+    const items: ConversationItem[] = [
+      {
+        id: "err_pending",
+        response_id: "resp_pending",
+        type: "error",
+        status: "completed",
+        source: "harness",
+        code: "databricks_sign_in_pending",
+        message: "Codex is waiting for a sign-in in this session's terminal.",
+        title: "Codex can't start until you sign in to Databricks",
+        remediation: "Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+      },
+    ];
+    const [error] = itemsToBlocks(items) as ErrorBlock[];
+    expect(error?.title).toBe("Codex can't start until you sign in to Databricks");
+    expect(error?.remediation).toContain("https://signin.example.com/device");
+  });
+
   it("preserves input_image and input_file content on UserMessageBlock", () => {
     const items: ConversationItem[] = [
       {
@@ -288,6 +387,110 @@ describe("itemsToBlocks — flat shape", () => {
       { type: "input_text", text: "carefully." },
       { type: "input_file", file_id: "file_abc" },
     ]);
+  });
+});
+
+describe("itemsToBlocks — historical error attribution", () => {
+  function errorItem(responseId: string, code = "RuntimeError"): ErrorItem {
+    return {
+      id: `err_${responseId}`,
+      response_id: responseId,
+      type: "error",
+      status: "completed",
+      source: "execution",
+      code,
+      message: "The turn did not complete.",
+    };
+  }
+
+  it.each(["message", "function_call", "reasoning"] as const)(
+    "attributes errors to the same response's %s agent after an agent switch",
+    (type) => {
+      function agentItem(responseId: string, model: string): ConversationItem {
+        if (type === "message") {
+          return assistantMessage(responseId, "Working on it.", `msg_${responseId}`, model);
+        }
+        if (type === "function_call") {
+          return functionCall(responseId, responseId, "read_file", {}, `fc_${responseId}`, model);
+        }
+        return {
+          id: `reasoning_${responseId}`,
+          response_id: responseId,
+          type: "reasoning",
+          status: "completed",
+          model,
+          summary: [],
+        };
+      }
+
+      const items = [
+        agentItem("resp_polly", "polly"),
+        errorItem("resp_polly"),
+        agentItem("resp_claude", "claude-native-ui (switch ag_claude)"),
+        errorItem("resp_claude", "native_turn_error"),
+        errorItem("resp_no_output"),
+      ];
+      const errors = itemsToBlocks(items).filter((b): b is ErrorBlock => b.type === "error");
+
+      expect(errors.map((error) => error.title)).toEqual([
+        "Polly ran into an error during this turn.",
+        "Claude Code ran into an error during this turn.",
+        undefined,
+      ]);
+      expect(errors.map((error) => error.ctx.agent)).toEqual([null, null, null]);
+      expect(errors.map((error) => error.ctx.responseId)).toEqual([
+        "resp_polly",
+        "resp_claude",
+        "resp_no_output",
+      ]);
+    },
+  );
+
+  it.each([
+    { ...userMessage("resp_failed", "Try again."), model: "polly" },
+    {
+      id: "routing",
+      response_id: "resp_failed",
+      type: "routing_decision",
+      status: "completed",
+      model: "provider-model",
+      applied: true,
+      rationale: "Selected for this task.",
+    },
+    {
+      id: "compaction",
+      response_id: "resp_failed",
+      type: "compaction",
+      status: "completed",
+      model: "provider-model",
+      summary: "Older context summarized.",
+    },
+  ] satisfies ConversationItem[])("does not infer an error's agent from $type", (item) => {
+    const blocks = itemsToBlocks([
+      assistantMessage("resp_earlier", "Earlier response", "msg_earlier", "claude-native-ui"),
+      item,
+      errorItem("resp_failed"),
+    ]);
+    expect(blocks.find((b): b is ErrorBlock => b.type === "error")?.title).toBeUndefined();
+  });
+
+  it("does not guess which of multiple response agents caused an error", () => {
+    const blocks = itemsToBlocks([
+      assistantMessage("resp_shared", "Parent response", "msg_parent", "polly"),
+      assistantMessage("resp_shared", "Child response", "msg_child", "polly.worker"),
+      errorItem("resp_shared"),
+    ]);
+    expect(blocks.find((b): b is ErrorBlock => b.type === "error")?.title).toBeUndefined();
+  });
+
+  it("preserves classified titles and informational notices with a known agent", () => {
+    const blocks = itemsToBlocks([
+      assistantMessage("resp_polly", "Working on it.", "msg_polly", "polly"),
+      { ...errorItem("resp_polly"), id: "err_classified", title: "Specific diagnosis" },
+      { ...errorItem("resp_polly"), id: "err_info", level: "info" },
+    ]);
+    const errors = blocks.filter((b): b is ErrorBlock => b.type === "error");
+    expect(errors.map((error) => error.title)).toEqual(["Specific diagnosis", undefined]);
   });
 });
 

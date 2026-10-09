@@ -24,11 +24,14 @@ from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
     CreateProjectRequest,
+    ProjectOrderRequest,
+    ProjectOrderResponse,
     UpdateProjectRequest,
 )
-from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -81,6 +84,9 @@ def create_projects_router(
             user_id,
             body.config,
         )
+        # Push the change to the owner's other connected clients so their
+        # sidebars pick up the new folder without a reload.
+        announce_projects_changed(user_id)
         return _to_response(project)
 
     @router.get("/projects")
@@ -92,8 +98,39 @@ def create_projects_router(
         :raises OmnigentError: 401 if unauthenticated in multi-user mode.
         """
         user_id = require_user(request, auth_provider)
-        projects = await asyncio.to_thread(project_store.list, user_id=user_id)
+
+        def read_projects() -> list[Project]:
+            return apply_project_order(
+                project_store.list(user_id=user_id),
+                project_store.get_order(user_id=user_id),
+                project_id=lambda p: p.id,
+                project_name=lambda p: p.name,
+            )
+
+        projects = await asyncio.to_thread(read_projects)
         return {"object": "list", "data": [_to_response(p) for p in projects]}
+
+    @router.get(
+        "/projects/order", response_model=None, responses={200: {"model": ProjectOrderResponse}}
+    )
+    async def get_project_order(request: Request) -> ProjectOrderPreference:
+        """Read the caller's custom order."""
+        user_id = require_user(request, auth_provider)
+        return await asyncio.to_thread(project_store.get_order_preference, user_id=user_id)
+
+    @router.put(
+        "/projects/order", response_model=None, responses={200: {"model": ProjectOrderResponse}}
+    )
+    async def save_project_order(
+        request: Request, body: ProjectOrderRequest
+    ) -> ProjectOrderPreference:
+        """Save the caller's order and notify their connected clients."""
+        user_id = require_user(request, auth_provider)
+        preference = await asyncio.to_thread(
+            project_store.save_order, body.ordered_project_ids, user_id=user_id
+        )
+        announce_projects_changed(user_id)
+        return preference
 
     @router.get("/projects/{project_id}")
     async def get_project(request: Request, project_id: str) -> dict[str, Any]:
@@ -137,6 +174,10 @@ def create_projects_router(
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        # A rename/config change is only ever seen by other connected clients
+        # (another tab, the mobile app) if it is pushed; nothing else refreshes
+        # their projects cache until a full reload.
+        announce_projects_changed(user_id)
         return _to_response(project)
 
     @router.delete("/projects/{project_id}")
@@ -156,6 +197,8 @@ def create_projects_router(
         deleted = await asyncio.to_thread(project_store.delete, project_id, user_id=user_id)
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        # Drop the folder from the owner's other connected clients live.
+        announce_projects_changed(user_id)
         return {"id": project_id, "object": "project.deleted", "deleted": True}
 
     return router

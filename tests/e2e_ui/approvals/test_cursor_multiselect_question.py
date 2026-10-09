@@ -6,7 +6,7 @@ UI. cursor-agent's ``AskQuestion`` tool marks a question multi-select with
 — verified against the cursor-agent 2026.08.31 bundle, whose TUI renders such a
 question with a "(multi-select)" suffix). The runner-side mirror translates the
 transcript-detected call into the web ``AskUserQuestion`` shape in
-``omnigent.cursor_native_permissions._askquestion_payload`` and parks it on the
+``omnigent.harnesses.cursor_native.permissions._askquestion_payload`` and parks it on the
 ``cursor-permission-request`` hook; the SPA renders ``AskUserQuestionForm`` from
 that payload — checkboxes when ``multiSelect`` is true, radios otherwise.
 
@@ -42,7 +42,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.cursor_native_permissions import (
+from omnigent.harnesses.cursor_native.permissions import (
     CursorPendingToolCall,
     _run_one_question,
     cursor_tool_call_elicitation_id,

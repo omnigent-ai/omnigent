@@ -106,6 +106,19 @@ def test_compaction_data_valid() -> None:
     assert cd.token_count == 342
 
 
+@pytest.mark.parametrize("window_id", [2, "01a070e2-2665-7d62-9b74-973decf239b7"])
+def test_compaction_data_accepts_vendor_window_id(window_id: int | str) -> None:
+    cd = CompactionData(
+        summary="Compacted",
+        last_item_id="msg_abc123",
+        model="system.ai.gpt-5-6-sol",
+        token_count=0,
+        window_id=window_id,
+    )
+
+    assert cd.window_id == window_id
+
+
 def test_compaction_data_missing_field() -> None:
     with pytest.raises(ValidationError, match="last_item_id"):
         CompactionData(summary="s", model="m", token_count=1)  # type: ignore[call-arg]
@@ -531,7 +544,11 @@ def test_to_api_dict_function_call() -> None:
         response_id="resp_1",
         created_at=1,
         data=FunctionCallData(
-            agent="my-agent", name="search", arguments='{"q": "test"}', call_id="call_1"
+            agent="my-agent",
+            name="search",
+            arguments='{"q": "test"}',
+            call_id="call_1",
+            namespace="container",
         ),
     )
     api = item.to_api_dict()
@@ -541,6 +558,7 @@ def test_to_api_dict_function_call() -> None:
     assert api["model"] == "my-agent"  # alias
     assert api["name"] == "search"
     assert api["call_id"] == "call_1"
+    assert api["namespace"] == "container"
     assert "created_by" not in api
 
 

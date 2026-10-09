@@ -10,6 +10,8 @@ import asyncio
 from typing import Any
 
 import pytest
+from websockets.exceptions import InvalidStatus, WebSocketException
+from websockets.http11 import Response
 
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -214,11 +216,17 @@ async def test_dispatch_via_asgi_app_crash_sends_500() -> None:
 
     end = decode_frame(sent[2])
     assert isinstance(end, ResponseEndFrame)
+    # Pre-head crash ends cleanly: the synthetic 500 body should be readable,
+    # not aborted.
+    assert end.error is None, (
+        f"pre-head crash sent error-flagged end frame: {end.error!r} — "
+        "breaks clean 500 delivery to the consumer"
+    )
 
 
 @pytest.mark.asyncio
 async def test_dispatch_via_asgi_app_crash_after_head_sends_end() -> None:
-    """An app crash after sending head still sends end frame."""
+    """An app crash after sending head still sends end frame, now error-flagged."""
 
     async def _late_crash_app(
         scope: dict[str, Any],
@@ -238,7 +246,13 @@ async def test_dispatch_via_asgi_app_crash_after_head_sends_end() -> None:
     frames = [decode_frame(s) for s in sent]
     assert isinstance(frames[0], ResponseHeadFrame)
     assert frames[0].status == 200
-    assert isinstance(frames[-1], ResponseEndFrame)
+    end = frames[-1]
+    assert isinstance(end, ResponseEndFrame)
+    # After-head crash must signal the error so the consumer raises rather than
+    # seeing a clean EOF after partial body.
+    assert end.error is not None, (
+        "after-head crash sent clean end frame — consumer would see silent EOF"
+    )
 
 
 @pytest.mark.asyncio
@@ -339,34 +353,134 @@ async def test_dispatch_via_asgi_query_string() -> None:
 # ── serve_tunnel recycle backoff ────────────────────────
 
 
+class _Recycled(WebSocketException):
+    """Fake close exception carrying a fixed close code via ``.code``.
+
+    :param code: WebSocket close code, e.g. ``1012``.
+    """
+
+    def __init__(self, code: int) -> None:
+        super().__init__("recycle")
+        self._code = code
+
+    @property
+    def code(self) -> int:
+        return self._code
+
+
 @pytest.mark.asyncio
-async def test_serve_tunnel_recycle_close_code_resets_backoff(
+@pytest.mark.parametrize("close_code", [1001, 1012])
+async def test_serve_tunnel_recycle_close_code_spreads_reconnect_delay(
     monkeypatch: pytest.MonkeyPatch,
+    close_code: int,
 ) -> None:
-    """A 1012 'service restart' close code resets backoff instead of escalating."""
-    from websockets.exceptions import WebSocketException
+    """A server-sent 1001/1012 recycle sleeps a uniform spread, not tight jitter.
 
-    class _Recycled(WebSocketException):
-        def __init__(self) -> None:
-            super().__init__("recycle")
-
-        @property
-        def code(self) -> int:
-            return 1012
-
+    Also proves the backoff never escalates across repeated recycles: both
+    attempts land on the same recycle bounds, not a doubling base delay.
+    """
     sleeps: list[float] = []
+    uniform_calls: list[tuple[float, float]] = []
     call_count = 0
 
     async def _serve_once(app: Any, **kwargs: Any) -> None:
         nonlocal call_count
         call_count += 1
         if call_count <= 2:
-            raise _Recycled()
+            raise _Recycled(close_code)
 
     async def _sleep(delay: float) -> None:
         sleeps.append(delay)
         if len(sleeps) >= 2:
             raise asyncio.CancelledError
+
+    def _uniform(a: float, b: float) -> float:
+        uniform_calls.append((a, b))
+        return 1.75
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", _uniform)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://localhost:8000",
+            runner_id="r1",
+            runner_version="0.1.0",
+        )
+
+    # Both sleeps use the mocked uniform-spread value directly, not a
+    # delay_s-scaled ±50% jitter that would differ from it.
+    assert sleeps == [1.75, 1.75]
+    assert (
+        uniform_calls
+        == [(serve_module._RECYCLE_RECONNECT_MIN_S, serve_module._RECYCLE_RECONNECT_MAX_S)] * 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_recycle_502_status_spreads_reconnect_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 502 upgrade rejection (ingress cycling) gets the same wide spread."""
+    call_count = 0
+    sleeps: list[float] = []
+    uniform_calls: list[tuple[float, float]] = []
+
+    async def _serve_once(app: Any, **kwargs: Any) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 1:
+            raise InvalidStatus(Response(502, "Bad Gateway", [], b""))  # type: ignore[arg-type]
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    def _uniform(a: float, b: float) -> float:
+        uniform_calls.append((a, b))
+        return 1.25
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", _uniform)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://localhost:8000",
+            runner_id="r1",
+            runner_version="0.1.0",
+        )
+
+    assert sleeps == [1.25]
+    assert uniform_calls == [
+        (serve_module._RECYCLE_RECONNECT_MIN_S, serve_module._RECYCLE_RECONNECT_MAX_S)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_4003_close_code_still_escalates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older server's 4003 'tunnel closed' is not a recycle code.
+
+    Confirms 4003 keeps today's generic-retry treatment (escalating ±50%
+    jitter) instead of picking up the new recycle spread meant for 1001/1012.
+    """
+    call_count = 0
+    sleeps: list[float] = []
+
+    async def _serve_once(app: Any, **kwargs: Any) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            raise _Recycled(4003)
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
@@ -380,31 +494,43 @@ async def test_serve_tunnel_recycle_close_code_resets_backoff(
             runner_version="0.1.0",
         )
 
-    # Both sleeps should be at the initial delay (0.5), not escalating.
-    assert sleeps == [0.5, 0.5]
+    # Escalates 0.5 -> 1.0, unlike a 1001/1012/502 recycle which would hold
+    # within [0.5, 3.0] regardless of attempt count.
+    assert sleeps == [0.5, 1.0]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("callback_fails", [False, True])
 async def test_serve_tunnel_on_reconnect_callback(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    callback_fails: bool,
 ) -> None:
-    """on_reconnect is called after successful reconnect (not initial connect)."""
-    reconnects: list[str] = []
+    """on_reconnect runs only after a reconnect reaches the ready state."""
+    events: list[str] = []
     call_count = 0
 
     async def _serve_once(app: Any, **kwargs: Any) -> None:
         nonlocal call_count
         call_count += 1
-        # A clean return models a served-then-closed connection, so the
-        # upgrade-accepted callback fires like the real _serve_tunnel_once.
+        events.append(f"attempt-{call_count}")
+        if call_count == 2:
+            raise ConnectionError("server is still starting")
         kwargs["on_connected"]()
+        on_ready = kwargs["on_ready"]
+        if on_ready is not None:
+            events.append(f"ready-{call_count}")
+            await on_ready()
 
     async def _sleep(delay: float) -> None:
-        if call_count >= 2:
+        del delay
+        if call_count >= 3:
             raise asyncio.CancelledError
 
     async def _on_reconnect() -> None:
-        reconnects.append("reconnected")
+        events.append("reconnected")
+        if callback_fails:
+            raise RuntimeError("callback failed")
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
@@ -418,8 +544,21 @@ async def test_serve_tunnel_on_reconnect_callback(
             on_reconnect=_on_reconnect,
         )
 
-    # on_reconnect is called before the second _serve_once, not the first.
-    assert reconnects == ["reconnected"]
+    assert events == [
+        "attempt-1",
+        "attempt-2",
+        "attempt-3",
+        "ready-3",
+        "reconnected",
+    ]
+
+    failures = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_reconnect_callback_failed"
+    ]
+    assert len(failures) == int(callback_fails)
+    assert not any(getattr(r, "event_name", None) == "runner_connected" for r in caplog.records)
 
 
 @pytest.mark.asyncio

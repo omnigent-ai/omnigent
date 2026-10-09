@@ -42,6 +42,73 @@ function makeIpcMain() {
   };
 }
 
+describe("browser IPC Arca context", () => {
+  it("adds a main-owned recovery hint only to a denied agent navigation", () => {
+    const ipcMain = makeIpcMain();
+    let allowed = false;
+    let hints = 0;
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: () => ({ ok: allowed, error: allowed ? undefined : "blocked" }),
+      }),
+      getAgentNavigationHintForEvent: () => {
+        hints++;
+        return "Reconnect to Arca";
+      },
+    });
+    const invoke = (agent) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "source", url: "http://localhost", opts: { agent } },
+      );
+    assert.equal(invoke(true).error, "blocked Reconnect to Arca");
+    assert.equal(invoke(false).error, "blocked");
+    allowed = true;
+    assert.equal(invoke(true).ok, true);
+    assert.equal(hints, 1);
+  });
+
+  it("pairs the renderer's source host with main's context and ignores caller exception flags", () => {
+    const ipcMain = makeIpcMain();
+    const calls = [];
+    const context = { serverTarget: "current", sourceHostId: "actual-host" };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: (...args) => {
+          calls.push(args);
+          return { ok: true };
+        },
+      }),
+      getAgentContextForEvent: (_event, host) => {
+        assert.equal(host, "actual-host");
+        return context;
+      },
+    });
+    ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost",
+        opts: {
+          force: true,
+          agent: true,
+          sourceHostId: "actual-host",
+          allowLocalhost: true,
+          isArca: true,
+          agentContext: { serverTarget: "forged" },
+        },
+      },
+    );
+    assert.deepEqual(calls[0][3], { force: true, agent: true, agentContext: context });
+  });
+});
+
 /** A stub webContents with a navigationHistory (Electron 42) and toggleable
  *  devtools + recorded navigation calls. */
 function makeWebContents({ canBack = false, canForward = false } = {}) {
@@ -67,6 +134,7 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
     reload: () => calls.push("reload"),
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
+    getURL: () => "https://example.com/restored",
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -110,6 +178,8 @@ function makeRegistry(conversationId, webContents) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
+  const recentSessionSupportCalls = [];
+  let recentSessionCancelCount = 0;
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
@@ -124,8 +194,18 @@ function makeRegistry(conversationId, webContents) {
       suppressedCalls.push(s);
       return { ok: true };
     },
+    cancelRecentSessionSwitch: () => {
+      recentSessionCancelCount += 1;
+      return { ok: true };
+    },
+    setRecentSessionSwitchSupported: (supported) => {
+      recentSessionSupportCalls.push(supported);
+      return { ok: true };
+    },
     close: () => ({ ok: true, removed: true }),
     suppressedCalls,
+    recentSessionSupportCalls,
+    recentSessionCancelCount: () => recentSessionCancelCount,
   };
 }
 
@@ -145,6 +225,24 @@ function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
   return { ipcMain, registry, wc, sent, event };
 }
 
+it("restores the URL and history state for the requested browser tab only", () => {
+  const viewId = "browser-tab:conv_1:tab-two";
+  const { ipcMain, event } = setup({
+    conversationId: viewId,
+    webContents: makeWebContents({ canBack: true }),
+  });
+  assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
+    exists: true,
+    url: "https://example.com/restored",
+    canGoBack: true,
+    canGoForward: false,
+  });
+  assert.deepEqual(
+    ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
+    { exists: false },
+  );
+});
+
 describe("browserIpc — trust gate", () => {
   it("registers every browser-* channel", () => {
     const { ipcMain } = setup();
@@ -153,6 +251,8 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-open-or-navigate",
       "omnigent:browser-set-active",
       "omnigent:browser-set-suppressed",
+      "omnigent:browser-set-recent-session-switch-supported",
+      "omnigent:browser-cancel-recent-session-switch",
       "omnigent:browser-resize",
       "omnigent:browser-screenshot",
       "omnigent:browser-execute",
@@ -203,6 +303,46 @@ describe("browserIpc — overlay suppression (#3980)", () => {
     const r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: true });
     assert.equal(r.ok, false);
     assert.match(r.error, /connected server's page/);
+  });
+});
+
+describe("browserIpc — recent-session cancellation", () => {
+  it("tracks whether the trusted renderer supports native forwarding", async () => {
+    const { ipcMain, registry, event } = setup();
+    await ipcMain.invoke("omnigent:browser-set-recent-session-switch-supported", event, {
+      supported: true,
+    });
+    await ipcMain.invoke("omnigent:browser-set-recent-session-switch-supported", event, {
+      supported: false,
+    });
+
+    assert.deepEqual(registry.recentSessionSupportCalls, [true, false]);
+  });
+
+  it("clears the registry latch for a trusted renderer", async () => {
+    const { ipcMain, registry, event } = setup();
+    const result = await ipcMain.invoke("omnigent:browser-cancel-recent-session-switch", event);
+
+    assert.equal(result.ok, true);
+    assert.equal(registry.recentSessionCancelCount(), 1);
+  });
+
+  it("rejects an unpinned sender", async () => {
+    const { ipcMain, registry, event } = setup({ pinned: false });
+    const cancelResult = await ipcMain.invoke(
+      "omnigent:browser-cancel-recent-session-switch",
+      event,
+    );
+    const supportResult = await ipcMain.invoke(
+      "omnigent:browser-set-recent-session-switch-supported",
+      event,
+      { supported: true },
+    );
+
+    assert.equal(cancelResult.ok, false);
+    assert.equal(supportResult.ok, false);
+    assert.equal(registry.recentSessionCancelCount(), 0);
+    assert.deepEqual(registry.recentSessionSupportCalls, []);
   });
 });
 

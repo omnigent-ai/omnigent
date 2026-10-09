@@ -1,7 +1,7 @@
 """Host-side checks for whether a harness family's inference is AI-Gateway-backed.
 
 Smart Routing's apply layer can only rewrite a launch's model when the launch
-resolves through the Databricks AI Gateway — that is where the routable model
+resolves through the Databricks Unity Gateway — that is where the routable model
 catalog lives. These checks answer that question per harness family from config
 resolution alone: no process launch, no network round-trip, so the host can
 report the answer alongside harness readiness on every registration.
@@ -21,7 +21,7 @@ CLAUDE_GATEWAY_HARNESSES: Final[tuple[str, ...]] = ("claude-native", "native-cla
 # Every spelling the Codex family travels under on the wire.
 CODEX_GATEWAY_HARNESSES: Final[tuple[str, ...]] = ("codex", "codex-native", "native-codex")
 
-# The AI Gateway serves Codex/OpenAI-Responses under this path suffix; both
+# The Unity Gateway serves Codex/OpenAI-Responses under this path suffix; both
 # gateway URL shapes (dedicated subdomain and workspace-hosted) end with it.
 _CODEX_GATEWAY_PATH_SUFFIX = "/codex/v1"
 
@@ -29,16 +29,16 @@ _CODEX_GATEWAY_PATH_SUFFIX = "/codex/v1"
 def claude_gateway_inference_backed() -> bool:
     """Whether a claude-native launch on this host resolves gateway-backed inference.
 
-    A gateway-backed launch pins a Databricks AI Gateway ``ANTHROPIC_BASE_URL``
+    A gateway-backed launch pins a Databricks Unity Gateway ``ANTHROPIC_BASE_URL``
     and delivers its bearer token through Claude Code's ``apiKeyHelper``. The
-    base URL must be a genuine Databricks AI Gateway (validated with
+    base URL must be a genuine Databricks Unity Gateway (validated with
     :func:`is_databricks_ai_gateway_url`, parity with the Codex check), since
     the external router's picks are Databricks catalog ids only that endpoint
     serves. The Bedrock path sets ``ANTHROPIC_BEDROCK_BASE_URL`` with no
     helper — not routable.
 
     A subscription / CLI login resolves no omnigent config, yet Claude Code
-    still routes all inference through an AI Gateway when an enterprise managed
+    still routes all inference through a Unity Gateway when an enterprise managed
     settings file pins it. Managed settings win at the actual launch, so that
     signal counts too: it flips the answer to ``True`` even when resolution
     yields nothing.
@@ -46,11 +46,11 @@ def claude_gateway_inference_backed() -> bool:
     :returns: ``True`` iff a claude-native launch resolves AI-Gateway-backed
         inference, from omnigent config or managed settings.
     """
-    from omnigent.claude_native import (
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+    from omnigent.harnesses.claude_native.main import (
         managed_claude_gateway_signal,
         resolve_native_claude_config,
     )
-    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     config = resolve_native_claude_config(spec=None, refresh_models=False)
     if config is not None:
@@ -72,14 +72,14 @@ def claude_gateway_inference_backed() -> bool:
 def codex_gateway_inference_backed() -> bool:
     """Whether a codex-native launch on this host resolves gateway-backed inference.
 
-    :returns: ``True`` iff the resolved launch routes through an AI Gateway
+    :returns: ``True`` iff the resolved launch routes through a Unity Gateway
         Codex base URL.
     """
-    from omnigent.codex_native_app_server import (
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+    from omnigent.harnesses.codex_native.app_server import (
         native_codex_launch_base_url,
         resolve_native_codex_launch,
     )
-    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     base_url = native_codex_launch_base_url(resolve_native_codex_launch(model=None))
     if not base_url:

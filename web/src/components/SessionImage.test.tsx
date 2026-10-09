@@ -9,7 +9,7 @@
 // and what authenticatedFetch resolves to; URL.createObjectURL/revokeObjectURL are
 // stubbed because jsdom lacks them.
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getOmnigentHostConfig = vi.fn();
@@ -29,12 +29,16 @@ vi.mock("@/components/ui/spinner", () => ({
   Spinner: () => <span data-testid="spinner" />,
 }));
 
-import type { SessionImage as SessionImageComponent } from "./SessionImage";
+import type {
+  InlineImage as InlineImageComponent,
+  SessionImage as SessionImageComponent,
+} from "./SessionImage";
 
 // The component caches object URLs in module scope so they survive remounts,
 // so each test needs a fresh module instance — otherwise one test's cached
 // image satisfies the next test's render and its authenticatedFetch mock never runs.
 let SessionImage: typeof SessionImageComponent;
+let InlineImage: typeof InlineImageComponent;
 
 let createObjectURL: ReturnType<typeof vi.fn>;
 let revokeObjectURL: ReturnType<typeof vi.fn>;
@@ -43,7 +47,7 @@ beforeEach(async () => {
   // Import before stubbing: the stub replaces the whole URL global, and the
   // module graph needs the real constructor while it loads.
   vi.resetModules();
-  ({ SessionImage } = await import("./SessionImage"));
+  ({ SessionImage, InlineImage } = await import("./SessionImage"));
   createObjectURL = vi.fn(() => "blob:fake-url");
   revokeObjectURL = vi.fn();
   vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
@@ -70,13 +74,26 @@ describe("SessionImage (standalone, no host fetcher)", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
-  it("reserves the preview box height before the image loads", () => {
-    // WHY: the chat scroller runs with overflow-anchor:none, so an image that
-    // sized itself only on decode would push the transcript down under the
-    // reader. The enclosing box must carry a fixed height from first paint.
-    render(<SessionImage path="/v1/sessions/a/files/x/content" alt="diagram" />);
-    const box = screen.getByRole("img", { name: "diagram" }).closest("div");
-    expect(box).toHaveClass("h-64");
+  it("keeps the image source when the path's bytes fail to arrive", () => {
+    // A fetched path can fail transiently, so keep it available for retry.
+    render(<SessionImage path="/v1/sessions/a/files/gone/content" alt="diagram" />);
+    const img = screen.getByRole("img", { name: "diagram" });
+    fireEvent.error(img);
+
+    expect(screen.getByRole("img", { name: "diagram" })).toHaveAttribute(
+      "src",
+      "/v1/sessions/a/files/gone/content",
+    );
+  });
+
+  it("keeps the image while the path is unresolved", () => {
+    // WHY: no session loaded yet means nothing has failed — a stray error on
+    // the src-less <img> must not latch and strand the slot on a chip.
+    render(<SessionImage path={undefined} alt="pending" />);
+    const img = screen.getByRole("img", { name: "pending" });
+    fireEvent.error(img);
+
+    expect(screen.getByRole("img", { name: "pending" }).tagName).toBe("IMG");
   });
 });
 
@@ -197,5 +214,53 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     await waitFor(() => expect(screen.getAllByRole("img")).toHaveLength(33));
     expect(revokeObjectURL).toHaveBeenCalledWith(created[0]);
     expect(revokeObjectURL).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("InlineImage (data: URI carried by the transcript)", () => {
+  const GOOD_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const BAD_PNG = "data:image/png;base64,garbage";
+
+  it("renders the data URI as a zoomable image", () => {
+    render(<InlineImage src={GOOD_PNG} alt="shot.png" className="c" />);
+    const img = screen.getByRole("img", { name: "shot.png" });
+    expect(img).toHaveAttribute("src", GOOD_PNG);
+    expect(img).toHaveClass("c");
+    expect(screen.getByRole("button", { name: "Zoom image: shot.png" })).toContainElement(img);
+  });
+
+  it("swaps a corrupt data URI for the unavailable-image chip", () => {
+    // WHY: a truncated/corrupt data URI from an imported transcript used to
+    // leave the browser's broken-image glyph in the transcript. It must
+    // collapse to the same compact chip the embedded fetch failure shows.
+    render(<InlineImage src={BAD_PNG} alt="broken.png" />);
+    fireEvent.error(screen.getByRole("img", { name: "broken.png" }));
+
+    const chip = screen.getByRole("img", { name: "broken.png" });
+    expect(chip).not.toHaveAttribute("src");
+    expect(chip).toHaveTextContent("broken.png");
+  });
+
+  it("drops the lightbox affordance once the image has failed", () => {
+    // WHY: the failed preview stayed clickable, opening a full-screen viewer on
+    // an image that never decoded.
+    render(<InlineImage src={BAD_PNG} alt="broken.png" />);
+    expect(screen.getByRole("button", { name: "Zoom image: broken.png" })).toBeInTheDocument();
+
+    fireEvent.error(screen.getByRole("img", { name: "broken.png" }));
+
+    expect(screen.queryByRole("button", { name: "Zoom image: broken.png" })).toBeNull();
+  });
+
+  it("retries when a new src replaces the failed one", () => {
+    // WHY: the error state is keyed by source, so re-rendering the same slot
+    // with different bytes must attempt the new image rather than stay a chip.
+    const { rerender } = render(<InlineImage src={BAD_PNG} alt="shot.png" />);
+    fireEvent.error(screen.getByRole("img", { name: "shot.png" }));
+    expect(screen.getByRole("img", { name: "shot.png" })).not.toHaveAttribute("src");
+
+    rerender(<InlineImage src={GOOD_PNG} alt="shot.png" />);
+    expect(screen.getByRole("img", { name: "shot.png" })).toHaveAttribute("src", GOOD_PNG);
   });
 });

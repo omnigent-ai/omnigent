@@ -106,6 +106,10 @@ def test_empty_landing_matches_baseline(
     # Wait for the async-populated regions to settle into their loaded state: the
     # agent picker (catalog resolved) and the sidebar session list.
     expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+        "aria-label", "Claude Code, unavailable", timeout=30_000
+    )
+    expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_be_visible()
     # `.first`: an expanded project with no chats renders the same empty-state
     # copy, so don't depend on this being the only match.
     expect(page.get_by_text("No sessions").first).to_be_visible(timeout=30_000)

@@ -332,6 +332,26 @@ function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
   };
 }
 
+/**
+ * A custom accent tints the selection the way it tints the sidebar's active
+ * row: a wash of the accent, at the stock wash's alpha, under the page
+ * foreground. With the accent unchanged, each palette keeps its stock wash.
+ */
+function rebaseSelection(
+  base: PaletteTokens,
+  primary: string | null,
+  foreground: string,
+): Pick<PaletteTokens, "selectionBackground" | "selectionForeground"> {
+  if (primary === null) {
+    return {
+      selectionBackground: base.selectionBackground,
+      selectionForeground: base.selectionForeground,
+    };
+  }
+  const alpha = parseCssColor(base.selectionBackground)?.alpha ?? 0.12;
+  return { selectionBackground: setAlpha(primary, alpha), selectionForeground: foreground };
+}
+
 function rebaseVariant(
   base: PaletteTokens,
   reference: GeneratedThemeVariant,
@@ -351,9 +371,20 @@ function rebaseVariant(
   );
   const border = rebaseColor(base.border, reference.border, current.border);
   const sidebar = rebaseColor(base.sidebar, reference.sidebar, current.sidebar);
+  const background = rebaseColor(base.background, reference.background, current.background);
+  const muted = rebaseColor(base.muted, reference.muted, current.muted);
+  const codeBackground = rebaseColor(
+    base.codeBackground,
+    reference.codeBackground,
+    current.codeBackground,
+  );
+  const linkSurfaces = [background, cardSolid, muted, codeBackground].flatMap((surface) => {
+    const color = parseCssColor(surface);
+    return color?.alpha === 1 ? [rgbToHex(color)] : [];
+  });
 
   return {
-    background: rebaseColor(base.background, reference.background, current.background),
+    background,
     foreground,
     card,
     cardSolid,
@@ -366,24 +397,26 @@ function rebaseVariant(
       current.foreground,
     ),
     primary: primaryChanged ? primary : base.primary,
+    link: ensureContrast(
+      primaryChanged ? primary : base.link,
+      linkSurfaces,
+      readableForeground(background),
+    ),
     primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
+    ...rebaseSelection(base, primaryChanged ? primary : null, foreground),
     secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
     secondaryForeground: rebaseColor(
       base.secondaryForeground,
       reference.foreground,
       current.foreground,
     ),
-    muted: rebaseColor(base.muted, reference.muted, current.muted),
+    muted,
     mutedForeground: rebaseColor(
       base.mutedForeground,
       reference.mutedForeground,
       current.mutedForeground,
     ),
-    codeBackground: rebaseColor(
-      base.codeBackground,
-      reference.codeBackground,
-      current.codeBackground,
-    ),
+    codeBackground,
     accent,
     accentForeground,
     border,
@@ -410,8 +443,14 @@ function rebaseVariant(
     ),
     sidebarBorder: rebaseColor(base.sidebarBorder, reference.border, current.border),
     sidebarRing: primaryChanged ? primary : base.sidebarRing,
-    sidebarActive: base.sidebarActive,
-    sidebarActiveForeground: base.sidebarActiveForeground,
+    // Tint the active-row highlight with the accent so it tracks a custom
+    // accent color; keep the hand-tuned base tint when the accent is unchanged.
+    // The rebased sidebar foreground stays legible on the low-alpha tint and
+    // mirrors the default token model's `var(--sidebar-foreground)`.
+    sidebarActive: primaryChanged ? setAlpha(primary, 0.12) : base.sidebarActive,
+    sidebarActiveForeground: primaryChanged
+      ? rebaseColor(base.sidebarForeground, reference.foreground, current.foreground)
+      : base.sidebarActiveForeground,
     sidebarBackground: base.sidebarBackground,
     shellBackground: base.shellBackground,
   };

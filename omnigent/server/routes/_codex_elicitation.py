@@ -7,8 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
-from omnigent.codex_native_elicitation import is_codex_request_id
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.elicitation import is_codex_request_id
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _CODEX_MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"

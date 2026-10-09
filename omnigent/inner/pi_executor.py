@@ -20,7 +20,10 @@ OpenAI Completions for others) and ``PI_CODING_AGENT_DIR`` is set so Pi
 picks it up.
 
 Requirements:
-    The ``pi`` CLI must be installed and on PATH.
+    The ``pi`` CLI must be installed and on PATH. Pi >= 0.80.4 reports
+    ``agent_settled``, which this executor uses as the turn boundary; older
+    builds end a turn at ``agent_end`` and can return before an automatic
+    retry or compaction finishes.
 
 Environment (Databricks):
     DATABRICKS_CONFIG_PROFILE — optional Databricks profile selector
@@ -46,18 +49,19 @@ import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, NotRequired, TypeAlias, TypedDict, cast
+from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
-from omnigent import model_catalog
+from omnigent.harnesses.pi_native.credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
-from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_metadata import ModelWireAPI
-from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
-from omnigent.pi_model_compatibility import (
+from omnigent.models import model_catalog
+from omnigent.models.model_metadata import ModelWireAPI
+from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
@@ -65,19 +69,18 @@ from omnigent.pi_model_compatibility import (
     pi_model_json_entry,
     unsupported_in_pi,
 )
-from omnigent.pi_native_credentials import (
-    _databricks_workspace_url_for_gateway,
-    _is_databricks_ai_gateway_url,
-)
-from omnigent.reasoning_effort import (
+from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonValue
+from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
     nearest_pi_thinking_level,
     to_pi_thinking_level,
     validate_effort,
 )
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
-from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
@@ -126,13 +129,18 @@ def _fetch_shell_command_token(command: str) -> str | None:
     return token
 
 
-# Tool-server callback provided by ``Session._wire_sdk_executor``. Invoked
-# with a tool name and argument dict; may return the result dict directly
-# or a coroutine/future yielding one.
-ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
-    [str, dict[str, Any]],
-    Awaitable[dict[str, Any]] | dict[str, Any],
-]
+class ToolExecutor(Protocol):
+    """Tool bridge callback carrying Pi's ID independently of stdout event order."""
+
+    def __call__(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+        /,
+        *,
+        call_id: str | None = None,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
+
 
 # Native-tool policy gate wired by :class:`PiExecutor`. Invoked with a native
 # (non-bridged) tool name + argument dict; returns ``{"block": bool, "reason":
@@ -294,7 +302,9 @@ class _ToolServer:
                     verdict = await self._evaluate_policy(raw_tool_name, tool_args)
                     response = {"id": raw_req_id, "verdict": verdict}
                 else:
-                    response = await self._execute(raw_tool_name, tool_args)
+                    raw_call_id = request.get("call_id")
+                    call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
+                    response = await self._execute(raw_tool_name, tool_args, call_id=call_id)
                     response["id"] = raw_req_id
                 # Serialize defensively: a tool result may carry a value
                 # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
@@ -327,11 +337,17 @@ class _ToolServer:
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         if self._tool_executor is None:
             return {"error": f"No tool executor for '{name}'"}
         try:
-            raw = self._tool_executor(name, args)
+            raw = (
+                self._tool_executor(name, args, call_id=call_id)
+                if call_id is not None
+                else self._tool_executor(name, args)
+            )
             resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
             if not isinstance(resolved, dict):
                 resolved = {"result": resolved}
@@ -460,7 +476,7 @@ const PORT = {port};
 const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
-function callTool(toolName, args) {{
+function callTool(toolName, args, callId) {{
   return new Promise((resolve) => {{
     // Idempotent settle: a tool call must resolve exactly once. Route every
     // resolve through finish() so a late "close" after a real "data" response
@@ -474,7 +490,8 @@ function callTool(toolName, args) {{
     }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
-      const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
+      const frame = {{ id, token: TOKEN, tool: toolName, args, call_id: callId }};
+      const req = JSON.stringify(frame) + "\\n";
       let buf = "";
       client.on("data", (chunk) => {{
         buf += chunk.toString();
@@ -573,8 +590,8 @@ module.exports = function(pi) {{
       description: tool.description,
       promptSnippet: tool.promptSnippet || tool.description,
       parameters: tool.parameters || {{ type: "object", properties: {{}} }},
-      async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {{
-        return callTool(tool.name, _params);
+      async execute(toolCallId, _params, _signal, _onUpdate, _ctx) {{
+        return callTool(tool.name, _params, toolCallId);
       }},
     }});
   }}
@@ -640,6 +657,16 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # _executor_adapter must be >= this value so the slice never fires first and
 # inject a CancelledError that bypasses the SIGKILL path.
 _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
+
+# Idle budget for one stdout read during a turn. Expiry alone never ends
+# the turn (a long tool call may stay silent past it); only a real stdout
+# EOF does. Module-level so tests can patch it.
+_TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
+
+# Post-error drain budget: pi emits the run's ``agent_end`` right after an
+# errored message, so only that gap is bounded tightly. Module-level so tests
+# can patch it.
+_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
 
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
 # not be written to logs verbatim. The value following these flags is replaced
@@ -726,11 +753,7 @@ def _build_models_json(
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     is_databricks_openai_gateway = bool(
-        raw_openai_base_url
-        and (
-            "/ai-gateway/" in raw_openai_base_url
-            or _is_databricks_ai_gateway_url(raw_openai_base_url)
-        )
+        raw_openai_base_url and _is_databricks_gateway_base_url(raw_openai_base_url)
     )
     # Databricks Codex URLs only accept Responses; Chat uses the workspace.
     if raw_openai_base_url and is_databricks_openai_gateway:
@@ -777,7 +800,7 @@ def _build_models_json(
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
-            # Models advertising Responses support use the AI Gateway's Codex
+            # Models advertising Responses support use the Unity Gateway's Codex
             # surface, including tool-result chaining on subsequent turns.
             "databricks-openai": {
                 "baseUrl": codex_gateway_url,
@@ -853,6 +876,7 @@ def _build_models_json(
                 model,
                 wire_catalog.get(model.lower()),
                 generic_openai_wire_api=generic_openai_wire_api,
+                only_family=_only_configured_family(base_urls),
             )
         ]
         if not any(entry.get("id") == model for entry in provider["models"]):
@@ -900,15 +924,80 @@ def _pi_needs_responses_api(
     return "gpt" in lower
 
 
+def _is_databricks_gateway_base_url(base_url: str) -> bool:
+    """Return whether a family base URL fronts a Databricks Unity Gateway.
+
+    The one generic-provider vs. Databricks-gateway distinction this module
+    makes: a workspace-hosted ``/ai-gateway/`` path or a canonical gateway
+    host (:func:`_is_databricks_ai_gateway_url`). Shared by the openai-family
+    wire selection and by :func:`_only_configured_family` so that model
+    registration and the launch selector reach the same answer.
+
+    :param base_url: A provider family's configured base URL.
+    :returns: ``True`` for a Databricks gateway URL, ``False`` for a generic
+        (OpenAI-compatible / Anthropic-compatible) vendor URL.
+    """
+    return "/ai-gateway/" in base_url or _is_databricks_ai_gateway_url(base_url)
+
+
+def _only_configured_family(base_urls: Mapping[str, str] | None) -> str | None:
+    """Return the lone family key when a generic provider configures exactly one.
+
+    An empty URL counts as unconfigured — the reading
+    :func:`_build_models_json` itself gives the dict — so a lone family with
+    an empty URL is not "configured" and never pins routing.
+
+    A lone *Databricks gateway* URL never pins either: one serialized family
+    does not mean one served surface there. The cli-config path emits only
+    the gateway's Anthropic surface (``{"claude": ".../ai-gateway/anthropic"}``)
+    while the same workspace serves GPT / Gemini / OSS models on the sibling
+    ``/ai-gateway/codex/v1``, ``/ai-gateway/mlflow/v1`` and
+    ``/serving-endpoints`` surfaces :func:`_build_models_json` derives, so an
+    explicit GPT override must keep its Responses routing.
+
+    :param base_urls: Provider base URLs keyed by family (``"claude"`` /
+        ``"openai"``), from ucode state or a provider entry.
+    :returns: The single configured family of a generic provider, or
+        ``None`` when both families (or neither) carry a URL or the lone URL
+        is a Databricks gateway.
+    """
+    configured = {family: url for family, url in (base_urls or {}).items() if url}
+    if len(configured) != 1:
+        return None
+    ((family, url),) = configured.items()
+    if _is_databricks_gateway_base_url(url):
+        return None
+    return family
+
+
 def _pi_provider_for_model(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
     *,
     generic_openai_wire_api: str | None = None,
+    only_family: str | None = None,
 ) -> str:
-    """Return the Pi provider name to use for a given Databricks model."""
+    """Return the Pi provider name to use for a given Databricks model.
+
+    :param model: Model id to route.
+    :param wire_apis: Catalog-reported wire surfaces, when known.
+    :param generic_openai_wire_api: Configured wire for a generic
+        (non-Databricks) OpenAI-compatible provider.
+    :param only_family: The lone family a *generic* provider entry
+        configures, from :func:`_only_configured_family` (``None`` for a
+        Databricks gateway, whose sibling surfaces are real). A one-family
+        generic provider has no other real endpoint, so every
+        dynamically-registered model routes to that family's surface
+        regardless of name tokens; name heuristics would otherwise pick a
+        provider whose base URL was fabricated for the Databricks workspace
+        host and 404 at the vendor.
+    """
     lower = model.lower()
-    if "claude" in lower:
+    if "claude" in lower and only_family != "openai":
+        return "databricks-anthropic"
+    # A claude-only provider fronts non-Claude-named ids (e.g. moonshot
+    # serving kimi) on its anthropic wire, so they route there too.
+    if only_family == "claude":
         return "databricks-anthropic"
     if generic_openai_wire_api is not None:
         if generic_openai_wire_api == RESPONSES_WIRE_API:
@@ -1006,6 +1095,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        system_prompt_mode: str = "append",
         thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
@@ -1024,8 +1114,10 @@ class _PiRpcSession:
         :param model: Pi model selector, e.g.
             ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
-        :param system_prompt: Text appended to Pi's default system
-            prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param system_prompt: Omnigent's composed instructions. ``None`` skips
+            injection in append mode; replace mode requires non-empty text.
+        :param system_prompt_mode: Append instructions to Pi's base prompt,
+            or replace it using ``--system-prompt``.
         :param thinking: Pi thinking level in Pi's own vocabulary
             (``off``/``minimal``/.../``max``), passed as ``--thinking``.
             ``None`` omits the flag so Pi's model default applies.
@@ -1045,11 +1137,13 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt:
-            # Use --append-system-prompt instead of --system-prompt so Pi
-            # keeps its default prompt (which includes tool descriptions from
-            # promptSnippet and guidelines).  Using --system-prompt would
-            # replace the default prompt entirely, stripping tool awareness.
+        if system_prompt_mode == "replace":
+            if not system_prompt or not system_prompt.strip():
+                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
+            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
+        elif system_prompt:
+            # Keep Pi's tool snippets and default guidance in append mode.
             args.extend(["--append-system-prompt", system_prompt])
         if extra_args:
             args.extend(extra_args)
@@ -1167,12 +1261,28 @@ class _PiRpcSession:
                 self._line_queue.put_nowait(line)
         return result
 
-    async def read_line(self, timeout: float = 120.0) -> str | None:
-        """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
+    async def read_line(self, timeout: float = _TURN_STDOUT_IDLE_TIMEOUT_S) -> str | None:
+        """Read the next JSONL line from Pi's stdout.
+
+        Returns ``None`` on EOF **or** timeout; callers that must tell
+        the two apart check :meth:`stdout_at_eof`.
+        """
         try:
             return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
+
+    def stdout_at_eof(self) -> bool:
+        """Whether Pi's stdout is exhausted (process exited / pipe closed).
+
+        The background reader runs until EOF and pushes the ``None``
+        sentinel from its ``finally``, so a finished (or never-started)
+        reader means no further stdout lines can arrive, while a live
+        reader means a ``read_line`` ``None`` was only an idle timeout.
+        Also requires an empty queue so already-buffered lines are
+        drained before the stream is declared exhausted.
+        """
+        return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
@@ -1703,18 +1813,26 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        context_files: bool = True,
+        system_prompt_mode: str = "append",
+        preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
         :param cwd: Working directory for the Pi subprocess.
+        :param context_files: Allow Pi to automatically load context files such
+            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+        :param system_prompt_mode: ``append`` retains Pi's base prompt;
+            ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
         :param model: Override the model name, e.g. ``"gateway-model-id"``.
+        :param preserve_model_ids: Keep exact IDs from a saved inference profile.
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
-            at a vendor-neutral gateway. The Databricks AI gateway is one
+            at a vendor-neutral gateway. The Databricks Unity Gateway is one
             producer of this transport; generic providers are another.
         :param databricks_profile: Databricks-specific config profile from
             ``~/.databrickscfg``, e.g. ``"<your-profile>"``.  Only used on the
@@ -1761,6 +1879,9 @@ class PiExecutor(Executor):
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
         """
+        if system_prompt_mode not in ("append", "replace"):
+            raise ValueError("system_prompt_mode must be 'append' or 'replace'")
+        self._system_prompt_mode = system_prompt_mode
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
@@ -1771,6 +1892,7 @@ class PiExecutor(Executor):
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
+        self._preserve_model_ids = preserve_model_ids
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
@@ -1801,10 +1923,31 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.pi_native import pi_supports_approve
+        from omnigent.harnesses.pi_native.main import (
+            PI_AGENT_SETTLED_MIN_VERSION,
+            PI_APPROVE_MIN_VERSION,
+            pi_version,
+        )
 
+        self._pi_version = pi_version(self._pi_path)
+        # Pi >= 0.80.4 reports ``agent_settled`` once a prompt's run is fully
+        # finished; older builds only emit ``agent_end`` per run.
+        self._settled_turn_boundary = (
+            self._pi_version is not None and self._pi_version >= PI_AGENT_SETTLED_MIN_VERSION
+        )
+        if not self._settled_turn_boundary:
+            logger.warning(
+                "PiExecutor: pi %s does not report agent_settled, so turns end at agent_end "
+                "and may return before an automatic retry or compaction finishes; upgrade "
+                "@earendil-works/pi-coding-agent to >= 0.80.4.",
+                ".".join(str(part) for part in self._pi_version)
+                if self._pi_version is not None
+                else "(unknown version)",
+            )
         self._extra_args: list[str] = ["--no-tools"]
-        if pi_supports_approve(self._pi_path):
+        if not context_files:
+            self._extra_args.append("--no-context-files")
+        if self._pi_version is not None and self._pi_version >= PI_APPROVE_MIN_VERSION:
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/
             # resources. In a runner-driven session there is nobody at the
@@ -1929,6 +2072,16 @@ class PiExecutor(Executor):
         if state is not None and state.rpc is not None:
             await state.rpc.close()
 
+    async def _evict_rpc(self, session_key: str, rpc: _PiRpcSession) -> None:
+        """Drop *rpc* mid-turn so frames it still emits can't reach the next turn."""
+        state = self._session_states.get(session_key)
+        if state is not None and state.rpc is rpc:
+            self._session_states.pop(session_key, None)
+        try:
+            await rpc.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort teardown on an already-failed turn
+            logger.debug("PiExecutor: evicting the RPC session failed: %s", exc)
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
         if state is None or state.rpc is None:
@@ -1998,20 +2151,16 @@ class PiExecutor(Executor):
                 raise TypeError("Databricks model resolution returned a non-string model id")
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
-        # by the direct Anthropic API but not by the Databricks AI Gateway.
-        if model and self._gateway:
+        # by the direct Anthropic API but not by the Databricks Unity Gateway.
+        if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model
 
     def _generic_openai_wire_api(self) -> str | None:
         """Return the configured wire only for a non-Databricks gateway."""
         openai_base_url = (self._base_urls_override or {}).get("openai")
-        if openai_base_url:
-            is_databricks_gateway = (
-                "/ai-gateway/" in openai_base_url or _is_databricks_ai_gateway_url(openai_base_url)
-            )
-            if not is_databricks_gateway:
-                return self._openai_wire_api or CHAT_WIRE_API
+        if openai_base_url and not _is_databricks_gateway_base_url(openai_base_url):
+            return self._openai_wire_api or CHAT_WIRE_API
         return None
 
     def _gateway_model_service_workspace_url(self) -> str | None:
@@ -2348,6 +2497,7 @@ class PiExecutor(Executor):
                 effective_model,
                 wire_catalog.get(effective_model.lower()),
                 generic_openai_wire_api=self._generic_openai_wire_api(),
+                only_family=_only_configured_family(self._base_urls_override),
             )
             pi_model = f"{provider}/{effective_model}"
         else:
@@ -2359,6 +2509,7 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
         )
@@ -2461,29 +2612,66 @@ class PiExecutor(Executor):
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
-        # Read events until agent_end.
+        # Read events until the turn boundary: ``agent_settled`` on pi >= 0.80.4,
+        # where one prompt may span several ``agent_end`` runs (retry, compaction,
+        # queued continuation); ``agent_end`` on older builds without settlement.
+        settled_boundary = self._settled_turn_boundary
         response_text = ""
         streamed_any = False
+        # Text deltas already yielded for the assistant message in flight. If
+        # that message then fails, pi regenerates it on retry; appending the new
+        # text after the partial one would corrupt an append-only consumer.
+        message_streamed_text = False
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
         # fallback). Summed into a turn-level usage dict at completion so a
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
         message_usages: list[_PiMessageUsage] = []
-        # Error reported by a ``message_end`` (stopReason=error); surfaced at
-        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        # Error reported by a ``message_end`` (stopReason=error); cleared when a
+        # later message completes (pi recovered) and surfaced at the turn
+        # boundary so every terminal frame is consumed off the RPC stream.
         pending_error: str | None = None
+        # True between an errored ``message_end`` and the ``agent_end`` pi
+        # emits right after it; only that gap uses the short drain budget.
+        awaiting_error_agent_end = False
 
         while True:
-            # After an errored message the only thing left to drain is the
-            # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            line = await rpc.read_line(
+                timeout=_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
+                if awaiting_error_agent_end
+                else _TURN_STDOUT_IDLE_TIMEOUT_S
+            )
             if line is None:
-                if pending_error is not None:
+                if not rpc.stdout_at_eof():
+                    if not awaiting_error_agent_end:
+                        # Idle timeout, not process death: pi's stdout reader is
+                        # still running (e.g. a long silent tool call). Keep waiting;
+                        # a dead pi delivers EOF, and the harness watchdog bounds hangs.
+                        logger.debug(
+                            "PiExecutor: stdout idle past budget; pi still running, waiting"
+                        )
+                        continue
+                    # The agent_end that always follows an errored message never
+                    # came; the session's state is unknown, so don't reuse it.
+                    if settled_boundary:
+                        await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(
+                        message=pending_error or "Pi stopped responding after an error"
+                    )
+                    return
+                # EOF: pi exited mid-turn.
+                stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
+                stderr_suffix = f" Stderr: {stderr}" if stderr else ""
+                if settled_boundary:
+                    await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(
+                        message=pending_error
+                        or f"Pi process ended before the turn settled.{stderr_suffix}"
+                    )
+                elif pending_error is not None:
                     yield ExecutorError(message=pending_error)
                 elif not streamed_any and not response_text:
-                    stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
-                    stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                     yield ExecutorError(
                         message=f"Pi process ended without response.{stderr_suffix}"
                     )
@@ -2508,8 +2696,14 @@ class PiExecutor(Executor):
             # Skip the command-ack response.
             if event_type == "response":
                 if not event.get("success", True):
+                    if settled_boundary:
+                        await self._evict_rpc(session_key, rpc)
                     yield ExecutorError(message=event.get("error", "Pi command failed"))
                     return
+                continue
+
+            if event_type == "message_start":
+                message_streamed_text = False
                 continue
 
             # Streaming text and thinking deltas.
@@ -2522,6 +2716,7 @@ class PiExecutor(Executor):
                         yield TextChunk(text=raw_delta)
                         response_text += raw_delta
                         streamed_any = True
+                        message_streamed_text = True
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
                     yield ReasoningChunk(delta="", event_type="reasoning_started")
@@ -2532,13 +2727,22 @@ class PiExecutor(Executor):
                         yield ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
                 continue
 
-            # Tool execution events.
+            # Both lifecycle events must retain the same Pi-owned correlation ID.
+            call_id = event.get("toolCallId")
+            if event_type in {"tool_execution_start", "tool_execution_end"}:
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+
             if event_type == "tool_execution_start":
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
                 yield ToolCallRequest(
                     name=tool_name,
                     args=args if isinstance(args, dict) else {},
+                    metadata={
+                        "call_id": call_id,
+                        "internally_executed": not any(t.get("name") == tool_name for t in tools),
+                    },
                 )
                 continue
 
@@ -2612,16 +2816,17 @@ class PiExecutor(Executor):
                     status=status,
                     result=result,
                     error=result_str if (is_error or is_blocked) else "",
+                    metadata={"call_id": call_id},
                 )
                 continue
 
-            # Agent ended — the turn is complete.
+            # ``agent_end`` closes one agent run. On pi >= 0.80.4 the turn goes on
+            # until ``agent_settled`` (pi may retry, compact and re-run, or continue
+            # with a queued message); older pi ends the turn here.
             if event_type == "agent_end":
-                if pending_error is not None:
-                    yield ExecutorError(message=pending_error)
-                    return
+                awaiting_error_agent_end = False
                 end_messages = event.get("messages", [])
-                if not response_text:
+                if not response_text and pending_error is None:
                     for m in reversed(end_messages):
                         if m.get("role") == "assistant":
                             content = m.get("content", [])
@@ -2647,6 +2852,25 @@ class PiExecutor(Executor):
                         if captured is not None:
                             message_usages.append(captured)
                             break
+                if settled_boundary:
+                    continue
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
+                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                _notify_usage_from_dict(model=model, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text,
+                    usage=dict(turn_usage) if turn_usage is not None else None,
+                )
+                return
+
+            # ``agent_settled``: no retry, compaction or queued continuation is
+            # left, so the stream is clean for the next turn on this session.
+            if event_type == "agent_settled" and settled_boundary:
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 yield TurnComplete(
@@ -2667,16 +2891,42 @@ class PiExecutor(Executor):
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
                     if stop == "aborted":
-                        err = msg.get("errorMessage", stop)
-                        yield ExecutorError(message=str(err))
+                        # pi still emits agent_end/agent_settled after an abort;
+                        # drop the session so the next turn cannot read them.
+                        if settled_boundary:
+                            await self._evict_rpc(session_key, rpc)
+                        yield ExecutorError(message=str(msg.get("errorMessage", stop)))
                         return
                     if stop == "error":
-                        # Pi emits the turn-terminal ``agent_end`` after an
-                        # errored LLM call; returning here would leave it
-                        # queued, so the next turn on this RPC session reads
-                        # the stale event as its own end. Record the error
-                        # and keep draining until ``agent_end``.
-                        pending_error = str(msg.get("errorMessage", stop))
+                        error = str(msg.get("errorMessage", stop))
+                        if settled_boundary and message_streamed_text:
+                            # pi regenerates this message on retry; its partial
+                            # text is already on screen, so stop here.
+                            await self._evict_rpc(session_key, rpc)
+                            yield ExecutorError(message=error)
+                            return
+                        # pi emits the run's ``agent_end`` right after an errored
+                        # call; consume it (and on pi >= 0.80.4 the retry or
+                        # settlement that follows) rather than leave it queued.
+                        pending_error = error
+                        awaiting_error_agent_end = True
+                    elif stop is not None:
+                        # A later completed assistant message means pi recovered.
+                        pending_error = None
+                continue
+
+            if event_type == "compaction_end" and settled_boundary:
+                if event.get("willRetry") and message_streamed_text:
+                    # Overflow recovery re-runs the prompt, replacing a
+                    # truncated message whose text already streamed.
+                    await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(
+                        message=(
+                            "Pi's response was truncated and it compacted the context to "
+                            "retry, but the partial response was already streamed."
+                        )
+                    )
+                    return
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

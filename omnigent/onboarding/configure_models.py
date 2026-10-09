@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.databricks_config import databricks_sdk_installed
-from omnigent.onboarding.interactive import ACCENT, console
+from omnigent.onboarding.interactive import ACCENT, console, encodable
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
@@ -48,9 +48,9 @@ from omnigent.onboarding.provider_config import (
     surface_default_provider,
 )
 
-# A short glyph per kind for the grouped listing. ASCII-safe fallbacks are
-# not needed — the rest of the REPL/CLI already emits emoji freely — but
-# the glyph is purely decorative: the kind word follows it.
+# A short glyph per kind for the grouped listing. The glyph is purely
+# decorative — the kind word follows it — and degrades to an ASCII stand-in
+# (see _KIND_ASCII_GLYPH) on a console that can't encode emoji.
 # The ADMISSION TICKETS glyph (subscription) carries a VARIATION SELECTOR-16 so
 # terminals render it as a 2-cell emoji (matching 🔑 / 🌐 / 🧱 and the 🎟️ in
 # README.oss.md) instead of a cramped 1-cell text glyph — that VS16, not extra
@@ -68,6 +68,21 @@ _KIND_GLYPH: dict[str, str] = {
     CLI_CONFIG_KIND: "\N{GEAR}\N{VARIATION SELECTOR-16}",
     # CLOUD for Bedrock-style gateways (AWS Bedrock, corporate AI gateways)
     BEDROCK_KIND: "\N{CLOUD}",
+}
+
+
+# Stand-ins for a console whose encoding can't carry the emoji above — a
+# Windows shell on a legacy ANSI codepage (cp1252) raises UnicodeEncodeError
+# on the write instead of rendering it. Each token is 2 ASCII cells, matching
+# the emoji's display width so the listing's columns stay aligned.
+_KIND_ASCII_GLYPH: dict[str, str] = {
+    KEY_KIND: "Ky",
+    SUBSCRIPTION_KIND: "Sb",
+    GATEWAY_KIND: "Gw",
+    LOCAL_KIND: "Lc",
+    DATABRICKS_KIND: "Db",
+    CLI_CONFIG_KIND: "Cf",
+    BEDROCK_KIND: "Cl",
 }
 
 
@@ -290,12 +305,31 @@ def kind_glyph(kind: str) -> str:
     subscription ticket via its VARIATION SELECTOR-16), so a single space
     separates it from the following label.
 
+    A console that can't encode the emoji — a Windows shell on a legacy
+    ANSI codepage — gets the kind's 2-cell ASCII stand-in instead, so the
+    listing degrades rather than dying on the write.
+
     :param kind: A provider kind, e.g. ``"key"``, ``"subscription"``,
         ``"gateway"``, ``"local"``, or ``"databricks"``.
     :returns: The kind's glyph (e.g. ``"🔑"`` for ``"key"``), or an
         empty string for an unknown kind.
     """
-    return _KIND_GLYPH.get(kind, "")
+    glyph = _KIND_GLYPH.get(kind, "")
+    if glyph and not encodable(glyph, console):
+        return _KIND_ASCII_GLYPH.get(kind, "")
+    return glyph
+
+
+def default_marker() -> str:
+    """Return the check mark used in the listing's ``default`` marker.
+
+    A legacy-codepage console (e.g. cp1252) cannot encode ``\N{CHECK MARK}``
+    either, so the marker degrades to ``*`` there — keeping the listing
+    renderable even when the stream itself was not relaxed to replace
+    unencodable output.
+    """
+    check = "\N{CHECK MARK}"
+    return check if encodable(check, console) else "*"
 
 
 def credential_label(
@@ -323,11 +357,11 @@ def credential_label(
         databricks credential whose profile is unknown to the caller).
     :param display_name: The provider's own display name for a
         ``cli-config`` credential — the ``name`` field of its
-        ``[model_providers.X]`` table, e.g. ``"Databricks AI Gateway"``;
+        ``[model_providers.X]`` table, e.g. ``"Databricks Unity Gateway"``;
         ``None`` for other kinds (and when the table named none, falling
         back to *provider_name*).
     :returns: A human label, e.g. ``"Subscription"``, ``"Anthropic API
-        Key"``, ``"Databricks (oss)"``, ``"Databricks AI Gateway"``, or a
+        Key"``, ``"Databricks (oss)"``, ``"Databricks Unity Gateway"``, or a
         gateway's display name.
     """
     if kind == SUBSCRIPTION_KIND:
@@ -416,7 +450,7 @@ def add_menu_options() -> list[AddOption]:
     def _opt(text: str, description: str, kind: str, **kw: object) -> AddOption:
         """Build an :class:`AddOption` whose label is glyph-prefixed for *kind*."""
         return AddOption(
-            label=f"{_KIND_GLYPH[kind]} {text}",
+            label=f"{kind_glyph(kind)} {text}",
             description=description,
             kind=kind,
             **kw,  # type: ignore[arg-type]  # provider/cli/other forwarded to AddOption
@@ -480,7 +514,7 @@ def add_menu_options() -> list[AddOption]:
         # selecting it aborts with the same hint (_configure_harness_add).
         _opt(
             "Databricks — workspace",
-            "Route harnesses through a Databricks workspace's Unity AI Gateway (via ucode)."
+            "Route harnesses through a Databricks workspace's Unity Gateway (via ucode)."
             if databricks_sdk_installed()
             # Markup-safe (rendered via Text.from_markup): no literal
             # brackets, so the extra is named in prose here and the exact
@@ -625,14 +659,14 @@ def render_provider_listing_by_harness(
             console.print("    [dim](none configured)[/dim]")
             continue
         for name, entry in serving:
-            glyph = _KIND_GLYPH.get(entry.kind, "")
+            glyph = kind_glyph(entry.kind)
             kind_style = _KIND_STYLE.get(entry.kind, "white")
             summary = _entry_models_summary(entry)
             line = (
                 f"    {glyph} [{kind_style}]{entry.kind}[/] [bold]{name}[/] [dim]{summary}[/dim]"
             )
             if family in _provider_default_families(entry, config):
-                line += " [green]✓ default[/green]"
+                line += f" [green]{default_marker()} default[/green]"
             console.print(line)
 
 
@@ -748,14 +782,14 @@ def render_provider_listing(
     if providers:
         console.print(f"[{ACCENT}]Configured providers[/]")
         for name, entry in providers.items():
-            glyph = _KIND_GLYPH.get(entry.kind, "")
+            glyph = kind_glyph(entry.kind)
             kind_style = _KIND_STYLE.get(entry.kind, "white")
             summary = _entry_models_summary(entry)
             default_families = _provider_default_families(entry, config)
             line = f"  {glyph} [{kind_style}]{entry.kind}[/] [bold]{name}[/] [dim]{summary}[/dim]"
             if default_families:
                 labels = " · ".join(_FAMILY_LABEL[f] for f in default_families)
-                line += f" [green]✓ default · {labels}[/green]"
+                line += f" [green]{default_marker()} default · {labels}[/green]"
             console.print(line)
     else:
         console.print("[dim]No providers configured yet.[/dim]")
@@ -881,7 +915,7 @@ def build_cli_config_provider_entry(
     A cli-config provider pins a custom model provider defined in the
     harness CLI's own config file (today: a ``[model_providers.X]`` table
     in ``~/.codex/config.toml`` with self-contained auth, e.g. the
-    Databricks AI Gateway written by ``isaac configure codex``). The
+    Databricks Unity Gateway written by ``isaac configure codex``). The
     provider definition and credential stay in that file; this entry only
     records which provider the launch selects.
 
@@ -890,11 +924,11 @@ def build_cli_config_provider_entry(
     :param model_provider: The ``[model_providers.X]`` id to pin, e.g.
         ``"Databricks"``.
     :param display_name: The provider table's ``name`` field, snapshotted
-        for display, e.g. ``"Databricks AI Gateway"``; ``None`` omits it
+        for display, e.g. ``"Databricks Unity Gateway"``; ``None`` omits it
         (labels fall back to the entry name).
     :returns: A provider entry body, e.g. ``{"kind": "cli-config", "cli":
         "codex", "model_provider": "Databricks", "display_name":
-        "Databricks AI Gateway"}``.
+        "Databricks Unity Gateway"}``.
     """
     body: dict[str, object] = {
         "kind": CLI_CONFIG_KIND,

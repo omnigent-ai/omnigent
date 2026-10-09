@@ -60,6 +60,39 @@ def test_load_skill_returns_content(
     assert result == "Summarize the input concisely."
 
 
+@pytest.mark.posix_only
+@pytest.mark.parametrize("explicit_root", [False, True])
+def test_load_skill_survives_deleted_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
+    explicit_root: bool,
+) -> None:
+    """A removed runner cwd does not prevent constructing or loading skills."""
+    root = tmp_path / "project"
+    host_skill = root / ".agents" / "skills" / "host-skill"
+    host_skill.mkdir(parents=True)
+    (host_skill / "SKILL.md").write_text(
+        "---\nname: host-skill\ndescription: Host skill\n---\nHost instructions.\n",
+        encoding="utf-8",
+    )
+    removed = tmp_path / "removed"
+    removed.mkdir()
+    with monkeypatch.context() as context:
+        context.chdir(removed)
+        removed.rmdir()
+        tool = LoadSkillTool(
+            [skill_no_resources],
+            agent_root=root if explicit_root else None,
+            skills_filter=["host-skill"],
+        )
+        result = tool.invoke(json.dumps({"name": "summarize"}), tool_ctx)
+
+    assert result == "Summarize the input concisely."
+    assert ("host-skill" in {skill.name for skill in tool.skills}) is explicit_root
+
+
 def test_load_skill_not_found(
     skill_no_resources: SkillSpec,
     tool_ctx: ToolContext,
@@ -293,6 +326,60 @@ def test_find_skill_by_name_ambiguous_bare_alias_stays_unresolved() -> None:
     a = _spec("plugina:brand-review")
     b = _spec("pluginb:brand-review")
     assert find_skill_by_name([a, b], "brand-review") is None
+
+
+def _labelled(name: str, label: str) -> SkillSpec:
+    """A skill invoked as *name* whose frontmatter name is *label*."""
+    return SkillSpec(name=name, description="d", content="body", display_name=label)
+
+
+def test_find_skill_by_name_accepts_unique_frontmatter_label() -> None:
+    """An older server's frontmatter name resolves to the directory-named skill."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    review = _labelled("review", "code-review")
+    plugin = _labelled("myplugin:audit", "security-audit")
+    assert find_skill_by_name([review, plugin], "code-review") is review
+    assert find_skill_by_name([review, plugin], "myplugin:security-audit") is plugin
+
+
+def test_find_skill_by_name_exact_name_beats_frontmatter_label() -> None:
+    """A skill actually named the requested command wins over another's label."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    exact = _spec("code-review")
+    labelled = _labelled("review", "code-review")
+    assert find_skill_by_name([labelled, exact], "code-review") is exact
+
+
+def test_find_skill_by_name_ambiguous_frontmatter_label_stays_unresolved() -> None:
+    """Two skills sharing a frontmatter label: don't guess."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    a = _labelled("review", "code-review")
+    b = _labelled("review-v2", "code-review")
+    assert find_skill_by_name([a, b], "code-review") is None
+
+
+def test_find_skill_by_name_label_and_namespace_aliases_are_ambiguous(tmp_path: Path) -> None:
+    """A label alias colliding with a plugin-namespace alias resolves neither."""
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    labelled = _labelled("review", "code-review")
+    assert find_skill_by_name([labelled, _spec("plugina:code-review")], "code-review") is None
+    plugin_labelled = _labelled("plugina:audit", "deploy")
+    bare = _plugin_skill(tmp_path, "plugina", "deploy")
+    assert find_skill_by_name([plugin_labelled, bare], "plugina:deploy") is None
+
+
+def test_find_skill_by_name_same_skill_matching_both_aliases_resolves(tmp_path: Path) -> None:
+    """Ambiguity means several skills match, not one skill matching two ways."""
+    from dataclasses import replace
+
+    from omnigent.tools.builtins.load_skill import find_skill_by_name
+
+    skill = replace(_plugin_skill(tmp_path, "toolkit", "lint"), display_name="toolkit:lint")
+    assert find_skill_by_name([skill], "toolkit:lint") is skill
 
 
 def test_find_skill_by_name_unknown_names_return_none() -> None:

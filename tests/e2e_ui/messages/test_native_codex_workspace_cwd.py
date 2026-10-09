@@ -27,12 +27,9 @@ real ``codex`` CLI booted in the session terminal — the same lane as
 
 from __future__ import annotations
 
-import io
 import json
 import re
 import shutil
-import tarfile
-import tempfile
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -41,6 +38,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.native_session import create_native_session
 from tests.e2e_ui.conftest import (
     _CODEX_MOCK_MODEL,
     _bind_session_runner,
@@ -112,40 +110,13 @@ def _create_codex_session_with_workspace(
     :param workspace: The session workspace directory the user selected.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="codex",
+        metadata={"workspace": str(workspace)},
     )
-    from omnigent.codex_native import _materialize_codex_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname → omnigent compat translator (the spec has
-        # no spec_version), matching the conftest fixture.
-        info = tarfile.TarInfo("codex-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-    }
-    metadata = {"labels": labels, "workspace": str(workspace)}
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("codex-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 

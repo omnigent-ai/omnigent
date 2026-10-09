@@ -35,15 +35,15 @@ context so a ``--video on`` pass captures the failing state.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
+
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # ---------------------------------------------------------------------------
 # Constants copied from test_start_session.py (same server/stub shape)
@@ -51,28 +51,6 @@ from playwright.async_api import Route, async_playwright, expect
 
 _HOST_ID = "host_e2e"
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright sync tests in the same process;
-    once one has run, pytest-asyncio can't start a loop on the main thread.
-    Exceptions (including assertion failures) are re-raised on the caller.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    t = threading.Thread(target=_worker)
-    t.start()
-    t.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _agents_body_polly() -> str:
@@ -203,7 +181,7 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
                 else:
                     await route.continue_()
 
-            # Suppress the agent-discovery scan (kind=any) so only the stubbed
+            # Suppress the agent-discovery scan (visibility=mine) so only the stubbed
             # polly agent feeds the picker — same guard as test_start_session.py.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
@@ -213,10 +191,14 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
                 )
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             # Seed a recent workspace so the host chip auto-fills and the Send
             # button can become enabled.

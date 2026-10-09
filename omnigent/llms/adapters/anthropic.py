@@ -12,12 +12,13 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import secrets
 import threading
 import time
 from collections.abc import AsyncIterator
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from cachetools import TTLCache
@@ -26,8 +27,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters._content import parse_data_uri
 from omnigent.llms.adapters.base import BaseAdapter
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
-from omnigent.model_metadata import ModelMetadata, ModelReasoningMode
-from omnigent.reasoning_effort import ANTHROPIC_EFFORTS, validate_effort_or_llm_error
+from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMode
+from omnigent.util.reasoning_effort import ANTHROPIC_EFFORTS, validate_effort_or_llm_error
 
 _logger = logging.getLogger(__name__)
 
@@ -218,7 +219,11 @@ def _chat_to_anthropic(
 def _models_url(base_url: str) -> str:
     """Return the Anthropic Models API URL for an adapter base URL."""
     trimmed = base_url.rstrip("/")
-    return f"{trimmed}/models" if trimmed.endswith("/v1") else f"{trimmed}/v1/models"
+    # A base that already names its API version lists at <base>/models;
+    # appending /v1 again builds a path no server serves.
+    if re.search(r"/v[0-9]+\Z", urlsplit(trimmed).path):
+        return f"{trimmed}/models"
+    return f"{trimmed}/v1/models"
 
 
 async def _get_anthropic_model_metadata(

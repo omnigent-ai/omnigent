@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
 DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 
@@ -47,7 +47,7 @@ DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 # ``subscription`` is a logged-in CLI; ``local`` is a self-hosted endpoint;
 # ``cli-config`` is a custom model provider a harness CLI's own config file
 # defines (today: a ``[model_providers.X]`` table in ``~/.codex/config.toml``
-# that carries its own auth, e.g. the Databricks AI Gateway written by
+# that carries its own auth, e.g. the Databricks Unity Gateway written by
 # ``isaac configure codex``).
 KEY_KIND: DetectedKind = "key"
 SUBSCRIPTION_KIND: DetectedKind = "subscription"
@@ -252,7 +252,7 @@ class CodexConfigProvider:
     :param provider_id: The ``model_provider`` id the config selects, i.e.
         the key under ``[model_providers.<id>]``, e.g. ``"Databricks"``.
     :param display_name: The provider table's ``name`` field, e.g.
-        ``"Databricks AI Gateway"``; falls back to :attr:`provider_id` when
+        ``"Databricks Unity Gateway"``; falls back to :attr:`provider_id` when
         the table names none.
     """
 
@@ -327,7 +327,7 @@ class CodexConfigTransport:
     The runtime-routing counterpart of :class:`CodexConfigProvider` (which
     only carries the id / display name for the setup menu). This reads the
     fields a harness needs to actually talk to the provider — the ones
-    ``isaac configure codex`` writes for the Databricks AI Gateway.
+    ``isaac configure codex`` writes for the Databricks Unity Gateway.
 
     :param base_url: The provider table's ``base_url``, e.g.
         ``"https://<workspace>.ai-gateway.cloud.databricks.com/codex/v1"``.
@@ -348,7 +348,7 @@ def codex_config_provider_transport(
     """Read the base URL + auth command for one Codex ``[model_providers.X]``.
 
     A harness that pinned a ``cli-config`` provider (e.g. pi-native routing the
-    user's Databricks AI Gateway) needs the *transport* — where to send
+    user's Databricks Unity Gateway) needs the *transport* — where to send
     requests and how to authenticate — not just the id. This parses the named
     ``[model_providers.<provider_id>]`` table out of ``config.toml`` and returns
     its ``base_url`` plus a shell command (rebuilt from ``[X.auth]``
@@ -499,7 +499,7 @@ def claude_managed_gateway(
 
     The single canonical parser for Claude Code's managed-settings credential,
     shared by ambient detection, the readiness gate, and the Smart-Routing
-    gateway check (:func:`omnigent.claude_native.managed_claude_gateway_signal`
+    gateway check (:func:`omnigent.harnesses.claude_native.main.managed_claude_gateway_signal`
     delegates here). A credential counts as delivered when the file carries a
     top-level ``apiKeyHelper`` (a token-printing command) or a truthy
     ``env.CLAUDE_CODE_USE_GATEWAY``.
@@ -538,17 +538,46 @@ def claude_managed_gateway(
     return None, False
 
 
+def claude_managed_model_picker(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Read a replacement model picker from Claude Code's managed settings."""
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        picker = payload.get("modelPicker")
+        if not isinstance(picker, dict) or picker.get("replaceBuiltInOptions") is not True:
+            return ()
+        options = picker.get("options")
+        if not isinstance(options, list):
+            return ()
+        return tuple(
+            (model.strip(), label.strip())
+            for option in options
+            if isinstance(option, dict)
+            and isinstance((model := option.get("model")), str)
+            and model.strip()
+            and isinstance((label := option.get("label", model)), str)
+            and label.strip()
+        )
+    return ()
+
+
 def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:
     """A human label for the managed-settings credential, when one is delivered.
 
     Used by the setup / ``/model`` display layer to show the Claude credential
-    as its actual backing (e.g. ``"Databricks AI Gateway"``) rather than the
+    as its actual backing (e.g. ``"Databricks Unity Gateway"``) rather than the
     generic ``"Subscription"``. Purely a display derivation from live managed
     settings — nothing is persisted.
 
     :param paths: Settings files to read; defaults to
         :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
-    :returns: ``"Databricks AI Gateway"`` for a recognized Databricks gateway,
+    :returns: ``"Databricks Unity Gateway"`` for a recognized Databricks gateway,
         the gateway host for another gateway, ``"Claude Code gateway"`` for a
         credential with no pinned base URL, or ``None`` when no credential is
         delivered.
@@ -563,7 +592,7 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     if is_databricks_ai_gateway_url(base_url):
-        return "Databricks AI Gateway"
+        return "Databricks Unity Gateway"
     return urlsplit(base_url).hostname or "Claude Code gateway"
 
 
@@ -783,7 +812,7 @@ def _detect_providers_now() -> list[DetectedProvider]:
         )
 
     # 3. A custom model provider in ~/.codex/config.toml (e.g. the
-    #    Databricks AI Gateway written by ``isaac configure codex``, which
+    #    Databricks Unity Gateway written by ``isaac configure codex``, which
     #    writes config.toml only — never auth.json — so the login check
     #    below cannot see it). Ordered BEFORE the codex login check so that
     #    on a machine with both, the auto-default matches what a plain

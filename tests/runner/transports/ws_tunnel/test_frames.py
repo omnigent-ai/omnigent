@@ -12,6 +12,10 @@ import json
 import pytest
 
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
     FrameKind,
     HelloFrame,
     PingFrame,
@@ -31,21 +35,75 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 # ── Round-trip per frame kind ────────────────────────────
 
 
+@pytest.mark.parametrize("events", [[], [{}], [{"type": 123}]])
+def test_event_batch_encoder_rejects_invalid_events(events: list[dict[str, object]]) -> None:
+    with pytest.raises(ValueError, match=r"event\.batch requires"):
+        encode_frame(EventBatchFrame(id="batch-1", session_id="session-1", events=events))
+
+
+def test_event_ingest_frames_round_trip() -> None:
+    hello = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        capabilities=[EVENT_INGEST_CAPABILITY],
+    )
+    assert decode_frame(encode_frame(hello)) == hello
+    ready = EventReadyFrame()
+    batch = EventBatchFrame(
+        id="batch-1",
+        session_id="session-1",
+        events=[{"type": "external_output_text_delta", "data": {"delta": "hi"}}],
+    )
+    ack = EventAckFrame(id="batch-1", applied=0, error="busy", retryable=True)
+    for frame in (ready, batch, ack, EventAckFrame(id="batch-1", applied=1)):
+        assert decode_frame(encode_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": []},
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": [{}]},
+        {"kind": "event.ack", "id": "b", "applied": -1},
+        {"kind": "event.ack", "id": "b", "applied": True},
+        {"kind": "event.ack", "id": "b", "applied": 0, "error": 123},
+    ],
+)
+def test_event_ingest_rejects_malformed_frames(frame: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        decode_frame(json.dumps(frame))
+
+
 def test_hello_round_trip() -> None:
     f = HelloFrame(
         runner_version="0.1.2",
         frame_protocol_version=1,
         harnesses=["claude-sdk", "codex"],
         envs=["os_sandbox"],
+        connection_id="c0ffee01",
     )
     decoded = decode_frame(encode_frame(f))
     assert isinstance(decoded, HelloFrame)
     assert decoded.runner_version == "0.1.2"
+    assert decoded.connection_id == "c0ffee01"
     assert decoded.frame_protocol_version == 1
     assert decoded.harnesses == ["claude-sdk", "codex"]
     assert decoded.envs == ["os_sandbox"]
     assert decoded.direct_attach_port is None
     assert decoded.direct_attach_token is None
+    assert decoded.capabilities == []
+
+
+def test_hello_attachment_capability_round_trip() -> None:
+    """New capabilities survive hello; legacy hellos keep their original shape."""
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+
+    legacy = HelloFrame(runner_version="0.14.0", frame_protocol_version=1)
+    assert "capabilities" not in json.loads(encode_frame(legacy))
+    legacy.capabilities = [CAP_FILESYSTEM_ATTACHMENTS]
+    decoded = decode_frame(encode_frame(legacy))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.capabilities == [CAP_FILESYSTEM_ATTACHMENTS]
 
 
 def test_hello_round_trip_with_direct_attach_advert() -> None:
@@ -66,6 +124,10 @@ def test_hello_without_advert_omits_direct_attach_keys_on_wire() -> None:
     wire = json.loads(encode_frame(HelloFrame(runner_version="0.1.2", frame_protocol_version=1)))
     assert "direct_attach_port" not in wire
     assert "direct_attach_token" not in wire
+    assert "connection_id" not in wire
+    decoded = decode_frame(json.dumps(wire))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.connection_id is None
 
 
 def test_hello_decode_drops_half_present_direct_attach_advert() -> None:
@@ -151,6 +213,27 @@ def test_response_end_round_trip() -> None:
     decoded = decode_frame(encode_frame(f))
     assert isinstance(decoded, ResponseEndFrame)
     assert decoded.id == "req_abc"
+    assert decoded.error is None
+
+
+def test_response_end_with_error_round_trip() -> None:
+    """Error-flagged end frames carry the error string through encode/decode."""
+    f = ResponseEndFrame(id="req_xyz", error="runner_stream_error")
+    encoded = encode_frame(f)
+    decoded = decode_frame(encoded)
+    assert isinstance(decoded, ResponseEndFrame)
+    assert decoded.id == "req_xyz"
+    assert decoded.error == "runner_stream_error"
+    # The wire format must include the "error" key when set.
+    wire = json.loads(encoded)
+    assert wire.get("error") == "runner_stream_error"
+
+
+def test_response_end_clean_omits_error_key() -> None:
+    """Clean end frames must NOT include an "error" key on the wire."""
+    f = ResponseEndFrame(id="req_abc")
+    wire = json.loads(encode_frame(f))
+    assert "error" not in wire
 
 
 def test_request_cancel_round_trip() -> None:
@@ -301,6 +384,14 @@ def test_encoded_kind_uses_canonical_string() -> None:
     assert json.loads(encode_frame(PingFrame(ts=1)))["kind"] == "ping"
     assert json.loads(encode_frame(PongFrame(ts=1)))["kind"] == "pong"
     assert json.loads(encode_frame(ResponseEndFrame(id="x")))["kind"] == "response.end"
+    assert json.loads(encode_frame(EventReadyFrame()))["kind"] == "event.ready"
+    assert (
+        json.loads(encode_frame(EventBatchFrame(id="x", session_id="s", events=[{"type": "x"}])))[
+            "kind"
+        ]
+        == "event.batch"
+    )
+    assert json.loads(encode_frame(EventAckFrame(id="x", applied=1)))["kind"] == "event.ack"
     # The dot-separated kinds are the load-bearing assertion — a
     # refactor that flipped them to "responseEnd" or "RESPONSE_END"
     # would break wire compat with any client outside the test suite.

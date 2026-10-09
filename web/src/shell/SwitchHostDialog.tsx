@@ -10,6 +10,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import {
   Select,
   SelectContent,
@@ -17,14 +20,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { WorkspacePicker, isNavigablePath, parentOf } from "./WorkspacePicker";
+import { parentOf, resolveWorkspacePath } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
-import { isValidWorkspace, normalizeWorkspacePath } from "./NewChatDialog";
+import { normalizeWorkspacePath } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { useChatStore } from "@/store/chatStore";
 
 /**
@@ -60,7 +65,39 @@ import { useChatStore } from "@/store/chatStore";
  * @param currentHostId - The host it is bound to now; excluded from the
  *   picker and used for the "different machine" warning.
  */
-export function SwitchHostDialog({
+export function SwitchHostDialog(props: Parameters<typeof SupportedSwitchHostDialog>[0]) {
+  const { switchHostDisabledReason } = useSessionActionRestrictions(props.sessionId, {
+    hostId: props.currentHostId,
+  });
+  if (switchHostDisabledReason) {
+    const loading = switchHostDisabledReason === SESSION_ACTIONS_LOADING;
+    return (
+      <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+        <DialogContent data-testid="switch-host-dialog" className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Switch host</DialogTitle>
+            <DialogDescription role="status">{switchHostDisabledReason}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => props.onOpenChange(false)}>
+              Cancel
+            </Button>
+            {!loading && (
+              <DisabledActionTooltip reason={switchHostDisabledReason} label="Switch host">
+                <Button data-testid="switch-host-button" disabled>
+                  Switch host
+                </Button>
+              </DisabledActionTooltip>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+  return <SupportedSwitchHostDialog {...props} />;
+}
+
+function SupportedSwitchHostDialog({
   open,
   onOpenChange,
   sessionId,
@@ -78,7 +115,6 @@ export function SwitchHostDialog({
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
-  const [browseNonce, setBrowseNonce] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Set when step 1 succeeded but step 2 failed: the session is now
@@ -164,13 +200,17 @@ export function SwitchHostDialog({
     onOpenChange(next);
   }
 
-  const workspaceTrimmed = normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = isValidWorkspace(workspace);
+  // Resolve a typed "~/…" path to its absolute form against the host's home
+  // (resolvedHome, above), so it's directly submittable without opening the
+  // tree browser (the server never expands ~). Already-absolute values pass
+  // through; a tilde path stays unresolved until the home listing arrives.
+  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
+  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
+  const workspaceValid = resolvedWorkspace !== null;
 
   function commitWorkspacePath(path: string): void {
     handleWorkspaceChange(path);
     setBrowsing(true);
-    setBrowseNonce((n) => n + 1);
   }
 
   async function handleSwitch(): Promise<void> {
@@ -198,7 +238,16 @@ export function SwitchHostDialog({
       // sitting in "Switching…" long after the move has landed.
       handleOpenChange(false);
       void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["session-agent", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // The old host's shells don't follow the session, but the terminals
+      // cache is SSE-primary with union-on-fetch semantics and never goes
+      // stale (staleTime: Infinity in useTerminals) — left alone, the strip
+      // keeps rendering the previous host's terminals. Clear, then refetch
+      // from the new runner; an entry racing the fetch survives via the
+      // queryFn union.
+      queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(sessionId), []);
+      void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(sessionId) });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");
     } finally {
@@ -259,18 +308,13 @@ export function SwitchHostDialog({
                     recent={recent}
                     dropdownDisabled={browsing}
                   />
-                  {browsing && (
-                    <WorkspacePicker
-                      key={browseNonce}
-                      hostId={selectedHostId}
-                      initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
-                      onSelect={(path) => {
-                        handleWorkspaceChange(path);
-                        setBrowsing(false);
-                      }}
-                      onClose={() => setBrowsing(false)}
-                    />
-                  )}
+                  <WorkspacePickerDialog
+                    open={browsing}
+                    onOpenChange={setBrowsing}
+                    hostId={selectedHostId}
+                    initialPath={workspaceTrimmed}
+                    onConfirm={handleWorkspaceChange}
+                  />
                   <p
                     className="flex items-start gap-1.5 text-xs text-warning"
                     data-testid="switch-host-warning"

@@ -10,11 +10,37 @@ name: Windows (native)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore:
+      - 'web/**'
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/browser_ui/**'
+      - 'tests/e2e_ui/**'
+      - 'tests/scripts/**'
+      - 'tests/github/**'
+      - '.github/scripts/polly-review-*.py'
+      - '.github/workflows/polly-review*.yml'
+      - '.github/workflows/*.js'
+      - 'tests/e2e/**'
+      - 'tests/integration/**'
   push:
     branches:
       - main
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore:
+      - 'web/**'
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/browser_ui/**'
+      - 'tests/e2e_ui/**'
+      - 'tests/scripts/**'
+      - 'tests/github/**'
+      - '.github/scripts/polly-review-*.py'
+      - '.github/workflows/polly-review*.yml'
+      - '.github/workflows/*.js'
+      - 'tests/e2e/**'
+      - 'tests/integration/**'
 
 permissions:
   contents: read
@@ -45,7 +71,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -63,6 +89,16 @@ jobs:
           uv run pytest
           tests/inner/test_proc_and_platform.py
           tests/runtime/test_process_manager.py
+          -p no:cacheprovider -q
+
+      - name: Codex skill junction regressions (hard)
+        run: >-
+          uv run pytest
+          tests/inner/test_codex_executor.py::test_populate_codex_skills_preserves_linked_junctions_without_symlink_privilege
+          tests/inner/test_codex_executor.py::test_populate_codex_skills_copy_mode_skips_nested_junctions
+          tests/inner/test_codex_staging.py::test_skills_link_junction_resolves_into_the_granted_directory
+          tests/inner/test_codex_staging.py::test_skills_refresh_does_not_follow_junctions
+          tests/inner/test_codex_staging.py::test_skills_refresh_rejects_junction_root
           -p no:cacheprovider -q
 
       - name: Broader unit sweep (non-blocking)

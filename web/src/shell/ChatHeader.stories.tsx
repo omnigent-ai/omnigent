@@ -23,6 +23,11 @@ const mobileMenu = {
   onOpenChanges: () => undefined,
   onOpenShells: () => undefined,
   onOpenSubagents: () => undefined,
+  githubPanelOpen: false,
+  onOpenGithub: () => undefined,
+  sideChatsPanelOpen: false,
+  showSideChats: false,
+  onOpenSideChats: () => undefined,
   onOpenMainExecutionLog: () => undefined,
 };
 
@@ -43,7 +48,9 @@ const meta = {
     boundAgent: undefined,
     wrapperLabel: null,
     canShare: false,
+    canFork: false,
     onShare: () => undefined,
+    onFork: () => undefined,
     hasAgentInfo: false,
     onAgentInfo: () => undefined,
     hasHeaderMenu: false,

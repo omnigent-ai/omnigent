@@ -1,4 +1,4 @@
-import { AlertTriangleIcon, Loader2Icon, WifiOffIcon } from "lucide-react";
+import { Loader2Icon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -143,16 +143,9 @@ export function ConnectionIndicator({
 }
 
 /**
- * Main-pane launch indicator — the single in-thread line for every
- * "session is coming up" state. Two launch shapes feed it, in
- * priority order:
- *
- * 1. A managed-sandbox launch (`sandboxStatus` in flight): shows the
- *    current pipeline stage ("Provisioning sandbox…", "Cloning
- *    repository…", …) for ANY session type.
- * 2. A terminal-first runner spin-up (`terminalStartingUp`): shows the
- *    generic "Starting up…" terminal copy. The sandbox stages win
- *    while both are active — they're strictly more specific.
+ * Main-pane managed-sandbox launch indicator. Shows the current pipeline
+ * stage ("Provisioning sandbox…", "Cloning repository…", …) for any session
+ * type. Ordinary terminal startup uses the standard Working indicator.
  *
  * Self-gates to null when neither applies. `hero` is the centered
  * empty-state placeholder (no bubbles yet); `row` is the in-thread
@@ -161,7 +154,6 @@ export function ConnectionIndicator({
  * there).
  */
 export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const terminalFirst = useTerminalFirst();
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // `ready` never reaches the store (cleared) and `failed` renders the
   // destructive band in ConnectionIndicator — only in-flight stages
@@ -170,17 +162,8 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
     sandboxStatus !== null && sandboxStatus.stage !== "failed"
       ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
       : undefined;
-  // `terminalStartingUp` is computed for ALL sessions in AppShell (it does not
-  // check isTerminalFirst), so gate on isTerminalFirst too: regular agents
-  // (e.g. polly) get the generic ConnectionIndicator "Connecting…" band and
-  // must not also render this.
-  const terminalSpinUp = Boolean(
-    terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp,
-  );
-  if (sandboxLabel === undefined && !terminalSpinUp) {
-    return null;
-  }
-  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
+  if (sandboxLabel === undefined) return null;
+  const line = `${sandboxLabel}…`;
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -190,12 +173,8 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         role="status"
         aria-live="polite"
         icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
-        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…"}
-        description={
-          sandboxLabel !== undefined
-            ? "Setting up your sandbox — this can take a minute."
-            : "This can take a few seconds."
-        }
+        title={line}
+        description="Setting up your sandbox — this can take a minute."
       />
     );
   }
@@ -220,10 +199,6 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
 // before collapsing the rest into "…" — mirrors the Codex TUI's own
 // startup header, and keeps a 20-server config to one line.
 const MCP_STARTING_NAMES_SHOWN = 3;
-// Cap for the settled warning's failed/cancelled name lists. Longer
-// than the starting cap because these name servers the user may need
-// to fix; beyond this the count carries the signal.
-const MCP_SETTLED_NAMES_SHOWN = 8;
 
 /**
  * The startup band's in-flight line, mirroring the Codex TUI's header.
@@ -242,60 +217,26 @@ export function mcpStartingLine(starting: string[], total: number): string {
 }
 
 /**
- * A settled warning's name list, capped so the band stays scannable.
- *
- * @param names Failed or cancelled server names, sorted.
- * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
- */
-export function mcpSettledNames(names: string[]): string {
-  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
-  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
-  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
-}
-
-/**
  * Per-MCP-server startup band for native harness sessions (codex-native).
  * Codex defers a mid-startup turn's execution until its MCP servers
  * settle, and the session previously showed nothing during that window.
- * Renders a spinner naming the still-starting servers; once startup
- * settles with failures/cancellations, a one-line notice says which
- * servers never came up. Self-gates to null when the store carries no
- * startup state (an all-ready map is cleared by the store handler).
+ * Renders a spinner naming the still-starting servers; once the round
+ * settles the band disappears entirely. Failures and cancellations are
+ * setup diagnostics, not conversation content — they stay in host logs
+ * rather than adding an item to the chat viewport.
  */
 export function McpStartupIndicator() {
   const mcpStartup = useChatStore((s) => s.mcpStartup);
   if (mcpStartup === null) return null;
   const names = Object.keys(mcpStartup).sort();
   const starting = names.filter((name) => mcpStartup[name].status === "starting");
-  if (starting.length > 0) {
-    return (
-      <Message
-        from="assistant"
-        data-testid="mcp-startup-indicator"
-        role="status"
-        aria-live="polite"
-      >
-        <MessageContent>
-          <span className="flex items-center gap-2 text-muted-foreground text-ui">
-            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
-            {mcpStartingLine(starting, names.length)}
-          </span>
-        </MessageContent>
-      </Message>
-    );
-  }
-  const failed = names.filter((name) => mcpStartup[name].status === "failed");
-  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
-  if (failed.length === 0 && cancelled.length === 0) return null;
-  const parts: string[] = [];
-  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
-  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
+  if (starting.length === 0) return null;
   return (
-    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
+    <Message from="assistant" data-testid="mcp-startup-indicator" role="status" aria-live="polite">
       <MessageContent>
         <span className="flex items-center gap-2 text-muted-foreground text-ui">
-          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
-          {`MCP startup incomplete (${parts.join("; ")})`}
+          <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
+          {mcpStartingLine(starting, names.length)}
         </span>
       </MessageContent>
     </Message>

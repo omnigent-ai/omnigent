@@ -19,15 +19,16 @@ hosts/agents are faked so the test doesn't need a real host.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
+
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Stubbed host the composer auto-selects.
 _HOST_ID = "host_e2e"
@@ -124,23 +125,6 @@ _MEASURE_RING_CLIP_JS = """
 """
 
 
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
-
-
 def _agents_body() -> str:
     """Single Claude Code agent for the stub."""
     return json.dumps(
@@ -196,8 +180,12 @@ async def _register_routes(page) -> None:
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
 
 async def _seed_workspace(page) -> None:
@@ -238,6 +226,7 @@ async def _drive_focus_ring(base_url: str) -> None:
 
             # Open the agent picker and click "Create custom agent".
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await page.get_by_test_id("new-chat-landing-create-agent").click()
 
             dialog = page.get_by_test_id("create-agent-dialog")

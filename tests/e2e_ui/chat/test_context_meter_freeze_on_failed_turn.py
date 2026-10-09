@@ -28,7 +28,6 @@ propagate their observed ``context_tokens``.
 from __future__ import annotations
 
 import io
-import json
 import re
 import tarfile
 import uuid
@@ -38,6 +37,7 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 _COMPOSER = "Send a message…"
@@ -45,7 +45,7 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 # The composer status tray's context ring exposes its value via aria-label,
 # e.g. "1% of context used".
-_RING = '[data-testid="composer-status-line"] [aria-label$="of context used"]'
+_RING = '[data-testid="composer-context-ring"][aria-label$="of context used"]'
 
 # Spec-declared window; percentages below derive from it.
 _CONTEXT_WINDOW = 200_000
@@ -75,7 +75,7 @@ def _build_claude_sdk_bundle(name: str, mock_llm_server_url: str) -> bytes:
         "prompt": "You are a terse assistant. Answer in as few words as possible.",
         "executor": {
             "harness": "claude-sdk",
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "context_window": _CONTEXT_WINDOW,
             "auth": {
                 "type": "api_key",
@@ -103,20 +103,10 @@ def _create_claude_sdk_session(base_url: str, runner_id: str, mock_llm_server_ur
     """
     name = f"ctx-freeze-{uuid.uuid4().hex[:8]}"
     bundle = _build_claude_sdk_bundle(name, mock_llm_server_url)
-    create_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create_resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 
@@ -198,6 +188,7 @@ def test_context_ring_updates_when_turn_fails_after_usage_observed(
             _send(page, f"Say ack. {token1}")
             expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=120_000)
             expect(page.locator(_WORKING)).to_have_count(0, timeout=120_000)
+            expect(page.locator(_ASSISTANT).first.get_by_text("ack", exact=True)).to_be_visible()
             ring = page.locator(_RING)
             expect(ring).to_be_visible(timeout=30_000)
             # The CLI can make more than one internal API call per turn, so

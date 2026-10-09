@@ -1,15 +1,69 @@
 <!doctype html>
 <html lang="en">
   <head>
+    <!--
+      Root-absolute fallback base URI so the build's relative asset refs
+      (./assets/...) resolve correctly on a deep-linked route (e.g. /c/<id>)
+      even when served by a server that predates the base-path rewrite in
+      omnigent/server/app.py (_rewrite_web_ui_index). That rewrite turns the
+      relative refs into absolute ones and removes this tag, so fragment refs
+      (inline SVG url(#id), footnote anchors) resolve against the current
+      document rather than the origin root. The tag only takes effect when an
+      older, non-rewriting server serves this file.
+    -->
+    <base href="/" />
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <meta name="theme-color" content="#0d1218" />
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Omnigent</title>
+    <style>
+      #boot-loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        background: #fff;
+        color: #6f6f6f;
+        font:
+          14px system-ui,
+          sans-serif;
+      }
+      #boot-loading span {
+        width: 18px;
+        height: 18px;
+        border: 2px solid #8884;
+        border-top-color: currentColor;
+        border-radius: 50%;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-color-scheme: dark) {
+        #boot-loading {
+          background: #0d1218;
+          color: #92a4b3;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #boot-loading span {
+          animation: none;
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div id="boot-loading" role="status" aria-busy="true">
+        <span aria-hidden="true"></span>Loading Omnigent…
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

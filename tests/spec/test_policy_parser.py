@@ -25,6 +25,7 @@ from omnigent.spec.parser import (
     _parse_condition,
     _parse_guardrails,
     parse,
+    parse_default_policies,
 )
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
@@ -294,6 +295,105 @@ policies:
         )
 
 
+def test_parse_function_policy_factory_params_sibling() -> None:
+    """`handler:` + sibling `factory_params:` folds into `function.arguments`.
+
+    This is the ``handler`` + ``factory_params`` shape shared with the
+    runtime Policy entity and the ``/v1/policies`` API. It must produce
+    the same :class:`FunctionRef` as the inline ``function: {path,
+    arguments}`` form so a spec bundle / server ``--config`` accepts it.
+    """
+    spec = _parse_guardrails(
+        _yaml("""
+policies:
+  rate:
+    type: function
+    handler: myorg.policies.rate_limit
+    factory_params:
+      limit: 50
+""")
+    )
+    assert spec is not None and spec.policies is not None
+    p = spec.policies[0]
+    assert isinstance(p, FunctionPolicySpec)
+    assert p.function is not None
+    assert p.function.path == "myorg.policies.rate_limit"
+    assert p.function.arguments == {"limit": 50}
+
+
+def test_parse_function_policy_factory_params_with_function_string() -> None:
+    """`function:` bare string + sibling `factory_params:` also folds."""
+    spec = _parse_guardrails(
+        _yaml("""
+policies:
+  cost:
+    type: function
+    function: omnigent.policies.builtins.cost.cost_budget
+    factory_params:
+      max_cost_usd: 5.0
+      ask_thresholds_usd: [1.0]
+""")
+    )
+    assert spec is not None and spec.policies is not None
+    p = spec.policies[0]
+    assert isinstance(p, FunctionPolicySpec)
+    assert p.function is not None
+    assert p.function.path == "omnigent.policies.builtins.cost.cost_budget"
+    assert p.function.arguments == {"max_cost_usd": 5.0, "ask_thresholds_usd": [1.0]}
+
+
+def test_parse_function_policy_factory_params_non_dict_rejected() -> None:
+    """`factory_params: [1, 2]` → loud error."""
+    with pytest.raises(OmnigentError, match=r"factory_params. must be a mapping"):
+        _parse_guardrails(
+            _yaml("""
+policies:
+  broken:
+    type: function
+    handler: myorg.x
+    factory_params: [1, 2]
+""")
+        )
+
+
+def test_parse_function_policy_factory_params_and_arguments_conflict() -> None:
+    """Both `function.arguments` and sibling `factory_params:` → loud error."""
+    with pytest.raises(OmnigentError, match=r"not both"):
+        _parse_guardrails(
+            _yaml("""
+policies:
+  broken:
+    type: function
+    function:
+      path: myorg.x
+      arguments: {limit: 1}
+    factory_params:
+      limit: 2
+""")
+        )
+
+
+def test_parse_default_policies_accepts_factory_params() -> None:
+    """Server `--config` policies share the parser, so the
+    `handler` + `factory_params` shape folds there too."""
+    policies = parse_default_policies(
+        _yaml("""
+session_cost_guard:
+  type: function
+  handler: omnigent.policies.builtins.cost.cost_budget
+  factory_params:
+    max_cost_usd: 5.0
+    ask_thresholds_usd: [1.0]
+""")
+    )
+    assert len(policies) == 1
+    p = policies[0]
+    assert isinstance(p, FunctionPolicySpec)
+    assert p.function is not None
+    assert p.function.path == "omnigent.policies.builtins.cost.cost_budget"
+    assert p.function.arguments == {"max_cost_usd": 5.0, "ask_thresholds_usd": [1.0]}
+
+
 def test_parse_policies_preserve_yaml_order() -> None:
     """Policies land in the list in their YAML declaration
     order — the engine iterates in this order per §4. If
@@ -553,3 +653,83 @@ def test_parse_condition_non_mapping_rejected() -> None:
     expected value or whitelist)."""
     with pytest.raises(OmnigentError, match=r"must be a mapping"):
         _parse_condition(["integrity", "0"], policy_name="p")  # type: ignore[arg-type]
+
+
+def test_parse_function_policy_warns_on_ignored_response_on_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An authored ``on: [response]`` on a ``type: function`` policy is
+    discarded (the callable self-selects its phases at runtime) — the
+    parser must say so instead of silently misleading the bundle author
+    into believing an output gate is bound."""
+    with caplog.at_level("WARNING", logger="omnigent.spec"):
+        spec = _parse_guardrails(
+            _yaml("""
+policies:
+  output_gate:
+    type: function
+    on: [response]
+    function: myorg.policies.check
+""")
+        )
+    assert spec is not None and spec.policies is not None
+    assert spec.policies[0].on is None
+    warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING" and "output_gate" in rec.message
+    ]
+    assert warnings, "expected a warning naming the policy whose on: was discarded"
+    assert "ignored" in warnings[0].message
+
+
+def test_parse_function_policy_warns_on_ignored_llm_response_on_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``on: [llm_response]`` is the other output phase an author might
+    expect to bind — it is discarded just as silently, so it must warn
+    the same way ``response`` does."""
+    with caplog.at_level("WARNING", logger="omnigent.spec"):
+        spec = _parse_guardrails(
+            _yaml("""
+policies:
+  llm_output_gate:
+    type: function
+    on: [llm_response]
+    function: myorg.policies.check
+""")
+        )
+    assert spec is not None and spec.policies is not None
+    assert spec.policies[0].on is None
+    warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING" and "llm_output_gate" in rec.message
+    ]
+    assert warnings, "expected a warning naming the policy whose on: was discarded"
+    assert "ignored" in warnings[0].message
+
+
+def test_parse_function_policy_no_warning_for_non_output_on_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``tool_call`` annotation (or no ``on:`` at all) warns nothing —
+    self-selection is the documented contract and a tool-phase note is
+    harmless documentation, not a policy hole."""
+    with caplog.at_level("WARNING", logger="omnigent.spec"):
+        spec = _parse_guardrails(
+            _yaml("""
+policies:
+  annotated:
+    type: function
+    on: [tool_call]
+    function: myorg.policies.check
+  quiet:
+    type: function
+    function: myorg.policies.check
+""")
+        )
+    assert spec is not None and spec.policies is not None
+    assert not [
+        rec for rec in caplog.records if rec.levelname == "WARNING" and "ignored" in rec.message
+    ]

@@ -11,10 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    codex_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
@@ -28,6 +26,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
@@ -263,12 +262,20 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     # the reader can find the cause. The raw ImportError text ("requires the
     # 'claude' CLI") must not appear in the HTTP body — only in that log.
     body = resp.json()
-    assert body["error"]["code"] == "native_terminal_start_failed"
-    assert body["error"]["message"] == (
-        "Native Claude terminal failed to start; "
-        f"see the runner log for details: {pinned_runner_log}"
+    error = body["error"]
+    error_id = error["error_id"]
+    assert error["code"] == "native_terminal_start_failed"
+    assert error_id.startswith("err_")
+    assert len(error_id) == 36
+    int(error_id.removeprefix("err_"), 16)
+    assert error["message"] == (
+        "Native Claude terminal failed to start (ImportError); "
+        f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
     )
-    assert "requires the 'claude' CLI" not in body["error"]["message"]
+    assert "requires the 'claude' CLI" not in error["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in error["message"]
 
 
 @dataclass
@@ -883,6 +890,10 @@ async def test_create_session_repl_terminal_dispatch(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
+    )
     # Keep the codex-native branch's bridge writes inside tmp_path.
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 
@@ -891,12 +902,6 @@ async def test_create_session_repl_terminal_dispatch(
         name="dispatch-agent",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
     )
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the parametrized spec for any agent id."""
-        del agent_id, session_id
-        return spec
 
     created_sessions: list[str] = []
 
@@ -929,14 +934,7 @@ async def test_create_session_repl_terminal_dispatch(
         "omnigent.runner.app._codex_session_needs_runner_terminal", _fake_codex_needs
     )
 
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        # A real (empty) registry: the dispatch gate requires one, and
-        # ``get()`` on it reports no existing REPL terminal.
-        terminal_registry=TerminalRegistry(),
-    )
+    app, _ = await _build_app_for_spec(spec, terminal_registry=TerminalRegistry())
 
     body: dict[str, Any] = {
         "session_id": "5eef02d60f39cba3fbd0ae188348643f",

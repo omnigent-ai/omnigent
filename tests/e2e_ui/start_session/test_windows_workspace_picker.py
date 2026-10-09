@@ -42,9 +42,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import threading
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -74,6 +73,8 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests.e2e_ui.start_session.helpers import open_landing_workspace_picker
 
 _HOST_NAME = "win11-e2e"
 _WIN_HOME = "C:\\Users\\alice"
@@ -322,32 +323,6 @@ def _video_kwargs() -> dict[str, Any]:
     return {"record_video_dir": video_dir} if video_dir else {}
 
 
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    Same rationale as ``test_start_session.py``: once a pytest-playwright
-    sync test has run in the session, pytest-asyncio can't start a loop on
-    the main thread. Exceptions (assertion failures included) re-raise on
-    the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
-
-
 async def _open_picker_at_windows_home(page: Any, base_url: str, host_id: str) -> None:
     """Open the landing composer's workspace picker on the Windows host.
 
@@ -374,8 +349,7 @@ async def _open_picker_at_windows_home(page: Any, base_url: str, host_id: str) -
     # workspace popover mid-test — a Radix timing artifact of clicking
     # faster than any human, not the behavior under test.
     await expect(page.locator('[data-slot="dropdown-menu-content"]')).to_have_count(0)
-    await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-    await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+    await open_landing_workspace_picker(page)
     await expect(page.get_by_test_id("workspace-picker-entry-work")).to_be_visible(timeout=15_000)
 
 

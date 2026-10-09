@@ -13,7 +13,7 @@ cursor / antigravity wraps' env-var config flow.
 Like cursor and antigravity, copilot has NO gateway / Databricks-profile env
 vars: the Copilot SDK talks only to GitHub's Copilot backend (authenticated by a
 GitHub token) and has no custom API base-URL override, so there is nothing for
-the workflow layer to route through the Databricks AI gateway.
+the workflow layer to route through the Databricks Unity Gateway.
 
 Env vars read at startup:
 
@@ -50,6 +50,7 @@ from fastapi import FastAPI
 from omnigent.inner.copilot_executor import CopilotExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),

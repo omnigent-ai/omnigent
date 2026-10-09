@@ -72,6 +72,7 @@ function mockTerminalList(terminals: TerminalInfo[]) {
 }
 
 function renderPanel({
+  open = true,
   initialTerminalKey = null,
   readOnly = false,
   terminals = [
@@ -79,6 +80,7 @@ function renderPanel({
     makeTerminal("terminal_worker", "worker", "s2"),
   ],
 }: {
+  open?: boolean;
   initialTerminalKey?: string | null;
   readOnly?: boolean;
   terminals?: TerminalInfo[];
@@ -86,7 +88,7 @@ function renderPanel({
   mockTerminalList(terminals);
   return render(
     <TerminalsPanel
-      open
+      open={open}
       conversationId="conv_terminal"
       initialTerminalKey={initialTerminalKey}
       readOnly={readOnly}
@@ -107,6 +109,25 @@ afterEach(() => {
 });
 
 describe("TerminalsPanel navigation", () => {
+  it("only casts a shadow while visible", () => {
+    const { rerender } = renderPanel({ open: false });
+    const panel = screen.getByTestId("terminals-panel");
+    expect(panel).toHaveClass("shadow-none");
+    expect(panel).not.toHaveClass("shadow-lg");
+
+    rerender(
+      <TerminalsPanel
+        open
+        conversationId="conv_terminal"
+        initialTerminalKey={null}
+        readOnly={false}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(panel).toHaveClass("shadow-lg");
+    expect(panel).not.toHaveClass("shadow-none");
+  });
+
   it("opens to the list view with all terminals visible and no terminal mounted", () => {
     renderPanel();
 
@@ -117,7 +138,7 @@ describe("TerminalsPanel navigation", () => {
     expect(screen.queryByTestId("terminal-view")).toBeNull();
   });
 
-  it("shows terminal view after clicking a row, deferred until expanded", () => {
+  it("shows terminal view after clicking a row, deferred until expanded", async () => {
     renderPanel();
 
     fireEvent.click(screen.getByRole("button", { name: /worker/i }));
@@ -128,7 +149,9 @@ describe("TerminalsPanel navigation", () => {
     // TerminalView deferred until 180 ms settle.
     expect(screen.queryByTestId("terminal-view")).toBeNull();
 
-    act(() => {
+    // async act flushes both the fake-timer tick and any Suspense microtasks
+    // from the lazy TerminalView chunk resolving through its boundary.
+    await act(async () => {
       vi.advanceTimersByTime(180);
     });
 

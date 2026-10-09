@@ -25,6 +25,7 @@ from typing import ParamSpec, TypeVar
 
 import click
 
+from omnigent._startup_events import observe_native_startup
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_common import (
     CLAUDE_STARTUP_PROFILE_ENV_VAR as _CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -35,6 +36,11 @@ from omnigent.cli_common import (
 from omnigent.cli_common import (
     reject_native_on_windows as _reject_native_on_windows,
 )
+
+# Decorator-time vocabulary for ``omnigent devin``'s ``click.Choice`` options.
+# Sourced from the stdlib-only bridge leaf, so importing it here adds no
+# launcher/runner imports to CLI startup.
+from omnigent.harnesses.devin_native.bridge import DEVIN_EFFORTS, DEVIN_PERMISSION_MODES
 
 _Args = ParamSpec("_Args")
 _Return = TypeVar("_Return")
@@ -69,6 +75,9 @@ def register_native_commands(cli: click.Group) -> None:
     _ensure_backend = _late_bound(lambda: _cli._ensure_backend)
     _load_effective_config = _late_bound(lambda: _cli._load_effective_config)
     _reject_reserved_kiro_resume_args = _late_bound(lambda: _cli._reject_reserved_kiro_resume_args)
+    _reject_reserved_devin_resume_args = _late_bound(
+        lambda: _cli._reject_reserved_devin_resume_args
+    )
     _resolve_auto_open_conversation_from_config = _late_bound(
         lambda: _cli._resolve_auto_open_conversation_from_config
     )
@@ -175,6 +184,7 @@ def register_native_commands(cli: click.Group) -> None:
         ),
     )
     @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+    @observe_native_startup("claude-native")
     def claude(
         server: str | None,
         resume: str | None,
@@ -260,8 +270,8 @@ def register_native_commands(cli: click.Group) -> None:
             choice.conversation_id if choice.conversation_id is not None else session_id
         )
 
-        from omnigent.claude_native import run_claude_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.claude_native.main import run_claude_native
 
         startup_profiler.mark("native module imported")
 
@@ -357,6 +367,7 @@ def register_native_commands(cli: click.Group) -> None:
         ),
     )
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
+    @observe_native_startup("codex-native")
     def codex(
         server: str | None,
         resume: str | None,
@@ -403,8 +414,8 @@ def register_native_commands(cli: click.Group) -> None:
                 or session_id is not None
             )
 
-        from omnigent.codex_native import run_codex_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.codex_native.main import run_codex_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -511,7 +522,7 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent opencode --resume                  # interactive picker
           omnigent opencode --server https://<app>.databricksapps.com
         """
-        from omnigent.opencode_native import run_opencode_native
+        from omnigent.harnesses.opencode_native.main import run_opencode_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -610,7 +621,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.pi_native import run_pi_native
+        from omnigent.harnesses.pi_native.main import run_pi_native
 
         cfg = _load_effective_config()
         # Thread ``harness.pi-native.command`` config into the runner via the
@@ -721,8 +732,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.cursor_native import run_cursor_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.cursor_native.main import run_cursor_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.cursor-native.command`` config into the
@@ -753,6 +764,145 @@ def register_native_commands(cli: click.Group) -> None:
             model=model,
             auto_open_conversation=auto_open_conversation,
             mode=mode,
+        )
+
+    @cli.command(
+        context_settings={
+            "ignore_unknown_options": True,
+            "allow_extra_args": True,
+        }
+    )
+    @click.option(
+        "--server",
+        default=None,
+        help=(
+            "Remote omnigent URL. Ensures the host daemon, asks the "
+            "daemon-spawned runner to launch the Devin TUI, and attaches this TTY. "
+            'Pass --server "" to auto-spawn a persistent local server in the '
+            "background and use that instead of a remote one."
+        ),
+    )
+    @click.option(
+        "-r",
+        "--resume",
+        "resume",
+        is_flag=False,
+        flag_value=_RESUME_PICKER_SENTINEL,
+        default=None,
+        help=(
+            "Resume a prior Omnigent conversation. With a conversation id "
+            "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+            "opens an interactive picker scoped to devin-native sessions."
+        ),
+    )
+    @click.option(
+        "--session",
+        "session_id",
+        metavar="SESSION_ID",
+        default=None,
+        hidden=True,
+        help="Deprecated alias for ``--resume <id>``; kept for one release.",
+    )
+    @click.option(
+        "--model",
+        default=None,
+        help=(
+            "Devin model for the native chat — any family slug or alias from "
+            "`devin models list` (e.g. ``opus``, ``gpt``, ``swe``). Combined with "
+            "--effort into Devin's variant id."
+        ),
+    )
+    @click.option(
+        "--effort",
+        default=None,
+        type=click.Choice(DEVIN_EFFORTS),
+        help=(
+            "Reasoning effort. Devin encodes effort as a model-variant suffix, so "
+            "this is composed onto --model (family + rung) rather than sent as its "
+            "own flag. Ignored when the chosen family has no such rung."
+        ),
+    )
+    @click.option(
+        "--permission-mode",
+        "permission_mode",
+        default=None,
+        type=click.Choice(DEVIN_PERMISSION_MODES),
+        help="Devin permission mode for this launch.",
+    )
+    @click.option(
+        "--sandbox",
+        is_flag=True,
+        default=False,
+        help="Enable Devin's OS-level process sandbox for its exec tool.",
+    )
+    @click.option(
+        "-p",
+        "--prompt",
+        default=None,
+        help="Send this as the initial Devin chat input when the TUI starts.",
+    )
+    @click.argument("devin_args", nargs=-1, type=click.UNPROCESSED)
+    def devin(
+        server: str | None,
+        resume: str | None,
+        session_id: str | None,
+        model: str | None,
+        effort: str | None,
+        permission_mode: str | None,
+        sandbox: bool,
+        prompt: str | None,
+        devin_args: tuple[str, ...],
+    ) -> None:
+        """Launch Devin with Omnigent.
+
+        \b
+        Examples:
+          omnigent devin
+          omnigent devin --resume conv_abc123
+          omnigent devin --resume                       # interactive picker
+          omnigent devin --model opus --effort xhigh
+          omnigent devin --permission-mode smart -p "review this repo"
+        """
+        choice = _split_resume_value(resume)
+        if session_id is not None and (choice.picker or choice.conversation_id is not None):
+            raise click.UsageError(
+                "--session and --resume are mutually exclusive; "
+                "prefer --resume (--session is deprecated).",
+            )
+        _reject_reserved_devin_resume_args(devin_args)
+
+        from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.devin_native.main import run_devin_native
+
+        cfg = _load_effective_config()
+        # Thread ``--command`` / ``harness.devin-native.command`` config into the
+        # runner via the canonical ``OMNIGENT_DEVIN_PATH`` env var (set before
+        # ``_ensure_backend`` so a locally-spawned daemon inherits it).
+        _resolved = resolve_harness_command("devin-native", default="", explicit=None, cfg=cfg)
+        if _resolved:
+            os.environ["OMNIGENT_DEVIN_PATH"] = _resolved
+        if server is None:
+            server = cfg.get("server")
+        if model is None:
+            model = cfg.get("model")
+        auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+        server = _ensure_backend(server)
+        resolved_session_id = (
+            choice.conversation_id if choice.conversation_id is not None else session_id
+        )
+
+        run_devin_native(
+            server=server,
+            session_id=resolved_session_id,
+            resume_picker=choice.picker,
+            extra_args=_resolve_harness_startup_args(cfg, "devin-native", devin_args),
+            model=model,
+            effort=effort,
+            permission_mode=permission_mode,
+            sandbox=sandbox,
+            prompt=prompt,
+            auto_open_conversation=auto_open_conversation,
         )
 
     @cli.command(
@@ -847,7 +997,7 @@ def register_native_commands(cli: click.Group) -> None:
         _reject_reserved_kiro_resume_args(kiro_args)
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.kiro_native import run_kiro_native
+        from omnigent.harnesses.kiro_native.main import run_kiro_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.kiro-native.command`` config into the
@@ -944,8 +1094,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.goose_native import run_goose_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.goose_native.main import run_goose_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.goose-native.command`` config into the
@@ -1032,7 +1182,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.hermes_native import run_hermes_native
+        from omnigent.harnesses.hermes_native.main import run_hermes_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.hermes-native.command`` config into the
@@ -1123,8 +1273,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.antigravity_native import run_antigravity_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.antigravity_native.main import run_antigravity_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -1223,7 +1373,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.qwen_native import run_qwen_native
+        from omnigent.harnesses.qwen_native.main import run_qwen_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.qwen-native.command`` config into the
@@ -1319,7 +1469,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.kimi_native import run_kimi_native
+        from omnigent.harnesses.kimi_native.main import run_kimi_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.kimi-native.command`` config into the

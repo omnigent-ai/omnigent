@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 // App-level wrapper that exposes per-session liveness via context so
 // hooks can gate on runner / host reachability without each standing up
 // its own poller.
@@ -32,7 +33,7 @@ import {
   useState,
 } from "react";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
-import { useConversations } from "@/hooks/useConversations";
+import { isTempConvId } from "@/store/chatStore";
 import { type RunnerHealthInput, useRunnerHealth } from "@/hooks/useRunnerHealth";
 import { useSession } from "@/hooks/useSession";
 
@@ -51,7 +52,7 @@ type RegisterRunnerHealth = (key: string, sessions: RunnerHealthInput[] | null) 
 const RunnerHealthRegistryContext = createContext<RegisterRunnerHealth>(() => {});
 
 export function RunnerHealthProvider({ children }: { children: ReactNode }) {
-  const { data } = useConversations("", true);
+  const { data } = useLoadedConversations();
   const sidebarSessions = useMemo(() => data?.pages.flatMap((page) => page.data) ?? [], [data]);
 
   // The open session is the one liveness actually matters for now (the
@@ -61,7 +62,12 @@ export function RunnerHealthProvider({ children }: { children: ReactNode }) {
   // cover it. Fold the open session into the fallback poll set so it
   // resolves to a real liveness state even when off-sidebar. Its snapshot
   // is already cached by the chat stream bind, so this is a cache hit.
-  const activeSession = useSession(useActiveConversationId()).session;
+  // A client-only temp id (`temp:*`, mid-create) has no server session — skip
+  // the fetch so it doesn't hit `/v1/sessions/temp:*` during the create window.
+  const activeConversationId = useActiveConversationId();
+  const activeSession = useSession(
+    isTempConvId(activeConversationId) ? undefined : activeConversationId,
+  ).session;
   const activeId = activeSession?.id;
 
   // Sessions registered by transient views (e.g. the new-session dialog)

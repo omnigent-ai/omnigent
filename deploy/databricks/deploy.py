@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from packaging.version import InvalidVersion, Version
+
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
@@ -46,9 +48,20 @@ _WORKSPACE_WHEEL_LIMIT_BYTES = _WORKSPACE_FILE_LIMIT_BYTES
 _WEB_UI_DIR_NAME = "web-ui"
 _WEB_UI_ARCHIVE_NAME = "web-ui.tar.gz"
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
-# Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
-# proxy instead (see run_uv_lock).
+# Public PyPI by default; UV_INDEX_URL selects a deployment-accessible mirror.
 _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
+
+# Select UV_INDEX_URL explicitly before clearing uv's environment overrides.
+# --no-config only ignores files; extra indexes can still outrank --default-index.
+_UV_INDEX_ENV_VARS = (
+    "UV_CONFIG_FILE",
+    "UV_DEFAULT_INDEX",
+    "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+    "UV_INDEX",
+    "UV_INDEX_URL",
+    "UV_NO_CONFIG",
+)
 
 # Leaving these in the env when we hand off to the CLI/SDK can
 # silently route us to the wrong workspace, or upload code under the
@@ -93,6 +106,10 @@ def _pyproject_paths() -> list[Path]:
     ]
 
 
+def _version_py_path() -> Path:
+    return _repo_root() / "omnigent" / "version.py"
+
+
 def _read_base_version() -> str:
     """Read the base version from the top-level pyproject.toml.
 
@@ -111,21 +128,54 @@ def _read_base_version() -> str:
 def _compute_deploy_version(base: str, explicit: str | None) -> str:
     if explicit:
         # Caller knows what they want — let it through after a sanity check.
-        if not re.match(r"^\d+(\.\d+)*(\.dev\d+|\.post\d+|[+\-][\w.]+)?$", explicit):
-            raise SystemExit(f"--version {explicit!r} is not a recognizable PEP 440 version")
-        return explicit
-    # Strip any existing `.postN` / `.devN` suffix so we don't stack
-    # them if a prior deploy left pyproject.toml dirty (or someone
-    # committed the bumped value). Without this, `0.1.0.post<old>`
-    # would become `0.1.0.post<old>.post<new>` which isn't valid
-    # PEP 440 and fails the wheel build.
+        # The parser accepts every form this script generates, so a generated
+        # version can be fed back through `--skip-build --version`; the
+        # normalized form is the one wheel filenames carry.
+        try:
+            return str(Version(explicit))
+        except InvalidVersion:
+            raise SystemExit(f"--version {explicit!r} is not a valid PEP 440 version") from None
+    # Strip a previous deploy's stamp so suffixes don't stack if a prior
+    # deploy left pyproject.toml dirty (or someone committed the bumped
+    # value): the local segment first, then `.postN` / `.devN`.
+    base = re.sub(r"\+[\w.]+$", "", base)
     base = re.sub(r"(\.post\d+|\.dev\d+)+$", "", base)
     # Post-release, not dev: pip treats `.dev` as a pre-release and
     # ignores it when resolving `>=` constraints, so a deploy that
     # bumps via `.dev` clashes with `omnigent-ui-sdk` declaring
     # `omnigent-client>=0.1.0`. `.post` is a final release and
-    # sorts strictly above the base.
-    return f"{base}.post{int(time.time())}"
+    # sorts strictly above the base. The local segment names the commit
+    # so a debug-log row's app_version (and a runner's hello) says which
+    # build it came from.
+    return f"{base}.post{int(time.time())}{_git_build_suffix()}"
+
+
+def _git_build_suffix() -> str:
+    """PEP 440 local segment for the checked-out commit, e.g. ``+g1a2b3c4``.
+
+    ``.dirty`` is appended when the tree has uncommitted changes or untracked,
+    non-ignored files (the wheel packages those too), so a deploy from a
+    modified tree is not mistaken for the commit itself. Empty when the tree
+    is not a git checkout.
+    """
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return f"+g{sha}.dirty" if dirty else f"+g{sha}"
 
 
 def set_version_in_pyproject(path: Path, new_version: str) -> str:
@@ -163,11 +213,41 @@ def set_version_in_pyproject(path: Path, new_version: str) -> str:
     return original
 
 
+_VERSION_CONSTANT = re.compile(r'^VERSION = "[^"]*"$', re.MULTILINE)
+
+
+def set_version_constant(path: Path, new_version: str) -> str:
+    """Rewrite the ``VERSION`` constant the runtime imports.
+
+    ``omnigent/version.py`` is what debug-log rows (``app_version``), the
+    runner hello and ``omnigent --version`` report; the wheel build reads
+    only the pyprojects, so the stamped version has to be written here too
+    or the deployed processes keep announcing the unstamped base version.
+
+    :param path: ``<repo>/omnigent/version.py``.
+    :param new_version: Stamped deploy version, e.g.
+        ``"0.16.0.post1790000000+g1a2b3c4"``.
+    :returns: The original file text, for restore after the build.
+    """
+    original = path.read_text()
+    updated, count = _VERSION_CONSTANT.subn(f'VERSION = "{new_version}"', original)
+    if count != 1:
+        raise RuntimeError(f"could not rewrite VERSION in {path}")
+    path.write_text(updated)
+    return original
+
+
 def _stamp_versions(new_version: str) -> dict[Path, str]:
-    """Stamp `new_version` into all three pyprojects. Returns originals for restore."""
+    """Stamp `new_version` into the three pyprojects and the runtime constant.
+
+    :param new_version: Stamped deploy version.
+    :returns: Original file texts keyed by path, for restore after the build.
+    """
     backups: dict[Path, str] = {}
     for path in _pyproject_paths():
         backups[path] = set_version_in_pyproject(path, new_version)
+    version_py = _version_py_path()
+    backups[version_py] = set_version_constant(version_py, new_version)
     return backups
 
 
@@ -217,7 +297,8 @@ def _build_wheels(skip_web_ui: bool) -> list[Path]:
         env["EXTERNALIZE_WEB_UI"] = "1"
         env.pop("SKIP_WEB_UI", None)
         env.pop("OMNIGENT_SKIP_WEB_UI", None)
-    _log(f"$ {build_sh}" + (" (SKIP_WEB_UI=1)" if skip_web_ui else " (EXTERNALIZE_WEB_UI=1)"))
+    mode = "SKIP_WEB_UI=1" if skip_web_ui else "EXTERNALIZE_WEB_UI=1"
+    _log(f"$ {build_sh} ({mode})")
     subprocess.run([str(build_sh)], cwd=root, env=env, check=True)
     wheels = sorted((root / "dist").glob("*.whl"))
     if not wheels:
@@ -253,6 +334,29 @@ def _classify_wheels(wheels: Iterable[Path]) -> _ClassifiedWheels:
         else:
             oversize.append(wheel)
     return _ClassifiedWheels(main=main_wheel, small=small, oversize=oversize)
+
+
+def _core_release_wheels(
+    wheels: Iterable[Path], explicit_extensions: Iterable[Path] = ()
+) -> list[Path]:
+    """Return the core release wheels, rejecting anything unexpected in dist/."""
+    explicit_paths = {wheel.resolve() for wheel in explicit_extensions}
+    core: list[Path] = []
+    unexpected: list[Path] = []
+    for wheel in wheels:
+        if wheel.name.startswith(_WHEEL_PREFIXES):
+            core.append(wheel)
+        elif wheel.resolve() in explicit_paths:
+            continue
+        else:
+            unexpected.append(wheel)
+    if unexpected:
+        names = ", ".join(wheel.name for wheel in unexpected)
+        raise SystemExit(
+            f"unexpected wheel(s) in dist/: {names}; pass additional extensions "
+            "with --extension-wheel from a separate output directory"
+        )
+    return core
 
 
 def _wheel_version(wheel: Path, prefix: str) -> str:
@@ -306,8 +410,6 @@ def _sweep_local_src_wheels(keep: set[str]) -> None:
         return
     for entry in src.iterdir():
         if not entry.is_file() or entry.suffix != ".whl":
-            continue
-        if not any(entry.name.startswith(p) for p in _WHEEL_PREFIXES):
             continue
         if entry.name in keep:
             continue
@@ -396,10 +498,23 @@ def _wheel_source_path(wheel: Path) -> str:
     )
 
 
+def _wheel_name_version(wheel: Path) -> tuple[str, str]:
+    """
+    Return the normalized distribution name and version from a wheel filename.
+
+    :param wheel: Wheel path, e.g.
+        ``dist/omnigent_hello_extension-0.1.0-py3-none-any.whl``.
+    :returns: ``("omnigent-hello-extension", "0.1.0")``.
+    """
+    name, version = wheel.name.split("-")[:2]
+    return name.lower().replace("_", "-"), version
+
+
 def _uv_source_lines(
     main_wheel: Path,
     small_wheels: list[Path],
     oversize_wheels: list[Path],
+    extension_wheels: list[Path] = (),
 ) -> list[str]:
     """Build ``[tool.uv.sources]`` lines for the three deploy wheels.
 
@@ -421,6 +536,21 @@ def _uv_source_lines(
         wheel = next(wheel for name, wheel in wheels.items() if name.startswith(wheel_prefix))
         source = _wheel_source_path(wheel)
         source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
+    core_names = {"omnigent", "omnigent-client", "omnigent-ui-sdk"}
+    seen: set[str] = set()
+    for wheel in extension_wheels:
+        package_name, _ = _wheel_name_version(wheel)
+        if package_name in core_names:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} would shadow the core package {package_name}"
+            )
+        if package_name in seen:
+            raise SystemExit(
+                f"--extension-wheel {wheel.name} repeats the extension {package_name}"
+            )
+        seen.add(package_name)
+        source = _wheel_source_path(wheel)
+        source_lines.append(f"{package_name} = {{ path = {_toml_string(source)} }}")
     return source_lines
 
 
@@ -429,6 +559,7 @@ def build_uv_pyproject(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> str:
     """Compose the app-level ``pyproject.toml`` for Databricks Apps.
 
@@ -438,14 +569,20 @@ def build_uv_pyproject(
     :param oversize_wheels: Wheels too large for the app source directory.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Omnigent extension wheels (``omnigent.extensions``
+        entry points) installed alongside the server, e.g.
+        ``src/omnigent_hello_extension-0.1.0-py3-none-any.whl``.
     :returns: Complete TOML text for ``src/pyproject.toml``.
     """
-    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels)
+    source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels, extension_wheels)
     dependencies = [
         f'"omnigent[databricks,tracing]=={deploy_version}"',
         f'"omnigent-client=={deploy_version}"',
         f'"omnigent-ui-sdk=={deploy_version}"',
     ]
+    for wheel in extension_wheels:
+        package_name, version = _wheel_name_version(wheel)
+        dependencies.append(f'"{package_name}=={version}"')
     return (
         "[project]\n"
         'name = "omnigent-databricks-app"\n'
@@ -461,24 +598,37 @@ def build_uv_pyproject(
 def run_uv_lock(src: Path) -> None:
     """Generate ``uv.lock`` for the Databricks Apps source directory.
 
+    Use public PyPI unless ``UV_INDEX_URL`` selects another deployment index.
+    Ignore machine-level uv configuration and competing index variables so
+    they cannot replace the selected index with a machine-only mirror.
+
     :param src: App source directory containing ``pyproject.toml``,
         e.g. ``deploy/databricks/src``.
     """
-    # Honor a caller-supplied UV_INDEX_URL (e.g. a private mirror or proxy);
-    # otherwise default to public PyPI. UV_INDEX / UV_DEFAULT_INDEX are dropped
-    # so a stray value in the shell can't shadow the index we lock against.
     index_url = os.environ.get("UV_INDEX_URL") or _UV_DEFAULT_INDEX_URL
     env = os.environ.copy()
-    env.pop("UV_INDEX", None)
-    env.pop("UV_DEFAULT_INDEX", None)
-    env["UV_INDEX_URL"] = index_url
-    _log(f"uv lock --python 3.12 --index-url {index_url}")
-    subprocess.run(
-        ["uv", "lock", "--python", "3.12", "--index-url", index_url],
-        cwd=src,
-        env=env,
-        check=True,
-    )
+    for var in _UV_INDEX_ENV_VARS:
+        env.pop(var, None)
+    _log(f"uv lock --python 3.12 --no-config --default-index {_redact_url(index_url)}")
+    cmd = ["uv", "lock", "--python", "3.12", "--no-config", "--default-index", index_url]
+    try:
+        subprocess.run(cmd, cwd=src, env=env, check=True)
+    except subprocess.CalledProcessError as exc:
+        # Keep credentialed index URLs out of failure tracebacks.
+        raise subprocess.CalledProcessError(
+            exc.returncode,
+            [*cmd[:-1], _redact_url(index_url)],
+            output=exc.output,
+            stderr=exc.stderr,
+        ) from None
+
+
+def _redact_url(url: str) -> str:
+    """Strip userinfo, query, and fragment from a URL before it reaches a log."""
+    # [^/]+ (not [^/@]+) so a literal `@` inside a password redacts fully.
+    url = re.sub(r"^(\w+://)[^/]+@", r"\1***@", url)
+    # Query strings and fragments can carry tokens (e.g. ?token=...).
+    return url.split("?", 1)[0].split("#", 1)[0]
 
 
 def write_uv_dependency_files(
@@ -487,6 +637,7 @@ def write_uv_dependency_files(
     small_wheels: list[Path],
     oversize_wheels: list[Path],
     deploy_version: str,
+    extension_wheels: list[Path] = (),
 ) -> None:
     """Write the uv dependency files Databricks Apps should install.
 
@@ -497,6 +648,7 @@ def write_uv_dependency_files(
     :param oversize_wheels: Wheels too large for ``src``.
     :param deploy_version: Version stamped into the wheels, e.g.
         ``"0.1.0.post123"``.
+    :param extension_wheels: Extension wheels already copied into ``src``.
     """
     requirements = src / "requirements.txt"
     if requirements.exists():
@@ -508,6 +660,7 @@ def write_uv_dependency_files(
         small_wheels,
         oversize_wheels,
         deploy_version,
+        extension_wheels,
     )
     (src / "pyproject.toml").write_text(pyproject)
     _log("src/pyproject.toml:\n" + pyproject)
@@ -669,7 +822,7 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Comma-separated deployment-wide release features, e.g. "
-            "'usage_page'. Empty keeps every release feature off."
+            "'usage_page,canvas'. Empty keeps every release feature off."
         ),
     )
     parser.add_argument(
@@ -705,8 +858,9 @@ def _parse_args() -> argparse.Namespace:
         "--version",
         default=None,
         help=(
-            "Explicit PEP 440 version to stamp into pyprojects for this "
-            "deploy. Default: <base-version>.post<unix-ts>."
+            "Explicit PEP 440 version to stamp into the pyprojects and "
+            "omnigent/version.py for this deploy. Default: "
+            "<base-version>.post<unix-ts>+g<short-sha>."
         ),
     )
     parser.add_argument(
@@ -718,6 +872,18 @@ def _parse_args() -> argparse.Namespace:
         "--skip-web-ui",
         action="store_true",
         help="Build without the SPA (API-only deploy).",
+    )
+    parser.add_argument(
+        "--extension-wheel",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="WHEEL",
+        help=(
+            "Prebuilt Omnigent extension wheel to install alongside the server "
+            "(repeatable), e.g. dist-ext/omnigent_hello_extension-0.1.0-py3-none-any.whl. "
+            "The server discovers it through its omnigent.extensions entry point."
+        ),
     )
     parser.add_argument(
         "--app-url",
@@ -995,7 +1161,7 @@ def main() -> int:
             if not wheels:
                 raise SystemExit("--skip-build was set but dist/ has no wheels to redeploy")
             wheel_version = _derive_deploy_version_from_wheels(wheels)
-            if args.version and args.version != wheel_version:
+            if args.version and deploy_version != wheel_version:
                 raise SystemExit(
                     f"--version {args.version!r} does not match reused wheel "
                     f"version {wheel_version!r}"
@@ -1007,11 +1173,19 @@ def main() -> int:
         if backups and not args.keep_version_bump:
             _restore_versions(backups)
 
-    classified = _classify_wheels(wheels)
+    explicit_extension_wheels = [wheel.resolve() for wheel in args.extension_wheel]
+    for wheel in explicit_extension_wheels:
+        if not wheel.is_file():
+            raise SystemExit(f"--extension-wheel {wheel} does not exist")
+    core_wheels = _core_release_wheels(wheels, explicit_extension_wheels)
+    classified = _classify_wheels(core_wheels)
+    extension_wheels = explicit_extension_wheels
     for wheel in wheels:
         size_mb = wheel.stat().st_size / 1024 / 1024
         _log(f"  {wheel.name}  {size_mb:.2f} MB")
-    if classified.oversize:
+    if classified.oversize or any(
+        wheel.stat().st_size > _WORKSPACE_WHEEL_LIMIT_BYTES for wheel in extension_wheels
+    ):
         raise SystemExit(
             "uv-based Databricks Apps deploys require every Omnigent wheel to "
             "fit under the 10 MB Workspace file cap. Reduce the Python payload "
@@ -1027,8 +1201,8 @@ def main() -> int:
     # wheels locally, then copy the new small wheels in.
     src = _src_dir()
     src.mkdir(parents=True, exist_ok=True)
-    _sweep_local_src_wheels(keep={w.name for w in classified.small})
-    for wheel in classified.small:
+    _sweep_local_src_wheels(keep={w.name for w in [*classified.small, *extension_wheels]})
+    for wheel in [*classified.small, *extension_wheels]:
         dest = src / wheel.name
         _log(f"copy {wheel.name} → {dest.relative_to(_repo_root())}")
         shutil.copy2(wheel, dest)
@@ -1045,6 +1219,7 @@ def main() -> int:
         classified.small,
         classified.oversize,
         deploy_version,
+        [src / wheel.name for wheel in extension_wheels],
     )
 
     # 3) Guard every uploaded source file before touching the workspace.

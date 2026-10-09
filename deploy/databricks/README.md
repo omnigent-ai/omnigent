@@ -11,7 +11,7 @@ via [Databricks Asset Bundles](https://docs.databricks.com/aws/en/dev-tools/bund
 > **Most Databricks users want the managed offering instead.**
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) runs the server for you, wired to workspace identity,
-> Foundation Models, AI Gateway, and MLflow Tracing out of the box.
+> Foundation Models, Unity Gateway, and MLflow Tracing out of the box.
 > Enable the **Omnigent** preview in your workspace settings and follow
 > the quickstart there. Use this directory only when you need to
 > self-manage the deployment: the managed service is not in your region
@@ -138,7 +138,9 @@ The script builds wheels, archives the SPA as `dist/web-ui.tar.gz`, copies the
 wheels and the single UI archive into `src/`, regenerates `src/pyproject.toml`
 and `src/uv.lock`, runs `databricks bundle deploy --target prod`, runs
 `databricks bundle run omnigent --target prod`, and polls `/health`
-with backoff until 200.
+with backoff until 200. Use repeatable `--extension-wheel` arguments to install
+prebuilt Omnigent extension wheels alongside the server; `--skip-web-ui`
+remains API-only.
 
 Databricks Apps rejects any single source file over 10 MB. The SPA is
 therefore shipped as one `src/web-ui.tar.gz` archive instead of inside the
@@ -158,12 +160,29 @@ redeploy:
 --features usage_page,harness_install
 ```
 
+The Canvas page is off by default; include `canvas` in `--features` for the
+apps that should show it.
+
 See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
 inventory and rollback procedure.
 
 > [!TIP]
-> To lock against a private PyPI mirror or proxy instead of public
-> PyPI, set `UV_INDEX_URL` before running `deploy.py`.
+> The generated app lock defaults to public PyPI. To use a private index or
+> proxy, set `UV_INDEX_URL` before running `deploy.py`. Databricks Apps
+> [supports private repositories](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/dependencies#install-from-private-repositories);
+> configure the matching index in the app build environment (for example,
+> `UV_INDEX_URL` in `src/app.yaml`, using `valueFrom` for secret-backed values).
+> The index and artifact URLs must be reachable there, with any required
+> credentials provided through Databricks secrets. The local setting only
+> controls lock generation; it does not configure the app's build environment.
+>
+> Lock generation ignores uv config files and competing index variables
+> (`UV_INDEX`, `UV_DEFAULT_INDEX`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`,
+> `UV_CONFIG_FILE`, `UV_NO_CONFIG`) so a machine-only mirror cannot override
+> the selected index. If your shell exports `UV_INDEX_URL` for local use only,
+> unset it for deployment to use public PyPI. Non-index settings in config
+> files are also ignored; supply TLS/timeout settings through environment
+> variables such as `UV_NATIVE_TLS`, `SSL_CERT_FILE`, or `UV_HTTP_TIMEOUT`.
 
 ## Smoke check
 

@@ -5,9 +5,7 @@ from typing import Any
 
 import pytest
 
-from omnigent import claude_native, codex_native_app_server, gateway_inference
-from omnigent.claude_native import ClaudeNativeUcodeConfig
-from omnigent.codex_native_app_server import NativeCodexLaunch, native_codex_launch_base_url
+from omnigent import gateway_inference
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.gateway_inference import (
     CLAUDE_GATEWAY_HARNESSES,
@@ -17,6 +15,13 @@ from omnigent.gateway_inference import (
     gateway_inference_map,
     gateway_inference_state,
     not_gateway_backed,
+)
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+from omnigent.harnesses.codex_native.app_server import (
+    NativeCodexLaunch,
+    native_codex_launch_base_url,
 )
 from omnigent.inner import codex_executor
 
@@ -516,7 +521,7 @@ def test_gateway_inference_state_reads_any_spelling_of_the_family(
 
 def test_not_gateway_backed_names_only_the_explicit_false_arms() -> None:
     arms = ("claude-native", "codex-native")
-    # Claude Code on the AI Gateway, Codex on a personal ChatGPT subscription.
+    # Claude Code on the Unity Gateway, Codex on a personal ChatGPT subscription.
     assert not_gateway_backed({"claude-native": True, "codex-native": False}, arms) == [
         "codex-native"
     ]

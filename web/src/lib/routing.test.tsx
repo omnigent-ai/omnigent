@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { MemoryRouter, type To } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { basenamedRouting, Link as RoutingLink, reactRouterRouting } from "./routing";
@@ -64,6 +64,27 @@ describe("basenamedRouting Link rebasing", () => {
     // (no `/`, `?`, or `#` at the boundary), so it gets rebased like any other
     // app-absolute path.
     expect(renderRebasedLink("/mount", "/mounting")).toBe("/mount/mounting");
+  });
+});
+
+describe("basenamedRouting navigation", () => {
+  it("keeps the rebased navigate callback stable across renders", async () => {
+    const baseNavigate = vi.fn();
+    const base = {
+      ...reactRouterRouting,
+      useNavigate: () => baseNavigate,
+    };
+    const { result, rerender } = renderHook(
+      ({ basename }) => basenamedRouting(basename, base).useNavigate(),
+      { initialProps: { basename: "/mount" } },
+    );
+    const navigate = result.current;
+
+    rerender({ basename: "/next" });
+
+    expect(result.current).toBe(navigate);
+    await result.current("/c/abc");
+    expect(baseNavigate).toHaveBeenCalledWith("/next/c/abc", undefined);
   });
 });
 

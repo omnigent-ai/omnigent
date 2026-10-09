@@ -22,7 +22,6 @@ the sidebar.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import uuid
 from collections.abc import Iterator
@@ -32,6 +31,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
     _ensure_runner_online,
@@ -100,11 +100,7 @@ def shared(
         timeout=30.0,
         limits=no_pool,
     )
-    create_resp = owner.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-    )
+    create_resp = post_session_bundle(owner.post, "/v1/sessions", _build_hello_world_bundle())
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
     owner.patch(
@@ -145,16 +141,18 @@ def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     assertions deterministic: a 404 means the SPA cannot render a
     composer afterwards, with no settle-time race.
     """
+    request_id = uuid.uuid4().hex
+    page_url = f"{base_url}/c/{session_id}?e2e_snapshot_request={request_id}"
     with page.expect_response(
-        # Match on the path: the chat surface requests the slim snapshot
-        # (?include_items=false&include_liveness=false), so the URL no
-        # longer *ends* with the session id.
+        # A previous document can still have a snapshot in flight when the
+        # next navigation begins. Match the same-origin referrer of this load.
         lambda r: (
             r.url.split("?")[0].endswith(f"/v1/sessions/{session_id}")
             and r.request.method == "GET"
+            and f"e2e_snapshot_request={request_id}" in r.request.headers.get("referer", "")
         )
     ) as resp_info:
-        page.goto(f"{base_url}/c/{session_id}")
+        page.goto(page_url)
     return resp_info.value.status
 
 

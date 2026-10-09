@@ -1,3 +1,8 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Regression tests for the UI-before-server pin-migration data loss.
 //
 // Pins moved from localStorage to a server-side `omnigent.pinned` label. The
@@ -11,7 +16,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
@@ -27,34 +31,18 @@ const { pinnedRef, filterHonoredRef, setPinnedSpy } = vi.hoisted(() => ({
   ),
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: pinnedRef.current, filterHonored: filterHonoredRef.current },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: setPinnedSpy,
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useProjectSessions: vi.fn(),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    usePinnedConversations: () => ({
+      data: { conversations: pinnedRef.current, filterHonored: filterHonoredRef.current },
+      isSuccess: true,
+    }),
+    setConversationPinned: setPinnedSpy,
+    useProjectSessions: vi.fn(),
+  };
+});
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { useConversations, useProjectSessions } from "@/hooks/useConversations";
@@ -77,31 +65,22 @@ function conv(id: string): Conversation {
 }
 
 function mockConversations(convs: Conversation[]) {
-  useConvMock.mockReturnValue({
-    data: {
-      pages: [{ data: convs, first_id: null, last_id: null, has_more: false }],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>);
+  useConvMock.mockReturnValue(conversationPage(convs, { first_id: null, last_id: null }));
 }
 
 function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Routes>
-            <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-          </Routes>
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Routes>
+              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
