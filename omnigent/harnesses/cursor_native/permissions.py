@@ -48,7 +48,11 @@ from pathlib import Path
 import httpx
 
 from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
-from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cursor_pane_keys
+from omnigent.harnesses.cursor_native.bridge import (
+    capture_cursor_pane,
+    cursor_pane_gone,
+    send_cursor_pane_keys,
+)
 
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
@@ -151,9 +155,9 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
         except (OSError, RuntimeError) as exc:
-            if await asyncio.to_thread(capture_cursor_pane, bridge_dir) is None:
-                # The pane (or its whole tmux server) is gone — an expected
-                # end-of-life state, not a malfunction; no traceback ERROR.
+            if await asyncio.to_thread(cursor_pane_gone, bridge_dir):
+                # A confirmed dead pane is an expected end-of-life state, not a
+                # malfunction; an indeterminate probe keeps the loud ERROR.
                 _logger.warning(
                     "cursor pane is gone; keystroke %r (of %r) was not delivered (%s); session=%s",
                     key,
@@ -177,7 +181,7 @@ async def _post_verdict_undelivered_notice(
     """Post recovery guidance for a verdict that never reached the cursor TUI.
 
     The card has already settled as answered by then. ``pane_gone`` picks the
-    remedy: relaunch for a dead pane, the embedded terminal for a live one.
+    remedy: relaunch for a confirmed dead pane, otherwise the embedded terminal.
     """
     if pane_gone:
         reason = (
@@ -221,29 +225,19 @@ async def _deliver_verdict_keys(
     """Deliver a web verdict's keystrokes, or tell the user in chat why they could not land.
 
     The parked hook can hold a verdict for up to :data:`_POST_TIMEOUT_S`, so the
-    pane is checked again before typing (as :func:`_yolo_auto_accept` does).
+    pane may be gone by the time a human answers. Delivery is still attempted;
+    only a confirmed dead pane, never an indeterminate probe, selects the
+    relaunch guidance.
 
     :returns: Whether the keystrokes were handed to tmux.
     """
-    if await asyncio.to_thread(capture_cursor_pane, bridge_dir) is None:
-        _logger.warning(
-            "cursor pane is gone; web verdict for %r cannot be delivered; session=%s",
-            description,
-            session_id,
-        )
-        await _post_verdict_undelivered_notice(
-            client, session_id=session_id, description=description, pane_gone=True
-        )
-        return False
-    if not await _send_cursor_keys(bridge_dir, session_id, *keys):
-        # The pane can die between the pre-check and the send; only a pane
-        # that is still alive makes this a live-pane send failure.
-        pane_gone = await asyncio.to_thread(capture_cursor_pane, bridge_dir) is None
-        await _post_verdict_undelivered_notice(
-            client, session_id=session_id, description=description, pane_gone=pane_gone
-        )
-        return False
-    return True
+    if await _send_cursor_keys(bridge_dir, session_id, *keys):
+        return True
+    pane_gone = await asyncio.to_thread(cursor_pane_gone, bridge_dir) is True
+    await _post_verdict_undelivered_notice(
+        client, session_id=session_id, description=description, pane_gone=pane_gone
+    )
+    return False
 
 
 async def _run_one_approval(

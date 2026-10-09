@@ -1,13 +1,9 @@
 """E2E (UI): approving a Cursor card after its pane died settles it and shows a notice.
 
-Mirror lane: a background thread runs the real ``_run_one_approval`` coroutine
-against the live spawned server with a transcript-shaped pending Shell call,
-while a real tmux server backs the pane via ``write_tmux_target``. The tmux
-server is killed and its socket removed while the card is parked, then the
-user clicks Approve. Asserts the card settles, the chat shows an undelivered-
-response notice, and the mirror records no raw keystroke ERROR. Needs tmux but
-no Cursor login; ``test_cursor_approval_dead_pane.py`` covers the same journey
-through the real runner-launched ``cursor-agent`` pane.
+Runs the real ``_run_one_approval`` coroutine against the live spawned server
+with a real tmux server behind the pane; that server is killed and its socket
+removed while the card is parked, then the user clicks Approve. Needs tmux; no
+Cursor login.
 """
 
 from __future__ import annotations
@@ -109,9 +105,7 @@ def test_cursor_approval_on_dead_pane_is_not_silently_dropped(
     mirror_result: dict[str, BaseException] = {}
 
     async def _mirror() -> None:
-        # The exact coroutine the cursor-native supervisor runs for a detected
-        # gated tool call: POST the cursor-permission-request hook → park for
-        # the web verdict → deliver the y/Escape keystroke into the pane.
+        # Run the supervisor's real approval coroutine against the live server.
         async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
             await _run_one_approval(
                 client,
@@ -151,6 +145,7 @@ def test_cursor_approval_on_dead_pane_is_not_silently_dropped(
         # The card settles as answered — from the web UI the approval "worked".
         responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
         expect(responded).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+        expect(responded).to_contain_text("Approved")
 
         # The verdict reached the mirror and its delivery attempt finished.
         thread.join(timeout=30)
@@ -197,5 +192,8 @@ def test_cursor_approval_on_dead_pane_is_not_silently_dropped(
     # their response never reached cursor (the card already reads as answered,
     # so feedback is the only signal the approval did not land).
     expect(page.get_by_text("could not be delivered").first).to_be_visible(
+        timeout=_MOCK_ELICITATION_TIMEOUT_MS
+    )
+    expect(page.get_by_text("no longer running").first).to_be_visible(
         timeout=_MOCK_ELICITATION_TIMEOUT_MS
     )

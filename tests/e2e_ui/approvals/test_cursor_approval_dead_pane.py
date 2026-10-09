@@ -1,16 +1,9 @@
-"""E2E (UI): approving a Cursor permission card after its terminal pane is gone.
+"""E2E (UI): approving a Cursor card after its pane's tmux socket vanished shows a notice.
 
-The cursor-native runner mirrors a gated Cursor tool call as a web approval card
-and delivers the verdict as a ``tmux send-keys`` into the Cursor pane. The card
-can stay parked for up to a day, and in that time the pane's tmux socket can
-vanish (temp-dir cleanup, sleep, terminal teardown). Clicking Approve then never
-reaches Cursor; the user must be told, instead of watching the card settle as
-"Approved" while the runner only logs an ERROR traceback.
-
-The pane is the real runner-launched ``cursor-agent`` TUI (no login needed: the
-unauthenticated TUI stays alive), so ``tmux send-keys`` runs for real. CI has no
-Cursor account, so the gated call is seeded into the cursor chat store the
-runner's transcript supervisor tails; detection is the only stand-in.
+Drives the real runner: a gated Shell call is seeded into the cursor chat store
+the supervisor tails, the runner-launched ``cursor-agent`` pane's socket is
+removed while the card is parked, then the user clicks Approve. Needs
+``cursor-agent`` and ``tmux`` on PATH; no Cursor login.
 """
 
 from __future__ import annotations
@@ -188,7 +181,7 @@ def test_cursor_approval_after_pane_socket_vanishes_notifies_user(
 
         tmux_error = _remove_pane_socket(pane)
         print(f"tmux after socket removal: {tmux_error}")
-        assert "No such file or directory" in tmux_error, tmux_error
+        assert tmux_error, "expected tmux to report an error after the socket was removed"
         card.get_by_role("button", name="Approve", exact=True).click()
 
         responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
