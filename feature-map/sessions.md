@@ -218,7 +218,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`unarchive`, Undo toast:**
   `tests/e2e_ui/sessions/test_sidebar_lifecycle.py::test_sidebar_session_organization_round_trip`
   archives two sessions and restores both to Mine through Undo, including after
-  a reload.
+  a reload. `tests/e2e_ui/sessions/test_undo_archive_multi_user.py` repeats Undo
+  against a header-auth multi-user server whose list reads, update stream, and
+  unarchive writes lag: restored rows return to Mine at once, survive a stale
+  archived frame, and show no unread dot.
 - **`delete`:**
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`

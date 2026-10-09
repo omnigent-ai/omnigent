@@ -70,7 +70,11 @@ import {
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
-import { markConversationSeen } from "./useUnseenConversations";
+import {
+  beginUnseenSuppression,
+  endUnseenSuppression,
+  markConversationSeen,
+} from "./useUnseenConversations";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
@@ -327,6 +331,8 @@ function markSessionsArchiving(ids: Iterable<string>): Map<string, ArchiveTombst
   for (const id of ids) {
     const previous = archivingSessions.get(id);
     if (previous?.timer !== undefined) clearTimeout(previous.timer);
+    // The latest archive direction owns the row.
+    unmarkSessionsUnarchiving([id]);
     const entry = {};
     archivingSessions.set(id, entry);
     marked.set(id, entry);
@@ -364,10 +370,59 @@ export function isSessionArchiving(id: string): boolean {
   return archivingSessions.has(id);
 }
 
+// Mirror of `archivingSessions`: pins a restored row's `archived` flag FALSE
+// while the archive's own late signals (WS frames, index-lagged fetches) propagate.
+const unarchivingSessions = new Map<string, ArchiveTombstone>();
+
+function markSessionsUnarchiving(ids: Iterable<string>): Map<string, ArchiveTombstone> {
+  const marked = new Map<string, ArchiveTombstone>();
+  for (const id of ids) {
+    const previous = unarchivingSessions.get(id);
+    if (previous?.timer !== undefined) clearTimeout(previous.timer);
+    // Supersede any in-flight archive guard: this row is coming back.
+    unmarkSessionsArchiving([id]);
+    const entry = {};
+    unarchivingSessions.set(id, entry);
+    marked.set(id, entry);
+  }
+  return marked;
+}
+
+function unmarkSessionsUnarchiving(
+  ids?: Iterable<string>,
+  marked?: Map<string, ArchiveTombstone>,
+): void {
+  const targets = ids ?? unarchivingSessions.keys();
+  for (const id of targets) {
+    const entry = unarchivingSessions.get(id);
+    if (entry === undefined || (marked !== undefined && marked.get(id) !== entry)) continue;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    unarchivingSessions.delete(id);
+  }
+}
+
+function expireSessionsUnarchiving(
+  marked: Map<string, ArchiveTombstone>,
+  ids: Iterable<string>,
+): void {
+  for (const id of ids) {
+    const entry = marked.get(id);
+    if (entry === undefined || unarchivingSessions.get(id) !== entry) continue;
+    entry.timer = setTimeout(() => {
+      if (unarchivingSessions.get(id) === entry) unarchivingSessions.delete(id);
+    }, DELETED_TOMBSTONE_MS);
+  }
+}
+
+export function isSessionUnarchiving(id: string): boolean {
+  return unarchivingSessions.has(id);
+}
+
 /** Wipe module-level tombstones between tests. */
 export function clearSessionTombstones(): void {
   unmarkSessionsDeleting();
   unmarkSessionsArchiving();
+  unmarkSessionsUnarchiving();
 }
 
 /**
@@ -378,13 +433,29 @@ function applySessionTombstones(
   dropArchiving = false,
   originalPage = page,
 ): ConversationsPage {
-  if (deletingSessionIds.size === 0 && archivingSessions.size === 0) return page;
+  if (
+    deletingSessionIds.size === 0 &&
+    archivingSessions.size === 0 &&
+    unarchivingSessions.size === 0
+  ) {
+    return page;
+  }
   let changed = false;
   let lastArchivingId: string | null = null;
   const data: Conversation[] = [];
   for (const conv of page.data) {
     if (isSessionDeleting(conv.id)) {
       changed = true;
+      continue;
+    }
+    if (isSessionUnarchiving(conv.id)) {
+      // The optimistic restore wins over stale indexed state.
+      if (conv.archived === true) {
+        changed = true;
+        data.push({ ...conv, archived: false });
+      } else {
+        data.push(conv);
+      }
       continue;
     }
     if (!isSessionArchiving(conv.id)) {
@@ -931,13 +1002,13 @@ async function paintConversationsArchived(
   queryClient: QueryClient,
   ids: readonly string[],
   archived: boolean,
-): Promise<{ snapshot: ArchiveListsSnapshot; marked?: Map<string, ArchiveTombstone> }> {
+): Promise<{ snapshot: ArchiveListsSnapshot; marked: Map<string, ArchiveTombstone> }> {
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
   ]);
-  const marked = archived ? markSessionsArchiving(ids) : undefined;
-  if (!archived) unmarkSessionsArchiving(ids);
+  // Arm a tombstone in the latest archive direction.
+  const marked = archived ? markSessionsArchiving(ids) : markSessionsUnarchiving(ids);
   const snapshot = snapshotArchiveLists(queryClient);
   for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
   if (archived) dropFromPinnedCache(queryClient, ids);
@@ -958,11 +1029,13 @@ export function useArchiveConversation() {
     }) => archiveConversation(id, archived, deleteWorktree),
     onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
     onError: (_err, { id, archived }, context) => {
-      if (archived && context?.marked !== undefined) {
+      if (context?.marked !== undefined) {
         const marked = context.marked.get(id);
-        const live = archivingSessions.get(id);
+        // Do not roll back over a newer operation.
+        const live = (archived ? archivingSessions : unarchivingSessions).get(id);
         if (live !== undefined && live !== marked) return;
-        unmarkSessionsArchiving([id], context.marked);
+        if (archived) unmarkSessionsArchiving([id], context.marked);
+        else unmarkSessionsUnarchiving([id], context.marked);
       }
       // Roll back to exactly the pre-archive caches, synchronously — so the
       // row (and any dropped pin) returns at once, rather than waiting on a
@@ -980,8 +1053,9 @@ export function useArchiveConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
       );
-      if (archived && context?.marked !== undefined) {
-        expireSessionsArchiving(context.marked, [updated.id]);
+      if (context?.marked !== undefined) {
+        if (archived) expireSessionsArchiving(context.marked, [updated.id]);
+        else expireSessionsUnarchiving(context.marked, [updated.id]);
       }
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
@@ -1336,9 +1410,15 @@ export function useBulkArchiveConversations() {
       if (!context?.snapshot) return;
       const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
       const succeeded = ids.filter((id) => !failed.has(id));
-      if (archived && context.marked !== undefined) {
-        unmarkSessionsArchiving(failed, context.marked);
-        expireSessionsArchiving(context.marked, succeeded);
+      if (context.marked !== undefined) {
+        // Keep guards only for rows that moved.
+        if (archived) {
+          unmarkSessionsArchiving(failed, context.marked);
+          expireSessionsArchiving(context.marked, succeeded);
+        } else {
+          unmarkSessionsUnarchiving(failed, context.marked);
+          expireSessionsUnarchiving(context.marked, succeeded);
+        }
       }
       restoreArchiveLists(queryClient, context.snapshot);
       if (!archived) {
@@ -1347,8 +1427,9 @@ export function useBulkArchiveConversations() {
       reapplyLiveSessionTombstones(queryClient);
     },
     onSuccess: (_data, { ids, archived }, context) => {
-      if (archived && context?.marked !== undefined) {
-        expireSessionsArchiving(context.marked, ids);
+      if (context?.marked !== undefined) {
+        if (archived) expireSessionsArchiving(context.marked, ids);
+        else expireSessionsUnarchiving(context.marked, ids);
       }
     },
     onSettled: () => {
@@ -1390,9 +1471,12 @@ export async function undoArchiveConversations(
 ): Promise<void> {
   if (conversations.length === 0) return;
   const ids = conversations.map((c) => c.id);
+  // The unarchive bumps updated_at before the seen anchors below land; hold the
+  // unread dot off until then.
+  for (const id of ids) beginUnseenSuppression(id);
   // Un-hide any rows still in the list cache (flag flip). Rows a refetch already
-  // evicted aren't here to flip — the keep-alive below covers those.
-  await paintConversationsArchived(queryClient, ids, false);
+  // evicted aren't here to flip; the keep-alive and tombstone cover those.
+  const { marked } = await paintConversationsArchived(queryClient, ids, false);
   const restored = conversations.map((conv) => ({ ...conv, archived: false }));
   for (const conv of restored) markRecentlyCreated(conv);
   // Optimistically write the evicted rows straight back into the cached lists
@@ -1427,10 +1511,15 @@ export async function undoArchiveConversations(
       if (result.status === "fulfilled") markConversationSeen(ids[i], result.value.updated_at);
       else failed.push(ids[i]);
     }
+    // Keep guards until stale archive signals have propagated.
+    const failedSet = new Set(failed);
+    expireSessionsUnarchiving(
+      marked,
+      ids.filter((id) => !failedSet.has(id)),
+    );
     if (failed.length > 0) {
-      // The ids that stayed archived: drop them from the keep-alive so they stop
-      // being re-injected, and overlay archived=true so they leave the list
-      // again. The ids that DID unarchive stay visible.
+      // Failed rows lose their guard and optimistic keep-alive.
+      unmarkSessionsUnarchiving(failed, marked);
       for (const id of failed) {
         unmarkRecentlyCreated(id);
         overlayArchivedIntoCaches(queryClient, id, true);
@@ -1445,6 +1534,8 @@ export async function undoArchiveConversations(
       );
     }
   } finally {
+    // Seen anchors have landed; resume normal unread detection.
+    for (const id of ids) endUnseenSuppression(id);
     void queryClient.invalidateQueries({ queryKey: ["projects"] });
     void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
     void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });

@@ -9,6 +9,12 @@ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
+import {
+  isConversationUnseen,
+  markConversationSeen,
+  resetReadStateForTests,
+  seedReadState,
+} from "./useUnseenConversations";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
@@ -3450,6 +3456,48 @@ describe("undoArchiveConversations optimistic restore", () => {
 
     resolvePatch(mockResponse(conversation({ id: "conv_a", archived: false, updated_at: 101 })));
     await undo;
+  });
+
+  it("keeps a restored row read while its unarchive is still in flight", async () => {
+    resetReadStateForTests();
+    try {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      queryClient.setQueryData(["conversations", "", false], infinitePage([]));
+      // The archive's own PATCH anchored the row as seen at its updated_at.
+      seedReadState([{ id: "conv_a", updated_at: 100 }]);
+      markConversationSeen("conv_a", 100);
+      let resolvePatch!: (value: Response) => void;
+      fetchMock.mockImplementation((_url: string, init?: RequestInit) =>
+        init?.method === "PATCH"
+          ? new Promise<Response>((resolve) => {
+              resolvePatch = resolve;
+            })
+          : Promise.resolve(mockResponse({})),
+      );
+
+      const undo = undoArchiveConversations(queryClient, [
+        conversation({ id: "conv_a", archived: true, updated_at: 100 }),
+      ]);
+      await waitFor(() => {
+        const data = queryClient.getQueryData<ConversationsInfiniteData>([
+          "conversations",
+          "",
+          false,
+        ]);
+        expect(data?.pages[0].data.map((c) => c.id)).toEqual(["conv_a"]);
+      });
+
+      // The stream reports the unarchive's updated_at bump before the PATCH response lands.
+      expect(isConversationUnseen("conv_a", 101, "idle")).toBe(false);
+
+      resolvePatch(mockResponse(conversation({ id: "conv_a", archived: false, updated_at: 101 })));
+      await undo;
+      expect(isConversationUnseen("conv_a", 101, "idle")).toBe(false);
+      // Suppression ends with the restore, so a later bump reads unseen again.
+      expect(isConversationUnseen("conv_a", 102, "idle")).toBe(true);
+    } finally {
+      resetReadStateForTests();
+    }
   });
 });
 
