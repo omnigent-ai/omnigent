@@ -129,11 +129,60 @@ describe("markdown links to workspace files", () => {
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 
+  it("preserves a root-level filename with a cited line through sanitization", () => {
+    renderMarkdown("[README.md](README.md:12:3)", ["README.md"]);
+
+    expect(screen.queryByText(/\[blocked\]/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "README.md" }));
+    expect(openFile).toHaveBeenCalledWith("README.md", { line: 12, column: 3 });
+  });
+
   it("leaves an external link as a real anchor", () => {
     renderMarkdown("[docs](https://example.com/page)");
 
     const link = screen.getByRole("link", { name: "docs" });
     expect(link).toHaveAttribute("href", "https://example.com/page");
+  });
+
+  it("adds a PR icon while preserving descriptive link text and its destination", () => {
+    const href = "https://github.com/acme/app/pull/42#discussion_r123";
+    renderMarkdown(`[Fix rendering](${href})`);
+
+    const link = screen.getByRole("link", { name: "Fix rendering" });
+    expect(link).toHaveAttribute("href", href);
+    expect(link).toHaveAttribute("title", href);
+    expect(link.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("shortens an autolinked PR URL without changing its destination", () => {
+    const href = "https://github.com/acme/app/pull/42";
+    renderMarkdown(href);
+
+    expect(screen.getByRole("link", { name: "app#42" })).toHaveAttribute("href", href);
+  });
+
+  it("preserves formatting and surrounding prose in a descriptive PR link", () => {
+    const href = "https://github.com/acme/app/pull/42";
+    renderMarkdown(`See [**Fix** rendering on narrow screens](${href}) before merging.`);
+
+    const link = screen.getByRole("link", { name: "Fix rendering on narrow screens" });
+    expect(link).toHaveAttribute("href", href);
+    expect(link.querySelector('[data-streamdown="strong"]')).toHaveTextContent("Fix");
+    expect(link.parentElement).toHaveTextContent(
+      "See Fix rendering on narrow screens before merging.",
+    );
+  });
+
+  it.each([
+    "https://github.com/acme/app/pull/42/files",
+    "https://github.com.example.com/acme/app/pull/42",
+    "https://example.com/acme/app/pull/42",
+  ])("preserves ordinary URL labels for %s", (href) => {
+    renderMarkdown(href);
+
+    const link = screen.getByRole("link", { name: href });
+    expect(link).toHaveAttribute("href", href);
+    expect(link.querySelector("svg")).toBeNull();
   });
 
   // Overriding the `a` slot replaces Streamdown's link component, so its
@@ -148,7 +197,7 @@ describe("markdown links to workspace files", () => {
 
     const link = screen.getByText(name).closest("a");
     expect(link).toHaveAttribute("data-streamdown", "link");
-    expect(link).toHaveClass("wrap-anywhere", "font-medium", "text-primary", "underline");
+    expect(link).toHaveClass("wrap-anywhere", "font-medium", "text-link", "underline");
   });
 
   it("keeps the source hast node out of the DOM", () => {
@@ -355,17 +404,18 @@ describe("dead file links give feedback instead of a silent no-op", () => {
     expect(toastMock).not.toHaveBeenCalled();
   });
 
-  it("keeps a bare-basename link inert — a skipped check is not proof of absence", () => {
-    // `[README.md](README.md)` in a live session: the path-shape heuristic
-    // skips the listing (bare basename, untrusted resolution), so nothing
-    // was ever verified. The link must stay plain text — not grow the
-    // dead-link affordance and toast a false "not found" about a real,
-    // openable root-level file.
-    renderMarkdown("[README.md](README.md)", [], FILE_VIEWER_WITH_SESSION);
+  it("verifies and opens an explicit root-level file citation", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "README.md", path: "README.md", type: "file", bytes: 5 }],
+        has_more: false,
+      }),
+    );
+    renderMarkdown("[README.md](README.md:12)", [], FILE_VIEWER_WITH_SESSION);
 
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "README.md" })).toBeNull();
-    expect(screen.getByText("README.md")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "README.md" }));
+    expect(openFile).toHaveBeenCalledWith("README.md", { line: 12 });
     expect(toastMock).not.toHaveBeenCalled();
   });
 

@@ -25,7 +25,8 @@ cancelBtn.addEventListener("click", () => {
   window.arcaConnect.cancel();
 });
 
-window.arcaConnect.onStarted(() => {
+window.arcaConnect.onStarted(({ login, command }) => {
+  commandEl.textContent = command;
   // Reveal the terminal pane (the main process grows the window to match).
   document.body.dataset.phase = "running";
   // Mount the terminal now that its container has real dimensions.
@@ -33,9 +34,11 @@ window.arcaConnect.onStarted(() => {
   // The button itself carries the progress: spinner + "Connecting…".
   confirmBtn.disabled = true;
   confirmBtn.classList.add("loading");
-  confirmBtn.textContent = "Connecting…";
+  confirmBtn.textContent = login ? "Signing in…" : "Connecting…";
   statusEl.dataset.kind = "";
-  statusEl.textContent = "A cold instance can take a few minutes to start.";
+  statusEl.textContent = login
+    ? "Complete sign-in in your browser. Credentials stay on the Arca instance."
+    : "A cold instance can take a few minutes to start.";
 });
 
 // The output pane is a real terminal (xterm.js, read-only), so arca/ssh ANSI
@@ -67,10 +70,16 @@ window.arcaConnect.onOutput((text) => {
   ensureTerminal().write(text);
 });
 
-window.arcaConnect.onDone(({ ok, error }) => {
+window.arcaConnect.onDone(({ ok, error, authRequired, command }) => {
   statusEl.dataset.kind = ok ? "ok" : "error";
   statusEl.textContent = ok ? "Connected. The Arca host should appear online shortly." : error;
   confirmBtn.classList.remove("loading");
-  confirmBtn.hidden = true;
-  cancelBtn.textContent = "Close";
+  confirmBtn.hidden = !authRequired;
+  confirmBtn.disabled = false;
+  if (authRequired) {
+    commandEl.textContent = command;
+    confirmBtn.textContent = "Sign in and retry";
+    confirmBtn.focus();
+  }
+  cancelBtn.textContent = authRequired ? "Cancel" : "Close";
 });
