@@ -6,12 +6,14 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.config as _config_module
 from omnigent.config import (
     _merge_effective_config,
     github_account_preference,
     global_config_path,
     load_effective_config,
     load_global_config,
+    load_local_config,
     save_global_config,
     set_github_account_preference,
 )
@@ -179,3 +181,57 @@ def test_save_global_config_respects_config_home(
     # Written to (and read back from) OMNIGENT_CONFIG_HOME/config.yaml.
     assert (tmp_path / "config.yaml").exists()
     assert github_account_preference("/Users/daniel.lok/omnigent") == "daniellok-db"
+
+
+def test_load_local_config_returns_empty_when_cwd_deleted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """load_local_config returns {} when the process cwd no longer exists."""
+    deleted = tmp_path / "deleted_dir"
+    deleted.mkdir()
+    monkeypatch.chdir(deleted)
+    deleted.rmdir()
+    # Reset the module-level warn-once guard so this test is self-contained.
+    monkeypatch.setattr(_config_module, "_cwd_missing_warned", False)
+
+    result = load_local_config()
+
+    assert result == {}
+
+
+def test_load_effective_config_returns_global_when_cwd_deleted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """load_effective_config returns global config when the cwd has been removed."""
+    config_home = tmp_path / "home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("model: global-model\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    deleted = tmp_path / "deleted_dir"
+    deleted.mkdir()
+    monkeypatch.chdir(deleted)
+    deleted.rmdir()
+    monkeypatch.setattr(_config_module, "_cwd_missing_warned", False)
+
+    cfg = load_effective_config()
+
+    assert cfg == {"model": "global-model"}
+
+
+def test_load_local_config_explicit_path_unaffected_by_missing_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Passing an explicit path to load_local_config bypasses cwd lookup."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("profile: explicit\n")
+
+    deleted = tmp_path / "deleted_dir"
+    deleted.mkdir()
+    monkeypatch.chdir(deleted)
+    deleted.rmdir()
+    monkeypatch.setattr(_config_module, "_cwd_missing_warned", False)
+
+    result = load_local_config(path=cfg_file)
+
+    assert result == {"profile": "explicit"}
