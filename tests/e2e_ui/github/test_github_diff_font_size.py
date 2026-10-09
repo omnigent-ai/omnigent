@@ -60,7 +60,7 @@ def test_github_diff_text_tracks_interface_font_size(
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     # The diff lines live in the FileDiff shadow root; Playwright pierces it.
