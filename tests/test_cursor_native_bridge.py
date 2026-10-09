@@ -46,8 +46,8 @@ def _install_fake_tmux(
 
     ``send-keys`` calls are recorded (and returned). ``capture-pane`` calls pop
     the next value from *pane_captures* (the last value repeats once exhausted,
-    modelling a composer that has settled). ``list-panes`` reports a live pane
-    unless *pane_dead* models a pane retained after cursor-agent exited.
+    modelling a composer that has settled). ``display-message`` reports a live
+    pane unless *pane_dead* models a pane retained after cursor-agent exited.
 
     :returns: The list that accumulates every tmux argv invoked.
     """
@@ -60,7 +60,7 @@ def _install_fake_tmux(
         if "capture-pane" in cmd:
             value = remaining.pop(0) if len(remaining) > 1 else (remaining[0] if remaining else "")
             return _FakeCompleted(stdout=value)
-        if "list-panes" in cmd:
+        if "display-message" in cmd:
             return _FakeCompleted(stdout="1\n" if pane_dead else "0\n")
         return _FakeCompleted()
 
@@ -196,7 +196,7 @@ def _prepare_bridge(tmp_path: Path) -> Path:
         pytest.param(_FakeCompleted(stdout="0\n"), True, id="live-pane"),
         pytest.param(_FakeCompleted(stdout="1\n"), False, id="retained-dead-pane"),
         pytest.param(_FakeCompleted(stdout="", returncode=1), False, id="no-server"),
-        pytest.param(_FakeCompleted(stdout=""), False, id="no-pane-row"),
+        pytest.param(_FakeCompleted(stdout=""), False, id="blank-probe-output"),
     ],
 )
 def test_session_alive_reads_pane_dead_not_session_existence(
@@ -213,7 +213,9 @@ def test_session_alive_reads_pane_dead_not_session_existence(
     monkeypatch.setattr("subprocess.run", _fake_run)
 
     assert cursor_native_bridge._session_alive(_SOCK, _TARGET) is alive
-    assert probes == [["tmux", "-S", _SOCK, "list-panes", "-t", _TARGET, "-F", "#{pane_dead}"]]
+    assert probes == [
+        ["tmux", "-S", _SOCK, "display-message", "-p", "-t", _TARGET, "#{pane_dead}"]
+    ]
 
 
 def test_session_alive_fails_closed_when_probe_times_out(

@@ -276,10 +276,9 @@ def test_cursor_main_terminal_survives_cursor_agent_exit_without_tmux_unavailabl
         assert pid is not None, f"no live cursor-agent process found in pane {target!r}"
         os.kill(pid, signal.SIGKILL)
 
-        # A regression logs the signature within a second of the exit; the
-        # window is generous so a slow box cannot mask it. The exit-observation
-        # line is collected alongside it so a green reflects the handled
-        # pane-dead exit rather than an unrelated resource removal.
+        # Generous window so a slow box cannot mask the signature; the
+        # exit-observation line is collected alongside it so a green reflects
+        # a handled pane-dead exit, not an unrelated resource removal.
         signature_line: str | None = None
         exit_observed_line: str | None = None
         terminal_gone = False

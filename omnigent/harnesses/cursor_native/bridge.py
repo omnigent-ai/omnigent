@@ -650,7 +650,9 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
 
     The pane is kept after cursor-agent exits (``keep_alive_after_exit``), so
     ``has-session`` keeps succeeding; ``#{pane_dead}`` tells a live TUI from a
-    retained dead pane. Probe errors fail closed.
+    retained dead pane. ``display-message`` resolves to exactly ``tmux_target``
+    -- the pane injections write to -- so a dead sibling in a split window
+    cannot mask it. Probe errors or a missing pane fail closed.
     """
     try:
         proc = subprocess.run(
@@ -658,10 +660,10 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
                 "tmux",
                 "-S",
                 socket_path,
-                "list-panes",
+                "display-message",
+                "-p",
                 "-t",
                 tmux_target,
-                "-F",
                 "#{pane_dead}",
             ],
             check=False,
@@ -671,8 +673,7 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
-    flags = proc.stdout.split()
-    return proc.returncode == 0 and bool(flags) and "1" not in flags
+    return proc.returncode == 0 and proc.stdout.strip() == "0"
 
 
 def capture_cursor_pane(bridge_dir: Path) -> str | None:
