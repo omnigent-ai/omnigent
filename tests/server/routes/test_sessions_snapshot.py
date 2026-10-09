@@ -21,6 +21,7 @@ from omnigent.server.routes.sessions import (
     _publish_subtree_cost_to_ancestors,
     _truncate_label,
 )
+from omnigent.server.schemas import SessionResponse
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
@@ -671,6 +672,84 @@ async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     # No report for runner_live → no forced failure, no synthetic error.
     assert snapshot.status != "failed"
     assert snapshot.last_task_error is None
+
+
+_RUNNER_EXIT_ERROR = "runner process exited with code 254"
+
+
+async def _snapshot_after_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, *, live_status: str
+) -> SessionResponse:
+    """Snapshot a session whose runner connected to this server, then reported an exit.
+
+    :param monkeypatch: Used to stamp the runner's liveness and to keep the
+        snapshot from probing a leaked process-wide runner client.
+    :param live_status: The session's persisted ``live_status``, e.g. ``"idle"``.
+    :returns: The session snapshot read while the exit report is still held.
+    """
+    from omnigent.server import session_live_state
+    from omnigent.server.host_registry import RunnerExitReports
+
+    session_id = "2d7a5c9e1b3f4a6c8e0d1f2a3b4c5d6e"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        runner_id="runner_ran",
+        live_status=live_status,
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+    _use_runner_client(monkeypatch, None)
+    # The runner tunnel connected to this server, which stamps it on connect and every ping.
+    monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_ran", 1)
+    reports = RunnerExitReports()
+    reports.record("runner_ran", _RUNNER_EXIT_ERROR, owner=None)
+
+    return await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        runner_exit_reports=reports,
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_idle_session_of_connected_runner_ignores_exit_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle session whose runner connected is not repainted failed by the exit report.
+
+    When the host dies after its runner ran, ``_on_runner_exited`` leaves the
+    idle session idle (no work was lost). The snapshot must agree while the
+    report is held, instead of showing a crash banner on every reload.
+    """
+    snapshot = await _snapshot_after_runner_exit(monkeypatch, live_status="idle")
+
+    assert snapshot.status == "idle"
+    assert snapshot.last_task_error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_status", ["running", "waiting", "failed"])
+async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_connected_runner(
+    monkeypatch: pytest.MonkeyPatch, live_status: str
+) -> None:
+    """A session caught mid-turn (or already failed) still surfaces the exit report.
+
+    The host dying interrupts in-flight work, so the liveness stamp that spares
+    an idle session must not hide the crash cause from these.
+    """
+    snapshot = await _snapshot_after_runner_exit(monkeypatch, live_status=live_status)
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == {
+        "code": "runner_failed_to_start",
+        "message": _RUNNER_EXIT_ERROR,
+    }
 
 
 @pytest.mark.asyncio

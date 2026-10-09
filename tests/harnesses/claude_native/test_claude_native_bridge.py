@@ -7915,13 +7915,13 @@ def test_hook_record_todo_write_with_non_list_todos_gives_none() -> None:
 
 
 def test_hook_record_parses_stop_failure_reason() -> None:
-    """``StopFailure`` keeps its error category and rendered error text."""
+    """``StopFailure`` keeps its error category and ``error_details`` text."""
     record = _hook_record_from_jsonl_record(
         _make_jsonl_record(
             {
                 "hook_event_name": "StopFailure",
                 "error": " server_error ",
-                "last_assistant_message": "API Error: 500 " + "x" * 5000,
+                "error_details": "API Error: 500 " + "x" * 5000,
             }
         )
     )
@@ -7950,10 +7950,10 @@ def test_hook_record_failure_fields_none_when_blank_or_not_stop_failure() -> Non
 
 
 def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
-    """The failure card rewrites dead-end CLI remedies like the mirrored message."""
+    """The failure card rewrites dead-end CLI remedies in ``error_details``."""
     overflow = _hook_record_from_jsonl_record(
         _make_jsonl_record(
-            {"hook_event_name": "StopFailure", "last_assistant_message": "Prompt is too long"}
+            {"hook_event_name": "StopFailure", "error_details": "Prompt is too long"}
         )
     )
     assert overflow.failure_message is not None
@@ -7963,13 +7963,33 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
             {
                 "hook_event_name": "StopFailure",
                 "error": "authentication_failed",
-                "last_assistant_message": "Login expired · Please run /login",
+                "error_details": "Login expired · Please run /login",
             }
         )
     )
     assert login.failure_message is not None
     assert login.failure_message.startswith("Login expired · Please run /login\n\n")
     assert "omni setup" in login.failure_message
+
+
+def test_hook_record_stop_failure_last_assistant_message_not_used() -> None:
+    """``last_assistant_message`` alone does not populate ``failure_message``."""
+    # Production bug: a session's previous turn prose appeared as the error
+    # because last_assistant_message can hold prose when the failure fires
+    # before any new output.
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "invalid_request",
+                "last_assistant_message": (
+                    "The wait fired. Checking when the integration command exited"
+                ),
+            }
+        )
+    )
+    assert record.failure_category == "invalid_request"
+    assert record.failure_message is None
 
 
 # ── stop_hook_seen_since: subagent filtering ─────────────────────────

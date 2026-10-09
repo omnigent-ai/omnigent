@@ -1497,7 +1497,8 @@ export function AppShell() {
     const selectedTab = tabList?.querySelector<HTMLElement>(
       '[role="tab"][aria-selected="true"], [role="button"][aria-current="true"]',
     );
-    (selectedTab ?? tabList)?.focus();
+    const visibleSelectedTab = (selectedTab?.checkVisibility?.() ?? true) ? selectedTab : null;
+    (visibleSelectedTab ?? tabList)?.focus();
   }, []);
   const revealRightPanel = useCallback(() => {
     if (!conversationId) return;

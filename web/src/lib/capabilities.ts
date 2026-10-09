@@ -62,6 +62,7 @@ export type FeatureKey =
   | "harness_install"
   | "canvas"
   | "arca_shutdown_warnings"
+  | "import_review"
   | "custom_agents_settings_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */

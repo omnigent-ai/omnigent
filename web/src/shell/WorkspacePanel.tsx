@@ -1,6 +1,8 @@
 import type { FilePosition } from "./FileViewerContext";
 import {
   BotIcon,
+  CheckIcon,
+  ChevronDownIcon,
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
@@ -60,6 +62,7 @@ import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
+import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import { PullRequestPanel } from "./PullRequestPanel";
@@ -360,7 +363,7 @@ function NewTabMenu({
 // of the fixed Files/Terminals/Agents tabs. Each tab is a cell with the
 // file's basename and an "x" close button. Clicking the cell activates the
 // tab (opening its viewer); clicking the x closes it. No own scroll container
-// or flex-1: the parent strip's overflow-x-auto scrolls the whole row.
+// or flex-1: the parent viewport scrolls the open tabs.
 // ---------------------------------------------------------------------------
 
 function FileTabsStrip({
@@ -1004,13 +1007,13 @@ function WorkspacePanelImpl({
     : handleProps;
   const defaultTab = readDefaultWorkspaceTab();
   const tabOrder = [defaultTab, ...defaultWorkspaceTabs.filter((tab) => tab !== defaultTab)];
-  const visiblePermanentTabs: RightRailTab[] = tabOrder.filter((tab) => {
+  const visiblePermanentTabs = tabOrder.filter((tab) => {
     if (tab === "subagents") return true;
     if (tab === "github") return pending || showGithubTab;
     return pending || showFilesPanel;
   });
   const shortcutFor = (tab: RightRailTab) => {
-    const index = visiblePermanentTabs.indexOf(tab);
+    const index = visiblePermanentTabs.findIndex((candidate) => candidate === tab);
     return index === -1 ? undefined : String(index + 1);
   };
   const selectPermanentTab = (tab: RightRailTab) => {
@@ -1058,6 +1061,60 @@ function WorkspacePanelImpl({
     browserFallbackTab,
     onRightRailTabChange,
   ]);
+  const panelLabels = {
+    files: "Files",
+    changes: "Changes",
+    github: "Pull Requests",
+    subagents: "Agents",
+  };
+  const panelOptions = [
+    ...visiblePermanentTabs.map((tab) => ({
+      key: tab,
+      label: panelLabels[tab],
+      active:
+        selectedFilePath === null &&
+        selectedTerminalKey === null &&
+        !browserSelected &&
+        !sideChatSelected &&
+        rightRailTab === tab,
+      select: () => selectPermanentTab(tab),
+      disabled: false,
+    })),
+    ...openFiles.map((path) => ({
+      key: `file:${path}`,
+      label: path,
+      active: selectedFilePath === path,
+      select: () => openFileViewer(path),
+      disabled: false,
+    })),
+    ...openTerminals.map((key) => ({
+      key,
+      label: terminalLabelFor(key),
+      active: selectedTerminalKey === key,
+      select: () => openTerminalTab(key),
+      disabled: closingTerminalKey === key,
+    })),
+    ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
+      key: `browser:${tabId}`,
+      label: `Browser ${index + 1}`,
+      active: browserSelected && browsers.selected === tabId,
+      select: () => {
+        browsers.select(tabId);
+        onRightRailTabChange("browser");
+      },
+      disabled: false,
+    })),
+    ...sideChats.tabs.map((childId, index) => ({
+      key: `sidechat:${childId}`,
+      label: `Side chat ${index + 1}`,
+      active: sideChatSelected && sideChats.selected === childId,
+      select: () => {
+        sideChats.select(childId);
+        onRightRailTabChange("sidechat");
+      },
+      disabled: false,
+    })),
+  ];
   const tabTriggers = {
     files: (pending || showFilesPanel) && (
       <WorkspaceTabTooltip key="files" label="Files" shortcut={shortcutFor("files")}>
@@ -1193,11 +1250,7 @@ function WorkspacePanelImpl({
           />
         )}
         {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
-        {/* Tab strip: the static nav tabs + divider stay pinned on the left at
-          every rail width, and ONLY the file-tabs region scrolls (it owns the
-          horizontal scroller — see below). The outer row never scrolls
-          (overflow-x-hidden), so the divider is a fixed boundary that doesn't
-          drift when the tabs scroll. */}
+        {/* Narrow rails use the picker for fixed panels, leaving room for open tabs. */}
         <div
           ref={tabListRef}
           role="toolbar"
@@ -1207,11 +1260,7 @@ function WorkspacePanelImpl({
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
           <Tabs
-            // Static group — never compresses (shrink-0) and stays anchored on
-            // the LEFT whether or not tabs are open. The open tabs render to its
-            // right; the maximize button owns the row's single ml-auto and pins
-            // to the right edge.
-            className="shrink-0"
+            className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
             // When a file or shell tab is active no fixed trigger should
             // highlight, so feed the radix group a sentinel that matches none of
             // them. The active file/shell tab carries its own highlight. Gate the
@@ -1235,22 +1284,18 @@ function WorkspacePanelImpl({
               {tabOrder.map((tab) => tabTriggers[tab])}
             </TabsList>
           </Tabs>
-          {/* 1px divider separating the static nav tabs from the open tabs.
-                Pinned (outside the scrolling file-tabs region), so it stays put
-                at every rail width while the tabs scroll past it. */}
+          {/* The divider follows the fixed panel icons' visibility. */}
           <div
             aria-hidden
-            className="mx-[8px] h-[14px] w-px shrink-0 self-center bg-border-strong"
+            className={cn(
+              "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
+              showOpenTabs && "@max-[400px]/rail:hidden",
+            )}
           />
           {showOpenTabs && (
             <>
-              {/* Open-tabs region (file tabs + shell tabs) — the horizontal
-                scroller. It sizes to its content and shrinks+scrolls only when
-                the tabs would overflow (min-w-0, no flex-1), so the "+" outside
-                it hugs the last tab when they fit and stays pinned when they
-                don't. overflow-y-hidden stops overflow-x:auto from spawning a
-                vertical scrollbar that eats horizontal space. */}
-              <div className="no-drag flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              {/* Open tabs fill the space before the pinned trailing controls. */}
+              <WorkspaceTabsScroller>
                 <FileTabsStrip
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
@@ -1351,11 +1396,8 @@ function WorkspacePanelImpl({
                     </div>
                   );
                 })}
-              </div>
-              {/* "+" trails the last tab but sits OUTSIDE the scroller, so it
-                stays pinned (never scrolls under / overlaps the tabs) when they
-                overflow, and hugs the last tab when they fit. ml-[2px] keeps the
-                same gap the scroller's gap-0.5 gives between tabs. */}
+              </WorkspaceTabsScroller>
+              {/* Keep new-panel actions outside the scrolling viewport. */}
               <NewTabMenu
                 conversationId={conversationId}
                 onOpenBrowser={showBrowserTab ? addBrowser : undefined}
@@ -1363,7 +1405,7 @@ function WorkspacePanelImpl({
                 onCreateError={onShellCreateFailed}
                 onOpenTerminal={openTerminalTab}
                 onCreateStart={onShellCreateStart}
-                triggerClassName="ml-[2px]"
+                triggerClassName="ml-1"
                 liveness={liveness}
               />
             </>
@@ -1383,16 +1425,45 @@ function WorkspacePanelImpl({
               liveness={liveness}
             />
           )}
-          {/* Maximize/minimize toggle, pinned to the rightmost edge via ml-auto,
-            which absorbs the free space before it. When open tabs exist their
-            ≥500px flex-1 region absorbs the space instead, so the button still
-            hugs the right. */}
+          {/* The picker and fullscreen toggle form the trailing control group. */}
+          <DropdownMenu>
+            <WorkspaceTabTooltip label="Select panel" className="ml-auto pl-1">
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className="size-6 shrink-0"
+                  aria-label="Select panel"
+                  disabled={pending}
+                >
+                  <ChevronDownIcon className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+            </WorkspaceTabTooltip>
+            <DropdownMenuContent align="end" className="max-w-[min(32rem,calc(100vw-2rem))]">
+              <SuppressBrowserView />
+              <DropdownMenuLabel>Panels</DropdownMenuLabel>
+              {panelOptions.map((option) => (
+                <DropdownMenuItem
+                  key={option.key}
+                  onSelect={option.select}
+                  disabled={option.disabled}
+                  title={option.label}
+                  aria-current={option.active ? "true" : undefined}
+                >
+                  <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                  {option.active && <CheckIcon className="size-4" aria-hidden />}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
           <WorkspaceTabTooltip
             label={maximized ? "Exit full screen" : "Full screen"}
-            className="ml-auto"
+            className="ml-1"
           >
             <Button
-              // type="button"
+              type="button"
               variant="ghost"
               aria-label={maximized ? "Exit full screen" : "Full screen"}
               aria-pressed={maximized}
