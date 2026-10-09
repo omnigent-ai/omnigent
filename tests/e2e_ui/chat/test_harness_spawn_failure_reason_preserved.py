@@ -46,11 +46,9 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-# A minimal single-model agent whose harness fails to spawn on the runner.
-# spec_version 1 + ``executor.config.harness`` routes through the strict parser
-# (arcname ``config.yaml``); ``open-responses`` is accepted as a valid harness
-# name at parse time but is unregistered in ``_HARNESS_MODULES`` so the runner
-# cannot spawn it -- the deterministic ``harness_spawn_failed`` trigger.
+# ``open-responses`` passes spec validation (spec_version 1, strict parser via
+# the ``config.yaml`` arcname) but is unregistered in ``_HARNESS_MODULES``, so the
+# runner cannot spawn it: the deterministic ``harness_spawn_failed`` trigger.
 _SPAWN_FAIL_HARNESS = "open-responses"
 _AGENT_YAML = f"""\
 spec_version: 1
@@ -69,9 +67,9 @@ executor:
 _RUNNER_ERROR_HEADLINE = "Something went wrong setting up the turn on the host."
 # The structured reason the runner attaches to the failed turn.
 _SPAWN_FAILED_CODE = "harness_spawn_failed"
-# The client-safe spawn cause (from ``HarnessSpawnError``) that the expanded
-# pill must preserve instead of redacting it to a log pointer alone.
-_SPAWN_FAILURE_REASON = f"unknown harness '{_SPAWN_FAIL_HARNESS}'"
+# The client-safe spawn cause the expanded pill must preserve instead of
+# redacting it to a log pointer alone; the harness name is asserted separately.
+_SPAWN_FAILURE_CAUSE = "unknown harness"
 
 
 def _bundle(name: str) -> bytes:
@@ -150,4 +148,5 @@ def test_spawn_failure_aborts_turn_and_preserves_reason(
     # not only the generic "see the runner log" pointer.
     error_pill.click()
     expect(error_pill).to_contain_text(_SPAWN_FAILED_CODE, timeout=10_000)
-    expect(error_pill).to_contain_text(_SPAWN_FAILURE_REASON, timeout=10_000)
+    expect(error_pill).to_contain_text(_SPAWN_FAILURE_CAUSE, timeout=10_000)
+    expect(error_pill).to_contain_text(_SPAWN_FAIL_HARNESS, timeout=10_000)
