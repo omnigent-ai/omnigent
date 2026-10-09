@@ -1273,12 +1273,16 @@ export function useLeaveSession() {
  * header merges snapshot fields over the list row (snapshot winning),
  * so a snapshot left stale at the pre-stop state would clobber the
  * now-stopped state and the header's Stop gate would lag.
+ *
+ * Also drops the session's pending user bubbles: the server settles the web
+ * messages queued before the stop without a `session.input.consumed` receipt.
  */
 export function useStopSession() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => stopSession(id),
     onSuccess: (_data, id) => {
+      useChatStore.getState().dropPendingUserMessages(id);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
     },

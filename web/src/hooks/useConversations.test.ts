@@ -46,6 +46,8 @@ import {
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import { bindConversationForTest, useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -2077,6 +2079,75 @@ describe("useStopSession invalidation", () => {
     // state. Dropping this invalidation reintroduces the bug where the
     // header lagged (Stop lingering).
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session", "conv_x"] });
+  });
+});
+
+describe("useStopSession pending bubbles", () => {
+  // The server settles web messages queued before a stop with no consumed
+  // receipt, so the stopped session's optimistic bubbles must go with it.
+  const bubble = (tempId: string): PendingUserMessage => ({
+    tempId,
+    content: [{ type: "input_text", text: `message ${tempId}` }],
+    posted: true,
+  });
+  const bubbleIds = (id: string) =>
+    conversationRegistry
+      .peek(id)!
+      .getState()
+      .pendingUserMessages.map((p) => p.tempId);
+
+  function renderStop() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    return renderHook(() => useStopSession(), { wrapper });
+  }
+
+  beforeEach(() => {
+    bindConversationForTest("conv_bg", { pendingUserMessages: [bubble("pend_bg")] });
+    bindConversationForTest("conv_fg", { pendingUserMessages: [bubble("pend_fg")] });
+  });
+
+  afterEach(() => {
+    conversationRegistry.clear();
+    bindConversationForTest(null);
+  });
+
+  it("drops the active conversation's bubbles once the stop lands", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+    const { result } = renderStop();
+
+    result.current.mutate("conv_fg");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(bubbleIds("conv_fg")).toEqual([]);
+    // The composer reads the root projection of the active entry.
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(bubbleIds("conv_bg")).toEqual(["pend_bg"]);
+  });
+
+  it("drops a background conversation's bubbles and leaves the active one's", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+    const { result } = renderStop();
+
+    result.current.mutate("conv_bg");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(bubbleIds("conv_bg")).toEqual([]);
+    expect(bubbleIds("conv_fg")).toEqual(["pend_fg"]);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_fg"]);
+  });
+
+  it("keeps the bubbles when the stop fails", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 503 }));
+    const { result } = renderStop();
+
+    result.current.mutate("conv_fg");
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // A stop that did not land leaves the session, and its queued messages, alive.
+    expect(bubbleIds("conv_fg")).toEqual(["pend_fg"]);
+    expect(bubbleIds("conv_bg")).toEqual(["pend_bg"]);
   });
 });
 
