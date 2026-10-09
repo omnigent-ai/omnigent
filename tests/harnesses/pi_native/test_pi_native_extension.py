@@ -3679,3 +3679,202 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
 """
     )
     _run_extension_script(node, _extension_path(), script)
+
+
+def _error_withholding_harness(*, pi_reports_settled: bool) -> str:
+    """Shared Node harness for the withheld-model-error tests.
+
+    Like the streaming harness, but the mocked ``pi`` only exposes
+    ``registerEntryRenderer`` when simulating Pi >= 0.80.4 — the extension
+    treats that method (shipped alongside ``agent_settled``) as the
+    settled-event capability probe.
+    """
+    entry_renderer = "  registerEntryRenderer() {},\n" if pi_reports_settled else ""
+    return (
+        r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const configPath = path.join(tmpDir, "config.json");
+
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1" }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+const posted = [];
+global.fetch = async (_url, request) => {
+  posted.push(JSON.parse(request.body));
+  return { ok: true };
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const handlers = {};
+const pi = {
+  registerCommand() {},
+  on(name, handler) { handlers[name] = handler; },
+  sendUserMessage() {},
+"""
+        + entry_renderer
+        + r"""};
+
+require(extensionPath)(pi);
+
+const ctx = { isIdle: () => false, ui: { setTitle() {}, setStatus() {}, notify() {} } };
+
+function items() {
+  return posted.filter((e) => e.type === "external_conversation_item");
+}
+function errorItems() {
+  return items().filter((i) => i.data && i.data.item_type === "error");
+}
+function assistantItems() {
+  return items().filter(
+    (i) =>
+      i.data &&
+      i.data.item_type === "message" &&
+      i.data.item_data.role === "assistant",
+  );
+}
+function erroredMessage(errorMessage) {
+  return { role: "assistant", content: [], stopReason: "error", errorMessage };
+}
+function okMessage(text) {
+  return { role: "assistant", content: [{ type: "text", text }] };
+}
+"""
+    )
+
+
+def test_model_error_withheld_when_pi_recovers_before_settling(
+    tmp_path: Path,
+) -> None:
+    """A provider error Pi retries past must never reach the web UI.
+
+    Pi >= 0.80.4 sequence: errored ``message_end`` → ``agent_end`` → retry's
+    ``agent_start`` → successful ``message_end`` → ``agent_settled``. The
+    withheld error is discarded on recovery, so no error item posts and the
+    recovered assistant message lands normally.
+    """
+    script = (
+        _error_withholding_harness(pi_reports_settled=True)
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  await handlers.message_end({ message: erroredMessage("503 overloaded") }, ctx);
+  await handlers.agent_end({ messages: [] }, ctx);
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  await handlers.message_end({ message: okMessage("Recovered answer") }, ctx);
+  await handlers.agent_end({ messages: [] }, ctx);
+  await handlers.agent_settled({}, ctx);
+
+  assert.deepEqual(errorItems(), [], JSON.stringify(posted));
+  const assistant = assistantItems();
+  assert.equal(assistant.length, 1, JSON.stringify(assistant));
+  assert.equal(assistant[0].data.item_data.content[0].text, "Recovered answer");
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_model_error_posts_once_when_run_settles_failed(tmp_path: Path) -> None:
+    """An unrecovered error posts exactly once, at ``agent_settled``.
+
+    The item is pinned to the errored turn's response_id — captured at the
+    errored ``message_end``, before ``agent_end`` resets it.
+    """
+    script = (
+        _error_withholding_harness(pi_reports_settled=True)
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  await handlers.message_end({ message: erroredMessage("503 overloaded") }, ctx);
+  await handlers.agent_end({ messages: [] }, ctx);
+  await handlers.agent_settled({}, ctx);
+
+  const errors = errorItems();
+  assert.equal(errors.length, 1, JSON.stringify(posted));
+  assert.equal(errors[0].data.item_data.code, "RuntimeError");
+  assert.equal(errors[0].data.item_data.message, "Pi model error: 503 overloaded");
+  assert.match(errors[0].data.response_id, /^pi-turn-1-/);
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_model_error_keeps_latest_message_across_retries(tmp_path: Path) -> None:
+    """Three failed attempts yield ONE error item carrying the last message.
+
+    Pi retries with growing backoff, so each failed attempt ends its run
+    (``agent_end``) and starts another; only the final failure's message is
+    worth showing, posted once the run settles.
+    """
+    script = (
+        _error_withholding_harness(pi_reports_settled=True)
+        + r"""
+(async () => {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await handlers.agent_start({}, ctx);
+    await handlers.turn_start({ turnIndex: attempt }, ctx);
+    await handlers.message_end(
+      { message: erroredMessage(`503 overloaded (attempt ${attempt})`) },
+      ctx,
+    );
+    await handlers.agent_end({ messages: [] }, ctx);
+  }
+  await handlers.agent_settled({}, ctx);
+
+  const errors = errorItems();
+  assert.equal(errors.length, 1, JSON.stringify(posted));
+  assert.equal(
+    errors[0].data.item_data.message,
+    "Pi model error: 503 overloaded (attempt 3)",
+  );
+  assert.match(errors[0].data.response_id, /^pi-turn-3-/);
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_model_error_flushes_at_agent_end_without_settled_support(
+    tmp_path: Path,
+) -> None:
+    """Older Pi (no ``agent_settled``) still posts the error, at ``agent_end``.
+
+    The mock omits ``registerEntryRenderer`` — the 0.80.4 capability probe —
+    so the extension falls back to flushing at the run's ``agent_end``. A
+    later ``session_shutdown`` must not double-post.
+    """
+    script = (
+        _error_withholding_harness(pi_reports_settled=False)
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+  await handlers.message_end({ message: erroredMessage("429 rate limited") }, ctx);
+  await handlers.agent_end({ messages: [] }, ctx);
+
+  const errors = errorItems();
+  assert.equal(errors.length, 1, JSON.stringify(posted));
+  assert.equal(errors[0].data.item_data.message, "Pi model error: 429 rate limited");
+
+  await handlers.session_shutdown({}, ctx);
+  assert.equal(errorItems().length, 1, JSON.stringify(posted));
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
