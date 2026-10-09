@@ -1,22 +1,16 @@
-"""E2E regression test: the cursor:main terminal must not disappear from tmux.
+"""E2E regression: the cursor:main terminal must survive cursor-agent's exit.
 
-Guards against this runner-log signature (``omnigent.inner.terminal`` /
+A real host daemon comes online, a cursor-native session makes its runner
+launch the real ``cursor-agent`` TUI in a runner-owned tmux pane, then that
+process is killed. The runner must report a handled pane-dead exit rather than
+the generic idle-watcher signature (``omnigent.inner.terminal`` /
 ``_idle_watch_loop_threaded``)::
 
     tmux unavailable after 3 consecutive probes for terminal cursor:main
 
-The Cursor ``main`` terminal must be launched with ``keep_alive_after_exit``:
-without it, tmux's defaults (``exit-empty on`` + ``remain-on-exit off``) reap
-the lone-pane server the instant ``cursor-agent`` exits, the idle watcher's
-probes fail, and only the generic line above is logged, with no pane exit
-status. Cursor sibling of ``test_pi_main_terminal_tmux_disappears_e2e``; reuses
-its helpers.
-
-The journey is real end-to-end: a host daemon comes online, a cursor-native
-session makes its runner launch the real ``cursor-agent`` TUI in a runner-owned
-tmux pane, then that process is killed. No Cursor login is needed: an
-unauthenticated cursor-agent stays on its "Press any key to log in..." screen
-until it is killed.
+No Cursor login is needed: an unauthenticated cursor-agent stays on its "Press
+any key to log in..." screen until it is killed. Cursor sibling of
+``test_pi_main_terminal_tmux_disappears_e2e``; reuses its helpers.
 
     .venv/bin/python -m pytest tests/e2e/test_cursor_main_terminal_tmux_disappears_e2e.py -v
 """
@@ -299,6 +293,10 @@ def test_cursor_main_terminal_survives_cursor_agent_exit_without_tmux_unavailabl
             time.sleep(POLL_INTERVAL_S)
         if signature_line is None and not terminal_gone:
             terminal_gone = not _terminal_resource_present(http_client, session_id)
+        if exit_observed_line is None:
+            exit_observed_line = _scan_home_logs_for(
+                host.home, _TERMINAL_EXIT_OBSERVED_RE, session_id=session_id
+            )
         assert terminal_gone or signature_line is not None, (
             "cursor:main never exited after cursor-agent was killed -- the exit path was "
             "not exercised, so the reproduction is inconclusive."
