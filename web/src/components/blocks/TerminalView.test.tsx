@@ -1497,32 +1497,39 @@ describe("automatic reconnect", () => {
     }
   });
 
-  it("re-dials with a fresh budget when a hidden warm surface is revealed", async () => {
-    // A warm surface parked behind another session's view: the transport
-    // flaps with nobody watching and the background reconnect loop burns
-    // its whole budget.
-    const { rerender } = render(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
-    );
-    await act(async () => {});
-    expect(terminalSessionMock.instances).toHaveLength(1);
+  it.each([1006, 4400])(
+    "re-dials a hidden terminal after exhausting retries for close %s",
+    async (code) => {
+      vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+      setSessionHost("conv_abc", "host_oss");
+      // A warm surface parked behind another session's view: the transport
+      // flaps with nobody watching and the background reconnect loop burns
+      // its whole budget.
+      const { rerender } = render(
+        <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+      );
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(1);
 
-    for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
-      closeNewest(1006);
-      // oxlint-disable-next-line no-await-in-loop
-      await elapse(delay);
-    }
-    closeNewest(1006);
-    await elapse(60_000);
-    const exhausted = RECONNECT_BACKOFF_MS.length + 1;
-    expect(terminalSessionMock.instances).toHaveLength(exhausted);
+      for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+        closeNewest(code);
+        // oxlint-disable-next-line no-await-in-loop
+        await elapse(delay);
+      }
+      closeNewest(code);
+      await elapse(60_000);
+      const exhausted = RECONNECT_BACKOFF_MS.length + 1;
+      expect(terminalSessionMock.instances).toHaveLength(exhausted);
 
-    // Reveal: a user is now looking at the dead pane — that is the retry
-    // signal, same as a tab thaw. One fresh dial, budget restored.
-    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
-    await act(async () => {});
-    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
-  });
+      // Reveal: a user is now looking at the dead pane — that is the retry
+      // signal, same as a tab thaw. One fresh dial, budget restored.
+      rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+      expect(terminalSessionMock.instances.at(-1)!.url).toBe(terminalSessionMock.instances[0].url);
+      expect(isHostKeyless("host_oss")).toBe(false);
+    },
+  );
 
   it("does not resurrect a deliberately closed terminal on reveal", async () => {
     const { rerender } = render(

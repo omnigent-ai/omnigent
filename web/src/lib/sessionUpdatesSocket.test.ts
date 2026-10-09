@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveModalHost, setSessionHost } from "./sessionHost";
 import {
   HEARTBEAT_WATCHDOG_MS,
   nextPushedSession,
@@ -76,18 +75,26 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     vi.useRealTimers();
   });
 
-  it("routes an OSS WebSocket by the same host key after reconnecting", () => {
+  it("routes an OSS WebSocket by the same host key after reconnecting", async () => {
+    vi.resetModules();
     vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    const { resolveModalHost, setSessionHost } = await import("./sessionHost");
+    const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
     setSessionHost("sess_oss", "host_oss");
     resolveModalHost();
-    sessionUpdatesSocket.start();
-    const first = latestWs();
-    expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
-    first.open();
-    first.close();
-    vi.advanceTimersByTime(RECONNECT_CEILING_MS);
-    expect(latestWs()).not.toBe(first);
-    expect(latestWs().url).toBe(first.url);
+    try {
+      socket.start();
+      const first = latestWs();
+      expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+      first.open();
+      first.close();
+      vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+      expect(latestWs()).not.toBe(first);
+      expect(latestWs().url).toBe(first.url);
+    } finally {
+      socket.stop();
+      vi.resetModules();
+    }
   });
 
   it("forces a reconnect after the watchdog window of total silence", () => {

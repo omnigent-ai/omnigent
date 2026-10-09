@@ -90,6 +90,10 @@ EOF
     k rollout status deployment/omnigent --timeout=180s
     ;;
   verify)
+    if [[ ! -f "$state/kubeconfig" ]]; then
+      printf 'No cluster state at %s. Run %s up first.\n' "$state/kubeconfig" "$0" >&2
+      exit 1
+    fi
     DOCKER_BUILDKIT=1 docker build --network "${PROTOTYPE_BUILD_NETWORK:-default}" \
       -t omnigent-prototype-client:local -f "$here/Client.Dockerfile" "$here"
     cd "$repo"

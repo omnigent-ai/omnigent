@@ -176,12 +176,10 @@ export function resolveSessionHost(
   sessionId: string,
   options: SessionHostResolveOptions = {},
 ): Promise<void> | null {
-  if (
-    _sessionHostResolver === null ||
-    (!getOmnigentHostConfig().fetcher &&
-      !(isDatabricksWorkspace() ? options.force : isHostRoutingEnabled()))
-  )
-    return null;
+  const canResolve =
+    getOmnigentHostConfig().fetcher != null ||
+    (isDatabricksWorkspace() ? options.force === true : isHostRoutingEnabled());
+  if (_sessionHostResolver === null || !canResolve) return null;
   if (getSessionHost(sessionId) !== null) return null;
   const refresh = _hostRefreshInFlight.get(sessionId);
   if (refresh !== undefined) return refresh;
@@ -202,7 +200,10 @@ export function resolveSessionHost(
         // Best-effort — leave the map unseeded and fall through to modal/keyless.
       })
       .finally(() => {
-        _hostResolveAttempted.add(sessionId);
+        // OSS must retry an unresolved lookup after a rollout.
+        if (isDatabricksWorkspace() || getSessionHost(sessionId) !== null) {
+          _hostResolveAttempted.add(sessionId);
+        }
         pending.delete(sessionId);
       });
     pending.set(sessionId, inFlight);

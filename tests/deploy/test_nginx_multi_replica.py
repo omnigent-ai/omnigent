@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "deploy/kubernetes/multi_replica"
@@ -65,8 +66,10 @@ async def test_evidence_failure_still_removes_host_container(
 
     commands.assert_any_await("docker", "rm", "-f", "omnigent-prototype-client-cleanup-")
     process.terminate.assert_called_once()
-    assert "host setup failed" in json.loads((args.output / "report.json").read_text())["error"]
-    assert args.mock_port > 0, "the rollout coordinator cannot probe the allocated mock port"
+    report = json.loads((args.output / "report.json").read_text())
+    assert "host setup failed" in report["error"]
+    assert report["mock_port"] > 0
+    assert args.mock_port == 0
 
 
 async def test_transient_pod_query_failure_is_retried() -> None:
@@ -107,17 +110,21 @@ async def test_mock_keeps_its_ephemeral_port_until_the_child_is_ready(tmp_path: 
                 await asyncio.to_thread(process.wait, timeout=5)
 
 
-def _run_up(
+def _run_script(
     tmp_path: Path,
     *,
     port: str,
     migration: str,
     cluster_exists: bool = True,
     transient: bool = False,
+    kubeconfig_exists: bool = True,
+    configured_port: str = "18081",
+    action: str = "up",
 ) -> tuple[subprocess.CompletedProcess, str]:
     state = tmp_path / "state"
     state.mkdir()
-    (state / "kubeconfig").touch()
+    if kubeconfig_exists:
+        (state / "kubeconfig").touch()
     commands = tmp_path / "commands"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -148,7 +155,7 @@ esac
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "PROTOTYPE_STATE_DIR": str(state),
-        "PROTOTYPE_PORT": "18081",
+        "PROTOTYPE_PORT": configured_port,
         "KIND_BIN": str(bin_dir / "kind"),
         "PROTOTYPE_TEST_COMMANDS": str(commands),
         "PROTOTYPE_TEST_PORT": port,
@@ -157,18 +164,18 @@ esac
         "PROTOTYPE_TEST_TRANSIENT": str(transient).lower(),
     }
     result = subprocess.run(
-        ["bash", str(EXAMPLE / "run.sh"), "up"],
+        ["bash", str(EXAMPLE / "run.sh"), action],
         env=env,
         capture_output=True,
         text=True,
         timeout=10,
         check=False,
     )
-    return result, commands.read_text()
+    return result, commands.read_text() if commands.exists() else ""
 
 
 def test_existing_cluster_rejects_changed_port_before_building(tmp_path: Path) -> None:
-    result, commands = _run_up(tmp_path, port="127.0.0.1:19000", migration="Complete=True")
+    result, commands = _run_script(tmp_path, port="127.0.0.1:19000", migration="Complete=True")
     assert result.returncode == 1
     assert "down before changing the port" in result.stderr
     assert "Ready:" not in result.stdout
@@ -176,7 +183,9 @@ def test_existing_cluster_rejects_changed_port_before_building(tmp_path: Path) -
 
 
 def test_deleted_cluster_reports_how_to_reset_stale_kubeconfig(tmp_path: Path) -> None:
-    result, commands = _run_up(tmp_path, port="", migration="Complete=True", cluster_exists=False)
+    result, commands = _run_script(
+        tmp_path, port="", migration="Complete=True", cluster_exists=False
+    )
     assert result.returncode == 1
     assert "no running cluster container" in result.stderr
     assert "down and retry" in result.stderr
@@ -184,7 +193,7 @@ def test_deleted_cluster_reports_how_to_reset_stale_kubeconfig(tmp_path: Path) -
 
 
 def test_failed_migration_reports_logs_without_waiting_for_timeout(tmp_path: Path) -> None:
-    result, commands = _run_up(tmp_path, port="127.0.0.1:18081", migration="Failed=True")
+    result, commands = _run_script(tmp_path, port="127.0.0.1:18081", migration="Failed=True")
     assert result.returncode == 1
     assert "Database migration failed" in result.stderr
     assert "migration diagnostic" in result.stderr
@@ -194,16 +203,50 @@ def test_failed_migration_reports_logs_without_waiting_for_timeout(tmp_path: Pat
 
 @pytest.mark.parametrize("port", ["127.0.0.1:18081", "127.0.0.1:18081\n[::1]:18081"])
 def test_completed_migration_allows_deployment(tmp_path: Path, port: str) -> None:
-    result, commands = _run_up(tmp_path, port=port, migration="Complete=True")
+    result, commands = _run_script(tmp_path, port=port, migration="Complete=True")
     assert result.returncode == 0, result.stderr
     assert "Ready: http://localhost:18081" in result.stdout
     assert "server.yaml" in commands
 
 
 def test_transient_migration_query_failure_is_retried(tmp_path: Path) -> None:
-    result, commands = _run_up(
+    result, commands = _run_script(
         tmp_path, port="127.0.0.1:18081", migration="Complete=True", transient=True
     )
     assert result.returncode == 0, result.stderr
     assert commands.count("get job migrate") == 2
     assert "server.yaml" in commands
+
+
+def test_fresh_cluster_uses_the_requested_local_port(tmp_path: Path) -> None:
+    result, commands = _run_script(
+        tmp_path,
+        port="",
+        migration="Complete=True",
+        kubeconfig_exists=False,
+        configured_port="19000",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "kind create cluster --name omnigent-nginx-prototype" in commands
+    assert f"--config {tmp_path / 'state/kind.yaml'}" in commands
+    assert "docker port " not in commands
+
+    config = yaml.safe_load((tmp_path / "state/kind.yaml").read_text())
+    assert config["nodes"][0]["extraPortMappings"] == [
+        {
+            "containerPort": 30080,
+            "hostPort": 19000,
+            "listenAddress": "127.0.0.1",
+            "protocol": "TCP",
+        }
+    ]
+    assert "Ready: http://localhost:19000" in result.stdout
+
+
+def test_verify_requires_cluster_state_before_building(tmp_path: Path) -> None:
+    result, commands = _run_script(
+        tmp_path, port="", migration="", kubeconfig_exists=False, action="verify"
+    )
+    assert result.returncode == 1
+    assert "up first" in result.stderr
+    assert commands == "", "verification ran a command before checking its kubeconfig"

@@ -93,6 +93,12 @@ export const RECONNECT_BACKOFF_MS = [
  */
 export const RECONNECT_STABLE_MS = 30_000;
 
+function isReconnectableTerminalClose(code: number): boolean {
+  return (
+    isUnexpectedTerminalClose(code) || (code === WS_CLOSE_WRONG_REPLICA && !isDatabricksWorkspace())
+  );
+}
+
 interface TerminalClipboardRequest {
   scope: string;
   epoch: number;
@@ -546,10 +552,9 @@ export function TerminalView({
         // every await.
         await Promise.resolve();
         if (superseded()) return;
-        // Route this WS to the replica holding the session's runner tunnel
-        // (key = the session's host_id). A browser WS can't set request
-        // headers, so the key rides the query string when host routing is on.
-        // A hostless session or direct connection needs no routing key.
+        // Browser WebSockets carry the host ID in the query string so they
+        // reach the replica holding the runner tunnel. Hostless sessions
+        // and direct connections need no routing key.
         const computedHostId = (() => {
           if (!isHostRoutingEnabled()) return undefined;
           if (isDatabricksWorkspace() && keylessRef.current) return undefined;
@@ -636,7 +641,7 @@ export function TerminalView({
     if (active && !wasActiveRef.current) {
       sessionRef.current?.focus();
       const current = stateRef.current;
-      if (current.kind === "closed" && isUnexpectedTerminalClose(current.code)) {
+      if (current.kind === "closed" && isReconnectableTerminalClose(current.code)) {
         reconnectAttemptsRef.current = 0;
         disposeActiveSession();
         setConnectAttempt((attempt) => attempt + 1);
@@ -691,7 +696,7 @@ export function TerminalView({
       setConnectAttempt((attempt) => attempt + 1);
       return;
     }
-    if (state.code !== WS_CLOSE_WRONG_REPLICA && !isUnexpectedTerminalClose(state.code)) {
+    if (!isReconnectableTerminalClose(state.code)) {
       setReconnectPending(false);
       return;
     }

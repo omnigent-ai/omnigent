@@ -147,8 +147,9 @@ async def verify(args) -> None:
     ws = None
     try:
         mock_log = (args.output / "mock.log").open("w")
-        mock, args.mock_port = start_mock_server(args.mock_port, mock_log)
-        mock_url = f"http://127.0.0.1:{args.mock_port}"
+        mock, mock_port = start_mock_server(args.mock_port, mock_log)
+        report["mock_port"] = mock_port
+        mock_url = f"http://127.0.0.1:{mock_port}"
         client = httpx.AsyncClient(
             base_url=args.url,
             headers={"Origin": "omnigent://internal", KEY_HEADER: host_id},
@@ -177,7 +178,8 @@ async def verify(args) -> None:
         )
         old_names = {pod["metadata"]["name"] for pod in initial_pods["items"]}
         report["initial_pods"] = sorted(old_names)
-        assert len(old_names) == 2, "Start with the two replicas in server.yaml"
+        if len(old_names) != 2:
+            raise RuntimeError("Start with the two replicas in server.yaml")
         backends = set()
         for _ in range(32):
             response = await client.get("/health", headers={KEY_HEADER: uuid.uuid4().hex})
@@ -185,7 +187,8 @@ async def verify(args) -> None:
             backends.add(response.headers["x-omnigent-upstream"])
             if len(backends) == 2:
                 break
-        assert len(backends) == 2, "Host-key hashing did not reach both server pods"
+        if len(backends) != 2:
+            raise RuntimeError("Host-key hashing did not reach both server pods")
         report["initial_backends"] = sorted(backends)
         await command(
             "docker",
@@ -401,7 +404,8 @@ async def verify(args) -> None:
         await eventually(stable, timeout=60)
         report["recovered_at"] = round(time.monotonic() - started, 3)
         report["old_terminal_connection_closed"] = ws.close_code is not None
-        assert report["old_terminal_connection_closed"], "NGINX left an old connection open"
+        if not report["old_terminal_connection_closed"]:
+            raise RuntimeError("NGINX left an old connection open")
 
         async def reattach_terminal():
             nonlocal ws
@@ -413,9 +417,12 @@ async def verify(args) -> None:
 
         after = await eventually(reattach_terminal, timeout=30)
         report["terminal_pid_after"] = after.group(1)
-        assert before.group(1) == after.group(1), "Shell process was replaced"
+        if before.group(1) != after.group(1):
+            raise RuntimeError("Shell process was replaced")
         response = await llm.post("/gate/release")
-        assert response.json()["released"], "Agent's blocked model request did not survive"
+        response.raise_for_status()
+        if not response.json()["released"]:
+            raise RuntimeError("Agent's blocked model request did not survive")
 
         async def turn_completed():
             snapshot = await client.get(f"/v1/sessions/{session_id}")

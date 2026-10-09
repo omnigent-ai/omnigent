@@ -23,6 +23,7 @@ beforeEach(() => {
     getOmnigentHostConfig: () => ({ fetcher: fetchMock }),
     hostFetch: fetchMock,
     isDatabricksWorkspace: isWorkspace,
+    isHostRoutingEnabled: isWorkspace,
   }));
 });
 
@@ -95,6 +96,7 @@ describe("managed first-message routing", () => {
       getOmnigentHostConfig: () => ({}),
       hostFetch: fetchMock,
       isDatabricksWorkspace: isWorkspace,
+      isHostRoutingEnabled: isWorkspace,
     }));
     const { authenticatedFetch, resolve } = await setup();
     fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
