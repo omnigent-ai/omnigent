@@ -17,6 +17,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.runtime.harnesses import _HARNESS_MODULES
 from tests.e2e_ui.conftest import _create_bundled_session
 
 # ``open-responses`` passes spec validation (spec_version 1, strict parser via
@@ -53,6 +54,9 @@ def spawn_fail_session(live_server: str, runner_id: str) -> Iterator[tuple[str, 
     :param runner_id: The token-bound runner id to bind the session to.
     :returns: ``(base_url, session_id)``.
     """
+    assert _SPAWN_FAIL_HARNESS not in _HARNESS_MODULES, (
+        f"{_SPAWN_FAIL_HARNESS!r} is now registered; the spawn-failure premise no longer holds"
+    )
     name = f"spawn_fail_{uuid.uuid4().hex[:8]}"
     session_id = _create_bundled_session(live_server, runner_id, _AGENT_YAML.format(name=name))
     try:
