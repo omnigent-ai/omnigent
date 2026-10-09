@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import NamedTuple
 
@@ -56,6 +57,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.inner._proc import kill_tree, spawn_kwargs
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -959,6 +961,36 @@ def _version_range_str(spec: HarnessInstallSpec) -> str | None:
     return f">={spec.min_version}, <{spec.max_version_exclusive}"
 
 
+def _run_cli_probe(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run a readiness probe in its own process group, killing the whole tree on timeout.
+
+    ``subprocess.run(timeout=...)`` kills only the direct child, so anything the CLI
+    spawned (an update-check ``git fetch``, an npm launcher's native binary) outlives
+    the probe, and the readiness loop re-probes failures every refresh. The tree is
+    also killed when the wait is interrupted (Ctrl-C during setup, cancellation).
+
+    :raises subprocess.TimeoutExpired: When the probe exceeds *timeout*.
+    """
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **spawn_kwargs(),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        kill_tree(process)
+        # Reap the leader, but never wait on a descendant that escaped the group
+        # and kept the pipe open.
+        with suppress(Exception):
+            process.communicate(timeout=1.0)
+        raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def _harness_cli_version_string(
     spec: HarnessInstallSpec,
     binary: str,
@@ -981,14 +1013,7 @@ def _harness_cli_version_string(
         if cached is not None:
             return cached
     try:
-        completed = subprocess.run(
-            [binary, "--version"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        completed = _run_cli_probe([binary, "--version"], timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
     # Failed launchers can print a runtime version, not the CLI's version.
@@ -1183,15 +1208,9 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             return True
     argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
-        result = subprocess.run(
-            [argv_binary, *spec.status_args],
-            check=False,
-            timeout=timeout,
-            # Concurrent probes must not change or restore a shared terminal's input mode.
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-        )
+        # stdin is /dev/null inside _run_cli_probe: concurrent probes must not
+        # change or restore a shared terminal's input mode.
+        result = _run_cli_probe([argv_binary, *spec.status_args], timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return False
     # Dispatch is explicit per spec: a harness that publishes a JSON status
