@@ -67,7 +67,12 @@ Env vars read at startup:
   ``ClaudeAgentOptions(skills=[], setting_sources=[])`` — the
   pair that suppresses both host-discovered (user/project)
   skills and the SDK's auto-default of
-  ``setting_sources=["user","project"]``.
+  ``setting_sources=["user","project"]``. Because those empty
+  sources also hide a project's ``disableClaudeAiConnectors``
+  opt-out, ``"none"`` carries that opt-out in the launch
+  settings and sets ``ENABLE_CLAUDEAI_MCP_SERVERS=false`` for
+  the CLI (the SDK's bundled CLI predates the setting), so
+  claude.ai connectors stay off.
 - ``HARNESS_CLAUDE_SDK_BUNDLE_DIR``: Absolute path to the
   agent bundle's extracted root. When set, the inner executor
   passes ``plugins=[{"type": "local", "path": <bundle_dir>}]``

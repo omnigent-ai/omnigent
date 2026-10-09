@@ -1987,6 +1987,25 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             json.loads(_claude_settings_payload(None, {"claude-opus-4-8": "gw-opus"})),
             {"modelOverrides": {"claude-opus-4-8": "gw-opus"}},
         )
+        # The connector opt-out rides alongside gateway settings, or alone.
+        self.assertEqual(
+            json.loads(
+                _claude_settings_payload(
+                    "printf tok",
+                    {"claude-opus-4-8": "gw-opus"},
+                    disable_claude_ai_connectors=True,
+                )
+            ),
+            {
+                "apiKeyHelper": "printf tok",
+                "modelOverrides": {"claude-opus-4-8": "gw-opus"},
+                "disableClaudeAiConnectors": True,
+            },
+        )
+        self.assertEqual(
+            json.loads(_claude_settings_payload(None, {}, disable_claude_ai_connectors=True)),
+            {"disableClaudeAiConnectors": True},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2317,6 +2336,94 @@ class TestSkillsFilterTranslation(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import _resolve_skills_option
 
         self.assertIsNone(_resolve_skills_option("bogus"))
+
+
+# ---------------------------------------------------------------------------
+# Tests: hermetic (skills=none) launch opts out of claude.ai connectors
+# ---------------------------------------------------------------------------
+
+
+class TestHermeticLaunchConnectorOptOut(unittest.TestCase):
+    """
+    ``skills: none`` forwards ``setting_sources=[]``, so the CLI never reads a
+    project's ``disableClaudeAiConnectors`` opt-out; the launch must carry that
+    opt-out itself, while other filters leave connectors to the host settings.
+    """
+
+    def _capture_launch_options(self, skills_filter, *, system_cli=True):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured = {}
+
+        def _construct():
+            if system_cli:
+                return ClaudeSDKExecutor(skills_filter=skills_filter)
+            with patch(
+                "omnigent.inner.claude_sdk_executor._find_system_claude", return_value=None
+            ):
+                return ClaudeSDKExecutor(skills_filter=skills_filter)
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK(_sdk_types()):
+            ResultMessage = _ResultMessage
+            messages = []
+
+            class ClaudeSDKClient(_SDKClient):
+                def __init__(self, options):
+                    super().__init__(options)
+                    captured["options"] = options
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [_ResultMessage(f"claude-{session_id}", "ok")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+        async def _t():
+            executor = _construct()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                    pass
+
+        _run(_t())
+        self.assertIn("options", captured, "SDK client was never constructed")
+        return captured["options"]
+
+    @staticmethod
+    def _launch_settings(options):
+        raw = getattr(options, "settings", None)
+        return json.loads(raw) if raw else {}
+
+    @staticmethod
+    def _launch_env(options):
+        return dict(getattr(options, "env", None) or {})
+
+    def test_skills_none_launch_disables_claude_ai_connectors(self):
+        options = self._capture_launch_options("none")
+
+        self.assertEqual(options.setting_sources, [])
+        self.assertIs(self._launch_settings(options).get("disableClaudeAiConnectors"), True)
+        self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
+
+    def test_skills_none_bundled_cli_fallback_keeps_env_opt_out(self):
+        # Without a system claude the SDK runs its bundled CLI, which predates
+        # the settings flag and only honors the environment knob.
+        options = self._capture_launch_options("none", system_cli=False)
+
+        self.assertIsNone(getattr(options, "cli_path", None))
+        self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
+
+    def test_other_filters_leave_connectors_to_host_settings(self):
+        for skills_filter in ("all", ["only"]):
+            with self.subTest(skills_filter=skills_filter):
+                options = self._capture_launch_options(skills_filter)
+                self.assertNotIn("disableClaudeAiConnectors", self._launch_settings(options))
+                self.assertNotIn("ENABLE_CLAUDEAI_MCP_SERVERS", self._launch_env(options))
 
 
 # ---------------------------------------------------------------------------
