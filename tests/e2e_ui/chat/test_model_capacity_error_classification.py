@@ -1,13 +1,7 @@
-"""A model-capacity 429 must fail the turn as a classified rate-limit error.
+"""A model-capacity 429 must fail the turn as a rate-limit error with the upstream message.
 
-Production sessions log ``session turn failed for <id>: Selected model is at
-capacity. Please try a different model.`` — an upstream model-serving
-throttle (HTTP 429), not an Omnigent defect. The failed turn has to keep that
-structured reason: the chat pill names the rate limit and the persisted
-``error`` item carries ``rate_limit_exceeded``, so the failure is not counted
-as an unexplained Omnigent error. The mock endpoint refuses every call, so a
-turn that completes anyway means the scripted refusals ran out before the
-harness gave up; the test fails instead of skipping its assertions.
+The mock endpoint refuses every call, so a turn that completes anyway means the
+scripted refusals ran out; the test fails instead of skipping its assertions.
 """
 
 from __future__ import annotations

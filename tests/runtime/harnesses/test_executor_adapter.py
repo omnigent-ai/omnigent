@@ -743,6 +743,36 @@ async def test_undelivered_executor_error_classifies_by_its_sdk_cause() -> None:
         await adapter.on_shutdown()
 
 
+@pytest.mark.asyncio
+async def test_explicit_executor_code_wins_over_its_sdk_cause() -> None:
+    """An executor that names its failure keeps that code even when an SDK cause is attached."""
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    rate = _rate_limit_error("Selected model is at capacity. Please try a different model.")
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Sign in first", code="databricks_sign_in_pending", exception=rate)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_coded_429", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        assert raised.value.__cause__ is rate
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.code == "databricks_sign_in_pending"
+        assert detail.message == "Sign in first"
+    finally:
+        await adapter.on_shutdown()
+
+
 def test_build_error_detail_uses_omnigent_error_code() -> None:
     """
     :class:`OmnigentError` (and its
