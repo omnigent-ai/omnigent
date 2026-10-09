@@ -58,6 +58,7 @@ _ESCALATION_PHRASE = "consecutive connections but never responded"
 # in omnigent/process_logging.py).
 _ERROR_RECORD_RE = re.compile(r"^ERROR\b.*" + re.escape(_ESCALATION_PHRASE))
 _WARNING_RECORD_RE = re.compile(r"^WARN(?:ING)?\b.*" + re.escape(_ESCALATION_PHRASE))
+_OPERATOR_NOTICE_RE = re.compile(r"^⚠ .*" + re.escape(_ESCALATION_PHRASE), re.MULTILINE)
 
 # Ten prompt (0.5s) reconnects plus per-attempt header/credential work; the
 # first hello also waits on startup capability discovery.
@@ -312,9 +313,10 @@ def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path)
             f"host daemon exited (code {proc.returncode}) instead of retrying "
             f"on backoff\n{diagnostics}"
         )
-        assert _ESCALATION_PHRASE in console, (
-            f"the host never escalated after {endpoint.accepted_upgrades} accepted-but-silent "
-            f"connections within {_ESCALATION_DEADLINE_S:.0f}s\n{diagnostics}"
+        assert _OPERATOR_NOTICE_RE.search(console), (
+            "the host never surfaced the ⚠ operator notice after "
+            f"{endpoint.accepted_upgrades} accepted-but-silent connections "
+            f"within {_ESCALATION_DEADLINE_S:.0f}s\n{diagnostics}"
         )
         assert endpoint.accepted_upgrades >= _SILENT_CONNECT_ESCALATE_ATTEMPTS, diagnostics
 

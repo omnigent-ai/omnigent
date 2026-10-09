@@ -6638,12 +6638,8 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Repeated accepted-but-silent connections escalate to slow backoff.
-
-    The endpoint failing to answer is a server-side condition the host rides
-    out on backoff, so the escalation record must be a WARNING with server
-    attribution — never a bare ERROR (the error KPI would count the server's
-    outage as an Omnigent defect).
+    """Accepted-but-silent connections escalate once to a WARNING with server
+    attribution and slow the reconnect cadence, never a bare ERROR.
     """
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
@@ -6672,6 +6668,7 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     assert escalation.attributes["error_impact"] == "blocking"
     assert escalation.attributes["error_phase"] == "unknown"
     assert escalation.attributes["consecutive_silent_connections"] == 3
+    assert escalation.attributes["server_url"] == host._server_url
     assert capsys.readouterr().err.count("never responded") == 1
     reconnects = [
         record.message for record in caplog.records if "Reconnecting in" in record.message
@@ -6699,7 +6696,11 @@ async def test_inbound_frame_resets_silent_connect_streak(
         await host.run()
 
     assert host._silent_connect_streak == 2
-    assert not [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert not [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "silent_endpoint_escalated"
+    ]
 
 
 async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> None:
