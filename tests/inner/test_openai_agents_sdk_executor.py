@@ -2632,12 +2632,16 @@ async def test_connection_error_keeps_connection_error_classification() -> None:
     executor = OpenAIAgentsSDKExecutor(client=object())
     _FakeRunner.last_calls = []
     _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=conn_error)
-    raised: BaseException | None = None
+    raised: openai.APIConnectionError | None = None
     events: list[Any] = []
     with patch(
         "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
         return_value=_fake_agents_sdk(),
     ):
+        # Accept either shape the adapter can classify: the executor re-raising the
+        # typed exception (current behavior) or yielding a coded ExecutorError. Only
+        # the SDK's own exception is caught, so an unrelated setup failure still fails
+        # the test instead of being misread as the connection error.
         try:
             events = await _collect(
                 executor.run_turn(
@@ -2646,10 +2650,9 @@ async def test_connection_error_keeps_connection_error_classification() -> None:
                     "Be helpful.",
                 )
             )
-        except Exception as exc:
+        except openai.APIConnectionError as exc:
             raised = exc
 
-    # The adapter stamps a code either from a typed exception or from the event itself.
     if raised is not None:
         code = classify_inner_exception(raised)
     else:

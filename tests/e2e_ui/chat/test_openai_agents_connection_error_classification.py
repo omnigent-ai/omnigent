@@ -25,12 +25,16 @@ CONNECTION_ERROR_HEADLINE = (
 )
 
 
-def _unreachable_endpoint() -> str:
-    """An OpenAI-compatible base URL on a loopback port nothing listens on."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    return f"http://127.0.0.1:{port}/v1"
+def _unreachable_endpoint() -> tuple[socket.socket, str]:
+    """An OpenAI-compatible base URL on a bound-but-not-listening loopback port.
+
+    The socket is held open (never ``listen``) so connections stay refused and the
+    port cannot be reassigned mid-test; the caller must close it when done.
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    return sock, f"http://127.0.0.1:{port}/v1"
 
 
 def _create_dead_endpoint_session(base_url: str, runner_id: str, endpoint: str) -> str:
@@ -93,10 +97,11 @@ def test_refused_model_connection_keeps_connection_error_code(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    endpoint_socket, endpoint = _unreachable_endpoint()
     session_id: str | None = None
     try:
         runner_id = str(_server_state["runner_id"])
-        session_id = _create_dead_endpoint_session(live_server, runner_id, _unreachable_endpoint())
+        session_id = _create_dead_endpoint_session(live_server, runner_id, endpoint)
         page: Page = request.getfixturevalue("page")
         try:
             page.goto(f"{live_server}/c/{session_id}")
@@ -140,6 +145,7 @@ def test_refused_model_connection_keeps_connection_error_code(
             ("connection_error", "Connection error.")
         ], observed
     finally:
+        endpoint_socket.close()
         try:
             if session_id is not None:
                 httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
