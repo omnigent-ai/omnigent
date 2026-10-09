@@ -48,6 +48,11 @@ jobs:
               BOOTED=1
               break
             fi
+            if ! kill -0 "$TEST_PID" 2>/dev/null; then
+              cat /tmp/before-xcodebuild.log
+              wait "$TEST_PID"
+              exit $?
+            fi
             sleep 1
           done
           test "$BOOTED" -eq 1
