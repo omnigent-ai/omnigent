@@ -131,8 +131,14 @@ vi.mock("@/hooks/useComments", () => ({
   useDeleteComment: vi.fn(() => ({ mutate: vi.fn() })),
 }));
 
+// Default content the viewer sees unless a test overrides it. Hoisted so the
+// mock factory and the per-suite teardown share one source of truth.
+const { defaultFileContent } = vi.hoisted(() => ({
+  defaultFileContent: { data: { content: "", path: "file1.py" } },
+}));
+
 vi.mock("@/hooks/useFileContent", () => ({
-  useFileContent: vi.fn(() => ({ data: { content: "", path: "file1.py" } })),
+  useFileContent: vi.fn(() => defaultFileContent),
 }));
 
 vi.mock("@/hooks/useFileDiff", () => ({
@@ -180,6 +186,7 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useFileContent } from "@/hooks/useFileContent";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
@@ -1920,6 +1927,67 @@ describe("FileViewer Escape closes the active tab", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     window.removeEventListener("keydown", swallow, { capture: true });
     expect(onCloseTab).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileViewer binary files", () => {
+  // Binary files render CodeViewer's "Preview not available" notice; Monaco
+  // would only show their bytes as replacement characters, so the diff toggle
+  // is suppressed even when the file is a changed file.
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  it.each(["bundle.zip", "recording.mp4"])(
+    "suppresses the diff toggle for %s even when it is a changed file",
+    (path) => {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      renderViewer({ open: true, path });
+      expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    },
+  );
+});
+
+describe("FileViewer binary files identified by content metadata", () => {
+  // Some binary files carry no extension the classifier recognizes and are
+  // identified only once the server reports base64 content. The diff toggle
+  // must still be suppressed once that metadata resolves.
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(useFileContent).mockReturnValue({
+      data: {
+        object: "session.environment.filesystem.file_content",
+        path: "datablob",
+        content_type: null,
+        encoding: "base64",
+        content: "AAAA",
+        bytes: 4,
+      },
+    } as unknown as ReturnType<typeof useFileContent>);
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [
+          { path: "datablob", bytes: 4, modified_at: null, name: "datablob", status: "modified" },
+        ],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+  });
+
+  afterEach(() => {
+    vi.mocked(useFileContent).mockReturnValue(
+      defaultFileContent as unknown as ReturnType<typeof useFileContent>,
+    );
+  });
+
+  it("suppresses the diff toggle for base64 content with an unrecognized extension", () => {
+    renderViewer({ open: true, path: "datablob" });
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
   });
 });
 

@@ -8,7 +8,8 @@
 //
 // The query is disabled unless the file appears in the changed-files list
 // (only files that were created, modified, or deleted this session have diff
-// data) and the runner is online.
+// data), the runner is online, and the caller has not opted out (the file
+// viewer disables it for media/binary files it never diffs).
 
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
@@ -56,8 +57,13 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
  * - `conversationId` or `path` is null / undefined
  * - the runner is offline
  * - the file does not appear in the session's changed-files list
+ * - the caller passes `enabled: false` (e.g. a file the viewer never diffs)
  */
-export function useFileDiff(conversationId: string | undefined, path: string | null) {
+export function useFileDiff(
+  conversationId: string | undefined,
+  path: string | null,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
   const serveable = useWorkspaceServeable(conversationId);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
@@ -65,7 +71,7 @@ export function useFileDiff(conversationId: string | undefined, path: string | n
   return useQuery({
     queryKey: ["file-diff", conversationId, path],
     queryFn: () => fetchFileDiff(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false && isInChangedFiles,
+    enabled: enabled && !!conversationId && !!path && serveable !== false && isInChangedFiles,
     staleTime: 5_000,
   });
 }

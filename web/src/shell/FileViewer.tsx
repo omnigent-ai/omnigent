@@ -401,7 +401,6 @@ function FileViewerBody({
   // (embedded in the desktop aside, never a fixed overlay).
   const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
   const fileQuery = useFileContent(conversationId, path);
-  const diffQuery = useFileDiff(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -688,16 +687,24 @@ function FileViewerBody({
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
-  // Monaco — mirrors CodeViewer's own base64/binary-path check.
+  // Monaco — mirrors CodeViewer's own base64/binary-path check. They have no
+  // text representation either, so diff is suppressed for them as well.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
     !isImage &&
     !isPdf &&
     !isModel &&
+    !isBinary &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  // Enable the prefetch once file classification settles: while content is still
+  // pending the type checks fall back to the extension, so an encoding-only binary
+  // would fetch a diff never shown. Deleted files always diff against prior content.
+  const diffQuery = useFileDiff(conversationId, path, {
+    enabled: isDiffAvailable && (!fileQuery.isPending || isDeletedFile),
+  });
   const revealTarget = useRevealTarget(path);
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
