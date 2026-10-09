@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -1335,6 +1336,45 @@ async def test_external_session_superseded_drains_pending_inputs(
         pending_inputs.reset_for_tests()
 
 
+async def test_external_session_superseded_leaves_interrupted_entries_hidden(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The ``/clear`` drain settles live entries and stops at the ones the person cancelled.
+
+    The drain still ends, the ``/clear`` entry is gone, and the cancelled entry
+    stays hidden (not in the snapshot, not "working") until the TTL evicts it.
+    """
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    try:
+        cancelled = pending_inputs.record(
+            session["id"], [{"type": "input_text", "text": "cancel me"}]
+        )
+        pending_inputs.mark_interrupted(session["id"], [cancelled])
+        pending_inputs.record(session["id"], [{"type": "input_text", "text": "/clear"}])
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d"},
+            },
+        )
+        assert resp.status_code in (200, 202)
+
+        assert pending_inputs.snapshot_for(session["id"]) == []
+        assert pending_inputs.has_pending(session["id"]) is False
+        assert pending_inputs.pending_ids(session["id"]) == [cancelled]
+        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        assert not any(item["type"] == "message" for item in items)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
@@ -1540,6 +1580,7 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from omnigent.server.routes.sessions import routes_events as event_routes
 
@@ -1588,6 +1629,22 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
         app=app, headers=Headers({}), owner=None, runner_id="runner-a", batch=batch
     )
     assert first.applied == 1 and first.retryable
+    (failure,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_event_ingest_failed"
+    ]
+    assert failure.session_id == session["id"]
+    assert failure.attributes == {
+        "runner_id": "runner-a",
+        "batch_id": "first",
+        "batch_size": 2,
+        "applied_count": 1,
+        "event_type": "external_conversation_item",
+        "failure_stage": "apply",
+        "error_type": "RuntimeError",
+        "retryable": True,
+    }
     retry = await ingest(
         app=app,
         headers=Headers({}),
@@ -1599,6 +1656,13 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     assert [event["type"] for event in published].count("response.output_text.delta") == 1
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     assert [item["content"][0]["text"] for item in items] == ["saved"]
+    assert (
+        sum(
+            getattr(record, "event_name", None) == "runner_event_ingest_failed"
+            for record in caplog.records
+        )
+        == 1
+    )
 
 
 async def test_runner_ingest_retries_internal_server_failures(
@@ -2393,6 +2457,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert "<user_request>\nreview this rollout\n</user_request>" in text
     assert "Use the load_skill tool" not in text
 
+    # The bundle revision lets the runner notice a reinstall under the same id.
+    assert forwarded[0].pop("agent_revision").startswith(f"{agent['id']}/")
     assert forwarded == [
         {
             "type": "message",
@@ -2424,6 +2490,88 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     session_resp = await client.get(f"/v1/sessions/{session['id']}")
     assert session_resp.status_code == 200, session_resp.text
     assert session_resp.json()["title"] == "/grill-me review this rollout"
+
+
+@pytest.mark.parametrize("in_sub_agent", [False, True])
+@pytest.mark.parametrize(
+    ("available", "status", "expected_names"),
+    [(["code-review"], 202, ["review", "code-review"]), (["other"], 400, ["review"])],
+)
+async def test_skill_slash_command_retries_frontmatter_name_on_older_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    available: list[str],
+    status: int,
+    expected_names: list[str],
+    in_sub_agent: bool,
+) -> None:
+    """
+    A runner from before directory-name invocation knows a bundled skill by
+    its frontmatter name, so the server retries with that name once the
+    runner rejects the directory name and lists the frontmatter name. A
+    declared sub-agent session takes the name from its own skills.
+    """
+    resolved: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Emulate an older runner that resolves only ``code-review``.
+
+        :param request: Request sent to the fake runner.
+        :returns: Meta text for ``code-review``, a 404 for other names, or
+            an accepted response for ``/events``.
+        """
+        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
+            name = json.loads(request.content)["name"]
+            resolved.append(name)
+            if name != "code-review":
+                return httpx.Response(
+                    404, json={"error": "skill_not_found", "available": available}
+                )
+            skill = SkillSpec(name=name, description="Review changes.", content="Look hard.")
+            return httpx.Response(200, json={"meta_text": format_skill_meta_text(skill, "")})
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        skills = [
+            {
+                "dir": "review",
+                "name": "code-review",
+                "description": "Review changes.",
+                "content": "Look hard.",
+            }
+        ]
+        agent = await create_test_agent(
+            client,
+            name="skill-agent",
+            skills=None if in_sub_agent else skills,
+            sub_agents=[{"name": "worker", "skills": skills}] if in_sub_agent else None,
+        )
+        session = await _create_session(client, agent["id"])
+        if in_sub_agent:
+            child = await client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": agent["id"],
+                    "parent_session_id": session["id"],
+                    "sub_agent_name": "worker",
+                    "title": "worker:review",
+                },
+            )
+            assert child.status_code == 201, child.text
+            session = child.json()
+
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "slash_command", "data": {"kind": "skill", "name": "review"}},
+        )
+
+    assert resp.status_code == status, resp.text
+    assert resolved == expected_names
 
 
 async def test_skill_slash_command_keeps_existing_title(
@@ -2588,7 +2736,7 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
@@ -5122,6 +5270,8 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         _runner_id: str,
         _runner_client: _RecoveringRunnerClient,
         _conversation_store: Any,
+        *,
+        conversation: Any = None,
     ) -> None:
         """
         Skip relay startup; this test targets the PATCH init branch.
@@ -5130,6 +5280,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         :param _runner_id: Runner id, e.g. ``"runner_recovered"``.
         :param _runner_client: Runner client stub.
         :param _conversation_store: Conversation store from the route.
+        :param conversation: Saved session row from the route.
         :returns: None.
         """
         relay_bindings.append((_session_id, _runner_id))
@@ -5496,6 +5647,96 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     assert snapshot_resp.json()["last_task_error"] == {
         **expected,
         "agent_name": "claude-native-ui",
+    }
+
+
+_OLD_CLI_DETAIL = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
+)
+_OLD_CLI_CARD = {
+    "title": "Claude Code needs an update",
+    "cause": (
+        "Claude Code 2.1.217 on the host doesn't support this model; "
+        "version 2.1.280 or newer is required."
+    ),
+    "remediation": "Run `claude update` on the host, then start a new session.",
+}
+
+
+@pytest.mark.parametrize("wire_output", [False, True])
+@pytest.mark.parametrize(
+    ("detail", "expected_code", "card"),
+    [
+        (
+            'API Error: 499 {"error_code":"CANCELLED","message":""}',
+            "transient_upstream_error",
+            {},
+        ),
+        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD),
+    ],
+)
+async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wire_output: bool,
+    detail: str,
+    expected_code: str,
+    card: dict[str, str],
+) -> None:
+    """A gateway 499 is retryable and an old-CLI refusal names its fix, live and on reload."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    response_id = "resp_native_coded_failure"
+    item_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": "src_native_coded_failure",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": detail}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if wire_output:
+        data["output"] = detail
+    status_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [event for event in published if event.get("status") == "failed"]
+    assert len(failed_events) == 1
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected_code
+    assert error["message"] == detail
+    for field in ("title", "cause", "remediation"):
+        assert error[field] == card.get(field)
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    assert snapshot_resp.json()["last_task_error"] == {
+        "code": expected_code,
+        "message": detail,
+        "agent_name": "claude-native-ui",
+        **card,
     }
 
 
@@ -9893,10 +10134,12 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
 @pytest.mark.parametrize(
     "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
 )
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     case: str,
+    event_type: str,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions.common import (
@@ -9919,6 +10162,22 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     )
     assert child_response.status_code == 202, child_response.text
     child_id = child_response.json()["child_session_id"]
+    item_response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex",
+                    "content": [{"type": "output_text", "text": "Keep this side-chat answer."}],
+                },
+            },
+        },
+    )
+    assert item_response.status_code == 202, item_response.text
+    transcript = (await client.get(f"/v1/sessions/{child_id}/items")).json()
     try:
         _session_status_cache[child_id] = "idle" if case in ("idle", "request_idle") else "running"
         if case == "cache":
@@ -9941,7 +10200,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
                 data["response_id"] = "unrelated_response"
             with patch.object(routes_events, "_publish_interrupted") as publish_interrupted:
                 response = await client.post(
-                    f"/v1/sessions/{child_id}/events", json={"type": "interrupt", "data": data}
+                    f"/v1/sessions/{child_id}/events", json={"type": event_type, "data": data}
                 )
             publish_interrupted.assert_not_called()
 
@@ -9966,6 +10225,17 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
             assert response.json() == {"queued": False}
         assert parent["id"] not in _interrupt_fenced_sessions
         assert child_id not in _interrupt_fenced_sessions
+        child = (await client.get(f"/v1/sessions/{child_id}")).json()
+        closed = event_type == "stop_session" and expected_status == 202
+        assert (child["labels"].get("omnigent.closed") == "true") is closed
+        assert (await client.get(f"/v1/sessions/{child_id}/items")).json() == transcript
+        if closed:
+            with patch.object(routes_events, "_get_runner_client") as get_runner:
+                repeated = await client.post(
+                    f"/v1/sessions/{child_id}/events", json={"type": "stop_session", "data": {}}
+                )
+            assert repeated.status_code == 202, repeated.text
+            get_runner.assert_not_called()
     finally:
         _interrupt_fenced_sessions.discard(child_id)
         _session_active_response_cache.pop(child_id, None)
@@ -10015,6 +10285,446 @@ async def test_interrupt_forward_success_keeps_stop_fence(
         finally:
             if session_id is not None:
                 _interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_interrupt_forward_success_marks_queued_native_messages_interrupted(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A delivered interrupt settles the web messages queued when Stop was pressed.
+
+    The web client clears those bubbles itself and the agent may never record
+    them, so the server stops showing them as pending (session list, reload).
+    A message queued while the interrupt was still in flight is one the person
+    sent after Stop and stays live.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    sent_after_stop: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the interrupt; the person sends another message while it is in flight."""
+        del request
+        sent_after_stop.append(
+            pending_inputs.record(session_id, [{"type": "input_text", "text": "after stop"}])
+        )
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        try:
+            queued_at_stop = [
+                pending_inputs.record(session_id, [{"type": "input_text", "text": text}])
+                for text in ("first", "second")
+            ]
+
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+            )
+
+            assert resp.status_code == 202, resp.text
+            assert len(sent_after_stop) == 1
+            snapshot = pending_inputs.snapshot_for(session_id)
+            assert [entry["pending_id"] for entry in snapshot] == sent_after_stop
+            assert pending_inputs.has_pending(session_id)
+            # The cancelled entries are flagged, not dropped: the next match settles them.
+            assert pending_inputs.pending_ids(session_id) == [*queued_at_stop, *sent_after_stop]
+        finally:
+            pending_inputs.reset_for_tests()
+            _interrupt_fenced_sessions.discard(session_id)
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        # Runner unreachable: the 5s POST raises.
+        "transport_error",
+        # WS tunnel closed mid-POST: a BARE ConnectionError, not an httpx.HTTPError.
+        "bare_connection_error",
+        # Runner reachable but the cancel didn't land.
+        "runner_503",
+        # No runner client resolves at all: nothing was forwarded anywhere.
+        "no_runner_client",
+    ],
+)
+async def test_interrupt_forward_failure_keeps_queued_native_messages_pending(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """
+    An interrupt that did not land leaves the queued web messages untouched.
+
+    The turn keeps running, so the agent may still record those messages:
+    hiding them or settling them quietly would lose the undelivered report if
+    it does not.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Fail the interrupt POST."""
+        del request
+        if failure_mode == "transport_error":
+            raise httpx.ConnectError("runner unreachable")
+        if failure_mode == "bare_connection_error":
+            raise ConnectionError("tunnel closed mid-request")
+        return httpx.Response(503, json={"error": "claude_native_interrupt_failed"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Any = None,
+    ) -> httpx.AsyncClient | None:
+        """Resolve every session to the failing fake runner (or to none)."""
+        del session_id, runner_router, conversation
+        return None if failure_mode == "no_runner_client" else fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    pending_inputs.reset_for_tests()
+    session_id: str | None = None
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        session_id = session["id"]
+        queued = pending_inputs.record(session_id, [{"type": "input_text", "text": "still live"}])
+
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "interrupt", "data": {}},
+        )
+
+        assert resp.status_code == 202, resp.text
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(session_id)] == [queued]
+        assert pending_inputs.has_pending(session_id)
+    finally:
+        pending_inputs.reset_for_tests()
+        if session_id is not None:
+            _interrupt_fenced_sessions.discard(session_id)
+        await fake_runner.aclose()
+
+
+async def test_interrupt_codex_side_chat_leaves_queued_native_messages_pending(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Interrupting a Codex side chat cancels one side turn, not the queued messages.
+
+    The interrupt is forwarded to the parent's runner for the side thread only,
+    so neither the parent's nor the side chat's queued web messages are settled.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import (
+        _interrupt_fenced_sessions,
+        _session_status_cache,
+    )
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    child_response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert child_response.status_code == 202, child_response.text
+    child_id = child_response.json()["child_session_id"]
+    queued = {
+        sid: pending_inputs.record(sid, [{"type": "input_text", "text": f"queued on {name}"}])
+        for sid, name in ((parent["id"], "parent"), (child_id, "side chat"))
+    }
+    try:
+        _session_status_cache[child_id] = "running"
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+            base_url="http://runner",
+        ) as runner:
+            monkeypatch.setattr(
+                sessions_module, "_get_runner_client", AsyncMock(return_value=runner)
+            )
+            with patch.object(
+                pending_inputs, "mark_interrupted", wraps=pending_inputs.mark_interrupted
+            ) as mark_interrupted:
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "interrupt", "data": {"response_id": "codex_turn_side"}},
+                )
+
+        # 202: the side-chat interrupt landed, which is when a top-level queue gets marked.
+        assert response.status_code == 202, response.text
+        mark_interrupted.assert_not_called()
+        for sid, pending_id in queued.items():
+            snapshot = pending_inputs.snapshot_for(sid)
+            assert [entry["pending_id"] for entry in snapshot] == [pending_id], sid
+    finally:
+        pending_inputs.reset_for_tests()
+        _interrupt_fenced_sessions.discard(child_id)
+        _session_status_cache.pop(child_id, None)
+
+
+@asynccontextmanager
+async def _codex_native_session(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    interrupt_status: int = 202,
+) -> AsyncIterator[tuple[str, list[tuple[str, dict[str, Any]]]]]:
+    """
+    Scope a codex-native session whose runner answers every interrupt with one status.
+
+    Captures the published events, and clears the pending-input index and the
+    stop fence on exit.
+
+    :param client: The test HTTP client.
+    :param monkeypatch: Used to capture published events and route to the runner.
+    :param interrupt_status: The runner's reply; a 2xx lands the interrupt, a
+        4xx/5xx is one that did not.
+    :yields: The session id and the list the published events are captured into.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    session_id = session["id"]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(interrupt_status)),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        try:
+            yield session_id, published
+        finally:
+            pending_inputs.reset_for_tests()
+            _interrupt_fenced_sessions.discard(session_id)
+
+
+def _queue_web_message(session_id: str, text: str) -> str:
+    """Record a native web message as the message route does; returns its pending id."""
+    from omnigent.runtime import pending_inputs
+
+    return pending_inputs.record(session_id, [{"type": "input_text", "text": text}])
+
+
+async def _press_stop(client: httpx.AsyncClient, session_id: str) -> None:
+    """POST an interrupt, as the web client's Stop button does."""
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+    )
+    assert response.status_code == 202, response.text
+
+
+async def _mirror_user_message(
+    client: httpx.AsyncClient, session_id: str, text: str, source_id: str
+) -> dict[str, Any]:
+    """
+    Post the transcript mirror of a user message, as a native forwarder does.
+
+    :param client: The test HTTP client.
+    :param session_id: The native session the message was sent to.
+    :param text: The text the agent recorded, e.g. ``"go on"``.
+    :param source_id: The forwarder's retry-safe id for the record, e.g. ``"codex:go-on:0"``.
+    :returns: The response body, which carries the persisted ``item_id``.
+    """
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": f"native_turn_{source_id}",
+                "source_id": source_id,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    return response.json()
+
+
+async def _persisted_user_texts_and_error_codes(
+    client: httpx.AsyncClient, session_id: str
+) -> tuple[list[str], list[str]]:
+    """Return the session's persisted user message texts and error codes, in order."""
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    user_texts = [
+        block["text"]
+        for item in items
+        if item["type"] == "message" and item["role"] == "user"
+        for block in item["content"]
+    ]
+    return user_texts, [item["code"] for item in items if item["type"] == "error"]
+
+
+def _consumed_pending_ids(published: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    """The pending ids the published ``session.input.consumed`` events cleared, in order."""
+    return [
+        event["data"]["cleared_pending_id"]
+        for _sid, event in published
+        if event.get("type") == "session.input.consumed"
+    ]
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+async def test_interrupted_native_message_is_not_reported_undelivered_by_a_later_mirror(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    delivered: bool,
+) -> None:
+    """
+    A message cancelled with Stop before the agent recorded it is not an error later.
+
+    The person sends a message and presses Stop before Codex records it, then
+    sends another. Without the interrupt landing, the next mirror jumps over
+    the first entry and persists it with a ``native_prompt_not_recorded`` error
+    (the ``delivered=False`` control). With it landed, the first entry is
+    settled quietly and only the message the agent did record is persisted.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(
+        client, monkeypatch, interrupt_status=202 if delivered else 503
+    ) as (session_id, published):
+        cancelled = _queue_web_message(session_id, "cancel me")
+        await _press_stop(client, session_id)
+        # The person's next message, sent after Stop, which the agent records.
+        kept = _queue_web_message(session_id, "go on")
+        await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        # Both entries are gone either way; what differs is whether the
+        # cancelled message is recorded as lost.
+        assert pending_inputs.pending_ids(session_id) == []
+        assert pending_inputs.snapshot_for(session_id) == []
+        if delivered:
+            assert error_codes == []
+            assert user_texts == ["go on"]
+            assert _consumed_pending_ids(published) == [kept]
+        else:
+            assert error_codes == ["native_prompt_not_recorded"]
+            assert user_texts == ["cancel me", "go on"]
+            assert _consumed_pending_ids(published) == [cancelled, kept]
+
+
+async def test_message_resent_after_stop_takes_the_mirror_of_the_same_text(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Stop, then resend the same text: the resend is the message the agent records.
+
+    Matching the cancelled copy first would leave the resend queued, so the next
+    unrelated mirror would persist it with a ``native_prompt_not_recorded`` error.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        _queue_web_message(session_id, "continue")
+        await _press_stop(client, session_id)
+        resent = _queue_web_message(session_id, "continue")
+        await _mirror_user_message(client, session_id, "continue", "codex:continue:0")
+        then = _queue_web_message(session_id, "then this")
+        await _mirror_user_message(client, session_id, "then this", "codex:then-this:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert user_texts == ["continue", "then this"]
+        assert error_codes == []
+        assert _consumed_pending_ids(published) == [resent, then]
+        assert pending_inputs.pending_ids(session_id) == []
+
+
+async def test_cancelled_message_the_agent_did_record_drains_as_matched(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The agent recorded the message before the Stop landed: its mirror still settles it.
+
+    The exact mirror drains the flagged entry as the match: one user message, no
+    error, and the receipt names its pending id. A forwarder retry of the same
+    mirror persists and publishes nothing more.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        cancelled = _queue_web_message(session_id, "cancel me")
+        await _press_stop(client, session_id)
+        assert pending_inputs.snapshot_for(session_id) == []
+
+        first = await _mirror_user_message(client, session_id, "cancel me", "codex:cancel-me:0")
+        retry = await _mirror_user_message(client, session_id, "cancel me", "codex:cancel-me:0")
+
+        user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
+        assert user_texts == ["cancel me"]
+        assert error_codes == []
+        assert _consumed_pending_ids(published) == [cancelled]
+        assert retry["item_id"] == first["item_id"]
+        assert pending_inputs.pending_ids(session_id) == []
+
+
+async def test_btw_sidechat_event_leaves_an_unrelated_queued_web_message_in_place(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A relayed ``/btw`` overlay settles nothing: a web message queued meanwhile keeps its entry.
+
+    A web ``/btw`` is never queued, so no entry belongs to the overlay. Settling the
+    oldest one would drop the other message's entry, and its own mirror would then
+    find nothing to settle.
+    """
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        queued = _queue_web_message(session_id, "go on")
+
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_btw_sidechat",
+                "data": {"question": "what is this?", "answer": "A test."},
+            },
+        )
+
+        assert response.status_code == 202, response.text
+        overlays = [
+            event for _sid, event in published if event.get("type") == "session.btw_sidechat"
+        ]
+        assert [(o["question"], o["answer"]) for o in overlays] == [("what is this?", "A test.")]
+        snapshot = pending_inputs.snapshot_for(session_id)
+        assert [entry["pending_id"] for entry in snapshot] == [queued]
+
+        await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
+
+        assert _consumed_pending_ids(published) == [queued]
+        assert pending_inputs.pending_ids(session_id) == []
 
 
 @dataclass
@@ -10760,6 +11470,141 @@ async def test_patch_permission_mode_rejects_non_claude_session(
 
     assert resp.status_code == 400, resp.text
     assert "permission_mode is only supported" in resp.text
+
+
+async def test_patch_session_effort_forwards_only_when_value_changes(
+    client: httpx.AsyncClient,
+) -> None:
+    """Repeated effort PATCHes do not reinject the effort command."""
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            body = json.loads(request.content) if request.content else None
+            captured.append(_ForwardedEffort(url=str(request.url), body=body))
+            return httpx.Response(204)
+        if request.method == "POST":
+            # Session setup traffic expects the runner's queued-response shape.
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(204)
+
+    def _change_events(session_id: str) -> list[dict[str, Any] | None]:
+        return [
+            forwarded.body
+            for forwarded in captured
+            if forwarded.url.endswith(f"/v1/sessions/{session_id}/events")
+            and isinstance(forwarded.body, dict)
+            and forwarded.body.get("type") == "effort_change"
+        ]
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(None)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        session_id = session["id"]
+        set_runner_client(fake_runner)
+        captured.clear()
+
+        changed = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"reasoning_effort": "high"},
+        )
+        assert changed.status_code == 200, changed.text
+        assert _change_events(session_id) == [{"type": "effort_change", "effort": "high"}]
+
+        captured.clear()
+        unchanged = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"reasoning_effort": "high"},
+        )
+        assert unchanged.status_code == 200, unchanged.text
+        assert unchanged.json()["reasoning_effort"] == "high"
+        assert _change_events(session_id) == []
+
+        captured.clear()
+        cleared = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"reasoning_effort": "default"},
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["reasoning_effort"] is None
+        assert _change_events(session_id) == [{"type": "effort_change", "effort": None}]
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+
+async def test_patch_session_effort_forwards_after_concurrent_silent_write(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale route snapshot must not hide a real effort change in storage."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.update_conversation(session_id, reasoning_effort="high")
+    captured: list[dict[str, Any]] = []
+    runtime_effort = "high"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal runtime_effort
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            body = json.loads(request.content)
+            if body.get("type") == "effort_change":
+                captured.append(body)
+                runtime_effort = body["effort"]
+            return httpx.Response(204)
+        return httpx.Response(202, json={"queued": True})
+
+    entered_update = threading.Event()
+    resume_update = threading.Event()
+    original_update = SqlAlchemyConversationStore.update_conversation_with_changes
+
+    def paused_update(
+        self: SqlAlchemyConversationStore, conversation_id: str, **kwargs: Any
+    ) -> Any:
+        if conversation_id == session_id and kwargs.get("reasoning_effort") == "high":
+            entered_update.set()
+            assert resume_update.wait(timeout=5), "Timed out waiting for concurrent write"
+        return original_update(self, conversation_id, **kwargs)
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "update_conversation_with_changes", paused_update
+    )
+    async with _runtime_runner(handler):
+        pending = asyncio.create_task(
+            client.patch(f"/v1/sessions/{session_id}", json={"reasoning_effort": "high"})
+        )
+        try:
+            assert await asyncio.to_thread(entered_update.wait, 5)
+            mirrored = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"reasoning_effort": "medium", "silent": True},
+            )
+            assert mirrored.status_code == 200, mirrored.text
+            assert mirrored.json()["reasoning_effort"] == "medium"
+            assert captured == []
+            # A silent write mirrors an effort the native pane already applied.
+            runtime_effort = "medium"
+        finally:
+            resume_update.set()
+            response = await pending
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reasoning_effort"] == "high"
+    assert captured == [{"type": "effort_change", "effort": "high"}]
+    assert runtime_effort == "high"
+    saved = store.get_conversation(session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == runtime_effort
 
 
 @pytest.mark.parametrize(

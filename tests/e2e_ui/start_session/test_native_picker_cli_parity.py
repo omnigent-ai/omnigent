@@ -207,18 +207,29 @@ def _subprocess_pythonpath() -> str:
 
 
 def _sanitized_env() -> dict[str, str]:
-    env = dict(os.environ)
-    for key in list(env):
-        if key.startswith(("OMNIGENT_RUNNER", "OMNIGENT_PROCESS", "ANTHROPIC_", "OPENAI_")):
-            env.pop(key)
-    for key in ("CLAUDECODE", "RUNNER_SERVER_URL", "OMNIGENT", "CODEX_HOME"):
-        env.pop(key, None)
+    state_names = {"CLAUDE_CODE", "CLAUDECODE", "CODEX", "RUNNER_SERVER_URL", "OMNIGENT"}
+    state_prefixes = (
+        "ANTHROPIC_",
+        "CLAUDE_CODE_",
+        "CODEX_",
+        "DATABRICKS_",
+        "OPENAI_",
+        "OMNIGENT_",
+        "_OMNIGENT_",
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in state_names and not key.startswith(state_prefixes)
+    }
+    env["OMNIGENT_SKIP_ONBOARD"] = "1"
+    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
     env["PYTHONPATH"] = _subprocess_pythonpath()
     return env
 
 
 def _build_codex_source_home(
-    root: Path, home: Path, *, custom_catalog: bool
+    root: Path, home: Path, *, custom_catalog: bool, hidden_default: bool = False
 ) -> tuple[list[str], str]:
     """Configure the isolated CLI with a default and an optional custom catalog.
 
@@ -228,9 +239,18 @@ def _build_codex_source_home(
     assert codex is not None
     bundled_home = root / "codex-bundled-probe"
     bundled_home.mkdir(parents=True, exist_ok=True)
+    temp_dir = root / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    xdg_dirs = {name: root / f"bundled-xdg-{name}" for name in ("config", "data", "cache")}
+    for path in xdg_dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
     env = _sanitized_env()
     env["HOME"] = str(home)
     env["CODEX_HOME"] = str(bundled_home)
+    env["TMPDIR"] = str(temp_dir)
+    env["XDG_CONFIG_HOME"] = str(xdg_dirs["config"])
+    env["XDG_DATA_HOME"] = str(xdg_dirs["data"])
+    env["XDG_CACHE_HOME"] = str(xdg_dirs["cache"])
     bundled = json.loads(
         subprocess.run(
             [codex, "debug", "models", "--bundled"],
@@ -267,7 +287,13 @@ def _build_codex_source_home(
     codex_home = home / ".codex"
     codex_home.mkdir(parents=True, exist_ok=True)
     catalog_path = codex_home / "model-catalog.json"
-    default_model = _CODEX_CONFIGURED_DEFAULT if custom_catalog else visible[-1]["slug"]
+    default_model = (
+        _CODEX_HIDDEN_SLUG
+        if hidden_default
+        else _CODEX_CONFIGURED_DEFAULT
+        if custom_catalog
+        else visible[-1]["slug"]
+    )
     catalog_setting = ""
     if custom_catalog:
         catalog_path.write_text(json.dumps(catalog))
@@ -308,7 +334,9 @@ class PickerRig:
         return "\n".join(parts)
 
 
-@pytest.fixture(scope="module", params=["structured-custom", "legacy-bundled"])
+@pytest.fixture(
+    scope="module", params=["structured-custom", "structured-hidden-default", "legacy-bundled"]
+)
 def picker_rig(
     built_spa: None, tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
 ) -> Iterator[PickerRig]:
@@ -322,9 +350,15 @@ def picker_rig(
     stub_bin.mkdir()
     stub = stub_bin / "claude"
     legacy = request.param == "legacy-bundled"
+    hidden_default = request.param == "structured-hidden-default"
     stub.write_text(_CLAUDE_STUB.replace("LEGACY = False", f"LEGACY = {legacy}"))
     stub.chmod(0o755)
-    codex_visible, codex_default = _build_codex_source_home(root, home, custom_catalog=not legacy)
+    codex_visible, codex_default = _build_codex_source_home(
+        root,
+        home,
+        custom_catalog=not legacy,
+        hidden_default=hidden_default,
+    )
 
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -333,6 +367,18 @@ def picker_rig(
     logs = []
 
     server_env = _sanitized_env()
+    server_home = root / "server-home"
+    server_tmp = root / "server-tmp"
+    server_xdg = {name: root / f"server-xdg-{name}" for name in ("config", "data", "cache")}
+    server_home.mkdir()
+    server_tmp.mkdir()
+    for path in server_xdg.values():
+        path.mkdir()
+    server_env["HOME"] = str(server_home)
+    server_env["TMPDIR"] = str(server_tmp)
+    server_env["XDG_CONFIG_HOME"] = str(server_xdg["config"])
+    server_env["XDG_DATA_HOME"] = str(server_xdg["data"])
+    server_env["XDG_CACHE_HOME"] = str(server_xdg["cache"])
     server_env["OMNIGENT_CONFIG_HOME"] = str(root / "server-config-home")
     server_env["OMNIGENT_DATA_DIR"] = str(root / "server-data")
     server_handle = open(server_log, "w")  # noqa: SIM115 — subprocess lifetime
@@ -361,6 +407,15 @@ def picker_rig(
     host_env = _sanitized_env()
     host_env["HOME"] = str(home)
     host_env["PATH"] = f"{stub_bin}{os.pathsep}{os.environ['PATH']}"
+    host_tmp = root / "host-tmp"
+    host_xdg = {name: root / f"host-xdg-{name}" for name in ("config", "data", "cache")}
+    host_tmp.mkdir()
+    for path in host_xdg.values():
+        path.mkdir()
+    host_env["TMPDIR"] = str(host_tmp)
+    host_env["XDG_CONFIG_HOME"] = str(host_xdg["config"])
+    host_env["XDG_DATA_HOME"] = str(host_xdg["data"])
+    host_env["XDG_CACHE_HOME"] = str(host_xdg["cache"])
     host_env["OMNIGENT_CONFIG_HOME"] = str(root / "host-config-home")
     host_env["OMNIGENT_DATA_DIR"] = str(root / "host-data")
     host_handle = open(host_log, "w")  # noqa: SIM115 — subprocess lifetime
@@ -463,6 +518,17 @@ def _pick_agent(page: Page, label: str) -> None:
 _MODELS_SECTION_TESTID = "new-chat-landing-agent-models"
 
 
+def _dismiss_setup_review(page: Page) -> None:
+    """Confirm the first-connection inventory review when it appears."""
+    dialog = page.get_by_role("dialog", name="Your setup is ready", exact=True)
+    with contextlib.suppress(PlaywrightError):
+        dialog.wait_for(state="visible", timeout=5_000)
+    if not dialog.is_visible():
+        return
+    dialog.get_by_role("button", name="Confirm", exact=True).click()
+    expect(dialog).to_have_count(0, timeout=10_000)
+
+
 def _expand_agent_config(page: Page, label: str) -> None:
     """Open the selected agent row's config flyout with the keyboard.
 
@@ -515,16 +581,42 @@ def _model_rows(page: Page, rig: PickerRig, agent_label: str) -> list[dict[str, 
     )
 
 
+def _codex_model_options(rig: PickerRig) -> list[dict[str, object]]:
+    """Read the real host model-options response for the configured Codex."""
+    response = httpx.get(
+        f"{rig.base_url}/v1/hosts/{rig.host_id}/harnesses/codex-native/model-options",
+        timeout=10,
+    )
+    assert response.status_code == 200, response.text
+    models = response.json().get("models")
+    assert isinstance(models, list), response.text
+    return models
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [
+        pytest.param({"width": 1440, "height": 900}, id="desktop"),
+        pytest.param({"width": 390, "height": 844}, id="mobile"),
+    ],
+)
 def test_codex_picker_offers_the_clis_catalog_and_default(
-    page: Page, picker_rig: PickerRig
+    page: Page, picker_rig: PickerRig, viewport: dict[str, int]
 ) -> None:
     """The Codex picker preserves configured or bundled choices and a new selection."""
+    page.set_viewport_size(viewport)
     page.goto(picker_rig.base_url)
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
+    _dismiss_setup_review(page)
     _pick_agent(page, "Codex")
 
     rows = _model_rows(page, picker_rig, "Codex")
     row_ids = [row["id"] for row in rows]
+
+    if picker_rig.codex_default == _CODEX_HIDDEN_SLUG:
+        api_rows = _codex_model_options(picker_rig)
+        assert {row.get("id") for row in api_rows} == set(picker_rig.codex_visible_slugs)
+        assert not any(row.get("isDefault") is True for row in api_rows)
 
     missing = [slug for slug in picker_rig.codex_visible_slugs if slug not in row_ids]
     assert not missing, (
@@ -542,13 +634,28 @@ def test_codex_picker_offers_the_clis_catalog_and_default(
     assert not hidden, f"hidden catalog entries must stay absent from the picker: {hidden}"
 
     checked = [row["id"] for row in rows if row["checked"] == "true"]
-    assert checked == [picker_rig.codex_default], (
-        f"the picker marks {checked} as the default choice; the CLI's effective default under "
-        f"this config.toml is model = {picker_rig.codex_default!r}"
-    )
+    if picker_rig.codex_default == _CODEX_HIDDEN_SLUG:
+        picker = page.get_by_test_id("new-chat-landing-agent-select")
+        expect(picker).to_have_attribute("aria-label", "Codex, Model Default")
+        expect(picker).to_contain_text("Default")
+        expect(picker).not_to_contain_text("Models unavailable")
+        harness_default = page.get_by_test_id(_MODELS_SECTION_TESTID).get_by_role(
+            "menuitemcheckbox", name="Harness default", exact=True
+        )
+        expect(harness_default).to_have_attribute("aria-checked", "true")
+        assert checked == []
+    else:
+        assert checked == [picker_rig.codex_default], (
+            f"the picker marks {checked} as the default choice; the CLI's effective default under "
+            f"this config.toml is model = {picker_rig.codex_default!r}"
+        )
 
-    selected = next(row_id for row_id in row_ids if row_id != picker_rig.codex_default)
+    selected_row = next(row for row in rows if row["id"] != picker_rig.codex_default)
+    selected = selected_row["id"]
     page.get_by_test_id(f"{_MODEL_ROW_PREFIX}{selected}").click()
+    expect(page.get_by_test_id("new-chat-landing-agent-model-value")).to_have_text(
+        selected_row["text"]
+    )
     selected_rows = _model_rows(page, picker_rig, "Codex")
     assert [row["id"] for row in selected_rows if row["checked"] == "true"] == [selected]
 
@@ -565,6 +672,7 @@ def test_claude_picker_omits_aliases_the_cli_picker_does_not_offer(
     """
     page.goto(picker_rig.base_url)
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
+    _dismiss_setup_review(page)
     _pick_agent(page, "Claude Code")
 
     rows = _model_rows(page, picker_rig, "Claude Code")
