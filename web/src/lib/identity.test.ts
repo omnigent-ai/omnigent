@@ -14,6 +14,7 @@ function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number 
     status: init?.status ?? 200,
     statusText: "OK",
     json: async () => body,
+    clone: () => mockJsonResponse(body, init),
   } as unknown as Response;
 }
 
@@ -508,6 +509,11 @@ describe("authenticatedFetch", () => {
 describe("OSS host routing", () => {
   beforeEach(() => {
     vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("resolves a cold session's host before sending a runner request", async () => {
@@ -528,21 +534,212 @@ describe("OSS host routing", () => {
     expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_oss");
   });
 
-  it("keeps the host key when a rollout temporarily returns wrong_replica", async () => {
+  it("waits through a handoff and resends the identical message with its host key", async () => {
     const { setSessionHost, isHostKeyless } = await import("./sessionHost");
     setSessionHost("sess_oss", "host_oss");
-    fetchMock.mockResolvedValueOnce(
+    const wrongReplica = mockJsonResponse(
+      { error: { code: "wrong_replica" } },
+      { ok: false, status: 400 },
+    );
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica)
+      .mockResolvedValueOnce(wrongReplica)
+      .mockResolvedValueOnce(mockJsonResponse({ queued: true }, { status: 202 }));
+    const { authenticatedFetch } = await import("./identity");
+    const body = JSON.stringify({
+      type: "message",
+      data: { content: "continue", stable_id: "same-message" },
+    });
+    const pending = authenticatedFetch("/v1/sessions/sess_oss/events", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).status).toBe(202);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(isHostKeyless("host_oss")).toBe(false);
+    for (const [url, init] of fetchMock.mock.calls as [string, RequestInit][]) {
+      expect(url).toBe("/v1/sessions/sess_oss/events");
+      expect(init.method).toBe("POST");
+      expect(init.body).toBe(body);
+      expect(init.cache).toBe("no-store");
+      expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe("host_oss");
+    }
+  });
+
+  it.each(["missing", "stale", "lookup failed"])(
+    "refreshes a %s host mapping once before retrying",
+    async (initial) => {
+      const { setSessionHost, isHostKeyless } = await import("./sessionHost");
+      if (initial === "stale") setSessionHost("sess_oss", "old_host");
+      const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+      const resolve = vi.fn(async (id: string, options?: { force?: boolean }) => {
+        if (options?.force) setSessionHost(id, "new_host");
+        else if (initial === "lookup failed") throw new Error("snapshot connection lost");
+      });
+      setSessionHostResolver(resolve);
+      const wrong = () =>
+        mockJsonResponse({ error: { code: "wrong_replica" } }, { ok: false, status: 400 });
+      fetchMock
+        .mockResolvedValueOnce(wrong())
+        .mockResolvedValueOnce(wrong())
+        .mockResolvedValueOnce(mockJsonResponse({}, { status: 202 }));
+      const body = JSON.stringify({ type: "message", data: { stable_id: "one-message" } });
+      const pending = authenticatedFetch("/v1/sessions/sess_oss/events", { method: "POST", body });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await pending).status).toBe(202);
+      expect(resolve.mock.calls.filter(([, options]) => options?.force)).toEqual([
+        ["sess_oss", { force: true }],
+      ]);
+      const requests = fetchMock.mock.calls.map(([, init]) => init as RequestInit);
+      expect(
+        requests.map((init) => new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")),
+      ).toEqual([initial === "stale" ? "old_host" : null, "new_host", "new_host"]);
+      expect(requests.every((init) => init.body === body && init.method === "POST")).toBe(true);
+      expect(isHostKeyless("new_host")).toBe(false);
+    },
+  );
+
+  it("deduplicates concurrent refreshes of a stale host", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "old_host");
+    const { resolveSessionHost, setSessionHostResolver } = await import("./identity");
+    let finish!: () => void;
+    const resolve = vi.fn(
+      () =>
+        new Promise<void>((done) => {
+          finish = done;
+        }),
+    );
+    setSessionHostResolver(resolve);
+    const first = resolveSessionHost("sess_oss", { force: true });
+    const second = resolveSessionHost("sess_oss", { force: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolve).toHaveBeenCalledOnce();
+    finish();
+    await Promise.all([first, second]);
+  });
+
+  it("returns the final rejection when the handoff exceeds its retry budget", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_oss");
+    const error = { error: { code: "wrong_replica", message: "still reconnecting" } };
+    fetchMock.mockImplementation(async () => mockJsonResponse(error, { ok: false, status: 400 }));
+    const { authenticatedFetch } = await import("./identity");
+    const started = performance.now();
+    const pending = authenticatedFetch("/v1/sessions/sess_oss/events", {
+      method: "POST",
+      body: "{}",
+    });
+
+    await vi.runAllTimersAsync();
+    const response = await pending;
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(error);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    expect(performance.now() - started).toBeLessThanOrEqual(15_000);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cancels a pending retry without sending again", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_oss");
+    fetchMock.mockResolvedValue(
       mockJsonResponse({ error: { code: "wrong_replica" } }, { ok: false, status: 400 }),
     );
     const { authenticatedFetch } = await import("./identity");
+    const controller = new AbortController();
+    const reason = new DOMException("Left the conversation", "AbortError");
+    const pending = authenticatedFetch("/v1/sessions/sess_oss/events", {
+      method: "POST",
+      body: "{}",
+      signal: controller.signal,
+    }).catch((error: unknown) => error);
 
-    const response = await authenticatedFetch("/v1/sessions/sess_oss/resources/terminals");
+    await vi.advanceTimersByTimeAsync(100);
+    controller.abort(reason);
+    expect(await pending).toBe(reason);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    [400, "invalid_request"],
+    [401, "unauthorized"],
+    [503, "runner_unavailable"],
+    [502, "bad_gateway"],
+  ])("does not replay other failures (HTTP %s, %s)", async (status, code) => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_oss");
+    const failure = mockJsonResponse({ error: { code } }, { ok: false, status });
+    fetchMock.mockResolvedValue(failure);
+    const { authenticatedFetch } = await import("./identity");
+
+    expect(await authenticatedFetch("/v1/sessions/sess_oss/events", { method: "POST" })).toBe(
+      failure,
+    );
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not replay a send after an ambiguous network failure", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_oss");
+    const failure = new TypeError("Failed to fetch");
+    fetchMock.mockRejectedValue(failure);
+    const { authenticatedFetch } = await import("./identity");
+
+    await expect(
+      authenticatedFetch("/v1/sessions/sess_oss/events", { method: "POST", body: "{}" }),
+    ).rejects.toBe(failure);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("preserves an explicit caller's host key during retries", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_cached");
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse({ error: { code: "wrong_replica" } }, { ok: false, status: 400 }),
+      )
+      .mockResolvedValueOnce(mockJsonResponse({ queued: true }, { status: 202 }));
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+    const resolve = vi.fn();
+    setSessionHostResolver(resolve);
+    const pending = authenticatedFetch("/v1/sessions/sess_oss/events", {
+      method: "POST",
+      headers: { "X-Databricks-Omnigent-Slice-Key": "host_explicit" },
+      body: "{}",
+    });
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect((await pending).status).toBe(202);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(resolve).not.toHaveBeenCalled();
+    for (const [, init] of fetchMock.mock.calls as [string, RequestInit][]) {
+      expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(
+        "host_explicit",
+      );
+    }
+  });
+
+  it("does not replay a streaming request body", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_oss");
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({ error: { code: "wrong_replica" } }, { ok: false, status: 400 }),
+    );
+    const { authenticatedFetch } = await import("./identity");
+    const response = await authenticatedFetch("/v1/sessions/sess_oss/events", {
+      method: "POST",
+      body: new ReadableStream(),
+    });
 
     expect(response.status).toBe(400);
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(isHostKeyless("host_oss")).toBe(false);
-    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-    expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_oss");
   });
 });
 

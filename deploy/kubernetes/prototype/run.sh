@@ -15,9 +15,35 @@ fi
 mkdir -p "$state"
 k() { kubectl --kubeconfig "$state/kubeconfig" --context "$context" -n omnigent-prototype "$@"; }
 
+wait_for_migration() {
+  local deadline=$((SECONDS + 180)) conditions
+  while (( SECONDS < deadline )); do
+    conditions=$(k get job migrate -o 'jsonpath={range .status.conditions[*]}{.type}={.status}{"\n"}{end}')
+    if [[ "$conditions" == *"Complete=True"* ]]; then
+      return
+    fi
+    if [[ "$conditions" == *"Failed=True"* ]]; then
+      printf 'Database migration failed.\n' >&2
+      k logs job/migrate --tail=100 >&2 || true
+      return 1
+    fi
+    sleep 2
+  done
+  printf 'Database migration did not complete within 180 seconds.\n' >&2
+  k logs job/migrate --tail=100 >&2 || true
+  return 1
+}
+
 case "${1:-help}" in
   up)
-    if [[ ! -f "$state/kubeconfig" ]]; then
+    if [[ -f "$state/kubeconfig" ]]; then
+      published_address=$(docker port "$cluster-control-plane" 30080/tcp)
+      if [[ "$published_address" != "127.0.0.1:$prototype_port" ]]; then
+        printf 'The existing cluster publishes %s, but PROTOTYPE_PORT is %s. Run %s down before changing the port.\n' \
+          "$published_address" "$prototype_port" "$0" >&2
+        exit 1
+      fi
+    else
       cat > "$state/kind.yaml" <<EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -45,7 +71,7 @@ EOF
     k delete job migrate --ignore-not-found
     k apply -f "$here/database.yaml"
     k rollout status deployment/postgres --timeout=180s
-    k wait --for=condition=complete job/migrate --timeout=180s
+    wait_for_migration
     existing_server=$(k get deployment/omnigent --ignore-not-found -o name)
     k apply -f "$here/server.yaml"
     if [[ -n "$existing_server" ]]; then
@@ -74,7 +100,11 @@ EOF
     "$kind_bin" delete cluster --name "$cluster"
     rm -f "$state/kubeconfig"
     ;;
-  *)
+  help|--help|-h)
     printf 'Usage: %s {up|rollout|verify|kubectl ...|down}\n' "$0"
+    ;;
+  *)
+    printf 'Unknown command: %s\nUsage: %s {up|rollout|verify|kubectl ...|down}\n' "$1" "$0" >&2
+    exit 1
     ;;
 esac

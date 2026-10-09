@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveModalHost, setSessionHost } from "./sessionHost";
-import {
-  HEARTBEAT_WATCHDOG_MS,
-  nextPushedSession,
-  sessionUpdatesSocket,
-} from "./sessionUpdatesSocket";
+import type * as SocketModule from "./sessionUpdatesSocket";
+
+let sessionUpdatesSocket: typeof SocketModule.sessionUpdatesSocket;
+let nextPushedSession: typeof SocketModule.nextPushedSession;
+let HEARTBEAT_WATCHDOG_MS: number;
+
+beforeEach(async () => {
+  vi.resetModules();
+  ({ sessionUpdatesSocket, nextPushedSession, HEARTBEAT_WATCHDOG_MS } =
+    await import("./sessionUpdatesSocket"));
+});
 
 // Minimal stand-in for the browser WebSocket: records sends/closes and lets
 // the test drive the lifecycle (open, message) by hand. A real socket can't be
@@ -76,19 +81,23 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     vi.useRealTimers();
   });
 
-  it("routes an OSS WebSocket by the same host key after reconnecting", () => {
-    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
-    setSessionHost("sess_oss", "host_oss");
-    resolveModalHost();
-    sessionUpdatesSocket.start();
-    const first = latestWs();
-    expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
-    first.open();
-    first.close();
-    vi.advanceTimersByTime(RECONNECT_CEILING_MS);
-    expect(latestWs()).not.toBe(first);
-    expect(latestWs().url).toBe(first.url);
-  });
+  it.each(["VITE_OMNIGENT_HOST_ROUTING", "VITE_DATABRICKS_WORKSPACE"])(
+    "keeps the host key after reconnecting in standalone mode (%s)",
+    async (flag) => {
+      vi.stubEnv(flag, "true");
+      const { resolveModalHost, setSessionHost } = await import("./sessionHost");
+      setSessionHost("sess_oss", "host_oss");
+      resolveModalHost();
+      sessionUpdatesSocket.start();
+      const first = latestWs();
+      expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+      first.open();
+      first.close();
+      vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+      expect(latestWs()).not.toBe(first);
+      expect(latestWs().url).toBe(first.url);
+    },
+  );
 
   it("forces a reconnect after the watchdog window of total silence", () => {
     sessionUpdatesSocket.start();

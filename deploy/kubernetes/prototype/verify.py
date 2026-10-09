@@ -19,6 +19,7 @@ import tarfile
 import time
 import uuid
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -93,7 +94,12 @@ async def terminal_reply(ws, pattern: str) -> re.Match:
                 return match
 
 
-async def verify(args) -> None:
+async def verify(
+    args,
+    *,
+    coordinated_rollout: Callable[[], Awaitable[float]] | None = None,
+    all_hosts_checked: Callable[[], Awaitable[None]] | None = None,
+) -> dict:
     if urlsplit(args.url).hostname != "localhost":
         raise ValueError("This fixture only connects to the local prototype at localhost")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -106,11 +112,22 @@ async def verify(args) -> None:
         "-n",
         "omnigent-prototype",
     ]
-    host_id = uuid.uuid4().hex
+    host_id = args.host_id or uuid.uuid4().hex
+    host_name = f"nginx-prototype-{host_id[:8]}"
+    replicas = args.replicas
     container = f"omnigent-prototype-client-{host_id[:8]}"
     marker = uuid.uuid4().hex
+    marker_file = f"marker-{host_id}.txt"
     mock_url = f"http://127.0.0.1:{args.mock_port}"
-    report = {"host_id": host_id, "samples": [], "sse_connections": 0}
+    report = {
+        "host_id": host_id,
+        "host_name": host_name,
+        "container": container,
+        "marker": marker,
+        "replicas": replicas,
+        "samples": [],
+        "sse_connections": 0,
+    }
     sse_text = []
     backfills = []
     tasks = []
@@ -136,12 +153,12 @@ async def verify(args) -> None:
     try:
 
         async def mock_ready():
+            if mock.poll() is not None:
+                raise RuntimeError(f"Mock server exited; see {args.output / 'mock.log'}")
             response = await llm.get("/stats")
             return response.is_success
 
         await eventually(mock_ready, timeout=15)
-        if mock.poll() is not None:
-            raise RuntimeError("Mock port already in use; choose --mock-port")
 
         async def ingress_ready():
             response = await client.get("/health")
@@ -155,15 +172,17 @@ async def verify(args) -> None:
         )
         old_names = {pod["metadata"]["name"] for pod in initial_pods["items"]}
         report["initial_pods"] = sorted(old_names)
-        assert len(old_names) == 2, "Start with the two replicas in server.yaml"
+        if not (len(old_names) == replicas):
+            raise RuntimeError(f"Expected {replicas} initial server pods")
         backends = set()
-        for _ in range(32):
+        for _ in range(128):
             response = await client.get("/health", headers={KEY_HEADER: uuid.uuid4().hex})
             response.raise_for_status()
             backends.add(response.headers["x-omnigent-upstream"])
-            if len(backends) == 2:
+            if len(backends) == replicas:
                 break
-        assert len(backends) == 2, "Host-key hashing did not reach both server pods"
+        if not (len(backends) == replicas):
+            raise RuntimeError("Host-key hashing did not reach every server pod")
         report["initial_backends"] = sorted(backends)
         await command(
             "docker",
@@ -176,7 +195,7 @@ async def verify(args) -> None:
             "-e",
             f"OMNIGENT_HOST_ID={host_id}",
             "-e",
-            "OMNIGENT_HOST_NAME=nginx-prototype",
+            f"OMNIGENT_HOST_NAME={host_name}",
             "-e",
             "OMNIGENT_HOST_SLICE_KEY_ENABLED=1",
             "-e",
@@ -196,13 +215,16 @@ async def verify(args) -> None:
             container,
             "python",
             "-c",
-            f"from pathlib import Path; Path('/workspace/marker.txt').write_text('{marker}')",
+            f"from pathlib import Path; Path('/workspace/{marker_file}').write_text('{marker}')",
         )
         host_path = f"/v1/hosts/{host_id}/filesystem/workspace"
 
         async def host_ready():
             response = await client.get(host_path)
-            return response.is_success and "marker.txt" in response.text
+            ready = response.is_success and marker_file in response.text
+            if ready:
+                report["initial_host_upstream"] = response.headers.get("x-omnigent-upstream")
+            return ready
 
         await eventually(host_ready)
         name = f"nginx-prototype-{host_id[:8]}"
@@ -235,14 +257,25 @@ async def verify(args) -> None:
         session_id = await launch_session()
         report["session_id"] = session_id
         file_path = (
-            f"/v1/sessions/{session_id}/resources/environments/default/filesystem/marker.txt"
+            f"/v1/sessions/{session_id}/resources/environments/default/filesystem/{marker_file}"
         )
 
         async def runner_ready():
             response = await client.get(file_path)
-            return response.is_success and marker in response.text
+            ready = response.is_success and marker in response.text
+            if ready:
+                report["initial_runner_upstream"] = response.headers.get("x-omnigent-upstream")
+            return ready
 
         await eventually(runner_ready)
+        if not (
+            report["initial_upstream"]
+            == report["initial_host_upstream"]
+            == report["initial_runner_upstream"]
+        ):
+            raise RuntimeError(
+                "Host and runner requests reached different replicas before the rollout"
+            )
         response = await client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={"terminal": "shell", "session_key": "rollout"},
@@ -330,10 +363,19 @@ async def verify(args) -> None:
                     response = await client.get(path, timeout=2)
                     status = response.status_code
                     upstream = response.headers.get("x-omnigent-upstream")
+                    expected_content = marker_file if kind == "host" else marker
+                    if status == 200 and expected_content not in response.text:
+                        status = "wrong_content"
                 except httpx.HTTPError:
                     status, upstream = "connection_error", None
                 report["samples"].append(
-                    {"at": at, "kind": kind, "status": status, "upstream": upstream}
+                    {
+                        "at": at,
+                        "kind": kind,
+                        "status": status,
+                        "upstream": upstream,
+                        "latency_seconds": round(time.monotonic() - started - at, 3),
+                    }
                 )
                 await asyncio.sleep(0.25)
 
@@ -343,20 +385,25 @@ async def verify(args) -> None:
                 asyncio.create_task(sample("runner", file_path)),
             ]
         )
-        report["rollout_started_at"] = round(time.monotonic() - started, 3)
-        print("Replacing both server pods while the agent turn and shell are live...", flush=True)
-        await command(*kube, "rollout", "restart", "deployment/omnigent")
-        print(
-            await command(*kube, "rollout", "status", "deployment/omnigent", "--timeout=180s"),
-            flush=True,
-        )
+        report["ready_for_rollout_at"] = round(time.monotonic() - started, 3)
+        if coordinated_rollout is None:
+            rollout_started = time.monotonic()
+            print(f"Replacing {replicas} server pods with work active...", flush=True)
+            await command(*kube, "rollout", "restart", "deployment/omnigent")
+            print(
+                await command(*kube, "rollout", "status", "deployment/omnigent", "--timeout=180s"),
+                flush=True,
+            )
+        else:
+            rollout_started = await coordinated_rollout()
+        report["rollout_started_at"] = round(rollout_started - started, 3)
 
         async def replaced():
             pods = json.loads(
                 await command(*kube, "get", "pods", "-l", "app=omnigent", "-o", "json")
             )
             names = {pod["metadata"]["name"] for pod in pods["items"]}
-            if old_names.isdisjoint(names) and len(names) == 2:
+            if old_names.isdisjoint(names) and len(names) == replicas:
                 report["final_pods"] = sorted(names)
                 return True
             return False
@@ -379,7 +426,8 @@ async def verify(args) -> None:
         await eventually(stable, timeout=60)
         report["recovered_at"] = round(time.monotonic() - started, 3)
         report["old_terminal_connection_closed"] = ws.close_code is not None
-        assert report["old_terminal_connection_closed"], "NGINX left an old connection open"
+        if not (report["old_terminal_connection_closed"]):
+            raise RuntimeError("NGINX left an old connection open")
 
         async def reattach_terminal():
             nonlocal ws
@@ -391,9 +439,11 @@ async def verify(args) -> None:
 
         after = await eventually(reattach_terminal, timeout=30)
         report["terminal_pid_after"] = after.group(1)
-        assert before.group(1) == after.group(1), "Shell process was replaced"
+        if not (before.group(1) == after.group(1)):
+            raise RuntimeError("Shell process was replaced")
         response = await llm.post("/gate/release")
-        assert response.json()["released"], "Agent's blocked model request did not survive"
+        if not (response.json()["released"]):
+            raise RuntimeError("Agent's blocked model request did not survive")
 
         async def turn_completed():
             snapshot = await client.get(f"/v1/sessions/{session_id}")
@@ -447,12 +497,27 @@ async def verify(args) -> None:
             return any(followup in line for line in sse_text)
 
         report["followup_turn_streamed"] = await eventually(followup_streamed, timeout=30)
+
+        async def followup_completed():
+            snapshot = await client.get(f"/v1/sessions/{session_id}")
+            items = await client.get(f"/v1/sessions/{session_id}/items")
+            return snapshot.json().get("status") == "idle" and followup in items.text
+
+        report["followup_turn_completed"] = await eventually(followup_completed, timeout=30)
+        if any(s["status"] == "wrong_content" for s in report["samples"]):
+            raise RuntimeError("A successful file request returned another host's content")
+        if all_hosts_checked is not None:
+            await all_hosts_checked()
         report["passed"] = True
         print(
             "PASS: host/runner RPCs recovered, the same shell survived, "
             "the active turn completed, and a new runner launched.",
             flush=True,
         )
+        return report
+    except BaseException as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         for task in tasks:
             task.cancel()
@@ -479,12 +544,14 @@ async def verify(args) -> None:
         (args.output / "backfills.json").write_text(json.dumps(backfills, indent=2) + "\n")
         with contextlib.suppress(RuntimeError):
             (args.output / "host.log").write_text(await command("docker", "logs", container))
+        with contextlib.suppress(RuntimeError):
             await command(
                 "docker",
                 "cp",
                 f"{container}:/root/.omnigent/logs",
                 str(args.output / "client-logs"),
             )
+        with contextlib.suppress(RuntimeError):
             await command("docker", "rm", "-f", container)
         with contextlib.suppress(RuntimeError):
             (args.output / "nginx.log").write_text(
@@ -505,5 +572,7 @@ if __name__ == "__main__":
     parser.add_argument("--kubeconfig", type=Path, required=True)
     parser.add_argument("--url", default="http://localhost:18081")
     parser.add_argument("--mock-port", type=int, default=18082)
+    parser.add_argument("--replicas", type=int, default=2)
+    parser.add_argument("--host-id")
     parser.add_argument("--output", type=Path, required=True)
     asyncio.run(verify(parser.parse_args()))

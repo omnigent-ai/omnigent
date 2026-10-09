@@ -1497,7 +1497,7 @@ describe("automatic reconnect", () => {
     }
   });
 
-  it("re-dials with a fresh budget when a hidden warm surface is revealed", async () => {
+  it.each([1006, 4400])("re-dials with a fresh budget on reveal after close %s", async (code) => {
     // A warm surface parked behind another session's view: the transport
     // flaps with nobody watching and the background reconnect loop burns
     // its whole budget.
@@ -1508,11 +1508,11 @@ describe("automatic reconnect", () => {
     expect(terminalSessionMock.instances).toHaveLength(1);
 
     for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
-      closeNewest(1006);
+      closeNewest(code);
       // oxlint-disable-next-line no-await-in-loop
       await elapse(delay);
     }
-    closeNewest(1006);
+    closeNewest(code);
     await elapse(60_000);
     const exhausted = RECONNECT_BACKOFF_MS.length + 1;
     expect(terminalSessionMock.instances).toHaveLength(exhausted);

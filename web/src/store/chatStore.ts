@@ -134,7 +134,7 @@ import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
-import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
+import { getOmnigentHostConfig, isDatabricksWorkspace, isHostRoutingEnabled } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
 import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
@@ -1501,6 +1501,16 @@ const sendChains = new Map<string | symbol, SendChain>();
  */
 const inFlightSends = new Map<string, boolean>();
 
+async function waitForSendReceipt(stableId: string): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (inFlightSends.get(stableId) === false && Date.now() < deadline) {
+    // oxlint-disable-next-line no-await-in-loop
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 500);
+    });
+  }
+}
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2408,6 +2418,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
     let initialDispatched = false;
+    let messageDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
       const state = id === null ? get() : setterForState(id);
@@ -2473,6 +2484,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
+      messageDispatched = true;
       const postResult = await postEvent(sessionId, {
         type: "message",
         data: {
@@ -2537,22 +2549,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
-      const { message, code } = describeSendFailure(err);
-      // A codex `/side` that armed the side-chat latch (line ~2103) but then
-      // failed — e.g. the host is too old and the server refused — must disarm
-      // it, or the next sub-agent created under this parent would wrongly open
-      // as a side-chat tab. Clear only our own arm: a newer `/side` re-arm or a
-      // `session_created` that already consumed the latch must not be clobbered.
-      if (opensSideChat && get().awaitingSideChatFor === submitConversationId) {
-        useChatStore.setState({ awaitingSideChatFor: null });
+      const answeredWithRefusal = err instanceof ApiError && err.code !== null;
+      const runnerMayReconnect =
+        err instanceof ApiError && err.status === 503 && err.code === RUNNER_UNAVAILABLE_CODE;
+      if (
+        messageDispatched &&
+        (!answeredWithRefusal || runnerMayReconnect) &&
+        !isDatabricksWorkspace() &&
+        isHostRoutingEnabled()
+      ) {
+        // A lost POST or runner tunnel can leave a saved message awaiting delivery.
+        // Wait for the runner's receipt without resending work; expiry still fails.
+        await waitForSendReceipt(stableId);
       }
-      // A caller that owns its own failure UX (e.g. a codex `/side`, whose error
-      // belongs to the side-chat tab, not the parent chat) takes the message and
-      // suppresses the default surfacing below — no restored draft, no error
-      // block in the parent transcript. The bubble rollback + status settle still
-      // run so the parent isn't left mid-send.
-      const callerHandlesError = opts?.onError !== undefined;
-      opts?.onError?.(message);
+      const { message, code } = describeSendFailure(err);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -2562,7 +2572,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       // A coded error confirms refusal; a transport failure leaves delivery
       // unknown unless this retries a previously refused send.
-      const answeredWithRefusal = err instanceof ApiError && err.code !== null;
       let serverRefused = answeredWithRefusal || retriesRefusedSend;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
@@ -2589,9 +2598,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
       }
+      if (deliveredDespiteFailure) {
+        if (draftSessionId !== null) {
+          setterFor(draftSessionId)((s) => ({
+            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          }));
+        }
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
+      // Clear only this send's side-chat latch; a newer /side may have replaced it.
+      if (opensSideChat && get().awaitingSideChatFor === submitConversationId) {
+        useChatStore.setState({ awaitingSideChatFor: null });
+      }
+      const callerHandlesError = opts?.onError !== undefined;
+      opts?.onError?.(message);
       if (
         !callerHandlesError &&
-        !deliveredDespiteFailure &&
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {

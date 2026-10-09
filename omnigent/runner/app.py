@@ -1363,6 +1363,7 @@ def create_runner_app(
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
+    _session_status_events: dict[str, _JsonObject] = {}
     # Detached watchers answering a /model confirm dialog that pops after
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
@@ -1409,6 +1410,8 @@ def create_runner_app(
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
+    # A completed turn's reply can reach the server after its tunnel reconnects.
+    _received_server_item_ids: dict[str, set[str]] = {}
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
@@ -1464,6 +1467,7 @@ def create_runner_app(
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
                 _native_pane_status[session_id] = _status_value
+                _session_status_events[session_id] = event_body
         _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
@@ -1812,6 +1816,7 @@ def create_runner_app(
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
+        _session_status_events.pop(event.session_id, None)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
@@ -2985,6 +2990,10 @@ def create_runner_app(
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
+        elif session_id in _session_histories and _turn_bind_epoch.get(session_id) is not None:
+            # Reinitializing a live runner must preserve replies still waiting to be saved.
+            # Missed user messages are recovered by the reconnect scan below.
+            history = []
         else:
             history = await _load_history_as_input(session_id)
         execution_seen = (
@@ -3329,6 +3338,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
+        _session_status_events.pop(session_id, None)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -3404,6 +3414,7 @@ def create_runner_app(
             _binding.relay.close()
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
+        _received_server_item_ids.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
         _subagent_recovery_done.discard(session_id)
@@ -6343,6 +6354,16 @@ def create_runner_app(
                         server_client=server_client,
                     )
 
+                persisted_item_id = message_body.get("persisted_item_id")
+                if not _is_native_harness(conversation_id) and isinstance(persisted_item_id, str):
+                    received_ids = _received_server_item_ids.setdefault(conversation_id, set())
+                    if persisted_item_id in received_ids:
+                        return JSONResponse(
+                            status_code=202,
+                            content={"status": "accepted", "detail": "Message already accepted."},
+                        )
+                    received_ids.add(persisted_item_id)
+
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
                     _awaiting_approval = pending_approvals.has_pending(conversation_id)
@@ -7514,6 +7535,15 @@ def create_runner_app(
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue
+            # A completed SDK turn's final status may have died with the old server.
+            # Keep the original error/turn ID; don't replay a running edge mid-stream.
+            status_event = _session_status_events.get(session_id)
+            if (
+                session_id not in _active_turns
+                and status_event is not None
+                and status_event.get("status") in {"idle", "waiting", "failed"}
+            ):
+                _publish_event(session_id, status_event)
             try:
                 after_id = _last_server_item_id.get(session_id)
                 all_new: list[_JsonObject] = []
@@ -7539,38 +7569,62 @@ def create_runner_app(
                     last_id = page_items[-1].get("id")
                     if last_id:
                         after_id = last_id
-                        _last_server_item_id[session_id] = last_id
                     if not page.get("has_more", False):
                         break
                 if not all_new:
                     continue
-                new_items = _convert_raw_items_to_input(all_new)
-                _session_histories.setdefault(session_id, []).extend(
-                    new_items,
-                )
-                if (
-                    session_id not in _active_turns
-                    and new_items
-                    and new_items[-1].get("role") == "user"
-                ):
-                    _begin_turn_slot(session_id)
-                    _publish_turn_status(session_id, "running")
+                received_ids = _received_server_item_ids.setdefault(session_id, set())
+                for item in all_new:
+                    item_id = item.get("id")
+                    # Replies and tool results already live in this runner's history.
+                    # Only user messages can have missed their server-to-runner delivery.
+                    if (
+                        item.get("type") != "message"
+                        or item.get("role") != "user"
+                        or not isinstance(item_id, str)
+                        or item_id in received_ids
+                    ):
+                        continue
+                    raw_content = item.get("content", [])
+                    if not isinstance(raw_content, list):
+                        continue
+                    content = await _resolve_forwarded_message_content(
+                        raw_content,
+                        session_id=session_id,
+                        server_client=server_client,
+                    )
+                    # A live forward or another scan may have won during the fetch.
+                    if item_id in received_ids:
+                        continue
                     agent_id = _session_agent_ids.get(session_id)
                     msg_body: _JsonObject = {
+                        "type": "message",
+                        "role": "user",
+                        "content": content,
+                        "persisted_item_id": item_id,
                         "agent_id": agent_id,
                         "model": agent_id or "",
                         # Catch-up has no live server dispatch carrying renderer state.
                         "browser_renderer_available": False,
                     }
-                    _turn_task = asyncio.create_task(
-                        _run_turn_bg(msg_body, session_id),
-                        name=f"turn-catchup-{session_id}",
+                    received_ids.add(item_id)
+                    _session_message_buffers.setdefault(session_id, []).append(msg_body)
+                    # The failed forward could not acknowledge this saved message.
+                    _publish_event(
+                        session_id,
+                        {
+                            "type": "session.input.consumed",
+                            "data": {
+                                "item_id": item_id,
+                                "type": "message",
+                                "data": item,
+                                "created_by": item.get("created_by"),
+                            },
+                        },
                     )
-                    _active_turns[session_id] = _turn_task
-                    _turn_task.add_done_callback(
-                        _background_tasks.discard,
-                    )
-                    _background_tasks.add(_turn_task)
+                if after_id:
+                    _last_server_item_id[session_id] = after_id
+                await _check_and_start_next_turn(session_id)
             except (httpx.HTTPError, RuntimeError):
                 _logger.warning(
                     "Catch-up scan failed for %s",

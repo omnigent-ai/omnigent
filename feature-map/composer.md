@@ -165,6 +165,19 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
   for the desktop entry point. The restore/delivery ordering and preservation of
   user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+- **`delivered-send-recovery`, OSS replica handoff (desktop browser):**
+  With `OMNIGENT_E2E_REPLICA_HANDOFF=1`,
+  `tests/e2e_ui/chat/test_replica_handoff.py::test_replica_handoff_composer`
+  exercises routing rejection, a lost POST response, and a saved-message 503
+  through real servers, a host, and a runner. The companion
+  `tests/e2e/test_replica_handoff_e2e.py::test_replica_handoff_client` drives the
+  same cases through the web client's send API. Each records browser errors
+  throughout recovery and checks that no delivered prompt returns as a draft.
+  `deploy/kubernetes/prototype/verify_browser.py` records six real browser
+  conversations during a three-pod Kubernetes rollout. See the adjacent README
+  for setup. `web/src/store/chatStore.test.ts` covers a delayed delivery receipt,
+  expiry of the wait, and immediate refusal. `web/src/lib/identity.test.ts`
+  covers bounded `wrong_replica` retries with the same host ID and message.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the

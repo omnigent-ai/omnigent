@@ -17,7 +17,7 @@ metadata:
   namespace: omnigent-prototype
 spec:
   replicas: 2
-  minReadySeconds: 5
+  minReadySeconds: 10
   strategy:
     rollingUpdate:
       maxSurge: 1

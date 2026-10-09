@@ -816,6 +816,8 @@ class QueuedResponse:
     # value paces the stream so live surfaces (a native TUI) visibly render
     # intermediate deltas.
     chunk_delay: float = 0.0
+    # Pause /v1/responses after N real SSE events, using the existing gate API.
+    pause_after: int | None = None
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -1143,11 +1145,15 @@ async def create_response(
     chunk_delay = qr.chunk_delay
 
     async def _generate() -> AsyncIterator[str]:
-        if chunk_delay > 0:
+        if chunk_delay > 0 or qr.pause_after is not None:
             # Paced like ``/v1/messages``: one SSE event at a time.
-            for event in sse_body.split("\n\n"):
+            for index, event in enumerate(filter(None, sse_body.split("\n\n")), start=1):
                 if event:
                     yield event + "\n\n"
+                    if index == qr.pause_after:
+                        qr._pending.set()
+                        _state.pending_gates.append(qr)
+                        await qr._gate.wait()
                     await asyncio.sleep(chunk_delay)
         else:
             yield sse_body
@@ -1511,6 +1517,7 @@ async def configure(request: Request) -> dict[str, object]:
                     refusal_category=entry.get("refusal_category"),
                     thinking=entry.get("thinking"),
                     chunk_delay=entry.get("chunk_delay", 0.0),
+                    pause_after=entry.get("pause_after"),
                 )
             )
         count = len(queue.responses)
