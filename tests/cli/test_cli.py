@@ -1074,6 +1074,52 @@ def test_pi_config_args_form_base_cli_args_append(
     assert captured["extra_args"] == ("--base", "--cli-flag")
 
 
+def test_pi_policies_file_is_loaded_and_threaded_to_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``omnigent pi --policies FILE`` hands the file's policies to the launcher.
+
+    Regression for #8147: harness commands had no way to attach policies to the
+    session they start; only ``omnigent server`` read policies, from config.
+    """
+    policies_file = tmp_path / "policies.yaml"
+    policies_file.write_text(
+        yaml.safe_dump(
+            {
+                "policies": [
+                    {
+                        "name": "cap-tool-calls",
+                        "type": "python",
+                        "handler": "omnigent.policies.builtins.safety.max_tool_calls_per_session",
+                        "factory_params": {"limit": 20},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.run_pi_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(cli, ["pi", "--policies", str(policies_file)])
+
+    assert result.exit_code == 0, result.output
+    assert captured["policies"] == [
+        {
+            "name": "cap-tool-calls",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.safety.max_tool_calls_per_session",
+            "factory_params": {"limit": 20},
+        }
+    ]
+
+
 def test_kiro_command_is_registered_in_click_help() -> None:
     """``omnigent kiro`` is a true top-level Click command."""
     result = CliRunner().invoke(cli, ["--help"])

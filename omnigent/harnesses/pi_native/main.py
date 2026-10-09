@@ -46,6 +46,7 @@ from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native.native_terminal import url_component
+from omnigent.session_policies_file import apply_session_policies
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -214,6 +215,7 @@ def run_pi_native(
     pi_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
+    policies: list[_JsonObject] | None = None,
 ) -> None:
     """
     Launch Pi TUI in an Omnigent terminal.
@@ -224,6 +226,8 @@ def run_pi_native(
     :param resume_picker: ``True`` runs the Pi-native picker.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after launch.
+    :param policies: Policy request bodies from ``--policies`` to attach
+        to the session before the runner starts, or ``None``.
     :returns: None after the terminal attach session ends.
     """
     pi_args = _normalize_extra_args(
@@ -244,6 +248,7 @@ def run_pi_native(
             resume_picker=resume_picker,
             pi_args=pi_args,
             auto_open_conversation=auto_open_conversation,
+            policies=policies,
         )
 
 
@@ -284,6 +289,7 @@ def _run_with_remote_server(
     resume_picker: bool,
     pi_args: tuple[str, ...],
     auto_open_conversation: bool = False,
+    policies: list[_JsonObject] | None = None,
 ) -> None:
     """
     Launch Pi on an Omnigent server via a daemon-spawned runner.
@@ -294,6 +300,7 @@ def _run_with_remote_server(
     :param resume_picker: When ``True``, run the Pi-native picker.
     :param pi_args: Raw Pi CLI args.
     :param auto_open_conversation: Whether to open the web conversation URL.
+    :param policies: Policy request bodies to attach to the session.
     """
     from omnigent.chat import _bundle_agent, _remote_headers
     from omnigent.cli import _ensure_host_daemon
@@ -325,6 +332,7 @@ def _run_with_remote_server(
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
+                    policies=policies,
                 )
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
@@ -360,6 +368,7 @@ async def _prepare_pi_terminal_via_daemon(
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
+    policies: list[_JsonObject] | None = None,
 ) -> PreparedPiTerminal:
     """
     Create or resume a Pi-native session through a daemon runner.
@@ -372,6 +381,8 @@ async def _prepare_pi_terminal_via_daemon(
     :param host_id: Local host daemon id.
     :param workspace: Absolute workspace path for the runner cwd.
     :param startup_progress: Optional user-visible progress renderer.
+    :param policies: Policy request bodies to attach once the session id
+        is known, before the runner starts, so the first turn is covered.
     :returns: Prepared terminal details for attaching.
     """
     persist_args = list(pi_args)
@@ -391,6 +402,9 @@ async def _prepare_pi_terminal_via_daemon(
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
+            if policies:
+                _update_startup_progress(startup_progress, "Attaching policies...")
+                await apply_session_policies(client, session_id, policies)
         else:
             _update_startup_progress(startup_progress, "Loading Pi session...")
             payload = await _fetch_pi_session(client, session_id)
@@ -402,6 +416,9 @@ async def _prepare_pi_terminal_via_daemon(
                 raise click.ClickException(
                     f"Conversation {session_id!r} is not a pi-native session."
                 )
+            if policies:
+                _update_startup_progress(startup_progress, "Attaching policies...")
+                await apply_session_policies(client, session_id, policies)
             existing_terminal = await _find_running_pi_terminal(client, session_id)
             if existing_terminal is not None:
                 if persist_args:
