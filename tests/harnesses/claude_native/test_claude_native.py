@@ -10511,6 +10511,24 @@ def test_parse_claude_current_model(stdout: str, expected: dict[str, str]) -> No
     assert claude_native._parse_claude_current_model(stdout) == expected
 
 
+def _init_event(**fields: object) -> str:
+    return json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-5", **fields})
+
+
+def test_parse_claude_current_model_reads_the_release_the_run_reported() -> None:
+    """The enumeration run's init event names the Claude Code release that ran it."""
+    assert claude_native._parse_claude_current_model(
+        _init_event(claude_code_version="2.1.217")
+    ) == {"model": "claude-opus-5", "cli_version": "2.1.217"}
+
+
+@pytest.mark.parametrize("version", ["2.1.280.1", "latest", "", 7, None, "2.1", "v2.1.217"])
+def test_parse_claude_current_model_ignores_an_unreadable_release(version: object) -> None:
+    assert claude_native._parse_claude_current_model(_init_event(claude_code_version=version)) == {
+        "model": "claude-opus-5"
+    }
+
+
 @pytest.mark.parametrize(
     ("alias", "label", "model", "expected"),
     [

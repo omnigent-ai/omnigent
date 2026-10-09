@@ -1877,6 +1877,95 @@ async def test_claude_native_model_options_use_session_launch_catalog(
 
 
 @pytest.mark.asyncio
+async def test_claude_native_model_options_serve_the_demoted_default_without_a_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The listing shows the Default a too-old Claude Code can run, read from the store.
+
+    The release the Default is judged against was reported by the catalog
+    probe and is stored with the rows, so serving the listing never runs
+    ``claude`` (a wrapper's ``--version`` alone can outlast the route's wait).
+    """
+    import asyncio
+    import subprocess
+
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
+    conv_id = "8c638a26a92f0a38ee0a2ab7e0cd5159"
+    claude_spec = _harness_spec("claude-native")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: ClaudeNativeUcodeConfig(env={}, api_key_helper="printf token", model=None),
+    )
+
+    async def _probe(claude_config: object) -> ClaudeModelProbe:
+        del claude_config
+        return ClaudeModelProbe(
+            alias_rows=[
+                {
+                    "id": "sonnet[1m]",
+                    "model": "system.ai.claude-sonnet-5-5[1m]",
+                    "displayName": "Sonnet 5.5 (1M context)",
+                },
+                {"id": "haiku", "model": "system.ai.claude-haiku-4-5", "displayName": "Haiku 4.5"},
+                {
+                    "id": "opus-4-8[1m]",
+                    "model": "system.ai.claude-opus-4-8[1m]",
+                    "displayName": "Opus 4.8 (1M context)",
+                },
+            ],
+            default_model="system.ai.claude-sonnet-5-5[1m]",
+            default_label="Sonnet 5.5 (1M context)",
+            cli_version="2.1.217",
+        )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app, _ = await _build_app_for_spec(claude_spec)
+
+    def _spawn(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"the model listing spawned a process: {args!r}")
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        monkeypatch.setattr(subprocess, "run", _spawn)
+        monkeypatch.setattr(subprocess, "Popen", _spawn)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        response = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert response.status_code == 200, response.text
+    rows = response.json()["models"]
+    assert [row["id"] for row in rows if row.get("isDefault")] == ["opus-4-8[1m]"]
+    assert [row["id"] for row in rows] == ["sonnet[1m]", "haiku", "opus-4-8[1m]"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
     monkeypatch: pytest.MonkeyPatch,

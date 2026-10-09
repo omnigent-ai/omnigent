@@ -12735,6 +12735,53 @@ async def test_create_session_notifies_runner_with_init_envelope(
     )
 
 
+async def test_external_info_notice_with_a_source_id_is_stored_once(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A runner that re-posts its Default-model notice on a relaunch adds no second one.
+
+    The notice carries ``source_id`` as its idempotency key, so the repeat is a
+    no-op; another key (another release or replacement model) is a new notice.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    def notice(source_id: str) -> dict[str, Any]:
+        return {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "claude_native_default_model_demoted",
+                    "title": "Claude Code is too old for the default model",
+                    "message": "Claude Code 2.1.217 can't run the default model.",
+                    "level": "info",
+                },
+                "source_id": source_id,
+            },
+        }
+
+    key = f"claude-native-default-demoted:{session['id']}:2.1.217:haiku"
+    for _ in range(2):
+        resp = await client.post(f"/v1/sessions/{session['id']}/events", json=notice(key))
+        assert resp.status_code in (200, 202), resp.text
+
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["level"] == "info"
+    assert errors[0]["title"] == "Claude Code is too old for the default model"
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events", json=notice(key.replace("haiku", "opus"))
+    )
+    assert resp.status_code in (200, 202), resp.text
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    assert len([item for item in items.json()["data"] if item["type"] == "error"]) == 2
+
+
 async def test_external_info_error_item_publishes_and_persists_level(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

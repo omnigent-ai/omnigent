@@ -140,6 +140,14 @@ prefixed digest is used when one is already present), holding e.g.
 `omnigent/harnesses/claude_native/state.py` and
 `omnigent/harnesses/codex_native/state.py`.
 
+`claude-native/` additionally holds `model-client-floors.json`: the
+Claude Code release a model was learned to need from a turn the API refused,
+filed per model catalog with the release that was refused. An entry stops
+applying when the installed release changes or after 30 days, so a Default
+launch skips a model the installed CLI cannot call
+(`omnigent/harnesses/claude_native/client_version.py`). Set
+`OMNIGENT_CLAUDE_DEFAULT_MODEL_FLOOR=0` to turn the behavior off.
+
 `codex-native/` additionally holds `process-registry.json` (+ `.lock`) and
 `process-owners/`, tracking spawned CLI processes
 (`omnigent/harnesses/codex_native/process_registry.py`).

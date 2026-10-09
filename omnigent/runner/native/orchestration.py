@@ -8129,6 +8129,80 @@ async def _clear_session_model_override(
         )
 
 
+_DEMOTION_NOTICE_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _schedule_claude_native_default_demotion_notice(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient,
+    notice: str,
+    source_id: str,
+) -> None:
+    """Post the Default-demotion notice in the background, off the launch path."""
+    task = asyncio.create_task(
+        _post_claude_native_default_demotion_notice(
+            session_id=session_id,
+            server_client=server_client,
+            notice=notice,
+            source_id=source_id,
+        ),
+        name=f"claude-default-demotion-notice-{session_id}",
+    )
+    _DEMOTION_NOTICE_TASKS.add(task)
+    task.add_done_callback(_DEMOTION_NOTICE_TASKS.discard)
+
+
+async def _post_claude_native_default_demotion_notice(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient,
+    notice: str,
+    source_id: str,
+) -> None:
+    """
+    Tell the session its Default model was swapped for one the client can run.
+
+    Posts an ``error`` item with ``level: "info"`` so the web UI renders a
+    neutral notice that persists across reload and, being a non-content item,
+    never enters the next turn's model context. *source_id* makes the post
+    idempotent, so a relaunch of the same session does not add a second one.
+    Best-effort: a failed post only loses the notice.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client.
+    :param notice: The user-facing explanation, e.g. ``"Claude Code 2.1.217
+        can't run Opus 5.5; it needs 2.1.280 or newer. ..."``.
+    :param source_id: The server-side idempotency key for the item.
+    """
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "claude_native_default_model_demoted",
+                        "title": "Claude Code is too old for the default model",
+                        "message": notice,
+                        "level": "info",
+                    },
+                    "source_id": source_id,
+                },
+            },
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except Exception:  # noqa: BLE001 — a background notice must never surface as a task error
+        _logger.warning(
+            "claude-native: failed to surface the default-model notice for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -8607,6 +8681,8 @@ async def _auto_create_claude_terminal(
     # Bound here so the vocabulary record below reads the same rows the
     # launch validated against, whether or not that validation ran.
     launch_catalog: list[dict[str, object]] | None = None
+    # Set to (notice, idempotency key) when the Default moved off a model the client refuses.
+    default_demotion_notice: tuple[str, str] | None = None
     if claude_binding is None and (session_model_override or launch_model is None):
         from omnigent.harnesses.claude_native.main import (
             claude_catalog_launch_spelling,
@@ -8726,7 +8802,9 @@ async def _auto_create_claude_terminal(
             # CLI's own default is servable by construction, and the
             # harness's ``reported_model`` records what it actually ran —
             # while the store's background re-probe converges the catalog.
-            if launch_catalog_was_stale:
+            # A client too old for that default fails a bare launch too: pin the demoted one.
+            default_demotion = getattr(launch_catalog, "demotion", None)
+            if launch_catalog_was_stale and default_demotion is None:
                 _logger.info(
                     "claude catalog for session=%s is stale; deferring the Default "
                     "launch to the CLI's own default model",
@@ -8739,6 +8817,31 @@ async def _auto_create_claude_terminal(
                         str(catalog_default.get("model") or catalog_default.get("id") or "")
                         or None
                     )
+                    if (
+                        default_demotion is not None
+                        and launch_model == default_demotion.chosen_model
+                    ):
+                        default_demotion_notice = (
+                            default_demotion.notice(),
+                            default_demotion.notice_source_id(session_id),
+                        )
+                        _logger.info(
+                            "claude-native: Claude Code %s cannot run the Default %s "
+                            "(needs %s or newer); launching on %s for session=%s",
+                            default_demotion.cli_version,
+                            default_demotion.wanted_model,
+                            default_demotion.min_version,
+                            default_demotion.chosen_model,
+                            session_id,
+                            extra=debug_event(
+                                "claude_native_default_model_demoted",
+                                session_id=session_id,
+                                cli_version=default_demotion.cli_version,
+                                wanted_model=default_demotion.wanted_model,
+                                min_version=default_demotion.min_version,
+                                chosen_model=default_demotion.chosen_model,
+                            ),
+                        )
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
@@ -8766,6 +8869,9 @@ async def _auto_create_claude_terminal(
         # spellings a later ``/model`` can type — a managed picker names
         # rows no pin covers.
         picker_values=stored_claude_picker_values(claude_config, launch_catalog),
+        # What a refused model's floor is learned against (see the forwarder).
+        catalog_scope=getattr(launch_catalog, "scope", None),
+        cli_version=getattr(launch_catalog, "cli_version", None),
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
@@ -8960,6 +9066,13 @@ async def _auto_create_claude_terminal(
         raise
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
+    if default_demotion_notice is not None:
+        _schedule_claude_native_default_demotion_notice(
+            session_id=session_id,
+            server_client=server_client,
+            notice=default_demotion_notice[0],
+            source_id=default_demotion_notice[1],
+        )
     # Surface the terminal on the live SSE stream so an already-connected
     # web UI enables the Terminal toggle immediately. The required-terminal
     # launch helper registers the resource and starts the activity watcher but

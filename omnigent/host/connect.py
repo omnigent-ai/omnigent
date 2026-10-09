@@ -612,6 +612,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
+        # Opt-out for the native-Claude Default model floor: ``0`` launches the
+        # catalog Default even on a Claude Code too old to call it. Read by the
+        # runner, so the daemon→runner env strip must not drop it. Not a secret.
+        "OMNIGENT_CLAUDE_DEFAULT_MODEL_FLOOR",
         # Native-Claude launcher plugin selector: the entry-point NAME of a
         # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
         # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
