@@ -25,7 +25,15 @@ jobs:
           ')"
           echo "id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
           xcrun simctl boot "$DEVICE_ID" 2>/dev/null || true
-          xcrun simctl bootstatus "$DEVICE_ID" -b
+          READY=0
+          for attempt in {1..18}; do
+            if xcrun simctl io "$DEVICE_ID" screenshot /tmp/simulator-ready.png; then
+              READY=1
+              break
+            fi
+            sleep 5
+          done
+          test "$READY" -eq 1
 
       - name: Save fixed implementation
         run: cp web/ios/Omnigent/OmnigentWebView.swift /tmp/OmnigentWebView.fixed.swift
