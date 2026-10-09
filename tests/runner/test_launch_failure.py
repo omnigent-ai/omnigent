@@ -311,6 +311,8 @@ def test_classifies_output_limit_exceeded(code: str, message: str) -> None:
         "Output tokens: 32000",
         # A request-parameter complaint names the field, not a cut-off reply.
         "API Error: 400 max_output_tokens must be at most 32000",
+        # An unrelated limit that happens to share the rewrite's opening words.
+        "Terminal output limit reached while capturing logs",
     ],
 )
 def test_output_limit_wording_alone_is_not_the_limit_error(message: str) -> None:

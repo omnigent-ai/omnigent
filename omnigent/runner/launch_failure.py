@@ -225,10 +225,11 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "rate limit is set to 0",
 )
 # Claude Code's output-token-limit error: the raw constant ("...exceeded the 32000 output
-# token maximum"), the bridge's "Output limit reached" rewrite, or the forwarder's
-# category-only fallback "...API error (max_output_tokens)". The model's cap, not our fault.
+# token maximum"), the bridge's rewrite ("...exceeded the model's maximum output length"),
+# or the forwarder's category-only fallback "...API error (max_output_tokens)".
 _OUTPUT_LIMIT_ERROR = re.compile(
-    r"response exceeded the [\d,]+ output token maximum|\boutput limit reached\b"
+    r"response exceeded the [\d,]+ output token maximum"
+    r"|response exceeded the model['’]s maximum output length"
     r"|\bAPI error \(max_output_tokens\)",
     re.IGNORECASE,
 )

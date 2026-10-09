@@ -9079,8 +9079,8 @@ def _assistant_message_item(
     :param text: Assistant text block.
     :param is_api_error: Whether Claude Code flagged the record as its
         own API error (see :func:`_is_api_error_entry`). Gates the
-        error; gates the output-limit rewrite and the ``/login`` guidance
-        append, which are safe only on CLI-authored text.
+        output-limit rewrite and the ``/login`` guidance append, which
+        are safe only on CLI-authored text.
     :param failure_context: Original error fields before display-text rewriting.
     :returns: Parsed transcript item.
     """

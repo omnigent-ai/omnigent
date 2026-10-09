@@ -16,7 +16,11 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.conftest import (
+    _CLAUDE_MOCK_MODEL,
+    configure_mock_llm,
+    set_fallback_mock_llm,
+)
 from tests.e2e_ui.messages.test_message_render_parity import (
     _ASSISTANT,
     _USER,
@@ -27,16 +31,13 @@ from tests.e2e_ui.messages.test_message_render_parity import (
 
 _ERROR_PILL = '[data-testid="error-pill"]'
 
-# Must match the mock anthropic provider model the native_claude_mock_session
-# fixture configures (conftest._CLAUDE_MOCK_MODEL).
-_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
-
 # Only requests carrying this token draw from the max_tokens fault queue.
 _FAULT_TOKEN = "overlong-report-fault"
 _SANITY_LINE = "MOCK TURN OK output-limit-sanity"
 
-# The generic code the server stamps on an unrecognized native turn failure.
-_GENERIC_TURN_ERROR = "native_turn_error"
+# The code and guidance an output-limit failure must carry instead of the raw constant.
+_OUTPUT_LIMIT_CODE = "output_limit_exceeded"
+_OUTPUT_LIMIT_GUIDANCE = "Output limit reached"
 
 # Claude Code's constant for a response that ended with stop_reason "max_tokens".
 _RAW_LIMIT_ERROR_RE = re.compile(
@@ -64,6 +65,16 @@ def _session_snapshot(base_url: str, session_id: str) -> dict:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15.0)
     resp.raise_for_status()
     return resp.json()
+
+
+def _wait_for_status(base_url: str, session_id: str, status: str, timeout_s: float) -> None:
+    """Poll ``GET /v1/sessions/{id}`` until the session reports *status*."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if str(_session_snapshot(base_url, session_id).get("status") or "") == status:
+            return
+        time.sleep(1.0)
+    pytest.fail(f"session never reached status {status!r} within {timeout_s:.0f}s")
 
 
 def _transcript_blob(base_url: str, session_id: str) -> str:
@@ -213,8 +224,8 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     )
     expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
 
-    # Claude Code's stop hooks run for a few seconds after the indicator clears.
-    time.sleep(10.0)
+    # The Stop hook flips the session back to idle a few seconds after the indicator clears.
+    _wait_for_status(base_url, session_id, "idle", timeout_s=60.0)
 
     # Turn 2 — the scripted reply to this request ends with stop_reason "max_tokens".
     _send(page, f"please write the full 50-page report now ({_FAULT_TOKEN})")
@@ -267,12 +278,17 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
             f"{where}. Setting CLAUDE_CODE_MAX_OUTPUT_TOKENS on the running CLI is "
             "not available from the Omnigent web chat."
         )
-    if status == "failed" and last_task_error.get("code") == _GENERIC_TURN_ERROR:
+    if status == "failed" and last_task_error.get("code") != _OUTPUT_LIMIT_CODE:
         problems.append(
-            "the failed turn was attributed to the generic "
-            f"{_GENERIC_TURN_ERROR!r} code (last_task_error={last_task_error!r}; "
-            f"server log={log_lines!r}), so the model's output cap is counted as an "
-            "Omnigent turn failure instead of an upstream limit."
+            f"the failed turn was not attributed to {_OUTPUT_LIMIT_CODE!r} "
+            f"(last_task_error={last_task_error!r}; server log={log_lines!r}), so the "
+            "model's output cap is counted as an Omnigent turn failure instead of an "
+            "upstream limit."
+        )
+    if status == "failed" and _OUTPUT_LIMIT_GUIDANCE not in _assistant_bubble_text(page):
+        problems.append(
+            f"the chat does not show the {_OUTPUT_LIMIT_GUIDANCE!r} guidance for the "
+            "failed turn, so the user has nothing to act on."
         )
     if problems:
         # Hold the failure state on screen so the recording ends on it.

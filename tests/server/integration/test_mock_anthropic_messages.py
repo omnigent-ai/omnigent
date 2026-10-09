@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -91,3 +93,33 @@ async def test_nonstream_tool_use_has_decoded_input() -> None:
         assert message["stop_reason"] == "tool_use"
         assert message["content"][0]["name"] == "inspect"
         assert message["content"][0]["input"] == {"path": "synthetic.txt"}
+
+
+@pytest.mark.parametrize("thinking", [None, "Let me plan the long report first."])
+async def test_streamed_stop_reason_override_reaches_message_delta(thinking: str | None) -> None:
+    """A queued ``stop_reason`` ends plain and thinking replies alike."""
+    response_spec: dict[str, object] = {"text": "Here is the start —", "stop_reason": "max_tokens"}
+    if thinking is not None:
+        response_spec["thinking"] = thinking
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=mock_llm_server.app), base_url="http://mock"
+    ) as client:
+        configured = await client.post("/mock/configure", json={"responses": [response_spec]})
+        configured.raise_for_status()
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "synthetic-model",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Write the full report."}],
+                "stream": True,
+            },
+        )
+        assert response.status_code == 200
+        deltas = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and '"message_delta"' in line
+        ]
+        assert [delta["delta"]["stop_reason"] for delta in deltas] == ["max_tokens"]
+        assert ('"type": "thinking"' in response.text) == (thinking is not None)

@@ -523,6 +523,7 @@ def anthropic_sse_thinking_text_response(
     text: str,
     model: str = "mock-model",
     usage: dict | None = None,
+    stop_reason: str = "end_turn",
 ) -> str:
     """Build Anthropic Messages API SSE stream: a thinking block, then text.
 
@@ -536,6 +537,8 @@ def anthropic_sse_thinking_text_response(
     :param text: The final assistant text streamed after the thought.
     :param usage: Optional prompt-usage overrides merged into
         ``message_start`` (see :func:`anthropic_sse_text_response`).
+    :param stop_reason: Terminal ``stop_reason`` for the ``message_delta``
+        event (see :func:`anthropic_sse_text_response`).
     """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     output_tokens = max(5, len(text.split()) + len(thinking.split()))
@@ -614,7 +617,7 @@ def anthropic_sse_thinking_text_response(
         "message_delta",
         {
             "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"output_tokens": output_tokens},
         },
     )
@@ -1257,7 +1260,11 @@ async def create_message(
         sse_body = anthropic_sse_tool_call_response(qr.tool_calls, model=echo_model)
     elif qr.thinking:
         sse_body = anthropic_sse_thinking_text_response(
-            qr.thinking, qr.text, model=echo_model, usage=qr.usage
+            qr.thinking,
+            qr.text,
+            model=echo_model,
+            usage=qr.usage,
+            stop_reason=qr.stop_reason or "end_turn",
         )
     else:
         sse_body = anthropic_sse_text_response(
