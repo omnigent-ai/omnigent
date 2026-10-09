@@ -153,16 +153,12 @@ function LocationProbe() {
   );
 }
 
-function RoutedCanvas({ controlSelection }: { controlSelection: boolean }) {
+function RoutedCanvas() {
   const match = useMatch("/canvas/c/:conversationId");
-  return (
-    <CanvasPage
-      selectedSessionId={controlSelection ? (match?.params.conversationId ?? null) : undefined}
-    />
-  );
+  return <CanvasPage selectedSessionId={match?.params.conversationId ?? null} />;
 }
 
-function pageTree(initialEntry = "/canvas", controlSelection = true) {
+function pageTree(initialEntry = "/canvas") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={queryClient}>
@@ -173,7 +169,7 @@ function pageTree(initialEntry = "/canvas", controlSelection = true) {
               path="/canvas/*"
               element={
                 <>
-                  <RoutedCanvas controlSelection={controlSelection} />
+                  <RoutedCanvas />
                   <LocationProbe />
                 </>
               }
@@ -417,7 +413,7 @@ describe("CanvasPage", () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("first", 2), conversation("second", 1)]),
     );
-    render(pageTree("/canvas", true));
+    render(pageTree("/canvas"));
     fireEvent.click(screen.getByTestId("flow-node-first"));
     expect(screen.getByTestId("flow-node-first")).toHaveAttribute("data-selected", "true");
     const onNodesChange = flowProps.current!.onNodesChange as (changes: unknown[]) => void;
@@ -435,7 +431,7 @@ describe("CanvasPage", () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })]),
     );
-    render(pageTree("/canvas", true));
+    render(pageTree("/canvas"));
     fireEvent.click(screen.getByTestId("flow-node-main"));
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
     fireEvent.click(screen.getByTestId("flow-node-alpha"));
@@ -454,7 +450,7 @@ describe("CanvasPage", () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })]),
     );
-    render(pageTree("/canvas", true));
+    render(pageTree("/canvas"));
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
     const viewport = { x: -80, y: 24, zoom: 0.75 };
     flowApi.getViewport.mockReturnValue(viewport);
@@ -474,7 +470,7 @@ describe("CanvasPage", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     const rows = [conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })];
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
-    const { rerender } = render(pageTree("/canvas", true));
+    const { rerender } = render(pageTree("/canvas"));
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
     flowApi.getViewport.mockReturnValue({ x: 100, y: 100, zoom: 1 });
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
@@ -483,7 +479,7 @@ describe("CanvasPage", () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("new", 3), ...rows]),
     );
-    rerender(pageTree("/canvas", true));
+    rerender(pageTree("/canvas"));
     fireEvent.click(screen.getByRole("tab", { name: "Main" }));
     expect(screen.getByTestId("flow-node-new")).toBeInTheDocument();
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(3));
@@ -500,7 +496,7 @@ describe("CanvasPage", () => {
       conversation("beta", 1, { project_id: "proj_b" }),
     ];
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
-    render(pageTree("/canvas", true));
+    render(pageTree("/canvas"));
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
     const mainViewport = { x: -80, y: 24, zoom: 0.75 };
     flowApi.getViewport.mockReturnValue(mainViewport);
@@ -544,7 +540,7 @@ describe("CanvasPage", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     const rows = [conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })];
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
-    const { rerender } = render(pageTree("/canvas", true));
+    const { rerender } = render(pageTree("/canvas"));
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
     flowApi.getViewport.mockReturnValue({ x: -80, y: 24, zoom: 0.75 });
     act(() =>
@@ -555,7 +551,7 @@ describe("CanvasPage", () => {
     flowApi.getViewport.mockReturnValue({ x: 200, y: -100, zoom: 1.25 });
 
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows.slice(1)));
-    rerender(pageTree("/canvas", true));
+    rerender(pageTree("/canvas"));
     fireEvent.click(screen.getByRole("tab", { name: "Main" }));
     expect(flowSetViewport).not.toHaveBeenCalled();
     vi.useFakeTimers();
@@ -566,7 +562,7 @@ describe("CanvasPage", () => {
       vi.advanceTimersByTime(100);
     });
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
-    rerender(pageTree("/canvas", true));
+    rerender(pageTree("/canvas"));
     expect(flowSetViewport).toHaveBeenLastCalledWith({ x: -280, y: -76, zoom: 0.75 });
     expect(flowFitView).toHaveBeenCalledTimes(2);
   });
@@ -591,7 +587,7 @@ describe("CanvasPage", () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("first", 1)]),
     );
-    render(pageTree("/canvas", true));
+    render(pageTree("/canvas"));
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
     let viewport = { x: -80, y: 24, zoom: 0.75 };
     flowApi.getViewport.mockImplementation(() => viewport);

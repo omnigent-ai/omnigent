@@ -42,8 +42,7 @@ export function CanvasSidebarRail({
     <nav
       aria-label="Collapsed sidebar"
       data-testid="canvas-sidebar-rail"
-      className="flex w-12 shrink-0 flex-col items-center gap-2 border-r bg-sidebar px-1 pb-3 md:w-14"
-      style={{ paddingTop: "calc(var(--omnigent-inset-top) + 8px)" }}
+      className="canvas-sidebar-rail flex w-12 shrink-0 flex-col items-center gap-2 border-r bg-sidebar px-1 pt-[calc(var(--omnigent-inset-top)+8px)] pb-3 md:w-14"
     >
       <Button
         variant="ghost"

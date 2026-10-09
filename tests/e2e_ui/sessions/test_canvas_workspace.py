@@ -40,6 +40,67 @@ def canvas_project(
             httpx.delete(f"{base_url}/v1/projects/{project_id}", timeout=10.0).raise_for_status()
 
 
+@pytest.mark.parametrize("width", [1440, 720])
+def test_canvas_controls_clear_the_macos_titlebar(
+    page: Page, canvas_project: tuple[str, str, str, str], width: int
+) -> None:
+    """Exercise macOS shell CSS in Chromium; native traffic lights are not rendered."""
+    base_url, first, _second, project_id = canvas_project
+    page.set_viewport_size({"width": width, "height": 900})
+    page.add_init_script(
+        """
+        Object.defineProperty(navigator, 'userAgent', {
+          value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)', configurable: true,
+        });
+        window.omnigentDesktop = {
+          kind: 'electron',
+          setBadgeCount() {},
+          notify: () => Promise.resolve(false),
+          onNotificationActivated: () => () => {},
+          getServerPicker: () => Promise.resolve(null),
+          switchServer: () => Promise.resolve(),
+          openServerSetup() {},
+        };
+        """
+    )
+    _stub_server_info(page, canvas=True)
+    page.goto(f"{base_url}/canvas?canvas={project_id}")
+    expect(page.locator("html")).to_have_attribute("data-electron-mac", "true")
+    heading = page.get_by_role("heading", name="Canvas", exact=True)
+    expect(heading).to_be_visible()
+    strip = page.locator(".electron-drag-strip").bounding_box()
+    assert strip is not None
+    titlebar_bottom = strip["y"] + strip["height"]
+    expand = page.get_by_role("navigation", name="Collapsed sidebar").get_by_role(
+        "button", name="Expand sidebar", exact=True
+    )
+    for control in (expand, heading):
+        bounds = control.bounding_box()
+        assert bounds is not None and bounds["y"] >= titlebar_bottom, (
+            f"Canvas control overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
+        )
+    expand.click()
+    expect(page.get_by_test_id("canvas-nav")).to_be_visible()
+    if width < 768:
+        page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
+    else:
+        page.locator(".electron-sidebar-header-actions").get_by_role(
+            "button", name="Close sidebar", exact=True
+        ).click()
+    card = page.locator(f'.react-flow__node[data-id="{first}"]').get_by_test_id("session-card")
+    card.click()
+    if width < 760:
+        restore = page.get_by_role("button", name="Back to canvas", exact=True)
+    else:
+        page.get_by_role("button", name="Focus conversation", exact=True).click()
+        restore = page.get_by_role("button", name="Show canvas beside conversation", exact=True)
+    expect(restore).to_be_visible()
+    bounds = restore.bounding_box()
+    assert bounds is not None and bounds["y"] >= titlebar_bottom
+    restore.click()
+    expect(heading).to_be_visible()
+
+
 def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
     page: Page,
     canvas_project: tuple[str, str, str, str],

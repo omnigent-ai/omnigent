@@ -107,6 +107,8 @@ the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
 the same board. The collapsed sidebar keeps its expand button first, followed by
 Search, Settings, and the same primary destinations as the expanded sidebar.
+On macOS desktop, the board and its controls stay below the window title bar,
+including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
 status and live session updates, including when the app is embedded.
 
@@ -388,6 +390,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_rail_matches_expanded_navigation`.
   The journey compares destinations and clicks Canvas with a project selected,
   then reloads to confirm the selected project remains remembered.
+  macOS title-bar clearance, rail expansion, and conversation focus/return at wide
+  and narrow widths run in
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`.
+  This Chromium journey emulates the macOS preload bridge and user agent; it
+  verifies the app's layout around the title bar, not native traffic-light rendering.
   `web/src/extensions/ExtensionPrimaryNavigation.test.tsx` verifies compact
   extension links retain accessible labels and work when activated.
 - **`canvas-create` (Main/project plus button, desktop/mobile):**

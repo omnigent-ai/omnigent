@@ -1073,6 +1073,7 @@ describe("Sidebar session list", () => {
       });
 
       expect(screen.getByTestId("canvas-nav")).toHaveAttribute("href", "/canvas?canvas=project");
+      expect(screen.getByTestId("canvas-nav")).toHaveAttribute("aria-current", "page");
     },
   );
 

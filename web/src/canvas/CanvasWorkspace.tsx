@@ -139,7 +139,7 @@ export function CanvasWorkspace({
     <CanvasWorkspaceContext.Provider value={controls}>
       <div
         ref={container}
-        className="relative flex min-h-0 min-w-0 flex-1"
+        className="canvas-workspace relative flex min-h-0 min-w-0 flex-1"
         data-testid="canvas-workspace"
       >
         <section
