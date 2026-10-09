@@ -149,12 +149,12 @@ class TestSplitTransientTail(unittest.TestCase):
         self.assertEqual(split.transient, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestExecutorError(unittest.TestCase):
     def test_positional_arguments_keep_their_meaning(self):
         error = ExecutorError("boom", False, None, True)
         self.assertTrue(error.preserve_session)
         self.assertIsNone(error.exception)
+
+
+if __name__ == "__main__":
+    unittest.main()

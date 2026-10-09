@@ -1179,18 +1179,7 @@ def test_classify_inner_exception_dispatches_across_sdks(
 
 
 def test_classify_inner_exception_walks_cause_chain() -> None:
-    """
-    :func:`classify_inner_exception` follows ``__cause__`` so a wrapper
-    raised with ``raise ... from sdk_exc`` classifies by the SDK
-    exception it carries.
-
-    What breaks if this fails: the executor adapter wraps every inner
-    ExecutorError as ``RuntimeError("inner executor error: …")`` chained
-    from the executor-caught SDK exception. Without the cause walk, a
-    provider-throttle 429 (``openai.RateLimitError``) surfaces as the
-    unclassified ``code="RuntimeError"`` — the upstream capacity outage
-    gets attributed to Omnigent and the retry allowlist never matches.
-    """
+    """SDK causes retain their classification; unknown and cyclic chains terminate safely."""
     from omnigent.runtime.harnesses._executor_adapter import (
         classify_inner_exception,
     )

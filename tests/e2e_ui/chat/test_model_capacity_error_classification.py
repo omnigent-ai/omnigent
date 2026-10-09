@@ -19,7 +19,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
 
 _CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model."
 _CAPACITY_SIGNATURE = "Selected model is at capacity"
@@ -60,7 +60,7 @@ def _settled_turn_error(base_url: str, session_id: str) -> dict[str, Any] | None
             if item.get("type") == "error" and str(fields.get("level") or "") != "info":
                 return fields
         for item in items:
-            role = item.get("role") or (item.get("data") or {}).get("role")
+            role = item.get("role") or _error_fields(item).get("role")
             if item.get("type") == "message" and role == "assistant":
                 return None
         time.sleep(0.5)
@@ -88,7 +88,19 @@ def test_model_capacity_429_fails_turn_as_rate_limit(
         key="model-at-capacity",
         match=_TRIGGER,
     )
+    try:
+        _drive_capacity_turn(request, base_url, session_id)
+    finally:
+        reset_mock_llm(mock_llm_server_url)
 
+
+def _drive_capacity_turn(request: Any, base_url: str, session_id: str) -> None:
+    """Send the trigger message and verify the failed turn's classification.
+
+    :param request: Pytest request; the recorded page is created here, after setup.
+    :param base_url: Server base URL.
+    :param session_id: The session/conversation id.
+    """
     page = request.getfixturevalue("page")
     assert isinstance(page, Page)
     page.goto(f"{base_url}/c/{session_id}")
