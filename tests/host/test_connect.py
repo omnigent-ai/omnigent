@@ -121,11 +121,9 @@ def _isolated_model_catalog_store(
 def _isolated_provider_resolution(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Model-options frame assertions must not depend on machine-global provider state.
+    """Isolate provider config, the inference overlay, and ambient detection.
 
-    The resolved provider ``source`` on every row comes from ``~/.omnigent/config.yaml``,
-    the ``OMNIGENT_INFERENCE_CONFIG`` overlay, and ambient-credential detection;
-    neutralize all three, as neighboring suites do for the same seams.
+    Exact model-option frame assertions must not depend on machine-global state.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path_factory.mktemp("config_home")))
     monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
