@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
+import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -1407,6 +1409,7 @@ class _FakeZerobus:
         self._mint_gate = mint_gate
         self._insert_gate = insert_gate
         self.mints = 0
+        self.mint_auth: list[object] = []
         self.inserts = 0
         self.insert_timeouts: list[float] = []
         self.inserted: list[str] = []
@@ -1416,6 +1419,7 @@ class _FakeZerobus:
     def post(self, url: str, **kwargs: object) -> httpx.Response:
         if url.endswith("/oidc/v1/token"):
             self.mints += 1
+            self.mint_auth.append(kwargs.get("auth"))
             self.in_mint.set()
             if self._mint_gate is not None:
                 self._mint_gate.wait(timeout=10)
@@ -1503,22 +1507,141 @@ def test_post_sends_nothing_without_time_left(
     assert client.mints == (0 if budget < 0 else 1)  # no mint starts without time left
 
 
-def test_shutdown_mint_never_runs_an_unresolved_secret_command(
-    monkeypatch: pytest.MonkeyPatch,
+# ── secret command: eager at sink start, bounded during the drain ───────────
+
+# Fake secret command: sleeps argv[2] seconds, appends a line to the file argv[1]
+# (one line per run), prints a demo secret and exits with status argv[3].
+_SECRET_SCRIPT = (
+    "import sys, time; time.sleep(float(sys.argv[2])); "
+    "open(sys.argv[1], 'a').write('ran\\n'); "
+    "print('demo-secret'); sys.exit(int(sys.argv[3]))"
+)
+
+
+def _secret_command_env(
+    monkeypatch: pytest.MonkeyPatch, runs: Path, *, seconds: float = 0.2, exit_code: int = 0
 ) -> None:
-    """The secret command is an unbounded subprocess; never run it at shutdown."""
+    """Configure a fake client-secret command that records each run in *runs*."""
+    argv = [sys.executable, "-c", _SECRET_SCRIPT, str(runs), str(seconds), str(exit_code)]
     monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
-    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, shlex.join(argv))
     monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
     monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+
+
+def _secret_runs(runs: Path) -> int:
+    return len(runs.read_text().splitlines()) if runs.exists() else 0
+
+
+def test_drain_runs_an_unresolved_secret_command_within_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drain that finds the secret unresolved resolves it rather than dropping the batch."""
+    runs = tmp_path / "runs"
+    _secret_command_env(monkeypatch, runs)
+    client = _FakeZerobus([200])
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + 5.0
+
+    sink._post([{"message": "m"}])
+
+    assert _secret_runs(runs) == 1
+    assert client.mint_auth == [("cid", "demo-secret")]
+    assert client.inserted == ["m"]
+
+
+@pytest.mark.parametrize("budget", [0.5, 1.05], ids=["short", "just-under-the-floor"])
+def test_drain_without_enough_budget_does_not_run_the_secret_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    budget: float,
+) -> None:
+    """Under the floor (budget minus the POST reserve < 1s) the batch is dropped, as before."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    runs = tmp_path / "runs"
+    _secret_command_env(monkeypatch, runs)
+    client = _FakeZerobus([200])
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + budget
+
+    sink._post([{"message": "m"}])
+
+    assert _secret_runs(runs) == 0
+    assert (client.mints, client.inserts) == (0, 0)
+    assert "no auth token (mint failing); dropping 1 row(s)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("budget", "timeout"),
+    [
+        (None, dl._SECRET_COMMAND_TIMEOUT_S),  # normal operation keeps the full limit
+        (100.0, dl._SECRET_COMMAND_TIMEOUT_S),  # a long drain is still capped by it
+        (3.0, 2.9),  # a drain leaves the POST reserve out of the command's time
+        (1.5, 1.4),
+    ],
+)
+def test_secret_command_timeout_follows_the_drain_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: float | None, timeout: float
+) -> None:
+    _secret_command_env(monkeypatch, tmp_path / "runs")
     config = dl.config_from_env()
     assert config is not None
-    ran: list[object] = []
-    monkeypatch.setattr(dl.subprocess, "run", lambda *a, **_k: ran.append(a))
-    tokens = dl._TokenSource(config, _FakeZerobus([200]))  # type: ignore[arg-type]
+    limits: list[float] = []
 
-    assert tokens.token(deadline=time.monotonic() + 1) is None
-    assert ran == []
+    def run(_command: tuple[str, ...], **kwargs: object) -> object:
+        limits.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+        return type("Completed", (), {"returncode": 0, "stdout": "demo-secret\n"})()
+
+    monkeypatch.setattr(dl.subprocess, "run", run)
+    tokens = dl._TokenSource(config, _FakeZerobus([200]))  # type: ignore[arg-type]
+    deadline = None if budget is None else time.monotonic() + budget
+
+    assert tokens.token(deadline=deadline) == "token"
+    (limit,) = limits
+    assert timeout - 0.25 < limit <= timeout  # only the time spent getting here is subtracted
+
+
+def test_drain_cuts_off_a_secret_command_that_outlives_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hung credential helper can't stretch the drain past its deadline."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    runs = tmp_path / "runs"
+    _secret_command_env(monkeypatch, runs, seconds=30)
+    config = dl.config_from_env()
+    assert config is not None
+    client = _FakeZerobus([200])
+    tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    started = time.monotonic()
+
+    assert tokens.token(deadline=started + 1.6) is None
+
+    assert time.monotonic() - started < 5
+    assert _secret_runs(runs) == 0  # killed before it finished
+    assert client.mints == 0
+    assert "client-secret command failed: TimeoutExpired" in caplog.text
+
+
+def test_static_secret_is_not_prefetched_and_ignores_the_secret_command_floor(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def run(*_: object, **__: object) -> object:
+        raise AssertionError("a static secret has no command to run")
+
+    monkeypatch.setattr(dl.subprocess, "run", run)
+    client = _FakeZerobus([200])
+    config = dl.config_from_env()
+    assert config is not None
+    tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+
+    tokens.prefetch()
+    assert client.mints == 0  # still minted lazily, by the first upload
+
+    assert tokens.token(deadline=time.monotonic() + 0.5) == "token"  # whatever the drain budget
+    assert client.mint_auth == [("cid", "secret")]
 
 
 def _live_zerobus_sink(
@@ -1624,3 +1747,154 @@ def test_near_deadline_auth_rejection_does_not_start_a_new_mint(_configured_env:
 
     assert client.mints == 1
     assert client.inserts == 1
+
+
+def _wait_until(condition: Callable[[], bool], timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not met in time"
+        time.sleep(0.01)
+
+
+def _hold_first_upload(sink: dl.ZerobusLogHandler) -> threading.Event:
+    """Make the worker wait for the returned event before it uploads anything."""
+    release = threading.Event()
+    post = sink._send
+
+    def held(batch: list[dl.DebugLogRow]) -> None:
+        assert release.wait(timeout=5)
+        post(batch)
+
+    sink._send = held
+    return release
+
+
+def test_row_logged_just_before_exit_ships_despite_a_slow_secret_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process that logs its fatal error and exits at once still ships it.
+
+    The row is logged while the slow secret command is unresolved, and the
+    worker uploads only after close() set the drain deadline.
+    """
+    runs = tmp_path / "runs"
+    _secret_command_env(monkeypatch, runs)
+    client = _FakeZerobus([200])
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    release = _hold_first_upload(sink)
+    try:
+        logger.critical("runner exiting: startup failed")
+        threading.Timer(0.05, release.set).start()  # lets the upload go once close() began
+        sink.close(timeout=5.0)
+    finally:
+        release.set()
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)
+
+    assert client.inserted == ["runner exiting: startup failed"]
+    assert client.mint_auth == [("cid", "demo-secret")]
+    assert _secret_runs(runs) == 1
+
+
+def test_secret_command_runs_once_at_sink_start_without_any_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The uploader resolves its credentials as it starts, before any row exists."""
+    runs = tmp_path / "runs"
+    _secret_command_env(monkeypatch, runs)
+    client = _FakeZerobus([200])
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        assert client.in_mint.wait(timeout=10)  # resolved and minted with nothing logged
+        assert _secret_runs(runs) == 1
+        assert client.inserts == 0
+        logger.info("first row")
+    finally:
+        logger.removeHandler(sink)
+        sink.close(timeout=5.0)
+
+    assert client.inserted == ["first row"]
+    assert (client.mints, _secret_runs(runs)) == (1, 1)  # the first upload reuses the credentials
+
+
+def test_failed_prefetch_is_ignored_and_retried_by_the_first_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing command at start leaves the worker alive; the first upload retries it."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    runs = tmp_path / "runs"
+    _secret_command_env(monkeypatch, runs, seconds=0.0, exit_code=3)
+    client = _FakeZerobus([200])
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        _wait_until(lambda: _secret_runs(runs) == 1)
+        assert sink._thread.is_alive()
+        logger.info("row")
+    finally:
+        logger.removeHandler(sink)
+        sink.close(timeout=5.0)
+
+    assert _secret_runs(runs) == 2  # the first upload ran the command again
+    assert (client.mints, client.inserts) == (0, 0)
+    assert caplog.text.count("exited with status 3") == 1  # one diagnostic, not one per attempt
+
+
+def test_static_secret_sink_mints_on_its_first_upload(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A static secret is untouched by the prefetch: nothing is minted before the first row."""
+    prefetched = threading.Event()
+    prefetch = dl._TokenSource.prefetch
+
+    def traced(tokens: dl._TokenSource) -> None:
+        prefetch(tokens)
+        prefetched.set()
+
+    monkeypatch.setattr(dl._TokenSource, "prefetch", traced)
+    client = _FakeZerobus([200])
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        assert prefetched.wait(timeout=5)  # the worker prefetched, and minted nothing
+        assert client.mints == 0
+        logger.info("row")
+    finally:
+        logger.removeHandler(sink)
+        sink.close(timeout=5.0)
+
+    assert client.inserted == ["row"]
+    assert client.mint_auth == [("cid", "secret")]
+
+
+def test_close_during_a_slow_prefetch_returns_at_its_timeout_and_counts_the_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A slow credential helper can't hold a closing process past close()'s timeout."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    _secret_command_env(monkeypatch, tmp_path / "runs")
+    in_command, release = threading.Event(), threading.Event()
+
+    def run(_command: tuple[str, ...], **_kwargs: object) -> object:
+        in_command.set()
+        assert release.wait(timeout=10)
+        return type("Completed", (), {"returncode": 0, "stdout": "demo-secret\n"})()
+
+    monkeypatch.setattr(dl.subprocess, "run", run)
+    client = _FakeZerobus([200])
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        assert in_command.wait(timeout=5)
+        logger.critical("runner exiting: startup failed")
+        started = time.monotonic()
+        sink.close(timeout=0.2)
+        assert time.monotonic() - started < 2
+        assert sink._thread.is_alive()  # still inside the command
+        release.set()
+        sink._thread.join(timeout=5)
+    finally:
+        release.set()
+        logger.removeHandler(sink)
+
+    assert client.inserts == 0
+    assert _dropped_counts(caplog) == [1]  # past the deadline, the row is dropped and counted

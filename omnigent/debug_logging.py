@@ -110,6 +110,8 @@ _HTTP_TIMEOUT_S = 10.0
 _SECRET_COMMAND_TIMEOUT_S = 30.0
 # At shutdown, don't start a request with less time than this left.
 _MIN_POST_BUDGET_S = 0.1
+# At shutdown, don't start the client-secret command with less time than this to run in.
+_MIN_SECRET_COMMAND_BUDGET_S = 1.0
 # Transport errors raised before the request was fully sent, so a retry can't
 # duplicate it. Any other transport error (e.g. a read timeout) may mean the
 # insert already landed, so the batch is dropped rather than resent.
@@ -208,10 +210,11 @@ def _parse_insert_url(insert_url: str) -> tuple[str, str] | None:
 def config_from_env() -> DebugLogConfig | None:
     """Build the sink config from the environment, or ``None`` when disabled.
 
-    The client secret may be supplied directly or by a command. The command is
-    invoked lazily by the uploader thread, so a slow credential provider never
-    delays process startup. When no variables are set the sink stays silently
-    off; a partial or ambiguous configuration logs one warning and disables it.
+    The client secret may be supplied directly or by a command. The uploader
+    thread runs the command as soon as it starts, so a slow credential provider
+    never delays process startup. When no variables are set the sink stays
+    silently off; a partial or ambiguous configuration logs one warning and
+    disables it.
     """
     client_id = os.environ.get(CLIENT_ID_ENV_VAR)
     client_secret = os.environ.get(CLIENT_SECRET_ENV_VAR)
@@ -642,21 +645,32 @@ class _TokenSource:
         """Return a cached token or mint one.
 
         With a monotonic shutdown *deadline*, the mint's HTTP call is bounded
-        by it, and an unresolved client-secret command (an unbounded
-        subprocess) is not run.
+        by it, and an unresolved client-secret command runs only if it can
+        finish with time left to POST (see :func:`_secret_command_timeout`).
         """
         with self._lock:
             if self._token and time.time() < self._expires_at - _TOKEN_REFRESH_SKEW_S:
                 return self._token
-            if deadline is not None and (
-                self._client_secret is None and self._config.client_secret_command is not None
-            ):
-                return None
-            minted = self._mint(deadline=deadline)
+            secret_timeout = _SECRET_COMMAND_TIMEOUT_S
+            if self._client_secret is None and self._config.client_secret_command is not None:
+                bounded = _secret_command_timeout(deadline)
+                if bounded is None:
+                    return None
+                secret_timeout = bounded
+            minted = self._mint(deadline=deadline, secret_timeout=secret_timeout)
             if minted is None:
                 return None
             self._token, self._expires_at = minted
             return self._token
+
+    def prefetch(self) -> None:
+        """Run the client-secret command and mint a token before the first upload.
+
+        A static secret keeps its lazy mint. A failure is left for the first
+        upload to retry, exactly as if nothing had been prefetched.
+        """
+        if self._config.client_secret_command is not None:
+            self.token()
 
     def invalidate(self) -> None:
         with self._lock:
@@ -665,7 +679,7 @@ class _TokenSource:
             if self._config.client_secret_command is not None:
                 self._client_secret = None
 
-    def _resolve_client_secret(self) -> str | None:
+    def _resolve_client_secret(self, timeout: float = _SECRET_COMMAND_TIMEOUT_S) -> str | None:
         if self._client_secret is not None:
             return self._client_secret
         command = self._config.client_secret_command
@@ -678,7 +692,7 @@ class _TokenSource:
                 check=False,
                 stdin=subprocess.DEVNULL,
                 text=True,
-                timeout=_SECRET_COMMAND_TIMEOUT_S,
+                timeout=timeout,
             )
         except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             _diag("secret_command", "client-secret command failed: %s", type(exc).__name__)
@@ -724,8 +738,10 @@ class _TokenSource:
             ]
         )
 
-    def _mint(self, *, deadline: float | None = None) -> tuple[str, float] | None:
-        client_secret = self._resolve_client_secret()
+    def _mint(
+        self, *, deadline: float | None = None, secret_timeout: float = _SECRET_COMMAND_TIMEOUT_S
+    ) -> tuple[str, float] | None:
+        client_secret = self._resolve_client_secret(secret_timeout)
         if client_secret is None:
             return None
         resource = f"api://databricks/workspaces/{self._config.workspace_id}/zerobusDirectWriteApi"
@@ -802,6 +818,20 @@ def _bounded_timeout(deadline: float | None) -> float:
     if remaining is None:
         return _HTTP_TIMEOUT_S
     return max(0.01, min(_HTTP_TIMEOUT_S, remaining))
+
+
+def _secret_command_timeout(deadline: float | None) -> float | None:
+    """The client-secret command's time limit, or ``None`` if *deadline* leaves too little.
+
+    Outside shutdown the command gets its full limit. During the drain it must
+    finish with room left to POST, and is not started with under
+    ``_MIN_SECRET_COMMAND_BUDGET_S`` to run in.
+    """
+    remaining = _remaining(deadline)
+    if remaining is None:
+        return _SECRET_COMMAND_TIMEOUT_S
+    limit = min(_SECRET_COMMAND_TIMEOUT_S, remaining - _MIN_POST_BUDGET_S)
+    return limit if limit >= _MIN_SECRET_COMMAND_BUDGET_S else None
 
 
 def _bounded_sleep(seconds: float, deadline: float | None) -> None:
@@ -993,6 +1023,10 @@ class ZerobusLogHandler(DebugLogHandler):
         # it down while a post or token mint is in flight.
         client = self._client
         try:
+            # Ready the credentials before the first row, so a process that dies
+            # early can still ship its last rows. A close() waits for this, up to its timeout.
+            with contextlib.suppress(Exception):
+                self._tokens.prefetch()
             super()._run()
         finally:
             with contextlib.suppress(Exception):
