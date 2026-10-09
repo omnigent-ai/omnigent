@@ -235,7 +235,7 @@ def test_client_safe_detail_redacts_raw_errors_but_preserves_spawn_reasons() -> 
     assert raw.startswith("Request failed on the runner")
 
     curated = _client_safe_error_detail(
-        HarnessSpawnError("unknown harness 'nope'; registered names: ['test']"),
+        HarnessSpawnError("unknown harness 'nope'; not registered with this runner"),
         context="harness spawn",
     )
     assert curated.startswith("unknown harness 'nope'"), (

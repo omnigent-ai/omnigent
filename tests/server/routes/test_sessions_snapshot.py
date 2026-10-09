@@ -2805,6 +2805,48 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_persist_error_labels_keeps_spawn_cause_and_log_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relayed harness-spawn failure persists with its cause and log pointer.
+
+    The runner composes ``harness_spawn_failed: <cause>; see the runner log for
+    details: <path>`` for the failed-turn status. The whole message must fit the
+    label column so a reload still shows why the spawn failed and where to look.
+    """
+    from omnigent.runner import app_support
+    from omnigent.runtime.harnesses.process_manager import HarnessSpawnError, _resolve_module_path
+    from omnigent.server.schemas import ErrorDetail
+
+    monkeypatch.setattr(
+        app_support,
+        "process_log_reference",
+        lambda _kind: "~/.omnigent/logs/runner/runner-20261009-190334-548495.log",
+    )
+    with pytest.raises(HarnessSpawnError) as spawn_error:
+        _resolve_module_path("never-registered-harness")
+    detail = app_support._client_safe_error_detail(spawn_error.value, context="harness spawn")
+    message = f"harness_spawn_failed: {detail}"
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    await _persist_session_status_error_labels(
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        ErrorDetail(code="runner_error", message=message),
+        _MockStore(),
+    )  # type: ignore[arg-type]
+
+    stored = captured["a1b2c3d4e5f60718293a4b5c6d7e8f90"]["omnigent.last_task_error_message"]
+    assert stored == message
+    assert "unknown harness 'never-registered-harness'" in stored
+    assert stored.endswith("runner-20261009-190334-548495.log")
+
+
 # ── _runner_reject_detail ────────────────────────────────────────────────────
 
 

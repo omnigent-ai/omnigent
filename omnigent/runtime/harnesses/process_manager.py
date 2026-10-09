@@ -253,9 +253,8 @@ def _resolve_module_path(harness: str) -> str:
     :returns: The fully-qualified module path that exports
         ``create_app() -> FastAPI``.
     :raises HarnessSpawnError: If ``harness`` is not registered. The
-        message names the registered harnesses (or notes the
-        registry is empty — common during Phase 1 step 2 before
-        wraps land in step 4).
+        client-safe message names the harness; the registered names
+        are written to the runner log.
     """
     module_path = _HARNESS_MODULES.get(harness)
     if module_path is not None:
@@ -272,10 +271,13 @@ def _resolve_module_path(harness: str) -> str:
             f"unknown harness {harness!r}; install `{package}` to add this harness"
         )
     if _HARNESS_MODULES:
-        registered = sorted(_HARNESS_MODULES)
-        raise HarnessSpawnError(f"unknown harness {harness!r}; registered names: {registered}")
-    # Dev-only state: no harness wraps are registered yet (Phase 1 step 4 of
-    # designs/SERVER_HARNESS_CONTRACT.md); tests register one via _HARNESS_MODULES.
+        # Clients see and persist this message, so the registry listing goes to
+        # the runner log instead of the exception text.
+        _logger.warning(
+            "unknown harness %r; registered names: %s", harness, sorted(_HARNESS_MODULES)
+        )
+        raise HarnessSpawnError(f"unknown harness {harness!r}; not registered with this runner")
+    # The registry may be empty in development and isolated tests.
     raise HarnessSpawnError(f"unknown harness {harness!r}; no harnesses are registered")
 
 

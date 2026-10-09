@@ -896,21 +896,25 @@ async def test_get_client_unknown_harness_raises_client_safe_spawn_error(
 
 def test_resolve_module_path_messages_stay_client_safe(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every unknown-harness branch raises ``HarnessSpawnError`` with curated text.
 
     These messages reach clients verbatim through the runner's error detail,
     so they must name only the harness and the remedy — no paths, hosts, or
-    module internals.
+    module internals — and stay short enough to persist with the log pointer.
+    The registry listing operators need goes to the runner log instead.
     """
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
     monkeypatch.setattr(pm_mod, "_HARNESS_MODULES", {_TEST_HARNESS_NAME: _TEST_HARNESS_MODULE})
-    with pytest.raises(HarnessSpawnError) as registered:
-        _resolve_module_path("never-registered")
+    with caplog.at_level(logging.WARNING, logger=pm_mod.__name__):
+        with pytest.raises(HarnessSpawnError) as registered:
+            _resolve_module_path("never-registered")
     assert str(registered.value) == (
-        "unknown harness 'never-registered'; registered names: ['test']"
+        "unknown harness 'never-registered'; not registered with this runner"
     )
+    assert "registered names: ['test']" in caplog.text
 
     monkeypatch.setattr(
         pm_mod, "missing_install_packages", lambda: {"never-registered": "omnigent-never"}
