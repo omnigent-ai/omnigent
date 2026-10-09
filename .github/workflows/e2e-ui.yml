@@ -18,7 +18,19 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['CHANGELOG.md']
+    paths-ignore:
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/scripts/**'
+      - 'tests/github/**'
+      - 'tests/onboarding/**'
+      - 'tests/llms/**'
+      - 'tests/deploy/**'
+      - 'tests/entities/**'
+      - '.github/scripts/polly-review-*.py'
+      - '.github/workflows/polly-review*.yml'
+      - '.github/workflows/*.js'
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
@@ -167,6 +179,11 @@ jobs:
 
       - name: Install project + test dependencies
         run: uv sync --locked --extra all --group test
+
+      # ci.yml skips UI-only changes, so check here that the verify-omnigent
+      # feature map still names tests that exist after UI test renames.
+      - name: Check verify-omnigent feature map
+        run: uv run pytest tests/dev/test_verify_omnigent_feature_map.py -q
 
       - name: Cache Playwright browsers
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
@@ -387,6 +404,8 @@ jobs:
           path: |
             test-results/
             playwright-report/
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/trace.zip
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/*.png
           retention-days: 3
           if-no-files-found: ignore
 
@@ -426,6 +445,9 @@ jobs:
             /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/runner.log
             /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/server.log
             /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/runner.log
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/*.log
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/network.json
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/first-response.json
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
             /tmp/codex-home-dump/**

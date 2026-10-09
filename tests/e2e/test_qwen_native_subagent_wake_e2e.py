@@ -28,7 +28,6 @@ with::
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import secrets
@@ -37,7 +36,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -48,6 +46,7 @@ import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import apply_runner_env, apply_server_env
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -301,16 +300,12 @@ def _register_parent(base_url: str, mock_llm_server_url: str) -> str:
     """Upload the orchestrator agent and return its durable agent id."""
     config = _parent_config()
     config["executor"]["auth"]["base_url"] = f"{mock_llm_server_url}/v1"
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml.dump(config).encode()
-        info = tarfile.TarInfo("qwen-wake-parent.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    resp = _client.post(
+    data = yaml.dump(config).encode()
+    bundle_bytes = bundle_files({"qwen-wake-parent.yaml": data})
+    resp = post_session_bundle(
+        _client.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        bundle_bytes,
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     if resp.status_code not in (200, 201, 409):
@@ -408,8 +403,7 @@ def test_qwen_native_subagent_completion_wakes_parent(
     )
     create.raise_for_status()
     session_id = str(create.json()["id"])
-    bind = _client.patch(f"{base_url}/v1/sessions/{session_id}", json={"runner_id": runner_id})
-    bind.raise_for_status()
+    bind_session_runner(_client.patch, base_url, session_id, runner_id)
 
     send = _client.post(
         f"{base_url}/v1/sessions/{session_id}/events",

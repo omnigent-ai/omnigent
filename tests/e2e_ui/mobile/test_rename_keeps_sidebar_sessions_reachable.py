@@ -29,12 +29,12 @@ scrolled into view while renaming.
 
 from __future__ import annotations
 
-import json
 import os
 
 import httpx
 from playwright.sync_api import Browser, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 # iPhone-13-class portrait profile with touch.
@@ -113,12 +113,7 @@ def _seed_filler_sessions(base_url: str, count: int) -> list[str]:
     ids: list[str] = []
     bundle = _build_hello_world_bundle()
     for i in range(count):
-        resp = httpx.post(
-            f"{base_url}/v1/sessions",
-            data={"metadata": json.dumps({})},
-            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-            timeout=30.0,
-        )
+        resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
         resp.raise_for_status()
         sid = resp.json()["session_id"]
         httpx.patch(

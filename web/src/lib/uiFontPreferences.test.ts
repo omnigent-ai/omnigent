@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedScopeRoot } from "./host";
 import {
   applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
   readUiFontSizePx,
@@ -9,6 +10,7 @@ import {
   UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
+  UI_FONT_SIZE_MOBILE_DEFAULT,
   writeUiFontFamily,
   writeUiFontSizePx,
 } from "./uiFontPreferences";
@@ -17,6 +19,7 @@ const STORAGE_KEY = "omnigent:ui-font-size";
 const FAMILY_STORAGE_KEY = "omnigent:ui-font-family";
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   localStorage.clear();
   setEmbedScopeRoot(null);
   document.documentElement.style.removeProperty("--desktop-ui-font-size");
@@ -27,6 +30,15 @@ describe("uiFontPreferences", () => {
   it("returns the default when nothing is stored", () => {
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
     expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+  });
+
+  it("uses a 14px default on mobile without scaling explicit choices", () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
+    expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_MOBILE_DEFAULT);
+    expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
+
+    writeUiFontSizePx(12);
+    expect(readUiFontSizePx()).toBe(12);
   });
 
   it("round-trips a valid size", () => {
@@ -70,6 +82,16 @@ describe("uiFontPreferences", () => {
   it("clamps before applying the desktop size", () => {
     applyDesktopUiFontSize(99);
     expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("18px");
+  });
+
+  it("only applies an inline override when a saved choice exists", () => {
+    applyDesktopUiFontSize(18);
+    applyStoredUiFontSize();
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("");
+
+    writeUiFontSizePx(12);
+    applyStoredUiFontSize();
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("12px");
   });
 
   it("applies onto the embed scope root when embedded, not the document root", () => {

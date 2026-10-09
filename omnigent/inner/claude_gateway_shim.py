@@ -4,7 +4,7 @@ Claude Code CLIs from 2.1.168 (and likely earlier 2.1.16x) drop the
 ``thinking.display`` field from ``POST /v1/messages`` bodies whenever
 experimental betas are disabled — the request builder gates ``display``
 on the same internal flag as the experimental beta headers. The
-Databricks AI gateway path must set
+Databricks Unity Gateway path must set
 ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`` (the gateway's beta
 allowlist rejects several of the CLI's experimental betas with HTTP
 400 "invalid beta flag"), so gateway Opus requests lose ``display``
