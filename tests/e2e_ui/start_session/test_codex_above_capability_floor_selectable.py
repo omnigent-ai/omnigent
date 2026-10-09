@@ -1,16 +1,8 @@
-"""E2E: a signed-in Codex above the native harness's capability floor stays selectable.
+"""E2E: a signed-in Codex above the capability floor stays ready and selectable.
 
-Journey from the bug report: connect a machine whose signed-in ``codex`` sits
-between the native harness's 0.129.0 policy-hook floor and a newer release as an
-``omnigent host``, open the new-chat screen on that host and choose Codex in the
-harness picker. The daemon's readiness map drives the picker, so the test
-registers a REAL ``omnigent host`` daemon (isolated ``HOME`` holding a Codex
-login, stub-first ``PATH``) against the live e2e server rather than stubbing the
-wire body. Codex must read ready, keep its row enabled, stay selected once
-chosen, and raise no outdated notice.
-
-The async-in-a-fresh-thread shape is inherited from
-``start_session/test_start_session.py``.
+A real ``omnigent host`` daemon (isolated ``HOME`` with a Codex login, stub
+``codex`` 0.133.0 first on ``PATH``) registers with the live e2e server, so the
+picker renders the daemon's own readiness map rather than a stubbed wire body.
 """
 
 from __future__ import annotations
@@ -165,7 +157,29 @@ def test_signed_in_codex_above_capability_floor_stays_selectable(
     """
     record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
     evidence_dir = Path(record_dir).parent / "screenshots" if record_dir else None
-    _run_in_fresh_loop(_drive_codex_picker(live_server, signed_in_stub_codex_host, evidence_dir))
+    host = signed_in_stub_codex_host
+    agent = _builtin_codex_agent(live_server)
+    seen: dict[str, Any] = {
+        "row_tooltip": None,
+        "warning": None,
+        "fallback": None,
+        "trigger_warning_count": 0,
+    }
+    _run_in_fresh_loop(_drive_codex_picker(live_server, host, agent, evidence_dir, seen))
+
+    # Re-read the row so the wire-level verdict matches what the picker rendered.
+    row = _fetch_host_row(live_server, host["name"]) or host
+    readiness = (row.get("configured_harnesses") or {}).get("codex-native")
+    assert readiness is True and seen["row_enabled"] and seen["badge_count"] == 0, (
+        f"host with signed-in codex-cli {_STUB_CODEX_VERSION} reports configured_harnesses"
+        f"['codex-native'] == {readiness!r}; picker row enabled={seen['row_enabled']}, "
+        f"badges={seen['badge_count']}, row tooltip={seen['row_tooltip']!r}"
+    )
+    notices = " | ".join(n for n in (seen["warning"], seen["fallback"]) if n)
+    assert not notices and seen["trigger_warning_count"] == 0, (
+        f"Codex must stay selected on {host['name']} without a readiness notice; "
+        f"got notice={notices!r}, trigger warnings={seen['trigger_warning_count']}"
+    )
 
 
 async def _select_host(page: Any, host: dict[str, Any]) -> None:
@@ -203,25 +217,22 @@ async def _reveal_agent_row(page: Any, agent_id: str) -> Any:
     return row
 
 
-async def _notice_text(page: Any, test_id: str, *, wait: bool) -> str | None:
-    """Return a composer notice's text, waiting for it only when one is expected."""
-    notice = page.get_by_test_id(test_id)
-    if wait:
-        try:
-            await notice.wait_for(state="visible", timeout=10_000)
-        except PlaywrightTimeoutError:
-            return None
-    elif not await notice.is_visible():
+async def _visible_text(page: Any, test_id: str) -> str | None:
+    """Return the element's text when it is visible, else ``None``."""
+    locator = page.get_by_test_id(test_id)
+    if not await locator.is_visible():
         return None
-    return (await notice.inner_text()).strip()
+    return (await locator.inner_text()).strip()
 
 
 async def _drive_codex_picker(
-    base_url: str, host: dict[str, Any], evidence_dir: Path | None
+    base_url: str,
+    host: dict[str, Any],
+    agent: dict[str, Any],
+    evidence_dir: Path | None,
+    seen: dict[str, Any],
 ) -> None:
-    agent = _builtin_codex_agent(base_url)
-    readiness = (host.get("configured_harnesses") or {}).get("codex-native")
-
+    """Drive the picker journey, recording what the user saw in *seen*."""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         context = await browser.new_context()
@@ -240,8 +251,8 @@ async def _drive_codex_picker(
             await _select_host(page, host)
 
             row = await _reveal_agent_row(page, agent["id"])
-            row_enabled = await row.is_enabled()
-            badge_count = await page.get_by_test_id(
+            seen["row_enabled"] = await row.is_enabled()
+            seen["badge_count"] = await page.get_by_test_id(
                 f"new-chat-landing-agent-warning-{agent['id']}"
             ).count()
             await row.hover()
@@ -249,42 +260,25 @@ async def _drive_codex_picker(
             if evidence_dir is not None:
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 await page.screenshot(path=str(evidence_dir / "picker-codex-row.png"))
-
-            codex_selected = False
-            if row_enabled:
-                await row.click()
-                # The trigger is icon-led, so confirm the pick through the
-                # picker's active row, then leave the composer settled.
-                row = await _reveal_agent_row(page, agent["id"])
-                try:
-                    await expect(row).to_have_attribute("data-active", "true", timeout=10_000)
-                    codex_selected = True
-                except AssertionError:
-                    codex_selected = False
-                await page.wait_for_timeout(_HOLD_MS)
-                await page.keyboard.press("Escape")
-                await expect(page.get_by_role("menu").first).to_be_hidden()
-                await page.wait_for_timeout(_SETTLE_MS)
-            else:
-                # The row cannot be chosen; land on Codex the way a returning
-                # user does, via the persisted last pick, so the composer's
-                # verdict on it is captured in the failure.
-                await page.keyboard.press("Escape")
-                await page.add_init_script(
-                    f'window.localStorage.setItem("omnigent:last-agent-id", "{agent["id"]}")'
+            if not seen["row_enabled"]:
+                # Keep the row's own explanation for the failure message.
+                seen["row_tooltip"] = await _visible_text(
+                    page, f"new-chat-landing-agent-tooltip-{agent['id']}"
                 )
-                await page.reload()
-                await page.get_by_test_id("new-chat-landing-input").wait_for(
-                    state="visible", timeout=30_000
-                )
+                return
 
-            warning = await _notice_text(
-                page, "new-chat-landing-harness-warning", wait=not row_enabled
-            )
-            fallback = await _notice_text(
-                page, "new-chat-landing-harness-fallback", wait=not row_enabled
-            )
-            trigger_warning_count = await page.get_by_test_id(
+            await row.click()
+            # The trigger is icon-led, so confirm the pick through the picker's
+            # active row, then leave the composer settled.
+            row = await _reveal_agent_row(page, agent["id"])
+            await expect(row).to_have_attribute("data-active", "true", timeout=10_000)
+            await page.wait_for_timeout(_HOLD_MS)
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_role("menu").first).to_be_hidden()
+            await page.wait_for_timeout(_SETTLE_MS)
+            seen["warning"] = await _visible_text(page, "new-chat-landing-harness-warning")
+            seen["fallback"] = await _visible_text(page, "new-chat-landing-harness-fallback")
+            seen["trigger_warning_count"] = await page.get_by_test_id(
                 "new-chat-landing-agent-warning"
             ).count()
             await page.wait_for_timeout(_HOLD_MS)
@@ -293,19 +287,3 @@ async def _drive_codex_picker(
         finally:
             await context.close()
             await browser.close()
-
-    notices = " | ".join(n for n in (warning, fallback) if n)
-    assert readiness is True, (
-        f"host with signed-in codex-cli {_STUB_CODEX_VERSION} reports configured_harnesses"
-        f"['codex-native'] == {readiness!r}; picker row enabled={row_enabled}, "
-        f"badges={badge_count}, composer notice={notices!r}"
-    )
-    assert row_enabled and badge_count == 0, (
-        f"Codex picker row must be selectable without a warning badge "
-        f"(enabled={row_enabled}, badges={badge_count}); composer notice={notices!r}"
-    )
-    assert codex_selected, "choosing the Codex row must leave Codex as the active agent"
-    assert not notices and trigger_warning_count == 0, (
-        f"Codex must stay selected on {host['name']} without a readiness notice; "
-        f"got notice={notices!r}, trigger warnings={trigger_warning_count}"
-    )
