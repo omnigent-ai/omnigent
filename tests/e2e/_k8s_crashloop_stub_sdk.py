@@ -1,19 +1,17 @@
-"""Stub ``kubernetes`` client simulating a crash-looping workspace-prep init.
+"""Stub ``kubernetes`` client: a Job Pod whose workspace-prep init container crash-loops.
 
-Materialized onto the server subprocess's PYTHONPATH by
-``test_kubernetes_init_crashloop_failfast_e2e``. It satisfies the SDK surface
-the launcher touches and plays back what a real apiserver reports while a
-Job Pod's ``workspace-prep`` init container fails its ``git clone`` and is
-restarted by the kubelet: the Pod stays in phase ``Pending`` with
-``init_container_statuses[0].state.waiting.reason == "CrashLoopBackOff"``
-(the exit recorded in ``last_state.terminated``), Pod events carry the
-kubelet's ``BackOff`` line, and the init container's log tail carries the
-clone error. The Pod never reaches ``Running`` and never reaches phase
-``Failed`` during the launch window (``restartPolicy: OnFailure``).
+Written onto the server subprocess's PYTHONPATH by the crash-loop launch tests.
+It covers the SDK surface the Kubernetes launcher touches and replays what an
+apiserver reports while the kubelet keeps restarting the init container after
+its ``git clone`` fails: the Pod stays ``Pending`` (host container
+``PodInitializing``), ``init_container_statuses[0]`` sits in
+``CrashLoopBackOff`` with the exit in ``last_state.terminated``, Pod events
+carry the kubelet's ``BackOff`` line, and the init container's log carries the
+clone error. The Pod never reaches ``Running`` or ``Failed`` during the launch
+window (``restartPolicy: OnFailure``).
 
-Kept in its own module (no network calls of its own) so the security exfil
-scan doesn't flag the API method names (``create_namespaced_secret``) sitting
-next to the test's real HTTP client.
+Kept separate from the tests so the API method names never sit next to a real
+HTTP client.
 """
 
 from __future__ import annotations
@@ -21,17 +19,19 @@ from __future__ import annotations
 import textwrap
 
 # The init container's own output, served by ``read_namespaced_pod_log`` for
-# the ``workspace-prep`` container — the diagnosis the launch error is
-# expected to carry.
+# ``workspace-prep``: the diagnosis the launch error is expected to carry.
 CLONE_ERROR_LINE = (
     "fatal: unable to access 'https://github.com/omnigent-ai/omnigent/': "
     "Could not resolve host: github.com"
 )
 
 # Seconds after Job creation before the simulated kubelet has seen the first
-# clone failure and parks the init container in CrashLoopBackOff. Before
-# that the init container reports as running (first attempt in flight).
+# clone failure and parks the init container in CrashLoopBackOff. Until then
+# the init container reports as running (first attempt in flight).
 CRASHLOOP_AFTER_S = 3.0
+
+# Kubelet back-off step the stub mimics for restart_count growth.
+_BACKOFF_STEP_S = 20
 
 _CLIENT_MODULE = textwrap.dedent(
     '''
@@ -43,6 +43,7 @@ _CLIENT_MODULE = textwrap.dedent(
     from . import rest  # noqa: F401
 
     _CRASHLOOP_AFTER_S = {crashloop_after_s}
+    _BACKOFF_STEP_S = {backoff_step_s}
 
     _CLONE_LOG = (
         "Cloning into '/home/omnigent/workspace/omnigent'...\\n"
@@ -50,8 +51,8 @@ _CLIENT_MODULE = textwrap.dedent(
         "\\n"
     )
 
-    # One simulated Job/Pod per server process: the Job name lands here on
-    # create_namespaced_job and every pod read replays its current state.
+    # One simulated Job/Pod per server process: create_namespaced_job records
+    # the Job name and every Pod read replays its state at that moment.
     _state = {{"job_name": None, "created_at": None}}
 
 
@@ -90,7 +91,7 @@ _CLIENT_MODULE = textwrap.dedent(
             last_state = SimpleNamespace(
                 terminated=SimpleNamespace(exit_code=128, reason="Error")
             )
-            restart_count = 1 + int((elapsed - _CRASHLOOP_AFTER_S) // 20)
+            restart_count = 1 + int((elapsed - _CRASHLOOP_AFTER_S) // _BACKOFF_STEP_S)
         else:
             init_state = SimpleNamespace(
                 waiting=None, running=SimpleNamespace(started_at=None), terminated=None
@@ -115,9 +116,7 @@ _CLIENT_MODULE = textwrap.dedent(
                         name="host",
                         restart_count=0,
                         state=SimpleNamespace(
-                            waiting=SimpleNamespace(
-                                reason="PodInitializing", message=None
-                            ),
+                            waiting=SimpleNamespace(reason="PodInitializing", message=None),
                             running=None,
                             terminated=None,
                         ),
@@ -202,6 +201,7 @@ _CLIENT_MODULE = textwrap.dedent(
     '''
 ).format(
     crashloop_after_s=repr(CRASHLOOP_AFTER_S),
+    backoff_step_s=repr(_BACKOFF_STEP_S),
     clone_error_line=repr(CLONE_ERROR_LINE),
 )
 
@@ -213,17 +213,17 @@ STUB_FILES: dict[str, str] = {
     ),
     "kubernetes/client/__init__.py": _CLIENT_MODULE,
     "kubernetes/client/rest.py": textwrap.dedent(
-        '''
+        """
         class ApiException(Exception):
             def __init__(self, status=None, reason=None, body=None):
                 super().__init__("(" + str(status) + ") Reason: " + str(reason))
                 self.status = status
                 self.reason = reason
                 self.body = body
-        '''
+        """
     ),
     "kubernetes/config/__init__.py": textwrap.dedent(
-        '''
+        """
         class ConfigException(Exception):
             pass
 
@@ -234,6 +234,14 @@ STUB_FILES: dict[str, str] = {
 
         def load_kube_config(config_file=None, client_configuration=None, **kw):
             return None
-        '''
+        """
     ),
 }
+
+
+def write_stub_sdk(root) -> None:
+    """Materialize the stub package under *root* (a ``Path``) for a PYTHONPATH entry."""
+    for rel, source in STUB_FILES.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)

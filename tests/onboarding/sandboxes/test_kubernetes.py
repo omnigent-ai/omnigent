@@ -2021,9 +2021,9 @@ def test_init_crashloopbackoff_pending_is_terminal(
 ) -> None:
     """A crash-looping init container fails the launch fast, not at the deadline.
 
-    The Pod sits in ``Pending`` while the kubelet restarts the workspace-prep
-    init container (e.g. its git clone keeps failing); the start wait must
-    detect the crash loop instead of polling out the pod-ready budget.
+    The Pod stays ``Pending`` while the kubelet restarts workspace-prep (e.g.
+    its git clone keeps failing); the start wait must report the crash loop
+    instead of polling out the pod-ready budget.
     """
     core, _batch = fake_clients
     monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
@@ -2042,8 +2042,9 @@ def test_init_crashloopbackoff_pending_is_terminal(
             server_url="http://srv.example.com",
         )
     message = str(excinfo.value)
-    assert "init container 'workspace-prep' is crash-looping" in message
     assert "did not start within" not in message
+    assert "workspace-prep" in message
+    assert "CrashLoopBackOff" in message
 
 
 def test_init_crashloopbackoff_failure_carries_init_log_tail(

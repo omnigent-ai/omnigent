@@ -134,27 +134,28 @@ def _spawn_server(
         ),
     }
     log_path = tmp_path / "server.log"
-    log_handle = open(log_path, "w")  # noqa: SIM115 — lives for the Popen's lifetime
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{tmp_path / 'e2e.db'}",
-            "--artifact-location",
-            str(tmp_path / "artifacts"),
-            "--config",
-            str(config_path),
-        ],
-        env=env,
-        cwd=str(_REPO_ROOT),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
+    # The child owns its own copy of the log fd; closing ours after spawn is safe.
+    with open(log_path, "w") as log_handle:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cli",
+                "server",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{tmp_path / 'e2e.db'}",
+                "--artifact-location",
+                str(tmp_path / "artifacts"),
+                "--config",
+                str(config_path),
+            ],
+            env=env,
+            cwd=str(_REPO_ROOT),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
     return proc, log_path
 
 
@@ -171,7 +172,7 @@ def _wait_for_health(proc: subprocess.Popen[bytes], base_url: str, log_path: Pat
             if httpx.get(f"{base_url}/health", timeout=2.0).status_code == 200:
                 return
         except httpx.HTTPError:
-            pass
+            pass  # not listening yet; keep polling until the deadline
         time.sleep(_POLL_INTERVAL_S)
     pytest.fail(f"server did not become healthy:\n{log_path.read_text()[-2000:]}")
 
