@@ -81,6 +81,7 @@ class _Closed(Exception):
     [
         (None, {"local_shutdown": True}, "local_shutdown"),
         (_Closed(1006), {"resumed_from_suspend": True}, "suspend_resume"),
+        (_Closed(1006), {"server_silent": True}, "server_silence"),
         (_Closed(4003, "server reassigned; reconnecting"), {}, "server_rehome"),
         (_Closed(1012, "service restart"), {}, "server_restart"),
         (_Closed(4003, "ping timeout"), {}, "ping_timeout"),

@@ -21,6 +21,7 @@ import pytest
 import uvicorn
 
 from omnigent.util.tunnel_limits import (
+    HOST_TUNNEL_SILENCE_TIMEOUT_S,
     RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
@@ -69,6 +70,24 @@ def test_keepalive_not_stricter_than_app_level_budget() -> None:
             "would drop a busy-but-healthy tunnel with 1011 before the app-level "
             "keepalive fires (issue #1116)."
         )
+
+
+def test_host_silence_timeout_tolerates_a_late_ping_within_the_reconnect_target() -> None:
+    """The host's inbound-silence watchdog sits between the server's app-ping
+    cadence and the one-minute recovery target.
+
+    At or below one ``host_tunnel.PING_INTERVAL_S`` it would drop a healthy
+    tunnel whenever a ping ran a little late. Too close to the minute, a host
+    whose front door kept its socket open after the server leg ended could not
+    detect the loss, redial and register within the minute the reconnect path
+    promises for a reachable server.
+    """
+    from omnigent.server.routes import host_tunnel
+
+    late_ping_tolerance_s = 10.0
+    reconnect_and_register_s = 5.0
+    assert host_tunnel.PING_INTERVAL_S + late_ping_tolerance_s <= HOST_TUNNEL_SILENCE_TIMEOUT_S
+    assert HOST_TUNNEL_SILENCE_TIMEOUT_S + reconnect_and_register_s <= 60.0
 
 
 def test_uvicorn_tunnel_kwargs_name_real_uvicorn_options() -> None:

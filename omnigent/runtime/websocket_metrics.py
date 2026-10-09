@@ -28,6 +28,7 @@ DisconnectReason = Literal[
     "protocol_error",
     "server_rehome",
     "server_restart",
+    "server_silence",
     "suspend_resume",
     "transport_error",
     "unknown",
@@ -108,6 +109,7 @@ def classify_disconnect_reason(
     *,
     local_shutdown: bool = False,
     resumed_from_suspend: bool = False,
+    server_silent: bool = False,
 ) -> DisconnectReason:
     """Map tunnel termination details to a bounded reason.
 
@@ -119,12 +121,16 @@ def classify_disconnect_reason(
     :param local_shutdown: Whether the local process requested shutdown.
     :param resumed_from_suspend: Whether a suspend watcher dropped the stale
         socket to reconnect.
+    :param server_silent: Whether the client dropped the socket because the
+        server's application frames stopped arriving.
     :returns: A stable low-cardinality disconnect reason.
     """
     if local_shutdown:
         return "local_shutdown"
     if resumed_from_suspend:
         return "suspend_resume"
+    if server_silent:
+        return "server_silence"
 
     code = websocket_close_code(error)
     close_reason = websocket_close_reason(error) or ""
@@ -205,6 +211,7 @@ class ClientWebSocketMetrics:
         *,
         local_shutdown: bool = False,
         resumed_from_suspend: bool = False,
+        server_silent: bool = False,
     ) -> None:
         """Record one ended established WebSocket connection.
 
@@ -213,6 +220,8 @@ class ClientWebSocketMetrics:
         :param local_shutdown: Whether the local process requested shutdown.
         :param resumed_from_suspend: Whether the stale socket was dropped after
             system resume.
+        :param server_silent: Whether the socket was dropped because the
+            server's application frames stopped arriving.
         """
         attributes: dict[str, str | int] = {
             "tunnel.kind": kind,
@@ -220,6 +229,7 @@ class ClientWebSocketMetrics:
                 error,
                 local_shutdown=local_shutdown,
                 resumed_from_suspend=resumed_from_suspend,
+                server_silent=server_silent,
             ),
         }
         close_code = websocket_close_code(error)
@@ -250,6 +260,7 @@ def record_websocket_disconnected(
     *,
     local_shutdown: bool = False,
     resumed_from_suspend: bool = False,
+    server_silent: bool = False,
 ) -> None:
     """Best-effort record of an ended client WebSocket connection."""
     if not telemetry_enabled():
@@ -260,6 +271,7 @@ def record_websocket_disconnected(
             error,
             local_shutdown=local_shutdown,
             resumed_from_suspend=resumed_from_suspend,
+            server_silent=server_silent,
         )
     except Exception:  # Telemetry must never disrupt the tunnel.
         _logger.debug("failed to record WebSocket disconnection metric", exc_info=True)
