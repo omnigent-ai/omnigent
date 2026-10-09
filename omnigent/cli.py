@@ -381,6 +381,56 @@ def _build_local_llm_routing_client(
     return LLMRoutingClient(policy_client)
 
 
+def _build_decision_model_routing_client(
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+    fallback: Any,  # type: ignore[explicit-any]  # RoutingClient | None
+) -> Any:  # type: ignore[explicit-any]  # RoutingClient | None
+    """Build a :class:`DecisionModelRoutingClient` in front of the built-in judge.
+
+    Requires ``base_url`` and ``model``. ``api_key`` (``${ENV}`` expanded) is
+    optional so an unauthenticated local server works. Optional
+    ``confidence_threshold`` (0-1) sets when a pick defers to the judge.
+
+    :param routing_cfg: The parsed ``routing:`` mapping (``provider ==
+        "decision-model"``, per the caller).
+    :param fallback: The built-in judge to defer to, or ``None``.
+    :returns: The client, or *fallback* unchanged when required config is
+        missing (a warning is printed; the judge keeps routing).
+    """
+    base_url = _routing_config_text(routing_cfg, "base_url")
+    model = _routing_config_text(routing_cfg, "model")
+    if not base_url or not model:
+        click.echo(
+            "routing.provider=decision-model requires base_url and model; "
+            "using the built-in judge only",
+            err=True,
+        )
+        return fallback
+    api_key = _routing_config_text(routing_cfg, "api_key")
+    if api_key:
+        from omnigent.spec import expand_env_vars
+
+        api_key = expand_env_vars({"api_key": api_key})["api_key"]
+
+    from omnigent.server.decision_routing import (
+        DEFAULT_CONFIDENCE_THRESHOLD,
+        DecisionModelRoutingClient,
+    )
+
+    threshold = routing_cfg.get("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD)
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise click.ClickException("routing.confidence_threshold must be a number")
+    if not 0.0 <= float(threshold) <= 1.0:
+        raise click.ClickException("routing.confidence_threshold must be between 0 and 1")
+    return DecisionModelRoutingClient(
+        base_url=base_url,
+        model=model,
+        api_key=api_key or None,
+        confidence_threshold=float(threshold),
+        fallback=fallback,
+    )
+
+
 def _build_routing_backends(
     cfg: Any,  # type: ignore[explicit-any]  # parsed server config
     server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
@@ -395,6 +445,8 @@ def _build_routing_backends(
     An explicit ``routing:`` block chooses the external side by ``provider``:
 
     * ``external`` — call an external ``routes:select`` service.
+    * ``decision-model`` — no external side; a System One decision model routes
+      first and defers to the built-in judge when unsure.
     * ``none`` — opt out of routing entirely; neither backend.
     * anything else — no external side, the built-in judge only.
 
@@ -413,6 +465,9 @@ def _build_routing_backends(
     provider = routing_cfg.get("provider") if isinstance(routing_cfg, dict) else None
     if provider == "none":
         return RoutingBackends()
+    if provider == "decision-model":
+        judge = _build_local_llm_routing_client(server_llm)
+        return RoutingBackends(local=_build_decision_model_routing_client(routing_cfg, judge))
     external: Any = None  # type: ignore[explicit-any]
     if provider == "external":
         external = _build_external_routing_client(routing_cfg, settings, cfg)
