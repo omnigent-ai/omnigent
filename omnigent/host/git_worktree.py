@@ -346,13 +346,54 @@ def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
     )
 
 
-def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
-    """Make ``base_branch`` resolvable, fetching once if needed.
+def _refresh_remote_tracking_base(repo_root: str, base_branch: str) -> None:
+    """Fetch ``base_branch`` from its remote when it is a remote-tracking ref.
 
-    If the base ref doesn't resolve locally (e.g. a remote-tracking
-    branch not yet fetched), attempt a single ``git fetch`` and
-    re-check. A fetch failure (offline) is not fatal on its own — the
-    subsequent re-check produces the user-facing error.
+    A locally resolvable ``origin/main`` is only as fresh as the last
+    fetch, so a new worktree would otherwise start from a stale commit.
+    Best-effort: a failed fetch (offline) leaves the existing ref in place.
+
+    :param repo_root: Absolute repo work-tree root, e.g.
+        ``"/Users/alice/myrepo"``.
+    :param base_branch: Base ref the user requested, e.g.
+        ``"origin/main"``. Local branches and other refs are left alone.
+    """
+    full_name = _run_git(
+        [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--symbolic-full-name",
+            "--end-of-options",
+            base_branch,
+        ],
+        cwd=repo_root,
+    )
+    tracking_ref = full_name.stdout.strip()
+    if full_name.returncode != 0 or not tracking_ref.startswith("refs/remotes/"):
+        return
+    remote_and_branch = tracking_ref[len("refs/remotes/") :]
+    remotes = _run_git(["remote"], cwd=repo_root).stdout.split()
+    # Remote names may contain '/', so match the longest remote prefix.
+    for remote in sorted(remotes, key=len, reverse=True):
+        if remote_and_branch.startswith(f"{remote}/"):
+            branch = remote_and_branch[len(remote) + 1 :]
+            _run_git(
+                ["fetch", "--end-of-options", remote, f"+refs/heads/{branch}:{tracking_ref}"],
+                cwd=repo_root,
+            )
+            return
+
+
+def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
+    """Make ``base_branch`` resolvable and current, fetching if needed.
+
+    A remote-tracking base (e.g. ``origin/main``) is fetched first so the
+    worktree starts from the remote's tip. If the base ref doesn't resolve
+    locally (e.g. a remote-tracking branch not yet fetched), attempt a
+    single ``git fetch`` and re-check. A fetch failure (offline) is not
+    fatal on its own — the subsequent re-check produces the user-facing
+    error.
 
     :param repo_root: Absolute repo work-tree root, e.g.
         ``"/Users/alice/myrepo"``.
@@ -361,6 +402,7 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
     :raises WorktreeError: If the base ref cannot be resolved even
         after a fetch attempt.
     """
+    _refresh_remote_tracking_base(repo_root, base_branch)
     # --end-of-options forces git to treat the user-supplied base_branch as a
     # rev, never an option, so a value like "--exec-path" can't inject a git
     # flag (argv-only, no shell). Note: a bare "--" would not work here — git

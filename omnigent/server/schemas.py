@@ -1336,8 +1336,10 @@ class SessionGitOptions(BaseModel):
         git ref-format rules; invalid names fail with ``invalid_input``.
     :param base_branch: Optional base ref to branch from, e.g.
         ``"main"`` or ``"origin/main"``. ``None`` branches from the
-        source repository's current ``HEAD``. Create mode only —
-        invalid with ``existing_worktree``.
+        source repository's current ``HEAD``. A remote-tracking ref such
+        as ``"origin/main"`` is fetched first; if the fetch fails, the
+        existing local ref is used. Create mode only — invalid with
+        ``existing_worktree``.
     :param existing_worktree: When ``True``, bind to the pre-existing
         worktree at ``workspace`` instead of creating one (see above).
     :param existing_branch: When ``True``, ``branch_name`` already

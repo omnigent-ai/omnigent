@@ -6067,7 +6067,7 @@
                 "type": "null"
               }
             ],
-            "description": "Optional base ref to branch from, e.g. `\"main\"` or `\"origin/main\"`. `None` branches from the source repository's current `HEAD`. Create mode only \u2014 invalid with `existing_worktree`.",
+            "description": "Optional base ref to branch from, e.g. `\"main\"` or `\"origin/main\"`. `None` branches from the source repository's current `HEAD`. A remote-tracking ref such as `\"origin/main\"` is fetched first; if the fetch fails, the existing local ref is used. Create mode only \u2014 invalid with `existing_worktree`.",
             "title": "Base Branch"
           },
           "branch_name": {

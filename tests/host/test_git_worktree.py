@@ -731,3 +731,56 @@ def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
         create_worktree(repo_path=str(source), branch_name="new")
     assert _branch_exists(git_repo, "new") is rollback_fails
     assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)
+
+
+@pytest.fixture()
+def cloned_repo(git_repo: Path, tmp_path: Path) -> Path:
+    """Clone ``git_repo`` and then advance its ``main``, leaving ``origin/main`` stale.
+
+    :returns: The clone's resolved root; ``git_repo`` is its ``origin``.
+    """
+    clone = (tmp_path / "clone").resolve()
+    _git(tmp_path, "clone", "-q", str(git_repo), str(clone))
+    (git_repo / "upstream.txt").write_text("new")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "upstream commit")
+    return clone
+
+
+def test_create_worktree_fetches_remote_tracking_base(git_repo: Path, cloned_repo: Path) -> None:
+    """A remote-tracking base is fetched, so the worktree starts at the remote's tip."""
+    stale = _rev_parse(cloned_repo, "origin/main")
+    created = create_worktree(
+        repo_path=str(cloned_repo), branch_name="fresh", base_branch="origin/main"
+    )
+    assert _rev_parse(Path(created.worktree_path)) == _rev_parse(git_repo, "main")
+    assert _rev_parse(Path(created.worktree_path)) != stale
+
+
+def test_create_worktree_local_base_does_not_fetch(
+    cloned_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local base branch resolves without contacting the remote."""
+    real_run = git_worktree_module._run_git
+    calls: list[list[str]] = []
+
+    def record(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return real_run(args, cwd=cwd)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", record)
+    created = create_worktree(repo_path=str(cloned_repo), branch_name="local", base_branch="main")
+    assert not [args for args in calls if args[0] == "fetch"]
+    assert _rev_parse(Path(created.worktree_path)) == _rev_parse(cloned_repo, "main")
+
+
+def test_create_worktree_unreachable_remote_uses_existing_tracking_ref(
+    cloned_repo: Path, tmp_path: Path
+) -> None:
+    """When the fetch fails (offline), the worktree falls back to the local tracking ref."""
+    _git(cloned_repo, "remote", "set-url", "origin", str(tmp_path / "missing"))
+    stale = _rev_parse(cloned_repo, "origin/main")
+    created = create_worktree(
+        repo_path=str(cloned_repo), branch_name="offline", base_branch="origin/main"
+    )
+    assert _rev_parse(Path(created.worktree_path)) == stale

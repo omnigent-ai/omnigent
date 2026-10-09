@@ -1749,14 +1749,14 @@ function DefaultBaseBranchControl() {
       <SettingsLabel
         label="Default base branch"
         className="flex-1"
-        description="Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill."
+        description="Auto-filled as the base when you name a new worktree branch. A remote branch such as origin/main is fetched first, so new worktrees start from its latest commit. Leave blank to not auto-fill."
         descriptionClassName="text-ui"
       />
       <Input
         type="text"
         aria-label="Default base branch"
         data-testid="settings-default-base-branch-input"
-        placeholder="e.g. main"
+        placeholder="e.g. origin/main"
         spellCheck={false}
         autoCapitalize="off"
         autoCorrect="off"
