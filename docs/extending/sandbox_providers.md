@@ -313,3 +313,10 @@ a network policy can allowlist by exact host+port:
 Every endpoint on these servers (other than `GET /health`) requires a
 per-relay bearer token, so allowlisting their coordinates does not expose
 unauthenticated functionality.
+
+## Experimental provider actions
+
+The [experimental sandbox actions SDK](experimental_sandbox_actions.md) lets
+external providers declare and exercise versioned actions in Python. It is a
+runnable contract preview; public session operations and production lifecycle
+integration remain unimplemented.

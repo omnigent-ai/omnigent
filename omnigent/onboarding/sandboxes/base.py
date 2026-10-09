@@ -41,6 +41,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
 
+    from omnigent.onboarding.sandboxes.experimental import (
+        SandboxAction,
+        SandboxActionRequest,
+        SandboxActionResult,
+        SandboxChildResult,
+    )
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
@@ -490,6 +496,17 @@ class SandboxLifecycle(ABC):
     supports_cli_bootstrap: ClassVar[bool] = True
     can_resume: ClassVar[bool] = False
     supports_managed_launch: ClassVar[bool] = True
+
+    @property
+    def experimental_actions(self) -> tuple[SandboxAction, ...]:
+        """Provider-owned SDK experiments; unused by production session routes."""
+        return ()
+
+    def invoke_experimental_action(
+        self, request: SandboxActionRequest
+    ) -> SandboxActionResult | SandboxChildResult:
+        """Execute a validated action from the experimental SDK dispatcher."""
+        raise self._capability_error(f"invoke experimental action {request.action!r}")
 
     @property
     def capabilities(self) -> _sandbox_types.SandboxCapabilities:
