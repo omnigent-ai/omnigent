@@ -8649,6 +8649,30 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_under_truncated_label() -> None:
+    """
+    A title wider than the pane still does not hide the input box.
+
+    Claude Code cuts such a title with ``…`` and the rule keeps only its
+    trailing glyph, so no leading run is left. Reading that as "no input
+    box" timed the turn out after ``_CLAUDE_PROMPT_TIMEOUT_S`` and reaped
+    the healthy pane. Pane shape follows a session that hit this.
+    """
+    rule = "─" * 103
+    pane = "\n".join(
+        [
+            '● Agent "fix the webhook retry path" finished · 3m 48s',
+            " Retry failed billing webhook deliveries with exponential backoff and"
+            " jitter, capped at one hour(… ─",  # opening rule: no leading run
+            "❯",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+            "  ⏵⏵ auto mode on · 1 shell",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -8663,6 +8687,8 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        # A title wider than the pane is cut with "…" and loses the leading run.
+        " Retry failed billing webhook deliveries with exponential backoff … ─",
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -8687,6 +8713,10 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        # No leading run: only a label cut with a spaced-off "…" may stand in for it.
+        "a sentence that ends in a box glyph ─",
+        "a truncated sentence that ends…─",
+        "… " + "─" * 30,  # the mark with no label before it
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:

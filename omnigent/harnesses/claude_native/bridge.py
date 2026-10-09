@@ -5832,7 +5832,10 @@ def _is_box_rule(line: str) -> bool:
     are otherwise the same shape. The length of the leading run cannot draw
     it: Claude Code right-aligns the label, so that run shrinks to a single
     glyph once the title nears the pane width, and the pane is only as wide
-    as the person's browser terminal.
+    as the person's browser terminal. A title wider than the pane is cut
+    with ``…`` and leaves no leading run at all
+    (``" a very long title… ─"``), so a rule without one is accepted only
+    when its label ends in that truncation mark.
 
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
@@ -5845,11 +5848,13 @@ def _is_box_rule(line: str) -> bool:
         return True
     lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
     trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
-    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+    if trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
         return False
     label = stripped[lead : len(stripped) - trail]
     if any(ch in _BOX_RULE_CHARS for ch in label):
         return False
+    if lead < 1:
+        return label.endswith("… ") and bool(label[:-2].strip())
     return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
 
 
