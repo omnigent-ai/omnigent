@@ -73,7 +73,7 @@ def spawn_server(
                     str(REPO_ROOT),
                     str(REPO_ROOT / "sdks" / "python-client"),
                     str(REPO_ROOT / "sdks" / "ui"),
-                    os.environ.get("PYTHONPATH", ""),
+                    *filter(None, [os.environ.get("PYTHONPATH")]),
                 ]
             ),
             "OPENAI_API_KEY": "unused-no-turn-runs",

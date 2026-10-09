@@ -42,10 +42,10 @@ _PROMPT = "Investigate this repository"
 # run (and its recording) short. 90s in a default deployment.
 _POD_READY_TIMEOUT_S = 25
 
-# The stub parks workspace-prep in CrashLoopBackOff ~3s after the Job is
-# submitted; a fail-fast start wait surfaces the banner a few polls later,
-# while the buggy path cannot fail before the 25s deadline.
-_FAILFAST_MAX_S = 15.0
+# Measured from the submit click, so it also covers session create, navigation
+# and status propagation on top of the launcher's ~5s detection (3s stub
+# crash-loop onset + a poll). The buggy path cannot fail before the 25s deadline.
+_FAILFAST_MAX_S = 20.0
 
 
 def _agent_id(base_url: str) -> str:
@@ -125,7 +125,7 @@ async def _drive_launch_to_failure(
             await browser.close()
 
 
-def test_init_crashloop_launch_fails_fast_with_log_tail(tmp_path: Path) -> None:
+def test_init_crashloop_launch_fails_fast_with_log_tail(tmp_path: Path, built_spa: None) -> None:
     """The launch must fail fast and its banner must carry the clone error.
 
     A crash-looping init container leaves the Pod ``Pending`` under

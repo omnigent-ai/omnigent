@@ -90,7 +90,11 @@ def _await_failed_launch(
     deadline = start + budget_s
     stage = None
     while time.monotonic() < deadline:
-        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+        try:
+            snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+        except httpx.HTTPError:
+            time.sleep(_POLL_INTERVAL_S)
+            continue
         status = snapshot.get("sandbox_status") or {}
         stage = status.get("stage")
         if stage == "failed":
