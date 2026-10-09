@@ -12,7 +12,6 @@ from omnigent.harnesses.claude_native.bridge import (
     _TMUX_FILE,
     bridge_dir_for_conversation_id,
     read_tmux_target,
-    tmux_target_advertised,
     write_tmux_target,
 )
 from omnigent.inner.terminal import TerminalInstance
@@ -96,7 +95,7 @@ async def test_live_unadvertised_pane_is_readvertised_before_inject(
         f"inject must see the live pane's re-advertised target; got {captured!r}"
     )
     # The heal is durable: the advertisement survives for subsequent injects.
-    assert tmux_target_advertised(bridge_dir)
+    assert read_tmux_target(bridge_dir) == _advertisement_of(instance)
 
 
 @pytest.mark.asyncio
@@ -173,7 +172,7 @@ async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
     assert resp.status_code == 503, resp.text
     assert captured == [], "the inject must have waited on the still-missing advertisement"
     assert auto_create_calls == [], "a failed repair must not recreate the live pane"
-    assert not tmux_target_advertised(bridge_dir)
+    assert read_tmux_target(bridge_dir) is None
 
 
 @pytest.mark.asyncio

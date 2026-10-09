@@ -98,10 +98,9 @@ def test_web_turn_survives_unadvertised_tmux_target(
     _log.info("removed tmux advertisement: %s", removed)
 
     # Switch to the chat composer and send a web-chat turn (the user's action).
-    if page.get_by_test_id("view-mode-toggle").count() > 0:
-        segment = page.get_by_test_id("view-mode-chat")
-        segment.wait_for(state="visible", timeout=30_000)
-        segment.click()
+    segment = page.get_by_test_id("view-mode-chat")
+    segment.wait_for(state="visible", timeout=30_000)
+    segment.click()
     composer = page.get_by_placeholder(_COMPOSER)
     composer.wait_for(state="visible", timeout=30_000)
     composer.fill(f"Reply with exactly this token and nothing else: {_ECHO_TOKEN}")

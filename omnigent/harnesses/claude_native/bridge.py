@@ -6192,17 +6192,6 @@ def read_tmux_target(bridge_dir: Path) -> dict[str, str] | None:
     return None
 
 
-def tmux_target_advertised(bridge_dir: Path) -> bool:
-    """
-    Report whether the bridge currently advertises a usable tmux target.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: ``True`` when ``tmux.json`` carries valid ``socket_path``
-        and ``tmux_target`` fields.
-    """
-    return read_tmux_target(bridge_dir) is not None
-
-
 def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
     """
     Wait for the runner to write ``tmux.json``.

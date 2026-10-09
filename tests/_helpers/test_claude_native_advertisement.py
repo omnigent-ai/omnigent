@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -26,7 +25,6 @@ def _advertised_bridge(root: Path, name: str, session_id: str) -> Path:
 def test_only_removes_its_session_advertisement(tmp_path: Path) -> None:
     own = _advertised_bridge(tmp_path, "own", "fixture-session")
     other = _advertised_bridge(tmp_path, "other", "unrelated-session")
-    os.utime(own, (1, 1))
     other_content = other.read_bytes()
 
     assert remove_tmux_advertisement("fixture-session", bridge_root=tmp_path) == str(own)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -961,3 +962,43 @@ def test_publish_if_registered_runs_only_for_the_registered_instance(tmp_path: P
         "conv_missing", "claude", "main", mine, lambda: published.append("missing")
     )
     assert published == ["mine"]
+
+
+def test_publish_if_registered_holds_the_lock_while_publishing(tmp_path: Path) -> None:
+    """A successor registered concurrently waits until the publication has finished."""
+    reg = TerminalRegistry()
+    mine = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "mine" / "tmux.sock",
+        private_dir=tmp_path / "mine",
+    )
+    successor = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "successor" / "tmux.sock",
+        private_dir=tmp_path / "successor",
+    )
+    reg._by_conversation["conv_publish"] = {("claude", "main"): mine}
+    replacing = threading.Event()
+    published = threading.Event()
+    replaced_after_publish: list[bool] = []
+
+    def _replace_like_launch() -> None:
+        replacing.set()
+        with reg._lock:  # launch() registers a successor under this same lock
+            reg._by_conversation["conv_publish"] = {("claude", "main"): successor}
+        replaced_after_publish.append(published.is_set())
+
+    replacer = threading.Thread(target=_replace_like_launch)
+
+    def _publish() -> None:
+        replacer.start()
+        assert replacing.wait(5)
+        time.sleep(0.1)  # let the replacer block on the lock before publication ends
+        published.set()
+
+    assert reg.publish_if_registered("conv_publish", "claude", "main", mine, _publish)
+    replacer.join(5)
+    assert replaced_after_publish == [True], "the replacement must wait for the publication"
+    assert reg.get("conv_publish", "claude", "main") is successor
