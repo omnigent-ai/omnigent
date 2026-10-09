@@ -2230,18 +2230,44 @@ class HostProcess:
         """
         handle = self._runners.pop(frame.runner_id, None)
         if handle is None:
+            _logger.info(
+                "Host runner stop requested for unknown runner",
+                extra=debug_event(
+                    "runner_stop_host_result",
+                    runner_id=frame.runner_id,
+                    stop_request_id=frame.request_id,
+                    status="failed",
+                ),
+            )
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
         handle.stop_requested = True
+        _logger.info(
+            "Host starting runner stop",
+            extra=debug_event(
+                "runner_stop_host_started",
+                runner_id=frame.runner_id,
+                stop_request_id=frame.request_id,
+            ),
+        )
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
         # freeze the daemon's control handler.
         await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
-        _logger.info("Stopped runner %s", frame.runner_id)
+        _logger.info(
+            "Stopped runner %s",
+            frame.runner_id,
+            extra=debug_event(
+                "runner_stop_host_result",
+                runner_id=frame.runner_id,
+                stop_request_id=frame.request_id,
+                status="stopped",
+            ),
+        )
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",
             flush=True,

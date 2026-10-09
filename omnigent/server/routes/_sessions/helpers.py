@@ -7110,6 +7110,7 @@ async def _stop_session_host_runner(
     *,
     expect_already_stopped: bool = False,
     attempt: _HostRunnerStopAttempt | None = None,
+    stop_request_id: str | None = None,
 ) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
@@ -7173,7 +7174,7 @@ async def _stop_session_host_runner(
         return False
     from omnigent.host.frames import HostStopRunnerFrame, encode_host_frame
 
-    request_id = secrets.token_hex(8)
+    request_id = stop_request_id or secrets.token_hex(8)
     future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
     conn.pending_stops[request_id] = future
     stop_frame = encode_host_frame(
@@ -7182,6 +7183,16 @@ async def _stop_session_host_runner(
     try:
         try:
             host_registry.send_text(conn, stop_frame)
+            _logger.info(
+                "Host runner stop frame queued",
+                extra=debug_event(
+                    "runner_stop_frame_queued",
+                    session_id=session_id,
+                    runner_id=runner_id,
+                    host_id=host_id,
+                    stop_request_id=request_id,
+                ),
+            )
         except ConnectionError:
             _logger.warning(
                 "Cannot stop runner %s for session %s: host %s connection was replaced",

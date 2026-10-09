@@ -763,6 +763,8 @@ async def _stop_host_runner_intentionally(
     runner_id: str,
     host_registry: Any,
     conversation_store: ConversationStore,
+    *,
+    stop_origin: str = "session_stop",
 ) -> bool:
     """Carry stop intent to the active sessions sharing the terminated runner.
 
@@ -775,8 +777,10 @@ async def _stop_host_runner_intentionally(
     # An unsuccessful concurrent stop must not roll back a delivered stop's intent.
     lock = _intentional_runner_stop_locks.setdefault(runner_id, asyncio.Lock())
     async with lock:
+        stop_request_id = secrets.token_hex(8)
         statuses: dict[str, str | None] = {}
         after: str | None = None
+        status_lookup_complete = True
         try:
             while True:
                 batch = await asyncio.to_thread(
@@ -790,6 +794,7 @@ async def _stop_host_runner_intentionally(
                     break
                 after = batch[-1][0]
         except Exception:  # noqa: BLE001
+            status_lookup_complete = False
             # Keep Stop available during a store outage; only known sessions can
             # inherit intent, so unseen cold sessions keep normal disconnect handling.
             _logger.warning(
@@ -824,13 +829,47 @@ async def _stop_host_runner_intentionally(
                     completed_stop_relays[related_id] = (handle, handle.running_event_count)
                 handle.intentional_stop_turn_ended = False
 
+        _logger.info(
+            "Requesting intentional runner stop",
+            extra=debug_event(
+                "runner_stop_requested",
+                session_id=session_id,
+                runner_id=runner_id,
+                host_id=host_id,
+                stop_request_id=stop_request_id,
+                stop_origin=stop_origin,
+                status_lookup_complete=status_lookup_complete,
+                related_session_count=len(statuses),
+                marked_session_count=sum(
+                    _intentional_stop_sessions.get(related_id) == runner_id
+                    for related_id in statuses
+                ),
+            ),
+        )
         acknowledged = False
         attempt = _HostRunnerStopAttempt()
         try:
             acknowledged = await _facade._stop_session_host_runner(
-                session_id, host_id, runner_id, host_registry, attempt=attempt
+                session_id,
+                host_id,
+                runner_id,
+                host_registry,
+                attempt=attempt,
+                stop_request_id=stop_request_id,
             )
         finally:
+            _logger.info(
+                "Intentional runner stop dispatch finished",
+                extra=debug_event(
+                    "runner_stop_dispatch_result",
+                    session_id=session_id,
+                    runner_id=runner_id,
+                    stop_request_id=stop_request_id,
+                    acknowledged=acknowledged,
+                    dispatched=attempt.dispatched,
+                    rejected=attempt.rejected,
+                ),
+            )
             if not acknowledged and (not attempt.dispatched or attempt.rejected):
                 for related_id in marked:
                     if _intentional_stop_sessions.get(related_id) == runner_id:
@@ -954,6 +993,7 @@ async def _archive_stop(
                 conv.runner_id,
                 host_registry,
                 conversation_store,
+                stop_origin="archive",
             )
         except Exception:  # noqa: BLE001
             _logger.debug(
@@ -7796,6 +7836,11 @@ async def _runner_disconnect_requires_failure(
             host_id=conv.host_id if conv is not None else None,
             conversation_updated_at=conv.updated_at if conv is not None else None,
             fail_idle_top_level=fail_idle_top_level,
+            intentional_stop_marker=(
+                conv is not None
+                and conv.runner_id is not None
+                and _intentional_stop_sessions.get(session_id) == conv.runner_id
+            ),
         ),
     )
     return decision in ("failed_mid_turn", "failed_before_start")

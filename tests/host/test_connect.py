@@ -3135,7 +3135,9 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
-async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
+async def test_handle_stop_terminates_process(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
     returns status='stopped'.
@@ -3155,17 +3157,30 @@ async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
         request_id="req_003",
         runner_id="runner_aaa",
     )
-    result = await host._handle_stop(frame)
+    with caplog.at_level("INFO"):
+        result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "stopped"
+    lifecycle = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None)
+        in {"runner_stop_host_started", "runner_stop_host_result"}
+    ]
+    assert [r.event_name for r in lifecycle] == [
+        "runner_stop_host_started",
+        "runner_stop_host_result",
+    ]
+    assert all(r.attributes["stop_request_id"] == frame.request_id for r in lifecycle)
+    assert lifecycle[-1].attributes["status"] == "stopped"
     # Process should be terminated.
     assert proc.poll() is not None, "Runner process should be terminated after stop"
     # Runner should be removed from tracking.
     assert "runner_aaa" not in host._runners
 
 
-async def test_handle_stop_unknown_runner() -> None:
+async def test_handle_stop_unknown_runner(caplog: pytest.LogCaptureFixture) -> None:
     """
     Verify that _handle_stop returns status='failed' for an
     unknown runner_id.
@@ -3178,11 +3193,17 @@ async def test_handle_stop_unknown_runner() -> None:
         request_id="req_004",
         runner_id="runner_nonexistent",
     )
-    result = await host._handle_stop(frame)
+    with caplog.at_level("INFO"):
+        result = await host._handle_stop(frame)
 
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
+    logged = next(
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_stop_host_result"
+    )
+    assert logged.attributes["stop_request_id"] == frame.request_id
+    assert logged.attributes["status"] == "failed"
 
 
 async def test_stop_trigger_waits_for_termination_after_cancellation(

@@ -149,8 +149,10 @@ async def test_stop_marks_only_affected_active_sessions_and_rolls_back(
 async def test_stop_intent_tracks_actual_host_frame_handoff(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     outcome: str,
 ) -> None:
+    caplog.set_level("INFO")
     store, ids = family
     registry = HostRegistry()
     conn = registry.register(
@@ -183,6 +185,20 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
             frame = decode_host_frame(encoded)
             assert isinstance(frame, HostStopRunnerFrame)
             assert frame.runner_id == _RUNNER
+            requested = next(
+                r
+                for r in caplog.records
+                if getattr(r, "event_name", None) == "runner_stop_requested"
+            )
+            queued = next(
+                r
+                for r in caplog.records
+                if getattr(r, "event_name", None) == "runner_stop_frame_queued"
+            )
+            assert requested.attributes["stop_request_id"] == frame.request_id
+            assert queued.attributes["stop_request_id"] == frame.request_id
+            assert requested.attributes["status_lookup_complete"] is True
+            assert requested.attributes["marked_session_count"] == 4
             if outcome == "cancelled":
                 stop.cancel()
             elif outcome in {"rejected", "stopped"}:
