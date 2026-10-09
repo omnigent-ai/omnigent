@@ -13,8 +13,13 @@ import pytest
 
 from tests.e2e.test_host_e2e import _spawn_host_daemon, _wait_for_host_online
 
-# Older pinned hosts in the compat matrix still log these skips at ERROR.
-pytestmark = [pytest.mark.timeout(180), pytest.mark.min_runner_version("0.18.0")]
+# Compat matrix: hosts older than 0.18.0 still log these skips at ERROR, and servers
+# older than 0.15.0 omit the per-session failures list from the import response.
+pytestmark = [
+    pytest.mark.timeout(180),
+    pytest.mark.min_runner_version("0.18.0"),
+    pytest.mark.min_server_version("0.15.0"),
+]
 
 _GOOD_ID = "6f0d9f4e-2f0f-4bde-9b6e-2f6a0f6c1a01"
 _DEEP_ID = "bad0bad0-c0de-4bad-9dad-badbadbadbad"
@@ -42,6 +47,7 @@ def _write_claude_transcripts(home: Path, cwd: str) -> None:
     (project / f"{_GOOD_ID}.jsonl").write_text(
         _user_record(_GOOD_ID, cwd, "healthy transcript") + "\n", encoding="utf-8"
     )
+    # CPython's C JSON scanner raises RecursionError past roughly 10k levels; 20k leaves margin.
     nested = "[" * 20000 + '"x"' + "]" * 20000
     deep_record = (
         '{"type":"user","uuid":"'

@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -8139,7 +8140,7 @@ async def test_handle_import_local_recovered_skip_logs_below_error(
     def _fake_across(*, limit: int) -> list[tuple[str, str]]:
         return [("claude", "bad")]
 
-    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+    def _fake_load(source: str, session_id: str) -> NoReturn:
         raise error
 
     monkeypatch.setattr(
