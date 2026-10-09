@@ -3921,43 +3921,19 @@ async def test_discover_records_an_adoption_before_the_port_resolves(
 
 
 @pytest.mark.asyncio
-async def test_discover_reports_the_resolver_fallback_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One ``ColdStartPortLog`` is shared by every recovery round of a discovery
-    run, so the resolver's fallback is warned about once and demoted afterwards."""
-    bridge_dir = _placeholder_bridge_dir(tmp_path)
-    warn_flags: list[bool] = []
-
-    def _resolver(
-        _s: object, _t: object, *, log: reader.ColdStartPortLog | None = None
-    ) -> int | None:
-        # Stand in for the resolver taking its fallback branch.
-        assert log is not None
-        warn_flags.append(not log.fallback_reported)
-        log.fallback_reported = True
-        return None
-
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _resolver)
-    monkeypatch.setattr(reader, "_PLACEHOLDER_RECOVERY_INTERVAL_S", 0.0)
-    monkeypatch.setattr(reader, "_sleep", _no_sleep)
-
-    assert await reader._discover(bridge_dir, poll_interval_s=0.0, stop=_stop_after(2)) is None
-    assert warn_flags == [True, False, False]
-
-
-@pytest.mark.asyncio
 async def test_discover_fallback_warning_waits_for_a_round_that_reaches_the_resolver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Rounds that bail out before the port resolver (no pane advertised yet) do
-    not use up the one WARNING; the first round that resolves still warns."""
+    """One ``ColdStartPortLog`` spans a discovery run: rounds that bail out before
+    the port resolver (no pane advertised yet) do not use up the WARNING, the
+    first round that resolves warns, and later rounds are demoted."""
     bridge_dir = _placeholder_bridge_dir(tmp_path, with_pane=False)
     warn_flags: list[bool] = []
 
     def _resolver(
         _s: object, _t: object, *, log: reader.ColdStartPortLog | None = None
     ) -> int | None:
+        # Stand in for the resolver taking its fallback branch.
         assert log is not None
         warn_flags.append(not log.fallback_reported)
         log.fallback_reported = True
@@ -3982,6 +3958,28 @@ async def test_discover_fallback_warning_waits_for_a_round_that_reaches_the_reso
     assert warn_flags == [True, False]
 
 
+def _recovering_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, _PostSink]:
+    """A placeholder bridge dir whose scan adopts the typed cascade and whose poll
+    mirrors one committed reply; returns the bridge dir and the event sink."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+    text = _load("planner_response_text")
+    sink = _PostSink()
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[text], [text]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    return bridge_dir, sink
+
+
 @pytest.mark.asyncio
 async def test_supervise_reader_recovers_placeholder_and_mirrors(
     tmp_path: Path,
@@ -3991,28 +3989,7 @@ async def test_supervise_reader_recovers_placeholder_and_mirrors(
     """The reader escapes the placeholder deadlock: it adopts the TUI-minted
     cascade, mirrors the typed turn, and records the adopted cascade for
     ``--resume`` (no rotation-based first adoption will ever run for it)."""
-    bridge_dir = _placeholder_bridge_dir(tmp_path)
-    _own_conversation_db(bridge_dir, _CASCADE_ID)
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
-    monkeypatch.setattr(
-        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
-    )
-
-    text = _load("planner_response_text")
-    script = _StepScript([[text], [text]])
-    sink = _PostSink()
-    monkeypatch.setattr(
-        reader,
-        "stream_agent_state_updates",
-        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
-    )
-    monkeypatch.setattr(reader, "get_trajectory_steps", script)
-    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
-
-    async def _noop_sleep(_seconds: float) -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+    bridge_dir, sink = _recovering_reader(tmp_path, monkeypatch)
 
     class _RecordingClient:
         def __init__(self) -> None:
@@ -4057,23 +4034,7 @@ async def test_supervise_reader_recovery_survives_a_failed_resume_record(
 ) -> None:
     """Recording the adopted cascade for --resume is best-effort: a failing PATCH
     is logged and the reader still binds the cascade and mirrors the turn."""
-    bridge_dir = _placeholder_bridge_dir(tmp_path)
-    _own_conversation_db(bridge_dir, _CASCADE_ID)
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
-    monkeypatch.setattr(
-        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
-    )
-    text = _load("planner_response_text")
-    script = _StepScript([[text], [text]])
-    sink = _PostSink()
-    monkeypatch.setattr(
-        reader,
-        "stream_agent_state_updates",
-        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
-    )
-    monkeypatch.setattr(reader, "get_trajectory_steps", script)
-    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
-    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    bridge_dir, sink = _recovering_reader(tmp_path, monkeypatch)
 
     class _UnreachableClient:
         async def patch(self, url: str, json: dict[str, object] | None = None) -> httpx.Response:
