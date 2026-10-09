@@ -274,13 +274,9 @@ def _resolve_module_path(harness: str) -> str:
     if _HARNESS_MODULES:
         registered = sorted(_HARNESS_MODULES)
         raise HarnessSpawnError(f"unknown harness {harness!r}; registered names: {registered}")
-    raise HarnessSpawnError(
-        f"unknown harness {harness!r}; the registry is empty (no per-harness "
-        f"wraps registered yet — see Phase 1 step 4 of "
-        f"designs/SERVER_HARNESS_CONTRACT.md, or register a fixture "
-        f"harness from a test by mutating "
-        f"omnigent.runtime.harnesses._HARNESS_MODULES)"
-    )
+    # Dev-only state: no harness wraps are registered yet (Phase 1 step 4 of
+    # designs/SERVER_HARNESS_CONTRACT.md); tests register one via _HARNESS_MODULES.
+    raise HarnessSpawnError(f"unknown harness {harness!r}; no harnesses are registered")
 
 
 async def _wait_for_bind(

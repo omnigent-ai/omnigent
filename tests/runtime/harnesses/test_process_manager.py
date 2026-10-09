@@ -50,7 +50,9 @@ from omnigent.runtime.harnesses.process_manager import (
     _model_env_key,
     _pid_alive,
     _pids_holding_socket,
+    _resolve_module_path,
     _SubprocessEntry,
+    _wait_for_bind,
     sweep_orphaned_harness_processes,
 )
 
@@ -890,6 +892,75 @@ async def test_get_client_unknown_harness_raises_client_safe_spawn_error(
     finally:
         await manager.shutdown()
     assert issubclass(HarnessSpawnError, RuntimeError)
+
+
+def test_resolve_module_path_messages_stay_client_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every unknown-harness branch raises ``HarnessSpawnError`` with curated text.
+
+    These messages reach clients verbatim through the runner's error detail,
+    so they must name only the harness and the remedy — no paths, hosts, or
+    module internals.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    with pytest.raises(HarnessSpawnError) as registered:
+        _resolve_module_path("never-registered")
+    assert str(registered.value).startswith(
+        "unknown harness 'never-registered'; registered names: ['"
+    )
+
+    monkeypatch.setattr(
+        pm_mod, "missing_install_packages", lambda: {"never-registered": "omnigent-never"}
+    )
+    with pytest.raises(HarnessSpawnError) as installable:
+        _resolve_module_path("never-registered")
+    assert str(installable.value) == (
+        "unknown harness 'never-registered'; install `omnigent-never` to add this harness"
+    )
+
+    monkeypatch.setattr(pm_mod, "missing_install_packages", dict)
+    monkeypatch.setattr(pm_mod, "_HARNESS_MODULES", {})
+    with pytest.raises(HarnessSpawnError) as empty:
+        _resolve_module_path("never-registered")
+    assert str(empty.value) == "unknown harness 'never-registered'; no harnesses are registered"
+
+
+async def test_wait_for_bind_failures_raise_client_safe_spawn_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subprocess that exits or never binds raises ``HarnessSpawnError``.
+
+    The message names only the harness, conversation id, and exit code or
+    timeout, matching the client-safe contract the runner relies on.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    class _NeverBinds:
+        async def can_connect(self) -> bool:
+            return False
+
+        def harden(self) -> None:
+            raise AssertionError("harden must not run for a failed spawn")
+
+    exited = _FakeReapProc()
+    exited.returncode = 3
+    with pytest.raises(HarnessSpawnError) as early_exit:
+        await _wait_for_bind(exited, _NeverBinds(), "test", "conv_bind")  # type: ignore[arg-type]
+    assert str(early_exit.value) == (
+        "harness 'test' for conversation 'conv_bind' exited with 3 during spawn "
+        "(see Omnigent stderr)"
+    )
+
+    monkeypatch.setattr(pm_mod, "_SPAWN_READY_TIMEOUT_S", 0.0)
+    hung = _FakeReapProc()
+    with pytest.raises(HarnessSpawnError) as timed_out:
+        await _wait_for_bind(hung, _NeverBinds(), "test", "conv_bind")  # type: ignore[arg-type]
+    assert str(timed_out.value) == (
+        "harness 'test' for conversation 'conv_bind' did not bind its endpoint within 0s"
+    )
+    assert hung.killed
 
 
 async def test_get_client_concurrent_first_calls_share_subprocess(
