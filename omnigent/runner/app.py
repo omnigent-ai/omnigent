@@ -390,13 +390,14 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
         resp = await server_client.get("/api/version")
         resp.raise_for_status()
         payload = resp.json()
+        version = payload["version"]
         raw_capabilities = payload.get("capabilities")
         _server_capabilities = frozenset(
             c
             for c in (raw_capabilities if isinstance(raw_capabilities, list) else [])
             if isinstance(c, str)
         )
-        _server_version = payload["version"]
+        _server_version = version
         _logger.info(
             "resolved server version: %s",
             _server_version,

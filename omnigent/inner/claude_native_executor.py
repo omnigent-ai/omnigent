@@ -188,14 +188,9 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
         if is_auth_slash_command(text):
-            # Claude Code's sign-in flow is an interactive TUI handoff the
-            # bridge cannot drive, so /login is escaped into plain text and
-            # reaches the model as a prompt. An expired login answers it with
-            # "Login expired · Please run /login" — a loop. Point at the host
-            # command that does re-authenticate instead of typing anything.
-            # `omni setup` signs in (`claude auth login --claudeai`) and out
-            # (`claude auth logout`), so one pointer serves both commands. An
-            # expected, user-remediable dead end: complete the turn, don't fail it.
+            # Sign-in is an interactive TUI handoff the bridge cannot drive;
+            # point at `omni setup` instead. An expected, user-remediable dead
+            # end: complete the turn, don't fail it.
             yield TurnNotice(
                 message=(
                     "Claude Code's sign-in runs in its own terminal, so /login and "

@@ -352,10 +352,13 @@ class ExecutorAdapter(HarnessApp):
                     config=config,
                 ):
                     if isinstance(event, TurnNotice) and not request.durable_notices:
-                        # Older servers drop info notices on reload; downgrade to
-                        # the failed-turn shape they persist.
+                        # Older servers drop info notices on reload; downgrade to the
+                        # failed-turn shape they persist. The executor stays reusable.
                         event = ExecutorError(
-                            message=event.message, code=event.code, undelivered=True
+                            message=event.message,
+                            code=event.code,
+                            undelivered=True,
+                            preserve_session=True,
                         )
                     if ctx.cancelled.is_set():
                         log_input_event(
