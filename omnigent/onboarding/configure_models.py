@@ -269,6 +269,7 @@ _PROVIDER_DISPLAY_NAME: dict[str, str] = {
     "google": "Google Gemini",
     "databricks": "Databricks",
     "ollama": "Ollama",
+    "llama-server": "llama-server",
 }
 
 
