@@ -188,6 +188,14 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- When the after clip runs on a stand-in (a stub CLI, a mock model, a seeded
+  credential), assert the rendered text of the control the caption describes —
+  `inner_text()` on the composer's harness/model trigger, not only a picker
+  row's `data-active` attribute — and name every stand-in artifact the final
+  frame shows, with its cause, in the caption: "the harness control reads
+  'Models unavailable' because the stub codex exposes no models". Naming the
+  stand-in environment alone does not disclose it. With no image tool, OCR the
+  final frame or dump the controls' rendered text and quote what it read.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.

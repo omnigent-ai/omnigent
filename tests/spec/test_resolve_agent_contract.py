@@ -325,3 +325,17 @@ def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None
     handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
     assert handoff["ocr_review"]
     assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}
+
+
+def test_after_clip_captions_disclose_stand_in_artifacts() -> None:
+    instructions = _normalized_resolve_instructions()
+    recording = instructions.split("**Record the result after the fix.**", 1)[1]
+
+    assert "name every stand-in artifact the final frame shows" in recording
+    assert "not only a picker row's `data-active` attribute" in recording
+    assert "Naming the stand-in environment alone does not disclose it" in recording
+
+    fields = instructions.split("Field meanings:", 1)[1]
+    recordings = fields.split("- `recordings`", 1)[1].split("- `test_audit`", 1)[0]
+    assert "names each artifact of that stand-in the final frame shows" in recordings
+    assert "naming the stand-in environment alone is not that disclosure" in recordings

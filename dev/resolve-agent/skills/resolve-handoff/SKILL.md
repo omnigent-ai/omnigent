@@ -177,9 +177,13 @@ readiness; name pending publication/review steps in `remaining_work`.
   Follow the recording rules in Step 2B.5 on both author and review runs; in
   review mode, record the reviewed PR head. Keep recovered before-clips and
   captions unchanged. Each after-clip's caption lists the actions shown, ending
-  with the corrected behavior. A missing before-clip is not a reason to skip
-  the after-clip. Use `[]` only for internal/API-only results with no visible
-  user interaction, or when recording is blocked as described above.
+  with the corrected behavior. A clip filmed on a stand-in also names each
+  artifact of that stand-in the final frame shows, with its cause (a "Models
+  unavailable" label because the stub CLI serves no models); naming the stand-in
+  environment alone is not that disclosure. A missing before-clip is not a
+  reason to skip the after-clip. Use `[]` only for internal/API-only results
+  with no visible user interaction, or when recording is blocked as described
+  above.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 

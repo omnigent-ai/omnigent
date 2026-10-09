@@ -324,6 +324,22 @@ pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
 the test body. Fix the stop point and re-record; do not caption around it.
 
+A stand-in leaves marks of its own on the screen, and the caption must name
+every one the proof frames show. A stub CLI that reports a version but serves no
+model list makes the composer's harness control read "Models unavailable" beside
+the harness icon; a mock model replies in canned text; a placeholder host name
+sits in the host chip. Naming the stand-in environment does not explain these: a
+reader sees an apparently broken composer under a caption that says the fix
+works. Before captioning, read the final frame — view it, OCR it, or take a
+driver read of the rendered text of the controls it shows (`inner_text()` on the
+composer's harness/model trigger, not only a `data-active` attribute on a picker
+row) — and state each visible artifact with its cause, for example "the harness
+control reads 'Models unavailable' because the stub codex exposes no models; the
+model list is outside this fix". With no image tool, quote the OCR or
+rendered-text read you made. Disclosure covers what the stand-in changed, not
+what the fix got wrong: a frame that contradicts the claim itself is a finding
+to settle, not an artifact to annotate.
+
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
 what the clip shows: e.g. `"start a session → open the model picker → select the
