@@ -996,15 +996,24 @@ def test_claude_provider_follows_symlinked_plugin_cache(
     assert sorted(s.name for s in out) == ["direct:plan", "linked:review"]
 
 
+@pytest.mark.parametrize("escape", ["direct", "nested_symlink"])
 def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, escape: str
 ) -> None:
-    """Only the cache target is trusted, not other directories next to it."""
+    """Only the cache target is trusted: neither its siblings nor a link escaping it."""
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     outside = tmp_path / "evil"
     _write_skill(outside / "skills", "review")
-    cfg = _config_dir_with_symlinked_cache(tmp_path, {"sp@mkt": outside})
+    install = outside
+    if escape == "nested_symlink":
+        # A plugin directory inside the shared cache that links out of it.
+        (tmp_path / "shared-cache" / "mkt" / "sp").mkdir(parents=True)
+        (tmp_path / "shared-cache" / "mkt" / "sp" / "1.0.0").symlink_to(
+            outside, target_is_directory=True
+        )
+        install = tmp_path / "profile" / "plugins" / "cache" / "mkt" / "sp" / "1.0.0"
+    cfg = _config_dir_with_symlinked_cache(tmp_path, {"sp@mkt": install})
 
     out = resolve_harness_skills(
         _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
