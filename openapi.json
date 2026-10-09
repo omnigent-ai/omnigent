@@ -5198,7 +5198,7 @@
             "type": "boolean"
           },
           "agent_detail": {
-            "default": true,
+            "default": false,
             "title": "Agent Detail",
             "type": "boolean"
           },

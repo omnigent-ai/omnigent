@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.server.app import ServerInfoResponse
 from omnigent.server.feature_flags import Feature, FeatureFlags
 
 pytestmark = pytest.mark.asyncio
@@ -106,6 +107,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
     assert data["single_user"] is True
+
+    # Older servers omit capabilities they do not support.
+    del data["agent_detail"]
+    assert ServerInfoResponse.model_validate(data).agent_detail is False
 
 
 async def test_info_single_user_false_without_marker(
