@@ -232,6 +232,8 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     _send(page, f"please write the full 50-page report now ({_FAULT_TOKEN})")
     expect(page.locator(_USER, has_text=_FAULT_TOKEN).first).to_be_visible(timeout=60_000)
 
+    snapshot: dict = {}
+    hits: list[tuple[str, str]] = []
     settled_at: float | None = None
     deadline = time.monotonic() + _FAULT_SETTLE_S
     while time.monotonic() < deadline:
@@ -255,8 +257,11 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
             break
         time.sleep(2.0)
 
-    snapshot = _session_snapshot(base_url, session_id)
-    hits = _raw_constant_surfaces(page, base_url, session_id, snapshot)
+    # Keep a raw-constant sighting from the loop; surfaces can re-render, and a
+    # transient API error here must not discard the diagnostics.
+    with contextlib.suppress(httpx.HTTPError):
+        snapshot = _session_snapshot(base_url, session_id)
+        hits = hits or _raw_constant_surfaces(page, base_url, session_id, snapshot)
     status = str(snapshot.get("status") or "")
     last_task_error = snapshot.get("last_task_error") or {}
     log_lines = _turn_failure_log_lines(tmp_path_factory, session_id)
