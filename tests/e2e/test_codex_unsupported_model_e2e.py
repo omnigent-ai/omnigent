@@ -25,7 +25,7 @@ from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
 from omnigent.spec.types import RetryPolicy
 
-# The exact model and rejection string quoted in the bug report.
+# A model name a ChatGPT account rejects, and the provider's rejection text.
 _UNSUPPORTED_MODEL = "gpt-6-astra"
 _UNSUPPORTED_REASON = (
     f"The '{_UNSUPPORTED_MODEL}' model is not supported when using Codex with a ChatGPT account."
@@ -112,17 +112,19 @@ async def _run_turn(executor: CodexExecutor, prompt: str) -> list[object]:
 async def test_codex_unsupported_model_surfaces_structured_reason(
     unsupported_model_provider: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A Codex turn on an unsupported model surfaces a useful reason, not a blob."""
     codex_bin = _codex_bin_or_skip()
 
     codex_home = tmp_path / "source-codex-home"
     codex_home.mkdir()
+    # Isolate the bridge source from the developer's real ~/.codex.
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    # Retries are pinned off: a 400 is a permanent client error that production
-    # never retries either.
+    # Retries are pinned off so the single 400 surfaces immediately.
     executor = CodexExecutor(
         codex_path=codex_bin,
         cwd=str(workspace),
@@ -135,8 +137,6 @@ async def test_codex_unsupported_model_surfaces_structured_reason(
         skills_filter="none",
         retry_policy=RetryPolicy(max_retries=0),
     )
-    # CODEX_HOME must exist before the app-server spawns.
-    executor._env["CODEX_HOME"] = str(codex_home)
 
     try:
         events = await _run_turn(executor, "say hi")

@@ -2992,6 +2992,15 @@ def test_unwrap_provider_error_json_extracts_responses_api_envelope() -> None:
         "a ChatGPT account. (error_code=invalid_request_error)"
     )
 
+    # ``error.code`` wins over ``error.type`` when both are present.
+    assert (
+        _unwrap_provider_error_json(
+            '{"error": {"type": "invalid_request_error", "code": "model_not_found", '
+            '"message": "No model."}}'
+        )
+        == "No model. (error_code=model_not_found)"
+    )
+
 
 def test_unwrap_provider_error_json_leaves_plain_text_unchanged() -> None:
     """Non-JSON and JSON-without-a-message inputs pass through untouched."""
@@ -3021,6 +3030,28 @@ def test_format_codex_error_params_unwraps_responses_api_envelope_message() -> N
     # The raw envelope must not leak through.
     assert not result.lstrip().startswith("{")
     assert '"invalid_request_error"' not in result
+
+    # A top-level ``code`` that repeats the envelope's code is named once.
+    assert _format_codex_error_params({**params, "code": "invalid_request_error"}) == (
+        "The 'gpt-6-astra' model is not supported when using Codex with "
+        "a ChatGPT account. (error_code=invalid_request_error)"
+    )
+    # A flat provider envelope in the top-level message unwraps the same way.
+    flat = {
+        "message": '{"error_code": "BAD_REQUEST", "message": "Bad model."}',
+        "willRetry": False,
+    }
+    assert _format_codex_error_params(flat) == "Bad model. (error_code=BAD_REQUEST)"
+
+
+def test_format_codex_error_params_reports_a_repeated_reason_once() -> None:
+    """A frame carrying the same provider envelope in its top-level and nested
+    ``message`` fields reports the reason once."""
+    from omnigent.inner.codex_executor import _format_codex_error_params
+
+    envelope = '{"error": {"type": "invalid_request_error", "message": "Model not allowed."}}'
+    result = _format_codex_error_params({"message": envelope, "error": {"message": envelope}})
+    assert result == "Model not allowed. (error_code=invalid_request_error)"
 
 
 async def test_run_turn_turn_failed_unwraps_provider_error_envelope() -> None:

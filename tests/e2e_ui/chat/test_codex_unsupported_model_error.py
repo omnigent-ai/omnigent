@@ -21,6 +21,7 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 pytestmark = pytest.mark.skipif(
@@ -61,20 +62,16 @@ def _build_codex_bundle(name: str, model: str) -> bytes:
 def _create_codex_session(base_url: str, runner_id: str, model: str) -> str:
     name = f"codex-unsupported-{uuid.uuid4().hex[:8]}"
     # A preset title keeps background title inference off the scripted queue.
-    create_resp = httpx.post(
+    create_resp = post_session_bundle(
+        httpx.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"title": "Codex unsupported model"})},
-        files={"bundle": ("agent.tar.gz", _build_codex_bundle(name, model), "application/gzip")},
+        _build_codex_bundle(name, model),
+        metadata={"title": "Codex unsupported model"},
         timeout=30.0,
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 
@@ -130,8 +127,7 @@ def test_codex_unsupported_model_rejection_shows_reason_not_raw_json(
             assert _UNSUPPORTED_REASON in shown, (
                 f"the provider's rejection reason must be preserved; got: {shown!r}"
             )
-            # The executor appends a codex stderr tail, so only the leading error
-            # body decides whether the provider envelope was unwrapped.
+            # Only the leading error body decides whether the envelope was unwrapped.
             body = shown.removeprefix("inner executor error:").lstrip()
             assert not body.startswith("{"), (
                 f"the failed turn shows the raw provider JSON envelope: {shown!r}"

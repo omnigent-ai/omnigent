@@ -473,9 +473,7 @@ def _format_codex_error_params(params: object) -> str:
     parts: list[str] = []
     message = params.get("message")
     if isinstance(message, str) and message.strip():
-        # The top-level ``message`` can itself be a stringified provider
-        # error envelope (e.g. a Responses-API 400 relayed verbatim);
-        # unwrap it so the human-readable reason surfaces, not raw JSON.
+        # Top-level messages can also contain provider JSON envelopes.
         parts.append(_unwrap_provider_error_json(message.strip()))
     # The app server's ``error`` events nest the actual upstream
     # failure under ``params["error"]`` (a dict with its own
@@ -498,7 +496,8 @@ def _format_codex_error_params(params: object) -> str:
         if inner_details:
             parts.append(f"details={inner_details!r}")
     code = params.get("code")
-    if code is not None:
+    labelled = any(part.endswith(f"(error_code={code})") for part in parts)
+    if code is not None and not labelled:
         parts.append(f"code={code}")
     data = params.get("data")
     if data is not None and data != "":
@@ -507,7 +506,8 @@ def _format_codex_error_params(params: object) -> str:
         # No standard JSON-RPC fields populated; dump the raw params
         # so the user can still see what codex sent.
         return f"Codex App Server error: raw_params={params!r}"
-    return "; ".join(parts)
+    # The top-level and nested messages can carry the same provider envelope.
+    return "; ".join(dict.fromkeys(parts))
 
 
 def _unwrap_provider_error_json(text: str) -> str:
