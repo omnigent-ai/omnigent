@@ -17,14 +17,14 @@ import httpx
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-PROTOTYPE = ROOT / "deploy/kubernetes/prototype"
+EXAMPLE = ROOT / "deploy/kubernetes/multi_replica"
 
 
 @pytest.mark.parametrize("failed_command", ["logs", "cp", "write", "missing-binary", "mock-wait"])
 async def test_evidence_failure_still_removes_host_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_command: str
 ) -> None:
-    spec = importlib.util.spec_from_file_location("nginx_verify", PROTOTYPE / "verify.py")
+    spec = importlib.util.spec_from_file_location("nginx_verify", EXAMPLE / "verify.py")
     assert spec is not None and spec.loader is not None
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
@@ -70,7 +70,7 @@ async def test_evidence_failure_still_removes_host_container(
 
 
 async def test_transient_pod_query_failure_is_retried() -> None:
-    spec = importlib.util.spec_from_file_location("nginx_verify", PROTOTYPE / "verify.py")
+    spec = importlib.util.spec_from_file_location("nginx_verify", EXAMPLE / "verify.py")
     assert spec is not None and spec.loader is not None
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
@@ -79,9 +79,9 @@ async def test_transient_pod_query_failure_is_retried() -> None:
     assert query.await_count == 2
 
 
-@pytest.mark.skipif(os.name != "posix", reason="the prototype uses Linux host networking")
+@pytest.mark.skipif(os.name != "posix", reason="the example uses Linux host networking")
 async def test_mock_keeps_its_ephemeral_port_until_the_child_is_ready(tmp_path: Path) -> None:
-    spec = importlib.util.spec_from_file_location("nginx_verify", PROTOTYPE / "verify.py")
+    spec = importlib.util.spec_from_file_location("nginx_verify", EXAMPLE / "verify.py")
     assert spec is not None and spec.loader is not None
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
@@ -157,7 +157,7 @@ esac
         "PROTOTYPE_TEST_TRANSIENT": str(transient).lower(),
     }
     result = subprocess.run(
-        ["bash", str(PROTOTYPE / "run.sh"), "up"],
+        ["bash", str(EXAMPLE / "run.sh"), "up"],
         env=env,
         capture_output=True,
         text=True,

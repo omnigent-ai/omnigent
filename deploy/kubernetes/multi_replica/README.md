@@ -11,10 +11,6 @@ more than one replica. One server pod would also support a rolling update
 with a temporary replacement, but would not test steady-state replication.
 Only one NGINX pod is needed for this example.
 
-This demonstrates routing and tunnel reconnection. A message sent during a
-rollout can still fail in the browser. See [Rollout limits](#rollout-limits)
-before using this setup for active conversations.
-
 ## Why requests need a host ID
 
 An Omnigent **host** is a machine that runs agents. Each agent session runs in
@@ -99,19 +95,6 @@ The example also sets `nginx.org/max-fails: "0"` and
 and prevents individual failed requests from choosing a different server
 while their host's tunnel remains elsewhere.
 
-### Rollout limits
-
-Readiness means a server can accept connections. It does not mean that a
-particular host and all of its runners have connected there yet. During that
-gap, a browser request can receive `400 wrong_replica`. An interrupted send
-can also lose its response after the server has saved the prompt. Routing
-alone cannot tell the browser whether that message was accepted.
-
-This example does not add message retries, delivery receipts, or changes to
-the session API. The verification below sends its first message before the
-rollout and its next message after the connections have settled. It does not
-prove that sending continuously during a rollout is free of browser errors.
-
 Use **F5 NGINX Ingress Controller OSS 5.2.1** (`nginx/nginx-ingress`), as pinned
 in the manifest. The community `ingress-nginx` controller updates endpoints
 differently; this example depends on F5's reload behavior.
@@ -124,8 +107,8 @@ enabled. From the repository root:
 
 ```bash
 uv sync --frozen
-deploy/kubernetes/prototype/run.sh up
-deploy/kubernetes/prototype/run.sh verify
+deploy/kubernetes/multi_replica/run.sh up
+deploy/kubernetes/multi_replica/run.sh verify
 ```
 
 Open **http://localhost:18081**. The startup script creates a dedicated kind
@@ -156,8 +139,8 @@ mock model on exit and leaves the cluster running for inspection. To inspect
 the pods or trigger another rollout:
 
 ```bash
-deploy/kubernetes/prototype/run.sh kubectl get pods -o wide
-deploy/kubernetes/prototype/run.sh rollout
+deploy/kubernetes/multi_replica/run.sh kubectl get pods -o wide
+deploy/kubernetes/multi_replica/run.sh rollout
 ```
 
 To connect your own host from this checkout:
@@ -170,7 +153,7 @@ OMNIGENT_HOST_SLICE_KEY_ENABLED=1 uv run --no-sync omnigent host \
 To remove the example cluster and its database and artifact volumes:
 
 ```bash
-deploy/kubernetes/prototype/run.sh down
+deploy/kubernetes/multi_replica/run.sh down
 ```
 
 Optional settings are `PROTOTYPE_STATE_DIR`, `PROTOTYPE_PORT`, `KIND_BIN`,
