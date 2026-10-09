@@ -196,8 +196,7 @@ class ClaudeNativeExecutor(Executor):
             # `omni setup` covers both directions: its harness menu signs in
             # (`claude auth login --claudeai`) and signs out (`claude auth
             # logout`), so one pointer serves /login and /logout alike.
-            # A notice, not an error: this is an expected, user-remediable
-            # dead end, so the turn completes instead of surfacing as failed.
+            # Expected, user-remediable dead end: complete the turn instead of failing it.
             yield TurnNotice(
                 message=(
                     "Claude Code's sign-in runs in its own terminal, so /login and "

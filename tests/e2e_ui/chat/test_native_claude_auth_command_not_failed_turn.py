@@ -70,7 +70,9 @@ def _wait_for_turn_outcome(page: Page, base_url: str, session_id: str) -> str:
         ):
             return status
         page.wait_for_timeout(1_000)
-    return status
+    pytest.fail(
+        f"Turn did not settle within {_TURN_SETTLE_TIMEOUT_S:.0f}s (last status {status!r})"
+    )
 
 
 def _expect_notice(page: Page) -> None:
