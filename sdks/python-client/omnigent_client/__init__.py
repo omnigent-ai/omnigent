@@ -78,7 +78,7 @@ from ._transforms import (
     skip_blocks,
     skip_intermediate_ends,
 )
-from ._types import File
+from ._types import File, PaginatedList
 from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
@@ -97,6 +97,7 @@ __all__ = [
     "NativeToolBlock",
     "OmnigentClient",
     "OmnigentError",
+    "PaginatedList",
     "QueryResult",
     "QueryStream",
     "RateLimitedError",

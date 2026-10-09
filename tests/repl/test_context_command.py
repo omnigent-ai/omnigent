@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
+from omnigent_client import PaginatedList
 from omnigent_ui_sdk import RichBlockFormatter
 
 from omnigent.repl._repl import (
@@ -614,7 +615,7 @@ class _OnePageSessionsApi:
         limit: int,
         after: str | None,
         order: str,
-    ) -> list[dict[str, object]]:
+    ) -> PaginatedList:
         """
         Return the configured single page of items.
 
@@ -625,7 +626,7 @@ class _OnePageSessionsApi:
         :returns: The configured items on the first call (cursor unset).
         """
         assert after is None, "second page requested for a sub-cap first page"
-        return list(self._items)
+        return PaginatedList(data=list(self._items), has_more=False)
 
 
 class _ItemsClient:
