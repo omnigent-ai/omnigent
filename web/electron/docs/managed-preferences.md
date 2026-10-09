@@ -67,7 +67,7 @@ When `databricksInternalFeaturesEnabled` is `true` **and** the window is
 connected to a Databricks-managed server (a workspace mount on
 `*.databricks.com` / `*.azuredatabricks.net`, or a Databricks App on
 `*.databricksapps.com`, https only), the new-session host picker offers
-**Connect to Arca**: connecting the user's Arca dev instance to the current
+**Run on Arca**: connecting the user's Arca dev instance to the current
 server as a host. On any other server the Arca option is disabled. Selecting it
 opens a shell-owned connect console that shows the exact command — `arca ssh`
 with a remote `isaac omni host --background --non-interactive` — and, after

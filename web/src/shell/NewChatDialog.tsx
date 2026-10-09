@@ -6670,9 +6670,7 @@ export function NewChatLandingScreen() {
                             <span className="flex size-4 shrink-0 items-center justify-center">
                               <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                             </span>
-                            <span>
-                              {connectingArca ? "Connecting to Arca…" : "Connect to Arca"}
-                            </span>
+                            <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
                           </DropdownMenuItem>
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}

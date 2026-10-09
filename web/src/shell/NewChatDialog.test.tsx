@@ -2958,7 +2958,7 @@ describe("Run on this machine (desktop host enrollment)", () => {
   });
 });
 
-describe("Connect to Arca (Databricks-internal, MDM-gated)", () => {
+describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
   beforeEach(() => {
     setupLandingMocks();
     mockHosts([]);
@@ -3011,7 +3011,7 @@ describe("Connect to Arca (Databricks-internal, MDM-gated)", () => {
     const row = await screen.findByTestId("new-chat-landing-host-arca-1");
     expect(row.textContent).toContain("Arca instance");
     expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-      "Connect to Arca",
+      "Run on Arca",
     );
     fireEvent.click(row);
     await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
@@ -3027,7 +3027,7 @@ describe("Connect to Arca (Databricks-internal, MDM-gated)", () => {
     });
     renderLanding();
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Connect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() =>
       expect(localStorage.getItem("omnigent:last-host-choice")).toBe("actual-arca"),
     );
@@ -3046,10 +3046,10 @@ describe("Connect to Arca (Databricks-internal, MDM-gated)", () => {
     });
     renderLanding();
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Connect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(1));
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Connect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(2));
     expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1");
   });
@@ -3067,17 +3067,17 @@ describe("Connect to Arca (Databricks-internal, MDM-gated)", () => {
       await openHostMenu();
 
       expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-        /^Connect to Arca$/,
+        /^Run on Arca$/,
       );
     },
   );
 
-  it("shows a plain Connect to Arca item (no status line) while not connected", async () => {
+  it("shows a plain Run on Arca item (no status line) while not connected", async () => {
     renderLanding();
     await openHostMenu();
 
     const item = await screen.findByTestId("new-chat-landing-run-on-arca");
-    expect(item).toHaveTextContent(/^Connect to Arca$/);
+    expect(item).toHaveTextContent(/^Run on Arca$/);
     expect(screen.queryByTestId("new-chat-landing-arca-subtitle")).toBeNull();
   });
 

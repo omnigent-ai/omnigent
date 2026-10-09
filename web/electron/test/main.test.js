@@ -3555,7 +3555,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       const event = { sender: h.webContents };
       for (const url of ["http://localhost:5173", "https://127.0.0.1", "http://[::1]"]) {
         if (expected) {
-          assert.match(hint(event, url), /If this session runs on Arca.*Connect to Arca/);
+          assert.match(hint(event, url), /If this session runs on Arca.*Run on Arca/);
         } else {
           assert.equal(hint(event, url), null);
         }
@@ -3587,7 +3587,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const eligible = h.browserRegistryDeps().isArcaAgentContext;
     const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
     assert.equal(eligible(context), false);
-    assert.match(hint({ sender: h.webContents }, "http://localhost"), /Connect to Arca/);
+    assert.match(hint({ sender: h.webContents }, "http://localhost"), /Run on Arca/);
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(eligible(context), true);
     assert.equal(hint({ sender: h.webContents }, "http://localhost"), null);

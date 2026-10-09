@@ -527,7 +527,7 @@ Eligibility is scoped to the selected server/workspace, not all sessions on
 a Databricks server.
 
 After restarting the desktop, or if automatic connect fails, open **New
-session** > **Host** > **Connect to Arca**. Complete the existing connect console, then select your
+session** > **Host** > **Run on Arca**. Complete the existing connect console, then select your
 original session in the sidebar and retry the browser tool. Reconnecting can
 capture identity from an already-running daemon; it does not create a new
 session or change automatic-connect preferences. Failed or unrecognized

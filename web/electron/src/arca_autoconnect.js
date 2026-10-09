@@ -4,7 +4,7 @@
  * Arca auto-connect (Databricks-internal): when a window loads an eligible
  * server, make sure the user's Arca instance is connected to it as a host by
  * running the same idempotent `arca ssh … isaac omni host --background` as the
- * manual "Connect to Arca" item — without the consent console, at most once per
+ * manual "Run on Arca" item — without the consent console, at most once per
  * server target (including the workspace selector) per app launch.
  *
  * The command exits once the remote daemon is up (or reports it was already
