@@ -55,11 +55,17 @@ def _background_status(
     chat.emit({"event": "session.status", "data": data})
 
 
-def _pill(page: Page, count: int) -> Locator:
+def _pill(page: Page, count: int, *, working: bool = False) -> Locator:
+    """The compact badge, located by its accessible name.
+
+    The visible text is the bare count; the sentence form is the accessible
+    name, prefixed with "Agent working —" while the agent's turn is active.
+    """
     plural = "" if count == 1 else "s"
-    return page.get_by_role(
-        "button", name=f"{count} background task{plural} still running", exact=True
-    )
+    name = f"{count} background task{plural} still running"
+    if working:
+        name = f"Agent working — {name}"
+    return page.get_by_role("button", name=name, exact=True)
 
 
 def test_bare_idle_clears_the_live_working_indicator(
@@ -109,6 +115,38 @@ def test_blocked_reason_reaches_the_live_working_indicator(
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)
+
+
+def test_background_task_pill_carries_the_working_state(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """While a turn runs the pill shows a spinner and says so; once idle it is plain again."""
+    chat = chat_session_contract
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+    spinner = page.get_by_test_id("background-task-working")
+
+    _background_status(chat, 1, [_MONITOR_TASK])
+    expect(_pill(page, 1)).to_have_text("1", timeout=10_000)
+    expect(working).to_have_count(0)
+    expect(spinner).to_have_count(0)
+
+    # A running edge carries no count: the sticky tally must survive it.
+    chat.emit_busy("browser-turn")
+    expect(working).to_be_visible(timeout=10_000)
+    expect(_pill(page, 1, working=True)).to_have_text("1")
+    expect(spinner).to_be_visible()
+
+    _background_status(chat, 1, [_MONITOR_TASK])
+    expect(working).to_be_hidden(timeout=10_000)
+    expect(_pill(page, 1)).to_have_text("1")
+    expect(spinner).to_have_count(0)
+
+    _background_status(chat, 0)
+    expect(page.get_by_test_id("background-task-pill")).to_have_count(0)
 
 
 @pytest.mark.parametrize(
