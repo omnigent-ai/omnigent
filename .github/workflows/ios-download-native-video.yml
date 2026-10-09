@@ -13,7 +13,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select and boot iPhone Simulator
+      - name: Select iPhone Simulator
         id: simulator
         run: |
           set -euo pipefail
@@ -24,8 +24,6 @@ jobs:
             puts phone.fetch("udid")
           ')"
           echo "id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
-          xcrun simctl boot "$DEVICE_ID" 2>/dev/null || true
-          sleep 20
 
       - name: Save fixed implementation
         run: cp web/ios/Omnigent/OmnigentWebView.swift /tmp/OmnigentWebView.fixed.swift
@@ -36,20 +34,32 @@ jobs:
         run: |
           set -euo pipefail
           git show origin/main:web/ios/Omnigent/OmnigentWebView.swift > web/ios/Omnigent/OmnigentWebView.swift
-          xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/before.mp4 &
-          VIDEO_PID=$!
-          set +e
           xcodebuild test \
             -project web/ios/Omnigent.xcodeproj \
             -scheme Omnigent \
             -configuration Debug \
             -destination "platform=iOS Simulator,id=$DEVICE_ID" \
             -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO > /tmp/before-xcodebuild.log 2>&1 &
+          TEST_PID=$!
+          BOOTED=0
+          for attempt in {1..120}; do
+            if xcrun simctl list devices | grep "$DEVICE_ID" | grep -q '(Booted)'; then
+              BOOTED=1
+              break
+            fi
+            sleep 1
+          done
+          test "$BOOTED" -eq 1
+          xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/before.mp4 &
+          VIDEO_PID=$!
+          set +e
+          wait "$TEST_PID"
           TEST_STATUS=$?
           set -e
           kill -INT "$VIDEO_PID"
           wait "$VIDEO_PID" || true
+          cat /tmp/before-xcodebuild.log
           test "$TEST_STATUS" -eq 0
 
       - name: Record after fix

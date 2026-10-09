@@ -40,6 +40,7 @@ final class OmnigentUITests: XCTestCase {
       "--omnigent-reset-state", "--omnigent-server-url", "http://localhost:\(server.port)",
     ]
     app.launch()
+    sleep(5)
 
     let download = app.webViews.links["Download file"]
     XCTAssertTrue(download.waitForExistence(timeout: 30))
