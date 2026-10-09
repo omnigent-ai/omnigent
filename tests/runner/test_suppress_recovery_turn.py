@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
+from omnigent.runner.app import _session_event_queues_ref, _session_histories_ref
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
@@ -34,6 +36,7 @@ from omnigent.runner.session_init_protocol import (
 from omnigent.spec.types import AgentSpec
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from tests.runner.conftest import (
+    _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
@@ -108,6 +111,60 @@ class _CatchUpServerClient(_HistoryServerClient):
         if url.rstrip("/").endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
         return self._Resp({})
+
+
+class _GatedItemsServer(_HistoryServerClient):
+    """Hold the first ``gates`` session-items loads until the test releases each one."""
+
+    def __init__(self, gates: int) -> None:
+        self.entered = [asyncio.Event() for _ in range(gates)]
+        self.release = [asyncio.Event() for _ in range(gates)]
+        self._calls = 0
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        response = await super().get(url, **kwargs)
+        if url.endswith(f"/{SESSION_ID}/items") and self._calls < len(self.release):
+            index = self._calls
+            self._calls += 1
+            self.entered[index].set()
+            await self.release[index].wait()
+        return response
+
+
+# The server's forward of the message it already persisted as ``msg_001``.
+_FORWARDED_MESSAGE = {
+    "type": "message",
+    "role": "user",
+    "agent_id": AGENT_ID,
+    "content": [{"type": "input_text", "text": "hello from history"}],
+    "persisted_item_id": "msg_001",
+}
+
+
+@pytest.fixture
+def fresh_session_state() -> Iterator[None]:
+    """Drop the module-level history and event queue earlier tests left for SESSION_ID."""
+    _session_histories_ref.pop(SESSION_ID, None)
+    _session_event_queues_ref.pop(SESSION_ID, None)
+    yield
+    _session_histories_ref.pop(SESSION_ID, None)
+    _session_event_queues_ref.pop(SESSION_ID, None)
+
+
+async def _settle_turns(app: FastAPI) -> None:
+    """Wait until no turn owns the session and no buffered message awaits replay."""
+    for _ in range(500):
+        queued = app.state.session_message_buffers.get(SESSION_ID)
+        if SESSION_ID not in app.state.active_turns and not queued:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("session turns did not settle")
+
+
+def _drain_turn_statuses() -> list[str]:
+    """Drain the ``session.status`` edges the runner published for SESSION_ID."""
+    events = _drain_session_event_queue(_session_event_queues_ref.get(SESSION_ID))
+    return [e["status"] for e in events if e.get("type") == "session.status"]
 
 
 def _build_sdk_app(
@@ -281,6 +338,7 @@ async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
         )
         _assert_browser_tools_hidden(harness.posted_bodies[0])
         assert _init_rows(caplog)[0]["recovery_turn"] == "history_resume"
+        assert _init_rows(caplog)[0]["message_ingest_inflight"] is False
 
         # Now forward the message: since the recovery turn already ran and
         # _active_turns is now empty, the forward triggers a second turn.
@@ -537,3 +595,98 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
         assert len(harness.posted_bodies) == int(startup_repaint is not None)
         assert (await client.post("/v1/sessions", json=payload)).status_code == 201
         assert len(harness.posted_bodies) == int(startup_repaint is not None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("fresh_session_state")
+async def test_message_forwarded_during_initialization_starts_one_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Init defers its history resume to a still-ingesting forward of the same message."""
+    server = _GatedItemsServer(gates=2)
+    app, _pm, harness = _build_sdk_app(server)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    async with _runner_client(app) as client:
+        init = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await asyncio.wait_for(server.entered[0].wait(), timeout=5)
+        forward = asyncio.create_task(
+            client.post(f"/v1/sessions/{SESSION_ID}/events", json=_FORWARDED_MESSAGE)
+        )
+        await asyncio.wait_for(server.entered[1].wait(), timeout=5)
+        assert app.state.message_ingest_inflight == {SESSION_ID: 1}
+
+        server.release[0].set()
+        init_response = await init
+        assert init_response.status_code == 201, init_response.text
+        (init_row,) = _init_rows(caplog)
+        assert init_row["recovery_turn"] == "none"
+        assert init_row["message_ingest_inflight"] is True
+        assert SESSION_ID not in app.state.active_turns
+
+        server.release[1].set()
+        forward_response = await forward
+        assert forward_response.status_code == 202, forward_response.text
+        assert forward_response.json()["status"] == "accepted"
+        await _settle_turns(app)
+        assert len(harness.posted_bodies) == 1, "the message started a second harness turn"
+        assert str(harness.posted_bodies[0]["content"]).count("hello from history") == 1
+        statuses = _drain_turn_statuses()
+        assert "running" in statuses
+        assert "failed" not in statuses
+        assert not any(r.getMessage().startswith("harness rejected turn") for r in caplog.records)
+        assert app.state.message_ingest_inflight == {}
+
+        # Once released, the count no longer blocks recovering a trailing user item.
+        assert (await client.post("/v1/sessions", json=payload)).status_code == 201
+        await _settle_turns(app)
+        assert _init_rows(caplog)[-1]["recovery_turn"] == "history_resume"
+        assert len(harness.posted_bodies) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("fresh_session_state")
+async def test_turn_started_during_message_ingest_buffers_the_message() -> None:
+    """A turn bound while the forward loads history keeps its slot; the message is buffered."""
+    server = _GatedItemsServer(gates=1)
+    app, _pm, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        forward = asyncio.create_task(
+            client.post(f"/v1/sessions/{SESSION_ID}/events", json=_FORWARDED_MESSAGE)
+        )
+        await asyncio.wait_for(server.entered[0].wait(), timeout=5)
+        live_turn = asyncio.create_task(asyncio.Event().wait())
+        app.state.active_turns[SESSION_ID] = live_turn
+        app.state.live_response_id[SESSION_ID] = "resp_live"
+        try:
+            server.release[0].set()
+            forward_response = await forward
+            assert forward_response.status_code == 202, forward_response.text
+            assert forward_response.json()["status"] == "buffered"
+            assert app.state.active_turns[SESSION_ID] is live_turn
+            (buffered,) = app.state.session_message_buffers[SESSION_ID]
+            injected = [event["injection_id"] for event in harness.patched_events]
+            assert injected == [buffered["injection_id"]]
+            assert harness.posted_bodies == []
+            assert SESSION_ID not in _session_histories_ref
+            assert app.state.message_ingest_inflight == {}
+        finally:
+            live_turn.cancel()
+            app.state.active_turns.pop(SESSION_ID, None)
+            app.state.live_response_id.pop(SESSION_ID, None)
+            app.state.session_message_buffers.pop(SESSION_ID, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("fresh_session_state")
+async def test_message_ingest_without_initialization_starts_its_turn() -> None:
+    """With no concurrent init, a forward that loads history starts exactly one turn."""
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    async with _runner_client(app) as client:
+        response = await client.post(f"/v1/sessions/{SESSION_ID}/events", json=_FORWARDED_MESSAGE)
+        assert response.status_code == 202, response.text
+        assert response.json()["status"] == "accepted"
+        await _settle_turns(app)
+    assert len(harness.posted_bodies) == 1
+    assert str(harness.posted_bodies[0]["content"]).count("hello from history") == 1
+    assert app.state.message_ingest_inflight == {}
