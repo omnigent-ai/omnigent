@@ -111,7 +111,11 @@ async def test_unavailable_error_retains_both_probes_before_cleanup(
 
     assert not tmp_path.exists()
     assert not instance.running
-    assert commands == ["capture-pane", "has-session"] * 3
+    # The threaded loop folds pane liveness + capture into one
+    # ``list-panes ; capture-pane`` call, so its leading probe command is
+    # list-panes; the async loop still issues a bare capture-pane.
+    pane_probe = "list-panes" if threaded else "capture-pane"
+    assert commands == [pane_probe, "has-session"] * 3
     records = [
         r
         for r in caplog.records
@@ -176,14 +180,25 @@ async def test_probe_history_resets_on_recovery(
     def run(cmd, **kwargs):
         nonlocal tick
         command = cmd[5]
-        if command == "capture-pane":
+        # The pane snapshot probe is bare capture-pane on the async loop and
+        # the folded ``list-panes ; capture-pane`` call on the threaded loop.
+        is_pane_probe = command == "capture-pane" or (
+            command == "list-panes" and "capture-pane" in cmd
+        )
+        if is_pane_probe:
             tick += 1
-        if tick == 3 and (
-            (command == "capture-pane" and recovery == "capture-spawn")
-            or (command == "has-session" and recovery == "session-spawn")
-        ):
-            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
-        if command == "list-panes" or (tick == 3 and command == recovery):
+        # The async loop reads pane liveness with a standalone list-panes after
+        # a successful capture; that probe always reports a live pane here.
+        if command == "list-panes" and not is_pane_probe:
+            return subprocess.CompletedProcess(cmd, 0, b"0\n", b"")
+        recovers_pane = is_pane_probe and recovery in ("capture-pane", "capture-spawn")
+        recovers_session = command == "has-session" and recovery in (
+            "has-session",
+            "session-spawn",
+        )
+        if tick == 3 and (recovers_pane or recovers_session):
+            if recovery.endswith("spawn"):
+                raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
             return subprocess.CompletedProcess(cmd, 0, b"0\n", b"")
         detail = (
             b"can't find session: before recovery"
