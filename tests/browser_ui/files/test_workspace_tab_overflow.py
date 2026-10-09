@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, BrowserType, Page, expect
 
 from tests.browser_ui.files.test_file_line_navigation import (
     BrowserSession,
@@ -19,17 +20,33 @@ from tests.browser_ui.files.test_file_line_navigation import (
 
 seeded_session = seeded_session_fixture
 
+# Gutter a plain scroller gets in this browser; zero means scrollbars are hidden.
+_SCROLLBAR_PROBE_JS = """() => {
+    const probe = document.createElement('div');
+    probe.style.cssText = 'position:fixed;width:100px;height:40px;overflow-x:scroll';
+    document.body.append(probe);
+    const gutter = probe.offsetHeight - probe.clientHeight;
+    probe.remove();
+    return gutter;
+}"""
 
-@pytest.fixture(scope="session")
-def browser_type_launch_args(browser_type_launch_args: dict[str, Any]) -> dict[str, Any]:
-    # Headless Chromium hides scrollbars by default; a user's browser draws them.
-    return {
+
+@pytest.fixture(scope="module")
+def browser(
+    browser_type: BrowserType, browser_type_launch_args: dict[str, Any]
+) -> Iterator[Browser]:
+    # Headless Chromium hides scrollbars by default while a user's browser draws
+    # them; a module-scoped browser keeps that change off the shared session browser.
+    launch_args = {
         **browser_type_launch_args,
         "ignore_default_args": [
             *browser_type_launch_args.get("ignore_default_args", []),
             "--hide-scrollbars",
         ],
     }
+    scrollbar_browser = browser_type.launch(**launch_args)
+    yield scrollbar_browser
+    scrollbar_browser.close()
 
 
 @pytest.mark.parametrize("width", [240, 360, 472, 900])
@@ -60,6 +77,7 @@ def test_workspace_tab_overflow(
     toolbar = page.get_by_role("toolbar", name="Workspace tabs")
     viewport = toolbar.locator("[data-workspace-tabs-viewport]")
     expect(viewport).to_be_visible(timeout=30_000)
+    assert page.evaluate(_SCROLLBAR_PROBE_JS) > 0, "this browser must draw scrollbars"
     fixed_panel_tabs = toolbar.locator('[data-workspace-tab="changes"]')
     if width < 400:
         # Narrow rails move the fixed panels into the picker to leave room for tabs.

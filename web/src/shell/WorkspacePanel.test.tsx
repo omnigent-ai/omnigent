@@ -1136,6 +1136,18 @@ describe("WorkspacePanel panel picker", () => {
     expect(onRightRailTabChange).toHaveBeenCalledWith("github");
   });
 
+  it("marks the nav panel active when the selected terminal is gone", () => {
+    // A sticky terminal selection whose terminal has disappeared shows the nav
+    // view, so the picker must mark that panel rather than nothing.
+    renderWorkspace({
+      openTerminals: [],
+      selectedTerminalKey: "terminal:gone",
+      rightRailTab: "files",
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Files" })).toHaveAttribute("aria-current", "true");
+  });
+
   it("selects an open terminal", () => {
     const { openTerminalTab } = renderWorkspace({ openTerminals: ["terminal:zsh"] });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });

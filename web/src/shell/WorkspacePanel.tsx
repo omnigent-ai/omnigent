@@ -77,6 +77,10 @@ const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
 const WORKSPACE_OPEN_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
+// Below this rail width the fixed panel icons live only in the Select panel
+// picker while tabs are open; the browser contract asserts the same breakpoint
+// (tests/browser_ui/files/test_workspace_tab_overflow.py).
+const NARROW_RAIL_HIDES_PANEL_TABS = "@max-[400px]/rail:hidden";
 const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
 const NEW_SHELL_KEYS = [MOD_KEY, ALT_KEY, "T"] as const;
 
@@ -1072,9 +1076,11 @@ function WorkspacePanelImpl({
     ...visiblePermanentTabs.map((tab) => ({
       key: tab,
       label: panelLabels[tab],
+      // Same gate as the Tabs sentinel below: a sticky terminal key whose
+      // terminal is gone falls back to the nav view, so its panel is active.
       active:
         selectedFilePath === null &&
-        selectedTerminalKey === null &&
+        (selectedTerminalKey === null || !openTerminals.includes(selectedTerminalKey)) &&
         !browserSelected &&
         !sideChatSelected &&
         rightRailTab === tab,
@@ -1261,7 +1267,7 @@ function WorkspacePanelImpl({
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
           <Tabs
-            className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
+            className={cn("shrink-0", showOpenTabs && NARROW_RAIL_HIDES_PANEL_TABS)}
             // When a file or shell tab is active no fixed trigger should
             // highlight, so feed the radix group a sentinel that matches none of
             // them. The active file/shell tab carries its own highlight. Gate the
@@ -1290,7 +1296,7 @@ function WorkspacePanelImpl({
             aria-hidden
             className={cn(
               "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
-              showOpenTabs && "@max-[400px]/rail:hidden",
+              showOpenTabs && NARROW_RAIL_HIDES_PANEL_TABS,
             )}
           />
           {showOpenTabs && (
