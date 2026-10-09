@@ -4168,8 +4168,11 @@ def _paste_and_submit(
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
     :returns: None.
-    :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
-        never leaves the input box after repeated submit Enters.
+    :raises ClaudeUserPromptPending: If a question or permission prompt is
+        pending before the submit Enter; the message was not sent.
+    :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
+        never leaves the input box after repeated submit Enters, or if a
+        prompt appears after the submit Enter.
     """
     delivery_diagnostics.start_attempt()
     delivery_diagnostics.set_stage("checking_pending_prompt")
@@ -4264,13 +4267,21 @@ def _paste_and_submit(
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
     delivery_diagnostics.set_stage("verifying_submit")
-    if _verify_submit_accepted(
-        socket_path,
-        tmux_target,
-        needle=needle,
-        what="submitted message",
-        bridge_dir=bridge_dir,
-    ):
+    try:
+        accepted = _verify_submit_accepted(
+            socket_path,
+            tmux_target,
+            needle=needle,
+            what="submitted message",
+            bridge_dir=bridge_dir,
+        )
+    except ClaudeUserPromptPending as exc:
+        # The Enter already went out, so the prompt may belong to this message's own turn.
+        raise RuntimeError(
+            "Claude is waiting for an explicit answer after the message was submitted; "
+            "it may already have been delivered."
+        ) from exc
+    if accepted:
         return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
