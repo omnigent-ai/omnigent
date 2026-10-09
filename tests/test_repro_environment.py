@@ -374,3 +374,24 @@ def test_generated_config_keeps_idle_runner_alive(monkeypatch, tmp_path):
         shutdown.assert_not_called()
 
     asyncio.run(check())
+
+
+def test_command_environment_exports_prepared_claude_config_dir(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from dev.repro_env import __main__ as cli
+
+    (tmp_path / "environment.json").write_text(json.dumps({"status": "ready", "runner_id": "r1"}))
+    relay = MagicMock()
+    relay.port = 4321
+    relay.__enter__.return_value = relay
+    monkeypatch.setattr(cli, "Relay", MagicMock(return_value=relay))
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.get.return_value.json.return_value = {"online": True}
+    monkeypatch.setattr(cli.httpx, "Client", MagicMock(return_value=client))
+
+    with cli.command_environment(tmp_path) as env:
+        assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
+        assert env["OMNIGENT_REPRO_RUNNER_ID"] == "r1"
+        assert env["OMNIGENT_REPRO_SERVER_URL"] == "http://127.0.0.1:4321"

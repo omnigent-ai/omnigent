@@ -4035,10 +4035,12 @@ def inject_user_message(
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
     inside the paste markers and Claude Code's TUI keeps multi-line
     input as data rather than submitting on each newline
-    (anthropics/claude-code#52126). A trailing newline inside the paste
-    absorbs any trailing backslash — otherwise ``\`` + the submit
+    (anthropics/claude-code#52126). A message ending in ``\`` gets a
+    trailing newline inside the paste — otherwise ``\`` + the submit
     ``Enter`` reads as a line-continuation and the message sits unsent.
-    ``Enter`` is a separate tmux call. The file-based buffer
+    No other message gets one: Claude Code collapses a paste holding
+    three or more line breaks into a ``[Pasted text #N +X lines]``
+    placeholder. ``Enter`` is a separate tmux call. The file-based buffer
     path (not ``send-keys`` argv) matters: tmux caps a single
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
@@ -4180,23 +4182,30 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
+    delivery_diagnostics.set_stage("encoding")
+    # Trailing line breaks add nothing before the submit Enter, and a third CR
+    # collapses the paste into a placeholder.
+    payload = _paste_payload_bytes(text).rstrip(b"\r")
+    if not payload:
+        raise RuntimeError(
+            "The message has no text to paste into Claude Code (only line breaks or "
+            "control characters). The message was not delivered."
+        )
+    if payload.endswith(b"\\"):
+        # Append a CR only when a trailing backslash would consume the submit Enter.
+        payload += b"\r"
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first: raw controls can otherwise become pasted text.
     # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
+    # Use a tmux buffer, not ``send-keys`` argv: tmux caps a client→server
+    # command at ~16KB. ``load-buffer`` avoids the cap; ``paste-buffer -p``
+    # keeps interior CRs as data, not submits (anthropics/claude-code#52126).
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
+        paste_file.write(payload)
         paste_path = paste_file.name
     try:
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
