@@ -149,7 +149,7 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except RuntimeError:
+        except (OSError, RuntimeError):
             if await asyncio.to_thread(capture_cursor_pane, bridge_dir) is None:
                 # The pane (or its whole tmux server) is gone — an expected
                 # end-of-life state, not a malfunction; no traceback ERROR.
@@ -170,20 +170,28 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
 
 
 async def _post_verdict_undelivered_notice(
-    client: httpx.AsyncClient, *, session_id: str, description: str
+    client: httpx.AsyncClient, *, session_id: str, description: str, pane_gone: bool
 ) -> None:
     """Tell the user (in chat) that their verdict never reached the cursor TUI.
 
     By the time delivery fails the card has already settled as answered, so
     without this notice the drop is invisible: the web UI reads "Approved"
-    while cursor never received the keystroke.
+    while cursor never received the keystroke. ``pane_gone`` picks the remedy:
+    a dead pane needs a relaunch, while a live pane that rejected the
+    keystroke can still be answered in the embedded terminal.
     """
-    text = (
-        f"Your response to “{description}” could not be delivered: the Cursor "
-        "terminal for this session is no longer running, so cursor-agent never "
-        "received it. Send a new message to relaunch the terminal and respond "
-        "again if it is still needed."
-    )
+    if pane_gone:
+        reason = (
+            "the Cursor terminal for this session is no longer running, so "
+            "cursor-agent never received it. Send a new message to relaunch the "
+            "terminal and respond again if it is still needed."
+        )
+    else:
+        reason = (
+            "the keystroke could not be sent to the Cursor terminal. Answer the "
+            "prompt in the embedded terminal if it is still waiting."
+        )
+    text = f"Your response to “{description}” could not be delivered: {reason}"
     try:
         response = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -229,12 +237,15 @@ async def _deliver_verdict_keys(
             session_id,
         )
         await _post_verdict_undelivered_notice(
-            client, session_id=session_id, description=description
+            client, session_id=session_id, description=description, pane_gone=True
         )
         return False
     if not await _send_cursor_keys(bridge_dir, session_id, *keys):
+        # The pane can die between the pre-check and the send; only a pane
+        # that is still alive makes this a live-pane send failure.
+        pane_gone = await asyncio.to_thread(capture_cursor_pane, bridge_dir) is None
         await _post_verdict_undelivered_notice(
-            client, session_id=session_id, description=description
+            client, session_id=session_id, description=description, pane_gone=pane_gone
         )
         return False
     return True

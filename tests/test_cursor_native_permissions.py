@@ -975,6 +975,22 @@ async def test_send_cursor_keys_still_errors_when_live_pane_send_fails(
     assert _keystroke_error_records(caplog)
 
 
+async def test_send_cursor_keys_reports_spawn_failure_as_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A tmux process that cannot be spawned is an undelivered keystroke, not an escape."""
+    caplog.set_level(logging.DEBUG)
+
+    def _boom(_bridge: Path, _key: str) -> None:
+        raise OSError("tmux: cannot spawn")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: None)
+
+    assert await cnp._send_cursor_keys(tmp_path, "conv_spawn_fail", "y") is False
+    assert not _keystroke_error_records(caplog)
+
+
 def _shell_approval_prompt() -> CursorApprovalPrompt:
     return CursorApprovalPrompt(
         operation_type="shell",
@@ -1020,7 +1036,7 @@ async def test_run_one_approval_dead_pane_notifies_user_instead_of_typing(
 async def test_run_one_approval_undelivered_keystroke_notifies_user(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A send that fails after the liveness check still tells the user."""
+    """A send that fails on a live pane tells the user without claiming the pane died."""
     monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: _IDLE_PANE)
 
     async def _fail_send(_bridge: Path, _session: str, *_keys: str) -> bool:
@@ -1041,6 +1057,33 @@ async def test_run_one_approval_undelivered_keystroke_notifies_user(
     assert url == "/v1/sessions/conv_send_fail/events"
     assert body["type"] == "external_assistant_message"
     assert "could not be delivered" in body["data"]["text"]
+    assert "embedded terminal" in body["data"]["text"]
+    assert "no longer running" not in body["data"]["text"]
+
+
+async def test_run_one_approval_pane_lost_after_precheck_suggests_relaunch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pane that dies between the liveness check and the send gets the relaunch notice."""
+    panes = iter([_IDLE_PANE, None])
+    monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: next(panes))
+
+    async def _fail_send(_bridge: Path, _session: str, *_keys: str) -> bool:
+        return False
+
+    monkeypatch.setattr(cnp, "_send_cursor_keys", _fail_send)
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"}), httpx.Response(200)])
+
+    await cnp._run_one_approval(
+        client,  # type: ignore[arg-type]
+        session_id="conv_pane_lost",
+        bridge_dir=tmp_path,
+        prompt=_shell_approval_prompt(),
+        elicitation_id="elic_lost",
+    )
+
+    _url, body = client.posts[-1]
+    assert "no longer running" in body["data"]["text"]
 
 
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────
