@@ -3887,6 +3887,11 @@ async def test_filesystem_delete_proxies_to_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "runner_body",
+    ["", "<html><body>502 Bad Gateway</body></html>"],
+    ids=["empty-body", "html-error-page"],
+)
+@pytest.mark.parametrize(
     ("method", "url", "body"),
     [
         (
@@ -3923,6 +3928,7 @@ async def test_filesystem_delete_proxies_to_runner(
 )
 async def test_mutating_proxy_maps_non_json_runner_reply_to_502(
     client: httpx.AsyncClient,
+    runner_body: str,
     method: str,
     url: str,
     body: dict[str, Any] | None,
@@ -3930,10 +3936,11 @@ async def test_mutating_proxy_maps_non_json_runner_reply_to_502(
     """A non-JSON runner reply to a mutating proxy surfaces as the GET proxy's 502.
 
     An empty or HTML body from the runner (or an intermediary in front of it)
-    must not escape as an unhandled ``json.JSONDecodeError`` (HTTP 500).
+    must not escape as an unhandled ``json.JSONDecodeError`` (HTTP 500). The
+    runner answers 200 so the 502 can only come from the decode guard.
     """
     fake_runner = _FakeRunnerClient(
-        text_responses={url: (502, "", {"content-type": "text/html"})},
+        text_responses={url: (200, runner_body, {"content-type": "text/html"})},
     )
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
