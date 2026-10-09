@@ -88,13 +88,20 @@ def test_measure_scenario_rejects_failed_static_asset(
     [
         ("page-error", "Browser errors:.*benchmark test error"),
         ("small-dom", "Fixture has only .* elements; requires"),
+        ("shrinking-dom", "Fixture shrank to .* elements while typing"),
     ],
 )
 def test_measure_scenario_rejects_invalid_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, message: str
 ) -> None:
-    body = _BODY if failure == "page-error" else _BODY.replace("<span></span>", "")
+    body = _BODY.replace("<span></span>", "") if failure == "small-dom" else _BODY
     script = "throw new Error('benchmark test error');" if failure == "page-error" else ""
+    if failure == "shrinking-dom":
+        script = """
+            document.addEventListener('input', () => {
+                document.querySelectorAll('span').forEach(node => node.remove());
+            }, {once: true});
+        """
 
     async def handler(route: Route) -> None:
         await route.fulfill(

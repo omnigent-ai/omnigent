@@ -28,6 +28,8 @@ from dev.benchmarks.ui.run import (
     required_journeys,
 )
 
+_ROOT = Path(__file__).resolve().parents[2]
+
 
 @pytest.fixture(autouse=True)
 def _isolated_git_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -367,7 +369,10 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal handling")
-def test_cli_records_ordinary_measurement_errors(tmp_path: Path) -> None:
+def test_cli_records_ordinary_measurement_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
     (tmp_path / "index.html").write_text("<html></html>")
     output_dir = tmp_path / "results"
     script = """
@@ -382,6 +387,7 @@ raise SystemExit(run.main(['--web-dist', sys.argv[1], '--output-dir', sys.argv[2
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path), str(output_dir)],
+        cwd=_ROOT,
         capture_output=True,
         text=True,
         timeout=10,
@@ -395,7 +401,10 @@ raise SystemExit(run.main(['--web-dist', sys.argv[1], '--output-dir', sys.argv[2
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal handling")
-def test_sigterm_finishes_teardown_and_reports_error(tmp_path: Path) -> None:
+def test_sigterm_finishes_teardown_and_reports_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
     (tmp_path / "index.html").write_text("<html></html>")
     script = """
 import asyncio
@@ -419,6 +428,7 @@ raise SystemExit(run.main(['--web-dist', str(root), '--output-dir', str(root)]))
 """
     process = subprocess.Popen(
         [sys.executable, "-c", script, str(tmp_path)],
+        cwd=_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

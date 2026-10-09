@@ -19,6 +19,14 @@ _DETECT = next(
 pytestmark = pytest.mark.skipif(not shutil.which("bash"), reason="Needs bash")
 
 
+def test_candidate_execution_waits_for_security_gate() -> None:
+    jobs = _WORKFLOW["jobs"]
+    assert jobs["gate"]["uses"] == "./.github/workflows/security-gate.yml"
+    for name in ("detect", "benchmark"):
+        dependencies = jobs[name]["needs"]
+        assert "gate" in ([dependencies] if isinstance(dependencies, str) else dependencies)
+
+
 @pytest.mark.skipif(not shutil.which("jq"), reason="Needs jq")
 @pytest.mark.parametrize(
     ("files", "api_failure", "expected"),

@@ -27,9 +27,13 @@ env:
   PIP_INDEX_URL: https://pypi.org/simple
 
 jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   # Job-level filtering keeps this usable as a required check for all PRs.
   detect:
     name: Detect UI benchmark inputs
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -60,7 +64,7 @@ jobs:
 
   benchmark:
     name: UI performance regression check
-    needs: detect
+    needs: [gate, detect]
     if: needs.detect.outputs.ui == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-24.04
     timeout-minutes: 25
