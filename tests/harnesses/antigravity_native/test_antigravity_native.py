@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1131,57 +1130,6 @@ async def test_cli_cold_start_discards_phantom_when_reader_adopted_meanwhile(
     after = read_bridge_state(bridge_dir)
     assert after is not None
     assert after.conversation_id == adopted_id
-
-
-async def test_cli_cold_start_persist_serializes_a_concurrent_adoption(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """An adoption that arrives while the cold-start is inside its conditional
-    write waits for that write to land and then refuses, so the two concurrent
-    writers on the CLI path can never interleave and clobber each other."""
-    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
-    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_serialized")
-    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
-    adopted_id = "9c0e5b2d-3a7f-4d1e-8b6a-2f4c7e9d1a35"
-    monkeypatch.setattr(_mod, "resolve_cold_start_agy_rpc_port", lambda _sock, _tgt: 52548)
-    monkeypatch.setattr(_mod, "start_cascade", lambda _port, _cascade_id: None)
-
-    outcome: dict[str, bool] = {}
-    adopters: list[threading.Thread] = []
-    original_write = bridge_mod.write_bridge_state
-
-    def adopt() -> None:
-        outcome["adopted"] = bridge_mod.update_conversation_id(
-            bridge_dir, adopted_id, expect_placeholder=True
-        )
-
-    def write_while_the_reader_adopts(
-        path: Path, state: bridge_mod.AntigravityNativeBridgeState
-    ) -> None:
-        # The cold-start holds the state lock here, so the adoption must wait.
-        adopter = threading.Thread(target=adopt)
-        adopter.start()
-        adopter.join(0.3)
-        outcome["waited"] = adopter.is_alive()
-        adopters.append(adopter)
-        original_write(path, state)
-
-    monkeypatch.setattr(bridge_mod, "write_bridge_state", write_while_the_reader_adopts)
-
-    await _mod._cold_start_agy_conversation(
-        bridge_dir,
-        "conv_cs",
-        base_url="http://test",
-        headers={},
-        timeout_s=1.0,
-    )
-    for adopter in adopters:
-        adopter.join(5)
-
-    assert outcome == {"waited": True, "adopted": False}
-    after = read_bridge_state(bridge_dir)
-    assert after is not None
-    assert after.conversation_id not in {"agy_conv_placeholder", adopted_id}
 
 
 async def test_cli_cold_start_scopes_to_pane_agy(

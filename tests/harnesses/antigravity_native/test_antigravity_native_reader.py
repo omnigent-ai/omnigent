@@ -3666,6 +3666,18 @@ def test_typed_root_cascade_ignores_non_cascade_trajectories() -> None:
     assert reader._typed_root_cascade(summaries) is None
 
 
+def test_typed_root_cascade_ignores_non_uuid_ids() -> None:
+    """A key that is not a UUID is never a candidate, however recently it was
+    typed into: the id becomes a file name and a ``--conversation`` argument."""
+    summaries = {
+        "../../outside-the-conversations-dir": _summary(
+            last_user_input_time="2026-06-23T17:50:29.232919Z"
+        ),
+        _OTHER_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
+    }
+    assert reader._typed_root_cascade(summaries) == _OTHER_CASCADE
+
+
 def _placeholder_bridge_dir(tmp_path: Path, *, with_pane: bool = True) -> Path:
     """A bridge dir stuck on the launcher placeholder (cold-start gave up)."""
     bridge_dir = tmp_path / "bridge"
@@ -3733,6 +3745,25 @@ def test_placeholder_recovery_requires_an_advertised_local_pane(
     assert state.conversation_id == "agy_conv_placeholder"
 
 
+def test_placeholder_recovery_requires_the_advertised_socket_on_this_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An advertised pane whose socket is not on this host (a remote runner) is
+    not scanned either: nothing typed through it could have come from here."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    (tmp_path / "tmux.sock").unlink()
+
+    def _no_scan(_s: object, _t: object, **_kwargs: object) -> int | None:
+        raise AssertionError("recovery must not resolve a port for a socket that is not local")
+
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _no_scan)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "agy_conv_placeholder"
+
+
 def test_placeholder_recovery_refuses_a_foreign_cascade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3749,6 +3780,33 @@ def test_placeholder_recovery_refuses_a_foreign_cascade(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == "agy_conv_placeholder"
+
+
+def test_placeholder_recovery_reports_a_foreign_cascade_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same foreign candidate is refused on every scan but warned about once;
+    repeats within a discovery run log at DEBUG."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+    reported: set[str] = set()
+
+    with caplog.at_level(logging.DEBUG, logger=reader.__name__):
+        for _ in range(3):
+            assert (
+                reader._recover_placeholder_cascade(bridge_dir, reported_foreign=reported) is None
+            )
+
+    levels = [
+        record.levelname
+        for record in caplog.records
+        if "NOT in this session's Gemini dir" in record.getMessage()
+    ]
+    assert levels == ["WARNING", "DEBUG", "DEBUG"]
+    assert reported == {_CASCADE_ID}
 
 
 def test_placeholder_recovery_noop_when_id_is_already_real(
@@ -3882,12 +3940,7 @@ async def test_supervise_reader_recovers_placeholder_and_mirrors(
     ``--resume`` (no rotation-based first adoption will ever run for it)."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     _own_conversation_db(bridge_dir, _CASCADE_ID)
-    # raising=False keeps this patch inert on a build without the recovery seam,
-    # so on such a build this test fails on the behavioral assertions below (the
-    # placeholder is never replaced), not on patching a missing attribute.
-    monkeypatch.setattr(
-        reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT, raising=False
-    )
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
     monkeypatch.setattr(
         reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
     )
@@ -3941,6 +3994,54 @@ async def test_supervise_reader_recovers_placeholder_and_mirrors(
     assert client.patches == [
         (f"/v1/sessions/{_SESSION_ID}", {"external_session_id": _CASCADE_ID})
     ]
+
+
+@pytest.mark.asyncio
+async def test_supervise_reader_recovery_survives_a_failed_resume_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Recording the adopted cascade for --resume is best-effort: a failing PATCH
+    is logged and the reader still binds the cascade and mirrors the turn."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+    text = _load("planner_response_text")
+    script = _StepScript([[text], [text]])
+    sink = _PostSink()
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", script)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+
+    class _UnreachableClient:
+        async def patch(self, url: str, json: dict[str, object] | None = None) -> httpx.Response:
+            raise httpx.ConnectError("server unreachable")
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    await reader.supervise_reader(
+        bridge_dir,
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, _UnreachableClient()),
+        on_pending_interaction=cast(Any, _on_pending),
+        poll_interval_s=0.0,
+        stop=_stop_after(4),
+    )
+
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+    assert sink.item_types() == ["message"]
 
 
 # ---------------------------------------------------------------------------
