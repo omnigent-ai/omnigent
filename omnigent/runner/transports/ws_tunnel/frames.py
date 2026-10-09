@@ -37,6 +37,7 @@ class FrameKind(str, Enum):
     RESPONSE_BODY = "response.body"
     RESPONSE_END = "response.end"
     REQUEST_CANCEL = "request.cancel"
+    REQUEST_FLOW = "request.flow"
     PING = "ping"
     PONG = "pong"
     # WebSocket-channel frames: carry tunneled WS attach to the runner
@@ -103,6 +104,9 @@ class RequestFrame:
     body: str | None = None
     encoding: str = "utf-8"  # "utf-8" or "base64"
     stream: bool = False
+    # Body frames the runner may keep in flight before waiting for request.flow
+    # credits; None (servers that predate flow control) disables the window.
+    flow_window: int | None = None
 
 
 @dataclass
@@ -143,6 +147,37 @@ class RequestCancelFrame:
 
     id: str
     reason: str = "client_disconnected"
+
+
+@dataclass
+class RequestFlowFrame:
+    """Server → runner: grant more response-body send credits for a request."""
+
+    id: str
+    credits: int
+
+
+# Runners advertising this hello capability honour ``RequestFrame.flow_window``
+# and expect ``request.flow`` credit grants; older runners get neither.
+RESPONSE_FLOW_CAPABILITY = "response-flow-control-v1"
+
+# Flow control: the runner keeps at most RESPONSE_FLOW_WINDOW_FRAMES frames in
+# flight; the server grants more in RESPONSE_FLOW_CREDIT_BATCH batches as it
+# drains them (window > batch so the final partial batch never stalls).
+RESPONSE_FLOW_WINDOW_FRAMES = 48
+RESPONSE_FLOW_CREDIT_BATCH = 16
+if RESPONSE_FLOW_WINDOW_FRAMES <= RESPONSE_FLOW_CREDIT_BATCH:
+    # Not an assert: this invariant must hold under ``python -O`` too. The batch
+    # must also stay <= the smallest window any supported runner caps to, or a
+    # mixed-version stream stalls waiting for a grant that never fires.
+    raise RuntimeError(
+        "send window must exceed the credit batch or the final partial batch stalls"
+    )
+
+# A single ASGI body chunk is split into frames of at most this many bytes, so
+# the send window bounds buffered memory by bytes, not just frame count. 64 KiB
+# matches the download read size, so ordinary downloads frame as before.
+RESPONSE_BODY_FRAME_MAX_BYTES = 64 * 1024
 
 
 @dataclass
@@ -238,6 +273,7 @@ Frame = (
     | ResponseBodyFrame
     | ResponseEndFrame
     | RequestCancelFrame
+    | RequestFlowFrame
     | PingFrame
     | PongFrame
     | WSOpenFrame
@@ -278,19 +314,20 @@ def encode_frame(frame: Frame) -> str:
             payload["direct_attach_token"] = frame.direct_attach_token
         return json.dumps(payload)
     if isinstance(frame, RequestFrame):
-        return json.dumps(
-            {
-                "kind": FrameKind.REQUEST.value,
-                "id": frame.id,
-                "method": frame.method,
-                "path": frame.path,
-                "query_string": frame.query_string,
-                "headers": [list(h) for h in frame.headers],
-                "body": frame.body,
-                "encoding": frame.encoding,
-                "stream": frame.stream,
-            }
-        )
+        request: dict[str, object] = {
+            "kind": FrameKind.REQUEST.value,
+            "id": frame.id,
+            "method": frame.method,
+            "path": frame.path,
+            "query_string": frame.query_string,
+            "headers": [list(h) for h in frame.headers],
+            "body": frame.body,
+            "encoding": frame.encoding,
+            "stream": frame.stream,
+        }
+        if frame.flow_window is not None:
+            request["flow_window"] = frame.flow_window
+        return json.dumps(request)
     if isinstance(frame, ResponseHeadFrame):
         return json.dumps(
             {
@@ -320,6 +357,14 @@ def encode_frame(frame: Frame) -> str:
                 "kind": FrameKind.REQUEST_CANCEL.value,
                 "id": frame.id,
                 "reason": frame.reason,
+            }
+        )
+    if isinstance(frame, RequestFlowFrame):
+        return json.dumps(
+            {
+                "kind": FrameKind.REQUEST_FLOW.value,
+                "id": frame.id,
+                "credits": frame.credits,
             }
         )
     if isinstance(frame, PingFrame):
@@ -446,6 +491,11 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
             )
         case FrameKind.REQUEST_CANCEL:
             return _decode_request_cancel(msg)
+        case FrameKind.REQUEST_FLOW:
+            credits = _required_int(msg, "credits")
+            if credits < 1:
+                raise ValueError("request.flow credits must be positive")
+            return RequestFlowFrame(id=_required_str(msg, "id"), credits=credits)
         case FrameKind.PING:
             return PingFrame(ts=_required_int(msg, "ts"))
         case FrameKind.PONG:
@@ -535,6 +585,7 @@ def _decode_request(msg: _JsonObject) -> RequestFrame:
         body=_optional_body(msg),
         encoding=_optional_str(msg, "encoding", "utf-8"),
         stream=_optional_bool(msg, "stream", False),
+        flow_window=_optional_flow_window(msg),
     )
 
 
@@ -691,6 +742,17 @@ def _optional_body(msg: _JsonObject) -> str | None:
     val = msg.get("body")
     if val is not None and not isinstance(val, str):
         raise ValueError("frame field must be a string or null: 'body'")
+    return val
+
+
+def _optional_flow_window(msg: _JsonObject) -> int | None:
+    """Return a request's send window, or ``None`` from servers that predate flow control.
+    :raises ValueError: If ``flow_window`` is present but not a positive integer."""
+    val = msg.get("flow_window")
+    if val is None:
+        return None
+    if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+        raise ValueError("frame field must be a positive integer or null: 'flow_window'")
     return val
 
 

@@ -21,6 +21,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
     RequestCancelFrame,
+    RequestFlowFrame,
     RequestFrame,
     ResponseBodyFrame,
     ResponseEndFrame,
@@ -243,6 +244,49 @@ def test_request_cancel_round_trip() -> None:
     assert decoded.reason == "client_disconnected"
 
 
+def test_request_flow_round_trip() -> None:
+    f = RequestFlowFrame(id="req_abc", credits=16)
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, RequestFlowFrame)
+    assert decoded.id == "req_abc"
+    assert decoded.credits == 16
+
+
+@pytest.mark.parametrize(
+    "credits",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(True, id="bool"),
+        pytest.param("16", id="string"),
+    ],
+)
+def test_request_flow_rejects_bad_credits(credits: object) -> None:
+    """A flow frame needs a positive integer credit count, not a silent zero."""
+    payload: dict[str, object] = {"kind": FrameKind.REQUEST_FLOW.value, "id": "req_abc"}
+    if credits is not None:
+        payload["credits"] = credits
+    with pytest.raises(ValueError, match="credits"):
+        decode_frame(json.dumps(payload))
+
+
+def test_request_round_trip_with_flow_window() -> None:
+    f = RequestFrame(id="req_fw", method="GET", path="/download", flow_window=48)
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, RequestFrame)
+    assert decoded.flow_window == 48
+
+
+def test_request_without_flow_window_stays_legacy() -> None:
+    """Servers that predate flow control send no window; the runner must not invent one."""
+    wire = json.loads(encode_frame(RequestFrame(id="req_old", method="GET", path="/download")))
+    assert "flow_window" not in wire
+    decoded = decode_frame(json.dumps(wire))
+    assert isinstance(decoded, RequestFrame)
+    assert decoded.flow_window is None
+
+
 def test_ping_pong_round_trip() -> None:
     p = PingFrame(ts=1709654400000)
     decoded_p = decode_frame(encode_frame(p))
@@ -311,6 +355,22 @@ def test_decode_rejects_request_missing_required_fields() -> None:
         pytest.param(
             {"kind": "request", "id": "r", "method": "GET", "path": "/", "body": 123},
             id="request-body-not-string",
+        ),
+        pytest.param(
+            {"kind": "request", "id": "r", "method": "GET", "path": "/", "flow_window": 0},
+            id="request-flow-window-zero",
+        ),
+        pytest.param(
+            {"kind": "request", "id": "r", "method": "GET", "path": "/", "flow_window": -1},
+            id="request-flow-window-negative",
+        ),
+        pytest.param(
+            {"kind": "request", "id": "r", "method": "GET", "path": "/", "flow_window": True},
+            id="request-flow-window-bool",
+        ),
+        pytest.param(
+            {"kind": "request", "id": "r", "method": "GET", "path": "/", "flow_window": "48"},
+            id="request-flow-window-not-int",
         ),
         pytest.param(
             {"kind": "response.head", "id": "r", "status": 200, "headers": [["ok"]]},

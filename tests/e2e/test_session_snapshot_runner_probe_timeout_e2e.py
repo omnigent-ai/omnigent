@@ -99,15 +99,17 @@ async def _slow_503_app(scope, receive, send):
     }})
 
 
-async def _dispatch_with_slow_snapshot(app, frame, send_text):
+async def _dispatch_with_slow_snapshot(app, frame, send_text, *args, **kwargs):
+    # Forward any extra dispatch args (e.g. the per-request flow-credit window)
+    # unchanged so this wrapper stays transparent as dispatch_via_asgi evolves.
     if (
         frame.method == "GET"
         and _SNAPSHOT_RE.match(frame.path)
         and os.path.exists(_ARM_FILE)
     ):
-        await _ORIG_DISPATCH(_slow_503_app, frame, send_text)
+        await _ORIG_DISPATCH(_slow_503_app, frame, send_text, *args, **kwargs)
         return
-    await _ORIG_DISPATCH(app, frame, send_text)
+    await _ORIG_DISPATCH(app, frame, send_text, *args, **kwargs)
 
 
 _serve.dispatch_via_asgi = _dispatch_with_slow_snapshot
