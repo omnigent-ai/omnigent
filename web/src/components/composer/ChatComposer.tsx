@@ -232,15 +232,24 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
 }
 
 /**
- * Insert a line break at the caret as typed input, so onChange sees it. The
- * ``insertText`` command also keeps it on the undo stack; the fallback covers
- * environments without it.
+ * Replace ``[start, end)`` (default: the selection) as typed input, so onChange
+ * sees it. The editing commands also keep it on the undo stack; the fallback
+ * covers environments without them.
  */
-function insertLineBreak(textarea: HTMLTextAreaElement) {
+function insertComposerText(
+  textarea: HTMLTextAreaElement,
+  text: string,
+  start = textarea.selectionStart,
+  end = textarea.selectionEnd,
+) {
+  textarea.setSelectionRange(start, end);
   const inserted =
-    typeof document.execCommand === "function" && document.execCommand("insertText", false, "\n");
+    typeof document.execCommand === "function" &&
+    (text || start === end
+      ? document.execCommand("insertText", false, text)
+      : document.execCommand("delete"));
   if (inserted) return;
-  textarea.setRangeText("\n", textarea.selectionStart, textarea.selectionEnd, "end");
+  textarea.setRangeText(text, start, end, "end");
   textarea.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
@@ -255,7 +264,7 @@ export function ComposerTextInput({
         // A newline in every mode and on touch devices; completion menus never see it.
         if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
           event.preventDefault();
-          insertLineBreak(event.currentTarget);
+          insertComposerText(event.currentTarget, "\n");
           return;
         }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
@@ -289,11 +298,7 @@ export function ComposerTextInput({
         const edit = listStartEdit ?? listEdit;
         if (edit) {
           event.preventDefault();
-          const textarea = event.currentTarget;
-          textarea.setRangeText(edit.text, edit.start, edit.end, "end");
-          textarea.dispatchEvent(
-            new InputEvent("input", { bubbles: true, inputType: "insertText", data: edit.text }),
-          );
+          insertComposerText(event.currentTarget, edit.text, edit.start, edit.end);
         }
       }}
     />
@@ -311,7 +316,7 @@ function composerListStartEdit(textarea: HTMLTextAreaElement) {
   return {
     start: lineStart,
     end: selectionStart,
-    text: `${indent || "  "}${/^\d/.test(marker) ? marker : "•"} `,
+    text: `${indent || "  "}${marker} `,
   };
 }
 
@@ -328,9 +333,10 @@ function composerListEdit(textarea: HTMLTextAreaElement) {
   if (!content.trim() && !suffix.trim()) {
     return { start: lineStart, end: lineEnd, text: "" };
   }
+  // Keep the typed bullet so the draft stays valid Markdown.
   const nextMarker = /^\d/.test(marker)
     ? `${Number.parseInt(marker, 10) + 1}${marker.at(-1)}`
-    : "•";
+    : marker;
   return { start: selectionStart, end: selectionEnd, text: `\n${indent}${nextMarker}${spacing}` };
 }
 

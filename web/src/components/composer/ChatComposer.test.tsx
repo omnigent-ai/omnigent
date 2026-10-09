@@ -30,48 +30,68 @@ describe("ChatComposer", () => {
     return { input: screen.getByRole("textbox") as HTMLTextAreaElement, onKeyDown };
   }
 
-  it("indents list markers when typed with a space", () => {
-    const { input } = renderEditor("1.");
+  function caretToEnd(input: HTMLTextAreaElement) {
     input.setSelectionRange(input.value.length, input.value.length);
+  }
+
+  it.each([
+    ["1.", "  1. "],
+    ["2)", "  2) "],
+    ["-", "  - "],
+    ["*", "  * "],
+  ])("indents %s when typed with a space and keeps the Markdown marker", (marker, expected) => {
+    const { input } = renderEditor(marker);
+    caretToEnd(input);
     fireEvent.keyDown(input, { key: " " });
-    expect(input).toHaveValue("  1. ");
-    for (const marker of ["-", "*"]) {
-      fireEvent.change(input, { target: { value: marker } });
-      input.setSelectionRange(input.value.length, input.value.length);
-      fireEvent.keyDown(input, { key: " " });
-      expect(input).toHaveValue("  • ");
-    }
+    expect(input).toHaveValue(expected);
   });
 
-  it("continues bullets and increments numbered lists with Shift+Enter", () => {
+  it("leaves markers after other text alone", () => {
+    const { input } = renderEditor("Step 1.");
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: " " });
+    expect(input).toHaveValue("Step 1.");
+  });
+
+  it("increments numbered lists with Shift+Enter", () => {
     const { input, onKeyDown } = renderEditor("  9. First item");
-    input.setSelectionRange(input.value.length, input.value.length);
+    caretToEnd(input);
     fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     expect(input).toHaveValue("  9. First item\n  10. ");
     expect(onKeyDown).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ shouldSubmitFromKeyboard: false }),
     );
-    fireEvent.change(input, { target: { value: "  • First item" } });
-    input.setSelectionRange(input.value.length, input.value.length);
+  });
+
+  it.each(["-", "*", "•"])("continues %s bullets with the same marker", (marker) => {
+    const { input } = renderEditor(`  ${marker} First item`);
+    caretToEnd(input);
     fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
-    expect(input).toHaveValue("  • First item\n  • ");
-    fireEvent.change(input, { target: { value: "  * First item" } });
-    input.setSelectionRange(input.value.length, input.value.length);
-    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
-    expect(input).toHaveValue("  * First item\n  • ");
+    expect(input).toHaveValue(`  ${marker} First item\n  ${marker} `);
   });
 
   it("ends a list when Shift+Enter follows an empty marker", () => {
     const { input } = renderEditor("- First item\n- ");
-    input.setSelectionRange(input.value.length, input.value.length);
+    caretToEnd(input);
     fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     expect(input).toHaveValue("- First item\n");
   });
 
+  it("ignores Enter and Space while an IME composition is active", () => {
+    const { input } = renderEditor("  1. 日本", true);
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    expect(input).toHaveValue("  1. 日本");
+    fireEvent.change(input, { target: { value: "-" } });
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: " ", isComposing: true });
+    expect(input).toHaveValue("-");
+  });
+
   it("submits a list on plain Enter with the default shortcut", () => {
     const { input, onKeyDown } = renderEditor("  1. First item");
-    input.setSelectionRange(input.value.length, input.value.length);
+    caretToEnd(input);
     fireEvent.keyDown(input, { key: "Enter" });
     expect(input).toHaveValue("  1. First item");
     expect(onKeyDown).toHaveBeenCalledWith(
@@ -82,15 +102,20 @@ describe("ChatComposer", () => {
 
   it("continues a list on plain Enter when Mod+Enter is the send shortcut", () => {
     const { input, onKeyDown } = renderEditor("  1. First item", true);
-    input.setSelectionRange(input.value.length, input.value.length);
+    caretToEnd(input);
     fireEvent.keyDown(input, { key: "Enter" });
     expect(input).toHaveValue("  1. First item\n  2. ");
     expect(onKeyDown).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ shouldSubmitFromKeyboard: false }),
     );
+  });
+
+  it("sends on Mod+Enter without continuing the list", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item", true);
+    caretToEnd(input);
     fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
-    expect(input).toHaveValue("  1. First item\n  2. ");
+    expect(input).toHaveValue("  1. First item");
     expect(onKeyDown).toHaveBeenLastCalledWith(
       expect.anything(),
       expect.objectContaining({ shouldSubmitFromKeyboard: true }),
