@@ -863,10 +863,8 @@ class NativeInterruptRunner:
 
         state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
         if state is None:
-            # No readable bridge state: the serve/session is still starting (state
-            # is cleared until it is created), or the state file is half-written.
-            # Fall through so the in-process cancel stops the startup turn, or
-            # no-ops when nothing is running; serve is not addressable here anyway.
+            # Bridge state absent (serve still starting, or a half-written file):
+            # fall through so the in-process cancel covers the startup turn.
             self._logger.info(
                 "OpenCode-native interrupt: no bridge state for %s; falling through.", conv_id
             )
@@ -876,14 +874,9 @@ class NativeInterruptRunner:
             auth_secret=state.auth_secret,
             directory=state.workspace,
         )
-        # Record the pending interrupt before aborting: the abort emits an idle
-        # edge over SSE and opencode turns are not forwarder-confirmed, so an idle
-        # that raced ahead of this record would settle the turn as completed.
-        self._defer_parent_wake_after_native_interrupt(conv_id)
         try:
             aborted = await client.abort(state.opencode_session_id)
         except (OpenCodeClientError, httpx.HTTPError) as exc:
-            self.clear_pending_interrupt(conv_id)
             self._logger.warning(
                 "OpenCode-native abort failed for session=%s opencode_session=%s",
                 conv_id,
@@ -906,10 +899,13 @@ class NativeInterruptRunner:
             # No active work server-side: the turn already ended, or the interrupt
             # raced ahead of prompt admission. Fall through so the in-process
             # cancel still covers a turn pending before admission.
-            self.clear_pending_interrupt(conv_id)
             self._logger.info(
                 "OpenCode-native interrupt found no active turn for %s; falling through.",
                 conv_id,
             )
             return None
+        # A confirmed abort owns the cancellation; defer the parent wake so the
+        # abort's idle edge settles the dispatch as cancelled, as the other
+        # native interrupt handlers do.
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
