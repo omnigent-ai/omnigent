@@ -132,9 +132,8 @@ def external_router(
         runtime_globals._caps,
         "routing_backends",
         RoutingBackends(external=router),
-        raising=False,
     )
-    monkeypatch.setattr(runtime_globals._caps, "routing_client", router, raising=False)
+    monkeypatch.setattr(runtime_globals._caps, "routing_client", router)
     return router
 
 
