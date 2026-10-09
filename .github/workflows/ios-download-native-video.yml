@@ -33,7 +33,7 @@ jobs:
           DEVICE_ID: ${{ steps.simulator.outputs.id }}
         run: |
           set -euo pipefail
-          git show origin/main:web/ios/Omnigent/OmnigentWebView.swift > web/ios/Omnigent/OmnigentWebView.swift
+          git show 3a845634d^:web/ios/Omnigent/OmnigentWebView.swift > web/ios/Omnigent/OmnigentWebView.swift
           xcodebuild test \
             -project web/ios/Omnigent.xcodeproj \
             -scheme Omnigent \
