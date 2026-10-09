@@ -5855,6 +5855,29 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
+  it("offers codex bypass in the quick Approval dropdown and arms the label on create", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const chip = screen.getByTestId("new-chat-landing-permission-chip");
+    openPermissions();
+    const menu = screen.getByTestId("new-chat-landing-permission-menu");
+    for (const label of ["Default", "Full access", "Read only", "Bypass approvals & sandbox"]) {
+      expect(menu).toHaveTextContent(label);
+    }
+    fireEvent.click(screen.getByTestId("new-chat-landing-permission-option-bypass"));
+    expect(chip).toHaveAccessibleName("Permission mode: Bypass approvals & sandbox");
+    expect(readHarnessOptions("codex-native").mode).toBe("bypass");
+
+    const { body } = await submitAndReadBody();
+    const labels = body.labels as Record<string, string>;
+    expect(labels["omnigent.codex_native.bypass_sandbox"]).toBe("1");
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
   it.each([
     ["default", "Default", undefined],
     [
