@@ -10,6 +10,14 @@ const vm = require("node:vm");
 const { createRequire } = require("node:module");
 
 const ORIGIN = "https://workspace.cloud.databricks.com";
+// Shape of the workspace IP access list rejection seen off the corporate VPN.
+const IP_ACL_RESPONSE = {
+  body: JSON.stringify({
+    error_code: "403",
+    message:
+      "Source IP address: 203.0.113.7 is blocked by Databricks IP ACL for workspace: 1234567890",
+  }),
+};
 const COOKIE = {
   name: "DBAUTH",
   domain: new URL(ORIGIN).hostname,
@@ -18,10 +26,10 @@ const COOKIE = {
   value: "new",
 };
 
-function harness({ respond, follow, oldCookie = false } = {}) {
+function harness({ respond, follow, oldCookie = false, stored } = {}) {
   const requests = [];
   const logs = [];
-  const calls = { browser: 0, stored: 0 };
+  const calls = { browser: 0, stored: 0, storedOrigins: [] };
   let jar = oldCookie ? [{ ...COOKIE, value: "old" }] : [];
   const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
   const ses = { cookies };
@@ -98,9 +106,10 @@ function harness({ respond, follow, oldCookie = false } = {}) {
               calls.browser++;
               return { tokens: { access_token: "token" }, issuerOrigin: ORIGIN };
             },
-            getValidStoredToken: async () => {
+            getValidStoredToken: async (origin) => {
               calls.stored++;
-              return "token";
+              calls.storedOrigins.push(origin);
+              return stored ? stored(origin) : "token";
             },
             saveWorkspaceToken() {},
           };
@@ -131,11 +140,71 @@ describe("Databricks session preparation", () => {
     assert.equal(h.calls.stored, 0);
     assert.equal(h.requests.length, 0);
   });
-  it("uses fresh browser auth only for explicit login", async () => {
-    const h = harness();
-    assert.equal(await h.ensureDatabricksSession(h.ses, ORIGIN), ORIGIN);
-    assert.equal(h.calls.browser, 1);
-    assert.equal(h.calls.stored, 0);
+  const throws = (message, props) => () => {
+    throw Object.assign(new Error(message), props);
+  };
+  const noToken = throws("no stored Databricks token", { errorCode: "NO_STORED_TOKEN" });
+  const account = "https://accounts.cloud.databricks.com";
+  let redirects = 0;
+  for (const [label, options, expected] of [
+    ["connects with stored credentials", {}, { stored: [ORIGIN], browser: 0 }],
+    [
+      "skips stored credentials when a browser sign-in is required",
+      { connect: { useStoredCredentials: false } },
+      { stored: [], browser: 1 },
+    ],
+    ["signs in when no token is stored", { stored: noToken }, { stored: [ORIGIN], browser: 1 }],
+    [
+      "signs in when the refresh grant is dead",
+      { stored: throws("token endpoint 400", { status: 400, errorCode: "invalid_grant" }) },
+      { stored: [ORIGIN], browser: 1 },
+    ],
+    [
+      "signs in when the stored credentials' session is sent to login",
+      {
+        respond: (req) =>
+          req.emit(
+            "redirect",
+            302,
+            "GET",
+            `${ORIGIN}${++redirects === 1 ? "/login" : "/omnigent"}`,
+          ),
+      },
+      { stored: [ORIGIN], browser: 1 },
+    ],
+    [
+      "signs in to an account URL since tokens are stored per workspace",
+      { origin: account, stored: (origin) => (origin === ORIGIN ? "token" : noToken()) },
+      { stored: [account], browser: 1 },
+    ],
+    [
+      "reports an unreachable workspace without opening the browser",
+      { respond: (req) => req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED")) },
+      { rejects: /ERR_NAME_NOT_RESOLVED/, stored: [ORIGIN], browser: 0 },
+    ],
+  ]) {
+    it(`on connect, ${label}`, async () => {
+      const h = harness(options);
+      const connect = h.ensureDatabricksSession(h.ses, options.origin ?? ORIGIN, options.connect);
+      if (expected.rejects) await assert.rejects(connect, expected.rejects);
+      else await connect;
+      assert.deepEqual(h.calls.storedOrigins, expected.stored);
+      assert.equal(h.calls.browser, expected.browser);
+    });
+  }
+  it("stops at cancellation instead of falling back to browser sign-in", async () => {
+    const controller = new AbortController();
+    const h = harness({
+      stored: () => {
+        controller.abort();
+        throw new TypeError("Invalid URL");
+      },
+    });
+    await assert.rejects(
+      h.ensureDatabricksSession(h.ses, ORIGIN, { signal: controller.signal }),
+      (error) => error.name === "AbortError",
+    );
+    assert.equal(h.calls.browser, 0);
   });
   it("uses stored credentials for silent restoration without interactive login", async () => {
     const h = harness();
@@ -215,6 +284,18 @@ describe("Databricks cookie minting", () => {
     assert.match(output, /trace-123/);
     assert.doesNotMatch(output, /private-/);
   });
+  it("labels a session-create 403 from the workspace IP access list without logging the address", async () => {
+    const h = harness({ respond: (req, response) => response(req, 403, false, IP_ACL_RESPONSE) });
+    await assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
+      assert.equal(error.status, 403);
+      assert.equal(error.errorCode, "IP_ACL_BLOCKED");
+      assert.doesNotMatch(error.message, /203\.0\.113\.7|IP ACL/);
+      return true;
+    });
+    const output = JSON.stringify(h.logs);
+    assert.match(output, /IP_ACL_BLOCKED/);
+    assert.doesNotMatch(output, /203\.0\.113\.7|IP ACL/);
+  });
   it("distinguishes a landing-page 403 from a session-create 403", async () => {
     const h = harness({ follow: (req, response) => response(req, 403) });
     await assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
@@ -283,7 +364,10 @@ describe("Databricks cookie minting", () => {
       },
       clearTimeoutFn() {},
     });
-    const rejected = assert.rejects(promise, /timed out/);
+    const rejected = assert.rejects(promise, {
+      message: /timed out/,
+      errorCode: "SESSION_TRANSPORT",
+    });
     await timerReady;
     await new Promise((resolve) => {
       setImmediate(resolve);
@@ -307,7 +391,11 @@ describe("Databricks cookie minting", () => {
   });
   it("rejects a response that errors, aborts, or closes before end", async () => {
     await Promise.all(
-      ["error", "aborted", "close"].map((event) => {
+      [
+        ["error", undefined],
+        ["aborted", "SESSION_TRANSPORT"],
+        ["close", "SESSION_TRANSPORT"],
+      ].map(([event, errorCode]) => {
         const h = harness({
           respond(req) {
             const res = new EventEmitter();
@@ -315,10 +403,11 @@ describe("Databricks cookie minting", () => {
             res.emit(event, new Error("response failed"));
           },
         });
-        return assert.rejects(
-          h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"),
-          /response failed|response aborted|response closed/,
-        );
+        return assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
+          assert.match(error.message, /response failed|response aborted|response closed/);
+          assert.equal(error.errorCode, errorCode);
+          return true;
+        });
       }),
     );
   });

@@ -2545,6 +2545,18 @@
             "description": "Tool function name, e.g. `\"search.web\"`.",
             "title": "Name",
             "type": "string"
+          },
+          "namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tool namespace the model emitted the call under, e.g. `\"container\"`. `None` for the default namespace. Harnesses that replay history must round-trip it with the call.",
+            "title": "Namespace"
           }
         },
         "required": [
@@ -2624,6 +2636,127 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HarnessEnvironment": {
+        "properties": {
+          "inherit": {
+            "title": "Inherit",
+            "type": "boolean"
+          },
+          "unset": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unset",
+            "type": "array"
+          },
+          "variables": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Variables",
+            "type": "object"
+          }
+        },
+        "required": [
+          "inherit",
+          "variables",
+          "unset"
+        ],
+        "title": "HarnessEnvironment",
+        "type": "object"
+      },
+      "HarnessStartup": {
+        "description": "Launch metadata returned through the owner-only host API.",
+        "properties": {
+          "arg_count": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Arg Count",
+            "type": "integer"
+          },
+          "args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Args"
+          },
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "command_source": {
+            "enum": [
+              "env",
+              "config",
+              "default"
+            ],
+            "title": "Command Source",
+            "type": "string"
+          },
+          "configured_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configured Args"
+          },
+          "configured_command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configured Command"
+          },
+          "environment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HarnessEnvironment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolved_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved Path"
+          }
+        },
+        "required": [
+          "command",
+          "resolved_path",
+          "command_source",
+          "arg_count"
+        ],
+        "title": "HarnessStartup",
         "type": "object"
       },
       "HeartbeatEvent": {
@@ -3049,7 +3182,7 @@
           "limit": {
             "default": 10,
             "format": "int64",
-            "maximum": 100.0,
+            "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
@@ -3275,6 +3408,17 @@
             "title": "Scope",
             "type": "string"
           },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
           "transport": {
             "description": "`stdio` for a local process, `http` for a remote server.",
             "enum": [
@@ -3321,6 +3465,115 @@
           "mcp_servers"
         ],
         "title": "McpServersResponse",
+        "type": "object"
+      },
+      "McpToolSummary": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "McpToolSummary",
+        "type": "object"
+      },
+      "McpToolsRequest": {
+        "properties": {
+          "harness": {
+            "enum": [
+              "claude",
+              "codex",
+              "cursor"
+            ],
+            "title": "Harness",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugin"
+          },
+          "server": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Server",
+            "type": "string"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "harness",
+          "server"
+        ],
+        "title": "McpToolsRequest",
+        "type": "object"
+      },
+      "McpToolsResponse": {
+        "properties": {
+          "connection": {
+            "enum": [
+              "connected",
+              "needs_auth",
+              "unreachable",
+              "timeout",
+              "unsupported"
+            ],
+            "title": "Connection",
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/McpToolSummary"
+            },
+            "maxItems": 500,
+            "title": "Tools",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tools",
+          "connection",
+          "truncated"
+        ],
+        "title": "McpToolsResponse",
         "type": "object"
       },
       "MessageData": {
@@ -3845,6 +4098,173 @@
           "level"
         ],
         "title": "PermissionObject",
+        "type": "object"
+      },
+      "PluginAsset": {
+        "properties": {
+          "id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "PluginAsset",
+        "type": "object"
+      },
+      "PluginSummary": {
+        "description": "Installed Claude plugin metadata, without paths or executable configuration.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "harness": {
+            "const": "claude",
+            "title": "Harness",
+            "type": "string"
+          },
+          "has_commands": {
+            "title": "Has Commands",
+            "type": "boolean"
+          },
+          "has_hooks": {
+            "title": "Has Hooks",
+            "type": "boolean"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "marketplace": {
+            "maxLength": 256,
+            "title": "Marketplace",
+            "type": "string"
+          },
+          "mcp_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Entries"
+          },
+          "mcp_servers": {
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Mcp Servers",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "skill_entries": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PluginAsset"
+                },
+                "maxItems": 128,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skill Entries"
+          },
+          "skills": {
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Skills",
+            "type": "array"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "harness",
+          "name",
+          "marketplace",
+          "enabled",
+          "skills",
+          "mcp_servers",
+          "has_hooks",
+          "has_commands"
+        ],
+        "title": "PluginSummary",
+        "type": "object"
+      },
+      "PluginsResponse": {
+        "description": "Installed plugins reported by the host (Claude only).",
+        "properties": {
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/PluginSummary"
+            },
+            "maxItems": 128,
+            "title": "Plugins",
+            "type": "array"
+          }
+        },
+        "required": [
+          "plugins"
+        ],
+        "title": "PluginsResponse",
         "type": "object"
       },
       "PolicyDeniedEvent": {
@@ -4777,6 +5197,16 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "agent_install": {
+            "default": false,
+            "title": "Agent Install",
+            "type": "boolean"
+          },
+          "archive_worktree_cleanup": {
+            "default": true,
+            "title": "Archive Worktree Cleanup",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
@@ -5145,15 +5575,15 @@
         ]
       },
       "SessionAgentChangedEvent": {
-        "description": "Bound-agent change on a live session.\n\nEmitted by the switch-agent route after the session's agent binding\nis rewritten in place. Connected clients re-derive their cached\nsession state (harness presentation labels, bound agent id/name)\nfrom a fresh snapshot \u2014 the chat UI's native-vs-SDK message\nlifecycle depends on those labels, so a stale cache drops the first\npost-switch message (it reappears only when the transcript\nround-trip lands).",
+        "description": "The session's bound agent changed.\n\nEmitted after a session's MCP servers are edited (the agent's bundle\nis rewritten). Connected clients re-derive their cached session state\n(bound agent, harness presentation labels) from a fresh snapshot.",
         "properties": {
           "agent_id": {
-            "description": "The session-scoped clone now bound to the session, e.g. `\"ag_abc123\"`.",
+            "description": "The agent bound to the session, e.g. `\"ag_abc123\"`.",
             "title": "Agent Id",
             "type": "string"
           },
           "agent_name": {
-            "description": "Display name of the agent the session now runs, e.g. `\"claude-native-ui\"`. Deliberately the clean target-agent name \u2014 not the clone row's `\"\u2026 (switch ag_\u2026)\"` disambiguation name \u2014 because clients render it verbatim. Category: **transient** (SSE-only). The switch is persisted on the conversation row, so on reconnect clients read the new binding from the session snapshot rather than from a replayed event.",
+            "description": "Display name of that agent, e.g. `\"claude-native-ui\"`. Category: **transient** (SSE-only). The change is persisted, so on reconnect clients read it from the session snapshot.",
             "title": "Agent Name",
             "type": "string"
           },
@@ -6902,7 +7332,7 @@
                 "type": "null"
               }
             ],
-            "description": "Error details from the most recently failed task. Only present when `status == \"failed\"` and the task stored an error. Lets clients display the failure reason on historical load without relying on the transient `response.error` SSE event (which may have been emitted before the web client subscribed). Format mirrors the `RetryErrorDetail` SSE shape: `{\"code\": \"executor_error\", \"message\": \"...\"}`. `None` in all other cases.",
+            "description": "Error details from the most recently failed task. Only present when `status == \"failed\"` and the task stored an error. Lets clients display the failure reason on historical load without relying on the transient `response.error` SSE event (which may have been emitted before the web client subscribed). Format mirrors the `RetryErrorDetail` SSE shape: `{\"code\": \"executor_error\", \"message\": \"...\"}`. A `runner_rejected_event` failure also carries `item_id`, the persisted item the runner refused, so a web client whose POST answer was lost can match the refusal to its own send. `None` in all other cases.",
             "title": "Last Task Error"
           },
           "last_total_tokens": {
@@ -7455,22 +7885,6 @@
         "title": "SessionSupersededEvent",
         "type": "object"
       },
-      "SessionSwitchAgentRequest": {
-        "additionalProperties": false,
-        "description": "Request body for `POST /v1/sessions/{id}/switch-agent`.\n\nRebinds an existing session in place to a different agent/harness,\nkeeping the same session (transcript, comments, files, workspace).\nUnlike fork, no new session is created.",
-        "properties": {
-          "agent_id": {
-            "description": "Built-in agent to switch the session to, e.g. `\"ag_builtin_codex\"`. Must be a built-in agent (one listed by `GET /v1/agents`) and different from the session's current agent.",
-            "title": "Agent Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "agent_id"
-        ],
-        "title": "SessionSwitchAgentRequest",
-        "type": "object"
-      },
       "SessionTerminalActivityEvent": {
         "description": "A terminal's pane produced output (runner-determined activity pulse).\n\nPowers the web \"active\" badge for any terminal without a client PTY\nattach \u2014 the runner's per-terminal pane watcher emits this when the\npane content changes. Transient (a live pulse; not persisted, not in\nthe connect snapshot).",
         "properties": {
@@ -7924,6 +8338,39 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "SkillContentResponse": {
+        "properties": {
+          "content": {
+            "maxLength": 262144,
+            "title": "Content",
+            "type": "string"
+          },
+          "description": {
+            "description": "Skill description, capped at 8192 characters.",
+            "maxLength": 8192,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 1024,
+            "title": "Name",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "Whether the SKILL.md body exceeded the 256 KiB UTF-8 limit.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "content",
+          "truncated"
+        ],
+        "title": "SkillContentResponse",
+        "type": "object"
+      },
       "SkillSummary": {
         "description": "Safe subset of a discovered skill for API exposure.\n\nSurfaces the skill name and one-line description so clients\n(e.g. the web composer's slash-command menu) can list which\nskills the session has access to. The full skill `content`\nis intentionally omitted \u2014 it's only loaded server-side when\nthe harness invokes the skill, and it can be large.",
         "properties": {
@@ -7932,8 +8379,20 @@
             "title": "Description",
             "type": "string"
           },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-facing label from the SKILL.md frontmatter `name`, e.g. `\"Triage Issues\"`. `None` when it equals `name` or the source has no label.",
+            "title": "Display Name"
+          },
           "name": {
-            "description": "Skill identifier as parsed from the SKILL.md frontmatter, e.g. `\"triage-issues\"`. Lowercase kebab-case.",
+            "description": "Invocation identifier (the skill's directory name), e.g. `\"triage-issues\"`, typed as `/triage-issues`.",
             "title": "Name",
             "type": "string"
           }
@@ -8569,6 +9028,12 @@
             "description": "Per-session cost-control switch: `\"on\"` activates the spec's configured cost-control mode, `\"off\"` disables cost control for this session. Explicit JSON `null` clears the override back to the spec default; omitting the field leaves it unchanged (`\"off\"` is a real value here, so the field's *presence* \u2014 not a clear alias \u2014 is the clear signal, unlike `model_override`).",
             "title": "Cost Control Mode Override"
           },
+          "delete_worktree": {
+            "default": false,
+            "description": "With `archived=True`, also remove the session's server-created git worktree directory once the archive teardown runs (after the Undo grace). The branch is kept. Ignored for sessions with no worktree; rejected (400) without `archived=True`.",
+            "title": "Delete Worktree",
+            "type": "boolean"
+          },
           "external_session_id": {
             "anyOf": [
               {
@@ -9023,7 +9488,7 @@
   "paths": {
     "/.well-known/omnigent.json": {
       "get": {
-        "description": "Version manifest for NON-BROWSER clients \u2014 chiefly the desktop shell.\n\nThe desktop shell ships and updates on its own cadence, so any\ninstalled build can meet any server version. The shell is the side\nthat must adapt (the user may not update it for months), and to adapt\nit first has to know what it is talking to. This endpoint is that\nanswer, fetched BEFORE the SPA loads \u2014 unlike `/v1/info`, which the\nSPA reads after boot and which is therefore useless to the shell when\ndeciding how to open a window in the first place.\n\nContract, in the order a client should apply it:\n\n1. `manifest_version` (int) versions this ENVELOPE. Clients gate on\n   `>=`, never `==`, so a newer server keeps working with an older\n   shell. See `WELL_KNOWN_MANIFEST_VERSION` for when it bumps \u2014\n   adding a field never does.\n2. `server_version` (str) is the installed omnigent package version,\n   the same value as `/api/version` and `/v1/info.server_version`.\n   Informational: for display and bug reports, NOT for gating. Gate on\n   the fields below, which state capability directly rather than making\n   every client hardcode \"which release added X\".\n3. `min_desktop_version` (str | null) is the oldest desktop build this\n   server still supports. Null means no floor \u2014 the overwhelmingly\n   common case, and what every shipped shell must treat as \"fine\".\n   A server sets it only to signal a genuinely breaking change.\n4. Everything else is additive detail an older client may ignore\n   wholesale. `ui` describes where server-driven chrome lives, so a\n   shell can place its own window furniture without guessing from the\n   version number: `server_picker` is `\"sidebar\"` on builds that\n   dock the picker at the sidebar's bottom (it was `\"titlebar\"`,\n   centered in the macOS title-bar strip, before this).\n\nUnknown fields MUST be ignored, and a missing manifest (404 \u2014 every\nserver older than this route) MUST be treated as the pre-manifest\nbaseline, not an error: the shell falls back to its current behavior.\nThat is what makes an old shell + new server and a new shell + old\nserver both work.\n\nAuthentication: intentionally UNAUTHED, like `/v1/info`. A client\nmust be able to read this before it holds a session cookie \u2014 the whole\npoint is to consult it before loading the app. It exposes only the\nversion already public via `/api/version` plus coarse UI-shape\nstrings, so there is nothing here to leak.\n\nServed under `/.well-known/` (RFC 8615) so it sits at a fixed,\nguessable path that never collides with an SPA client route.\n\n**Returns:** The manifest described above.",
+        "description": "Version manifest for NON-BROWSER clients \u2014 chiefly the desktop shell.\n\nThe desktop shell ships and updates on its own cadence, so any\ninstalled build can meet any server version. The shell is the side\nthat must adapt (the user may not update it for months), and to adapt\nit first has to know what it is talking to. This endpoint is that\nanswer, fetched BEFORE the SPA loads \u2014 unlike `/v1/info`, which the\nSPA reads after boot and which is therefore useless to the shell when\ndeciding how to open a window in the first place.\n\nContract, in the order a client should apply it:\n\n1. `manifest_version` (int) versions this ENVELOPE. Clients gate on\n   `>=`, never `==`, so a newer server keeps working with an older\n   shell. See `WELL_KNOWN_MANIFEST_VERSION` for when it bumps \u2014\n   adding a field never does.\n2. `server_version` (str) is the installed omnigent package version,\n   the same value as `/api/version` and `/v1/info.server_version`.\n   Informational: for display and bug reports, NOT for gating. Gate on\n   the fields below, which state capability directly rather than making\n   every client hardcode \"which release added X\".\n3. `min_desktop_version` (str | null) is the oldest desktop build this\n   server still supports. Null means no floor \u2014 the overwhelmingly\n   common case, and what every shipped shell must treat as \"fine\".\n   A server sets it only to signal a genuinely breaking change.\n4. Everything else is additive detail an older client may ignore\n   wholesale. `ui` describes where server-driven chrome lives, so a\n   shell can place its own window furniture without guessing from the\n   version number: `server_picker` is `\"sidebar\"` on builds that\n   dock the picker at the sidebar's bottom (it was `\"titlebar\"`,\n   centered in the macOS title-bar strip, before this).\n5. `auth` tells a native client how this server signs users in,\n   before it loads anything. `mode` is `\"oidc\"`, `\"accounts\"`,\n   `\"header\"`, `\"custom\"` (an embedding app's own provider), or\n   `\"none\"`. `\"oidc\"` also promises the native loopback sign-in\n   (`/auth/login` native parameters + `POST /auth/native-token`).\n   `session_cookie` names the session cookie for `oidc` and\n   `accounts` and is `null` otherwise. `native_redirect_uris`\n   lists the private-use-scheme redirects (e.g. the iOS app's\n   `ai.omnigent.ios:/oauth/callback`) the native sign-in accepts\n   besides loopback, sorted, for `oidc`; `null` otherwise. The\n   iOS app gates on its URI being listed, because servers that only\n   support loopback answer the custom scheme with 400. A missing\n   `auth` (older servers) means \"sign in as before\".\n6. `server_name` (str | null) is the operator's display name for\n   this deployment (`branding.server_name`), for clients that list\n   several servers. Self-asserted by the server, so clients show it\n   for display only and keep the host in any trust decision. Null\n   when unset; it never falls back to `branding.app_name`.\n\nUnknown fields MUST be ignored, and a missing manifest (404 \u2014 every\nserver older than this route) MUST be treated as the pre-manifest\nbaseline, not an error: the shell falls back to its current behavior.\nThat is what makes an old shell + new server and a new shell + old\nserver both work.\n\nAuthentication: intentionally UNAUTHED, like `/v1/info`. A client\nmust be able to read this before it holds a session cookie \u2014 the whole\npoint is to consult it before loading the app. It exposes only the\nversion already public via `/api/version`, coarse UI-shape\nstrings, and the sign-in mode and cookie name any visitor already\nlearns from `/v1/info` and the login redirect, so there is\nnothing here to leak.\n\nServed under `/.well-known/` (RFC 8615) so it sits at a fixed,\nguessable path that never collides with an SPA client route.\n\n**Returns:** The manifest described above.",
         "operationId": "well_known_manifest__well_known_omnigent_json_get",
         "responses": {
           "200": {
@@ -9140,11 +9605,11 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\n**Returns:** A `PaginatedList` of built-in agents.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\n**Returns:** A `PaginatedList` of agents.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
-            "description": "Maximum number of agents to return (1-1000).",
+            "description": "Maximum number of agents to return (1-1000; `scope=user` caps it at 50).",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -9157,7 +9622,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return agents after this id.",
+            "description": "Cursor: return agents after this id.",
             "in": "query",
             "name": "after",
             "required": false,
@@ -9174,7 +9639,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return agents before this id.",
+            "description": "Cursor: return agents before this id (server agents only).",
             "in": "query",
             "name": "before",
             "required": false,
@@ -9191,7 +9656,7 @@
             }
           },
           {
-            "description": "Sort order, `\"asc\"` or `\"desc\"`.",
+            "description": "Sort order, `\"asc\"` or `\"desc\"` (server agents only).",
             "in": "query",
             "name": "order",
             "required": false,
@@ -9200,6 +9665,24 @@
               "pattern": "^(asc|desc)$",
               "title": "Order",
               "type": "string"
+            }
+          },
+          {
+            "description": "`\"user\"` to list the caller's own agents.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^user$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
             }
           }
         ],
@@ -9226,6 +9709,81 @@
           }
         },
         "summary": "List Builtin Agents",
+        "tags": [
+          "agents"
+        ]
+      },
+      "post": {
+        "description": "Install (or reinstall) the caller's user agent from a bundle.\n\nMultipart form with one `bundle` part: a gzipped tarball, the same\nshape multipart `POST /v1/sessions` accepts. The bundle is validated\nlike any tenant upload and never executed here.\n\n**Returns:** The installed agent as an `AgentObject`.",
+        "operationId": "install_agent_v1_agents_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Install Agent",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}": {
+      "delete": {
+        "description": "Remove one of the caller's user agents.\n\nSessions using it keep running while their runner holds the spec, then\nreport that the agent no longer exists, so while any exist this returns\n409 with `sessions_in_use` unless `force` is set. Server agents,\nother users' agents, and unowned rows all read as 404.\n\n**Returns:** `{\"id\": agent_id, \"deleted\": True}`, or the 409 response.",
+        "operationId": "remove_agent_v1_agents__agent_id__delete",
+        "parameters": [
+          {
+            "description": "User agent to remove.",
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Remove even though sessions still use the agent.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Remove Agent V1 Agents  Agent Id  Delete"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Agent",
         "tags": [
           "agents"
         ]
@@ -9561,7 +10119,7 @@
     },
     "/v1/hosts/{host_id}/credentials/detected": {
       "get": {
-        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline, 502/504 on host failure/timeout.",
+        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline or the host daemon is too old to detect credentials, 502/504 on host failure/timeout.",
         "operationId": "detect_host_credentials_v1_hosts__host_id__credentials_detected_get",
         "parameters": [
           {
@@ -9929,7 +10487,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/credential": {
       "post": {
-        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`harness_install` release feature exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline, 502 on host-side failure, 504 on timeout.",
+        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`harness_install` release feature exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline or the host daemon is too old to store credentials, 502 on host-side failure, 504 on timeout.",
         "operationId": "store_host_harness_credential_v1_hosts__host_id__harnesses__harness__credential_post",
         "parameters": [
           {
@@ -9995,7 +10553,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/install": {
       "post": {
-        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline, 502 on a host-side install failure, 504 on host timeout.",
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
         "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
         "parameters": [
           {
@@ -10051,7 +10609,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/model-options": {
       "get": {
-        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.",
+        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the host is unknown, 403 when not the owner, 409 when offline or the host daemon is too old to list model options, 502 on host-side failure, 504 on timeout.",
         "operationId": "get_host_model_options_v1_hosts__host_id__harnesses__harness__model_options_get",
         "parameters": [
           {
@@ -10101,6 +10659,135 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/{harness}/skills/{name}": {
+      "get": {
+        "operationId": "get_skill_content_v1_hosts__host_id__harnesses__harness__skills__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillContentResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Skill Content",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/startup": {
+      "get": {
+        "description": "Read host launch defaults, configured invocation, and env-wrapper settings.",
+        "operationId": "get_harness_startup_v1_hosts__host_id__harnesses__harness__startup_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessStartup"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Harness Startup",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/mcp-servers": {
       "get": {
         "description": "List the user-level MCP servers configured for each harness on a host.\n\nReturns names and non-secret metadata only; the caller must own the host.",
@@ -10139,6 +10826,101 @@
           }
         },
         "summary": "Get Mcp Servers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/mcp-servers/tools": {
+      "post": {
+        "operationId": "get_mcp_tools_v1_hosts__host_id__mcp_servers_tools_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpToolsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpToolsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mcp Tools",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/plugins": {
+      "get": {
+        "description": "List installed Claude plugins. The caller must own the host.",
+        "operationId": "get_plugins_v1_hosts__host_id__plugins_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plugins",
         "tags": [
           "hosts"
         ]
@@ -11497,6 +12279,17 @@
             "schema": {
               "default": true,
               "title": "Include Liveness",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "When `False`, skip the live-status probe of the session's bound runner on a status-cache miss and report `status` from the cached or persisted value. Runner-owned reads pass `False` because the probe targets the very runner waiting on this response.",
+            "in": "query",
+            "name": "include_live_status",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Live Status",
               "type": "boolean"
             }
           },
@@ -15288,60 +16081,6 @@
           }
         },
         "summary": "Stream Session",
-        "tags": [
-          "sessions"
-        ]
-      }
-    },
-    "/v1/sessions/{session_id}/switch-agent": {
-      "post": {
-        "description": "Switch an existing session in place to a different agent/harness.\n\nUnlike fork, this keeps the SAME session \u2014 transcript, comments,\nfiles, host, and workspace are untouched; only the agent/harness\nchanges. The current session-scoped agent is replaced by a clone\nof the target built-in, model settings carry over only within the\nsame provider family (a model id is provider-bound), the native\nruntime session id is cleared, and the harness-presentation labels\nare recomputed for the target. The next turn cold-starts the new\nharness (rebuilding the native transcript from this session's own\nitems for a same-family native target). Only built-in agents are\nbindable, and only while the session is idle.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionSwitchAgentRequest`.\n\n**Returns:** A `SessionResponse` describing the session after the switch (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session or target agent does not exist or the target is not a bindable built-in; 403 if the caller lacks edit access; 400 if the session is a sub-agent, has no agent binding, or the target bundle can't be loaded; 409 if a turn is currently running.",
-        "operationId": "switch_session_agent_v1_sessions__session_id__switch_agent_post",
-        "parameters": [
-          {
-            "description": "Session/conversation identifier to switch, e.g. `\"conv_abc123\"`.",
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SessionSwitchAgentRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SessionResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Switch Session Agent",
         "tags": [
           "sessions"
         ]

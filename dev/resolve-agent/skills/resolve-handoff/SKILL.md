@@ -125,7 +125,10 @@ readiness; name pending publication/review steps in `remaining_work`.
   `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
   fixed it — name the fixing commit and recommend closing the ticket), or
   `needs_more_info` (couldn't recover a reliable reproduction, evidence is unsafe,
-  intended behavior is ambiguous, or setup/environment blocks verification).
+  required inputs/authorization are missing, or setup/environment blocks verification).
+  When intended behavior is ambiguous, follow `resolve-investigate`: a supported
+  proposal with an unresolved design choice is `partially_fixed`, with the choice
+  in `remaining_work`. Do not describe it as a proven fix.
 - `problem_summary` / `solution_summary` — the two user-facing paragraphs shown
   prominently in the Linear update under **What's the problem?** and **How is it
   fixed?** Write plain, natural English for someone who uses the product but has
@@ -139,6 +142,12 @@ readiness; name pending publication/review steps in `remaining_work`.
   publication/review fallbacks, so concrete symbols and filenames are welcome.
   In review mode, describe the reviewed PR's approach and leave `files_changed`
   empty (you changed nothing).
+  Distinguish the observed symptom from the supported cause; include sources for
+  historical intent, competing explanations checked, and any proposed policy
+  change. Identify the real configuration path exercised and any substituted
+  components. If the test assumes the suspected cause, retain it as a hypothesis
+  and carry the missing proof into the outcome and `remaining_work`, following
+  `resolve-investigate`. State missing evidence plainly; never include credentials.
 - `review_body` — the PR-facing review text from Step 2A. Fill it in for
   `reviewed_existing_pr`, including workflow-owned publication; use `""` in
   other modes. State the verdict and reason first, then separate the proof and
@@ -203,7 +212,8 @@ readiness; name pending publication/review steps in `remaining_work`.
   touched env-derived defaults: which added/edited tests you re-ran with ambient
   vars set and that they still passed. Empty string when not applicable (no such
   test in the diff).
-- `pr_url` — the ready-for-review PR you **opened** (author mode). Empty in review
+- `pr_url` — the PR you **opened** (author mode), including a draft proposal
+  identified as such in `fix_summary`. Empty in review
   mode, when `skip_push` was set, or if you stopped before opening one.
 - `reviewed_pr_url` — the existing PR you **reviewed** (review mode), or the fork
   PR you **took over** into your own (fork takeover — `pr_url` is then yours).
@@ -262,5 +272,7 @@ a fix lands (push directly, or — for an unpushable fork PR that needs changes 
 take over into your own PR carrying the contributor's commits), and that the direct author path opens a PR while the
 review path adopts an existing one. Workflow-owned author publication ends after
 the validated body, deferred validation prompt, and final handoff are prepared;
-the publisher owns the post-publication loop. `skip_push` and `needs_more_info`
+the publisher owns the post-publication loop. A direct draft proposal instead
+ends with the incomplete handoff in `resolve-publish`; it makes no readiness or
+independent-review claim. `skip_push` and `needs_more_info`
 runs end earlier, with no PR to land. In every mode, **you do not merge.**

@@ -116,6 +116,15 @@ on an existing PR,
 not gated mid-run, so it works with nobody at a terminal; the ready-for-review PR
 is the review gate after the fact.
 
+Before choosing a fix, Resolve reconstructs the exact reported configuration,
+checks competing causes, and looks for the design rationale in code and history.
+It does not reverse intentional behavior simply to make a repro test pass.
+Uncertain product choices go to PR review as a supported proposal, with a draft
+and `partially_fixed` outcome when a material choice remains. Missing required
+inputs, credentials, or authorization still block dependent work. Workflow-owned
+publication follows its supplied contract; the prompt does not add draft support
+to the publisher. No new test-selection gate is introduced.
+
 ## What it does
 
 1. Recovers the repro handoff (verdict, facets, journey, `bug_url`) and the reproduction
@@ -151,8 +160,10 @@ is the review gate after the fact.
    key available, on the ticket.
 6. *(author path)* Commits the focused, locally validated fix, then follows the
    selected publication mode. Direct runs push and open a **ready-for-review
-   PR**. Workflow-owned runs prepare the validated PR body and handoff without
-   GitHub writes. Local-only runs stop at the commit. Full repository validation
+   PR**, or a draft proposal for an unresolved design choice. Draft proposals
+   retain an incomplete handoff and skip the readiness loop. Workflow-owned runs
+   prepare the validated PR body and handoff without GitHub writes. Local-only
+   runs stop at the commit. Full repository validation
    and independent review happen after publication.
 7. *(direct author path and review path)* **Drives the open PR to a landable
    state** — iterating until ready or concretely blocked. Workflow-owned author

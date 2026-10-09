@@ -30,38 +30,192 @@ both ends.
 
 ## Server events (`source = 'server'`)
 
-- `runner_tunnel` with `phase` `connected`, `closed`, `disconnected` or
+- `runner_tunnel` with `phase` `connected`, `disconnected` or
   `error`: `connection_id` from the runner's hello, `connection_age_s`,
   `last_frame_age_s`, `ended_by` (the helper tasks that had finished when the
-  end was observed, comma-separated: `tunnel-receive` for a peer close,
-  `tunnel-ping` for a server-declared timeout, both when the peer's close
-  reply had already arrived), plus the close `code` and `reason` on
-  `disconnected`. `closed` covers a server-initiated end the peer has not yet
-  acknowledged, such as a ping timeout, which previously left no row.
+  end was observed, comma-separated: `tunnel-receive`, `tunnel-ping`, or
+  `tunnel-sender`), plus the close `code` and `reason` on `disconnected`.
+  When a helper reports a peer disconnect, the event preserves its observed
+  code and reason. Otherwise it records the first server-requested close,
+  including retirement, replacement, or ping timeout, without implying that
+  the peer acknowledged it. Concurrent close requests can make the recorded
+  code and reason differ from those sent on the socket. A stale receive or
+  ping helper can end before the sender, so `ended_by` alone does not identify
+  the close cause.
+
+  During a rollout, queries should accept both `closed` (older servers) and
+  `disconnected`, and allow missing close details on older `closed` rows.
+  Update queries that select only `closed` to use `disconnected` after the
+  server upgrade is complete.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
+- `runner_stream_connected` and `runner_stream_ready` carry `runner_id` and
+  `telemetry_schema = runner_stream_recovery.v1`. `connected` means the runner
+  accepted the HTTP stream; `ready` means the first `session.heartbeat` arrived.
+  The marker lets rollout queries exclude older rows without adding
+  heartbeat-volume events.
 - `runner_stream_transport_lost`: one row per outage when the relay first
-  observes the loss, with `intentional_stop` and `grace_s`. An unintentional
-  loss is then held for `grace_s`; an intentional stop goes straight to the
-  give-up row.
+  observes the loss, with `outage_id`, the loss-time `runner_id` and `turn_id`
+  (when known), `stream_ready`, `intentional_stop`, `grace_s`, and the same
+  `telemetry_schema`. An unintentional loss is then held for `grace_s`; an
+  intentional stop goes straight to the give-up row.
+- `runner_stream_recovered`: at most one row per `outage_id`, emitted only
+  when a retry receives its first `session.heartbeat`. It carries the same
+  `outage_id`, loss-time `runner_id`/`turn_id`, `recovery_attempt`,
+  `outage_s`, `recovery_evidence = stream_heartbeat`, and the schema marker.
+  Initial relay readiness is not recovery. A cancellation or relay rebind
+  before a heartbeat emits no recovery row. A long attempt that resets the
+  grace window without readiness starts a new outage ID and does not recover
+  the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
-  (`intentional_stop`, `server_shutdown`, `idle_no_failure` or
-  `failed_mid_turn`), `grace_s`, `outage_s`, `retries`. `outage_s` is the
+  (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
+  `failed_mid_turn`), the matching `outage_id`, loss-time `runner_id`/`turn_id`,
+  `grace_s`, `outage_s`, `retries`, and the schema marker. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
+- `runner_disconnect_decision`: a warning explaining the status check in the
+  relay (`origin = runner_disconnected_mid_turn`) or offline sweep
+  (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
+  `failed_mid_turn`, `failed_before_start`, `intentional_stop`, or
+  `subagent_unobserved`.
+  Idle subsessions keep their status and emit no `session_turn_failed` event
+  or error labels. Running and waiting sessions still fail on disconnect, but
+  a subsession mirrored from a native parent (such as a Claude subsession)
+  needs that status in this server's cache: a saved or adopted running/waiting
+  status alone gives `subagent_unobserved`. A mirror's row can still read
+  mid-turn after its last idle edge, and the parent's native runtime, not the
+  server, drives the mirror's turn and reports its outcome.
+  `fail_idle_top_level` applies only to top-level startup failures.
+
+  `status_source` is `cache`, `persisted`, `snapshot`, `relay_snapshot`, or
+  `unknown`, alongside `cached_session_status`, `persisted_session_status`,
+  `snapshot_session_status`, and `status_lookup` (`not_needed`, `found`,
+  `missing`, or `error`). Both paths read a fresh row on a cache miss and
+  recheck the cache after the read. A missing or failed read falls back to the
+  sweep's snapshot (`snapshot`) or the known status retained when the relay
+  adopted its runner binding (`relay_snapshot`). Without any known state,
+  the disconnect still reports a failure.
+
+  Adoption snapshots stay outside the live cache: an old saved status must
+  not override a newer row written by another server. They belong to one
+  relay binding and are discarded when it ends or is replaced. A quiet
+  Claude subsession can emit only heartbeats after handoff, so retaining its
+  saved idle state avoids a false failure if the later status lookup fails.
+  A readable running/waiting row still takes precedence, including when
+  that persisted state is stale; this fallback does not repair stale writes.
+
+  The row includes the active `turn_id` and, when available, `session_kind`,
+  `parent_session_id`, `runner_id`, `host_id`, and `conversation_updated_at`.
+  The latter measures content activity, not the time of a status transition.
+  A relay cache hit does not load conversation metadata solely for logging.
 - `runner_session_init_started`: `resume_interrupted_turn`,
   `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
   reconnect hook; resume set is a sub-agent restore; suppress set is a
   message forward.
 
+## Native event ingestion
+
+`runner_event_ingest_failed` adds session and batch attribution to existing
+server exception logs. Both stages include `session_id`, `runner_id`, `batch_id`,
+`batch_size`, `error_type`, and `retryable`:
+
+- `failure_stage = dispatch`: the tunnel's ingestion callback raised. Includes
+  `connection_id`; the number of events already applied is unknown.
+- `failure_stage = apply`: applying an individual event raised. Includes its
+  allowlisted `event_type` and `applied_count`, the acknowledged prefix length.
+
+These are retryable delivery attempts, not evidence that a session's turn
+ultimately failed. Replay uses source IDs to avoid duplicating persisted events.
+The structured fields contain no event bodies or credentials. Existing exception
+tracebacks and log severity are unchanged; successful retries add no error row.
+
 ## Correlation
+
+The disconnect grace task rechecks the local tunnel after loading bound
+sessions. A reconnect during that read logs `reconnected during offline
+lookup; skipping offline-marking`; an older database snapshot must not turn
+the live runner's sessions into disconnect failures.
 
 Join the runner's and server's rows for one socket on
 `attributes['connection_id']`. A `runner_connected` row with `reconnect =
 False` after earlier rows for the same `runner_id` is a new process; `pid`
 confirms it. A repeating `connection_age_s` across drops points at an
 intermediary timeout rather than either endpoint.
+
+Join relay loss, recovery, and give-up rows on the exact
+`session_id + attributes['outage_id'] + attributes['runner_id']` tuple. Do not
+infer a tunnel `connection_id` for relay rows; it is intentionally absent from
+this contract unless a separate event supplies the known value.
+
+## Credential recovery
+
+`auth token refresh failed; falling back to previous token` describes a
+failed renewal attempt, not the cause of the preceding socket close. Check
+the exception type and subsequent handshake result: a rejected old bearer
+can keep the runner disconnected even after network connectivity returns.
+
+Delegated runner credentials and stored or refreshed OIDC logins do not
+require the Databricks executor to import. The SDK path loads only when
+those providers do not supply a token; an import failure there still permits
+the existing managed-mint fallback. This does not repair an inconsistent
+installation or provide a credential when every configured provider fails.
+
+## Heartbeat and send diagnostics
+
+The tunnel connection, disconnect, and `runner_ping_timeout` rows also carry
+local timing observations. `runner_tunnel_health` reports a scheduling delay,
+send, or queue wait of at least one second, at most once per minute per
+connection. A sampler runs every five seconds; a pending send is visible even
+if it never completes. Ordinary heartbeats add no log rows.
+
+Unexpected sampler failures are logged with their traceback. Loop-lag sampling
+then stops and subsequent snapshots set `sampler_failed = true`; send and queue
+timing observations continue. A new connection starts with `sampler_failed = false`.
+
+Join on `connection_id` and compare `tunnel_side = server` with `runner`:
+
+| Fields | Meaning |
+| --- | --- |
+| `loop_lag_s`, `loop_lag_max_s` | Delay past the sampler's scheduled wakeup. A local scheduling gap, including process suspension on platforms whose monotonic clock advances during suspension; it does not identify the blocking code. |
+| `sends_in_flight`, `oldest_tracked_send_age_s` | Sends awaiting the local WebSocket API at the observation time. A blocked send can coexist with a responsive loop. |
+| `send_duration_s`, `send_duration_max_s`, `last_send_outcome` | Completed, failed, or cancelled send duration. Includes loop scheduling delays; send completion proves local acceptance, not peer receipt. |
+| `outbound_queue_depth`, `outbound_queue_high_water` | Server frames waiting behind its sole sender. Absent on the runner, which sends directly. |
+| `enqueue_delay_s`, `queue_wait_s` (and `_max_s`) | Server time from requesting an enqueue to execution on the socket loop, and from enqueue to dequeue, respectively. Queue timing metadata never travels over the wire. |
+| `app_pings_queued`, `last_app_ping_queued_age_s`, `last_app_ping_sent_age_s`, `last_app_pong_received_age_s` | Server application-heartbeat progress through enqueue, successful send, and pong receipt. |
+| `last_app_ping_received_age_s`, `last_app_pong_sent_age_s` | Runner application-heartbeat receive and successful response-send times. |
+| `app_ping_rtt_s` | Server-local elapsed time from starting the matching ping send to consuming its pong; excludes queue wait, may include send delay. Uses the echoed token only for matching, not as a clock. |
+| `last_received_frame_age_s` | Time since a WebSocket message was received, including messages later dropped as non-text or malformed. |
+| `last_sent_frame_age_s` | Time since an application-frame send completed successfully. |
+
+All durations use local monotonic time. Maxima cover this connection's lifetime;
+their accompanying `_max_age_s` fields distinguish old congestion from delays
+near the failure. Disconnect observations are frozen before helper cancellation.
+`diagnostics_age_s` is time since that snapshot, so add it to an age when
+comparing to the log row's timestamp. Missing timing fields mean no observation,
+not zero elapsed time. The debug sink omits nulls.
+
+History is bounded to eight outstanding application ping tokens and 64 active
+send samples. `app_ping_samples_dropped` and `send_samples_dropped` expose any
+sampling limit; `sends_in_flight` still counts all sends. Frames already waiting
+in the server queue retain only their own timestamp and optional ping token.
+
+Application heartbeats and WebSocket protocol keepalives are separate. These
+fields do not observe protocol control-frame ping/pong traffic. Runner
+`protocol_ping_interval_s` and `protocol_ping_timeout_s` come from the live
+WebSocket connection (`protocol_keepalive_source = websockets_connection`).
+With that source, an absent interval or timeout means the corresponding library
+setting is disabled. Server rows expose the actual `app_ping_interval_s` and
+`app_silence_timeout_s`; `protocol_keepalive_source = unavailable_from_asgi`
+explicitly leaves the server's protocol settings unknown. Shared constants alone
+do not prove a deployment's Uvicorn configuration.
+
+A large loop delay localizes a scheduling interruption to that process, without
+proving CPU starvation versus suspension. Long sends or queue waits with small
+loop delays suggest backpressure. Missing heartbeats with neither observation
+still leave the peer or network path unresolved; compare both sides before
+assigning a cause. These observations do not change liveness, retry, or turn
+failure decisions.
 
 ## Build identity
 
@@ -78,9 +232,12 @@ the build. The generated version is itself valid for
 
 ```sh
 uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_serve.py \
+  tests/runner/transports/ws_tunnel/test_diagnostics.py \
   tests/runner/transports/ws_tunnel/test_frames.py \
   tests/server/integration/test_runner_tunnel_route.py \
   tests/server/routes/test_sessions_runner_relay.py \
+  tests/server/integration/test_sessions_tunnel_three_layer.py \
+  tests/server/routes/test_subagent_status.py \
   tests/server/test_runner_session_init.py \
   tests/runner/test_suppress_recovery_turn.py \
   tests/deploy/test_databricks_deploy_version.py
@@ -91,3 +248,34 @@ runner's socket, hold a reconnect past `RUNNER_DISCONNECT_GRACE_S`, kill the
 runner process, and crash a harness mid-turn. One query on the session over
 the events above, ordered by `client_time`, must tell the four apart and show
 whether the original turn survived.
+
+For a credential-free recovery check, run
+`uv run --no-sync pytest -q tests/e2e/test_runner_tunnel_mid_turn_reconnect_grace_e2e.py`.
+This uses real server and runner processes with a mock LLM, including a
+45-second tunnel blackout and reconnects to another replica. The original
+turn must complete without a failed status edge.
+
+On a disposable local runner, pause only that runner process with
+`kill -STOP "$runner_pid"`, wait eight seconds, then `kill -CONT "$runner_pid"`.
+Check its `runner_tunnel_health` row for a loop delay and match its
+`connection_id` to the server's rows. A send delay alone should not be labelled
+an event-loop stall. Use the blocked-send and stalled-loop tests above for
+deterministic examples of both signatures.
+
+For idle-child handling, let a Claude subsession become idle, then stop its
+host without using the session's Stop action. After the disconnect grace,
+the child should remain idle with a warning whose decision is
+`idle_no_failure`, no disconnect error in its transcript, and no Failed
+activity in its parent's transcript. Repeat with a running child whose turn
+this server relayed to confirm that interrupted work still produces
+`runner_disconnected`.
+
+For handoff handling, reconnect an idle child's runner to a fresh server,
+then drop the runner after its heartbeat-only relay is ready. In a test
+environment, make the disconnect-time conversation lookup fail or return no
+row. The warning should report `status_source = relay_snapshot` and
+`decision = idle_no_failure`. Repeat after persisting a new running status:
+the fresh row must win (`status_source = persisted`), giving
+`subagent_unobserved` for the Claude subsession; a top-level session or a
+`sys_session_create` child in that state must
+still fail.

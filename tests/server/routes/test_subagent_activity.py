@@ -65,6 +65,24 @@ async def test_lifecycle_publishes_once_per_child_turn(
         assert item.data.resource == {"title": "Audit"}
 
 
+@pytest.mark.asyncio
+async def test_side_chat_child_records_no_lifecycle_notices(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        labels={"omnigent.codex_native.agent_nickname": "Side chat"},
+    )
+    publish = Mock()
+    monkeypatch.setattr("omnigent.server.subagent_activity.session_stream.publish", publish)
+    await record_subagent_activity(child.id, "delegated", store)
+    await record_subagent_activity(child.id, "returned", store, turn_id="t1")
+    assert store.list_items(parent.id).data == []
+    publish.assert_not_called()
+
+
 def _message(text: str) -> dict[str, Any]:
     return {"role": "user", "is_meta": True, "content": [{"type": "input_text", "text": text}]}
 

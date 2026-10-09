@@ -68,12 +68,14 @@ function createBrowserViewRegistry({
   sendToRenderer, // (channel, payload) => mainWindow.webContents.send(...)
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
+  isHostFocused = () => true,
   // Desktop affordances for the pane's context menu; injected so the registry
   // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
   openUrlExternal = () => {}, // (url) => shell.openExternal(url)
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
+  isArcaAgentContext = () => false,
   cap = DEFAULT_CAP,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
@@ -86,6 +88,7 @@ function createBrowserViewRegistry({
   // layer, which always paints above the renderer regardless of z-index. Sticky
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
+  let recentSessionSwitchSupported = false;
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -135,12 +138,14 @@ function createBrowserViewRegistry({
       // this, the allowlist only guards the first hop and a redirect to an
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
+      agentContext: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
       designModeListener: null,
       designModeInputListener: null,
       designModeWebContents: null,
+      recentSessionSwitching: false,
     };
     return entry;
   }
@@ -169,6 +174,7 @@ function createBrowserViewRegistry({
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
+    attachRecentSessionInput(entry);
     return { ok: true, entry, created: true };
   }
 
@@ -194,7 +200,9 @@ function createBrowserViewRegistry({
         return { action: "deny" };
       }
       if (entry.agentNavLocked) {
-        const verdict = isAgentNavigationAllowed(url);
+        const verdict = isAgentNavigationAllowed(url, {
+          allowLocalhost: isArcaAgentContext(entry.agentContext),
+        });
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
             conversationId: entry.conversationId,
@@ -259,7 +267,9 @@ function createBrowserViewRegistry({
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
-      const verdict = isAgentNavigationAllowed(targetUrl);
+      const verdict = isAgentNavigationAllowed(targetUrl, {
+        allowLocalhost: isArcaAgentContext(entry.agentContext),
+      });
       if (!verdict.ok) {
         try {
           event.preventDefault();
@@ -283,6 +293,81 @@ function createBrowserViewRegistry({
     });
   }
 
+  // The embedded page owns a separate WebContents, so Ctrl+Tab never reaches
+  // the shell renderer's window listener. Forward only the recent-session
+  // gesture; all other page keyboard input remains local to the page.
+  function cancelRecentSessionInput(entry, notifyRenderer) {
+    if (!entry.recentSessionSwitching) return;
+    entry.recentSessionSwitching = false;
+    if (notifyRenderer) {
+      sendToRenderer("browser-recent-session-input", {
+        type: "keydown",
+        key: "Escape",
+        code: "Escape",
+        ctrlKey: false,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+        repeat: false,
+      });
+    }
+  }
+
+  function cancelRecentSessionSwitch() {
+    if (activeConversationId === null) return { ok: true };
+    const entry = entries.get(activeConversationId);
+    if (entry) cancelRecentSessionInput(entry, false);
+    return { ok: true };
+  }
+
+  function setRecentSessionSwitchSupported(supported) {
+    recentSessionSwitchSupported = !!supported;
+    if (!recentSessionSwitchSupported) {
+      entries.forEach((entry) => cancelRecentSessionInput(entry, false));
+    }
+    return { ok: true };
+  }
+
+  function attachRecentSessionInput(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    wc.on("before-input-event", (event, input) => {
+      if (!recentSessionSwitchSupported) return;
+      const type =
+        input && input.type === "keyDown"
+          ? "keydown"
+          : input && input.type === "keyUp"
+            ? "keyup"
+            : null;
+      if (type === null) return;
+      const key = input.key || "";
+      const startsSwitching =
+        type === "keydown" && key === "Tab" && input.control && !input.alt && !input.meta;
+      const commitsSwitching =
+        type === "keyup" && key === "Control" && entry.recentSessionSwitching;
+      const cancelsSwitching =
+        type === "keydown" && key === "Escape" && entry.recentSessionSwitching;
+      if (!startsSwitching && !commitsSwitching && !cancelsSwitching) return;
+
+      if (startsSwitching || cancelsSwitching) event.preventDefault();
+      sendToRenderer("browser-recent-session-input", {
+        type,
+        key,
+        code: input.code || key,
+        ctrlKey: !!input.control,
+        shiftKey: !!input.shift,
+        altKey: !!input.alt,
+        metaKey: !!input.meta,
+        repeat: !!input.isAutoRepeat,
+      });
+      if (startsSwitching) entry.recentSessionSwitching = true;
+      else entry.recentSessionSwitching = false;
+    });
+    wc.on("blur", () => {
+      cancelRecentSessionInput(entry, !isHostFocused());
+    });
+  }
+
   function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
     // Agent-driven nav (opts.agent) is gated by an allowlist (see
@@ -291,7 +376,9 @@ function createBrowserViewRegistry({
     // (user-typed) nav stays permissive. Checked before getOrCreate so a
     // rejected nav creates no blank view.
     if (opts && opts.agent && url) {
-      const verdict = isAgentNavigationAllowed(url);
+      const verdict = isAgentNavigationAllowed(url, {
+        allowLocalhost: isArcaAgentContext(opts.agentContext),
+      });
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };
       }
@@ -302,7 +389,10 @@ function createBrowserViewRegistry({
     // Latch who drives THIS navigation so the will-navigate/will-redirect guard
     // enforces the allowlist on an agent nav's whole redirect chain, and leaves
     // user-typed URL-bar nav permissive. Set only when a url is actually issued.
-    if (url) entry.agentNavLocked = !!(opts && opts.agent);
+    if (url) {
+      entry.agentNavLocked = !!(opts && opts.agent);
+      entry.agentContext = entry.agentNavLocked ? (opts.agentContext ?? null) : null;
+    }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
     // create-detached and let `setActive(conversationId)` attach on user switch.
@@ -344,6 +434,7 @@ function createBrowserViewRegistry({
       if (activeConversationId !== null) {
         const prev = entries.get(activeConversationId);
         if (prev) {
+          cancelRecentSessionInput(prev, true);
           try {
             detachFromHost(prev.view);
           } catch {
@@ -362,6 +453,7 @@ function createBrowserViewRegistry({
       if (activeConversationId !== null) {
         const prev = entries.get(activeConversationId);
         if (prev) {
+          cancelRecentSessionInput(prev, true);
           try {
             detachFromHost(prev.view);
           } catch {
@@ -381,6 +473,7 @@ function createBrowserViewRegistry({
     if (activeConversationId !== null) {
       const prev = entries.get(activeConversationId);
       if (prev) {
+        cancelRecentSessionInput(prev, true);
         try {
           detachFromHost(prev.view);
         } catch {
@@ -404,6 +497,7 @@ function createBrowserViewRegistry({
   function close(conversationId, reason) {
     const entry = entries.get(conversationId);
     if (!entry) return { ok: true, removed: false };
+    cancelRecentSessionInput(entry, true);
     if (activeConversationId === conversationId) {
       try {
         detachFromHost(entry.view);
@@ -457,6 +551,8 @@ function createBrowserViewRegistry({
     openOrNavigate,
     setActive,
     setSuppressed,
+    cancelRecentSessionSwitch,
+    setRecentSessionSwitchSupported,
     close,
     closeAll,
     // Introspection

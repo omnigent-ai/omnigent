@@ -42,6 +42,12 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.native.input_diagnostics import (
+    INPUT_FIELDS,
+    input_attributes,
+    input_delivery_scope,
+    log_input_event,
+)
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
@@ -114,14 +120,14 @@ def _is_host_tool(tool_name: str) -> bool:
 
 class InnerExecutorError(RuntimeError):
     """
-    An executor-reported failure that names its own semantic error code.
+    An executor-reported failure with a code or explicit delivery evidence.
 
     Raised by :class:`ExecutorAdapter` when an :class:`ExecutorError` event
-    carries a ``code``, so the terminal ``response.failed`` reports that code,
-    headline and next step instead of the exception class name.
+    carries a ``code`` or ``undelivered`` flag. Uncoded failures retain their
+    RuntimeError classification while carrying delivery evidence to the relay.
 
     :param message: Human-readable failure text shown to the user.
-    :param code: Semantic failure code, e.g. ``"databricks_sign_in_pending"``.
+    :param code: Semantic failure code, or ``None`` for the generic classifier.
     :param title: Short headline for the error card, or ``None``.
     :param remediation: Concrete next step for the user, or ``None``.
     :param undelivered: ``True`` when the harness never received the message.
@@ -131,7 +137,7 @@ class InnerExecutorError(RuntimeError):
         self,
         message: str,
         *,
-        code: str,
+        code: str | None,
         title: str | None = None,
         remediation: str | None = None,
         undelivered: bool = False,
@@ -246,6 +252,8 @@ class ExecutorAdapter(HarnessApp):
         # Set True before each genuine-completion return so the finally can schedule a
         # bounded interrupt only on abnormal exits (CancelledError, ExecutorError, etc.).
         clean_exit = False
+        input_identity = input_attributes(request.model_dump(include=set(INPUT_FIELDS)))
+        input_outcome_logged = False
         self._dispatched_call_ids.clear()
         self._observed_tool_calls.clear()
         self._pr_tool_calls.clear()
@@ -278,7 +286,15 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with session_scope(turn_session_id), phase_scope(ErrorPhase.TURN), trace_cm:
+            with (
+                session_scope(turn_session_id),
+                phase_scope(ErrorPhase.TURN),
+                trace_cm,
+                input_delivery_scope(input_identity, response_id=ctx.response_id),
+            ):
+                log_input_event(
+                    _logger, "native_input_execution_started", session_id=turn_session_id
+                )
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -294,6 +310,13 @@ class ExecutorAdapter(HarnessApp):
                     config=config,
                 ):
                     if ctx.cancelled.is_set():
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="cancelled",
+                        )
+                        input_outcome_logged = True
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
 
@@ -333,12 +356,26 @@ class ExecutorAdapter(HarnessApp):
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="executor_returned",
+                        )
+                        input_outcome_logged = True
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None
                         clean_exit = True
                         return
                     if isinstance(event, TurnCancelled):
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="cancelled",
+                        )
+                        input_outcome_logged = True
                         ctx.cancelled.set()
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
@@ -349,6 +386,14 @@ class ExecutorAdapter(HarnessApp):
                         clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
+                        log_input_event(
+                            _logger,
+                            "native_input_execution_finished",
+                            session_id=turn_session_id,
+                            outcome="reported_undelivered" if event.undelivered else "error",
+                            error_code=event.code,
+                        )
+                        input_outcome_logged = True
                         clean_exit = event.preserve_session
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
@@ -366,19 +411,36 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
-                        if event.code:
-                            # The executor named the failure: keep its code, headline
-                            # and next step so the card reads as that failure rather
-                            # than as a bare exception class.
+                        if event.code or event.undelivered:
+                            # Delivery evidence must survive even when the executor
+                            # leaves classification to the generic error path.
                             raise InnerExecutorError(
-                                detail,
+                                detail if event.code else f"inner executor error: {detail}",
                                 code=event.code,
                                 title=event.title,
                                 remediation=event.remediation,
                                 undelivered=event.undelivered,
                             )
                         raise RuntimeError(f"inner executor error: {detail}")
+                log_input_event(
+                    _logger,
+                    "native_input_execution_finished",
+                    session_id=turn_session_id,
+                    outcome="executor_stream_ended",
+                )
+                input_outcome_logged = True
         except ElicitationDeclinedError:
+            if input_identity and not input_outcome_logged:
+                log_input_event(
+                    _logger,
+                    "native_input_execution_finished",
+                    session_id=turn_session_id,
+                    attributes=input_identity,
+                    response_id=ctx.response_id,
+                    outcome="cancelled",
+                    cancellation_reason="elicitation_declined",
+                )
+                input_outcome_logged = True
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
             _logger.info(
                 "elicitation explicitly declined for response %s — aborting turn",
@@ -392,7 +454,18 @@ class ExecutorAdapter(HarnessApp):
             ctx.cancelled.set()
             if self._executor is not None:
                 await self._executor.interrupt_session(self._session_key)
-        except BaseException:
+        except BaseException as exc:
+            if input_identity and not input_outcome_logged:
+                log_input_event(
+                    _logger,
+                    "native_input_execution_finished",
+                    session_id=turn_session_id,
+                    attributes=input_identity,
+                    response_id=ctx.response_id,
+                    outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                    exception_type=type(exc).__name__,
+                )
+                input_outcome_logged = True
             # Close the span so it doesn't leak on the OTel provider.
             if tctx is not None and agent_span is not None:
                 tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
@@ -564,7 +637,31 @@ class ExecutorAdapter(HarnessApp):
             if ctx.cancelled.is_set():
                 return
             try:
-                accepted = await executor.enqueue_session_message(self._session_key, text)
+                with input_delivery_scope(
+                    injection.model_dump(include=set(INPUT_FIELDS)), response_id=ctx.response_id
+                ):
+                    log_input_event(
+                        _logger, "native_input_steering_started", session_id=ctx.session_id
+                    )
+                    try:
+                        accepted = await executor.enqueue_session_message(self._session_key, text)
+                    except BaseException as exc:
+                        log_input_event(
+                            _logger,
+                            "native_input_steering_finished",
+                            session_id=ctx.session_id,
+                            outcome="cancelled"
+                            if isinstance(exc, asyncio.CancelledError)
+                            else "error",
+                            exception_type=type(exc).__name__,
+                        )
+                        raise
+                    log_input_event(
+                        _logger,
+                        "native_input_steering_finished",
+                        session_id=ctx.session_id,
+                        outcome="executor_accepted" if accepted else "executor_refused",
+                    )
             except Exception:
                 _logger.exception(
                     "inner executor.enqueue_session_message failed; in-band injection lost"
@@ -989,11 +1086,13 @@ class ExecutorAdapter(HarnessApp):
     def _build_error_detail(self, exception: BaseException) -> Any:
         """Map an exception to a semantic code the Omnigent retry allowlist recognizes.
 
-        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``.
-        Unknown types fall back to base class (``type(exception).__name__``).
+        OmnigentError uses its own ``code``; others go through ``classify_inner_exception``,
+        then a text check for a CLI too old for the model. Unknown types fall back to base
+        class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
+        from omnigent.runner.launch_failure import diagnose_client_update_required
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, ProviderAuthRequired):
@@ -1005,6 +1104,11 @@ class ExecutorAdapter(HarnessApp):
                 remediation=exception.remediation,
             )
         if isinstance(exception, InnerExecutorError):
+            if not exception.code:
+                detail = self._build_error_detail(RuntimeError(str(exception)))
+                return detail.model_copy(
+                    update={"undelivered": True if exception.undelivered else None}
+                )
             return ErrorDetail(
                 code=exception.code,
                 message=str(exception),
@@ -1018,6 +1122,18 @@ class ExecutorAdapter(HarnessApp):
         code = classify_inner_exception(exception)
         if code is not None:
             return ErrorDetail(code=code, message=str(exception))
+
+        # An old-CLI model refusal reaches here as a bare RuntimeError; its text names the fix.
+        message = str(exception)
+        diagnosis = diagnose_client_update_required(message)
+        if diagnosis is not None:
+            return ErrorDetail(
+                code="client_update_required",
+                message=message,
+                title=diagnosis.title,
+                cause=diagnosis.cause,
+                remediation=diagnosis.remediation,
+            )
 
         return super()._build_error_detail(exception)
 

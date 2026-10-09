@@ -20,6 +20,7 @@ subprocess spawn, no real CLI.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
@@ -106,7 +107,7 @@ def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
 def _isolate_ambient_provider_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Isolate host state ambient provider detection reads (issue #4279).
 
-    Two ambient sources leak past ``$OMNIGENT_CONFIG_HOME``:
+    Ambient sources leak past ``$OMNIGENT_CONFIG_HOME``:
 
     - ``~/.codex/config.toml`` and ``~/.databrickscfg`` live under ``$HOME``
       (``$USERPROFILE`` on Windows), so redirect it to an empty temp dir.
@@ -119,6 +120,7 @@ def _isolate_ambient_provider_state(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("omnigent.onboarding.ambient._claude_login_detected", lambda: False)
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
 
 
 @pytest.fixture
@@ -566,6 +568,152 @@ def test_claude_sdk_falls_back_to_first_available_anthropic_credential(
     assert _resolve_provider_for_build(spec, harness_type="claude-sdk") is None
 
 
+@pytest.fixture
+def managed_claude_settings(config_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Use an isolated enterprise Claude credential instead of host settings."""
+    settings = config_home / "managed-settings.json"
+    settings.write_text(json.dumps({"apiKeyHelper": "printf %s managed-token"}))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+    return settings
+
+
+@pytest.mark.parametrize("configured_subscription", [True, False])
+@pytest.mark.parametrize("credential", ["helper", "gateway"])
+def test_claude_sdk_managed_credential_beats_unselected_saved_key(
+    config_home: Path,
+    managed_claude_settings: Path,
+    configured_subscription: bool,
+    credential: str,
+) -> None:
+    """An unpinned SDK parent keeps the CLI's managed auth and model."""
+    if credential == "gateway":
+        managed_claude_settings.write_text(json.dumps({"env": {"CLAUDE_CODE_USE_GATEWAY": "1"}}))
+    providers: dict[str, object] = {
+        "anthropic": {
+            "kind": "key",
+            "anthropic": _key_family(
+                "https://api.anthropic.com", "saved-key", "unrelated-saved-model"
+            ),
+        }
+    }
+    if configured_subscription:
+        providers["claude-subscription"] = {"kind": "subscription", "cli": "claude"}
+    _write_config(config_home, {"providers": providers})
+    before = (config_home / "config.yaml").read_text()
+    spec = _make_spec(harness="claude-sdk")
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert not any(key.startswith("HARNESS_CLAUDE_SDK_GATEWAY") for key in env)
+    assert "HARNESS_CLAUDE_SDK_API_KEY_HELPER" not in env
+    assert "HARNESS_CLAUDE_SDK_MODEL" not in env
+    for for_launch in (True, False):
+        provider = _resolve_provider_for_build(
+            spec, harness_type="claude-sdk", for_launch=for_launch
+        )
+        assert provider is not None
+        assert provider.kind == "subscription"
+        assert provider.cli == "claude"
+    assert (config_home / "config.yaml").read_text() == before
+
+
+def test_claude_sdk_managed_fallback_preserves_spec_model(
+    config_home: Path, managed_claude_settings: Path
+) -> None:
+    """Letting the CLI own auth must not remove an explicitly pinned model."""
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "anthropic": {
+                    "kind": "key",
+                    "anthropic": _key_family(
+                        "https://api.anthropic.com", "saved-key", "unrelated-saved-model"
+                    ),
+                },
+                "claude-subscription": {"kind": "subscription", "cli": "claude"},
+            }
+        },
+    )
+    spec = _make_spec(harness="claude-sdk", model="managed-pinned-model")
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "managed-pinned-model"
+    assert "HARNESS_CLAUDE_SDK_GATEWAY" not in env
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "native-claude"])
+def test_claude_sdk_managed_fallback_does_not_change_native_resolution(
+    config_home: Path, managed_claude_settings: Path, harness: str
+) -> None:
+    """Native Claude retains its own fallback despite sharing the SDK adapter."""
+    _write_config(
+        config_home,
+        {"providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}},
+    )
+
+    assert (
+        _resolve_provider_for_build(
+            _make_spec(harness=harness), harness_type="claude-sdk", actual_harness=harness
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("selection", ["named", "default"])
+def test_claude_sdk_explicit_provider_beats_managed_fallback(
+    config_home: Path, managed_claude_settings: Path, selection: str
+) -> None:
+    """Managed CLI credentials do not override an intentional provider choice."""
+    key_provider: dict[str, object] = {
+        "kind": "key",
+        "anthropic": _key_family("https://selected.example.com", "selected-key", "selected-model"),
+    }
+    if selection == "default":
+        key_provider["default"] = ["anthropic"]
+    _write_config(config_home, {"providers": {"selected": key_provider}})
+    spec = _make_spec(
+        harness="claude-sdk",
+        auth=ProviderAuth(name="selected") if selection == "named" else None,
+    )
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://selected.example.com"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s selected-key"
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "selected-model"
+
+
+def test_claude_sdk_managed_url_without_credentials_keeps_saved_key_fallback(
+    config_home: Path, managed_claude_settings: Path
+) -> None:
+    """A managed endpoint alone cannot authenticate the SDK parent."""
+    managed_claude_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://managed.example.com"}})
+    )
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "anthropic": {
+                    "kind": "key",
+                    "anthropic": _key_family(
+                        "https://api.anthropic.com", "saved-key", "saved-model"
+                    ),
+                },
+                "claude-subscription": {"kind": "subscription", "cli": "claude"},
+            }
+        },
+    )
+
+    env = _build_claude_sdk_spawn_env(_make_spec(harness="claude-sdk"), workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s saved-key"
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "saved-model"
+
+
 def test_for_launch_gates_legacy_databricks_synthesis(config_home: Path) -> None:
     """
     A legacy Databricks credential is folded into a synthesized provider only
@@ -754,6 +902,89 @@ def test_named_provider_auth_missing_provider_fails_loud(config_home: Path) -> N
 
     with pytest.raises(Exception, match="does-not-exist"):
         _build_claude_sdk_spawn_env(spec, workdir=None)
+
+
+def test_named_provider_auth_survives_inference_config_overlay(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    ``executor.auth: {type: provider, name: X}`` finds the local provider even
+    when ``OMNIGENT_INFERENCE_CONFIG`` is active and would otherwise displace it.
+
+    Regression guard for OMNI-11616.  The Databricks App server sets
+    ``OMNIGENT_INFERENCE_CONFIG`` with its own server-side providers.
+    ``load_runtime_inference_config`` overlays those providers on top of the
+    user's ``~/.omnigent/config.yaml``, wiping the user's custom gateway entry.
+    A custom agent spec that explicitly names this provider via
+    ``executor.auth: {type: provider, name: databricks-uc-gateway}`` must still
+    be routed through it — the overlay should not prevent the user's own
+    explicitly-declared provider from being used.
+
+    The fix in ``_resolve_provider_for_build``: when the provider is absent from
+    the overlay config, fall back to the raw local config and try there.  This
+    lets the explicit ``ProviderAuth`` win; server harness-bindings (the
+    ``resolve_bound_provider`` early-return path) still take precedence.
+    """
+    import json
+
+    # User's ~/.omnigent/config.yaml has their custom gateway provider.
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "databricks-uc-gateway": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": (
+                            "https://fevm-srijit-nair-ci-demo.cloud.databricks.com"
+                            "/ai-gateway/anthropic"
+                        ),
+                        "auth_command": (
+                            "env -u DATABRICKS_CONFIG_PROFILE "
+                            "databricks auth token -p ci-demo | jq -r .access_token"
+                        ),
+                        "models": {"default": "databricks-claude-sonnet-4-5"},
+                    },
+                }
+            }
+        },
+    )
+
+    # The managed sandbox sets OMNIGENT_INFERENCE_CONFIG with server-side
+    # providers that do NOT include 'databricks-uc-gateway'.
+    server_inference = {
+        "providers": {
+            "some-server-gateway": {
+                "kind": "gateway",
+                "anthropic": {
+                    "base_url": "https://server.databricks.com/ai-gateway/anthropic",
+                    "auth_command": "echo server-token",
+                    "models": {"default": "server-model"},
+                },
+            }
+        },
+        "inference": {},
+    }
+    inference_path = tmp_path / "inference.json"
+    inference_path.write_text(json.dumps(server_inference))
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(inference_path))
+
+    spec = _make_spec(harness="claude-sdk", auth=ProviderAuth(name="databricks-uc-gateway"))
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    # The user's custom gateway provider must win.
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert (
+        env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"]
+        == "https://fevm-srijit-nair-ci-demo.cloud.databricks.com/ai-gateway/anthropic"
+    )
+    assert "databricks auth token -p ci-demo" in env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"]
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-5"
+    # The server's gateway must not have leaked in.
+    assert "server.databricks.com" not in env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"]
 
 
 # ── Per-family selection through the spawn path ─────────────────────────────
@@ -1369,7 +1600,7 @@ def _cli_config_default_config() -> dict[str, object]:
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
                 "default": True,
             }
         }
@@ -1407,7 +1638,7 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
     """A codex ``subscription`` default pins the built-in ``openai`` provider.
 
     The executor bridges the user's ~/.codex/config.toml, whose custom
-    default model_provider (e.g. isaac's Databricks AI Gateway) would
+    default model_provider (e.g. isaac's Databricks Unity Gateway) would
     otherwise silently hijack a Subscription selection. Failure means
     "Subscription" stops meaning "ChatGPT login" on machines with a custom
     config.toml default.
@@ -1447,7 +1678,7 @@ def test_pi_cli_config_databricks_default_routes_gateway(
     """A cli-config Databricks gateway default routes the pi (gateway) harness.
 
     Unlike openai-agents (which fails loud), pi CAN consume a cli-config
-    Databricks AI Gateway — the gateway's Anthropic Messages surface is one Pi
+    Databricks Unity Gateway — the gateway's Anthropic Messages surface is one Pi
     speaks. The gateway-harness pi path must translate it into the
     ``HARNESS_PI_GATEWAY_*`` transport (the same vars an inline gateway emits),
     pointing at the gateway's ``/anthropic`` surface — NOT raise the
@@ -1548,7 +1779,7 @@ _DISMISSIBLE_CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]

@@ -1,7 +1,7 @@
 """Shared test helpers for the native-harness policy hooks.
 
 Used by both ``tests/harnesses/claude_native/test_claude_native_hook.py`` and
-``tests/test_codex_native_hook.py`` so the fail-closed failure-mode stub
+``tests/harnesses/codex_native/test_codex_native_hook.py`` so the fail-closed failure-mode stub
 lives in one place and can't drift if new modes are added.
 """
 

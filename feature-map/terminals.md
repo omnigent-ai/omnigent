@@ -21,8 +21,6 @@ reattach when the session moves to another host.
   agent terminal attach to the new host's terminal, not the old one.
 - `direct-attach`: when the runner is on the same machine the terminal connects
   directly, and falls back to the relay when the direct route is unreachable.
-- `agent-switch-cleanup`: switching the session's agent removes the old agent's
-  terminals instead of leaving closed tabs.
 - `tmux-outage`: terminals stay usable through temporary tmux health-check
   failures and still notice a real exit afterwards.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
@@ -46,6 +44,9 @@ reattach when the session moves to another host.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
+Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+hosts. Their "Switch host…" item is disabled; hover or focus it for the
+unsupported explanation.
 
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
@@ -86,9 +87,6 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`direct-attach`:**
   `tests/e2e_ui/shells/test_terminal_direct_attach.py::test_terminal_upgrades_to_loopback_attach_when_runner_is_local`,
   `tests/e2e_ui/shells/test_terminal_direct_attach.py::test_terminal_falls_back_to_relay_when_loopback_is_unreachable`
-- **`agent-switch-cleanup`:**
-  `tests/e2e_ui/agent_switch/test_switch_agent_terminals.py::test_switch_agent_prunes_dead_terminals`
-  (opt-in; read the test for the environment variable it needs).
 - **`tmux-outage`:**
   `tests/e2e_ui/shells/test_antigravity_tmux_recovery.py::test_antigravity_survives_probe_outage_then_detects_exit`
   (opt-in; Antigravity only).

@@ -1,11 +1,11 @@
-// Standalone entry for the gated server selector v2 (Electron shell).
+// Standalone entry for the Electron server selector V2.
 //
-// Loaded from a file:// window when OMNIGENT_SERVER_SELECTOR_V2=1 (see
-// electron/src/main.js `setupPagePath`). Renders the ServerSelectorV2, wiring it
+// Loaded from a file:// window (see electron/src/main.js `setupPagePath`).
+// Renders the ServerSelectorV2, wiring it
 // to the shell's `omnigentSetup` preload bridge (server URL, recent / managed
 // servers, connect, start-local). Theme follows the OS via index.css.
 
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Spinner } from "./components/ui/spinner";
 import type { Runner } from "./pages/onboarding/RunnerStep";
@@ -24,6 +24,7 @@ interface OmnigentSetup {
   onConnectionProgress?: (cb: (p: { requestId?: string; phase?: string }) => void) => () => void;
   getManagedServers: () => Promise<string[]>;
   getManagedServerNames?: () => Promise<Record<string, string>>;
+  getServerNames?: () => Promise<Record<string, string>>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
   getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
@@ -78,6 +79,7 @@ export function BridgeSetupApp() {
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
   const [managedServerNames, setManagedServerNames] = useState<Record<string, string>>({});
+  const [serverNames, setServerNames] = useState<Record<string, string>>({});
   // Whether the `omnigent` CLI is installed — decides "Install" vs "Start"/"Open".
   // Undefined until the probe resolves.
   const [installed, setInstalled] = useState<boolean | undefined>(undefined);
@@ -100,6 +102,13 @@ export function BridgeSetupApp() {
   const [ready, setReady] = useState(false);
   // The in-flight connect's request ID; cleared by Cancel so its late result reads as cancelled.
   const activeConnect = useRef<string | null>(null);
+  const refreshCliStatus = useCallback(async () => {
+    const status = await setupBridge()?.getCliStatus();
+    setInstalled(status?.installed === true);
+    setInstallSupported(status?.installSupported === true);
+    setLocalServerRunning(status?.localServerRunning === true);
+    return status?.installed === true;
+  }, []);
 
   useEffect(() => {
     const bridge = setupBridge();
@@ -124,11 +133,11 @@ export function BridgeSetupApp() {
       (names) => setManagedServerNames(names ?? {}),
       () => {},
     );
-    const cli = bridge.getCliStatus().then((status) => {
-      setInstalled(status?.installed === true);
-      setInstallSupported(status?.installSupported === true);
-      setLocalServerRunning(status?.localServerRunning === true);
-    });
+    void bridge.getServerNames?.().then(
+      (names) => setServerNames(names ?? {}),
+      () => {},
+    );
+    const cli = refreshCliStatus();
     // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
     // it too, so the legacy item isn't shown enabled before v2Forced resolves.
     const caps = bridge.getSetupCapabilities
@@ -151,7 +160,7 @@ export function BridgeSetupApp() {
       setInstalled((prev) => prev ?? false);
       setReady(true);
     });
-  }, [failedUrl, isEphemeral]);
+  }, [failedUrl, isEphemeral, refreshCliStatus]);
 
   // Sync the wizard's `.dark` class with the shell's effective theme: the dark
   // styles key off the class (index.css), not the OS media query. The shell
@@ -169,7 +178,10 @@ export function BridgeSetupApp() {
     recentServers,
     managedServers,
     managedServerNames,
+    serverNames,
     installed,
+    installSupported,
+    onRecheckCli: refreshCliStatus,
     connectedBefore,
     localServerRunning,
     onConnect: async (url, onPhase) => {
@@ -330,10 +342,7 @@ export function BridgeSetupApp() {
 
   return (
     <>
-      {/* Window drag surface: with the native title bar hidden (titleBarStyle
-          "hiddenInset" / frame:false, see electron/src/main.js) this strip is
-          the only place the user can grab to move the window. Matches the
-          static setup page's 36px .drag-strip. */}
+      {/* Match the main shell and static setup page's 48px window drag band. */}
       <div
         style={
           {
@@ -341,7 +350,7 @@ export function BridgeSetupApp() {
             top: 0,
             left: 0,
             right: 0,
-            height: 36,
+            height: 48,
             WebkitAppRegion: "drag",
           } as CSSProperties
         }

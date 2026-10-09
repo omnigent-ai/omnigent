@@ -4,13 +4,18 @@ Run **both Polly AI Review (`/review`) and Open Code Review (`/ocr`)** on the
 PR you are driving. Neither reviewer automatically reruns on every push. Their
 slash-command handlers ignore bot comments, so Resolve uses the equivalent
 `workflow_dispatch` entry points with its App token (Actions: read and write, for run/artifact reads and dispatch). Use
-`review_cycle.py request` below as the single dispatch path; it forces missing
-reviews to rerun even when skip markers or incomplete publication evidence remain.
+`review_cycle.py request` below as the single dispatch path. It reuses verified
+automatic reviews of the current commit and waits for a matching review already
+running. New commits need their own reviews. CI may route this command through
+its host so the session does not need a broader token.
 
 Use the target repository's default branch for workflow code, including fork
-PRs. Never run a workflow from the contributor's branch. A missing workflow,
-403, unavailable credentials, or failed review is an incomplete review, never a
-clean result. Do not fall back to bot-authored slash comments.
+PRs. Never run a workflow from the contributor's branch. A missing workflow, 403, capacity limit, timeout, or failed review is unavailable
+coverage, never a clean result. In CI's checked-publication mode, record these
+as `review_failures` with the run URL, head and reason, or retain the host's
+request-failure receipt. They are warnings and do not require code changes.
+Continue checking product CI and dispositioning every real finding. CI's helper
+validates those conditions before allowing `fixed` with a review warning. Do not fall back to bot-authored slash comments.
 
 #### Collect complete, current-head feedback
 
@@ -44,10 +49,11 @@ Completion requires these independent proofs, not just green checks:
 - **Polly:** a trusted bot comment starting with exact `<!-- polly-review-bot -->`,
   `<!-- polly-reviewed-sha: <full current head SHA> -->`, and matching
   `polly-review-run` lines, plus an unexpired `polly-completed-<pr>-<head SHA>`
-  artifact from a completed, successful `polly-review.yml` run on the default
-  branch via `workflow_dispatch` or `issue_comment`. Marker text quoted inside
-  another bot's review cannot establish completion. Automatic `pull_request`
-  runs do not establish trusted workflow provenance; dispatch through the helper.
+  artifact from a completed, successful `polly-review.yml` run via trusted
+  `pull_request_target`, or via `workflow_dispatch`/`issue_comment` on the default
+  branch. Marker text quoted inside another bot's review cannot establish
+  completion. Legacy `pull_request` runs remain untrusted; request a fresh review
+  through the helper when only that older evidence exists.
   Repositories must deploy the receipt-producing Polly workflow before this gate
   can pass. Do not fall back to bare markers on older workflow versions.
 - **OCR:** an unexpired `ocr-completed-<pr>-<full current head SHA>` artifact
@@ -108,12 +114,14 @@ proof and dispositions cannot establish readiness for a new head. A fork takeove
 starts the same loop on the replacement PR.
 
 Continue fix → test → push → both reviews → triage until no actionable findings
-remain. There is **no fixed review-round cap**. Repeated invalid findings can be
+remain. Follow the workflow-provided review budget when present; otherwise there is no fixed review-round cap. Repeated invalid findings can be
 justified against current code; they do not require meaningless edits to appease
-a reviewer. Stop early only for a concrete blocker, a necessary human decision,
-or an actual execution deadline. Preserve the head, review run links, findings,
-dispositions, and next actions in the handoff. Use `partially_fixed` (or
-`needs_more_info` for a required decision); never call that state ready or clean.
+a reviewer. For ambiguous design intent, use `resolve-investigate` to prepare a
+supported recommendation on the PR and complete independent work. A remaining
+design choice belongs in `remaining_work` with `partially_fixed`, not an
+interactive question. Concrete blockers and an actual execution deadline still
+permit an early handoff. Preserve the head, review run links, findings,
+dispositions, and next actions; never call an incomplete state ready or clean.
 
 Before `fixed`, approval, or a ready-for-maintainer handoff, write the complete
 handoff to a local JSON file and run the live gate:

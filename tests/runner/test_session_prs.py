@@ -397,6 +397,37 @@ def test_pr_changes_still_use_command_targets(command: str) -> None:
     assert not created
 
 
+@pytest.mark.parametrize("redirection", ["2>errors.log", "2>>errors.log", "2>&1", "3<input.txt"])
+@pytest.mark.parametrize("target", ["", "2", "42"])
+def test_shell_redirection_descriptors_are_not_pr_targets(redirection: str, target: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"gh pr merge {target} -R example/one --squash {redirection}"},
+        {"exit_code": 0, "stdout": "Done."},
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command,target",
+    [
+        ("gh pr ready -R example/one 2>&1", None),
+        ("gh pr edit -R example/one 2 >out", "2"),
+    ],
+)
+def test_shell_redirections_preserve_positional_arguments(
+    command: str, target: str | None
+) -> None:
+    refs, created = extract_prs(
+        "Bash", {"command": command}, {"exit_code": 0, "stdout": "Updated"}
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
+    assert not created
+
+
 @pytest.mark.parametrize("repo", ["comments", "reviews"])
 def test_repository_name_does_not_classify_rest_operation(repo: str) -> None:
     url = f"https://github.com/example/{repo}/pull/42"
@@ -618,16 +649,14 @@ def test_title_cache_preserves_newer_timeout_marker(
     assert store.list() == latest
 
 
-# ── State-based ordering (OMNI-10446) ────────────────────────────────────────
+# ── State-based ordering ─────────────────────────────────────────────────────
 
 
 def test_list_sorts_open_before_merged(tmp_path: Path) -> None:
     """OPEN PR is placed first in list() regardless of last_seen_at order."""
     store = SessionPrRegistry("conv_a", root=tmp_path)
-    # Record in order: A most recently, B older, then C oldest
     store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=30)
     store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
-    # Cache states: A is MERGED (most recent), B is OPEN (older), C has no state
     store.update_titles({}, states={A: "MERGED", B: "OPEN"})
     result = store.list()
     # B (OPEN, older) must come before A (MERGED, newer)
@@ -647,9 +676,12 @@ def test_list_sorts_open_before_merged(tmp_path: Path) -> None:
         # Same-state: most recently seen first (A seen at 30, B at 20)
         ("OPEN", "OPEN", [A, B]),
         ("MERGED", "MERGED", [A, B]),
-        # None (unknown) sorts like CLOSED — ahead of MERGED
+        # An unprobed PR ranks after OPEN but ahead of CLOSED and MERGED
         (None, "MERGED", [A, B]),
         ("MERGED", None, [B, A]),
+        (None, "CLOSED", [A, B]),
+        ("CLOSED", None, [B, A]),
+        (None, "OPEN", [B, A]),
     ],
 )
 def test_list_state_priority_ordering(
@@ -674,13 +706,28 @@ def test_update_titles_caches_state(tmp_path: Path) -> None:
     assert entries[A].state == "OPEN"
     assert entries[A].title == "PR one"
     assert entries[B].state == "MERGED"
-    # State update must not unset a non-None previous state unless explicitly changed
     store.update_titles({}, states={A: "MERGED"}, timestamp=40)
-    assert store.list()[0].state == "MERGED"  # A state updated
-    # An empty states dict is a no-op; guard prevents unnecessary writes
+    assert {e.url: e.state for e in store.list()} == {A: "MERGED", B: "MERGED"}
+    # A None state keeps the cached one.
+    store.update_titles({}, states={A: None}, timestamp=50)
+    assert {e.url: e.state for e in store.list()} == {A: "MERGED", B: "MERGED"}
     before = store.list()
     store.update_titles({})
     assert store.list() == before
+
+
+def test_state_ranks_ahead_of_relationship(tmp_path: Path) -> None:
+    """An open branch-inferred PR leads a merged explicit one; ties keep explicit first."""
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=30)
+    store.record(
+        [PullRequestRef.from_url(B)], relationship="inferred", source="branch", timestamp=10
+    )
+    assert [e.url for e in store.list()] == [A, B]
+    store.update_titles({}, states={A: "MERGED", B: "OPEN"})
+    assert [e.url for e in store.list()] == [B, A]
+    store.update_titles({}, states={A: "OPEN"})
+    assert [e.url for e in store.list()] == [A, B]
 
 
 def test_state_is_backward_compatible_with_old_registry(tmp_path: Path) -> None:
@@ -1112,10 +1159,27 @@ def test_gh_subcommand_and_host(command: str, urls: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    "result", [{"backgroundTaskId": "job-1"}, {"status": "running"}, {"interrupted": True}]
+    "result,graphql",
+    [
+        ({"backgroundTaskId": "job-1"}, False),
+        ({"status": "running"}, False),
+        ({"interrupted": True}, False),
+        ({"exit_code": 1}, False),
+        ({"exit_code": None, "session_id": "still-running"}, False),
+        ({"exit_code": 1}, True),
+    ],
 )
-def test_background_or_interrupted_shell_does_not_attach_target(result: dict) -> None:
-    refs, _ = extract_prs("Bash", {"command": f"gh pr edit {A} --title new"}, result)
+def test_unsuccessful_shell_does_not_attach_target(result: dict, graphql: bool) -> None:
+    command, output = (
+        (
+            "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+            "{ pullRequest { url } } }'",
+            json.dumps({"data": {"createPullRequest": {"pullRequest": {"url": A}}}}),
+        )
+        if graphql
+        else (f"gh pr edit {A} --title new", A)
+    )
+    refs, _ = extract_prs("exec_command", {"cmd": command}, {**result, "stdout": output})
     assert refs == []
 
 
@@ -1136,6 +1200,7 @@ def test_background_or_interrupted_shell_does_not_attach_target(result: dict) ->
             True,
         ),
         (["gh api repos/example/one/pulls -X POST", "gh pr create"], [A, B], True),
+        (["gh api repos/example/one/pulls -X POST --jq .body", "gh pr create"], [], True),
     ],
 )
 @pytest.mark.parametrize("reverse", [False, True])
@@ -1148,6 +1213,66 @@ def test_combined_operations_keep_prs_without_misattributing_creation(
         A + "\n" + B,
     )
     assert {ref.url for ref in refs} == set(urls)
+    assert was_created is created
+
+
+def test_gitlab_identity_jq_compound_output_remains_unattributed() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {
+            "command": "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .web_url; gh pr create"
+        },
+        "https://gitlab.com/example/one/-/merge_requests/7\n" + A,
+    )
+    assert refs == []
+    assert created
+
+
+@pytest.mark.parametrize(
+    "content_command,target,created",
+    [
+        (
+            "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .description",
+            None,
+            True,
+        ),
+        (
+            "glab api projects/example%2Fone/merge_requests/7 -X PUT "
+            "--hostname gitlab.com --jq .description",
+            "https://gitlab.com/example/one/-/merge_requests/7",
+            False,
+        ),
+        (
+            "az repos pr create --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            None,
+            True,
+        ),
+        (
+            "az repos pr update --id 7 --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            "https://dev.azure.com/example/project/_git/repo/pullrequest/7",
+            False,
+        ),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_graphql_with_other_providers_content_preserves_only_explicit_targets(
+    content_command: str, target: str | None, created: bool, reverse: bool
+) -> None:
+    graphql = (
+        "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+        "{ pullRequest { url } } }' --jq .data.createPullRequest.pullRequest.url"
+    )
+    commands = [graphql, content_command]
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        A + "\n" + B,
+    )
+    assert [ref.url for ref in refs] == ([target] if target else [])
     assert was_created is created
 
 

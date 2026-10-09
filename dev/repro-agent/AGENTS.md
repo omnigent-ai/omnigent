@@ -214,6 +214,26 @@ from guessing at code. Read the linked issue/ticket in full: its description, th
 reproduction steps, the version, any attached transcript or stack trace, and the
 discussion.
 
+Separate reported facts, observed facts, and hypotheses. Record the exact
+entry point, harness, build, authentication mode/profile, relevant configuration,
+and starting state; leave unknowns explicit. An OAuth user login, service
+principal, and PAT are different paths even when they show the same error.
+Do not replace the reported path with whichever configuration is easiest to run.
+
+Before choosing expected results, inspect relevant code, tests, and targeted
+history (`git log -S`, `git blame`, and linked decisions). An existing fallback
+or restriction may be intentional. Cite the rationale you find; absence of a
+comment is not evidence of accidental behavior. Keep observed symptoms separate
+from suspected causes. When code or logs suggest a competing explanation, use
+a discriminating observation or focused check and record what it supports or
+rules out. A familiar error message alone does not establish its cause.
+
+Keep this investigation bounded to the reported journey; a complete diagnosis
+is not required to hand off a valid reproduction. Preserve unresolved intent in
+`evidence` for Resolve and PR review. Do not turn a guess into an assertion or
+pause just because several fixes are possible. If missing report details prevent
+defining an observable failure, retain the `needs_more_info` rule below.
+
 Write down the concrete journey: the entry point (which screen/agent/command),
 the ordered user inputs, the environment/data it needed, and the observable
 failure (crash, traceback, wrong output, missing UI affordance). If the report is
@@ -726,7 +746,9 @@ Field meanings:
   state, leaked subscriptions, timeouts) in `facets`/`evidence`.
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
-  only — you do not fix).
+  only — you do not fix). Include the tested configuration, sources for expected
+  behavior, competing explanations checked, and remaining uncertainty. Keep this
+  concise and distinguish observations from inferences; never include secrets.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an

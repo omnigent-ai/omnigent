@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import os
 import stat
@@ -3699,13 +3700,13 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
-def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
-    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` is hard-linked and its lock dir symlinked.
 
     Codex keeps OAuth tokens for remote (``url =``) MCP servers in
-    ``.credentials.json``, guarded across processes by
-    ``mcp-oauth-locks/``. A private home missing them starts those servers
-    unauthenticated while ``command =`` (stdio) servers still work.
+    ``.credentials.json``, guarded across processes by ``mcp-oauth-locks/``,
+    and rewrites it through an ``O_NOFOLLOW`` open that fails on a symlink
+    with ELOOP, so those servers never start.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
@@ -3720,11 +3721,64 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
 
     _populate_codex_home_config(target, source)
 
-    # Symlinked (not copied) so a refresh in either direction is shared.
-    assert (target / ".credentials.json").is_symlink()
-    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert bridged.samefile(source / ".credentials.json")
+    # Codex's in-place rewrite succeeds and the refresh reaches the real home.
+    fd = os.open(bridged, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, b'{"linear|abc": {"access_token": "t2"}}')
+    finally:
+        os.close(fd)
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t2"}}'
     assert (target / "mcp-oauth-locks").is_symlink()
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_copies_remote_mcp_oauth_across_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the store cannot be hard-linked, it is bridged as a private copy."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / ".credentials.json").chmod(0o600)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert not bridged.samefile(source / ".credentials.json")
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    bridged.write_text('{"linear|abc": {"access_token": "t2"}}')
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+
+
+def test_populate_codex_home_config_replaces_legacy_credentials_symlink(tmp_path: Path) -> None:
+    """A native session home reused from before hard-linking drops its symlink."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "reused_codex_home"
+    target.mkdir()
+    (target / ".credentials.json").symlink_to(source / ".credentials.json")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").samefile(source / ".credentials.json")
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
@@ -4280,6 +4334,29 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
     _run(_t())
 
 
+def test_codex_home_source_preserves_custom_home_from_inherited_credentials_hardlink(
+    tmp_path: Path,
+) -> None:
+    """A nested launch resolves a custom home with no ``auth.json`` or memories symlink."""
+    from omnigent.inner.codex_executor import (
+        _populate_codex_home_config,
+        _resolve_codex_home_config_source,
+    )
+
+    custom_home = tmp_path / "custom-codex-home"
+    custom_home.mkdir()
+    (custom_home / "config.toml").write_text('model_provider = "custom"')
+    (custom_home / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    inherited = tmp_path / "home" / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    inherited.mkdir(parents=True)
+
+    _populate_codex_home_config(inherited, custom_home)
+
+    assert not (inherited / ".credentials.json").is_symlink()
+    default_home = tmp_path / "home" / ".codex"
+    assert _resolve_codex_home_config_source(inherited, default_home) == custom_home.resolve()
+
+
 def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) -> None:
     """If a config file already exists in the target (e.g. from a
     previous partial start), it is not replaced.
@@ -4363,6 +4440,31 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     assert provider["request_max_retries"] == 13
     assert provider["stream_max_retries"] == 13
     assert provider["stream_idle_timeout_ms"] == 300_000
+
+
+def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouched(
+    tmp_path: Path,
+) -> None:
+    """Built-in provider tables get no retry stamping; custom tables in the same config do."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model_provider = "amazon-bedrock"\n\n'
+        '[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n\n'
+        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n'
+    )
+
+    materialize_codex_provider_config(codex_home, [])
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model_providers"]["amazon-bedrock"] == {"aws": {"region": "us-east-1"}}
+    gateway = config["model_providers"]["gateway"]
+    assert gateway["request_max_retries"] == RetryPolicy().max_retries
 
 
 # ---------------------------------------------------------------------------
@@ -4845,16 +4947,18 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
-    """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
+    """Bundle and Codex-specific skills take precedence over shared skills."""
     from omnigent.inner.codex_executor import codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
+    (home / ".agents" / "skills").mkdir(parents=True)
     assert codex_skill_sources(bundle, home) == [
         bundle / "skills",
         home / ".codex" / "skills",
+        home / ".agents" / "skills",
     ]
 
 
@@ -5476,5 +5580,246 @@ def test_run_turn_clears_stale_gateway_error_at_turn_start():
         # normally rather than fast-failing on it.
         assert any(isinstance(e, TurnComplete) for e in events), events
         assert not any(isinstance(e, ExecutorError) for e in events), events
+
+    _run(_t())
+
+
+# A launcher certificate error plus a connection retry must fail the turn promptly.
+
+_CERTIFICATE_STDERR_LINE = (
+    "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
+    "ssl/tls alert certificate expired (_ssl.c:2580)"
+)
+
+
+def _connection_retry_event(*, http_status: int | None = None) -> dict:
+    """The ``error``/``willRetry`` notification codex-cli 0.154 emits per reconnect."""
+    return {
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Reconnecting... waiting for network",
+                "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": http_status}},
+                "additionalDetails": "Connection failed: error sending request",
+            },
+            "willRetry": True,
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+        },
+    }
+
+
+def _completed_turn_event() -> dict:
+    return {
+        "method": "turn/completed",
+        "params": {"turn": {"id": "turn-1", "status": "completed"}},
+    }
+
+
+def _session_with_scripted_turn() -> _CodexAppServerSession:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session._request = AsyncMock(
+        side_effect=[
+            {"result": {"thread": {"id": "thread-1"}}},
+            {"result": {"turn": {"id": "turn-1"}}},
+            {"result": {}},
+        ]
+    )
+    return session
+
+
+async def _run_turn_with_events(session: _CodexAppServerSession, events: list[dict]) -> list:
+    async def _inject() -> None:
+        for event in events:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(event)
+
+    inject_task = asyncio.create_task(_inject())
+    # Bounded so a head that keeps waiting on Codex's reconnect loop fails
+    # here instead of hanging the suite.
+    async with asyncio.timeout(10):
+        collected = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+    await inject_task
+    return collected
+
+
+def test_certificate_failure_on_stderr_fails_fast_on_connection_retry():
+    """The launcher's certificate line plus Codex's first reconnect ends the turn."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(session, [_connection_retry_event()])
+
+            errors = [event for event in events if isinstance(event, ExecutorError)]
+            assert len(errors) == 1, events
+            error = errors[0]
+            assert error.retryable is False
+            assert "could not connect to its model endpoint for gpt-5" in error.message
+            assert "the TLS certificate has expired" in error.message
+            assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in error.message
+            assert "wedged LLM" not in error.message
+            assert error.code == "model_endpoint_certificate_rejected"
+            assert error.title == "Codex can't reach its model endpoint"
+            assert error.remediation is not None and "run dbcert" in error.remediation
+            session._request.assert_any_await(
+                "turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}
+            )
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_connection_retry_without_certificate_evidence_keeps_waiting():
+    """Codex reconnecting on its own stays a retry; only the idle-watchdog cause is recorded."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+            detail = native_forwarder_health.recent_post_failure(60.0)
+            assert detail is not None
+            assert "reconnecting to its model endpoint" in detail
+            assert "Connection failed: error sending request" in detail
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_retry_with_http_status_is_not_blamed_on_certificate():
+    """A retry that got an HTTP response reached the endpoint over TLS, so the turn continues."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(http_status=503), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def _failed_turn_event(message: str) -> dict:
+    return {"method": "turn/failed", "params": {"turn": {"id": "turn-1"}, "message": message}}
+
+
+def test_turn_failed_on_connection_names_certificate_cause():
+    """A connection-level turn failure after the certificate line names the certificate."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("stream disconnected: error sending request")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+        assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in errors[0].message
+        assert "Codex reported: stream disconnected: error sending request" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_after_connection_retry_names_certificate_cause():
+    """A retry that got no response, then a bare failure, is still the certificate's doing."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        # Interrupting is best-effort; a failed interrupt must not mask the cause.
+        session._interrupt_failed_turn = AsyncMock()
+
+        events = await _run_turn_with_events(
+            session, [_connection_retry_event(), _failed_turn_event("turn failed")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_for_unrelated_reason_keeps_its_own_error():
+    """A tool or provider failure keeps Codex's text and stays retryable despite the line."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("command exited with code 1")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is True
+        assert errors[0].message == "command exited with code 1"
+
+    _run(_t())
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [{"id": "turn-1", "status": "completed"}, {"id": "turn-1"}],
+    ids=["status-completed", "legacy-no-status"],
+)
+def test_completed_turn_clears_certificate_evidence(turn: dict):
+    """A turn that reaches the model proves the egress works; the launch-time line is forgotten."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        assert session._certificate_failure is not None
+
+        events = await _run_turn_with_events(
+            session, [{"method": "turn/completed", "params": {"turn": turn}}]
+        )
+
+        assert not any(isinstance(event, ExecutorError) for event in events), events
+        assert session._certificate_failure is None
 
     _run(_t())

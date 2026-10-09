@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
+    _TERMINAL_EXIT_OUTPUT_MAX_LINES,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
@@ -909,6 +911,14 @@ def test_trim_terminal_output_keeps_long_line_before_final_line() -> None:
     assert len(trimmed.split("\n", 1)[1]) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
 
+def test_trim_terminal_output_skips_blank_pane_rows() -> None:
+    # A dead pane's capture has its output at the top, then blank rows down to
+    # tmux's "Pane is dead" line; the blank rows must not use up the line budget.
+    blank_rows = "\n" * (_TERMINAL_EXIT_OUTPUT_MAX_LINES + 10)
+    text = f"Error: failed to get token\n{blank_rows}Pane is dead (status 1)"
+    assert trim_terminal_output(text) == "Error: failed to get token\nPane is dead (status 1)"
+
+
 def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
     trimmed = trim_terminal_output(line)
@@ -1256,6 +1266,68 @@ async def test_cleanup_session_closes_primary_env(
         assert not reg.has_primary_env("conv_1")
     finally:
         os.environ.pop("OMNIGENT_RUNNER_OS_ENV_ROOT", None)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe() -> None:
+    """Primary environment cleanup finishes after repeated cancellation."""
+    reg = SessionResourceRegistry()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    heartbeat_ran_while_blocked = asyncio.Event()
+
+    class _BlockingEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            started.set()
+            assert release.wait(timeout=2.0)
+            self._closed = True
+            finished.set()
+
+    environment = _BlockingEnvironment(
+        spec=OSEnvSpec(type="caller_process", cwd="/tmp", sandbox=OSEnvSandboxSpec(type="none")),
+        cwd=Path("/tmp"),
+    )
+    reg._primary_envs["conv_blocked_cleanup"] = environment
+
+    async def heartbeat() -> None:
+        while not finished.is_set():
+            if started.is_set():
+                heartbeat_ran_while_blocked.set()
+                return
+            await asyncio.sleep(0.01)
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+    watchdog = threading.Thread(
+        target=lambda: (release.wait(timeout=2.0), release.set()),
+        name="test-resource-cleanup-watchdog",
+        daemon=True,
+    )
+    watchdog.start()
+    try:
+        heartbeat_task = asyncio.create_task(heartbeat())
+        cleanup_task = asyncio.create_task(reg.cleanup_session("conv_blocked_cleanup"))
+        await asyncio.wait_for(heartbeat_ran_while_blocked.wait(), timeout=1.0)
+        cleanup_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup_task
+    finally:
+        release.set()
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(cleanup_task, heartbeat_task, return_exceptions=True)
+        watchdog.join(timeout=1.0)
+
+    assert finished.is_set()
+    assert environment._closed
+    assert not reg.has_primary_env("conv_blocked_cleanup")
+    assert heartbeat_ran_while_blocked.is_set()
 
 
 # ── Phase 4: cleanup endpoint tests ─────────────────────────────

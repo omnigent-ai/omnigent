@@ -11,6 +11,7 @@ Pinning:
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -24,6 +25,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     ResponseHeadFrame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from tests.budgets import budget
 
 
 class _NoopWS:
@@ -164,36 +166,53 @@ async def test_wait_for_runner_resolves_multiple_waiters() -> None:
 async def test_wait_for_runner_cap_bounds_waiter_growth() -> None:
     """The per-runner cap prevents unbounded waiter accumulation."""
     reg = TunnelRegistry(max_connect_waiters_per_runner=1)
-    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.2))
-    await _wait_until(lambda: reg.connect_waiter_count("r1") == 1)
+    # Registration ends the admitted wait; scheduling delays must not expire it.
+    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=math.inf))
+    tasks = [first]
+    try:
+        await _wait_until(lambda: reg.connect_waiter_count("r1") == 1, timeout_s=budget(1.0))
 
-    second = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.01))
-    await asyncio.sleep(0)
-    assert reg.connect_waiter_count("r1") == 1
+        second = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.01))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        assert reg.connect_waiter_count("r1") == 1
 
-    assert await second is None
-    assert reg.connect_waiter_count("r1") == 1
-    assert await first is None
-    assert reg.connect_waiter_count("r1") == 0
+        assert await second is None
+        assert reg.connect_waiter_count("r1") == 1
+        session = reg.register("r1", _NoopWS(), _hello())
+        assert await asyncio.wait_for(first, timeout=budget(1.0)) is session
+        assert reg.connect_waiter_count("r1") == 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
 async def test_wait_for_runner_global_cap_bounds_waiter_growth() -> None:
     """The global cap prevents unbounded waiter accumulation across runner ids."""
     reg = TunnelRegistry(max_connect_waiters_total=1)
-    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=0.2))
-    await _wait_until(lambda: reg.connect_waiter_count() == 1)
+    first = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=math.inf))
+    tasks = [first]
+    try:
+        await _wait_until(lambda: reg.connect_waiter_count() == 1, timeout_s=budget(1.0))
 
-    second = asyncio.create_task(reg.wait_for_runner("r2", timeout_s=0.01))
-    await asyncio.sleep(0)
-    assert reg.connect_waiter_count() == 1
-    assert reg.connect_waiter_count("r2") == 0
-    assert reg.connect_wait_started_at("r2") is None
+        second = asyncio.create_task(reg.wait_for_runner("r2", timeout_s=0.01))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        assert reg.connect_waiter_count() == 1
+        assert reg.connect_waiter_count("r2") == 0
+        assert reg.connect_wait_started_at("r2") is None
 
-    assert await second is None
-    assert reg.connect_waiter_count() == 1
-    assert await first is None
-    assert reg.connect_waiter_count() == 0
+        assert await second is None
+        assert reg.connect_waiter_count() == 1
+        session = reg.register("r1", _NoopWS(), _hello())
+        assert await asyncio.wait_for(first, timeout=budget(1.0)) is session
+        assert reg.connect_waiter_count() == 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def test_wait_for_runner_rejects_invalid_waiter_caps() -> None:
