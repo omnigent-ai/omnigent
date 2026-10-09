@@ -24,6 +24,9 @@ the header menu), and each place is a separate entry point.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner.
+- `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
+  writable side chat; Reply on side-chat text quotes it in that chat. Both keep
+  the existing draft and attachments, and quotes can be removed before sending.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -159,6 +162,13 @@ after stopping; this relaunches the parent and both use one runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace.
+
+**Side-chat quotes:** select text in the parent conversation and choose **Ask in
+side chat**. It appends a removable quote to the visible side-chat tab, including
+an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
+new unsent tab. In the desktop side-chat pane or mobile drawer, select transcript
+text and choose **Reply** to quote it in that chat's composer. Adding a quote
+does not send a message; enter a question and send when ready.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -314,6 +324,19 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
   runner and verify parent recovery before binding; the hosted lifecycle test
   above proves live-parent reuse with actual runner processes.
+- **`side-chat-quotes`, desktop Ask in side chat and Reply:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
+  checks pending/live tab reuse, draft preservation, and replies sent only to
+  the child. Hide Workspace and repeat Ask in side chat to verify
+  a new tab opens instead of changing the hidden draft.
+- **`side-chat-quotes`, mobile drawer Reply:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
+  checks that Reply stays on screen and the quoted follow-up reaches only the
+  side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
+  checks quote removal, preserved text/files, read-only chats, and starting-tab
+  eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
+  and parent isolation. In an embedded app, repeat text selection in both the
+  parent and side chat and check the popup's theme and button styling.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
@@ -424,6 +447,9 @@ plain `uv run pytest`, which starts a private server for the test.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new
   chat shares that replacement runner and stops with the parent again.
+- Ask in side chat reuses only a visible, writable tab belonging to the current
+  parent. Hidden, ended, and currently starting tabs are ineligible; another
+  selection opens a new unsent tab. Ended chats do not offer Reply.
 - A phone-width browser run does not prove the mobile side-chat drawer in the
   embedded web app or the native apps. Both style the drawer only inside the
   app's own page area: placed outside it, the drawer stays off screen when

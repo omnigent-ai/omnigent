@@ -15,6 +15,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
@@ -4327,6 +4329,46 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
       expect(textarea()).toHaveValue("");
     },
   );
+
+  it("keeps a selection made during side-chat creation in a new pending tab", async () => {
+    let resolveStart!: () => void;
+    const onStart = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    const queryClient = new QueryClient();
+    const pane = (id: string) => (
+      <QueryClientProvider client={queryClient}>
+        <SideChatPane key={id} childId={id} selectionParentId="conv_test" onStart={onStart} />
+      </QueryClientProvider>
+    );
+    const view = render(pane("pending:starting"));
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "First question" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+
+    // Switching tabs or moving to the mobile drawer must keep the start lock.
+    view.unmount();
+    const remounted = render(pane("pending:starting"));
+    act(() => ref.current?.startSideChat("A second passage"));
+    const newId = useChatStore.getState().sideChatToOpen!.childId;
+    expect(newId).not.toBe("pending:starting");
+    expect(newId).toMatch(/^pending:/);
+    remounted.rerender(pane(newId));
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("A second passage");
+
+    await act(async () => resolveStart());
+
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("First question");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("A second passage");
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(useChatStore.getState().sideChatDrafts[newId]).toBe("A second passage");
+  });
 
   it("does not add selections to another parent's side chat", () => {
     useChatStore.setState({ sideChatSelectionTarget: { childId: "conv_side", parentId: "other" } });

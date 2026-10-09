@@ -120,7 +120,10 @@ describe("side-chat working indicator", () => {
         }),
     );
     useChatStore.setState({ blockedOn: "dialog open", backgroundTaskCount: 1 });
-    renderPane(<SideChatPane childId="pending:side" onStart={onStart} />);
+    const pane = (
+      <SideChatPane childId="pending:side" selectionParentId="conv_main" onStart={onStart} />
+    );
+    const view = renderPane(pane);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Explain the approach" } });
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
@@ -129,12 +132,19 @@ describe("side-chat working indicator", () => {
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(input).toBeDisabled();
+    expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
+
+    view.unmount();
+    renderPane(pane);
+    expect(screen.getByTestId("side-chat-input")).toBeDisabled();
+    expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
 
     await act(async () => rejectStart?.(new Error("Fork creation failed")));
 
     expect(screen.queryByTestId("working-indicator")).toBeNull();
-    expect(input).toBeEnabled();
-    expect(input).toHaveValue("Explain the approach");
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Explain the approach");
+    expect(useChatStore.getState().sideChatSelectionTarget?.childId).toBe("pending:side");
     expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
   });
 });
@@ -239,6 +249,15 @@ describe("side-chat selection reply", () => {
   it("does not offer Reply in a read-only side chat", () => {
     renderPane(<SideChatPane childId={childId} readOnly />);
     selectText(screen.getByText("This side chat has ended and can’t be continued."));
+    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+  });
+
+  it("does not offer Reply while a side chat is starting", () => {
+    useChatStore.setState({
+      sideChatComposers: { "pending:starting": { text: "Question", files: [], starting: true } },
+    });
+    renderPane(<SideChatPane childId="pending:starting" />);
+    selectText(screen.getByTestId("working-indicator"));
     expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
   });
 });

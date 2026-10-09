@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { CornerUpLeftIcon, MessagesSquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { getEmbedRoot } from "@/lib/host";
 
 export function SelectionPopup({
   containerRef,
@@ -127,6 +128,6 @@ export function SelectionPopup({
         </Button>
       ) : null}
     </div>,
-    document.body,
+    getEmbedRoot() ?? document.body,
   );
 }

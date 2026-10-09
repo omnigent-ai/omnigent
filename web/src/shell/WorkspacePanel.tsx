@@ -853,6 +853,7 @@ function WorkspacePanelImpl({
       const awaiting = awaitingPendingIdsRef.current.shift();
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
+        useChatStore.getState().clearSideChatComposer(awaiting);
       } else {
         // Generic already rekeyed its own tab; this just re-selects it (idempotent).
         sideChats.open(childId);

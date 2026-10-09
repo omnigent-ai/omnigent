@@ -1035,6 +1035,7 @@ export interface ConversationState {
  */
 /** One side chat's unsent composer contents. */
 export interface SideChatComposerDraft {
+  starting?: boolean;
   quotes?: string[];
   text: string;
   files: File[];

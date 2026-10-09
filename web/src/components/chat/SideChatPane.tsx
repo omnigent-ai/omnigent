@@ -107,12 +107,12 @@ export function SideChatPane({
   readOnly?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
-  const [starting, setStarting] = useState(false);
+  const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
   const { session } = useSession(pending ? null : childId);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
-    if (!selectionParentId || readOnly) return;
+    if (!selectionParentId || readOnly || starting) return;
     const target = { childId, parentId: selectionParentId };
     useChatStore.setState({ sideChatSelectionTarget: target });
     return () => {
@@ -120,7 +120,7 @@ export function SideChatPane({
         useChatStore.setState({ sideChatSelectionTarget: null });
       }
     };
-  }, [childId, selectionParentId, readOnly]);
+  }, [childId, selectionParentId, readOnly, starting]);
   // Open the child's stream once (real tabs only) so it hydrates and streams
   // here. The store guards a double-bind and re-binds a failed entry, so
   // re-mounts / tab switches / retries are cheap.
@@ -245,14 +245,21 @@ export function SideChatPane({
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;
-    setStarting(true);
+    // Keep the in-flight tab locked across tab switches and drawer remounts.
+    useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+      ...current,
+      starting: true,
+    }));
     try {
       await onStart(text);
       // The quoted selection now travels with the fork's first message.
       useChatStore.getState().clearSideChatDraft(childId);
     } catch {
       // Re-enable the composer while preserving the draft for retry.
-      setStarting(false);
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        starting: false,
+      }));
     }
   };
 
@@ -299,7 +306,7 @@ export function SideChatPane({
             </div>
           )}
         </div>
-        {!readOnly && (
+        {!readOnly && !starting && (
           <SelectionPopup
             containerRef={transcriptRef}
             onReply={(text) => {
