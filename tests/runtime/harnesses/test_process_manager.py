@@ -905,10 +905,11 @@ def test_resolve_module_path_messages_stay_client_safe(
     """
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
+    monkeypatch.setattr(pm_mod, "_HARNESS_MODULES", {_TEST_HARNESS_NAME: _TEST_HARNESS_MODULE})
     with pytest.raises(HarnessSpawnError) as registered:
         _resolve_module_path("never-registered")
-    assert str(registered.value).startswith(
-        "unknown harness 'never-registered'; registered names: ['"
+    assert str(registered.value) == (
+        "unknown harness 'never-registered'; registered names: ['test']"
     )
 
     monkeypatch.setattr(

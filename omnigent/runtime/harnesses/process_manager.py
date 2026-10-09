@@ -308,9 +308,8 @@ async def _wait_for_bind(
     deadline = loop.time() + _SPAWN_READY_TIMEOUT_S
     while True:
         if process.returncode is not None:
-            # Subprocess inherits stderr so the failure message
-            # surfaces on AP's own stderr — operators see the
-            # full traceback there, not in this RuntimeError.
+            # The subprocess inherits stderr, so operators see the full traceback
+            # there; this client-safe message names only the harness and exit code.
             raise HarnessSpawnError(
                 f"harness {harness!r} for conversation "
                 f"{conversation_id!r} exited with "
