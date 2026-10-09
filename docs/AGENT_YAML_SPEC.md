@@ -109,8 +109,9 @@ executor:
 ### Pi context files
 
 With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
-and `CLAUDE.md` from the workspace, its ancestors, and Pi's global agent
-directory. To disable this discovery for an agent, set `context_files: false`:
+and `CLAUDE.md` from the workspace, its ancestors, Pi's global agent directory,
+and the agent bundle's root. To disable this discovery for an agent, set
+`context_files: false`:
 
 ```yaml
 name: focused-agent
@@ -140,6 +141,28 @@ Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
 `--no-context-files` flag. It does not disable skills, extensions, or Pi's
 separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
 or other harnesses.
+
+### Pi bundle resources
+
+A `harness: pi` directory bundle can ship Pi's own project-local resources, and
+sessions load them even though Pi runs in the session workspace rather than in
+the bundle:
+
+- `.pi/extensions/<name>/` directories (or top-level `.pi/extensions/*.ts` /
+  `*.js` files) are passed to Pi with `--extension`; `package.json`
+  `pi.extensions` entries must be files inside the extension directory.
+  Extensions run as code inside the Pi process, so bundle only extensions you
+  trust. Hook-style extensions (for example `before_agent_start`) take full
+  effect; tools an extension registers are loaded but not offered to the model,
+  because sessions expose only Omnigent's bridged tools to Pi.
+- `skills/<name>/SKILL.md` and `.pi/skills/<name>/SKILL.md` are passed with
+  `--skill` and follow the `skills` filter; when both roots define the same
+  name, `skills/` wins.
+- A bundle-root `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` (Pi's order) is
+  appended to the agent's instructions as an automatic context file. It is not
+  appended twice when the spec already adopted that same file as its
+  `instructions:`, and `context_files: false` disables it; an `AGENTS.md` the
+  spec already adopted as the agent's instructions is unaffected by that option.
 
 ### Pi system prompt
 
