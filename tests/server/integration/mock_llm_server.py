@@ -816,6 +816,8 @@ class QueuedResponse:
     # value paces the stream so live surfaces (a native TUI) visibly render
     # intermediate deltas.
     chunk_delay: float = 0.0
+    # Pause /v1/responses after N real SSE events, using the existing gate API.
+    pause_after: int | None = None
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -1141,14 +1143,30 @@ async def create_response(
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
     chunk_delay = qr.chunk_delay
+    events = [event for event in sse_body.split("\n\n") if event]
+    if qr.pause_after is not None and not 1 <= qr.pause_after <= len(events):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "type": "mock_config_error",
+                    "message": (
+                        f"pause_after={qr.pause_after} is outside the {len(events)} SSE events"
+                    ),
+                }
+            },
+        )
 
     async def _generate() -> AsyncIterator[str]:
-        if chunk_delay > 0:
+        if chunk_delay > 0 or qr.pause_after is not None:
             # Paced like ``/v1/messages``: one SSE event at a time.
-            for event in sse_body.split("\n\n"):
-                if event:
-                    yield event + "\n\n"
-                    await asyncio.sleep(chunk_delay)
+            for index, event in enumerate(events, start=1):
+                yield event + "\n\n"
+                if index == qr.pause_after:
+                    qr._pending.set()
+                    _state.pending_gates.append(qr)
+                    await qr._gate.wait()
+                await asyncio.sleep(chunk_delay)
         else:
             yield sse_body
 
@@ -1511,6 +1529,7 @@ async def configure(request: Request) -> dict[str, object]:
                     refusal_category=entry.get("refusal_category"),
                     thinking=entry.get("thinking"),
                     chunk_delay=entry.get("chunk_delay", 0.0),
+                    pause_after=entry.get("pause_after"),
                 )
             )
         count = len(queue.responses)

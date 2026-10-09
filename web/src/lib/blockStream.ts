@@ -706,13 +706,18 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // either empty or carries the previous turn's id, so isResponseSwitch
       // spuriously fires for an in-fact same-response message_done.
       const accumulatedFromDeltas = state.fullText;
+      const text = outputTextFromMessageContent(event.content);
+      const matchesStreamedText = hadOpenText && !!text && text === accumulatedFromDeltas;
 
       // Close prior blocks under the OLD responseId before stamping the new one.
       yield* closeReasoning(state);
       if (hadOpenText) {
-        // On a response switch, event.itemId belongs to the new message — don't
-        // attach it to the old text block being closed.
-        yield* closeText(state, isResponseSwitch ? null : event.itemId || null);
+        // Matching content identifies the same message when its turn header was
+        // lost. Keep its saved ID so a later snapshot cannot add a second copy.
+        yield* closeText(
+          state,
+          !isResponseSwitch || matchesStreamedText ? event.itemId || null : null,
+        );
       }
 
       // A message_done with a new id is a genuine turn transition (the
@@ -732,15 +737,13 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // avoid duplication. Response-switch: emit event.content as the new body.
       if (hadOpenText && !isResponseSwitch) return;
 
-      const text = outputTextFromMessageContent(event.content);
-
       // Race-safe dedup: even on a perceived response switch, if the deltas
       // that just closed accumulated EXACTLY the text in ``event.content``,
       // both belong to the same response and emitting a second ``text_done``
       // would duplicate the assistant message in the UI. Triggered when
       // ``response.created`` is lost on the session stream (the turn-1
       // race against fresh subscribe registration).
-      if (hadOpenText && text === accumulatedFromDeltas) return;
+      if (matchesStreamedText) return;
 
       if (text) {
         yield {
@@ -995,6 +998,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     case "session_terminal_pending":
     case "session_sandbox_status":
     case "session_mcp_startup":
+    case "session_input_accepted":
     case "session_input_consumed":
     case "session_created":
       return;

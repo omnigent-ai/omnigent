@@ -20,7 +20,7 @@ import re
 import tempfile
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -210,6 +210,9 @@ from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+_CANCELLATION_RESPONSE_PREFIX = "cancel_"
+_MAX_INPUT_RECEIPTS = 1000
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
@@ -1363,6 +1366,7 @@ def create_runner_app(
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
+    _session_status_events: dict[str, _JsonObject] = {}
     # Detached watchers answering a /model confirm dialog that pops after
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
@@ -1409,6 +1413,18 @@ def create_runner_app(
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
+    # A completed turn's reply can reach the server after its tunnel reconnects.
+    _received_server_item_ids: dict[str, set[str]] = {}
+    _recent_input_receipts: dict[str, deque[str]] = {}
+
+    def _remember_accepted_input(session_id: str, item_id: str) -> None:
+        received = _received_server_item_ids.setdefault(session_id, set())
+        if item_id not in received:
+            received.add(item_id)
+            _recent_input_receipts.setdefault(
+                session_id, deque(maxlen=_MAX_INPUT_RECEIPTS)
+            ).append(item_id)
+
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
@@ -1464,6 +1480,7 @@ def create_runner_app(
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
                 _native_pane_status[session_id] = _status_value
+                _session_status_events[session_id] = event_body
         _fan_out_child_delta_to_parent(session_id, event_body)
 
     def _child_preview_from_status(
@@ -1812,6 +1829,7 @@ def create_runner_app(
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
+        _session_status_events.pop(event.session_id, None)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
@@ -2985,6 +3003,16 @@ def create_runner_app(
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
+        elif (
+            session_id in _session_histories
+            and _turn_bind_epoch.get(session_id) is not None
+            and not (
+                init_context.envelope is not None and init_context.envelope.resume_interrupted_turn
+            )
+        ):
+            # A live reconnect keeps unsaved replies. Explicit task recovery reloads
+            # history because this runner may have missed work on another runner.
+            history = []
         else:
             history = await _load_history_as_input(session_id)
         execution_seen = (
@@ -3169,7 +3197,7 @@ def create_runner_app(
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
-    async def stream_session(session_id: str) -> StreamingResponse:
+    async def stream_session(session_id: str, input_receipts: bool = False) -> StreamingResponse:
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -3187,6 +3215,9 @@ def create_runner_app(
                     continue
                 if event is None:
                     break
+                # Each server connection must opt in to the new receipt event.
+                if event.get("type") == "session.input.accepted" and not input_receipts:
+                    continue
                 frame = "data: " + json.dumps(event) + "\n\n"
                 try:
                     yield frame.encode("utf-8")
@@ -3202,6 +3233,13 @@ def create_runner_app(
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
+        )
+
+    @app.get("/v1/sessions/{session_id}/input-receipts")
+    async def get_input_receipts(session_id: str) -> JSONResponse:
+        """Confirm accepted inputs even when no browser saw the reconnect event."""
+        return JSONResponse(
+            {"item_ids": list(_recent_input_receipts.get(session_id, ()))},
         )
 
     @app.get("/v1/sessions/{session_id}")
@@ -3329,6 +3367,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
+        _session_status_events.pop(session_id, None)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -3404,6 +3443,8 @@ def create_runner_app(
             _binding.relay.close()
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
+        _received_server_item_ids.pop(session_id, None)
+        _recent_input_receipts.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
         _subagent_recovery_done.discard(session_id)
@@ -3440,12 +3481,12 @@ def create_runner_app(
     ) -> None:
         import uuid as _uuid
 
-        response_id = f"cancel_{_uuid.uuid4().hex}"
+        response_id = f"{_CANCELLATION_RESPONSE_PREFIX}{_uuid.uuid4().hex}"
         for item in items:
             item_type = item.get("type", "message")
             item_data = {k: v for k, v in item.items() if k != "type"}
             try:
-                await server_client.post(
+                response = await server_client.post(
                     f"/v1/sessions/{conv_id}/events",
                     json={
                         "type": "external_conversation_item",
@@ -3457,7 +3498,11 @@ def create_runner_app(
                     },
                     timeout=10.0,
                 )
-            except (httpx.HTTPError, RuntimeError):
+                response.raise_for_status()
+                item_id = response.json().get("item_id")
+                if isinstance(item_id, str) and conv_id in _session_histories:
+                    _received_server_item_ids.setdefault(conv_id, set()).add(item_id)
+            except (httpx.HTTPError, RuntimeError, ValueError):
                 _logger.warning(
                     "Failed to persist cancellation item for %s: %s",
                     conv_id,
@@ -6343,6 +6388,16 @@ def create_runner_app(
                         server_client=server_client,
                     )
 
+                persisted_item_id = message_body.get("persisted_item_id")
+                received_ids: set[str] | None = None
+                if not _is_native_harness(conversation_id) and isinstance(persisted_item_id, str):
+                    received_ids = _received_server_item_ids.setdefault(conversation_id, set())
+                    if persisted_item_id in received_ids:
+                        return JSONResponse(
+                            status_code=202,
+                            content={"status": "accepted", "detail": "Message already accepted."},
+                        )
+
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
                     _awaiting_approval = pending_approvals.has_pending(conversation_id)
@@ -6365,6 +6420,8 @@ def create_runner_app(
                         conversation_id,
                         [],
                     ).append(message_body)
+                    if received_ids is not None and isinstance(persisted_item_id, str):
+                        _remember_accepted_input(conversation_id, persisted_item_id)
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
@@ -6445,15 +6502,22 @@ def create_runner_app(
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:
-                    persisted_item_id = message_body.get("persisted_item_id")
                     loaded = await _load_history_as_input(
                         conversation_id,
                         drop_item_id=persisted_item_id,
                     )
+                    # Reconnect recovery may have queued this message during the read.
+                    if received_ids is not None and persisted_item_id in received_ids:
+                        return JSONResponse(
+                            status_code=202,
+                            content={"status": "accepted", "detail": "Message already accepted."},
+                        )
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
                 _begin_turn_slot(conversation_id)
+                if received_ids is not None and isinstance(persisted_item_id, str):
+                    _remember_accepted_input(conversation_id, persisted_item_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -7514,6 +7578,27 @@ def create_runner_app(
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue
+            # A forward's answer can die with the tunnel after we accepted it.
+            # Report acceptance independently of the history scan's cursor.
+            accepted_ids = list(_recent_input_receipts.get(session_id, ()))
+            for start in range(0, len(accepted_ids), 100):
+                _publish_event(
+                    session_id,
+                    {
+                        "type": "session.input.accepted",
+                        "conversation_id": session_id,
+                        "item_ids": accepted_ids[start : start + 100],
+                    },
+                )
+            # A completed SDK turn's final status may have died with the old server.
+            # Keep the original error/turn ID; don't replay a running edge mid-stream.
+            status_event = _session_status_events.get(session_id)
+            if (
+                session_id not in _active_turns
+                and status_event is not None
+                and status_event.get("status") in {"idle", "waiting", "failed"}
+            ):
+                _publish_event(session_id, status_event)
             try:
                 after_id = _last_server_item_id.get(session_id)
                 all_new: list[_JsonObject] = []
@@ -7539,44 +7624,82 @@ def create_runner_app(
                     last_id = page_items[-1].get("id")
                     if last_id:
                         after_id = last_id
-                        _last_server_item_id[session_id] = last_id
                     if not page.get("has_more", False):
                         break
                 if not all_new:
                     continue
-                new_items = _convert_raw_items_to_input(all_new)
-                _session_histories.setdefault(session_id, []).extend(
-                    new_items,
-                )
-                if (
-                    session_id not in _active_turns
-                    and new_items
-                    and new_items[-1].get("role") == "user"
-                ):
-                    _begin_turn_slot(session_id)
-                    _publish_turn_status(session_id, "running")
+                received_ids = _received_server_item_ids.setdefault(session_id, set())
+                for item in all_new:
+                    item_id = item.get("id")
+                    response_id = item.get("response_id")
+                    # Replies and tool results already live in this runner's history.
+                    # Only user messages can have missed their server-to-runner delivery.
+                    if (
+                        item.get("type") != "message"
+                        or item.get("role") != "user"
+                        or item.get("history_only") is True
+                        # Older servers did not mark Stop records as history-only.
+                        or (
+                            isinstance(response_id, str)
+                            and response_id.startswith(_CANCELLATION_RESPONSE_PREFIX)
+                        )
+                    ):
+                        continue
+                    raw_content = item.get("content", [])
+                    if not isinstance(item_id, str) or not isinstance(raw_content, list):
+                        _logger.warning(
+                            "Catch-up scan skipping malformed user item %r for %s",
+                            item_id,
+                            session_id,
+                        )
+                        continue
+                    if item_id in received_ids:
+                        continue
+                    content = await _resolve_forwarded_message_content(
+                        raw_content,
+                        session_id=session_id,
+                        server_client=server_client,
+                    )
+                    # A live forward or another scan may have won during the fetch.
+                    if item_id in received_ids:
+                        continue
                     agent_id = _session_agent_ids.get(session_id)
                     msg_body: _JsonObject = {
+                        "type": "message",
+                        "role": "user",
+                        "content": content,
+                        "persisted_item_id": item_id,
                         "agent_id": agent_id,
                         "model": agent_id or "",
                         # Catch-up has no live server dispatch carrying renderer state.
                         "browser_renderer_available": False,
                     }
-                    _turn_task = asyncio.create_task(
-                        _run_turn_bg(msg_body, session_id),
-                        name=f"turn-catchup-{session_id}",
+                    _session_message_buffers.setdefault(session_id, []).append(msg_body)
+                    _remember_accepted_input(session_id, item_id)
+                    # The failed forward could not acknowledge this saved message.
+                    _publish_event(
+                        session_id,
+                        {
+                            "type": "session.input.consumed",
+                            "data": {
+                                "item_id": item_id,
+                                "type": "message",
+                                "data": item,
+                                "created_by": item.get("created_by"),
+                            },
+                        },
                     )
-                    _active_turns[session_id] = _turn_task
-                    _turn_task.add_done_callback(
-                        _background_tasks.discard,
-                    )
-                    _background_tasks.add(_turn_task)
+                if after_id:
+                    _last_server_item_id[session_id] = after_id
             except (httpx.HTTPError, RuntimeError):
                 _logger.warning(
                     "Catch-up scan failed for %s",
                     session_id,
                     exc_info=True,
                 )
+            finally:
+                # A later attachment failure must not strand inputs already acknowledged.
+                await _check_and_start_next_turn(session_id)
 
     app.state.catch_up_scan = _catch_up_scan
 

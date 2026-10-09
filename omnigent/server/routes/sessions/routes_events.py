@@ -3054,6 +3054,33 @@ def register_events_routes(
             if runner_client is not None:
                 try:
                     resp = await asyncio.wait_for(
+                        runner_client.get(f"/v1/sessions/{session_id}/input-receipts"),
+                        timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
+                    )
+                    if resp.status_code == 200:
+                        payload = resp.json()
+                        item_ids = payload.get("item_ids") if isinstance(payload, dict) else None
+                        if not isinstance(item_ids, list) or any(
+                            not isinstance(item_id, str) or not item_id for item_id in item_ids
+                        ):
+                            _logger.warning(
+                                "snapshot: malformed input receipts for %s", session_id
+                            )
+                            item_ids = []
+                        for start in range(0, len(item_ids), 100):
+                            events.append(
+                                {
+                                    "type": "session.input.accepted",
+                                    "conversation_id": session_id,
+                                    "item_ids": item_ids[start : start + 100],
+                                }
+                            )
+                except Exception:
+                    _logger.debug(
+                        "snapshot: input receipts failed for %s", session_id, exc_info=True
+                    )
+                try:
+                    resp = await asyncio.wait_for(
                         # order=asc: the web cache appends each replayed
                         # ``created`` event, so the replay must arrive in
                         # creation order or the session's own terminal (always

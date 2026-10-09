@@ -253,10 +253,8 @@ class _CatchUpServer(_SubAgentSnapshotServer):
                         {
                             "id": "item_new1",
                             "type": "message",
-                            "data": {
-                                "role": "user",
-                                "content": [{"type": "input_text", "text": "continue"}],
-                            },
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "continue"}],
                         }
                     ],
                     "has_more": False,

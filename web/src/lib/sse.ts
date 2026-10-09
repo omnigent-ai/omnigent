@@ -39,6 +39,7 @@ import type {
   SessionChildSessionUpdatedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
+  SessionInputAcceptedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
   SessionPresenceEvent,
@@ -814,6 +815,16 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       servers,
     } satisfies SessionMcpStartupEvent;
+  }
+  if (eventType === "session.input.accepted") {
+    if (typeof data.conversation_id !== "string" || !Array.isArray(data.item_ids)) return null;
+    if (!data.item_ids.every((id): id is string => typeof id === "string" && id.length > 0))
+      return null;
+    return {
+      type: "session_input_accepted",
+      conversationId: data.conversation_id,
+      itemIds: data.item_ids,
+    } satisfies SessionInputAcceptedEvent;
   }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.

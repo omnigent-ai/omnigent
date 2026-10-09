@@ -3401,6 +3401,8 @@ def _parse_external_conversation_item(
             f"Invalid data payload for external item type {item_type!r}: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if isinstance(data, MessageData) and data.role == "user":
+        data = data.model_copy(update={"history_only": True})
     if message_id is not None and isinstance(data, MessageData) and data.role == "assistant":
         data = data.model_copy(update={"stream_message_id": message_id})
     return NewConversationItem(
@@ -7283,8 +7285,13 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
-    if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
-        data = data.model_copy(update={"user_authored": True})
+    if isinstance(data, MessageData) and data.role == "user":
+        data = data.model_copy(
+            update={
+                "user_authored": data.user_authored or not data.is_meta,
+                "history_only": False,
+            }
+        )
     return NewConversationItem(
         type=body.type,
         response_id=response_id,

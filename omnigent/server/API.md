@@ -968,7 +968,9 @@ Request body matches `SessionEventInput`:
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
-                                  starting a duplicate task
+                                  starting a duplicate task. The server
+                                  marks user messages `history_only: true`
+                                  so reconnect recovery cannot run them.
       - "external_output_text_delta"
                                 — internal terminal-observed assistant
                                   text delta; publishes a transient
@@ -1308,6 +1310,7 @@ stream and surface queue/interrupt semantics.
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
+| `session.input.accepted` | `SessionInputAcceptedEvent` | `{type, conversation_id, item_ids}` — reconnect receipts for inputs already accepted by the runner. Match sends by item ID; these are not new transcript items. |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |
 | `session.interrupted` | `SessionInterruptedEvent` | `{type, data: {requested_at, queued_item_id?: null}}` (nested envelope) |
 | `session.created` | `SessionCreatedEvent` | `{type, conversation_id: <parent>, child_conversation_id, agent_id, ...}` — emitted on the PARENT session's stream when a sub-agent is spawned. |

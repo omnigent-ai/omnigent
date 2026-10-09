@@ -190,7 +190,7 @@ export async function prefetchSessionHostChain(
     id !== null &&
     visited.size < MAX_HOST_CHAIN_READS &&
     !visited.has(id) &&
-    getSessionHost(sessionId) === null
+    (options.force || getSessionHost(sessionId) === null)
   ) {
     visited.add(id);
     const hopId: string = id;
@@ -216,6 +216,7 @@ export async function prefetchSessionHostChain(
     // snapshot seeds the map the same way.
     setSessionHost(session.id, session.hostId);
     setSessionParent(session.id, session.parentSessionId, session.labels);
+    if (session.hostId) break;
     id = getSessionParent(session.id);
   }
 }

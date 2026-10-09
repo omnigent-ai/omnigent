@@ -3588,6 +3588,12 @@
             "title": "Content",
             "type": "array"
           },
+          "history_only": {
+            "default": false,
+            "description": "Transcript copy that must not start a new runner turn during reconnect recovery. Set by the server for external user items.",
+            "title": "History Only",
+            "type": "boolean"
+          },
           "interrupted": {
             "default": false,
             "description": "`True` when an assistant message is a durable partial response from an interrupted external-native turn, e.g. Codex `turn/completed` with status `\"interrupted\"`. Defaults to `False` and is omitted from serialized payloads in that case.",
@@ -5381,6 +5387,7 @@
             "session.collaboration_mode": "#/components/schemas/SessionCollaborationModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
+            "session.input.accepted": "#/components/schemas/SessionInputAcceptedEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
@@ -5448,6 +5455,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionModelOptionsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionInputAcceptedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionInputConsumedEvent"
@@ -6120,6 +6130,50 @@
           "type"
         ],
         "title": "SessionHeartbeatEvent",
+        "type": "object"
+      },
+      "SessionInputAcceptedEvent": {
+        "description": "Reconfirm inputs held by a surviving runner after its tunnel reconnects.\n\nThese are delivery receipts, not new transcript items. Clients match their\nsends by item id; replaying this event must not consume another pending input.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session whose runner accepted the inputs.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "item_ids": {
+            "description": "Persisted item ids accepted by that runner, in batches of 100.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Item Ids",
+            "type": "array"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.input.accepted",
+            "description": "Always `\"session.input.accepted\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "item_ids"
+        ],
+        "title": "SessionInputAcceptedEvent",
         "type": "object"
       },
       "SessionInputConsumedEvent": {

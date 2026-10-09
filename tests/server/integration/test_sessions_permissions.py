@@ -18,6 +18,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -3193,6 +3194,64 @@ async def test_stream_presence_join_broadcast_and_snapshot(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await collector.stop()
+
+
+@pytest.mark.parametrize(
+    ("payload", "valid"),
+    [
+        ({"item_ids": ["accepted"]}, True),
+        ({"item_ids": []}, True),
+        ({"item_ids": None}, False),
+        ({"item_ids": "accepted"}, False),
+        ({"item_ids": [None]}, False),
+        ({"item_ids": [""]}, False),
+        ({}, False),
+        ([], False),
+    ],
+)
+async def test_stream_receipt_snapshot_validates_runner_payload(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    payload: Any,
+    valid: bool,
+) -> None:
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(auth_client, user="user-a")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+
+    async def get(path: str, **kwargs: Any) -> httpx.Response:
+        return httpx.Response(
+            200, json=payload if path.endswith("/input-receipts") else {"data": []}
+        )
+
+    runner = AsyncMock()
+    runner.get.side_effect = get
+    monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner))
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+    task = asyncio.create_task(
+        auth_client.get(
+            f"/v1/sessions/{session_id}/stream", headers={"X-Forwarded-Email": "user-a"}
+        )
+    )
+    try:
+        response = await _end_stream_via_close(session_id, task)
+        assert response.status_code == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        receipts = [
+            event["item_ids"] for event in events if event["type"] == "session.input.accepted"
+        ]
+        assert receipts == ([payload["item_ids"]] if valid and payload["item_ids"] else [])
+        assert ("malformed input receipts" in caplog.text) is (not valid)
+        assert any(event["type"] == "session.changed_files.invalidated" for event in events)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_stream_disconnect_broadcasts_leave_after_grace(

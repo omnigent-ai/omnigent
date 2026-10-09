@@ -42,6 +42,34 @@ function parse(event: string, data: Record<string, unknown>): StreamEvent[] {
   return [...parseEventLines([JSON.stringify({ event, data })])];
 }
 
+describe("session.input.accepted (FLAT envelope)", () => {
+  it("carries exact accepted ids without creating transcript items", () => {
+    expect(
+      parse("session.input.accepted", {
+        type: "session.input.accepted",
+        conversation_id: "conv_abc",
+        item_ids: ["first", "second"],
+      }),
+    ).toEqual([
+      {
+        type: "session_input_accepted",
+        conversationId: "conv_abc",
+        itemIds: ["first", "second"],
+      },
+    ]);
+  });
+
+  it.each([null, "item", [null], [""], ["first", 42]])("ignores malformed ids: %j", (ids) => {
+    expect(
+      parse("session.input.accepted", {
+        type: "session.input.accepted",
+        conversation_id: "conv_abc",
+        item_ids: ids,
+      }),
+    ).toEqual([]);
+  });
+});
+
 describe("session.status (FLAT envelope)", () => {
   it("lifts conversation_id and status", () => {
     const out = parse("session.status", {

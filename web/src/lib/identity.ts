@@ -46,6 +46,8 @@ const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
 // The request is valid but reached a replica without its host tunnel.
 // Unlike runner_unavailable, wrong_replica can recover by re-addressing.
 const WRONG_REPLICA_CODE = "wrong_replica";
+const REPLICA_HANDOFF_RETRY_MS = 500;
+const REPLICA_HANDOFF_GRACE_MS = 15_000;
 
 /**
  * Classify a request URL for slice-key routing. A host-scoped request must key
@@ -118,7 +120,7 @@ function hostScopeForUrl(url: string): UrlHostScope {
 
 /** Options for resolving a session's routing host. */
 export interface SessionHostResolveOptions {
-  /** Refresh a hostless snapshot after a managed host has been assigned. */
+  /** Refresh a snapshot after its host has been assigned or changed. */
   force?: boolean;
 }
 
@@ -176,13 +178,11 @@ export function resolveSessionHost(
   sessionId: string,
   options: SessionHostResolveOptions = {},
 ): Promise<void> | null {
-  if (
-    _sessionHostResolver === null ||
-    (!getOmnigentHostConfig().fetcher &&
-      !(isDatabricksWorkspace() ? options.force : isHostRoutingEnabled()))
-  )
-    return null;
-  if (getSessionHost(sessionId) !== null) return null;
+  const canResolve =
+    getOmnigentHostConfig().fetcher ||
+    (isDatabricksWorkspace() ? options.force : isHostRoutingEnabled());
+  if (_sessionHostResolver === null || !canResolve) return null;
+  if (!options.force && getSessionHost(sessionId) !== null) return null;
   const refresh = _hostRefreshInFlight.get(sessionId);
   if (refresh !== undefined) return refresh;
   if (!options.force && _hostResolveAttempted.has(sessionId)) return null;
@@ -454,6 +454,19 @@ async function _isWrongReplica(res: Response): Promise<boolean> {
   }
 }
 
+function waitForReplicaRetry(signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, REPLICA_HANDOFF_RETRY_MS);
+    signal?.addEventListener("abort", finish, { once: true });
+    if (signal?.aborted) finish();
+  });
+}
+
 export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -522,6 +535,42 @@ export async function authenticatedFetch(
     cache: "no-store",
   });
 
+  // Ingress can move a host's requests before its tunnels reconnect. Keep the
+  // host key and replay only explicit rejections, with a bounded grace period.
+  if (
+    !isDatabricksWorkspace() &&
+    isHostRoutingEnabled() &&
+    !(init?.body instanceof ReadableStream)
+  ) {
+    const deadline = performance.now() + REPLICA_HANDOFF_GRACE_MS;
+    const explicitHost = new Headers(init?.headers).has(SLICE_KEY_HEADER);
+    const sessionId = sessionIdForHostResolve(url);
+    let refreshedHost = false;
+    let retryHeaders = headers;
+    // Each retry must wait for the preceding attempt's explicit rejection.
+    /* eslint-disable no-await-in-loop */
+    while (await _isWrongReplica(res)) {
+      init?.signal?.throwIfAborted();
+      if (!refreshedHost && !explicitHost && sessionId !== null) {
+        // Another tab may have moved this session, or its first lookup failed.
+        refreshedHost = true;
+        await resolveSessionHost(sessionId, { force: true });
+        const hostId = getSessionHost(sessionId);
+        if (hostId !== null) {
+          retryHeaders = new Headers(headers);
+          retryHeaders.set(SLICE_KEY_HEADER, hostId);
+        }
+      }
+      if (!retryHeaders.has(SLICE_KEY_HEADER)) break;
+      if (performance.now() + REPLICA_HANDOFF_RETRY_MS > deadline) break;
+      await waitForReplicaRetry(init?.signal);
+      init?.signal?.throwIfAborted();
+      if (performance.now() > deadline) break;
+      res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
+    }
+    /* eslint-enable no-await-in-loop */
+  }
+
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
   // back 400 wrong_replica. Re-address ONCE with the key removed so it routes by
   // the default (client and host may be out of sync on which sharding strategy
@@ -555,7 +604,9 @@ export async function authenticatedFetch(
     const sessionId = sessionIdForHostResolve(url);
     if (sessionId !== null) {
       init?.signal?.throwIfAborted();
-      await resolveSessionHost(sessionId, { force: true });
+      if (getSessionHost(sessionId) === null) {
+        await resolveSessionHost(sessionId, { force: true });
+      }
       init?.signal?.throwIfAborted();
       const hostId = getSessionHost(sessionId);
       if (hostId !== null) {

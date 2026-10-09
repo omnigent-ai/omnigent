@@ -304,6 +304,8 @@ class MessageData(BaseModel):
         suppress delayed preview chunks after the authoritative item.
     :param user_authored: Confirmed or conservatively preserved user input;
         prevents legacy content cleanup from hiding literal agent markup.
+    :param history_only: Transcript copy that must not start a new runner turn
+        during reconnect recovery. Set by the server for external user items.
     :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
@@ -313,6 +315,7 @@ class MessageData(BaseModel):
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    history_only: bool = Field(default=False, exclude_if=lambda value: value is False)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None

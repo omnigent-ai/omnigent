@@ -3512,6 +3512,22 @@ class SessionModelOptionsEvent(_SSEEventBase):
     conversation_id: str
 
 
+class SessionInputAcceptedEvent(_SSEEventBase):
+    """Reconfirm inputs held by a surviving runner after its tunnel reconnects.
+
+    These are delivery receipts, not new transcript items. Clients match their
+    sends by item id; replaying this event must not consume another pending input.
+
+    :param type: Always ``"session.input.accepted"``.
+    :param conversation_id: Session whose runner accepted the inputs.
+    :param item_ids: Persisted item ids accepted by that runner, in batches of 100.
+    """
+
+    type: Literal["session.input.accepted"]
+    conversation_id: str
+    item_ids: list[str]
+
+
 class SessionInputConsumedPayload(BaseModel):
     """
     Inner payload of a :class:`SessionInputConsumedEvent`.
@@ -4746,6 +4762,7 @@ ServerStreamEvent = Annotated[
     | SessionSandboxStatusEvent
     | SessionMcpStartupEvent
     | SessionModelOptionsEvent
+    | SessionInputAcceptedEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent

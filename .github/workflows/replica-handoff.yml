@@ -1,0 +1,95 @@
+name: Replica handoff regressions
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'omnigent/**'
+      - 'web/**'
+      - 'tests/_helpers/**'
+      - 'tests/e2e/test_replica_handoff_e2e.py'
+      - 'tests/e2e/conftest.py'
+      - 'tests/e2e/resilience/lab/**'
+      - 'tests/e2e_ui/chat/test_replica_handoff.py'
+      - 'tests/e2e_ui/conftest.py'
+      - 'tests/server/integration/mock_llm_server.py'
+      - '.github/workflows/replica-handoff.yml'
+      - 'uv.lock'
+      - 'pnpm-lock.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replica-handoff-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  OMNIGENT_SKIP_WEB_UI: 'true'
+  OMNIGENT_E2E_REPLICA_HANDOFF: '1'
+  OMNIGENT_E2E_LEGACY_SERVER_ROOT: '${{ github.workspace }}/.replica-legacy-server'
+  UV_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
+  regressions:
+    name: Replica handoff E2E and UI
+    needs: gate
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check out the server from before receipt events existed
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: '9567b2bfc6c3f182e8ae43165c73bf0d64be9076'
+          path: .replica-legacy-server
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: .python-version
+      - uses: ./.github/actions/setup-pnpm
+      - uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          uv sync --frozen --extra all --group test
+          pnpm install --frozen-lockfile --filter web
+          uv run --no-sync playwright install --with-deps chromium
+      - name: Exercise every fault through the client API and browser composer
+        run: |
+          mkdir -p handoff-results
+          uv run --no-sync pytest \
+            tests/e2e/test_replica_handoff_e2e.py \
+            tests/e2e_ui/chat/test_replica_handoff.py \
+            --ui-skip-build --video=on --screenshot=on --tracing=on \
+            --output=handoff-results/browser --basetemp=handoff-results/processes \
+            --junitxml=handoff-results/junit.xml -vv --tb=short
+      - name: Save recordings and transport evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: replica-handoff-${{ github.run_id }}
+          path: |
+            handoff-results/browser/
+            handoff-results/junit.xml
+            handoff-results/processes/**/network.json
+            handoff-results/processes/**/session.json
+            handoff-results/processes/**/items.json
+            handoff-results/processes/**/model-requests.json
+            handoff-results/processes/**/web.log
+            handoff-results/processes/**/server.log
+            handoff-results/processes/**/host.log
+            handoff-results/processes/**/home/.omnigent/logs/
+            handoff-results/processes/**/terminal-*.png
+          include-hidden-files: true
+          retention-days: 14

@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
+import io
 import json
 import os
 import socket
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -28,7 +30,6 @@ async def test_evidence_failure_still_removes_host_container(
     assert spec is not None and spec.loader is not None
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
-    monkeypatch.setattr(verifier.uuid, "uuid4", lambda: SimpleNamespace(hex="cleanup-test"))
     process = Mock()
     if failed_command == "mock-wait":
         process.wait.side_effect = subprocess.TimeoutExpired("mock", 5)
@@ -58,6 +59,8 @@ async def test_evidence_failure_still_removes_host_container(
         url="http://localhost:18081",
         kubeconfig=tmp_path / "kubeconfig",
         output=tmp_path / "evidence",
+        host_id="cleanup-test",
+        replicas=2,
         mock_port=0,
     )
     with pytest.raises(RuntimeError, match="host setup failed"):
@@ -77,6 +80,31 @@ async def test_transient_pod_query_failure_is_retried() -> None:
     query = AsyncMock(side_effect=[RuntimeError("Kubernetes API unavailable"), True])
     assert await verifier.eventually(query, timeout=2)
     assert query.await_count == 2
+
+
+@pytest.mark.parametrize("failure", [OSError, RuntimeError, asyncio.CancelledError])
+async def test_log_follower_closes_its_file_if_startup_fails(
+    monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    spec = importlib.util.spec_from_file_location("nginx_verify", PROTOTYPE / "verify.py")
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    handle = io.StringIO()
+    path = Mock()
+    path.open.return_value = handle
+    monkeypatch.setattr(
+        verifier,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=AsyncMock(side_effect=failure()),
+            subprocess=asyncio.subprocess,
+            CancelledError=asyncio.CancelledError,
+        ),
+    )
+    with pytest.raises(failure):
+        await verifier.start_log_follower(["kubectl"], "pod", path)
+    assert handle.closed
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the prototype uses Linux host networking")
@@ -105,6 +133,55 @@ async def test_mock_keeps_its_ephemeral_port_until_the_child_is_ready(tmp_path: 
             except subprocess.TimeoutExpired:
                 process.kill()
                 await asyncio.to_thread(process.wait, timeout=5)
+
+
+@pytest.mark.parametrize("failed_capture", ["observer", "response", "mock-wait"])
+async def test_browser_evidence_failure_cannot_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_capture: str
+) -> None:
+    monkeypatch.syspath_prepend(str(PROTOTYPE))
+    spec = importlib.util.spec_from_file_location("nginx_browser", PROTOTYPE / "verify_browser.py")
+    assert spec is not None and spec.loader is not None
+    recorder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recorder)
+    monkeypatch.setattr(recorder, "command", AsyncMock(return_value=""))
+    args = argparse.Namespace(url="http://localhost:18081", output=tmp_path, capture_streams=False)
+    host = recorder.BrowserHost(args, 1, "test-host", "upstream", "pod", 0, time.monotonic())
+    host.report["turns"] = [
+        {
+            "reply_visible": True,
+            "saved_user_count": 1,
+            "saved_assistant_count": 1,
+            "rendered_user_count": 1,
+            "rendered_assistant_count": 1,
+            "model_request_count": 1,
+        }
+    ]
+    host.report["final_session_status"] = "idle"
+    if failed_capture == "observer":
+        host.page = AsyncMock()
+        host.page.evaluate.return_value = None
+        host.monitor_task = asyncio.create_task(host.observe_ui())
+        with pytest.raises(RuntimeError, match="observer disappeared"):
+            await host.monitor_task
+    elif failed_capture == "response":
+
+        async def failed_response():
+            raise OSError("response evidence unavailable")
+
+        host.response_tasks.append(asyncio.create_task(failed_response()))
+    else:
+        host.mock = Mock()
+        host.mock.wait.side_effect = subprocess.TimeoutExpired("mock", 5)
+        host.mock_log = io.StringIO()
+    await host.cleanup()
+    assert not host.report["passed"]
+    assert host.report["cleanup_errors"]
+    assert json.loads((host.output / "report.json").read_text())["passed"] is False
+    if failed_capture == "mock-wait":
+        host.mock.kill.assert_called_once()
+        assert host.mock_log.closed
+        assert host.client.is_closed
 
 
 def _run_up(

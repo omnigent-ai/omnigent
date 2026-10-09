@@ -771,6 +771,13 @@ export interface SessionInputConsumedEvent {
   clearedPendingId?: string | null;
 }
 
+/** Delivery receipts from a surviving runner after its tunnel reconnects. */
+export interface SessionInputAcceptedEvent {
+  type: "session_input_accepted";
+  conversationId: string;
+  itemIds: string[];
+}
+
 /**
  * `session.interrupted` — user-triggered cancel reached the loop.
  *
@@ -1020,6 +1027,7 @@ export type StreamEvent =
   | SessionTerminalPendingEvent
   | SessionSandboxStatusEvent
   | SessionMcpStartupEvent
+  | SessionInputAcceptedEvent
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
