@@ -737,6 +737,111 @@ class SysSessionGetInfoTool(Tool):
         }
 
 
+class SysSessionRespondElicitationTool(Tool):
+    """
+    Answer an approval prompt outstanding on a direct child session.
+
+    The write counterpart to the ``pending_elicitations`` that
+    :class:`SysSessionGetInfoTool` reports: without it an orchestrator can
+    see a child blocked on an approval prompt but only a human in the
+    parent's chat can clear it, so an unattended run stalls indefinitely.
+
+    Confined to **direct children** — the target's parent must be the
+    calling session. Answering is a write with consequences beyond the one
+    blocked call (resolving applies the policy writes an ASK gate deferred,
+    e.g. a cost-budget checkpoint), so it stays narrower than the spawn-tree
+    scope ``sys_session_close`` uses and remains subject to the caller's own
+    guardrail policies, which can refuse a dangerous accept.
+
+    Deliberately carries no "remember" option. Remembering an approval
+    retires the gate for a whole tool in that child rather than approving
+    this call, so every later call of that shape would bypass the policy
+    that is meant to stay in the loop; pre-authorisation belongs in the
+    agent's declared policy, not in a model's per-call argument.
+
+    Runner-dispatched: the elicitation index and the resolve route live on
+    the server, so the runner verifies the target and proxies ``POST
+    /v1/sessions/{id}/elicitations/{eid}/resolve``.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_respond_elicitation"``."""
+        return "sys_session_respond_elicitation"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Answer an approval prompt a direct child session is "
+            "blocked on, so an unattended run does not stall waiting "
+            "for a human. Get session_id and elicitation_id from the "
+            "pending_elicitations that sys_session_get_info reports. "
+            "action is 'accept' (approve), 'decline' (refuse) or "
+            "'cancel' (dismiss without a choice); pass content only "
+            "for a prompt that requested form fields. Returns "
+            "session_not_found, session_not_a_child if the target is "
+            "not your own child, or elicitation_not_found if the "
+            "prompt is unknown or already answered."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a ``"function"``
+            sub-dict; ``session_id``, ``elicitation_id`` and ``action``
+            are required.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionRespondElicitationTool.name(),
+                "description": SysSessionRespondElicitationTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The blocked child session, e.g. "
+                                "'conv_abc123'. Must be a direct child "
+                                "of the calling session."
+                            ),
+                        },
+                        "elicitation_id": {
+                            "type": "string",
+                            "description": (
+                                "Correlation id of the prompt to answer, "
+                                "e.g. 'elicit_abc123', as reported in the "
+                                "child's pending_elicitations."
+                            ),
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": ["accept", "decline", "cancel"],
+                            "description": (
+                                "'accept' approves the blocked call, "
+                                "'decline' refuses it, 'cancel' dismisses "
+                                "the prompt without an explicit choice."
+                            ),
+                        },
+                        "content": {
+                            "type": "object",
+                            "description": (
+                                "Form fields, only for a prompt that "
+                                "requested a schema. Omit for a plain "
+                                "approve/refuse prompt."
+                            ),
+                        },
+                    },
+                    "required": ["session_id", "elicitation_id", "action"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
 class SysSessionShareTool(Tool):
     """
     Grant another user (or the public) access to a session.
