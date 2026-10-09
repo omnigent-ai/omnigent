@@ -20,6 +20,7 @@ import logging
 import os
 import pathlib
 import shlex
+import string
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -719,7 +720,9 @@ def _install_csi_u_sequences() -> None:
 
     1. Control characters (``Ctrl+C``, ``Ctrl+D``, etc.) by
        codepoint.
-    2. ``Ctrl+<letter>`` by ASCII code of the letter.
+    2. ``Ctrl+<letter>`` for every letter, and ``Alt+<key>``
+       for every printable key as Escape + the key (the same
+       two presses the legacy ``ESC <key>`` encoding yields).
     3. Special keys (Escape, Backspace, Delete, ``Ctrl+M``,
        Shift+Enter → ``F20``, focus-in/out markers).
 
@@ -769,30 +772,16 @@ def _install_csi_u_sequences() -> None:
     for cp, key in _ctrl_codepoints.items():
         ANSI_SEQUENCES[f"\x1b[{cp};5u"] = key
 
-    _ctrl_letter_keys = {
-        "a": Keys.ControlA,
-        "b": Keys.ControlB,
-        "c": Keys.ControlC,
-        "d": Keys.ControlD,
-        "e": Keys.ControlE,
-        "f": Keys.ControlF,
-        "g": Keys.ControlG,
-        "h": Keys.ControlH,
-        "k": Keys.ControlK,
-        "l": Keys.ControlL,
-        "n": Keys.ControlN,
-        "o": Keys.ControlO,
-        "p": Keys.ControlP,
-        "q": Keys.ControlQ,
-        "r": Keys.ControlR,
-        "s": Keys.ControlS,
-        "t": Keys.ControlT,
-        "u": Keys.ControlU,
-        "w": Keys.ControlW,
-        "y": Keys.ControlY,
-    }
-    for ch, key in _ctrl_letter_keys.items():
-        ANSI_SEQUENCES[f"\x1b[{ord(ch)};5u"] = key
+    # Every Ctrl+letter. The protocol encodes the letter's codepoint, so any
+    # letter missing here leaks "[<cp>;5u" into the prompt (Ctrl+J did).
+    for ch in string.ascii_lowercase:
+        ANSI_SEQUENCES[f"\x1b[{ord(ch)};5u"] = getattr(Keys, f"Control{ch.upper()}")
+
+    # Alt+<printable> → Escape + the key: the two presses the legacy "ESC <key>"
+    # encoding produces, so bindings such as Alt+B / Alt+F (word motion) keep
+    # working instead of leaking "[<cp>;3u".
+    for cp in range(0x21, 0x7F):
+        ANSI_SEQUENCES[f"\x1b[{cp};3u"] = (Keys.Escape, chr(cp))
 
     # Other CSI-u sequences power users hit:
     ANSI_SEQUENCES["\x1b[27u"] = Keys.Escape
