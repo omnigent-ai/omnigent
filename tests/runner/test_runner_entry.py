@@ -2907,7 +2907,7 @@ async def test_resolve_agent_spec_from_server_recovers_on_final_attempt(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [500, 502, 503])
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
 async def test_resolve_agent_spec_from_server_5xx_retry_budget_is_bounded(
     tmp_path: Path,
     status_code: int,

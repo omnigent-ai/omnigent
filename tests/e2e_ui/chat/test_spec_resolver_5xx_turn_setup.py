@@ -220,15 +220,12 @@ class _Spec503Proxy:
                     return
                 buf += chunk
                 pattern = self._pattern
-                if transparent or pattern is None:
-                    bwriter.write(buf)
-                    await bwriter.drain()
-                    buf = b""
-                    continue
-                # Once identified as the WebSocket tunnel, stop scanning: it is
-                # long-lived binary frames, never the target request line.
-                if b"upgrade: websocket" in buf.lower():
+                # Identify the long-lived WebSocket tunnel and stop scanning it
+                # for good; detect it even while unarmed so a tunnel opened
+                # before arm() is never scanned once a pattern is set.
+                if not transparent and b"upgrade: websocket" in buf.lower():
                     transparent = True
+                if transparent or pattern is None:
                     bwriter.write(buf)
                     await bwriter.drain()
                     buf = b""

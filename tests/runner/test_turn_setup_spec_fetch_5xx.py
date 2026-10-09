@@ -376,12 +376,9 @@ async def test_bg_turn_setup_rides_out_transient_spec_fetch_5xx(
     ``failed`` status is ever surfaced to the UI.
 
     :param monkeypatch: Used to zero the resolver backoff delays for speed.
-        ``raising=False`` tolerates a build without that constant.
     :returns: None.
     """
-    monkeypatch.setattr(
-        "omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", _NO_DELAYS, raising=False
-    )
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", _NO_DELAYS)
     resolver_client = _TransientAgentContents5xxClient(_bundle_tar_gz(_BLIP_HARNESS), failures=2)
     captured: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="spec-fetch-blip-cache-") as cache_dir:
@@ -427,14 +424,11 @@ async def test_bg_turn_setup_persistent_spec_fetch_5xx_surfaces_failed_to_ui(
     is logged for operators but genericized out of the client-facing message.
 
     :param monkeypatch: Used to zero the resolver backoff delays for speed.
-        ``raising=False`` tolerates a build without that constant.
     :param caplog: Pytest log capture, used to confirm the canonical
         broken-turn log lines emit and the raw cause is logged, not relayed.
     :returns: None.
     """
-    monkeypatch.setattr(
-        "omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", _NO_DELAYS, raising=False
-    )
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_FETCH_RETRY_DELAYS_S", _NO_DELAYS)
     with tempfile.TemporaryDirectory(prefix="spec-fetch-down-cache-") as cache_dir:
         resolver = functools.partial(
             _resolve_agent_spec_from_server,
