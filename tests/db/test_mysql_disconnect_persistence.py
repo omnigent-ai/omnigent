@@ -1,24 +1,23 @@
 """Regression against a real MySQL server: a transient mid-transaction disconnect
-silently drops a session-persistence write.
+must not silently drop a session-persistence write.
 
-The bug lives in :func:`omnigent.db.utils.run_write_transaction`, which replays
-only CockroachDB serialization failures (40001) and MySQL deadlock victims
-(1213). A connection-loss error raised mid-transaction -- pymysql 2013 ("Lost
-connection to MySQL server during query") or 2006 ("MySQL server has gone
-away") -- is not retryable, so it re-raises and the write is lost. The reported
-signatures both come from a session append: the 2013 case on the
+:func:`omnigent.db.utils.run_write_transaction` replays CockroachDB
+serialization failures (40001) and MySQL deadlock victims (1213). A
+statement-phase connection loss -- pymysql 2013 ("Lost connection to MySQL
+server during query") or 2006 ("MySQL server has gone away") -- must replay
+too, or the append re-raises it and the write is lost. The reported signatures
+both come from a session append: the 2013 case on the
 ``UPDATE conversations SET next_position=...`` write, the 2006 case as a broken
 pipe while the aborted transaction rolls back. Both escape the store as a
 SQLAlchemy ``OperationalError`` (a ``StatementError``), which the server's
 ``_handle_statement_error`` maps to an HTTP 500 with a ``Database error:`` log
 -- the KPI signature this guards against.
 
-This test drives the REAL ``SqlAlchemyConversationStore.append()`` against a
-REAL MySQL 8.0 server (matching the reported ``mysql+pymysql://`` deployment),
-fronting it with a TCP relay that drops the connection mid-statement on the
-reported ``UPDATE conversations`` write. On the buggy build the append re-raises
-the pymysql disconnect and the item never persists; the fix replays the write
-transaction so the append recovers and the item persists exactly once.
+This test drives the real ``SqlAlchemyConversationStore.append()`` against a
+real MySQL 8.0 server (matching the reported ``mysql+pymysql://`` deployment),
+fronting it with a TCP relay that severs the connection mid-statement on the
+reported ``UPDATE conversations`` write, and asserts the item still persists
+exactly once.
 
 The reported disconnects (failover, restart, a ``wait_timeout`` kill) are
 server-side events: MySQL tears the dead session down and releases its row
@@ -42,6 +41,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -49,6 +49,7 @@ pymysql = pytest.importorskip("pymysql")
 
 from sqlalchemy.exc import OperationalError  # noqa: E402
 
+from omnigent.db.utils import clear_engine_cache  # noqa: E402
 from omnigent.entities import MessageData, NewConversationItem  # noqa: E402
 from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
     SqlAlchemyConversationStore,
@@ -56,14 +57,12 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
 
 
 def _find_mysqld() -> str | None:
-    for candidate in ("mysqld", "mariadbd"):
-        found = shutil.which(candidate)
-        if found:
-            return found
-    for path in ("/usr/sbin/mysqld", "/usr/sbin/mariadbd"):
-        if os.path.exists(path):
-            return path
-    return None
+    # The server command uses MySQL-8 syntax (--initialize-insecure, --skip-ssl,
+    # mysql_native_password), so only a real mysqld is a valid backend here.
+    found = shutil.which("mysqld")
+    if found:
+        return found
+    return "/usr/sbin/mysqld" if os.path.exists("/usr/sbin/mysqld") else None
 
 
 def _free_port() -> int:
@@ -265,51 +264,83 @@ def _reap_orphaned_transaction(
 
     A failover, restart, or ``wait_timeout`` kill terminates the dead session
     and releases its row locks. Severing only the TCP path leaves the orphaned
-    transaction holding the ``conversations`` row lock, so once the disconnect
-    has fired, kill the oldest idle in-flight transaction (``RUNNING`` with no
-    active query). The orphan began before the disconnect, so it is strictly
-    older than any replay transaction; killing the oldest never targets the
-    replay, and the replay is then no longer blocked on a lock the real causes
-    would have released. Connects straight to the server, bypassing the relay.
+    transaction holding the ``conversations`` row lock. While the write is in
+    flight (before the drop), record the thread id of the oldest ``RUNNING``
+    transaction -- the orphan-to-be; once the disconnect has fired, kill that
+    exact thread so the reaper targets the orphan rather than the replay, which
+    reconnects on a new thread. If the orphan was never observed before the
+    drop, fall back to the oldest idle ``RUNNING`` transaction (no active
+    query), which the orphan becomes once its client disappears. The reaper's
+    own connection is excluded, and it connects straight to the server,
+    bypassing the relay.
     """
-    while not stop.is_set() and drops() == 0:
-        time.sleep(0.05)
-    killed = False
-    while not killed and not stop.wait(0.1):
-        try:
-            conn = pymysql.connect(
-                host=host,
-                port=port,
-                user="omni",
-                password="omni",
-                database="omnigent",
-                connect_timeout=5,
-            )
-        except Exception:
-            continue
-        try:
-            conn.autocommit(True)
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT trx_mysql_thread_id FROM information_schema.innodb_trx "
-                    "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
-                    "ORDER BY trx_started ASC LIMIT 1"
-                )
-                row = cur.fetchone()
-                if row is not None:
-                    # The orphan may vanish on its own between SELECT and KILL.
-                    with contextlib.suppress(Exception):
-                        cur.execute(f"KILL {int(row[0])}")
-                        killed = True
-        finally:
-            conn.close()
+    orphan_thread_id: int | None = None
+    conn: Any = None
+    try:
+        while not stop.is_set():
+            if conn is None:
+                try:
+                    conn = pymysql.connect(
+                        host=host,
+                        port=port,
+                        user="omni",
+                        password="omni",
+                        database="omnigent",
+                        connect_timeout=5,
+                    )
+                    conn.autocommit(True)
+                except Exception:
+                    conn = None
+                    if stop.wait(0.02):
+                        return
+                    continue
+            dropped = drops() > 0
+            try:
+                with conn.cursor() as cur:
+                    if not dropped:
+                        cur.execute(
+                            "SELECT trx_mysql_thread_id "
+                            "FROM information_schema.innodb_trx "
+                            "WHERE trx_state = 'RUNNING' "
+                            "AND trx_mysql_thread_id <> CONNECTION_ID() "
+                            "ORDER BY trx_started ASC LIMIT 1"
+                        )
+                        row = cur.fetchone()
+                        if row is not None:
+                            orphan_thread_id = int(row[0])
+                    else:
+                        target = orphan_thread_id
+                        if target is None:
+                            cur.execute(
+                                "SELECT trx_mysql_thread_id "
+                                "FROM information_schema.innodb_trx "
+                                "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
+                                "AND trx_mysql_thread_id <> CONNECTION_ID() "
+                                "ORDER BY trx_started ASC LIMIT 1"
+                            )
+                            row = cur.fetchone()
+                            target = int(row[0]) if row is not None else None
+                        if target is not None:
+                            # The orphan may vanish on its own before the KILL.
+                            with contextlib.suppress(Exception):
+                                cur.execute(f"KILL {target}")
+                            return
+            except Exception:
+                conn = None
+                continue
+            if stop.wait(0.01 if not dropped else 0.05):
+                return
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
 
 
 @pytest.fixture(scope="module")
 def mysql_server() -> Iterator[_MySQLServer]:
     mysqld = _find_mysqld()
     if mysqld is None:
-        pytest.skip("mysqld/mariadbd not available")
+        pytest.skip("mysqld not available")
     server = _MySQLServer(mysqld)
     try:
         server.start()
@@ -334,6 +365,9 @@ def store_and_relay(
         yield store, relay
     finally:
         relay.stop()
+        # Dispose the store's cached engine so each test's per-port URI does not
+        # leak a connection pool for the module's lifetime.
+        clear_engine_cache()
 
 
 def _user_message(text: str) -> NewConversationItem:
@@ -350,9 +384,9 @@ def test_transient_mysql_disconnect_persists_session_write(
 ) -> None:
     """A transient disconnect during the append write must not lose the item.
 
-    Fails on the buggy build: ``run_write_transaction`` re-raises the pymysql
-    disconnect (2013/2006) without replay, so the second message never persists
-    and the error escapes as the HTTP 500 / ``Database error:`` KPI signature.
+    Without the replay, ``run_write_transaction`` re-raises the pymysql
+    disconnect (2013/2006), so the second message never persists and the error
+    escapes as the HTTP 500 / ``Database error:`` KPI signature.
     """
     store, relay = store_and_relay
     conv = store.create_conversation()

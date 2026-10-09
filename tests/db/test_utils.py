@@ -246,8 +246,7 @@ def test_run_write_transaction_retries_transient_disconnect(
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            # Only connection_invalidated/statement are inspected, not the DBAPI
-            # error type, so a plain Exception reproduces the 2013/2006 disconnect.
+            # Only connection_invalidated/statement are read, not the error type.
             orig = Exception(f"({errno}, 'Lost connection to MySQL server during query')")
             raise DBAPIError(
                 "UPDATE conversations SET next_position=%(next_position)s",
@@ -271,8 +270,12 @@ def test_run_write_transaction_retries_transient_disconnect(
     assert [session.commit.call_count for session in maker.sessions] == [0, 1]
 
 
-def _make_write_maker(dialect_name: str) -> Any:
-    """A fake named managed session maker that commits/rolls back like the real one."""
+def _make_write_maker(dialect_name: str, commit_side_effect: Exception | None = None) -> Any:
+    """A fake named managed session maker that commits/rolls back like the real one.
+
+    ``commit_side_effect`` makes each session's ``commit()`` raise, modelling a
+    disconnect during the maker's commit at context-manager exit.
+    """
     from collections.abc import Iterator
     from contextlib import contextmanager
 
@@ -286,6 +289,8 @@ def _make_write_maker(dialect_name: str) -> Any:
         @contextmanager
         def __call__(self, query_name: str) -> Iterator[MagicMock]:
             session = MagicMock()
+            if commit_side_effect is not None:
+                session.commit.side_effect = commit_side_effect
             self.sessions.append(session)
             try:
                 yield session
@@ -388,24 +393,28 @@ def test_run_write_transaction_does_not_replay_ambiguous_or_plain_failures() -> 
     """
     from sqlalchemy.exc import DBAPIError
 
-    maker = _make_write_maker("mysql")
-
+    # A disconnect raised while the maker commits surfaces through context-manager
+    # exit with ``statement is None``; it must propagate rather than replay, since
+    # the commit may already have landed.
+    commit_disconnect = DBAPIError(
+        None,
+        None,
+        Exception('(2006, "MySQL server has gone away")'),
+        connection_invalidated=True,
+    )
+    commit_maker = _make_write_maker("mysql", commit_side_effect=commit_disconnect)
     attempts = 0
 
-    def commit_phase_disconnect(_session: object) -> None:
+    def succeeding_write(_session: object) -> None:
         nonlocal attempts
         attempts += 1
-        raise DBAPIError(
-            None,
-            None,
-            Exception('(2006, "MySQL server has gone away")'),
-            connection_invalidated=True,
-        )
 
     with pytest.raises(DBAPIError):
-        run_write_transaction(maker, "write", commit_phase_disconnect)
+        run_write_transaction(commit_maker, "write", succeeding_write)
     assert attempts == 1
+    assert [session.commit.call_count for session in commit_maker.sessions] == [1]
 
+    maker = _make_write_maker("mysql")
     attempts = 0
 
     def plain_statement_failure(_session: object) -> None:
