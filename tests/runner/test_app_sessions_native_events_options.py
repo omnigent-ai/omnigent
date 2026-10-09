@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +148,7 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s
@@ -422,6 +426,7 @@ async def test_events_compact_on_native_session_types_slash_command(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Record the call (including auto_confirm) without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, auto_confirm))
@@ -513,6 +518,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s, auto_confirm
@@ -1797,6 +1803,8 @@ async def test_events_model_change_on_native_session_types_slash_command(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, confirm_hint))
@@ -1895,8 +1903,10 @@ async def _post_model_change_with_status_sequence(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
-        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s, deadline
         commands.append(command)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
@@ -1937,7 +1947,11 @@ async def _post_model_change_with_status_sequence(
     monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
     # No tmux behind these tests: the in-loop dialog check must not spend a
     # real 1 s tmux-info wait per poll.
-    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", lambda _b, *, hint: False)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "confirm_dialog_if_open",
+        lambda _b, *, hint, deadline=None: False,
+    )
     monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.3)
     monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
 
@@ -2152,6 +2166,411 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
     assert resp.status_code == 204, resp.text
 
 
+_BOOT_SESSION_ID = "68c7c1acc5eeec3978c5e62043da51a6"
+
+# Virtual seconds one confirm poll costs when the request runs on a `_VirtualClock`.
+_VIRTUAL_CONFIRM_POLL_S = 0.25
+
+
+class _VirtualClock:
+    """A ``time`` stand-in whose ``sleep`` advances ``monotonic`` instead of blocking."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+async def _post_model_change_through_a_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wait: Callable[..., None],
+    inject: Callable[..., None],
+    status: Callable[[Any], str | None],
+    clock: _VirtualClock | None = None,
+    dialog_deadlines: list[float | None] | None = None,
+) -> httpx.Response:
+    """Run one claude-native ``model_change`` against a scripted terminal boot.
+
+    ``wait``, ``inject`` and ``status`` stand in for the bridge's prompt wait,
+    slash-command injection and statusLine read. The confirm poll is tightened
+    so the unconfirmed path stays fast; its window is left to the handler.
+
+    With a ``clock`` the handler reads it instead of the wall clock and each
+    confirm poll costs it ``_VIRTUAL_CONFIRM_POLL_S``, so the budget arithmetic
+    holds exactly on a loaded machine. The stand-ins advance it for the time
+    they would take. ``dialog_deadlines`` collects the deadline each in-request
+    dialog check was handed.
+
+    :returns: The ``/events`` response.
+    """
+    monkeypatch.setattr(claude_native_bridge, "wait_for_input_ready", wait)
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", status)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
+
+    def _no_dialog(_bridge_dir: Any, *, hint: str, deadline: float | None = None) -> bool:
+        del hint
+        if dialog_deadlines is not None:
+            dialog_deadlines.append(deadline)
+        if clock is not None:
+            clock.sleep(_VIRTUAL_CONFIRM_POLL_S)
+        return False
+
+    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", _no_dialog)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": _BOOT_SESSION_ID, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        if clock is not None:
+            monkeypatch.setattr(native_controls, "time", clock)
+        return await client.post(
+            f"/v1/sessions/{_BOOT_SESSION_ID}/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+
+
+def _prompt_wait_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The structured prompt-wait records the model-change handler logged."""
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_native_model_change_prompt_wait"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_takes_its_baseline_after_a_slow_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A switch asked for mid-boot is typed after the boot and judged against it.
+
+    While Claude Code starts, the statusLine snapshot is empty, so a baseline
+    read at the top of the request is ``None``. The switch then lands under a
+    spelling outside the expected set (a gateway's own id for the model), which
+    only reads as a change against the booted pane's model.
+    """
+    events: list[str] = []
+    state = {"booted": False, "switched": False}
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        events.append("wait")
+        time.sleep(0.05)
+        state["booted"] = True
+
+    def _status(bridge_dir: Any) -> str | None:
+        del bridge_dir
+        if not state["booted"]:
+            return None
+        value = "gateway-claude-opus-4-7" if state["switched"] else "claude-opus-4-6"
+        events.append(f"status:{value}")
+        return value
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir
+        assert state["booted"], f"{command!r} was typed before the prompt was up"
+        events.append("inject")
+        state["switched"] = True
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        resp = await _post_model_change_through_a_boot(
+            monkeypatch, wait=_wait, inject=_inject, status=_status
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert events[:3] == ["wait", "status:claude-opus-4-6", "inject"], events
+    (waited,) = _prompt_wait_events(caplog)
+    assert waited.session_id == _BOOT_SESSION_ID
+    assert waited.attributes["timed_out"] is False
+    assert waited.attributes["waited_ms"] >= 50
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_spends_its_budget_on_the_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow boot comes out of the request's budget instead of adding to it.
+
+    The server abandons the request after ~20s and rolls the pick back, so the
+    prompt wait is capped by what is left of the budget, the injection is
+    handed only what the wait did not use, and the confirm window shrinks to
+    fit. Its own 10s default stays in place here: only the clipping keeps a
+    switch that never lands inside the budget. The request runs on virtual
+    time, so none of this depends on how fast the machine is.
+    """
+    clock = _VirtualClock()
+    started_at = clock.now
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_PROMPT_WAIT_S", 5.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CHANGE_BUDGET_S", 1.5)
+    budgets: dict[str, float] = {}
+    deadlines: list[float | None] = []
+    dialog_deadlines: list[float | None] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, timeout_s
+        budgets["wait"] = ready_timeout_s
+        clock.sleep(0.4)
+
+    def _inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        ready_timeout_s: float | None = None,
+        deadline: float | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        del bridge_dir, command
+        assert ready_timeout_s is not None
+        budgets["inject"] = ready_timeout_s
+        deadlines.append(deadline)
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+        dialog_deadlines=dialog_deadlines,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
+    # The 5s cap is clipped to the 1.5s budget, then the boot's 0.4s is subtracted.
+    assert budgets["wait"] == pytest.approx(1.5)
+    assert budgets["inject"] == pytest.approx(1.1)
+    # The injection and every in-request dialog answer are bound by the instant
+    # the request's budget ends at.
+    assert deadlines == [pytest.approx(started_at + 1.5)]
+    assert dialog_deadlines
+    assert dialog_deadlines == [pytest.approx(started_at + 1.5)] * len(dialog_deadlines)
+    # The confirm window ran out with the budget (give or take one poll), not its 10s default.
+    assert clock.now - started_at <= 1.5 + _VIRTUAL_CONFIRM_POLL_S
+
+
+def _tui_composer(draft: str = "") -> str:
+    """A Claude input box holding ``draft``, framed the way the bridge locates it."""
+    return (
+        "──────────────────────────────\n"
+        f"❯ {draft}\n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+
+
+_TUI_SWITCH_DIALOG = "  Switch model?\n  This will invalidate the prompt cache.\n"
+
+
+class _SlowSwitchTui:
+    """A Claude TUI that lags behind the keys it is sent, on a virtual clock.
+
+    The typed command echoes ``draft_after_s`` after the paste, and the
+    ``/model`` dialog opens ``dialog_after_s`` after the submit; ``None`` means
+    that never happens. Once open, the dialog swallows every Enter, as a
+    repainting TUI drops keys. ``sent`` logs each key with the virtual time it
+    arrived at.
+    """
+
+    def __init__(
+        self,
+        clock: _VirtualClock,
+        *,
+        draft_after_s: float | None,
+        dialog_after_s: float | None,
+    ) -> None:
+        self.sent: list[tuple[float, str]] = []
+        self._clock = clock
+        self._draft_after_s = draft_after_s
+        self._dialog_after_s = dialog_after_s
+        self._pasted_at: float | None = None
+        self._submitted_at: float | None = None
+
+    def run_tmux(self, _socket_path: str, *args: str) -> None:
+        """Stand-in for ``_run_tmux``: log the key and track paste and submit."""
+        now = self._clock.monotonic()
+        self.sent.append((now, args[-1]))
+        if "-l" in args:
+            self._pasted_at = now
+        elif args[-1] == "Enter" and self._submitted_at is None:
+            self._submitted_at = now
+
+    def capture_pane(
+        self, _socket_path: str, _tmux_target: str, *, join_wrapped: bool = False
+    ) -> str:
+        """Stand-in for ``_capture_pane``: the pane as the lagging TUI shows it now."""
+        del join_wrapped
+        now = self._clock.monotonic()
+        if self._submitted_at is not None:
+            dialog_open = (
+                self._dialog_after_s is not None
+                and now - self._submitted_at >= self._dialog_after_s
+            )
+            return _TUI_SWITCH_DIALOG if dialog_open else _tui_composer()
+        echoed = (
+            self._pasted_at is not None
+            and self._draft_after_s is not None
+            and now - self._pasted_at >= self._draft_after_s
+        )
+        return _tui_composer("/model claude-opus-4-7" if echoed else "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("draft_after_s", "dialog_after_s"),
+    [(None, None), (3.0, 3.8)],
+    ids=["submit-never-echoes", "confirm-enter-swallowed"],
+)
+async def test_events_model_change_sends_no_key_past_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    draft_after_s: float | None,
+    dialog_after_s: float | None,
+) -> None:
+    """A slow submission or dialog cannot type into the terminal after the request failed.
+
+    The boot takes the whole prompt wait, so what is left of the budget is less
+    than the paste, dialog watch and confirm retries can spend. Each must stop
+    at the request's deadline: a key sent after it would apply the model once
+    the server has already rolled the pick back.
+    """
+    clock = _VirtualClock()
+    started_at = clock.now
+    budget_s = native_controls._CLAUDE_MODEL_CHANGE_BUDGET_S
+    tui = _SlowSwitchTui(clock, draft_after_s=draft_after_s, dialog_after_s=dialog_after_s)
+    pane_dir = tmp_path / "bridge"
+    pane_dir.mkdir()
+    (pane_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/fake.sock", "tmux_target": "claude:0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", tui.run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", tui.capture_pane)
+    real_inject = claude_native_bridge.inject_slash_command
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        clock.sleep(native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S)
+
+    def _inject(bridge_dir: Any, **kwargs: Any) -> None:
+        # The real injection, aimed at the fake pane's bridge directory.
+        del bridge_dir
+        real_inject(pane_dir, **kwargs)
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_failed"
+    keys = [key for _, key in tui.sent]
+    assert keys[:3] == ["C-u", "/model claude-opus-4-7", "Enter"], keys
+    late = [
+        (round(at - started_at, 2), key) for at, key in tui.sent if at >= started_at + budget_s
+    ]
+    assert late == [], f"keys reached the terminal after the {budget_s}s budget: {late}"
+    assert (
+        clock.now - started_at <= budget_s + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_fails_and_logs_when_the_prompt_never_renders(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A terminal still booting when the wait lapses fails before anything is typed."""
+    typed: list[str] = []
+    status_reads: list[str] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        raise claude_native_bridge.ClaudePromptTimeout(
+            "Claude Code terminal did not become ready within 9.0s"
+        )
+
+    def _status(bridge_dir: Any) -> str | None:
+        del bridge_dir
+        status_reads.append("read")
+        return None
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        resp = await _post_model_change_through_a_boot(
+            monkeypatch,
+            wait=_wait,
+            inject=lambda _bridge_dir, *, command, **_kwargs: typed.append(command),
+            status=_status,
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_failed"
+    assert typed == []
+    assert status_reads == []
+    (waited,) = _prompt_wait_events(caplog)
+    assert waited.attributes["timed_out"] is True
+    assert waited.attributes["error_type"] == "ClaudePromptTimeout"
+    assert waited.attributes["budget_ms"] == round(
+        native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S * 1000
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [{"type": "effort_change", "effort": "high"}, {"type": "compact"}],
+    ids=["effort_change", "compact"],
+)
+async def test_events_settings_controls_cap_their_prompt_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    event: dict[str, Any],
+) -> None:
+    """Effort and compact stop waiting for a booting prompt inside the server's budget.
+
+    Uncapped, a live-but-booting pane earns the slow-boot extension (up to
+    180s), far past the ~20s the server waits for these controls.
+    """
+    caps: list[float | None] = []
+
+    def _fake_inject(
+        bridge_dir: Any, *, command: str, ready_timeout_s: float | None = None, **_kwargs: Any
+    ) -> None:
+        del bridge_dir, command
+        caps.append(ready_timeout_s)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": _BOOT_SESSION_ID, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{_BOOT_SESSION_ID}/events", json=event)
+
+    assert resp.status_code in (200, 204), resp.text
+    assert caps == [native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("pins", "picker_values", "picked", "expected_command"),
@@ -2234,9 +2653,11 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
         """Record the injected command without touching tmux."""
-        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s, deadline
         captured.append(command)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
@@ -2474,6 +2895,8 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s

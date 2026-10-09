@@ -5317,8 +5317,9 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     C-u kills any draft the user is mid-typing — otherwise the paste
     concatenates and Enter submits ``<draft>/effort high``. ``-l`` is
     required so tmux pastes ``/`` and spaces literally; Enter submits.
-    Every capture here is blank, so this also pins the fail-soft path:
-    a never-identifiable draft still gets the single blind submit.
+    Every capture here is an idle composer that never shows the typed
+    command, so this also pins the fail-soft path: a never-identifiable
+    draft still gets the single blind submit.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -5337,10 +5338,13 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         stderr = ""
 
     def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
-        """Record one tmux invocation; return rc=0."""
+        """Record one tmux invocation; return rc=0 and an idle composer."""
         del kwargs
         captured.append(cmd)
-        return _FakeCompleted()
+        result = _FakeCompleted()
+        if "capture-pane" in cmd:
+            result.stdout = _composer_pane()
+        return result
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
@@ -10406,6 +10410,111 @@ def test_a_dialog_that_never_closes_gives_up_instead_of_retrying_forever(
     assert len(enters) >= 2, f"the swallowed confirm Enter was never retried; got {enters}"
 
 
+def test_a_swallowed_confirm_enter_is_not_retried_past_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The confirm retries stop at the caller's deadline, not at their own budget.
+
+    A model change the caller already failed must not land afterwards: with
+    every Enter swallowed, the retries would otherwise keep pressing for the
+    whole accept budget, each one a chance to commit the rolled-back switch.
+    """
+    clock = _VirtualClock()
+    sends: list[tuple[float, str]] = []
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_run_tmux",
+        lambda _socket, *args: sends.append((clock.monotonic(), args[-1])),
+    )
+    # Nothing here ever clears the dialog, however many Enters arrive.
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: _EFFORT_DIALOG_PANE)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    deadline = 1.0
+    # Shorter than the accept budget, so only the deadline can be what stops the retries.
+    assert deadline < claude_native_bridge._CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            deadline=deadline,
+        )
+
+    # The first Enter and one retry fit before the deadline; the next retry would not.
+    assert [key for _, key in sends] == ["Enter", "Enter"]
+    assert all(at < deadline for at, _ in sends), sends
+    assert clock.monotonic() < deadline + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+
+
+@pytest.mark.parametrize(
+    ("pane", "timeout_s", "deadline"),
+    [
+        pytest.param(_EFFORT_DIALOG_PANE, 4.0, 0.0, id="dialog-shows-after-the-deadline"),
+        pytest.param(_IDLE_PANE, 4.0, 1.0, id="watch-cut-short-by-the-deadline"),
+        pytest.param(_IDLE_PANE, 1.0, 1.0, id="blind-enter-due-at-the-deadline"),
+    ],
+)
+def test_confirm_sends_no_enter_once_the_deadline_has_passed(
+    monkeypatch: pytest.MonkeyPatch, pane: str, timeout_s: float, deadline: float
+) -> None:
+    """Neither a confirm Enter nor the blind timeout Enter goes out past the deadline.
+
+    The dialog watch ends at the deadline too, instead of running out its own
+    timeout: the caller is no longer there to use what it finds.
+    """
+    clock = _VirtualClock()
+    tails: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda _s, *args: tails.append(args[-1])
+    )
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: pane)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock",
+            "claude:0.0",
+            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            timeout_s=timeout_s,
+            deadline=deadline,
+        )
+
+    assert tails == []
+    assert clock.monotonic() <= deadline + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+
+
+def test_confirm_dialog_if_open_sends_nothing_once_the_deadline_has_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-request dialog check answers only while the caller is still waiting."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    captures: list[str] = []
+    tails: list[str] = []
+
+    def _capture(_socket_path: str, _tmux_target: str) -> str:
+        captures.append("capture")
+        return _EFFORT_DIALOG_PANE
+
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda _s, *args: tails.append(args[-1])
+    )
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    hint = claude_native_bridge.EFFORT_DIALOG_HINT
+
+    assert (
+        claude_native_bridge.confirm_dialog_if_open(bridge_dir, hint=hint, deadline=0.0) is False
+    )
+    assert captures == [] and tails == []
+
+    assert (
+        claude_native_bridge.confirm_dialog_if_open(bridge_dir, hint=hint, deadline=60.0) is True
+    )
+    assert tails[:1] == ["Enter"]
+
+
 def test_a_slash_command_submit_waits_for_the_command_to_render(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10521,6 +10630,108 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     assert tails == ["C-u", "/effort high", "Enter"], (
         f"An unverifiable draft must submit blind exactly once; got {tails}."
     )
+
+
+def test_inject_slash_command_does_not_submit_blind_past_the_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command that never echoes is submitted blind only while the caller still waits.
+
+    With no deadline the paste wait falls through to an unverified Enter after
+    its own 5s; one landing after the caller gave up could still apply it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    tails: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda _s, *args: tails.append(args[-1])
+    )
+    # The composer never shows the typed command.
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: _IDLE_PANE)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high", deadline=2.0)
+
+    assert tails == ["C-u", "/effort high"]
+    assert clock.monotonic() < claude_native_bridge._PASTE_COMMIT_TIMEOUT_S
+
+
+def test_inject_slash_command_stops_retrying_the_submit_at_the_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swallowed submit Enter is re-sent only until the caller's deadline.
+
+    With the command still drafted, the retries would otherwise run on for the
+    whole verify window.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    sends: list[tuple[float, str]] = []
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_run_tmux",
+        lambda _s, *args: sends.append((clock.monotonic(), args[-1])),
+    )
+    # Every Enter is swallowed: the command stays in the composer.
+    monkeypatch.setattr(
+        claude_native_bridge, "_capture_pane", lambda _s, _t: _composer_pane("/effort high")
+    )
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    deadline = 1.5
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high", deadline=deadline
+        )
+
+    # The submit and its first retry fit before the deadline; the next retry is 2s later.
+    assert [key for _, key in sends] == ["C-u", "/effort high", "Enter", "Enter"]
+    assert all(at < deadline for at, _ in sends), sends
+    assert clock.monotonic() < deadline + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+
+
+def test_inject_slash_command_types_nothing_when_the_prompt_renders_after_the_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot that outlasts the deadline leaves the composer untouched, not half-typed.
+
+    The prompt wait returns once the box finally mounts, which can be past the
+    caller's deadline; typing the command then would leave it drafted, with no
+    one left to submit or clear it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=2.0)
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high", deadline=pane.boot_s
+        )
+
+    assert pane.clock.monotonic() >= pane.boot_s
+    assert pane.composer_keys() == []
+
+
+def test_inject_slash_command_touches_nothing_once_the_deadline_has_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command whose deadline lapsed before it got the injection lock is dropped untouched."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    run_tmux = Mock()
+    capture_pane = Mock(return_value=_IDLE_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture_pane)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionDeadlineExceeded):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high", deadline=0.0)
+
+    run_tmux.assert_not_called()
+    capture_pane.assert_not_called()
 
 
 def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
@@ -11163,6 +11374,250 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
 
 
+class _BootingClaudePane:
+    """A tmux pane whose Claude Code TUI only mounts its input box after a boot.
+
+    Captures read *boot_pane* until the virtual clock reaches ``boot_s``, then a
+    composer holding whatever was typed; every send-keys is logged with the
+    virtual time it happened at. Liveness probes answer ``state``, a live
+    process until a test says otherwise.
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        boot_s: float,
+        boot_pane: str = _BOOTING_PANE,
+    ) -> None:
+        self.clock = _VirtualClock()
+        self.boot_s = boot_s
+        self.boot_pane = boot_pane
+        self.state = claude_native_bridge._ClaudePaneState(True)
+        self.sends: list[tuple[float, str]] = []
+        self._draft = ""
+        monkeypatch.setattr(claude_native_bridge, "_run_tmux", self._run_tmux)
+        monkeypatch.setattr(claude_native_bridge, "_capture_pane", self._capture_pane)
+        monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", self._pane_state)
+        monkeypatch.setattr(claude_native_bridge, "time", self.clock)
+
+    def _pane_state(
+        self, socket_path: str, tmux_target: str
+    ) -> claude_native_bridge._ClaudePaneState:
+        del socket_path, tmux_target
+        return self.state
+
+    def _run_tmux(self, socket_path: str, *args: str) -> None:
+        del socket_path
+        self.sends.append((self.clock.monotonic(), args[-1]))
+        if "-l" in args:
+            self._draft = args[-1]
+        elif args[-1] == "Enter":
+            self._draft = ""
+
+    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        if self.clock.monotonic() < self.boot_s:
+            return self.boot_pane
+        return _composer_pane(self._draft)
+
+    def composer_keys(self) -> list[tuple[float, str]]:
+        """Every keystroke sent; a boot screen gets none, not even a dismissal Escape."""
+        return list(self.sends)
+
+
+def test_inject_slash_command_waits_for_a_booting_prompt_before_typing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Nothing touches the composer until Claude Code's input box has rendered.
+
+    A model change forwarded right after a session wake lands while the TUI is
+    still starting, and a starting TUI drops typed keys: the command never ran
+    while the picker claimed the switch. The boot here outlasts the
+    occupied-input reclaim's own give-up, so only the readiness gate can hold
+    the keystrokes back.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    boot_s = claude_native_bridge._OCCUPIED_INPUT_DISMISS_TIMEOUT_S + 2.0
+    pane = _BootingClaudePane(monkeypatch, boot_s=boot_s)
+
+    claude_native_bridge.inject_slash_command(
+        bridge_dir, command="/effort high", ready_timeout_s=boot_s + 5.0
+    )
+
+    assert [key for _, key in pane.composer_keys()] == ["C-u", "/effort high", "Enter"]
+    assert all(at >= pane.boot_s for at, _ in pane.composer_keys()), pane.sends
+
+
+def test_inject_slash_command_without_a_cap_waits_out_a_slow_boot_like_a_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no cap the wait is the message path's: base budget, then slow-boot extension.
+
+    The turn-time ``/model`` switch is followed by the message itself, which
+    waits for a live pane however long it boots; the switch must not fail the
+    turn earlier than the message would.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=20.0)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda _socket, _target: claude_native_bridge._ClaudePaneState(True),
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high", timeout_s=1.0)
+
+    assert [key for _, key in pane.composer_keys()] == ["C-u", "/effort high", "Enter"]
+    assert all(at >= pane.boot_s for at, _ in pane.composer_keys()), pane.sends
+
+
+def test_inject_slash_command_gives_up_within_its_ready_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A capped wait fails on time with the readiness error, typing nothing.
+
+    The server abandons a model change after ~20s, so a terminal still booting
+    when the cap lapses must fail the command rather than take the message
+    path's slow-boot extension (it is alive, so that extension would run to
+    180s) past the request.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=1000.0)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda _socket, _target: claude_native_bridge._ClaudePaneState(True),
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout, match="did not become ready"):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high", ready_timeout_s=4.0
+        )
+
+    # The reclaim and the readiness poll share the one cap (plus a poll of slack).
+    assert pane.clock.monotonic() <= 4.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    assert pane.composer_keys() == []
+
+
+def test_wait_for_input_ready_returns_after_the_boot_without_typing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The standalone wait blocks through the boot and leaves the composer alone.
+
+    A caller reads the booted pane's statusLine between this wait and the
+    injection, so the wait itself must not type anything.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=5.0)
+
+    claude_native_bridge.wait_for_input_ready(bridge_dir, ready_timeout_s=9.0)
+
+    assert pane.clock.monotonic() >= pane.boot_s
+    assert pane.composer_keys() == []
+
+
+def test_wait_for_input_ready_times_out_at_its_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal still booting when the cap lapses raises the readiness timeout."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=1000.0)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge.wait_for_input_ready(bridge_dir, ready_timeout_s=2.0)
+
+    assert pane.clock.monotonic() <= 2.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    assert pane.composer_keys() == []
+
+
+def test_wait_for_input_ready_reports_a_dead_pane_within_its_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A terminal that exited fails the capped wait at a liveness check, not at the cap.
+
+    The cap used to be the first probe's due time and the deadline check runs
+    first, so no probe ever ran: a dead pane burned the whole cap and came back
+    as a generic readiness timeout instead of the exit it was.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=1000.0)
+    pane.state = claude_native_bridge._ClaudePaneState(False, exited=True, exit_status="1")
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalExited) as excinfo:
+        claude_native_bridge.wait_for_input_ready(bridge_dir, ready_timeout_s=9.0)
+
+    assert excinfo.value.exit_status == "1"
+    # The reclaim may spend its own dismiss window first; the first probe follows a
+    # liveness interval into the readiness wait, far short of the 9s cap.
+    assert pane.clock.monotonic() <= (
+        claude_native_bridge._OCCUPIED_INPUT_DISMISS_TIMEOUT_S
+        + claude_native_bridge._CLAUDE_LIVENESS_POLL_INTERVAL_S
+        + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    )
+    assert pane.composer_keys() == []
+
+
+@pytest.mark.parametrize("alive", [True, None])
+def test_capped_readiness_probes_liveness_until_its_cap(
+    monkeypatch: pytest.MonkeyPatch, alive: bool | None
+) -> None:
+    """A capped wait probes on the regular cadence and still ends exactly at its cap."""
+    clock = _VirtualClock()
+    probe = Mock(return_value=claude_native_bridge._ClaudePaneState(alive))
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/sock", "main", timeout_s=3.5, extend_for_slow_boot=False
+        )
+
+    assert clock.monotonic() == 3.5
+    # One probe per liveness interval (1s, 2s, 3s), none at the cap itself.
+    assert probe.call_count == 3
+
+
+@pytest.mark.parametrize("ready_timeout_s", [30.0, None], ids=["generous-cap", "no-cap"])
+def test_inject_slash_command_waits_for_the_prompt_only_until_its_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ready_timeout_s: float | None,
+) -> None:
+    """
+    The caller's deadline bounds the prompt wait, whatever cap it is given.
+
+    Without a cap a live pane would earn the slow-boot extension, far past the
+    moment the caller stopped waiting.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=1000.0)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout, match="did not become ready"):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir,
+            command="/effort high",
+            ready_timeout_s=ready_timeout_s,
+            deadline=pane.clock.monotonic() + 4.0,
+        )
+
+    assert pane.clock.monotonic() <= 4.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    assert pane.composer_keys() == []
+
+
 def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11171,20 +11626,30 @@ def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
     A composer-less dialog with no Escape hint gets no keystrokes at all.
 
     The restore leaves such a surface alone (an Escape would not clear it,
-    and one spent on launcher output reaches the composer later), and a
-    slash command has no readiness gate behind it: nothing would draft, so
-    the blind submit Enter would accept the dialog's highlighted option
-    instead of running the command, while the call reported success. The
-    ``/effort`` confirmation shows the shape — the pending-user-prompt
-    guard does not recognize it as a decision prompt either.
+    and one spent on launcher output reaches the composer later). The
+    readiness gate then waits for an input box that never mounts, so the call
+    ends with the readiness timeout and nothing typed: a blind submit Enter
+    would accept the dialog's highlighted option instead of running the
+    command, while the call reported success. The ``/effort`` confirmation
+    shows the shape — the pending-user-prompt guard does not recognize it as
+    a decision prompt either.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(monkeypatch, [_EFFORT_DIALOG_PANE])
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda _socket, _target: claude_native_bridge._ClaudePaneState(True),
+    )
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
-        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout, match="did not become ready"):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/compact", ready_timeout_s=2.0
+        )
 
-    assert sends == [], f"Nothing may be typed into the dialog; got {sends}."
+    # No Escape either: the dialog advertises none. Never a C-u, command text or Enter.
+    tails = [args[-1] for args in sends]
+    assert tails == [], f"Nothing may be typed into the dialog; got {tails}."
 
 
 def test_inject_slash_command_fails_loud_when_dismissal_is_exhausted(
@@ -11196,13 +11661,14 @@ def test_inject_slash_command_fails_loud_when_dismissal_is_exhausted(
 
     The picker advertises Escape and takes each one, yet never leaves; the
     restore gives up at :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` and hands
-    the surface back. Only the dismissal Escapes may reach the pane — not
-    the ``C-u``, the command text, or the Enter that used to follow blind.
+    the surface back, and the readiness gate then names the picker and
+    refuses it. Only the dismissal Escapes may reach the pane — not the
+    ``C-u``, the command text, or the Enter that used to follow blind.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by an overlay"):
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="Select model"):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
 
     tails = [args[-1] for args in sends]
@@ -11258,6 +11724,88 @@ def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
 
     assert [args[-1] for args in sends] == ["Escape", "C-u", "/compact", "Enter"]
+
+
+def test_inject_slash_command_waits_out_launcher_output_instead_of_refusing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Launcher output before the input box mounts is waited out, not refused.
+
+    The screen has no composer and no Escape hint, so the reclaim hands it
+    back as an overlay. A booting terminal is not a dialog: the command must
+    neither fail loud nor spend an Escape on it, and goes in once the box
+    mounts.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _BootingClaudePane(monkeypatch, boot_s=2.0, boot_pane=_LAUNCHER_OUTPUT_PANE)
+
+    claude_native_bridge.inject_slash_command(
+        bridge_dir, command="/effort high", ready_timeout_s=9.0
+    )
+
+    assert [key for _, key in pane.sends] == ["C-u", "/effort high", "Enter"]
+    assert all(at >= pane.boot_s for at, _ in pane.sends), pane.sends
+
+
+@pytest.mark.parametrize(
+    ("pane", "surface"),
+    [
+        pytest.param(_SHELL_MODE_PANE, "shell mode", id="shell-mode"),
+        pytest.param(
+            _INLINE_REVERSE_SEARCH_PANE, "the prompt-history search", id="history-search"
+        ),
+    ],
+)
+def test_inject_slash_command_refuses_an_input_mode_that_survives_the_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane: str,
+    surface: str,
+) -> None:
+    """
+    A mode that outlives the dismissal Escapes is refused at once, not waited on.
+
+    Typing there would run the command as bash or filter history, and the
+    prompt wait would only poll out its whole budget before failing, so the
+    refusal comes straight from the restore's result with nothing typed.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [pane])
+    clock = claude_native_bridge.time
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match=f"occupied by {surface}"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    tails = [args[-1] for args in sends]
+    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+    # Refused when the dismissal window lapsed, not after the prompt wait's budget.
+    assert clock.monotonic() <= (
+        claude_native_bridge._OCCUPIED_INPUT_DISMISS_TIMEOUT_S
+        + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
+    )
+
+
+def test_restore_returns_the_surface_that_outlives_a_short_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller-sized dismissal window ends early and hands the surface back.
+
+    The picker takes no Escape, so the window is what ends the restore; the
+    surface it returns is what the caller then refuses to type into.
+    """
+    sends = _fake_tmux(monkeypatch, [_MODEL_PICKER_PANE])
+    clock = claude_native_bridge.time
+
+    surface = claude_native_bridge._restore_occupied_input(
+        "/tmp/example/tmux.sock", "claude:0.0", timeout_s=1.0
+    )
+
+    assert surface == claude_native_bridge._OVERLAY_SURFACE
+    assert {args[-1] for args in sends} == {"Escape"}
+    assert clock.monotonic() <= 1.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(

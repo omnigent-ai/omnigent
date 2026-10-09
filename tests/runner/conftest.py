@@ -69,6 +69,19 @@ def _isolated_model_catalog_store(
 
 
 @pytest.fixture(autouse=True)
+def _no_claude_prompt_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the claude-native model-change prompt wait off a real tmux pane.
+
+    The handler waits for the pane's prompt before typing. Runner tests have no
+    pane behind them, so that wait passes at once; a test that exercises it
+    re-patches ``wait_for_input_ready`` itself.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.wait_for_input_ready", lambda *_a, **_k: None
+    )
+
+
+@pytest.fixture(autouse=True)
 def _ensure_subprocess_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
     """Put the project root on ``PYTHONPATH`` for spawned harness children.
 
