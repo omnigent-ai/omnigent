@@ -25,10 +25,6 @@ The footer indicator is the thinking surface available on every Pi build this
 suite runs against: the ``/thinking`` slash command only exists in newer Pi,
 while the footer reflects ``model.reasoning`` with no picker, model request, or
 network round-trip.
-
-Modelled on ``test_pi_native_gateway_claude_misroute_e2e.py`` (pexpect + fake
-``HOME`` against ``omnigent pi``) and ``test_pi_native_model_scope_e2e.py``
-(``pyte`` screen reads of the Pi TUI).
 """
 
 from __future__ import annotations
@@ -55,6 +51,10 @@ pexpect = pytest.importorskip("pexpect")
 pyte = pytest.importorskip("pyte")
 
 pytestmark = [
+    pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="pi-native thinking e2e seeds the Linux XDG catalog cache and a PATH shim.",
+    ),
     pytest.mark.skipif(
         (_reason := cli_unavailable_reason("pi")) is not None,
         reason=f"pi-native thinking e2e requires a runnable 'pi' CLI; {_reason}.",
@@ -157,10 +157,8 @@ def write_fake_home(home: Path, workspace_url: str) -> None:
     )
     (home / ".databrickscfg").write_text(f"[repro]\nhost = {workspace_url}\ntoken = repro-token\n")
 
-    # Offline CI has no real ``databricks`` binary, but Pi resolves the gateway
-    # provider's apiKey by shelling out to ``databricks auth token``. Provide a
-    # stand-in on PATH that mints the fake profile's PAT the way a configured
-    # workstation's CLI would, so the auth command succeeds without network.
+    # Pi resolves the gateway apiKey via ``databricks auth token``; offline CI
+    # has no real CLI, so put a shim on PATH that mints the fake profile's PAT.
     bin_dir = home / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     databricks_shim = bin_dir / "databricks"
@@ -331,7 +329,11 @@ def select_model(tui: PiTui, model: str) -> None:
     tui.send("/model\r")
     tui.wait_for(lambda text: model in text, timeout=30, what="the model picker")
     tui.send(model.removeprefix("system.ai."))
-    time.sleep(1)
+    tui.wait_for(
+        lambda text: model in text and DEEPSEEK_MODEL not in text,
+        timeout=30,
+        what=f"the picker to narrow to {model}",
+    )
     tui.send("\r")
     tui.wait_for(_footer_shows(model), timeout=30, what=f"the footer naming {model}")
     time.sleep(1)
@@ -346,7 +348,10 @@ def read_footer_thinking(tui: PiTui, model: str, *, settle: float = 8.0) -> str 
     deadline = time.monotonic() + settle
     level: str | None = None
     while time.monotonic() < deadline:
-        tui._pump()
+        try:
+            tui._pump()
+        except pexpect.EOF:
+            pytest.fail(f"omnigent pi exited while reading the footer for {model}:\n{tui.text()}")
         level = footer_thinking_level(tui.text(), model)
         if level is not None:
             return level
@@ -409,6 +414,13 @@ def test_pi_native_gateway_reasoning_models_offer_thinking_levels(pi_home: Path)
             child.kill(signal.SIGKILL)
         stop_local_server(env)
 
+    assert any(
+        r["path"].startswith("/api/2.1/unity-catalog/model-services")
+        for r in _WorkspaceHandler.requests
+    ), (
+        "the mock workspace never served its model-services listing; "
+        f"got {_WorkspaceHandler.requests}"
+    )
     assert thinking["claude"] is not None, (
         f"control failed: Pi's footer showed no thinking indicator for {CLAUDE_MODEL}; "
         f"thinking looks disabled for every model, not just non-Claude ones. Screens: {dump_dir}"

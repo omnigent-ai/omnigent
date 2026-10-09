@@ -3869,7 +3869,7 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
     _real_client = httpx.Client
     with unittest.mock.patch(
         "httpx.Client",
-        lambda **kw: _real_client(transport=_MockTransport()),
+        lambda *args, **kwargs: _real_client(transport=_MockTransport()),
     ):
         claude, gpt, _completions, mlflow = creds._fetch_pi_model_lists(
             "https://wkspc.example.com", "tok"
