@@ -646,10 +646,24 @@ def _paste_payload_bytes(text: str) -> bytes:
 
 
 def _session_alive(socket_path: str, tmux_target: str) -> bool:
-    """Return whether the tmux session/pane still exists (the TUI is running)."""
+    """Return whether the Cursor pane's process is still running.
+
+    The pane is kept after cursor-agent exits (``keep_alive_after_exit``), so
+    ``has-session`` keeps succeeding; ``#{pane_dead}`` tells a live TUI from a
+    retained dead pane. Probe errors fail closed.
+    """
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "list-panes",
+                "-t",
+                tmux_target,
+                "-F",
+                "#{pane_dead}",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -657,7 +671,8 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
-    return proc.returncode == 0
+    flags = proc.stdout.split()
+    return proc.returncode == 0 and bool(flags) and "1" not in flags
 
 
 def capture_cursor_pane(bridge_dir: Path) -> str | None:

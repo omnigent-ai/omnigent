@@ -1,60 +1,65 @@
-"""E2E regression: cursor:main must survive a cursor-agent exit without the generic
-``tmux unavailable ... cursor:main`` cascade, which needs ``keep_alive_after_exit``.
-Skips unless ``cursor-agent`` and ``tmux`` are on PATH."""
+"""E2E regression test: the cursor:main terminal must not disappear from tmux.
+
+Guards against this runner-log signature (``omnigent.inner.terminal`` /
+``_idle_watch_loop_threaded``)::
+
+    tmux unavailable after 3 consecutive probes for terminal cursor:main
+
+The Cursor ``main`` terminal must be launched with ``keep_alive_after_exit``:
+without it, tmux's defaults (``exit-empty on`` + ``remain-on-exit off``) reap
+the lone-pane server the instant ``cursor-agent`` exits, the idle watcher's
+probes fail, and only the generic line above is logged, with no pane exit
+status. Cursor sibling of ``test_pi_main_terminal_tmux_disappears_e2e``; reuses
+its helpers.
+
+The journey is real end-to-end: a host daemon comes online, a cursor-native
+session makes its runner launch the real ``cursor-agent`` TUI in a runner-owned
+tmux pane, then that process is killed. No Cursor login is needed: an
+unauthenticated cursor-agent stays on its "Press any key to log in..." screen
+until it is killed.
+
+    .venv/bin/python -m pytest tests/e2e/test_cursor_main_terminal_tmux_disappears_e2e.py -v
+"""
 
 from __future__ import annotations
 
 import contextlib
-import io
-import json
 import os
 import re
 import shutil
 import signal
 import subprocess
-import tarfile
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
+import psutil
 import pytest
 import yaml
 
-from omnigent._wrapper_labels import (
-    CURSOR_NATIVE_WRAPPER_VALUE,
-    UI_MODE_LABEL_KEY,
-    UI_MODE_TERMINAL_VALUE,
-    WRAPPER_LABEL_KEY,
-)
-from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
-from tests.e2e._harness_probes import cli_unavailable_reason
+from tests._helpers.native_session import create_native_session
 from tests.e2e.helpers import POLL_INTERVAL_S
+from tests.e2e.test_pi_main_terminal_tmux_disappears_e2e import (
+    _scan_home_logs_for,
+    _terminal_resource_present,
+    _wait_for_host_online,
+)
 
-# Worktree root (this file lives at <worktree>/tests/e2e/). Used to build an
-# absolute PYTHONPATH for the daemon so the runner it spawns -- whose cwd is
-# the session workspace, not this worktree -- can still import omnigent.
 _WORKTREE = Path(__file__).resolve().parents[2]
 
-# The exact log signature the buggy vanish-then-generic-log path emits.
 _TMUX_UNAVAILABLE_RE = re.compile(
     r"tmux unavailable after \d+ consecutive probes for terminal cursor:main"
 )
 
-# Skip the whole module unless the real Cursor terminal toolchain is present:
-# the launch path shells out to cursor-agent inside a runner-owned tmux pane.
 pytestmark = [
     pytest.mark.skipif(
-        (_reason := cli_unavailable_reason("cursor-agent")) is not None,
-        reason=f"cursor-native tmux-disappear e2e needs a runnable 'cursor-agent' CLI; {_reason}.",
+        shutil.which("cursor-agent") is None,
+        reason="cursor-native tmux-disappear e2e needs the 'cursor-agent' CLI on PATH.",
     ),
-    # tmux is gated on presence only: its version flag is ``-V`` (not the
-    # generic ``--version`` cli_unavailable_reason probes with), so that probe
-    # false-negatives on a perfectly usable tmux.
     pytest.mark.skipif(
         shutil.which("tmux") is None,
         reason="cursor-native terminal launch needs 'tmux' on PATH.",
@@ -62,32 +67,14 @@ pytestmark = [
 ]
 
 
-def _scan_home_logs_for(home: Path, pattern: re.Pattern[str], *, session_id: str) -> str | None:
-    """Find the signature in this session's runner logs, excluding earlier retries."""
-    for log_path in home.rglob(f"runner-{session_id}-*.log"):
-        try:
-            text = log_path.read_text(errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            if pattern.search(line):
-                return line
-    return None
-
-
-def test_log_scan_ignores_previous_session(tmp_path: Path) -> None:
-    """A failed earlier attempt must not contaminate the current session."""
-    signature = "tmux unavailable after 3 consecutive probes for terminal cursor:main"
-    (tmp_path / "runner-previous-20260916.log").write_text(signature)
-    current = tmp_path / "runner-current-20260916.log"
-    current.write_text("cursor terminal started")
-    assert _scan_home_logs_for(tmp_path, _TMUX_UNAVAILABLE_RE, session_id="current") is None
-    current.write_text(signature)
-    assert _scan_home_logs_for(tmp_path, _TMUX_UNAVAILABLE_RE, session_id="current") == signature
-
-
 class _CursorHost:
-    """A spawned host daemon that can launch the real cursor-agent TUI."""
+    """A spawned host daemon whose HOME carries no Cursor login.
+
+    :param proc: The daemon subprocess handle.
+    :param host_id: The registered host id.
+    :param home: The daemon's HOME (holds ``.omnigent`` + the runner logs).
+    :param daemon_log: Captured daemon log path.
+    """
 
     def __init__(
         self,
@@ -102,8 +89,8 @@ class _CursorHost:
         self.daemon_log = daemon_log
 
 
-def _seed_cursor_home(home: Path) -> str:
-    """Seed *home* with a host config and return its host id (no Cursor login needed)."""
+def _seed_host_home(home: Path) -> str:
+    """Seed *home* with a host config only; the TUI then idles on its sign-in screen."""
     omni_dir = home / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
     host_id = uuid.uuid4().hex
@@ -118,93 +105,22 @@ def _seed_cursor_home(home: Path) -> str:
     return host_id
 
 
-def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 45.0) -> None:
-    """Poll ``GET /v1/hosts`` until *host_id* is online."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = client.get("/v1/hosts")
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
-        except httpx.ConnectError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
-
-
-def _cursor_terminal_metadata(client: httpx.Client, session_id: str) -> dict | None:
-    """cursor:main terminal metadata (carries ``tmux_socket``/``tmux_target``), or ``None``."""
-    resp = client.get(f"/v1/sessions/{session_id}/resources", timeout=30.0)
-    if resp.status_code != 200:
-        return None
-    for item in resp.json().get("data", []):
-        if item.get("type") == "terminal" and item.get("name") == "cursor:main":
-            return item.get("metadata") or {}
-    return None
-
-
-def _terminal_resource_present(client: httpx.Client, session_id: str) -> bool:
-    """Whether cursor:main is still exposed; it is removed on exit, so present->absent
-    marks the disappearance."""
-    return _cursor_terminal_metadata(client, session_id) is not None
-
-
-def _pane_pid(socket: str, target: str) -> int | None:
-    """Return the PID of the process running in the tmux pane, or ``None``."""
-    try:
-        probe = subprocess.run(
-            ["tmux", "-S", socket, "display-message", "-p", "-t", target, "#{pane_pid}"],
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if probe.returncode != 0:
-        return None
-    out = probe.stdout.strip()
-    return int(out) if out.isdigit() else None
-
-
-def _pid_alive(pid: int) -> bool:
-    """Return whether *pid* is a live process this test can signal."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _capture_pane(socket: str, target: str) -> str:
-    """Capture the pane's visible content, for failure messages."""
-    try:
-        probe = subprocess.run(
-            ["tmux", "-S", socket, "capture-pane", "-t", target, "-p", "-e"],
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"<capture failed: {exc}>"
-    return (probe.stdout.strip() or probe.stderr.strip() or "<empty pane>")[-1500:]
-
-
 @pytest.fixture(scope="module")
 def cursor_host(
     live_server: str,
     http_client: httpx.Client,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[_CursorHost]:
-    """Spawn one host daemon that can launch the real cursor-agent TUI."""
+    """Spawn one host daemon with an isolated, login-less HOME.
+
+    :param live_server: Server URL the daemon registers with.
+    :param http_client: HTTP client pointed at the server.
+    :param tmp_path_factory: Module-scoped temp dir factory (the daemon HOME).
+    :yields: The spawned :class:`_CursorHost`.
+    """
     home = tmp_path_factory.mktemp("cursor-tmux-home")
-    host_id = _seed_cursor_home(home)
+    host_id = _seed_host_home(home)
     daemon_log = home / "host-daemon.log"
-    # Pin HOME + config/data dirs so the daemon and its runner read the seeded
-    # config and write their logs under this HOME for the signature scan.
     env = {
         **os.environ,
         "HOME": str(home),
@@ -212,8 +128,9 @@ def cursor_host(
         "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
-    # Absolute worktree roots: the spawned runner's cwd is the workspace, so a
-    # relative PYTHONPATH entry would dangle into ModuleNotFoundError.
+    env.pop("CURSOR_API_KEY", None)
+    # The runner the daemon spawns runs with cwd=<workspace>, so only absolute
+    # PYTHONPATH entries keep ``omnigent`` importable there.
     _existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join(
         [
@@ -243,92 +160,120 @@ def cursor_host(
             proc.wait()
 
 
-def _create_cursor_native_session(client: httpx.Client, host: _CursorHost, workspace: Path) -> str:
-    """Create a cursor-native session on *host*; triggers ``_auto_create_cursor_terminal``
-    (``-f`` avoids prompts)."""
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_yaml = _materialize_cursor_agent_spec(Path(_tmp)).read_text()
+def _cursor_terminal_socket(client: httpx.Client, session_id: str) -> tuple[str, str] | None:
+    """Return ``(tmux_socket, tmux_target)`` advertised by the session's cursor:main resource."""
+    resp = client.get(f"/v1/sessions/{session_id}/resources", timeout=30.0)
+    if resp.status_code != 200:
+        return None
+    for item in resp.json().get("data", []):
+        metadata = item.get("metadata") or {}
+        if item.get("type") != "terminal" or metadata.get("terminal_name") != "cursor":
+            continue
+        socket_path = metadata.get("tmux_socket")
+        if isinstance(socket_path, str) and socket_path:
+            return socket_path, str(metadata.get("tmux_target") or "main")
+    return None
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = spec_yaml.encode()
-        info = tarfile.TarInfo("cursor-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
 
-    metadata = {
-        "host_id": host.host_id,
-        "workspace": str(workspace),
-        "labels": {
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: CURSOR_NATIVE_WRAPPER_VALUE,
-        },
-        "terminal_launch_args": ["-f"],
-    }
-    create = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("cursor-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=60.0,
+def _tmux(socket_path: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["tmux", "-S", socket_path, *args], capture_output=True, text=True, timeout=10.0
     )
-    assert create.status_code in (200, 201), f"session create failed: {create.text}"
-    return str(create.json()["session_id"])
 
 
-# cursor-agent cold-start in a fresh tmux pane is an external-CLI dependency a
-# loaded shard can miss once; retry rather than red the shard.
+def _pane_text(socket_path: str, target: str) -> str:
+    probe = _tmux(socket_path, "capture-pane", "-p", "-t", target)
+    if probe.returncode != 0:
+        return f"<capture-pane failed rc={probe.returncode}: {probe.stderr.strip()}>"
+    return probe.stdout
+
+
+def _cursor_agent_pid(socket_path: str, target: str) -> int | None:
+    """Find the live cursor-agent process in the pane (the pane process or a descendant)."""
+    probe = _tmux(socket_path, "list-panes", "-t", target, "-F", "#{pane_pid}")
+    if probe.returncode != 0 or not probe.stdout.strip():
+        return None
+    try:
+        pane = psutil.Process(int(probe.stdout.split()[0]))
+        candidates = [pane, *pane.children(recursive=True)]
+    except (psutil.Error, ValueError):
+        return None
+    for proc in reversed(candidates):
+        try:
+            tokens = [proc.name(), *proc.cmdline()]
+        except psutil.Error:
+            continue
+        if any("cursor-agent" in token or "/cursor/" in token for token in tokens):
+            return proc.pid
+    return pane.pid if pane.is_running() else None
+
+
 @pytest.mark.timeout(360, method="signal")
-@pytest.mark.flaky(reruns=1, reruns_delay=5)
-def test_cursor_main_terminal_survives_cursor_exit_without_tmux_unavailable(
+def test_cursor_main_terminal_survives_cursor_agent_exit_without_tmux_unavailable(
     cursor_host: _CursorHost,
+    live_server: str,
     http_client: httpx.Client,
 ) -> None:
-    """Killing cursor-agent must not log the generic "tmux unavailable" cascade;
-    keep_alive_after_exit persists the dead pane so the exit is reported deterministically."""
+    """Killing cursor-agent must not vaporize cursor:main or log "tmux unavailable".
+
+    Drives the real cursor-native journey: create the session on the host, let
+    the runner auto-launch the real ``cursor-agent`` TUI inside a runner-owned
+    tmux server, then kill that process. The dead pane must persist so the idle
+    watcher reports the exit without the generic ``tmux unavailable after N
+    consecutive probes for terminal cursor:main`` line.
+
+    :param cursor_host: The spawned host daemon.
+    :param live_server: Server base URL.
+    :param http_client: HTTP client pointed at the server.
+    """
     host = cursor_host
     workspace = host.home / "ws"
     workspace.mkdir(exist_ok=True)
-    session_id = _create_cursor_native_session(http_client, host, workspace)
+    created = create_native_session(
+        http_client,
+        live_server,
+        harness="cursor",
+        metadata={
+            "host_id": host.host_id,
+            "workspace": str(workspace),
+            "terminal_launch_args": ["-f"],
+        },
+    )
+    session_id = str(created["session_id"])
 
     try:
-        # 1) Wait for the real cursor-agent TUI to launch inside the
-        #    runner-owned tmux server, so the idle watcher is live before we
-        #    kill it. Resolve the pane process via the terminal's tmux socket.
-        socket: str | None = None
-        target = "main"
-        cursor_pid: int | None = None
+        # The TUI must have painted so the idle watcher is live before the kill.
+        socket_info: tuple[str, str] | None = None
+        pane_text = ""
         deadline = time.monotonic() + 150.0
         while time.monotonic() < deadline:
-            meta = _cursor_terminal_metadata(http_client, session_id)
-            if meta is not None:
-                socket = meta.get("tmux_socket")
-                target = meta.get("tmux_target", "main")
-                if socket:
-                    pid = _pane_pid(socket, target)
-                    if pid is not None and _pid_alive(pid):
-                        cursor_pid = pid
-                        break
+            socket_info = socket_info or _cursor_terminal_socket(http_client, session_id)
+            if socket_info is not None:
+                pane_text = _pane_text(*socket_info)
+                if "Cursor Agent" in pane_text or "cursor" in pane_text.lower():
+                    break
             if host.proc.poll() is not None:
                 raise AssertionError(
                     f"host daemon exited (rc={host.proc.returncode}) before cursor-agent "
                     f"launched; log tail:\n{host.daemon_log.read_text()[-2000:]}"
                 )
             time.sleep(1.0)
-        assert socket is not None and cursor_pid is not None, (
-            "the launched 'cursor-agent' process never appeared for session "
-            f"{session_id!r}; the runner did not register a live cursor:main pane.\n"
+        assert socket_info is not None, (
+            f"cursor:main terminal resource never appeared for session {session_id!r}; "
             f"daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
-
-        # 2) Give the idle watcher a couple of poll intervals to arm.
+        socket_path, target = socket_info
+        assert "Cursor Agent" in pane_text or "cursor" in pane_text.lower(), (
+            f"the cursor-agent TUI never painted in pane {target!r} on {socket_path}:\n{pane_text}"
+        )
         time.sleep(2.5)
 
-        # 3) Kill cursor-agent -- models the organic crash/exit the KPI counts.
-        os.kill(cursor_pid, signal.SIGKILL)
+        pid = _cursor_agent_pid(socket_path, target)
+        assert pid is not None, f"no live cursor-agent process found in pane {target!r}"
+        os.kill(pid, signal.SIGKILL)
 
-        # 4) Scan the runner logs for the failure signature while confirming the
-        #    terminal exit is handled. On the buggy build the signature fires
-        #    within ~3 probe intervals (~3-5s); scan generously past that.
+        # A regression logs the signature within a second of the exit; the
+        # window is generous so a slow box cannot mask it.
         signature_line: str | None = None
         terminal_gone = False
         scan_deadline = time.monotonic() + 25.0
@@ -339,27 +284,22 @@ def test_cursor_main_terminal_survives_cursor_exit_without_tmux_unavailable(
                 break
             if not _terminal_resource_present(http_client, session_id):
                 terminal_gone = True
-            time.sleep(0.5)
-
-        # Sanity: the kill actually exercised the terminal-exit path (the
-        # terminal is removed on both the buggy and fixed builds), so a green
-        # result reflects the fix, not a no-op where cursor-agent never died.
+            time.sleep(POLL_INTERVAL_S)
         if signature_line is None and not terminal_gone:
             terminal_gone = not _terminal_resource_present(http_client, session_id)
         assert terminal_gone or signature_line is not None, (
-            "cursor:main terminal never exited after cursor-agent was killed -- the "
-            "exit path was not exercised, so the reproduction is inconclusive.\n"
-            f"final pane:\n{_capture_pane(socket, target)}"
+            "cursor:main never exited after cursor-agent was killed -- the exit path was "
+            "not exercised, so the reproduction is inconclusive."
         )
 
-        # The regression assertion.
+        has_session = _tmux(socket_path, "has-session", "-t", target)
         assert signature_line is None, (
-            "Killing cursor-agent vaporized the cursor:main "
-            "tmux server (launched without keep_alive_after_exit), and the idle "
-            "watcher logged the generic tmux-unavailable signature instead of a "
-            f"diagnosable pane-dead exit:\n    {signature_line}"
+            "killing cursor-agent vaporized the cursor:main tmux server (keep_alive_after_exit "
+            "not in effect), and the idle watcher logged the generic tmux-unavailable "
+            "signature instead of a diagnosable pane-dead exit:\n"
+            f"    {signature_line}\n"
+            f"tmux has-session rc={has_session.returncode}: {has_session.stderr.strip()}"
         )
     finally:
-        # Let the runner stop its watchers before tearing down its tmux server.
         with contextlib.suppress(httpx.HTTPError):
             http_client.delete(f"/v1/sessions/{session_id}", timeout=15.0)

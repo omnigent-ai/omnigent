@@ -6,10 +6,15 @@ the composer when a turn is cancelled (web-UI Stop -> ``inject_interrupt`` sends
 ``Escape``), and its input widget ignores the readline ``C-a``/``C-k`` keys the
 clear used to send — so the leftover survived and prepended the next message.
 The clear now floods ``Backspace`` until the pane stops changing.
+
+Also covers the pane-liveness guard (:func:`_session_alive`) that fronts every
+injection: the pane is retained after cursor-agent exits, so liveness must come
+from ``#{pane_dead}``, not from the tmux session still existing.
 """
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import click
@@ -25,8 +30,8 @@ _TARGET = "cursor:0.0"
 class _FakeCompleted:
     """Minimal stand-in for ``subprocess.CompletedProcess``."""
 
-    def __init__(self, stdout: str = "") -> None:
-        self.returncode = 0
+    def __init__(self, stdout: str = "", returncode: int = 0) -> None:
+        self.returncode = returncode
         self.stdout = stdout
         self.stderr = ""
 
@@ -35,12 +40,14 @@ def _install_fake_tmux(
     monkeypatch: pytest.MonkeyPatch,
     *,
     pane_captures: list[str],
+    pane_dead: bool = False,
 ) -> list[list[str]]:
     """Patch ``subprocess.run`` so tmux is mocked.
 
     ``send-keys`` calls are recorded (and returned). ``capture-pane`` calls pop
     the next value from *pane_captures* (the last value repeats once exhausted,
-    modelling a composer that has settled).
+    modelling a composer that has settled). ``list-panes`` reports a live pane
+    unless *pane_dead* models a pane retained after cursor-agent exited.
 
     :returns: The list that accumulates every tmux argv invoked.
     """
@@ -53,6 +60,8 @@ def _install_fake_tmux(
         if "capture-pane" in cmd:
             value = remaining.pop(0) if len(remaining) > 1 else (remaining[0] if remaining else "")
             return _FakeCompleted(stdout=value)
+        if "list-panes" in cmd:
+            return _FakeCompleted(stdout="1\n" if pane_dead else "0\n")
         return _FakeCompleted()
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -179,6 +188,66 @@ def _prepare_bridge(tmp_path: Path) -> Path:
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path(_SOCK), tmux_target=_TARGET)
     return bridge_dir
+
+
+@pytest.mark.parametrize(
+    ("probe_result", "alive"),
+    [
+        pytest.param(_FakeCompleted(stdout="0\n"), True, id="live-pane"),
+        pytest.param(_FakeCompleted(stdout="1\n"), False, id="retained-dead-pane"),
+        pytest.param(_FakeCompleted(stdout="", returncode=1), False, id="no-server"),
+        pytest.param(_FakeCompleted(stdout=""), False, id="no-pane-row"),
+    ],
+)
+def test_session_alive_reads_pane_dead_not_session_existence(
+    monkeypatch: pytest.MonkeyPatch, probe_result: _FakeCompleted, alive: bool
+) -> None:
+    """Liveness comes from ``#{pane_dead}``; a retained dead pane is not alive."""
+    probes: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        del kwargs
+        probes.append(cmd)
+        return probe_result
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    assert cursor_native_bridge._session_alive(_SOCK, _TARGET) is alive
+    assert probes == [["tmux", "-S", _SOCK, "list-panes", "-t", _TARGET, "-F", "#{pane_dead}"]]
+
+
+def test_session_alive_fails_closed_when_probe_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        del kwargs
+        raise subprocess.TimeoutExpired(cmd, 10.0)
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    assert cursor_native_bridge._session_alive(_SOCK, _TARGET) is False
+
+
+def test_inject_user_message_fails_fast_on_retained_dead_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane kept after cursor-agent exited must reject the message, not eat it.
+
+    The tmux session still exists, so a session-existence check would let the
+    paste proceed into a pane nobody reads; the guard must raise before any
+    paste is attempted.
+    """
+    bridge_dir = _prepare_bridge(tmp_path)
+    captured = _install_fake_tmux(
+        monkeypatch, pane_captures=["Pane is dead (status 137)"], pane_dead=True
+    )
+    monkeypatch.setattr(cursor_native_bridge.time, "sleep", lambda *_a, **_k: None)
+
+    with pytest.raises(RuntimeError, match="no longer running"):
+        cursor_native_bridge.inject_user_message(bridge_dir, content="hello", timeout_s=0.01)
+
+    assert not any("load-buffer" in cmd or "paste-buffer" in cmd for cmd in captured)
 
 
 class TestInjectModelGate:
