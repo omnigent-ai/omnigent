@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import contextlib
 import json
-import socket
 import time
 import traceback
 import uuid
@@ -29,19 +28,6 @@ def ready(pod: dict) -> bool:
         condition["type"] == "Ready" and condition["status"] == "True"
         for condition in pod["status"].get("conditions", [])
     )
-
-
-def mock_ports(count: int) -> list[int]:
-    listeners = []
-    try:
-        for _ in range(count):
-            listener = socket.socket()
-            listener.bind(("127.0.0.1", 0))
-            listeners.append(listener)
-        return [listener.getsockname()[1] for listener in listeners]
-    finally:
-        for listener in listeners:
-            listener.close()
 
 
 async def run(args) -> None:
@@ -107,7 +93,6 @@ async def run(args) -> None:
                 break
     if not (all(len(hosts) == per_pod for hosts in groups.values())):
         raise RuntimeError(groups)
-    ports = mock_ports(args.hosts)
     host_args = []
     for upstream, host_ids in sorted(groups.items()):
         for host_id in host_ids:
@@ -121,7 +106,7 @@ async def run(args) -> None:
                     replicas=args.replicas,
                     kubeconfig=args.kubeconfig,
                     url=args.url,
-                    mock_port=ports[index - 1],
+                    mock_port=0,
                     output=args.output / f"host-{index}",
                 )
             )
@@ -249,10 +234,11 @@ async def run(args) -> None:
                 try:
                     await asyncio.wait_for(process.wait(), timeout=5)
                 except TimeoutError:
-                    process.kill()
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
                     await process.wait()
             handle.close()
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, OSError):
             (args.output / "nginx.log").write_text(
                 await command(*kube, "logs", "deployment/nginx", "--timestamps", "--since=10m")
             )

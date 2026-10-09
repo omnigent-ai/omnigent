@@ -25,8 +25,8 @@ from urllib.parse import urlsplit
 import httpx
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright, expect
-from verify import KEY_HEADER, ROOT, agent_bundle, command, eventually
-from verify_multi import mock_ports, ready
+from verify import KEY_HEADER, agent_bundle, command, eventually, start_mock_server
+from verify_multi import ready
 
 OBSERVE_UI = """() => {
   const events = [];
@@ -94,7 +94,7 @@ class BrowserHost:
         self.output.mkdir()
         self.container = f"omnigent-browser-client-{host_id[:8]}"
         self.name = f"nginx-browser-host-{index}-{host_id[:8]}"
-        self.mock_url = f"http://127.0.0.1:{port}"
+        self.mock_url = None
         self.port = port
         self.started = started
         self.mock = None
@@ -111,7 +111,7 @@ class BrowserHost:
             timeout=5,
             trust_env=False,
         )
-        self.llm = httpx.AsyncClient(base_url=self.mock_url, timeout=5, trust_env=False)
+        self.llm = None
         self.report = {
             "host": index,
             "host_id": host_id,
@@ -125,6 +125,7 @@ class BrowserHost:
             "console": [],
             "page_errors": [],
             "ui_observations": [],
+            "navigations": [],
             "cleanup_errors": [],
             "passed": False,
             "visible_issue_counts": {},
@@ -136,15 +137,9 @@ class BrowserHost:
 
     async def start(self, browser):
         self.mock_log = (self.output / "mock.log").open("w")
-        self.mock = subprocess.Popen(
-            [
-                sys.executable,
-                str(ROOT / "tests/server/integration/mock_llm_server.py"),
-                str(self.port),
-            ],
-            stdout=self.mock_log,
-            stderr=subprocess.STDOUT,
-        )
+        self.mock, self.port = start_mock_server(self.port, self.mock_log)
+        self.mock_url = f"http://127.0.0.1:{self.port}"
+        self.llm = httpx.AsyncClient(base_url=self.mock_url, timeout=5, trust_env=False)
 
         async def mock_ready():
             if self.mock.poll() is not None:
@@ -294,6 +289,14 @@ class BrowserHost:
         await self.page.goto(f"{self.args.url}/c/{self.session_id}", wait_until="domcontentloaded")
         await self.page.get_by_label("Message the agent").wait_for(state="visible")
         await self.page.evaluate(OBSERVE_UI)
+        self.page.on(
+            "framenavigated",
+            lambda frame: (
+                self.report["navigations"].append({"at": self.at(), "url": frame.url})
+                if frame == self.page.main_frame
+                else None
+            ),
+        )
         self.monitor_task = asyncio.create_task(self.observe_ui())
         # Collapse only the navigation sidebar, using the app's own control.
         sidebar = self.page.get_by_role("button", name="Collapse sidebar", exact=True)
@@ -369,7 +372,9 @@ class BrowserHost:
     async def observe_ui(self):
         captured = False
         while True:
-            events = await self.page.evaluate("window.__rolloutUI || []")
+            events = await self.page.evaluate("window.__rolloutUI")
+            if not isinstance(events, list):
+                raise RuntimeError("Browser UI observer disappeared after navigation")
             self.report["ui_observations"] = events
             if not captured and any(event["visible"] for event in events):
                 await self.page.screenshot(path=str(self.output / "first-visible-issue.png"))
@@ -559,8 +564,13 @@ class BrowserHost:
     async def cleanup(self):
         if self.monitor_task:
             self.monitor_task.cancel()
-            await asyncio.gather(self.monitor_task, return_exceptions=True)
-        await asyncio.gather(*self.response_tasks, return_exceptions=True)
+            results = await asyncio.gather(self.monitor_task, return_exceptions=True)
+            self.report["cleanup_errors"].extend(
+                f"UI observation: {type(result).__name__}: {result}"
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            )
         if self.context:
             try:
                 if not self.args.capture_streams:
@@ -575,6 +585,12 @@ class BrowserHost:
                     self.report["video"] = str(self.output / "browser.webm")
             except (PlaywrightError, OSError) as exc:
                 self.report["cleanup_errors"].append(str(exc))
+        results = await asyncio.gather(*self.response_tasks, return_exceptions=True)
+        self.report["cleanup_errors"].extend(
+            f"Response evidence: {type(result).__name__}: {result}"
+            for result in results
+            if isinstance(result, BaseException)
+        )
         for args, destination in [
             (["docker", "logs", self.container], self.output / "host.log"),
             (
@@ -604,7 +620,8 @@ class BrowserHost:
         if self.mock_log:
             self.mock_log.close()
         await self.client.aclose()
-        await self.llm.aclose()
+        if self.llm is not None:
+            await self.llm.aclose()
         visible = [issue for event in self.report["ui_observations"] for issue in event["visible"]]
         self.report["visible_issue_counts"] = dict(Counter(issue["kind"] for issue in visible))
         self.report["http_error_counts"] = dict(
@@ -704,7 +721,6 @@ async def run(args):
     summary["initial_distribution"] = {
         by_upstream[upstream]: ids for upstream, ids in groups.items()
     }
-    ports = mock_ports(6)
     hosts = []
     for upstream, host_ids in sorted(groups.items()):
         for host_id in host_ids:
@@ -716,7 +732,7 @@ async def run(args):
                     host_id,
                     upstream,
                     by_upstream[upstream],
-                    ports[index - 1],
+                    0,
                     started,
                 )
             )

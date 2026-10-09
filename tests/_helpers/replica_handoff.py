@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 import uvicorn
@@ -46,14 +47,27 @@ def eventually(check: Callable[[], Any], what: str, timeout: float = 30) -> Any:
     raise AssertionError(f"Timed out waiting for {what}")
 
 
-def sse_events(body: str) -> list[dict[str, Any]]:
-    """Decode complete JSON events without changing their contents."""
-    result = []
-    for line in body.splitlines():
-        if line.startswith("data: ") and line != "data: [DONE]":
-            with contextlib.suppress(ValueError):
-                result.append(json.loads(line[6:]))
-    return result
+class SSEEvents:
+    """Keep partial events and UTF-8 characters until the next network chunk."""
+
+    def __init__(self) -> None:
+        self.pending = b""
+
+    def feed(self, chunk: bytes | str) -> list[dict[str, Any]]:
+        data = chunk.encode() if isinstance(chunk, str) else chunk
+        frames = (self.pending + data).replace(b"\r\n", b"\n").split(b"\n\n")
+        self.pending = frames.pop()
+        result = []
+        for frame in frames:
+            payload = b"\n".join(
+                line[5:].lstrip(b" ") for line in frame.splitlines() if line.startswith(b"data:")
+            )
+            if payload and payload != b"[DONE]":
+                with contextlib.suppress(ValueError):
+                    event = json.loads(payload)
+                    if isinstance(event, dict):
+                        result.append(event)
+        return result
 
 
 def evidence_body(body: bytes | bytearray) -> Any:
@@ -144,6 +158,12 @@ class HandoffProxy:
     def seen(self, kind: str) -> list[dict[str, Any]]:
         return [record for record in self.records if record["kind"] == kind]
 
+    def _target(self, scope: Scope) -> str:
+        host_key = dict(scope["headers"]).get(KEY_HEADER.lower().encode(), b"").decode()
+        if not host_key:
+            host_key = parse_qs(scope["query_string"].decode()).get("omnigent_slice_key", [""])[0]
+        return self.host_routes.get(host_key, self.target)
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         task = asyncio.current_task()
         assert task is not None
@@ -168,8 +188,7 @@ class HandoffProxy:
         path = scope["path"]
         query = scope["query_string"].decode()
         headers = [(k, v) for k, v in scope["headers"] if k not in _HOP_HEADERS]
-        host_key = dict(headers).get(KEY_HEADER.lower().encode(), b"").decode()
-        target = self.host_routes.get(host_key, self.target)
+        target = self._target(scope)
         url = f"{target}{path}" + (f"?{query}" if query else "")
         request = self.client.build_request(
             scope["method"], url, headers=headers, content=bytes(body)
@@ -194,13 +213,14 @@ class HandoffProxy:
                 if task is not None:
                     self.streams.add(task)
                 self.note("browser_stream", target=target, path=path)
+                decoder = SSEEvents()
                 async for chunk in response.aiter_raw():
                     await self.gates["browser"].wait()
                     self.note(
                         "browser_events",
                         target=target,
                         path=path,
-                        events=sse_events(chunk.decode(errors="replace")),
+                        events=decoder.feed(chunk),
                     )
                     await send({"type": "http.response.body", "body": chunk, "more_body": True})
                 await send({"type": "http.response.body", "body": b""})
@@ -239,9 +259,9 @@ class HandoffProxy:
             if streaming and started:
                 # Finish the real SSE response so the downstream proxy forwards
                 # EOF immediately instead of leaving a half-open browser socket.
-                await send({"type": "http.response.body", "body": b""})
-            else:
-                raise
+                with contextlib.suppress(RuntimeError, OSError):
+                    await send({"type": "http.response.body", "body": b""})
+            raise
         finally:
             await response.aclose()
             if task is not None:
@@ -255,7 +275,7 @@ class HandoffProxy:
             await send({"type": "websocket.close", "code": 1013})
             self.note("refused_tunnel", path=path)
             return
-        target = self.target
+        target = self._target(scope)
         headers = [
             (k.decode(), v.decode())
             for k, v in scope["headers"]
@@ -271,6 +291,7 @@ class HandoffProxy:
                 self.tunnels[path] = (send, upstream)
                 self.note("tunnel", path=path, target=target)
             requests: dict[str, dict[str, Any]] = {}
+            event_streams: dict[str, SSEEvents] = {}
 
             async def to_runner() -> None:
                 async for raw in upstream:
@@ -287,6 +308,7 @@ class HandoffProxy:
                                 method=frame["method"],
                             )
                             if frame["path"].endswith("/stream"):
+                                event_streams[frame["id"]] = SSEEvents()
                                 await self.gates["runner_stream"].wait()
                             if (
                                 self.drop_forward
@@ -325,7 +347,8 @@ class HandoffProxy:
                                 future.set_result(json.loads(probe_body))
                             continue
                         if frame.get("kind") == "response.body":
-                            events = sse_events(frame["body"])
+                            decoder = event_streams.get(frame["id"])
+                            events = decoder.feed(frame["body"]) if decoder is not None else []
                             if events:
                                 self.note("runner_events", target=target, events=events)
                             if any(
@@ -339,6 +362,7 @@ class HandoffProxy:
                                 await send({"type": "websocket.close", "code": 1012})
                                 return
                         if frame.get("kind") == "response.end":
+                            event_streams.pop(frame["id"], None)
                             request = requests.pop(frame["id"], None)
                             if request is not None:
                                 self.note(
@@ -381,7 +405,8 @@ class HandoffProxy:
         send = next(
             (send for path, (send, _) in self.tunnels.items() if "/runners/" in path), None
         )
-        assert send is not None, "no open runner tunnel to probe through"
+        if send is None:
+            raise RuntimeError("no open runner tunnel to probe through")
         key = f"probe-{uuid.uuid4().hex}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.probes[key] = (future, bytearray())
@@ -683,5 +708,5 @@ def handoff_lab(root: Path, model_url: str) -> Iterator[HandoffLab]:
             for name in ("history", "runner_stream", "browser", "updates"):
                 lab.proxy.gate(name, hold=False)
             lab.proxy.configure(refuse_tunnels=False)
-            with contextlib.suppress(httpx.HTTPError):
+            with contextlib.suppress(httpx.HTTPError, OSError, ValueError, TypeError):
                 lab.save()

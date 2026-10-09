@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import re
+import socket
 import subprocess
 import sys
 import tarfile
@@ -30,6 +31,31 @@ from websockets.exceptions import WebSocketException
 
 ROOT = Path(__file__).resolve().parents[3]
 KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+
+
+def start_mock_server(port, log):
+    """Pass a bound listener to the mock so another process cannot claim its port."""
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "tests.server.integration.mock_llm_server:app",
+                "--fd",
+                str(listener.fileno()),
+                "--log-level",
+                "warning",
+            ],
+            cwd=ROOT,
+            pass_fds=(listener.fileno(),),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        return process, listener.getsockname()[1]
 
 
 async def command(*args: str) -> str:
@@ -118,7 +144,6 @@ async def verify(
     container = f"omnigent-prototype-client-{host_id[:8]}"
     marker = uuid.uuid4().hex
     marker_file = f"marker-{host_id}.txt"
-    mock_url = f"http://127.0.0.1:{args.mock_port}"
     report = {
         "host_id": host_id,
         "host_name": host_name,
@@ -139,15 +164,8 @@ async def verify(
     ws = None
     try:
         mock_log = (args.output / "mock.log").open("w")
-        mock = subprocess.Popen(
-            [
-                sys.executable,
-                str(ROOT / "tests/server/integration/mock_llm_server.py"),
-                str(args.mock_port),
-            ],
-            stdout=mock_log,
-            stderr=subprocess.STDOUT,
-        )
+        mock, mock_port = start_mock_server(args.mock_port, mock_log)
+        mock_url = f"http://127.0.0.1:{mock_port}"
         client = httpx.AsyncClient(
             base_url=args.url,
             headers={"Origin": "omnigent://internal", KEY_HEADER: host_id},
@@ -430,9 +448,12 @@ async def verify(
         # Endpoint updates and reconnects can outlast `rollout status`.
         await eventually(stable, timeout=60)
         report["recovered_at"] = round(time.monotonic() - started, 3)
-        report["old_terminal_connection_closed"] = ws.close_code is not None
-        if not (report["old_terminal_connection_closed"]):
-            raise RuntimeError("NGINX left an old connection open")
+
+        async def old_terminal_closed():
+            return ws.close_code is not None
+
+        await eventually(old_terminal_closed, timeout=15)
+        report["old_terminal_connection_closed"] = True
 
         async def reattach_terminal():
             nonlocal ws
@@ -555,21 +576,27 @@ async def verify(
                     failed_at = None
             report[f"{kind}_longest_observed_outage_seconds"] = round(longest, 3)
             report[f"{kind}_still_failing_at_end"] = failed_at is not None
-        (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-        (args.output / "sse.log").write_text("\n".join(sse_text))
-        (args.output / "backfills.json").write_text(json.dumps(backfills, indent=2) + "\n")
-        with contextlib.suppress(RuntimeError):
+        for name, content in (
+            ("report.json", json.dumps(report, indent=2) + "\n"),
+            ("sse.log", "\n".join(sse_text)),
+            ("backfills.json", json.dumps(backfills, indent=2) + "\n"),
+        ):
+            try:
+                (args.output / name).write_text(content)
+            except OSError as exc:
+                print(f"Could not save {name}: {exc}", file=sys.stderr, flush=True)
+        with contextlib.suppress(RuntimeError, OSError):
             (args.output / "host.log").write_text(await command("docker", "logs", container))
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, OSError):
             await command(
                 "docker",
                 "cp",
                 f"{container}:/root/.omnigent/logs",
                 str(args.output / "client-logs"),
             )
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, OSError):
             await command("docker", "rm", "-f", container)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(RuntimeError, OSError):
             (args.output / "nginx.log").write_text(
                 await command(*kube, "logs", "deployment/nginx", "--since=15m")
             )

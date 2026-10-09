@@ -1143,11 +1143,24 @@ async def create_response(
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
     chunk_delay = qr.chunk_delay
+    events = [event for event in sse_body.split("\n\n") if event]
+    if qr.pause_after is not None and not 1 <= qr.pause_after <= len(events):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "type": "mock_config_error",
+                    "message": (
+                        f"pause_after={qr.pause_after} is outside the {len(events)} SSE events"
+                    ),
+                }
+            },
+        )
 
     async def _generate() -> AsyncIterator[str]:
         if chunk_delay > 0 or qr.pause_after is not None:
             # Paced like ``/v1/messages``: one SSE event at a time.
-            for index, event in enumerate(filter(None, sse_body.split("\n\n")), start=1):
+            for index, event in enumerate(events, start=1):
                 yield event + "\n\n"
                 if index == qr.pause_after:
                     qr._pending.set()

@@ -304,16 +304,16 @@ file requests every 250 ms, the longest observed failure interval was
 Requests to both were succeeding consistently at the end. These timings
 describe that run; they do not guarantee a maximum interruption.
 
-With the recovery changes described above and `minReadySeconds: 10`, three
+With the recovery changes described above and `minReadySeconds: 10`, five
 three-pod, six-host browser runs passed on the same day. They completed
-**165, 173, and 172 turns**, respectively. The last run used commit `038a1934e`,
-before the subsequent CI and review fixes. Every prompt and reply was
+**165, 173, 172, 169, and 170 turns**, respectively. The last run includes the
+review fixes and stricter checks for incomplete browser evidence. Every prompt and reply was
 saved and rendered once, each turn made one model request, no browser showed
 an error, and all six sessions finished idle. Each run started with two hosts
 per pod, replaced all three pods, and completed two additional turns per host
-after the old pods were gone. The rollouts took **53.30, 53.56, and 53.89 seconds**,
-measured through deletion of the last old pod. These are observations from
-those runs, not availability guarantees.
+after the old pods were gone. The latest rollout took **53.57 seconds**, measured
+through deletion of the last old pod. Its longest turn, including the model
+response, took **4.25 seconds**. These observations do not guarantee availability.
 
 This is a local experiment with authentication disabled and disposable
 database credentials. The artifact volume is `ReadWriteOnce`: both server

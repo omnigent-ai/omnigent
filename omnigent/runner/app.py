@@ -211,6 +211,8 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
+_CANCELLATION_RESPONSE_PREFIX = "cancel_"
+
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
@@ -3457,7 +3459,7 @@ def create_runner_app(
     ) -> None:
         import uuid as _uuid
 
-        response_id = f"cancel_{_uuid.uuid4().hex}"
+        response_id = f"{_CANCELLATION_RESPONSE_PREFIX}{_uuid.uuid4().hex}"
         for item in items:
             item_type = item.get("type", "message")
             item_data = {k: v for k, v in item.items() if k != "type"}
@@ -7601,14 +7603,22 @@ def create_runner_app(
                     if (
                         item.get("type") != "message"
                         or item.get("role") != "user"
-                        or not isinstance(item_id, str)
-                        or item_id in received_ids
                         # Stop writes history, not input; its save acknowledgment can be lost.
-                        or (isinstance(response_id, str) and response_id.startswith("cancel_"))
+                        or (
+                            isinstance(response_id, str)
+                            and response_id.startswith(_CANCELLATION_RESPONSE_PREFIX)
+                        )
                     ):
                         continue
                     raw_content = item.get("content", [])
-                    if not isinstance(raw_content, list):
+                    if not isinstance(item_id, str) or not isinstance(raw_content, list):
+                        _logger.warning(
+                            "Catch-up scan skipping malformed user item %r for %s",
+                            item_id,
+                            session_id,
+                        )
+                        continue
+                    if item_id in received_ids:
                         continue
                     content = await _resolve_forwarded_message_content(
                         raw_content,

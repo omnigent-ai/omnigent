@@ -18,7 +18,7 @@ k() { kubectl --kubeconfig "$state/kubeconfig" --context "$context" -n omnigent-
 wait_for_migration() {
   local deadline=$((SECONDS + 180)) conditions
   while (( SECONDS < deadline )); do
-    conditions=$(k get job migrate -o 'jsonpath={range .status.conditions[*]}{.type}={.status}{"\n"}{end}')
+    conditions=$(k get job migrate -o 'jsonpath={range .status.conditions[*]}{.type}={.status}{"\n"}{end}' || true)
     if [[ "$conditions" == *"Complete=True"* ]]; then
       return
     fi
