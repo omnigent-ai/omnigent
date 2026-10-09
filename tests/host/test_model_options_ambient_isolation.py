@@ -49,8 +49,11 @@ _AMBIENT_DETECTION_ENV = {
 # Every selected test answers a frame through HostProcess._handle_model_options.
 _MODEL_OPTIONS_SELECTION = "handle_model_options or model_options_frame"
 
-# Stays under the outer E2E job's 180s per-test cap; a cold run takes seconds.
+# Stays under the unit suite's 300s per-test timeout; a cold run takes seconds.
 _NESTED_PYTEST_TIMEOUT_S = 150.0
+
+# A partial rename that shrinks the selection must fail loudly (19 match today).
+_MIN_SELECTED_TESTS = 10
 
 
 def _partial_output(exc: subprocess.TimeoutExpired) -> str:
@@ -109,7 +112,7 @@ def test_model_options_tests_ignore_ambient_subscription_defaults(tmp_path: Path
     output = f"{nested.stdout}\n{nested.stderr}"
     # Exit 5 (nothing collected) must read as a broken guard, not as green.
     passed = re.search(r"(\d+) passed", output)
-    assert nested.returncode == 0 and passed and int(passed.group(1)) > 0, (
+    assert nested.returncode == 0 and passed and int(passed.group(1)) >= _MIN_SELECTED_TESTS, (
         "host model-options tests absorbed the machine's ambient provider state "
         f"instead of isolating it — nested pytest exited {nested.returncode}:\n{output}"
     )
