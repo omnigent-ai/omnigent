@@ -16,6 +16,7 @@ HTTP client.
 
 from __future__ import annotations
 
+import string
 import textwrap
 
 # The init container's own output, served by ``read_namespaced_pod_log`` for
@@ -33,8 +34,9 @@ CRASHLOOP_AFTER_S = 3.0
 # Kubelet back-off step the stub mimics for restart_count growth.
 _BACKOFF_STEP_S = 20
 
-_CLIENT_MODULE = textwrap.dedent(
-    '''
+_CLIENT_MODULE = string.Template(
+    textwrap.dedent(
+        '''
     """Stub SDK client: plays back a Pod whose init container crash-loops."""
 
     import time
@@ -42,18 +44,18 @@ _CLIENT_MODULE = textwrap.dedent(
 
     from . import rest  # noqa: F401
 
-    _CRASHLOOP_AFTER_S = {crashloop_after_s}
-    _BACKOFF_STEP_S = {backoff_step_s}
+    _CRASHLOOP_AFTER_S = $crashloop_after_s
+    _BACKOFF_STEP_S = $backoff_step_s
 
     _CLONE_LOG = (
         "Cloning into '/home/omnigent/workspace/omnigent'...\\n"
-        {clone_error_line}
+        $clone_error_line
         "\\n"
     )
 
     # One simulated Job/Pod per server process: create_namespaced_job records
     # the Job name and every Pod read replays its state at that moment.
-    _state = {{"job_name": None, "created_at": None}}
+    _state = {"job_name": None, "created_at": None}
 
 
     class Configuration:
@@ -199,7 +201,8 @@ _CLIENT_MODULE = textwrap.dedent(
         def delete_namespaced_job(self, name, namespace, **kw):
             return SimpleNamespace()
     '''
-).format(
+    )
+).substitute(
     crashloop_after_s=repr(CRASHLOOP_AFTER_S),
     backoff_step_s=repr(_BACKOFF_STEP_S),
     clone_error_line=repr(CLONE_ERROR_LINE),

@@ -29,12 +29,12 @@ _PROMPT = "Investigate this repository"
 
 # Pod-ready budget: generous enough that a fail-fast well under it is
 # unambiguous, small enough that the buggy poll-to-the-deadline path keeps the
-# run (and its recording) short. 90s in a default deployment.
-_POD_READY_TIMEOUT_S = 25
+# run short. 90s in a default deployment.
+_POD_READY_TIMEOUT_S = 45
 
 # Measured from the submit click, so it also covers session create, navigation
 # and status propagation on top of the launcher's ~5s detection (3s stub
-# crash-loop onset + a poll). The buggy path cannot fail before the 25s deadline.
+# crash-loop onset + a poll). The buggy path cannot fail before the 45s deadline.
 _FAILFAST_MAX_S = 20.0
 
 
@@ -59,7 +59,8 @@ async def _drive_launch_to_failure(
     """
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
-        # Keep any recording at viewport size so the expanded error stays legible.
+        # The e2e_ui conftest injects record_video_dir when OMNIGENT_E2E_RECORD_DIR
+        # is set; keep that recording at viewport size so the error stays legible.
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             record_video_size={"width": 1280, "height": 900},
