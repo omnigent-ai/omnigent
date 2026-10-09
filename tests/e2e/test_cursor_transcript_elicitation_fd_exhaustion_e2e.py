@@ -43,8 +43,7 @@ pytestmark = [
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The KPI signature measured by the bug report (message prefix of the ERROR
-# record emitted by the supervisor's catch-all, logger
+# Message prefix of the ERROR record the supervisor's catch-all emits (logger
 # omnigent.harnesses.cursor_native.permissions).
 _POLL_FAILED_SIGNATURE = "cursor transcript elicitation poll failed"
 
@@ -174,22 +173,23 @@ async def main():
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
     hoard = []
     hoard_errno = None
-    try:
-        while True:
-            hoard.append(os.open(os.devnull, os.O_RDONLY))
-    except OSError as exc:
-        hoard_errno = exc.errno
     selfcheck_errno = None
     try:
-        os.listdir(str(chats_root))
-    except OSError as exc:
-        selfcheck_errno = exc.errno
-
-    await asyncio.sleep(FAULT_HOLD_S)  # many poll passes under real EMFILE
-
-    for fd in hoard:
-        os.close(fd)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+        try:
+            while True:
+                hoard.append(os.open(os.devnull, os.O_RDONLY))
+        except OSError as exc:
+            hoard_errno = exc.errno
+        try:
+            os.listdir(str(chats_root))
+        except OSError as exc:
+            selfcheck_errno = exc.errno
+        await asyncio.sleep(FAULT_HOLD_S)  # many poll passes under real EMFILE
+    finally:
+        # Always release the hoard so the child can still report its result.
+        for fd in hoard:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
     # ── fault cleared ──────────────────────────────────────────────────
 
     # Now the gate the user is waiting on: a live chat (created past the
@@ -204,6 +204,12 @@ async def main():
             break
         await asyncio.sleep(0.05)
 
+    # A supervisor that died before polling never logs; report it explicitly.
+    supervisor_error = (
+        repr(supervisor.exception())
+        if supervisor.done() and not supervisor.cancelled()
+        else ""
+    )
     poll_failed = [
         {"msg": r["msg"], "exc_tail": r["exc"][-800:]}
         for r in records
@@ -215,6 +221,7 @@ async def main():
             "selfcheck_errno": selfcheck_errno,
             "warmup_errors": warmup_errors,
             "surfaced": surfaced,
+            "supervisor_error": supervisor_error,
             "poll_failed_count": len(poll_failed),
             "poll_failed": poll_failed[:3],
             "error_msgs": [r["msg"] for r in records if r["level"] == "ERROR"][:20],
@@ -323,7 +330,8 @@ def test_transient_fd_exhaustion_does_not_emit_poll_failed_errors(
             # elicitation — and is resolvable through the web approval path.
             assert result["surfaced"], (
                 "pending Cursor gate never surfaced after the fd-exhaustion "
-                f"window cleared; driver errors: {result['error_msgs']}"
+                f"window cleared; supervisor error: {result['supervisor_error'] or 'none'}; "
+                f"driver errors: {result['error_msgs']}"
             )
             pending = poll_for_pending_elicitation(
                 http_client,
@@ -338,10 +346,8 @@ def test_transient_fd_exhaustion_does_not_emit_poll_failed_errors(
                 action="accept",
             )
 
-            # Regression guard (the reported bug): a bounded, transient
-            # fd-exhaustion episode must not be logged as per-pass omnigent
-            # ERRORs — unfixed, every pass inside the window emits one full
-            # ERROR traceback (~poll cadence), which is the measured failure.
+            # A transient fd-exhaustion window must produce zero per-pass ERROR
+            # tracebacks; the loop treats it as a transient condition.
             assert result["poll_failed_count"] == 0, (
                 f"transient EMFILE window produced {result['poll_failed_count']} "
                 f"ERROR-level '{_POLL_FAILED_SIGNATURE}' records (one per poll "

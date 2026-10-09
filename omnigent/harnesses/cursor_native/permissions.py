@@ -54,6 +54,7 @@ from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cu
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
 # (one chat per workspace) and reads the live ``-wal`` state correctly.
 from omnigent.harnesses.cursor_native.forwarder import (
+    _FD_EXHAUSTION_REWARN_S,
     _discover_store,
     _fd_exhaustion_errno,
     _read_blob_rows,
@@ -857,8 +858,10 @@ async def supervise_cursor_transcript_elicitations(
     auto_accept_attempts: dict[str, _YoloAcceptRetry] = {}
     next_auto_accept_at = 0.0
     store_path: Path | None = None
-    # Loop-time when the current fd-exhaustion episode began, or None.
+    # Loop-time when the current fd-exhaustion episode began (None when
+    # healthy) and when it was last logged at WARNING.
     fd_exhausted_since: float | None = None
+    fd_exhaustion_last_warn = 0.0
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
@@ -980,10 +983,13 @@ async def supervise_cursor_transcript_elicitations(
             except Exception as exc:
                 fd_errno = _fd_exhaustion_errno(exc)
                 if fd_errno is not None:
-                    # The process is out of descriptors; the pass will succeed
-                    # again once they free up. One WARNING per episode.
-                    if fd_exhausted_since is None:
-                        fd_exhausted_since = loop.time()
+                    # Out of descriptors: warn when the episode starts, re-warn at
+                    # most every _FD_EXHAUSTION_REWARN_S, and keep polling.
+                    now = loop.time()
+                    if (
+                        fd_exhausted_since is None
+                        or now - fd_exhaustion_last_warn >= _FD_EXHAUSTION_REWARN_S
+                    ):
                         _logger.warning(
                             "cursor transcript elicitation poll degraded by fd "
                             "exhaustion (%s: %s); retrying every %.2fs; session=%s "
@@ -994,13 +1000,16 @@ async def supervise_cursor_transcript_elicitations(
                             session_id,
                             bridge_dir,
                         )
+                        fd_exhaustion_last_warn = now
                     else:
                         _logger.debug(
                             "cursor transcript elicitation poll still fd-exhausted "
                             "(%.1fs); session=%s",
-                            loop.time() - fd_exhausted_since,
+                            now - fd_exhausted_since,
                             session_id,
                         )
+                    if fd_exhausted_since is None:
+                        fd_exhausted_since = now
                 else:
                     _logger.exception(
                         "cursor transcript elicitation poll failed; session=%s bridge_dir=%s",
@@ -1010,8 +1019,8 @@ async def supervise_cursor_transcript_elicitations(
             else:
                 if fd_exhausted_since is not None:
                     _logger.info(
-                        "cursor transcript elicitation poll recovered from fd "
-                        "exhaustion after %.1fs; session=%s",
+                        "cursor transcript elicitation poll pass completed after fd "
+                        "exhaustion (%.1fs); session=%s",
                         loop.time() - fd_exhausted_since,
                         session_id,
                     )
