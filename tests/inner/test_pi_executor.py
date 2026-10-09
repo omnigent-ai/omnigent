@@ -414,6 +414,28 @@ class TestPiProviderForModel(unittest.TestCase):
             "databricks-completions",
         )
 
+    def test_system_gemini_uses_native_gemini_surface(self):
+        gemini_wires = frozenset({ModelWireAPI.OPENAI_CHAT, ModelWireAPI.GEMINI_GENERATE_CONTENT})
+        for wire_apis in (None, gemini_wires):
+            self.assertEqual(
+                _pi_provider_for_model("system.ai.gemini-3-5-flash", wire_apis),
+                "databricks-gemini",
+            )
+
+    def test_catalog_without_gemini_surface_keeps_mlflow(self):
+        # The catalog is authoritative: a Gemini it lists only on chat stays there.
+        self.assertEqual(
+            _pi_provider_for_model(
+                "system.ai.gemini-3-5-flash", frozenset({ModelWireAPI.OPENAI_CHAT})
+            ),
+            "databricks-mlflow",
+        )
+
+    def test_gemini_serving_endpoint_alias_keeps_completions(self):
+        self.assertEqual(
+            _pi_provider_for_model("databricks-gemini-3-5-flash"), "databricks-completions"
+        )
+
 
 # ---------------------------------------------------------------------------
 # _split_pi_prompt tests
@@ -591,16 +613,18 @@ class TestBuildModelsJson(unittest.TestCase):
             self.assertNotIn("/ai-gateway/codex", base_url)
             self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
 
-    def test_gemini_model_routed_to_mlflow_gateway(self):
-        # Gemini uses /ai-gateway/mlflow/v1 — system.ai.* ids 404 at serving-endpoints
-        # and the Responses API returns 400 for Gemini.
+    def test_gemini_model_routed_to_native_gemini_gateway(self):
+        # Gemini-3 rejects tool-call history without thought signatures, which Pi
+        # only round-trips on its google API; the chat-completions surfaces 400.
         result = _build_models_json(
             "https://host.example.com",
             "tok",
             model="system.ai.gemini-3-flash",
         )
         provider = result["providers"][_pi_provider_for_model("system.ai.gemini-3-flash")]
-        self.assertEqual(provider["baseUrl"], "https://host.example.com/ai-gateway/mlflow/v1")
+        self.assertEqual(provider["baseUrl"], "https://host.example.com/ai-gateway/gemini/v1beta")
+        self.assertEqual(provider["api"], "google-generative-ai")
+        self.assertIs(provider["authHeader"], True)
         self.assertIn(
             "system.ai.gemini-3-flash",
             [entry.get("id") for entry in provider["models"]],
@@ -3848,6 +3872,15 @@ def test_models_json_lists_only_live_gateway_models() -> None:
             family="other",
             metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT})),
         ),
+        ModelEntry(
+            id="system.ai.gemini-catalog",
+            family="other",
+            metadata=ModelMetadata(
+                wire_apis=frozenset(
+                    {ModelWireAPI.OPENAI_CHAT, ModelWireAPI.GEMINI_GENERATE_CONTENT}
+                )
+            ),
+        ),
     )
     models = _build_models_json(
         "https://host.example.com",
@@ -3863,6 +3896,9 @@ def test_models_json_lists_only_live_gateway_models() -> None:
     assert openai_responses_ids == ["system.ai.gpt-responses-catalog"]
     assert [m["id"] for m in providers["databricks-mlflow"]["models"]] == [
         "system.ai.llama-catalog"
+    ]
+    assert [m["id"] for m in providers["databricks-gemini"]["models"]] == [
+        "system.ai.gemini-catalog"
     ]
 
 

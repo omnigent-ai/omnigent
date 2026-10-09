@@ -2123,6 +2123,44 @@ def test_model_services_listing_stops_on_repeated_page_token(
     assert any("repeated a page token" in record.message for record in caplog.records)
 
 
+def test_model_services_listing_tags_gemini_generate_content() -> None:
+    """The gateway's native Gemini surface is recorded alongside its chat surface."""
+    from omnigent.models import model_catalog
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    _uc_service(
+                        "system.ai.gemini-3-5-flash",
+                        [
+                            "mlflow/v1/chat/completions",
+                            "gemini/v1/generateContent",
+                            "gemini/v1/streamGenerateContent",
+                        ],
+                    ),
+                    _uc_service("system.ai.llama-4-maverick", ["mlflow/v1/chat/completions"]),
+                ]
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    by_id = {entry.id: entry.metadata.wire_apis for entry in entries}
+    assert by_id == {
+        "system.ai.gemini-3-5-flash": frozenset(
+            {ModelWireAPI.OPENAI_CHAT, ModelWireAPI.GEMINI_GENERATE_CONTENT}
+        ),
+        "system.ai.llama-4-maverick": frozenset({ModelWireAPI.OPENAI_CHAT}),
+    }
+
+
 # ── Generic ACP curation (acp_curated_models) ───────────────────────────────
 
 

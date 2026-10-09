@@ -38,6 +38,13 @@ class DatabricksPiSurface(Enum):
     RESPONSES = "responses"
     COMPLETIONS = "completions"
     MLFLOW = "mlflow"
+    GEMINI = "gemini"
+
+
+# The gateway's native Gemini surface, which Pi drives with its google API. Gemini-3
+# rejects tool-call history without its thought signatures, and Pi only carries
+# them on that API. The catalog labels it ``gemini/v1``, but only v1beta is served.
+DATABRICKS_GEMINI_GATEWAY_PATH = "/ai-gateway/gemini/v1beta"
 
 
 def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
@@ -62,6 +69,8 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
         # chat surface omits Pi's required finish reason need Responses instead.
         if any(keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS):
             return DatabricksPiSurface.RESPONSES
+        if "gemini" in lower:
+            return DatabricksPiSurface.GEMINI
         return DatabricksPiSurface.MLFLOW
     if "gpt" in lower:
         # Unknown GPT metadata fails toward Responses — the forward-compatible

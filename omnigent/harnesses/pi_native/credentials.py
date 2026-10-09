@@ -44,6 +44,7 @@ from omnigent.models.databricks_model_discovery import preferred_served_claude_m
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.model_override import normalize_model_for_provider
 from omnigent.models.pi_model_compatibility import (
+    DATABRICKS_GEMINI_GATEWAY_PATH,
     PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
@@ -105,6 +106,8 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 _PI_MLFLOW_PROVIDER_ID = "omnigent-mlflow"
+# system.ai.* Gemini on the gateway's native Gemini surface.
+_PI_GEMINI_PROVIDER_ID = "omnigent-gemini"
 
 # Which provider id serves each Databricks gateway surface. The Anthropic
 # surface is the primary provider, so it is registered inline, not here.
@@ -112,6 +115,7 @@ _SURFACE_PROVIDER_IDS: dict[DatabricksPiSurface, str] = {
     DatabricksPiSurface.RESPONSES: _PI_OPENAI_PROVIDER_ID,
     DatabricksPiSurface.COMPLETIONS: _PI_COMPLETIONS_PROVIDER_ID,
     DatabricksPiSurface.MLFLOW: _PI_MLFLOW_PROVIDER_ID,
+    DatabricksPiSurface.GEMINI: _PI_GEMINI_PROVIDER_ID,
 }
 
 _PI_MANAGED_PROVIDER_IDS = frozenset({_PI_PROVIDER_ID, *_SURFACE_PROVIDER_IDS.values()})
@@ -176,6 +180,7 @@ class _PiModelsConfig(TypedDict):
 
 
 _PiModelLists: TypeAlias = tuple[
+    list[_PiModelEntry],
     list[_PiModelEntry],
     list[_PiModelEntry],
     list[_PiModelEntry],
@@ -410,11 +415,15 @@ class PiProviderConfig:
             # ``additional_providers``, and this renders more than once.
             additional[provider_id] = {**existing, "models": [*existing["models"], entry]}
             return
-        responses = surface is DatabricksPiSurface.RESPONSES
-        api_type = "openai-responses" if responses else "openai-completions"
-        additional[provider_id] = _databricks_openai_provider(
-            self.api_key, self.databricks_surfaces[surface], [entry], api_type=api_type
-        )
+        base_url = self.databricks_surfaces[surface]
+        if surface is DatabricksPiSurface.GEMINI:
+            additional[provider_id] = _databricks_gemini_provider(self.api_key, base_url, [entry])
+        else:
+            responses = surface is DatabricksPiSurface.RESPONSES
+            api_type = "openai-responses" if responses else "openai-completions"
+            additional[provider_id] = _databricks_openai_provider(
+                self.api_key, base_url, [entry], api_type=api_type
+            )
         _LOGGER.info(
             "pi-native: %r was not in the workspace model catalog; routing it to the %s "
             "surface by model family.",
@@ -655,6 +664,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     claude_models: list[_PiModelEntry] = []
     gpt_models: list[_PiModelEntry] = []
     completions_models: list[_PiModelEntry] = []
+    mlflow_models: list[_PiModelEntry] = []
     gemini_models: list[_PiModelEntry] = []
     try:
         creds = resolve_databricks_workspace(entry.profile)
@@ -665,8 +675,8 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         credential_warning = _databricks_credential_warning(entry.profile)
     else:
         try:
-            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                creds.host, creds.token
+            claude_models, gpt_models, completions_models, mlflow_models, gemini_models = (
+                _fetch_pi_model_lists(creds.host, creds.token)
             )
         except Exception:  # noqa: BLE001 — network failure must not break launch
             _LOGGER.info(
@@ -682,9 +692,13 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
             api_key, f"{host}/serving-endpoints", completions_models, api_type="openai-completions"
         )
-    if gemini_models:
+    if mlflow_models:
         additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, f"{host}/ai-gateway/mlflow/v1", gemini_models, api_type="openai-completions"
+            api_key, f"{host}/ai-gateway/mlflow/v1", mlflow_models, api_type="openai-completions"
+        )
+    if gemini_models:
+        additional[_PI_GEMINI_PROVIDER_ID] = _databricks_gemini_provider(
+            api_key, f"{host}{DATABRICKS_GEMINI_GATEWAY_PATH}", gemini_models
         )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
@@ -705,6 +719,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             DatabricksPiSurface.RESPONSES: f"{host}/ai-gateway/codex/v1",
             DatabricksPiSurface.COMPLETIONS: f"{host}/serving-endpoints",
             DatabricksPiSurface.MLFLOW: f"{host}/ai-gateway/mlflow/v1",
+            DatabricksPiSurface.GEMINI: f"{host}{DATABRICKS_GEMINI_GATEWAY_PATH}",
         },
     )
 
@@ -802,6 +817,26 @@ def _databricks_openai_provider(
     }
 
 
+def _databricks_gemini_provider(
+    api_key: str,
+    base_url: str,
+    models: list[_PiModelEntry],
+) -> _PiProviderPayload:
+    """Build a Pi provider for the Unity Gateway's native Gemini surface.
+
+    Pi's ``google-generative-ai`` API is the one that round-trips the thought
+    signatures Gemini-3 requires on tool-call history; its chat-completions
+    path drops them and the gateway rejects the next request.
+    """
+    return {
+        "baseUrl": base_url,
+        "apiKey": api_key,
+        "api": "google-generative-ai",
+        "authHeader": True,
+        "models": models,
+    }
+
+
 _AUTH_COMMAND_REAP_TIMEOUT_S = 2.0
 
 
@@ -895,8 +930,10 @@ def _fetch_pi_model_lists(
 
     * ``openai/v1/responses`` in supported_api_types → ``openai-responses``
       provider at the Unity Gateway codex surface.
-    * Chat-capable models without Responses API support → ``openai-completions``
-      provider at the serving-endpoints surface.
+    * ``gemini/…/generateContent`` → ``google-generative-ai`` provider at the
+      native Gemini surface.
+    * Other ``system.ai.*`` chat models → ``openai-completions`` provider at
+      the MLflow surface; remaining ids at the serving-endpoints surface.
     * Claude models → ``anthropic-messages`` provider.
 
     Using this API avoids the ``databricks-*`` → ``system.ai.*`` translation
@@ -908,8 +945,9 @@ def _fetch_pi_model_lists(
     :param workspace_url: Databricks workspace base URL, e.g.
         ``"https://wkspc.example.com"`` — **no** trailing slash or path.
     :param token: Bearer token for the workspace API.
-    :returns: ``(claude_models, gpt_responses_models, completions_models, gemini_models)`` —
-        Pi model entry dicts ready to write into ``models.json``.
+    :returns: ``(claude_models, gpt_responses_models, completions_models,
+        mlflow_models, gemini_models)`` — Pi model entry dicts ready to write
+        into ``models.json``.
     """
     try:
         models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
@@ -919,11 +957,12 @@ def _fetch_pi_model_lists(
             "Pi will show only the selected model",
             exc_info=True,
         )
-        return [], [], [], []
+        return [], [], [], [], []
 
     claude: list[_PiModelEntry] = []
     gpt_responses: list[_PiModelEntry] = []
     completions: list[_PiModelEntry] = []
+    mlflow: list[_PiModelEntry] = []
     gemini: list[_PiModelEntry] = []
 
     # The model-service listing reports availability but no token limits; the
@@ -952,17 +991,19 @@ def _fetch_pi_model_lists(
             claude.append(entry)
         elif unsupported_in_pi(name_lower):
             pass  # exclude (e.g. gemini-2-5 thinking models)
+        elif ModelWireAPI.GEMINI_GENERATE_CONTENT in model.metadata.wire_apis:
+            gemini.append(entry)
         elif needs_responses:
             # Responses API: GPT models that need it + kimi/inkling/qwen3/glm keywords.
             gpt_responses.append(entry)
         elif name_lower.startswith("system.ai."):
-            # Other system.ai.* ids (Gemini, Llama) → mlflow gateway;
+            # Other system.ai.* ids (Llama) → mlflow gateway;
             # system.ai.* ids are not valid at /serving-endpoints.
-            gemini.append(entry)
+            mlflow.append(entry)
         else:
             completions.append(entry)
 
-    if not claude and not gpt_responses and not completions and not gemini:
+    if not any((claude, gpt_responses, completions, mlflow, gemini)):
         _LOGGER.info(
             "pi-native: Unity Catalog model-services returned no LLM models; "
             "Pi will show only the selected model"
@@ -970,9 +1011,11 @@ def _fetch_pi_model_lists(
 
     # Claude entries keep their catalog ceiling (already within serving caps);
     # the OSS/GPT/Gemini surfaces carry the oversized values that 400 at runtime.
-    _clamp_entries_to_output_caps(workspace_url, token, [*gpt_responses, *completions, *gemini])
+    _clamp_entries_to_output_caps(
+        workspace_url, token, [*gpt_responses, *completions, *mlflow, *gemini]
+    )
 
-    return claude, gpt_responses, completions, gemini
+    return claude, gpt_responses, completions, mlflow, gemini
 
 
 def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTransport | None:
@@ -1134,6 +1177,7 @@ def _databricks_gateway_pi_provider(
     claude_models: list[_PiModelEntry] = []
     gpt_models: list[_PiModelEntry] = []
     completions_models: list[_PiModelEntry] = []
+    mlflow_models: list[_PiModelEntry] = []
     gemini_models: list[_PiModelEntry] = []
     parsed_gateway = urlparse(gateway_base_url)
     gateway_labels = (parsed_gateway.hostname or "").split(".")
@@ -1149,7 +1193,7 @@ def _databricks_gateway_pi_provider(
         list_token = _run_auth_command(auth_command) if auth_command else static_api_key
         if list_token:
             try:
-                claude_models, gpt_models, completions_models, gemini_models = (
+                claude_models, gpt_models, completions_models, mlflow_models, gemini_models = (
                     _fetch_pi_model_lists(workspace_url, list_token)
                 )
             except Exception:  # noqa: BLE001 — network failure must not break launch
@@ -1174,6 +1218,9 @@ def _databricks_gateway_pi_provider(
     codex_gateway_url = f"{gateway_origin}{_DATABRICKS_GATEWAY_CODEX_SUFFIX}"
     workspace_completions_url = workspace_url + "/serving-endpoints" if workspace_url else None
     workspace_mlflow_url = workspace_url + "/ai-gateway/mlflow/v1" if workspace_url else None
+    workspace_gemini_url = (
+        workspace_url + DATABRICKS_GEMINI_GATEWAY_PATH if workspace_url else None
+    )
     additional: dict[str, _PiProviderPayload] = {}
     if gpt_models:
         additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
@@ -1183,15 +1230,21 @@ def _databricks_gateway_pi_provider(
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
             api_key, workspace_completions_url, completions_models, api_type="openai-completions"
         )
-    if gemini_models and workspace_mlflow_url:
+    if mlflow_models and workspace_mlflow_url:
         additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
+            api_key, workspace_mlflow_url, mlflow_models, api_type="openai-completions"
+        )
+    if gemini_models and workspace_gemini_url:
+        additional[_PI_GEMINI_PROVIDER_ID] = _databricks_gemini_provider(
+            api_key, workspace_gemini_url, gemini_models
         )
     surfaces = {DatabricksPiSurface.RESPONSES: codex_gateway_url}
     if workspace_completions_url:
         surfaces[DatabricksPiSurface.COMPLETIONS] = workspace_completions_url
     if workspace_mlflow_url:
         surfaces[DatabricksPiSurface.MLFLOW] = workspace_mlflow_url
+    if workspace_gemini_url:
+        surfaces[DatabricksPiSurface.GEMINI] = workspace_gemini_url
     config = PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{gateway_origin}{_DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX}",
@@ -1203,7 +1256,9 @@ def _databricks_gateway_pi_provider(
         additional_providers=additional,
         databricks_surfaces=surfaces,
     )
-    listed_anything = bool(claude_models or gpt_models or completions_models or gemini_models)
+    listed_anything = any(
+        (claude_models, gpt_models, completions_models, mlflow_models, gemini_models)
+    )
     if declared_surface is None or not listed_anything:
         return config
     limits = {

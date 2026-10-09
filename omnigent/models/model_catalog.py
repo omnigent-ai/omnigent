@@ -1718,6 +1718,11 @@ def fetch_databricks_model_service_entries(
             "anthropic" in api_type and "messages" in api_type for api_type in normalized_api_types
         ):
             wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
+        if any(
+            api_type.startswith("gemini/") and "generatecontent" in api_type
+            for api_type in normalized_api_types
+        ):
+            wire_apis.add(ModelWireAPI.GEMINI_GENERATE_CONTENT)
         if not wire_apis:
             continue
         models.append(

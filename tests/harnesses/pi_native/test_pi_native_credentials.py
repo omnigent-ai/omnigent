@@ -172,7 +172,8 @@ def test_inline_databricks_gateway_enumerates_all_families(
         [{"id": "system.ai.claude-opus-5"}],  # claude → anthropic surface
         [{"id": "system.ai.gpt-5"}],  # gpt → responses surface
         [],  # completions
-        [{"id": "system.ai.gemini-3-flash"}],  # gemini → mlflow surface
+        [],  # other system.ai.* → mlflow surface
+        [{"id": "system.ai.gemini-3-flash"}],  # gemini → native gemini surface
     )
     monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda host, token: canned)
     config = {
@@ -198,7 +199,7 @@ def test_inline_databricks_gateway_enumerates_all_families(
     assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
     assert [m["id"] for m in provider.extra_models] == ["system.ai.claude-opus-5"]
     # GPT and Gemini surface as additional providers (the openai-only bug hid these).
-    assert set(provider.additional_providers) == {"omnigent-openai", "omnigent-mlflow"}
+    assert set(provider.additional_providers) == {"omnigent-openai", "omnigent-gemini"}
     # The configured default is still what Pi launches with, served by its surface.
     assert provider.model == "system.ai.gpt-5"
     rendered = provider.to_models_config()["providers"]
@@ -278,7 +279,7 @@ def test_inline_databricks_gateway_enumerates_only_the_selected_family(
 
     def _listing(host: str, token: str):
         listings.append(host)
-        return ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], [])
+        return ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], [], [])
 
     monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
     config = {
@@ -359,6 +360,7 @@ def test_inline_databricks_gateway_mlflow_url_derives_surfaces_from_origin(
             [{"id": "system.ai.claude-opus-5"}],
             [],
             [],
+            [{"id": "system.ai.llama-4-maverick"}],
             [{"id": "system.ai.gemini-3-flash"}],
         ),
     )
@@ -386,7 +388,13 @@ def test_inline_databricks_gateway_mlflow_url_derives_surfaces_from_origin(
     assert rendered["omnigent-mlflow"]["baseUrl"] == (
         "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1"
     )
-    assert [m["id"] for m in rendered["omnigent-mlflow"]["models"]] == ["system.ai.gemini-3-flash"]
+    assert [m["id"] for m in rendered["omnigent-mlflow"]["models"]] == [
+        "system.ai.llama-4-maverick"
+    ]
+    assert rendered["omnigent-gemini"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/gemini/v1beta"
+    )
+    assert [m["id"] for m in rendered["omnigent-gemini"]["models"]] == ["system.ai.gemini-3-flash"]
 
 
 def test_inline_databricks_gateway_partial_listing_keeps_default_on_declared_surface(
@@ -396,7 +404,7 @@ def test_inline_databricks_gateway_partial_listing_keeps_default_on_declared_sur
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], [], []),
     )
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_openai_gateway_config)
@@ -430,6 +438,7 @@ def test_inline_databricks_gateway_keeps_configured_limits_on_default(
             gpt if default_listed else [],
             [],
             [],
+            [],
         ),
     )
     config = _databricks_openai_gateway_config()
@@ -458,7 +467,7 @@ def test_inline_databricks_gateway_picking_omitted_default_keeps_its_surface(
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], [], []),
     )
     config = _databricks_openai_gateway_config()
 
@@ -557,6 +566,7 @@ def test_inline_databricks_gateway_listed_default_follows_the_workspace_surface(
             [{"id": "system.ai.gpt-5"}],
             [],
             [],
+            [],
         ),
     )
     config = {
@@ -599,7 +609,7 @@ def test_inline_databricks_gateway_unlisted_override_is_routed_like_databricks_k
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], [], []),
     )
     override = "system.ai.gpt-5-mini"
     expected_provider = creds._SURFACE_PROVIDER_IDS[databricks_pi_surface_for_model(override)]
@@ -660,6 +670,7 @@ def test_databricks_gateway_builder_derives_codex_surface_from_anthropic_url(
         lambda host, token: (
             [{"id": "system.ai.claude-opus-5"}],
             [{"id": "system.ai.gpt-5"}],
+            [],
             [],
             [],
         ),
@@ -972,7 +983,7 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
         # A pre-upgrade selection named the single-family primary; the workspace
         # listing now serves the model from the Responses surface.
         (
-            ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], []),
+            ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], [], []),
             "omnigent/system.ai.gpt-5",
             "omnigent-openai",
         ),
@@ -985,7 +996,7 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
 def test_inline_databricks_gateway_selection_follows_the_model_across_discovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    listing: tuple[list, list, list, list] | None,
+    listing: tuple[list, list, list, list, list] | None,
     selection: str,
     expected_provider: str,
 ) -> None:
@@ -1023,6 +1034,7 @@ def test_inline_databricks_gateway_default_launches_with_thinking_off(
         lambda host, token: (
             [{"id": "system.ai.claude-opus-5"}],
             [{"id": "system.ai.gpt-5"}],
+            [],
             [],
             [],
         ),
@@ -1237,6 +1249,7 @@ def test_pi_native_model_options_default_row_is_the_no_selection_launch(
         lambda host, token: (
             [{"id": "system.ai.claude-opus-5"}],
             [{"id": "system.ai.gpt-5"}],
+            [],
             [],
             [],
         ),
@@ -2292,7 +2305,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda *_: (live_claude, live_gpt_responses, live_gpt_completions, []),
+        lambda *_: (live_claude, live_gpt_responses, live_gpt_completions, [], []),
     )
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
@@ -2346,7 +2359,7 @@ def test_cli_config_databricks_registers_gpt_provider(
         # Assert the auth_command token is used, not the SDK token
         assert token == "cmd-tok", f"expected auth_command token, got {token!r}"
         assert "dbc-a5d4177a" in workspace_url
-        return live_claude, live_gpt, [], []
+        return live_claude, live_gpt, [], [], []
 
     monkeypatch.setattr(creds, "_fetch_pi_model_lists", _mock_fetch)
 
@@ -2396,6 +2409,15 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
             _make_service("system.ai.gpt-chat-only", ["mlflow/v1/chat/completions"]),
             # Llama - chat only
             _make_service("system.ai.llama-4-maverick", ["mlflow/v1/chat/completions"]),
+            # Gemini - chat plus the native Gemini surface
+            _make_service(
+                "system.ai.gemini-3-5-flash",
+                [
+                    "mlflow/v1/chat/completions",
+                    "gemini/v1/generateContent",
+                    "gemini/v1/streamGenerateContent",
+                ],
+            ),
             # Kimi - chat only (no Responses API per UC metadata)
             _make_service("system.ai.kimi-k2-7-code", ["mlflow/v1/chat/completions"]),
             # Embedding model - should be excluded
@@ -2414,7 +2436,7 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_MockTransport()),
     ):
-        claude, gpt, completions, _gemini = creds._fetch_pi_model_lists(
+        claude, gpt, completions, mlflow, gemini = creds._fetch_pi_model_lists(
             "https://wkspc.example.com", "tok"
         )
 
@@ -2431,9 +2453,12 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     kimi_entry = next(m for m in gpt if m["id"] == "system.ai.kimi-k2-7-code")
     assert kimi_entry.get("reasoning") is None
     # Llama routes to mlflow gateway (system.ai.* ids 404 at serving-endpoints).
-    mlflow_ids = [m["id"] for m in _gemini]
+    mlflow_ids = [m["id"] for m in mlflow]
     assert "system.ai.llama-4-maverick" in mlflow_ids
     assert "system.ai.gpt-chat-only" in mlflow_ids
+    # Gemini takes its native surface, where Pi keeps the tool-call thought signatures.
+    assert [m["id"] for m in gemini] == ["system.ai.gemini-3-5-flash"]
+    assert "system.ai.gemini-3-5-flash" not in mlflow_ids
     completions_ids = [m["id"] for m in completions]
     assert not completions_ids  # no completions-only models in this test payload
     # Embedding excluded
@@ -2460,13 +2485,14 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_ErrorTransport()),
     ):
-        claude, gpt, completions, gemini = creds._fetch_pi_model_lists(
+        claude, gpt, completions, mlflow, gemini = creds._fetch_pi_model_lists(
             "https://wkspc.example.com", "bad-tok"
         )
 
     assert claude == []
     assert gpt == []
     assert completions == []
+    assert mlflow == []
     assert gemini == []
 
 
@@ -2529,7 +2555,7 @@ def test_fetch_pi_model_lists_carries_catalog_token_limits(
         "httpx.Client",
         lambda **kw: _real_client(transport=_MockTransport()),
     ):
-        claude, _gpt, _completions, _gemini = creds._fetch_pi_model_lists(
+        claude, _gpt, _completions, _mlflow, _gemini = creds._fetch_pi_model_lists(
             "https://wkspc.example.com", "tok"
         )
 
@@ -2585,7 +2611,7 @@ def test_fetch_pi_model_lists_survives_catalog_outage(monkeypatch: pytest.Monkey
         "httpx.Client",
         lambda **kw: _real_client(transport=_MockTransport()),
     ):
-        claude, _gpt, _completions, _gemini = creds._fetch_pi_model_lists(
+        claude, _gpt, _completions, _mlflow, _gemini = creds._fetch_pi_model_lists(
             "https://wkspc.example.com", "tok"
         )
 
@@ -2625,7 +2651,7 @@ def _mock_databricks_model_lists(
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda *_: (_entries(claude), _entries(gpt), [], []),
+        lambda *_: (_entries(claude), _entries(gpt), [], [], []),
     )
 
 
@@ -2774,7 +2800,7 @@ def _databricks_provider_without_catalog(
         ("system.ai.glm-5-2", "omnigent-openai", "openai-responses"),
         ("databricks-kimi-k3", "omnigent-completions", "openai-completions"),
         ("databricks-gpt-5-5", "omnigent-openai", "openai-responses"),
-        ("system.ai.gemini-3-5-flash", "omnigent-mlflow", "openai-completions"),
+        ("system.ai.gemini-3-5-flash", "omnigent-gemini", "google-generative-ai"),
         ("databricks-gemini-3-5-flash", "omnigent-completions", "openai-completions"),
         ("databricks-llama-4-maverick", "omnigent-completions", "openai-completions"),
         ("databricks-deepseek-v3", "omnigent-completions", "openai-completions"),
@@ -2892,7 +2918,7 @@ def test_cataloged_model_is_not_touched_by_fallback(monkeypatch: pytest.MonkeyPa
     live_claude = [{"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]}]
     live_completions = [{"id": "databricks-llama-4", "input": ["text", "image"]}]
     monkeypatch.setattr(
-        creds, "_fetch_pi_model_lists", lambda *_: (live_claude, [], live_completions, [])
+        creds, "_fetch_pi_model_lists", lambda *_: (live_claude, [], live_completions, [], [])
     )
 
     provider = creds.resolve_pi_native_provider(
@@ -3048,7 +3074,7 @@ def test_single_family_provider_serves_any_model(
 def test_databricks_builders_carry_reachable_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Databricks profile path records every surface its credential reaches."""
     _mock_databricks_profile(monkeypatch)
-    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: ([], [], [], []))
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: ([], [], [], [], []))
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -3057,6 +3083,7 @@ def test_databricks_builders_carry_reachable_surfaces(monkeypatch: pytest.Monkey
         creds.DatabricksPiSurface.RESPONSES: "https://wkspc.example.com/ai-gateway/codex/v1",
         creds.DatabricksPiSurface.COMPLETIONS: "https://wkspc.example.com/serving-endpoints",
         creds.DatabricksPiSurface.MLFLOW: "https://wkspc.example.com/ai-gateway/mlflow/v1",
+        creds.DatabricksPiSurface.GEMINI: "https://wkspc.example.com/ai-gateway/gemini/v1beta",
     }
 
 
@@ -3228,7 +3255,7 @@ def test_cli_config_pi_provider_uses_live_discovery_over_catalog_default(
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda host, token: (LIVE_CLAUDE, [], [], []),
+        lambda host, token: (LIVE_CLAUDE, [], [], [], []),
     )
     monkeypatch.setattr(
         creds,
@@ -3280,7 +3307,7 @@ def test_cli_config_pi_provider_explicit_override_wins_over_discovery(
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], [], []),
     )
     monkeypatch.setattr(
         creds,

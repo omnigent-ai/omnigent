@@ -62,6 +62,7 @@ from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from
 from omnigent.models import model_catalog
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.pi_model_compatibility import (
+    DATABRICKS_GEMINI_GATEWAY_PATH,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
@@ -751,6 +752,7 @@ def _build_models_json(
     serving_endpoints_url = f"{h}/serving-endpoints"
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
+    gemini_gateway_url = f"{h}{DATABRICKS_GEMINI_GATEWAY_PATH}"
     raw_openai_base_url = (base_urls or {}).get("openai")
     is_databricks_openai_gateway = bool(
         raw_openai_base_url and _is_databricks_gateway_base_url(raw_openai_base_url)
@@ -783,6 +785,7 @@ def _build_models_json(
         "databricks": [],
         "databricks-anthropic": [],
         "databricks-mlflow": [],
+        "databricks-gemini": [],
         "databricks-completions": [],
     }
     for catalog_model in catalog_models:
@@ -833,7 +836,16 @@ def _build_models_json(
                 "authHeader": True,
                 "models": provider_models["databricks-anthropic"],
             },
-            # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
+            # Gemini → the gateway's native Gemini surface, the only one where Pi
+            # round-trips the thought signatures Gemini-3 requires on tool calls.
+            "databricks-gemini": {
+                "baseUrl": gemini_gateway_url,
+                "apiKey": token,
+                "api": "google-generative-ai",
+                "authHeader": True,
+                "models": provider_models["databricks-gemini"],
+            },
+            # Other system.ai.* models not needing Responses API (Llama) → mlflow gateway.
             "databricks-mlflow": {
                 "baseUrl": mlflow_gateway_url,
                 "apiKey": token,
@@ -924,6 +936,20 @@ def _pi_needs_responses_api(
     return "gpt" in lower
 
 
+def _pi_uses_gemini_api(
+    model: str,
+    wire_apis: frozenset[ModelWireAPI] | None = None,
+) -> bool:
+    """Return whether Pi should use the Databricks native Gemini surface.
+
+    Catalog metadata is authoritative when available; unknown metadata falls
+    back to the model family, which the gateway serves there.
+    """
+    if wire_apis is not None:
+        return ModelWireAPI.GEMINI_GENERATE_CONTENT in wire_apis
+    return "gemini" in model.lower()
+
+
 def _is_databricks_gateway_base_url(base_url: str) -> bool:
     """Return whether a family base URL fronts a Databricks Unity Gateway.
 
@@ -1004,6 +1030,8 @@ def _pi_provider_for_model(
             return "databricks-openai"
         return "databricks-completions"
     if lower.startswith("system.ai."):
+        if _pi_uses_gemini_api(model, wire_apis):
+            return "databricks-gemini"
         return (
             "databricks-openai"
             if _pi_needs_responses_api(model, wire_apis)
