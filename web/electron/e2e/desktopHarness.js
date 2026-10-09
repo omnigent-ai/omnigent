@@ -424,8 +424,7 @@ async function launchDesktop(opts) {
   // an embedded browser view. The display capture becomes the primary clip in
   // saveRecording; the per-page clips remain as context.
   // Dev builds read dev-app-update.yml and would try to reach the update
-  // endpoint; a version override keeps the app off the update path. An
-  // `undefined` opts.env entry removes that variable (e.g. DISPLAY to force Wayland).
+  // endpoint; a version override keeps the app off the update path.
   const env = Object.fromEntries(
     Object.entries({
       ...process.env,

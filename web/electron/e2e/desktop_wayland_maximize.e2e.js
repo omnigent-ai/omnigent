@@ -1,7 +1,6 @@
 // Maximizing the main window on native Wayland must not kill the shell (Chromium
 // traps on the zero-height geometry a collapsed update overlay once produced).
-// Drives the real shell against a headless stub compositor enforcing xdg-shell
-// (needs pywayland >= 0.4.19 in OMNIGENT_PYTHON's environment; skips otherwise).
+// Drives the real shell against a headless stub compositor enforcing xdg-shell.
 
 "use strict";
 
@@ -50,10 +49,11 @@ async function pollUntil(fn, { timeout, interval = 200, label }) {
 // electronApp.close() resolves, so wait until every page seen has a raw clip
 // and the clips stop growing before saveRecording renames them.
 async function waitForRawVideo(recordDir, expectedPages, timeout = 15_000) {
+  if (expectedPages === 0) return;
   const rawClipSizes = () =>
     fs
       .readdirSync(recordDir)
-      .filter((f) => (f.startsWith("page@") || f.startsWith("display@")) && f.endsWith(".webm"))
+      .filter((f) => f.startsWith("page@") && f.endsWith(".webm"))
       .map((f) => fs.statSync(path.join(recordDir, f)).size);
   const deadline = Date.now() + timeout;
   let last = -1;
@@ -87,6 +87,10 @@ async function startCompositor() {
     env: { ...process.env, XDG_RUNTIME_DIR: runtimeDir },
     stdio: ["ignore", "pipe", "inherit"],
   });
+  let spawnError = null;
+  proc.on("error", (err) => {
+    spawnError = err;
+  });
 
   let buffer = "";
   proc.stdout.setEncoding("utf8");
@@ -106,34 +110,50 @@ async function startCompositor() {
     }
   });
 
-  await pollUntil(() => fs.existsSync(path.join(controlDir, "ready")), {
-    timeout: 15_000,
-    label: "compositor ready",
+  const exited = new Promise((resolve) => {
+    proc.once("exit", resolve);
   });
+  const stop = async () => {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      proc.kill("SIGTERM");
+      await Promise.race([exited, sleep(2000)]);
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill("SIGKILL");
+        await Promise.race([exited, sleep(1000)]);
+      }
+    }
+    fs.rmSync(runtimeDir, { recursive: true, force: true });
+  };
 
-  const command = async (name, selector = {}) => {
+  try {
+    await pollUntil(
+      () => {
+        if (spawnError) throw spawnError;
+        if (proc.exitCode !== null || proc.signalCode !== null) {
+          throw new Error(`compositor exited before ready (${proc.exitCode ?? proc.signalCode})`);
+        }
+        return fs.existsSync(path.join(controlDir, "ready"));
+      },
+      { timeout: 15_000, label: "compositor ready" },
+    );
+  } catch (err) {
+    await stop();
+    throw err;
+  }
+
+  const command = async (name) => {
     const file = path.join(controlDir, name);
     for (const suffix of [".done", ".taken"]) {
       fs.rmSync(file + suffix, { force: true });
     }
-    // The compositor polls for `file`; rename a finished temp file into place so
-    // it never parses a partially written command.
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify(selector));
+    // The compositor polls for `file`; rename a finished temp file into place.
+    fs.writeFileSync(`${file}.tmp`, "");
     fs.renameSync(`${file}.tmp`, file);
     const done = await pollUntil(
       () => (fs.existsSync(file + ".done") ? fs.readFileSync(file + ".done", "utf8") : null),
       { timeout: 10_000, label: `compositor ${name}` },
     );
     return JSON.parse(done);
-  };
-
-  const stop = async () => {
-    if (proc.exitCode === null && proc.signalCode === null) {
-      proc.kill("SIGTERM");
-      await sleep(200);
-      if (proc.exitCode === null) proc.kill("SIGKILL");
-    }
-    fs.rmSync(runtimeDir, { recursive: true, force: true });
   };
 
   return { socket, runtimeDir, events, command, stop };
@@ -278,6 +298,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       (e) => e.event === "invalid_window_geometry",
     );
 
+    evidence.exitAtEnd = exitInfo;
     fs.writeFileSync(path.join(RECORD_DIR, "evidence.json"), JSON.stringify(evidence, null, 2));
 
     assert.equal(
@@ -289,7 +310,8 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     const after = evidence.windowsAfter ?? [];
     assert.ok(
       after.some((w) => !w.overlay && w.maximized),
-      "the main window should be maximized and alive after the resize",
+      "the main window should be maximized and alive after the resize " +
+        `(exit: ${JSON.stringify(exitInfo)}; ${evidence.windowsAfterError ?? "windows listed"})`,
     );
     assert.equal(
       evidence.exitAfterUnmaximize,

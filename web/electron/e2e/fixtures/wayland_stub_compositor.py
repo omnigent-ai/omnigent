@@ -1,6 +1,6 @@
 """Headless stub Wayland compositor: enough wl_*/xdg_wm_base for Chromium to open windows
 (nothing is displayed), zero-sized geometry rejected unless ``--lenient-geometry``, JSON-line
-logs on stdout, and ``maximize``/``unmaximize``/``quit`` command files under ``--control DIR``."""
+logs on stdout, and ``maximize``/``unmaximize`` command files under ``--control DIR``."""
 
 from __future__ import annotations
 
@@ -618,49 +618,38 @@ class StubCompositor:
             emit(buffer, "release")
         self.poll_control()
 
-    def target_toplevels(self, selector):
-        """Toplevels a control command applies to: ``{"title": ...}`` picks by title,
-        ``{"all": true}`` every toplevel; otherwise the largest non-child toplevel
-        stands in for the focused window a real compositor would act on."""
+    def focused_toplevel(self):
+        """The largest non-child toplevel stands in for the focused window a real
+        compositor would act on."""
         candidates = [
             (key, state)
             for key, state in self.toplevels.items()
             if state.parent is None and state.xdg._ptr is not None and key in self.live
         ]
-        title = selector.get("title")
-        if title is not None:
-            return [self.live[key] for key, state in candidates if state.title == title]
-        if selector.get("all"):
-            return [self.live[key] for key, _ in candidates]
 
         def area(entry):
             geometry = self.state_of(entry[1].xdg).geometry
             return 0 if geometry is None else geometry[2] * geometry[3]
 
-        return [self.live[max(candidates, key=area)[0]]] if candidates else []
+        return self.live[max(candidates, key=area)[0]] if candidates else None
 
     def poll_control(self):
         if not self.control:
             return
-        for command in ("maximize", "unmaximize", "quit"):
+        for command in ("maximize", "unmaximize"):
             path = os.path.join(self.control, command)
             if not os.path.exists(path):
                 continue
-            with open(path, encoding="utf-8") as body:
-                text = body.read().strip()
-            selector = json.loads(text) if text else {}
             os.replace(path, path + ".taken")
             affected = []
-            if command in ("maximize", "unmaximize"):
-                for toplevel in self.target_toplevels(selector):
-                    if command == "maximize":
-                        self.maximize(toplevel, source="compositor")
-                    else:
-                        self.unmaximize(toplevel, source="compositor")
-                    affected.append(self.describe(self.state_of(toplevel).xdg))
-            elif command == "quit":
-                self.quit = True
-            self.log("control", command=command, selector=selector, affected=affected)
+            toplevel = self.focused_toplevel()
+            if toplevel is not None:
+                if command == "maximize":
+                    self.maximize(toplevel, source="compositor")
+                else:
+                    self.unmaximize(toplevel, source="compositor")
+                affected.append(self.describe(self.state_of(toplevel).xdg))
+            self.log("control", command=command, affected=affected)
             with open(path + ".done", "w", encoding="utf-8") as done:
                 json.dump({"command": command, "affected": affected}, done)
 
@@ -691,7 +680,7 @@ def main():
         "--socket", default=None, help="WAYLAND_DISPLAY socket name (default: auto)"
     )
     parser.add_argument(
-        "--control", default=None, help="directory polled for maximize/unmaximize/quit files"
+        "--control", default=None, help="directory polled for maximize/unmaximize files"
     )
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
