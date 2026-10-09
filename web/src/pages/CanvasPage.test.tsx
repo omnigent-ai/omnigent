@@ -1,11 +1,11 @@
 // Tests for the Canvas page (`/canvas`). React Flow is stubbed to a plain list
-// that exposes the props the page drives (nodes, drag-stop, double-click), and
+// that exposes the props the page drives (nodes, drag-stop, click), and
 // the session loader and project hook are mocked at their seams; the layout,
 // storage, and card modules run for real.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type * as xyflow from "@xyflow/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation, useMatch, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -58,9 +58,9 @@ vi.mock("@xyflow/react", async (importActual) => ({
             data-x={node.position?.x}
             data-y={node.position?.y}
             data-selected={node.selected ? "true" : "false"}
-            onDoubleClick={() =>
-              (props.onNodeDoubleClick as (event: MouseEvent, value: unknown) => void)(
-                new MouseEvent("dblclick"),
+            onClick={() =>
+              (props.onNodeClick as (event: MouseEvent, value: unknown) => void)(
+                new MouseEvent("click"),
                 node,
               )
             }
@@ -133,10 +133,36 @@ function projectsStub(projects: ProjectSummary[] | undefined) {
 
 function LocationProbe() {
   const location = useLocation();
-  return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
+  const navigate = useNavigate();
+  return (
+    <>
+      <div data-testid="location">{`${location.pathname}${location.search}`}</div>
+      <button type="button" onClick={() => navigate(-1)}>
+        Back
+      </button>
+      <button type="button" onClick={() => navigate(1)}>
+        Forward
+      </button>
+      <button
+        type="button"
+        onClick={() => navigate({ pathname: "/canvas", search: location.search })}
+      >
+        Close session
+      </button>
+    </>
+  );
 }
 
-function pageTree(initialEntry = "/canvas") {
+function RoutedCanvas({ controlSelection }: { controlSelection: boolean }) {
+  const match = useMatch("/canvas/c/:conversationId");
+  return (
+    <CanvasPage
+      selectedSessionId={controlSelection ? (match?.params.conversationId ?? null) : undefined}
+    />
+  );
+}
+
+function pageTree(initialEntry = "/canvas", controlSelection = false) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={queryClient}>
@@ -144,10 +170,10 @@ function pageTree(initialEntry = "/canvas") {
         <MemoryRouter initialEntries={[initialEntry]}>
           <Routes>
             <Route
-              path="/canvas"
+              path="/canvas/*"
               element={
                 <>
-                  <CanvasPage />
+                  <RoutedCanvas controlSelection={controlSelection} />
                   <LocationProbe />
                 </>
               }
@@ -175,6 +201,7 @@ beforeEach(() => {
   flowProps.current = null;
   flowFitView.mockClear();
   flowSetViewport.mockClear();
+  flowApi.getViewport.mockReturnValue({ x: 0, y: 0, zoom: 1 });
   vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub([]));
   vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub([]));
 });
@@ -358,7 +385,7 @@ describe("CanvasPage", () => {
     expect(screen.getByText("No sessions in Legacy")).toBeInTheDocument();
   });
 
-  it("opens a session on double-click and starts new sessions in the active project", () => {
+  it("opens a session on one click and starts new sessions in the active project", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("conv_1", 1, { project_id: "proj_a" })]),
@@ -366,19 +393,78 @@ describe("CanvasPage", () => {
     const { unmount } = renderPage();
 
     fireEvent.click(screen.getByTestId("canvas-new-session"));
-    expect(screen.getByTestId("location")).toHaveTextContent("/");
+    expect(screen.getByTestId("location")).toHaveTextContent("/?canvas=main");
     unmount();
 
     renderPage();
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
     fireEvent.click(screen.getByTestId("canvas-new-session"));
-    expect(screen.getByTestId("location")).toHaveTextContent("/?project=Alpha");
+    expect(screen.getByTestId("location")).toHaveTextContent("/?canvas=proj_a&project=Alpha");
     cleanup();
 
     renderPage();
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
-    fireEvent.doubleClick(screen.getByTestId("flow-node-conv_1"));
-    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_1");
+    fireEvent.click(screen.getByTestId("flow-node-conv_1"));
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas/c/conv_1?canvas=proj_a");
+    expect(screen.getByRole("tab", { name: "Alpha" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
+  });
+
+  it("follows session selection and clears it when the conversation closes", () => {
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("first", 2), conversation("second", 1)]),
+    );
+    render(pageTree("/canvas", true));
+    fireEvent.click(screen.getByTestId("flow-node-first"));
+    expect(screen.getByTestId("flow-node-first")).toHaveAttribute("data-selected", "true");
+    const onNodesChange = flowProps.current!.onNodesChange as (changes: unknown[]) => void;
+    act(() => onNodesChange([{ id: "first", type: "select", selected: false }]));
+    expect(screen.getByTestId("flow-node-first")).toHaveAttribute("data-selected", "true");
+    fireEvent.click(screen.getByTestId("flow-node-second"));
+    expect(screen.getByTestId("flow-node-first")).toHaveAttribute("data-selected", "false");
+    expect(screen.getByTestId("flow-node-second")).toHaveAttribute("data-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close session" }));
+    expect(screen.getByTestId("flow-node-second")).toHaveAttribute("data-selected", "false");
+  });
+
+  it("restores the project and selected card through browser Back and Forward", () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })]),
+    );
+    render(pageTree("/canvas", true));
+    fireEvent.click(screen.getByTestId("flow-node-main"));
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    fireEvent.click(screen.getByTestId("flow-node-alpha"));
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/canvas$/);
+    expect(screen.getByRole("tab", { name: "Main" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Forward" }));
+    expect(screen.getByRole("tab", { name: "Alpha" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Forward" }));
+    expect(screen.getByTestId("flow-node-alpha")).toHaveAttribute("data-selected", "true");
+  });
+
+  it("preserves a panned viewport when opening a session and revisiting a project", async () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("main", 2), conversation("alpha", 1, { project_id: "proj_a" })]),
+    );
+    render(pageTree("/canvas", true));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(1));
+    const viewport = { x: -80, y: 24, zoom: 0.75 };
+    flowApi.getViewport.mockReturnValue(viewport);
+    const onMoveEnd = flowProps.current!.onMoveEnd as (event: MouseEvent) => void;
+    act(() => onMoveEnd(new MouseEvent("mouseup")));
+    fireEvent.click(screen.getByTestId("flow-node-main"));
+    expect(flowFitView).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(2));
+    flowApi.getViewport.mockReturnValue({ x: 200, y: 100, zoom: 1 });
+    fireEvent.click(screen.getByRole("tab", { name: "Main" }));
+    await waitFor(() => expect(flowSetViewport).toHaveBeenLastCalledWith(viewport));
+    expect(flowFitView).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the clicked card's selection while the session list churns", () => {
@@ -561,17 +647,7 @@ describe("CanvasPage", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(
       projectsStub([{ id: "proj_release", name: "Release" }]),
     );
-    rerender(
-      <QueryClientProvider client={new QueryClient()}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/canvas"]}>
-            <Routes>
-              <Route path="/canvas" element={<CanvasPage />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>,
-    );
+    rerender(pageTree());
     expect(screen.getByRole("tab", { name: "Release" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("No sessions in Release")).toBeInTheDocument();
   });

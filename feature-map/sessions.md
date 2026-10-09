@@ -52,6 +52,16 @@ the header menu), and each place is a separate entry point.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab.
+- `canvas-workspace`: Canvas collapses navigation to an icon rail; clicking a
+  card opens its session beside the project board. Switching cards keeps
+  drafts and board state; resize, focus, and close controls adjust the split.
+- `canvas-mobile`: narrow screens show the selected session with a Canvas back
+  button, retaining the project across deep links and reloads.
+- `canvas-navigation`: the collapsed sidebar keeps its expand button at the
+  top; the remaining icons follow the expanded sidebar's order and available
+  destinations, including Usage when enabled.
+- `canvas-create`: the plus button on Main or a project opens the new-session
+  composer; sending returns to that board with the new session selected.
 
 ## How to get to it (user POV)
 
@@ -77,6 +87,18 @@ dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
+
+**Canvas:** choose Canvas in the sidebar, select Main or a project, and click
+a session card once. Expand navigation manually to keep it open while switching
+cards. Drag the divider to resize, focus the session to use the full area, or
+close the session to return to the board. Opening, closing, or maximizing
+Workspace keeps the canvas visible. Session focus is independent: Show canvas
+restores the board without closing Workspace. On narrow screens, Back to canvas returns to
+the selected project. A Canvas session link opens the same layout directly.
+The plus button starts a new session in the selected canvas. After sending,
+the new session opens beside that board; on narrow screens, Back to canvas
+returns to it. The collapsed sidebar keeps its expand button first, followed by
+Search, Settings, and the same primary destinations as the expanded sidebar.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
@@ -321,6 +343,24 @@ plain `uv run pytest`, which starts a private server for the test.
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
   tabs; all should be signed out.
+- **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
+  Workspace open/close, independent focus, maximizing, and pane sizing on wide
+  and smaller desktops:
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_stays_visible_when_workspace_opens`.
+  Grouping, feature gating, drag persistence, and live updates also run in
+  `tests/e2e_ui/sessions/test_canvas_page.py`, with selection churn in
+  `tests/e2e_ui/sessions/test_canvas_selected_highlight_persists.py::test_clicked_card_keeps_selected_highlight_across_live_updates`.
+- **`canvas-mobile` (deep link, back button, and reload):**
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
+- **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_rail_matches_expanded_navigation`.
+- **`canvas-create` (Main/project plus button, desktop/mobile):**
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_plus_creates_session_on_the_selected_board`.
+  The composer uses a fixture host; session creation, binding to the isolated
+  runner, and the mock-backed first reply use the real server. Temporary-id
+  replacement, server-first creation, feature gating, and failed-create draft
+  recovery also run in `web/src/shell/NewChatDialog.flow.test.tsx`.
 
 ## Gotchas
 
@@ -328,6 +368,13 @@ plain `uv run pytest`, which starts a private server for the test.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new
   chat shares that replacement runner and stops with the parent again.
+- Canvas is feature-gated, including conversation deep links. Its browser
+  tests enable that flag explicitly; they do not enable it on a deployed app.
+- Canvas entry collapses navigation once. Selecting another card must not
+  collapse navigation that the user has manually expanded. Card dragging must
+  not open a session. Workspace must not hide the canvas or change session
+  focus; both panels resize to leave room for the conversation controls.
+
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header

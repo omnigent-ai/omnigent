@@ -1,0 +1,143 @@
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter, useLocation, useMatch, useNavigate } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CanvasWorkspace, useCanvasWorkspace } from "./CanvasWorkspace";
+
+vi.mock("@/pages/CanvasPage", () => ({
+  CanvasPage: ({ selectedSessionId }: { selectedSessionId: string | null }) => (
+    <div>
+      <input aria-label="Board state" defaultValue="Unchanged board" />
+      <span data-testid="selected-session">{selectedSessionId}</span>
+    </div>
+  ),
+}));
+
+let containerWidth = 1200;
+let notifyResize: () => void;
+
+function Conversation() {
+  const canvas = useCanvasWorkspace()!;
+  return (
+    <>
+      <button type="button" onClick={canvas.toggleFocus}>
+        {canvas.focused ? "Restore canvas" : "Focus session"}
+      </button>
+      <button type="button" onClick={canvas.closeConversation}>
+        {canvas.compact ? "Back to canvas" : "Close session"}
+      </button>
+    </>
+  );
+}
+
+function Workspace() {
+  const match = useMatch("/canvas/c/:conversationId");
+  const navigate = useNavigate();
+  const location = useLocation();
+  return (
+    <>
+      <button type="button" onClick={() => navigate("/canvas/c/first?canvas=project")}>
+        First card
+      </button>
+      <button type="button" onClick={() => navigate("/canvas/c/second?canvas=project")}>
+        Second card
+      </button>
+      <div data-testid="location">{location.pathname + location.search}</div>
+      <CanvasWorkspace active conversationId={match?.params.conversationId}>
+        <Conversation />
+      </CanvasWorkspace>
+    </>
+  );
+}
+
+async function renderWorkspace(entry = "/canvas?canvas=project") {
+  render(
+    <MemoryRouter initialEntries={[entry]}>
+      <Workspace />
+    </MemoryRouter>,
+  );
+  return screen.findByLabelText("Board state");
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  containerWidth = 1200;
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(() => ({
+    width: containerWidth,
+    height: 800,
+    x: 0,
+    y: 0,
+    top: 0,
+    left: 0,
+    right: containerWidth,
+    bottom: 800,
+    toJSON() {},
+  }));
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      constructor(callback: () => void) {
+        notifyResize = callback;
+      }
+      observe() {}
+      disconnect() {}
+    },
+  );
+});
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe("CanvasWorkspace", () => {
+  it("keeps the board mounted through selection, focus, and closing the session", async () => {
+    const board = await renderWorkspace();
+    fireEvent.change(board, { target: { value: "Preserved viewport and cards" } });
+    fireEvent.click(screen.getByText("First card"));
+    expect(screen.getByTestId("selected-session")).toHaveTextContent("first");
+    fireEvent.click(screen.getByText("Second card"));
+    expect(screen.getByTestId("selected-session")).toHaveTextContent("second");
+    fireEvent.click(screen.getByText("Focus session"));
+    expect(screen.getByLabelText("Canvas pane")).toHaveClass("hidden");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByLabelText("Canvas pane")).not.toHaveClass("hidden");
+    fireEvent.click(screen.getByText("Close session"));
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=project");
+    expect(screen.queryByRole("separator")).toBeNull();
+    expect(screen.getByLabelText("Board state")).toBe(board);
+    expect(board).toHaveValue("Preserved viewport and cards");
+  });
+
+  it("persists keyboard resizing within both panes' minimum widths", async () => {
+    await renderWorkspace("/canvas/c/first?canvas=project");
+    const divider = screen.getByRole("separator");
+    const originalWidth = Number(divider.getAttribute("aria-valuenow"));
+    fireEvent.keyDown(divider, { key: "ArrowRight" });
+    expect(Number(divider.getAttribute("aria-valuenow"))).toBe(originalWidth + 24);
+    fireEvent.keyDown(divider, { key: "End" });
+    expect(divider.getAttribute("aria-valuenow")).toBe(divider.getAttribute("aria-valuemax"));
+    expect(localStorage.getItem("omnigent:canvas-split-ratio")).not.toBeNull();
+    fireEvent.keyDown(divider, { key: "Home" });
+    expect(divider.getAttribute("aria-valuenow")).toBe(divider.getAttribute("aria-valuemin"));
+  });
+
+  it("switches to a single pane on narrow screens and returns to the same board", async () => {
+    const board = await renderWorkspace("/canvas/c/first?canvas=project");
+    containerWidth = 600;
+    act(() => notifyResize());
+    expect(screen.getByLabelText("Canvas pane")).toHaveClass("hidden");
+    expect(screen.queryByRole("separator")).toBeNull();
+    fireEvent.click(screen.getByText("Back to canvas"));
+    expect(screen.getByLabelText("Canvas pane")).not.toHaveClass("hidden");
+    expect(screen.getByLabelText("Board state")).toBe(board);
+    expect(screen.getByTestId("location")).toHaveTextContent("/canvas?canvas=project");
+  });
+
+  it("restores a narrow board preference on a wide display", async () => {
+    containerWidth = 2800;
+    localStorage.setItem("omnigent:canvas-split-ratio", "0.15");
+    await renderWorkspace("/canvas/c/first?canvas=project");
+    expect(screen.getByRole("separator")).toHaveAttribute("aria-valuenow", "419");
+  });
+});

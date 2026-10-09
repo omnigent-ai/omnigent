@@ -164,10 +164,22 @@ describe("Canvas route", () => {
     expect(screen.queryByText("canvas page")).toBeNull();
   });
 
-  it("renders the native Canvas page inside the shell when the feature is on", async () => {
+  it("leaves the Canvas landing surface to the shell when the feature is on", () => {
     renderRoute("/canvas", { canvas: true });
-    expect(await screen.findByText("canvas page")).toBeInTheDocument();
     expect(screen.getByText("app shell")).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
+  });
+
+  it("opens a normal chat inside the Canvas route when enabled", async () => {
+    renderRoute("/canvas/c/session-one?canvas=project", { canvas: true });
+    expect(await screen.findByText("chat page")).toBeInTheDocument();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
+  });
+
+  it("gates Canvas conversation deep links with the same feature flag", async () => {
+    renderRoute("/canvas/c/session-one?canvas=project");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("chat page")).toBeNull();
   });
 });
 

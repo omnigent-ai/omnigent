@@ -9,6 +9,8 @@ import {
 } from "@/components/composer/HarnessPicker";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
   ComposerWorkspaceBar,
   ComposerWorkspaceTrigger,
@@ -5215,6 +5217,18 @@ export function NewChatLandingScreen() {
     // after the user has navigated elsewhere while this component is still
     // mounted in the outgoing transition tree.
     const createLocation = window.location.href;
+    const returnToCanvas = searchParams.has(CANVAS_QUERY_PARAM) && isFeatureEnabled(info, "canvas");
+    let createdCanvasId = selectedProject
+      ? (configProjectId ?? `name:${selectedProject}`)
+      : MAIN_CANVAS_ID;
+    const sessionLocation = (sessionId: string) =>
+      returnToCanvas ? canvasLocation(createdCanvasId, sessionId) : `/c/${sessionId}`;
+    const stillViewingLocalSession = (sessionId: string) => {
+      const destination = sessionLocation(sessionId);
+      return window.location.pathname.endsWith(
+        typeof destination === "string" ? destination : destination.pathname,
+      );
+    };
     // Remember the repos/branches for next time (seeds the picker on the next
     // visit). Only when a repo is actually set — a no-repo session leaves the
     // remembered repos untouched rather than clearing them.
@@ -5235,10 +5249,12 @@ export function NewChatLandingScreen() {
     // failure after the navigate-first jump strands a read-only phantom chat.
     const tearDownLocalConversation = () => {
       if (localConv === null) return;
-      const stillOnTempRoute = window.location.pathname.endsWith(`/c/${localConv.tempConvId}`);
+      const stillOnTempRoute = stillViewingLocalSession(localConv.tempConvId);
       const wasViewing = removeLocalConversation(localConv.tempConvId);
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
-      if (wasViewing && stillOnTempRoute) navigate("/");
+      if (wasViewing && stillOnTempRoute) {
+        navigate(returnToCanvas ? { pathname: "/", search: `?${searchParams.toString()}` } : "/");
+      }
     };
     // The draft is spent from the moment it is submitted: it belongs to the
     // session now being created, so a detour back to this screen must not
@@ -5465,7 +5481,7 @@ export function NewChatLandingScreen() {
             // real host (null for a sandbox create).
             hostId: sandboxSelected ? null : selectedHostId,
           });
-          if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
+          if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
         } catch {
           /* non-fatal: the response still opens the server session */
         }
@@ -5677,7 +5693,8 @@ export function NewChatLandingScreen() {
           // File via first-class project_id; the helper resolves the picked
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
-          await moveConversationToProject(data.id, selectedProject);
+          const filed = await moveConversationToProject(data.id, selectedProject);
+          if (filed?.project_id) createdCanvasId = filed.project_id;
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -5712,7 +5729,7 @@ export function NewChatLandingScreen() {
       // `localConv` is set only when a real agent id was resolved up front, so
       // it's safe to POST the first message with it.
       if (localConv !== null && effectiveAgentId !== null) {
-        const tempRouteSuffix = `/c/${localConv.tempConvId}`;
+        const tempConvId = localConv.tempConvId;
         promoteSessionDraft(localConv.tempConvId, data.id);
         // Hydrate the temp id onto the real id and POST the first message.
         hydrateLocalConversation(
@@ -5723,8 +5740,8 @@ export function NewChatLandingScreen() {
           files,
           localConv.pendingMsgTempId,
           skill,
-          navigate,
-          () => window.location.pathname.endsWith(tempRouteSuffix),
+          returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
+          () => stillViewingLocalSession(tempConvId),
           localProject,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
@@ -5735,7 +5752,7 @@ export function NewChatLandingScreen() {
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
         if (onScreenRef.current && window.location.href === createLocation) {
-          navigate(`/c/${data.id}`);
+          navigate(sessionLocation(data.id));
         }
       }
     } catch {

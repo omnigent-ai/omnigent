@@ -232,6 +232,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -437,7 +438,7 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
-  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
+  const isCanvasPage = !isExtensionRoute && isCanvasPathname(location.pathname);
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
