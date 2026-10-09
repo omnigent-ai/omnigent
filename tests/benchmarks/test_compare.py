@@ -49,28 +49,6 @@ def test_compare_flags_a_run_median_regression() -> None:
     assert rows[0]["status"] == "regression"
 
 
-@pytest.mark.parametrize(
-    ("baseline_p95", "candidate_p50", "candidate_p95", "passed"),
-    [
-        (0.2, 0.3, 0.5, True),  # large percentages, negligible absolute work
-        (10.0, 8.0, 10.0, False),  # only median work regressed
-        (0.2, 0.3, 20.0, False),  # only tail latency regressed
-    ],
-)
-def test_compare_can_require_an_absolute_increase(
-    baseline_p95: float, candidate_p50: float, candidate_p95: float, passed: bool
-) -> None:
-    baseline = {"journeys": {"render": _journey([0.1] * 3, [baseline_p95] * 3, n=80)}}
-    candidate = {"journeys": {"render": _journey([candidate_p50] * 3, [candidate_p95] * 3, n=80)}}
-
-    actual, rows = compare_reports(baseline, candidate, threshold=1.0, min_regression_ms=5.0)
-
-    assert actual is passed
-    assert rows[0]["status"] == ("ok" if passed else "regression")
-    # Existing callers keep the relative-only behavior.
-    assert compare_reports(baseline, candidate, threshold=1.0)[0] is False
-
-
 def test_compare_falls_back_to_summary_for_legacy_reports() -> None:
     baseline = {
         "journeys": {

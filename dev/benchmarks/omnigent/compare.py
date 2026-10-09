@@ -105,7 +105,6 @@ def compare_reports(
     threshold: float,
     backend: str | None = None,
     threshold_p95: float | None = None,
-    min_regression_ms: float = 0.0,
 ) -> tuple[bool, list[dict]]:
     """Compare journeys between two reports.
 
@@ -115,8 +114,6 @@ def compare_reports(
     :param backend: If set, only compare journeys whose ``backend`` key matches.
     :param threshold_p95: Separate threshold for P95, which is noisier than
         P50 even with enough samples. ``None`` uses *threshold*.
-    :param min_regression_ms: Minimum absolute increase as well as the relative
-        threshold. Keeps sub-millisecond rendering noise from failing UI runs.
     Run-level medians drive latency comparisons so one noisy timed run cannot
     dominate a three-run report. Summary averages remain the fallback for
     legacy reports that did not retain per-run metrics. P95 is reported but not
@@ -232,9 +229,7 @@ def compare_reports(
             for n in (_min_run_samples(b_data), _min_run_samples(c_data))
         )
         p95_limit = threshold if threshold_p95 is None else threshold_p95
-        regression = (delta_p50 > threshold and c_p50 - b_p50 > min_regression_ms) or (
-            p95_gated and delta_p95 > p95_limit and c_p95 - b_p95 > min_regression_ms
-        )
+        regression = delta_p50 > threshold or (p95_gated and delta_p95 > p95_limit)
         if regression:
             passed = False
 
@@ -281,7 +276,6 @@ def _status_style(status: str) -> str:
         "new": "cyan",
         "ok": "green",
         "skipped": "yellow",
-        "advisory": "yellow",
     }.get(status, "")
 
 

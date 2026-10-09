@@ -26,6 +26,17 @@ _DETECT = next(
         ([{"filename": "web/src/index.css"}], False, "true"),
         ([{"filename": "omnigent/server/app.py"}], False, "true"),
         ([{"filename": "omnigent/stores/file_store/sqlalchemy_store.py"}], False, "true"),
+        ([{"filename": "uv.lock"}], False, "true"),
+        (
+            [
+                {"filename": "package.json.bak"},
+                {"filename": "uv.lock.orig"},
+                {"filename": "pyproject.toml.rej"},
+                {"filename": ".github/workflows/benchmark-ui.yml.bak"},
+            ],
+            False,
+            "false",
+        ),
         ([{"filename": "docs/ui.md"}], False, "false"),
         (
             [{"filename": "docs/styles.css", "previous_filename": "web/src/index.css"}],
@@ -50,6 +61,8 @@ _DETECT = next(
         "ui",
         "server",
         "stores",
+        "config",
+        "config-backups",
         "docs",
         "rename-out",
         "rename-in",

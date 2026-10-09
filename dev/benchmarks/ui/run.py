@@ -351,9 +351,7 @@ def assess_reports(
         return ["Paired comparisons require at least three runs"], [], []
 
     baseline = reports["baseline"]
-    _, rows = compare_reports(
-        baseline, candidate, threshold=args.threshold, min_regression_ms=args.min_regression_ms
-    )
+    _, rows = compare_reports(baseline, candidate, threshold=args.threshold)
     warnings = [f"{message} (advisory with a baseline)" for message in over_budget]
     budgets = _budgets(args)
     required_pairs = args.runs // 2 + 1
