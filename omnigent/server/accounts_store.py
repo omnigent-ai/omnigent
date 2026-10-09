@@ -30,6 +30,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlDeviceGrant,
     SqlHost,
+    SqlPreference,
     SqlProject,
     SqlScheduledTask,
     SqlSessionPermission,
@@ -474,9 +475,14 @@ class SqlAlchemyAccountStore:
                 )
             )
             _revoke_durable_authority(session, user_id, now=int(time.time()))
+            session.execute(
+                delete(SqlPreference).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == user_id,
+                )
+            )
             target.deleted_at = int(time.time())
             target.password_hash = None
-            target.project_order = None
             target.is_admin = False
             session.execute(
                 delete(SqlAccountToken).where(

@@ -96,6 +96,7 @@ function loadMainHarness({
       getPath: (name) => (name === "userData" ? userData : userData),
       getVersion: () => "0.3.0",
       setName: () => {},
+      setPath: () => {},
       requestSingleInstanceLock: () => true,
       on: (name, listener) => appEvents.set(name, listener),
       whenReady: () => ({ then: () => {} }),
@@ -440,7 +441,7 @@ describe("developer-mode menu wiring", () => {
     assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), false);
   });
 
-  it("shows the Debug menu when a packaged macOS build opts in", (t) => {
+  it("shows authentication debugging when a packaged macOS build opts in", (t) => {
     const harness = loadMainHarness({
       isPackaged: true,
       platform: "darwin",
@@ -452,10 +453,15 @@ describe("developer-mode menu wiring", () => {
 
     const menu = harness.calls.setApplicationMenu.at(-1);
     assert.equal(hasDebugMenu(menu), true);
-    assert.equal(findMenuItem(menu, "simulate_session_expiry"), null);
-    assert.equal(findMenuItem(menu, "simulate_oauth_token_expiry"), null);
-    assert.equal(findMenuItem(menu, "invalidate_oauth_refresh_token"), null);
-    assert.equal(findMenuItem(menu, "debug_authentication"), null);
+    const authentication = findMenuItem(menu, "debug_authentication");
+    assert.equal(authentication.label, "Authentication");
+    for (const id of [
+      "simulate_session_expiry",
+      "simulate_oauth_token_expiry",
+      "invalidate_oauth_refresh_token",
+    ]) {
+      assert.equal(typeof findMenuItem(menu, id)?.click, "function");
+    }
   });
 });
 

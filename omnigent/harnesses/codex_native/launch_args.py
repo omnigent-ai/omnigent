@@ -9,9 +9,10 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import tomlkit
-from tomlkit.exceptions import TOMLKitError
+from tomlkit.exceptions import ParseError, TOMLKitError
 
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
@@ -40,6 +41,26 @@ _CODEX_CONFIG_PATHS = (
 
 _MISSING = object()
 
+# Config keys whose values are safe to log verbatim. Every other ``-c`` value is
+# masked because launch args may carry credentials or private endpoints.
+_LOGGABLE_CONFIG_KEYS = frozenset(
+    {
+        "approval_policy",
+        "approvals_reviewer",
+        "default_permissions",
+        "model",
+        "model_provider",
+        "model_reasoning_effort",
+        "profile",
+        "sandbox_mode",
+    }
+)
+_ENV_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+# An option with its value attached by ``=`` (e.g. ``--remote=ws://...``), so
+# the value can be redacted without treating the whole token as opaque.
+_ATTACHED_OPTION = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9-]*)=(.*)$", re.DOTALL)
+
 
 def absolute_codex_path(value: str, base: Path) -> str:
     """Match Codex's lexical path normalization without resolving symlinks."""
@@ -67,9 +88,11 @@ def _resolve_profile_paths(config: dict[str, Any], source_home: Path) -> None:
         resolve(config, path.split("."))
 
 
-def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
-    """Expand aliases and attached short values without interpreting option values."""
-    value_flags = {
+# Codex options that consume the following token as their value, so a reserved
+# token appearing as one of those values (e.g. ``--model app-server``) is NOT a
+# subcommand/flag and must not be rejected.
+_CODEX_VALUE_FLAGS = frozenset(
+    {
         "-c",
         "--config",
         "-s",
@@ -89,6 +112,51 @@ def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
         "--enable",
         "--disable",
     }
+)
+
+# App-server/transport tokens the runner owns: it starts the Codex app-server
+# (``codex app-server --listen``) and appends the TUI ``--remote`` attach
+# itself. A caller that passes any of these as pass-through args produces an
+# incoherent argv — e.g. ``codex app-server … --remote`` (app-server rejects
+# ``--remote`` on every codex version, clap exits 2) — so the thread never
+# starts. ``--remote-control`` is app-server-only and equally invalid on the TUI.
+_RESERVED_CODEX_TRANSPORT_TOKENS = frozenset(
+    {"app-server", "--listen", "--remote", "--remote-control"}
+)
+
+
+def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
+    """Reject pass-through Codex args that select or attach the runner-owned transport.
+
+    Scoped to Codex (the runner owns ``app-server``/``--listen``/``--remote``);
+    option *values* are never flagged (``--model app-server`` passes), and tokens
+    after a ``--`` prompt separator are left alone.
+
+    :param args: Caller pass-through Codex CLI args (``terminal_launch_args``).
+    :raises ValueError: when a reserved transport token appears as a standalone
+        flag or subcommand.
+    """
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg.split("=", 1)[0] in _CODEX_VALUE_FLAGS:
+            # Skip the option and its value (an attached ``=`` form carries its own).
+            index += 1 if "=" in arg else 2
+            continue
+        if arg in _RESERVED_CODEX_TRANSPORT_TOKENS:
+            raise ValueError(
+                f"terminal_launch_args may not contain the runner-owned Codex transport "
+                f"token {arg!r}: the runner starts the app-server and appends the TUI "
+                "attach itself"
+            )
+        index += 1
+
+
+def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
+    """Expand aliases and attached short values without interpreting option values."""
+    value_flags = _CODEX_VALUE_FLAGS
     canonical: list[str] = []
     index = 0
     while index < len(args):
@@ -205,6 +273,69 @@ def _write_private_config(path: Path, content: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def read_codex_mcp_servers(
+    source_home: Path,
+    profile: str | None,
+    *,
+    codex_version: tuple[int, int, int] | None,
+    minimal_config: bool = False,
+) -> dict[str, Any]:
+    """Read current user MCPs; minimal mode omits ambient, not explicit profile MCPs."""
+
+    def read(path: Path, *, optional: bool = False) -> dict[str, Any]:
+        try:
+            return tomlkit.parse(path.read_text(encoding="utf-8")).unwrap()
+        except FileNotFoundError:
+            if optional:
+                return {}
+            raise ValueError(f"Missing Codex MCP config: {path}") from None
+        except OSError as error:
+            reason = error.strerror or type(error).__name__
+            raise ValueError(f"Cannot read Codex MCP config: {path} ({reason})") from None
+        except ParseError as error:
+            # Parser messages can contain config values; expose the location and kind only.
+            raise ValueError(
+                f"Invalid Codex MCP config: {path} "
+                f"({type(error).__name__} at line {error.line}, column {error.col})"
+            ) from None
+        except (TOMLKitError, UnicodeError) as error:
+            raise ValueError(
+                f"Invalid Codex MCP config: {path} ({type(error).__name__})"
+            ) from None
+
+    def inventory(config: dict[str, Any], path: Path) -> dict[str, Any]:
+        servers = config.get("mcp_servers", {})
+        if not isinstance(servers, dict) or any(
+            not isinstance(server, dict) for server in servers.values()
+        ):
+            raise ValueError(f"Invalid mcp_servers table in Codex config: {path}")
+        return copy.deepcopy(servers)
+
+    source_path = source_home / "config.toml"
+    file_profile = codex_version is None or codex_version >= (0, 134, 0)
+    # Minimal mode needs the base only to find an explicitly selected legacy profile.
+    source = (
+        read(source_path, optional=True)
+        if not minimal_config or (profile is not None and not file_profile)
+        else {}
+    )
+    servers = {} if minimal_config else inventory(source, source_path)
+    if profile is not None:
+        # Reject invalid profile names before deriving a file path from them.
+        codex_config_profile(["--profile", profile])
+        if file_profile:
+            profile_path = source_home / f"{profile}.config.toml"
+            overlay = read(profile_path)
+        else:
+            profile_path = source_path
+            profiles = source.get("profiles", {})
+            overlay = profiles.get(profile) if isinstance(profiles, dict) else None
+            if not isinstance(overlay, dict):
+                raise ValueError(f"Codex config profile {profile!r} does not exist")
+        _merge_tables(servers, inventory(overlay, profile_path))
+    return servers
+
+
 def _profile_base(state_path: Path, current: dict[str, Any]) -> dict[str, Any]:
     try:
         state = tomlkit.parse(state_path.read_text()).unwrap()
@@ -297,3 +428,68 @@ def materialize_codex_config_profile(
     _write_private_config(state_path, pending_state)
     _write_private_config(config_path, rendered)
     _write_private_config(state_path, final_state)
+
+
+def redact_codex_launch_args(args: Sequence[str]) -> list[str]:
+    """
+    Return the resolved Codex argv with secret-bearing values masked.
+
+    Flag names, subcommands, paths and thread ids stay intact so a log row
+    shows exactly which launch was attempted. Masked: the value of every
+    ``-c``/``--config`` override outside :data:`_LOGGABLE_CONFIG_KEYS`, every
+    ``NAME=value`` environment assignment (an ``env`` wrapper's config args),
+    and the userinfo and query of any URL, whether it is a bare argument or
+    attached to an option by ``=`` (e.g. ``--remote=ws://user:pw@host?sig=x``).
+    Redaction never raises: a malformed URL is masked whole rather than
+    aborting the launch it is meant to record.
+
+    :param args: Resolved argv after the host's config args and Omnigent's
+        remote args are merged, e.g. ``["OPENAI_API_KEY=sk-x", "codex", "-c",
+        'model="gpt-5.4"', "resume", "--remote", "ws://127.0.0.1:1", "t1"]``.
+    :returns: The argv with masked values, e.g. ``["OPENAI_API_KEY=***",
+        "codex", "-c", 'model="gpt-5.4"', "resume", "--remote",
+        "ws://127.0.0.1:1", "t1"]``.
+    """
+    redacted: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-c", "--config"} and index + 1 < len(args):
+            redacted.extend((arg, _redact_config_override(args[index + 1])))
+            index += 2
+            continue
+        if arg.startswith(("-c=", "--config=")):
+            flag, _, override = arg.partition("=")
+            redacted.append(f"{flag}={_redact_config_override(override)}")
+        elif arg.startswith("-c") and len(arg) > 2 and not arg.startswith("--"):
+            redacted.append(f"-c{_redact_config_override(arg[2:])}")
+        elif _URL_SCHEME.match(arg):
+            redacted.append(_redact_url(arg))
+        elif (attached := _ATTACHED_OPTION.match(arg)) and _URL_SCHEME.match(attached.group(2)):
+            redacted.append(f"{attached.group(1)}={_redact_url(attached.group(2))}")
+        elif not arg.startswith("-") and (match := _ENV_ASSIGNMENT.match(arg)):
+            redacted.append(f"{match.group(1)}=***")
+        else:
+            redacted.append(arg)
+        index += 1
+    return redacted
+
+
+def _redact_config_override(override: str) -> str:
+    key, separator, _ = override.partition("=")
+    if not separator or key.strip() in _LOGGABLE_CONFIG_KEYS:
+        return override
+    return f"{key}=***"
+
+
+def _redact_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        # urlsplit rejects some inputs (e.g. an unterminated IPv6 literal like
+        # ``ws://[broken``). Mask the whole value so logging never aborts the
+        # launch it records.
+        return "***"
+    if not parts.scheme:
+        return "***"
+    return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))

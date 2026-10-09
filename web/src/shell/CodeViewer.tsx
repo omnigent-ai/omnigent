@@ -79,6 +79,7 @@ import { PreviewCommentBanner } from "./PreviewCommentBanner";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
@@ -511,8 +512,18 @@ export function CodeViewer({
   // Non-markdown files render in Monaco (read-only or editable by permission);
   // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview.
   const showMonaco = lang !== "markdown" && viewMode !== "preview";
-  // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
-  const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
+  // HTML, markdown, and notebook previews render through their own surfaces and
+  // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
+  const isHtmlPreview = viewMode === "preview" && lang === "html";
+  const isMarkdownOrNotebookPreview =
+    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
+  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
+  // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
+  // rendered previews, which never render these lines.
+  const rawLines = useMemo(
+    () => (showMonaco || isRenderedPreview ? [] : content.split("\n")),
+    [content, showMonaco, isRenderedPreview],
+  );
 
   const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
   useEffect(() => {
@@ -545,6 +556,12 @@ export function CodeViewer({
   useEffect(() => {
     if (showMonaco) return; // Monaco does its own highlighting.
     if (viewMode === "editor" && lang === "markdown") return;
+    if (isRenderedPreview) {
+      // Drop stale tokens so a later switch to source view can't briefly render
+      // the previous file's highlighted text.
+      setTokenLines(null);
+      return;
+    }
     let cancelled = false;
     setTokenLines(null);
     if (!content) return;
@@ -555,7 +572,7 @@ export function CodeViewer({
     return () => {
       cancelled = true;
     };
-  }, [content, lang, viewMode, showMonaco]);
+  }, [content, lang, viewMode, showMonaco, isRenderedPreview]);
 
   // Scroll to the line containing the active selection when it changes
   // (e.g. user clicked a comment in the panel).
@@ -592,7 +609,7 @@ export function CodeViewer({
   useEffect(() => {
     if (!panelOpen || !isMarkdownEditor) return;
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f") {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -611,7 +628,7 @@ export function CodeViewer({
     // above with its own find bar).
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f") {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -838,7 +855,7 @@ export function CodeViewer({
   // HTML preview gets its own comment-enabled viewer (selection capture +
   // highlights relayed over a bridge into the still-sandboxed iframe), so it
   // owns the truncated banner internally.
-  if (viewMode === "preview" && lang === "html") {
+  if (isHtmlPreview) {
     return (
       <HtmlCommentViewer
         conversationId={conversationId}
@@ -851,7 +868,7 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+  if (isMarkdownOrNotebookPreview) {
     const isNotebook = isNotebookPath(path);
     return (
       <PreviewWithSearch

@@ -656,7 +656,7 @@ def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
     monkeypatch.undo()
     options = add_menu_options()
     databricks = next(o for o in options if o.label.endswith("Databricks — workspace"))
-    assert "Unity AI Gateway" in databricks.description
+    assert "Unity Gateway" in databricks.description
 
 
 def test_configure_models_add_databricks_aborts_without_extra(
@@ -2631,7 +2631,7 @@ def test_credential_label_cli_config_uses_provider_name() -> None:
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "isaac-databricks-codex", display_name="Databricks AI Gateway"
+        "cli-config", "isaac-databricks-codex", display_name="Databricks Unity Gateway"
     )
     assert label == "Isaac-Databricks-Codex"
 
@@ -2654,11 +2654,11 @@ def test_build_cli_config_provider_entry_shapes() -> None:
     """
     from omnigent.onboarding.configure_models import build_cli_config_provider_entry
 
-    assert build_cli_config_provider_entry("codex", "Databricks", "Databricks AI Gateway") == {
+    assert build_cli_config_provider_entry("codex", "Databricks", "Databricks Unity Gateway") == {
         "kind": "cli-config",
         "cli": "codex",
         "model_provider": "Databricks",
-        "display_name": "Databricks AI Gateway",
+        "display_name": "Databricks Unity Gateway",
     }
     # No display name → key omitted entirely (labels fall back to the
     # entry name), not written as None/empty.
@@ -2677,7 +2677,7 @@ _CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]
@@ -2761,7 +2761,7 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
     # the friendly display name for labels.
     assert entry["kind"] == "cli-config"
     assert entry["model_provider"] == "Databricks"
-    assert entry["display_name"] == "Databricks AI Gateway"
+    assert entry["display_name"] == "Databricks Unity Gateway"
     # Re-claims the codex (openai) default — there is no other credential.
     assert entry["default"] is True or entry.get("default") == "true"
     # The dismissal is cleared, so the credential behaves like an ordinary
@@ -3518,8 +3518,8 @@ def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch)
         )
     )
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
-    assert _credential_label("claude", entry) == "Databricks AI Gateway"
-    assert _compact_credential_label(det) == "Databricks AI Gateway"
+    assert _credential_label("claude", entry) == "Databricks Unity Gateway"
+    assert _compact_credential_label(det) == "Databricks Unity Gateway"
 
 
 def _cp1252_console():

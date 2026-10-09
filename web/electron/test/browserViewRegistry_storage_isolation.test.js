@@ -76,6 +76,30 @@ function makePartitionCapturingRegistry() {
 }
 
 describe("browserViewRegistry — storage partition isolation", () => {
+  it("shares storage across the agent browser and user tabs while keeping views independent", () => {
+    const { registry, createdPrefs } = makePartitionCapturingRegistry();
+    const ids = ["conv_A", "browser-tab:conv_A:first", "browser-tab:conv_A:second"];
+    for (const id of ids) registry.openOrNavigate(id, "https://example.com/");
+    assert.equal(new Set(createdPrefs.map((prefs) => prefs.partition)).size, 1);
+    assert.equal(new Set(ids.map((id) => registry.get(id).view)).size, 3);
+
+    registry.close(ids[1]);
+    registry.openOrNavigate(ids[1], "https://example.com/");
+    assert.equal(createdPrefs[3].partition, createdPrefs[0].partition);
+    registry.openOrNavigate("browser-tab:conv_B:first", "https://example.com/");
+    assert.notEqual(createdPrefs[4].partition, createdPrefs[0].partition);
+  });
+
+  it("decodes the owning session ID and leaves malformed tab keys isolated", () => {
+    assert.equal(
+      agentPartition("w1", "browser-tab:session%3Aone%2Ftwo:tab"),
+      agentPartition("w1", "session:one/two"),
+    );
+    for (const id of ["browser-tab:conv_A", "browser-tab:conv_A:", "browser-tab:%ZZ:tab"]) {
+      assert.equal(agentPartition("w1", id), `omnigent-agent-w1-${id}`);
+    }
+  });
+
   it("passes a non-empty partition to WebContentsViewCtor for each created view", () => {
     const { registry, createdPrefs } = makePartitionCapturingRegistry();
 
@@ -183,24 +207,24 @@ describe("agent partition permission hardening wiring (src/main.js)", () => {
   // Agent views moved off session.defaultSession onto per-conversation
   // partitions, so the shell's defaultSession permission handlers no longer
   // cover them — and an Electron session with NO handler auto-grants every
-  // permission request. Guard that main.js wires deny-all handlers for each
+  // permission request. Guard that main.js wires the consent policy for each
   // agent partition before constructing the view. Comment-stripped source
   // match (same technique as main.test.js): proves the calls exist as live
   // code, which the unit tests above cannot see.
   const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
   const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
-  it("registers deny-all permission handlers on each agent partition", () => {
+  it("registers the browser permission policy on each agent partition", () => {
     assert.match(
       liveCode,
-      /function hardenAgentPartition[\s\S]{0,600}session\.fromPartition\(partition\)[\s\S]{0,300}setPermissionRequestHandler\([\s\S]{0,120}callback\(false\)\)[\s\S]{0,200}setPermissionCheckHandler\(\(\) => false\)/,
+      /function hardenAgentPartition[\s\S]{0,200}session\.fromPartition\(partition\)[\s\S]{0,100}registerBrowserPermissions\(ses,/,
     );
   });
 
-  it("hardens the partition before the WebContentsView is constructed", () => {
+  it("hardens the partition before construction and binds the policy to the new view", () => {
     assert.match(
       liveCode,
-      /hardenAgentPartition\(opts && opts\.webPreferences && opts\.webPreferences\.partition\);[\s\S]{0,120}new WebContentsView\(opts\)/,
+      /hardenAgentPartition\(opts\.webPreferences\.partition, win, canPrompt,[\s\S]{0,100}const view = new WebContentsView\(opts\);\s*policy\.attach\(view\.webContents\)/,
     );
   });
 });

@@ -13,9 +13,6 @@ Usage::
 
 from __future__ import annotations
 
-import io
-import json
-import tarfile
 from typing import Any
 
 import httpx
@@ -23,6 +20,7 @@ import pytest
 import yaml
 
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _OWNER_EMAIL = "usage-owner@e2e.test"
 _AGENT_NAME = "e2e-usage-test"
@@ -38,20 +36,15 @@ def _build_minimal_agent_bundle() -> bytes:
             "llm": {"model": _AGENT_NAME, "connection": {"api_key": "test-key"}},
         }
     ).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config)
-        tf.addfile(info, io.BytesIO(config))
-    return buf.getvalue()
+    return bundle_files({"config.yaml": config})
 
 
 def _create_session(client: httpx.Client, *, email: str) -> str:
     """Create a real session as *email* (granted LEVEL_OWNER) and return its id."""
-    resp = client.post(
+    resp = post_session_bundle(
+        client.post,
         "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_minimal_agent_bundle(), "application/gzip")},
+        _build_minimal_agent_bundle(),
         headers={"X-Forwarded-Email": email},
     )
     assert resp.status_code == 201, f"Session creation failed: {resp.status_code} {resp.text}"

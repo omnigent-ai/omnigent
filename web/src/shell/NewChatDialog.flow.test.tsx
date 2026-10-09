@@ -41,6 +41,7 @@ import type { ReactNode } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -63,6 +64,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 const navigateMock = vi.fn();
 const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
+const hasPendingLocalMessageMock = vi.fn();
 const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
 let searchParams = new URLSearchParams();
@@ -89,6 +91,7 @@ vi.mock("@/lib/routing", () => ({
 // (keyed by conversation id), not router state — assert on that call.
 vi.mock("@/store/chatStore", () => ({
   beginLocalConversation: (...args: unknown[]) => beginLocalConversationMock(...args),
+  hasPendingLocalMessage: (...args: unknown[]) => hasPendingLocalMessageMock(...args),
   hydrateLocalConversation: (...args: unknown[]) => hydrateLocalConversationMock(...args),
   removeLocalConversation: (...args: unknown[]) => removeLocalConversationMock(...args),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
@@ -391,6 +394,8 @@ beforeEach(() => {
   setPendingInitialPromptMock.mockReset();
   beginLocalConversationMock.mockReset();
   beginLocalConversationMock.mockReturnValue(null);
+  hasPendingLocalMessageMock.mockReset();
+  hasPendingLocalMessageMock.mockReturnValue(true);
   hydrateLocalConversationMock.mockReset();
   removeLocalConversationMock.mockReset();
   removeLocalConversationMock.mockReturnValue(false);
@@ -401,6 +406,7 @@ beforeEach(() => {
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
   clearOptimisticTitles();
+  clearSessionDrafts();
   localStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
@@ -425,6 +431,126 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it.each([
+    { query: "canvas=main", canvasId: "main", project: undefined },
+    {
+      query: "canvas=proj_alpha&project=Alpha",
+      canvasId: "proj_alpha",
+      project: { id: "proj_alpha", name: "Alpha" },
+    },
+  ])(
+    "keeps a Canvas create on its board through temporary and real routes ($canvasId)",
+    async ({ query, canvasId, project }) => {
+      searchParams = new URLSearchParams(query);
+      projects = project ? [project] : [];
+      const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_canvas",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Create a session from Canvas");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+      const search = canvasId === "main" ? "" : `?canvas=${canvasId}`;
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenCalledWith({
+          pathname: `/canvas/c/${encodeURIComponent(tempConvId)}`,
+          search,
+        }),
+      );
+      await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+      const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith(
+        { pathname: "/canvas/c/conv_new", search },
+        { replace: true },
+      );
+      const stillViewing = hydrateLocalConversationMock.mock.calls[0][8];
+      const previousUrl = window.location.href;
+      try {
+        window.history.replaceState({}, "", `/canvas/c/${encodeURIComponent(tempConvId)}${search}`);
+        expect(stillViewing()).toBe(true);
+        window.history.replaceState({}, "", "/canvas");
+        expect(stillViewing()).toBe(false);
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
+
+  it("returns a server-first Canvas create to its project", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([], { features: { canvas: true } });
+    await waitForWorkspaceSeed();
+    typeMessage("Create from the project board");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith({
+        pathname: "/canvas/c/conv_new",
+        search: "?canvas=proj_alpha",
+      }),
+    );
+  });
+
+  it("ignores a Canvas return parameter when the feature is off", async () => {
+    searchParams = new URLSearchParams("canvas=main");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("Create a regular session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("keeps the Canvas project and draft when a temporary create fails", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    const previousUrl = window.location.href;
+    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+    });
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_canvas",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    removeLocalConversationMock.mockReturnValue(true);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Host unavailable" }), { status: 503 }),
+    );
+    try {
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Keep this Canvas draft");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenLastCalledWith({
+          pathname: "/",
+          search: "?canvas=proj_alpha&project=Alpha",
+        }),
+      );
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this Canvas draft");
+      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
@@ -654,6 +780,96 @@ describe("NewChatLandingScreen create flow", () => {
       ),
     );
     expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["original task", "corrected task", ""])(
+    "returns only the canceled draft after creation fails: %j",
+    async (corrected) => {
+      const tempConvId = "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+      let resolveCreate!: (response: Response) => void;
+      vi.mocked(authenticatedFetch).mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        }) as ReturnType<typeof authenticatedFetch>,
+      );
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_cancel",
+        createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      });
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("original task");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      cleanup();
+
+      hasPendingLocalMessageMock.mockReturnValue(false);
+      setSessionDraft(tempConvId, { text: corrected, files: [] });
+      await act(async () => {
+        resolveCreate({
+          ok: false,
+          status: 503,
+          json: async () => ({ detail: "host unavailable" }),
+        } as unknown as Response);
+      });
+      await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(corrected);
+      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("restores the recovered temp-draft files onto the still-mounted landing after a failed create", async () => {
+    // The create is rejected while the landing is still on screen, and the
+    // optimistic temp conversation accumulated its own draft meanwhile. The
+    // recovered draft (submitted draft + temp draft) must be restored onto
+    // the live composer — a missing restore would leave only the submitted
+    // chip and go red here, unlike the unmount path where the remount
+    // re-seeds from the stashed draft either way.
+    const tempConvId = "temp:cccccccccccccccccccccccccccccccc";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_restore",
+      createToken: "cccccccccccccccccccccccccccccccc",
+    });
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("original task");
+    const submitted = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [submitted] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    // A file the landing composer never had lands in the temp draft.
+    const carried = new File(["world"], "extra.txt", { type: "text/plain" });
+    act(() => {
+      setSessionDraft(tempConvId, { text: "more context", files: [carried] });
+    });
+    await act(async () => {
+      resolveCreate({
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: "host unavailable" }),
+      } as unknown as Response);
+    });
+
+    await waitFor(() => expect(screen.getByText("extra.txt")).toBeTruthy());
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "original task\n\nmore context",
+    );
   });
 
   it("keeps a failed create's restored draft when a newer create succeeds", async () => {
@@ -2272,7 +2488,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Pick the non-default agent (Radix opens on pointerdown). "second_agent"
-    // is a custom agent, so it lives in the "Custom agents" submenu.
+    // is a custom agent, so it lives in the "Other..." submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));

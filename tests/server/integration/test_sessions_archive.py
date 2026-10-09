@@ -13,6 +13,7 @@ pipeline without subprocesses.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gzip
 import io
 import tarfile
@@ -30,6 +31,20 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _no_archive_stop_grace() -> object:
+    """
+    Fire the deferred archive teardown immediately in these tests.
+
+    The handler defers the runner teardown past the Undo window (see
+    ``_ARCHIVE_STOP_UNDO_GRACE_S``); zeroing it here keeps the stop-runs /
+    stop-skipped assertions fast. Tests that need the timer to stay pending
+    (to observe or cancel it) set their own grace.
+    """
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0):
+        yield
 
 
 # ── Archive / unarchive lifecycle ────────────────────────
@@ -282,7 +297,7 @@ async def test_archive_tears_down_host_spawned_runner(
         )
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
-        _sessions_common._intentional_stop_sessions.discard(session_id)
+        _sessions_common._intentional_stop_sessions.pop(session_id, None)
 
 
 async def test_failed_archive_leaves_session_running(
@@ -414,6 +429,258 @@ async def test_unarchive_skips_stop(
         mock_stop.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_undo_within_grace_keeps_runner_alive(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Unarchiving before the deferred stop fires keeps the runner alive.
+
+    Same-replica fast path: an Undo (which re-PATCHes ``archived=false``)
+    cancels the pending stop, so it never runs.
+    """
+    session = await create_test_session(client, name="archive-undo-keep")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            assert session_id in _sessions_orchestration._pending_archive_stops
+            undo = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+            assert undo.json()["archived"] is False
+            # The pending stop is cancelled and drops out of the registry.
+            assert session_id not in _sessions_orchestration._pending_archive_stops
+            await _drain_detached_stops()
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_archive_stop_skips_when_row_unarchived(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    The deferred stop re-reads the store and skips a no-longer-archived row.
+
+    Cross-replica backstop: a timer on another replica than the Undo can't
+    be cancelled in memory, so firing ``_archive_stop`` against a row that
+    is no longer archived must tear down nothing. Reading the persisted
+    flag (not a per-replica entry) is what makes it safe.
+    """
+    session = await create_test_session(client, name="archive-stop-unarchived")
+    session_id = session["id"]
+
+    # Archive, then unarchive so the persisted flag reads false.
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            # Simulate the deferred stop firing after the grace elapsed.
+            await _sessions_orchestration._archive_stop(
+                session_id, conv_store, runner_router=None, host_registry=None
+            )
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_archive_stop_retries_transient_read_then_honors_undo(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A transient read failure is retried, then the confirmed flag is honored.
+
+    Neither guessing stop nor guessing skip on a failed read is safe. So the
+    teardown retries the row read; here the retry succeeds and sees the
+    session was unarchived (a late Undo persisted on ``another replica``),
+    so it must NOT stop the runner.
+    """
+    session = await create_test_session(client, name="archive-stop-retry-undo")
+    session_id = session["id"]
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    # Persist the Undo, as another replica would.
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    real_get = conv_store.get_conversation
+    calls = {"n": 0}
+
+    def _flaky_once(sid: str) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient store failure")
+        return real_get(sid)
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(conv_store, "get_conversation", _flaky_once),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            await _sessions_orchestration._archive_stop(
+                session_id, conv_store, runner_router=None, host_registry=None
+            )
+        assert calls["n"] >= 2  # retried past the transient failure
+        mock_stop.assert_not_awaited()  # confirmed unarchive → left alone
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_archive_stop_skips_when_read_never_succeeds(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A sustained read outage gives up and skips, never blindly stopping.
+
+    If every retry fails we can't confirm the archived state, so the
+    conservative choice is to leave the runner (a later lifecycle event
+    reaps it) rather than risk killing a session that was just unarchived.
+    """
+    session = await create_test_session(client, name="archive-stop-read-outage")
+    session_id = session["id"]
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+
+    def _always_raise(*_a: object, **_k: object) -> None:
+        raise RuntimeError("sustained store outage")
+
+    try:
+        with (
+            patch.object(_sessions_orchestration, "_ARCHIVE_STOP_LOOKUP_RETRY_S", 0.0),
+            patch.object(conv_store, "get_conversation", _always_raise),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            await _sessions_orchestration._archive_stop(
+                session_id, conv_store, runner_router=None, host_registry=None
+            )
+        mock_stop.assert_not_awaited()  # gave up, did not blind-stop
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_cancel_cannot_interrupt_teardown_in_flight(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A cancel racing an in-flight teardown can't strand the intentional-stop
+    marker.
+
+    Once ``_archive_stop`` passes its archived-flag guard it unregisters
+    from the pending map, so a late ``_cancel_pending_archive_stop`` (an
+    Undo racing the teardown) is a no-op and the stop runs to completion —
+    the marker it sets is only cleared by the stop's own logic, never left
+    dangling by a cancellation mid-await.
+    """
+    session = await create_test_session(client, name="archive-cancel-race")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _parked_best_effort(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        await release.wait()
+
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        # Drive the REAL registered path: _spawn_archive_stop registers a task
+        # in _pending_archive_stops (grace=0 so it starts at once), and the
+        # parked best-effort stop holds it at the in-flight point.
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _parked_best_effort),
+        ):
+            _sessions_orchestration._spawn_archive_stop(session_id, conv_store, None, None)
+            registered = _sessions_orchestration._pending_archive_stops.get(session_id)
+            assert registered is not None
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+            # The registered task is now mid-teardown; it must have removed
+            # ITSELF from the map, so a cancel here can't reach and interrupt it.
+            assert session_id not in _sessions_orchestration._pending_archive_stops
+            _sessions_orchestration._cancel_pending_archive_stop(session_id)
+            release.set()
+            await asyncio.wait_for(registered, timeout=5.0)
+            # The very task the map held ran to completion, not cancelled.
+            assert not registered.cancelled()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_delete_worktree_requires_archive(
+    client: httpx.AsyncClient,
+) -> None:
+    """``delete_worktree`` without ``archived=true`` is rejected."""
+    session = await create_test_session(client, name="archive-worktree-invalid")
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"title": "x", "delete_worktree": True},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("delete_worktree", [True, False])
+async def test_archive_stop_removes_worktree_when_requested(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    delete_worktree: bool,
+) -> None:
+    """The archive teardown removes the worktree (keeping the branch) only on opt-in."""
+    session = await create_test_session(client, name=f"archive-worktree-{delete_worktree}")
+    session_id = session["id"]
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    real_conv = conv_store.get_conversation(session_id)
+    assert real_conv is not None
+    worktree_conv = dataclasses.replace(
+        real_conv,
+        git_branch="feature/x",
+        workspace="/repo-worktrees/feature-x",
+        host_id="host_1",
+        runner_id=None,
+    )
+    mock_remove = AsyncMock()
+    with (
+        patch.object(conv_store, "get_conversation", return_value=worktree_conv),
+        patch.object(_sessions_facade, "_best_effort_stop", AsyncMock()),
+        patch.object(_sessions_facade, "_remove_session_worktree_best_effort", mock_remove),
+    ):
+        await _sessions_orchestration._archive_stop(
+            session_id,
+            conv_store,
+            runner_router=None,
+            host_registry=None,
+            delete_worktree=delete_worktree,
+        )
+    if not delete_worktree:
+        mock_remove.assert_not_awaited()
+        return
+    mock_remove.assert_awaited_once()
+    kwargs = mock_remove.await_args.kwargs
+    assert kwargs["worktree_path"] == "/repo-worktrees/feature-x"
+    assert kwargs["branch"] == "feature/x"
+    assert kwargs["delete_branch"] is False
+    assert kwargs["exclude_conversation_id"] == session_id
 
 
 # ── Agent contents download ──────────────────────────────

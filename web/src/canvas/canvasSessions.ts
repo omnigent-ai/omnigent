@@ -9,9 +9,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type InfiniteData, type QueryClient, useQueryClient } from "@tanstack/react-query";
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import {
+  CONNECTED_STREAM_REFETCH_INTERVAL_MS,
+  type Conversation,
+  type ConversationsPage,
+} from "@/hooks/useConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { dedupeConversationsById } from "@/shell/sidebarNav";
 
 /** First page when nothing is cached: small, so the first paint is quick. */
@@ -457,7 +462,21 @@ export function useCanvasSessions(): CanvasSessions {
     const refreshIfVisible = () => {
       if (!document.hidden) void refresh();
     };
-    const timer = setInterval(refreshIfVisible, SESSION_POLL_INTERVAL_MS);
+    // The updates stream mirrors changes in place for cards it watches, but its
+    // watch set is bounded (sidebar-loaded + active sessions), so canvas cards
+    // on the cold tail still need periodic reconciliation. Keep the base
+    // SESSION_POLL_INTERVAL_MS cadence when the stream is down, and skip
+    // alternate ticks while connected so the hot set (covered by the stream)
+    // reconciles at the slower CONNECTED_STREAM_REFETCH_INTERVAL_MS.
+    const connectedTickStride = Math.round(
+      CONNECTED_STREAM_REFETCH_INTERVAL_MS / SESSION_POLL_INTERVAL_MS,
+    );
+    let tick = 0;
+    const timer = setInterval(() => {
+      tick += 1;
+      if (sessionUpdatesSocket.isConnected() && tick % connectedTickStride !== 0) return;
+      refreshIfVisible();
+    }, SESSION_POLL_INTERVAL_MS);
     window.addEventListener("focus", refreshIfVisible);
     document.addEventListener("visibilitychange", refreshIfVisible);
     return () => {

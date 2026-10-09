@@ -2039,7 +2039,7 @@ def test_setup_creates_first_admin_and_signs_in(
 def test_setup_after_saving_no_auth_project_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A preference-only local user must not prevent first-admin setup."""
+    """Saved local preferences must not prevent first-admin setup."""
     from sqlalchemy.orm import Session
 
     from omnigent.db.db_models import SqlUser
@@ -2048,7 +2048,7 @@ def test_setup_after_saving_no_auth_project_order(
 
     db_url = f"sqlite:///{tmp_path}/test.db"
     project_store = SqlAlchemyProjectStore(db_url)
-    # Migrations seed a local admin; exercise lazy preference-owner creation instead.
+    # Migrations seed a local admin; exercise preferences without an account.
     with Session(get_or_create_engine(db_url)) as session:
         local = session.get(SqlUser, (0, "local"))
         if local is not None:
@@ -2057,10 +2057,7 @@ def test_setup_after_saving_no_auth_project_order(
     project = project_store.create("a" * 32, "Local project", None)
     project_store.save_order([project.id], user_id=None)
     with Session(get_or_create_engine(db_url)) as session:
-        local = session.get(SqlUser, (0, "local"))
-        assert local is not None
-        assert local.is_admin is False
-        assert local.password_hash is None
+        assert session.get(SqlUser, (0, "local")) is None
 
     with contextmanager(_build_accounts_app)(
         tmp_path, monkeypatch, init_admin_password=None

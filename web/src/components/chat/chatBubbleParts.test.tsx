@@ -1,13 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
-import { BubbleView } from "./chatBubbleParts";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
+import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
-const continuation = "Please continue from where you left off before the rate limit error.";
+const continuation = "Please continue from where you left off.";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -54,6 +56,158 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+});
+
+describe("Mermaid diagram width", () => {
+  it("uses the full chat column for a Mermaid fence", () => {
+    const items = [
+      { kind: "text" as const, itemId: "diagram", text: "```mermaid\nA-->B\n```", final: true },
+    ];
+    expect(containsMermaidDiagram(items)).toBe(true);
+    const bubble: Extract<Bubble, { kind: "assistant" }> = {
+      kind: "assistant",
+      responseId: "resp_diagram",
+      stableId: "diagram",
+      lifecycle: "completed",
+      error: null,
+      items,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={bubble} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("max-w-full");
+    expect(screen.getByTestId("message-bubble").firstElementChild).toHaveClass("w-full");
+  });
+
+  it("ignores Mermaid mentioned outside a fence", () => {
+    expect(
+      containsMermaidDiagram([
+        { kind: "text", itemId: "prose", text: "A Mermaid diagram would help.", final: true },
+      ]),
+    ).toBe(false);
+  });
+});
+
+describe("AssistantBubble fork source", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_side_reply",
+    stableId: "side_reply",
+    lifecycle: "completed",
+    error: null,
+    items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
+  };
+
+  it("disables the message fork without hiding its explanation", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            canFork: true,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "side chat",
+      scope: "conv_side_child",
+      expected: {
+        sourceSessionId: "conv_side_child",
+        upToResponseId: "resp_side_reply",
+      },
+    },
+    {
+      name: "main chat",
+      scope: null,
+      expected: { sourceSessionId: undefined, upToResponseId: "resp_side_reply" },
+    },
+  ])("opens from the $name session", ({ scope, expected }) => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={bubble} isLastAssistant={false} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("fork-from-response"));
+
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(openForkDialog).toHaveBeenCalledWith(expected);
+  });
+});
+
+describe("message navigation highlight", () => {
+  const text = "Highlight only this message content";
+  const messageId = "highlight_target";
+  const createdAtS = 1_700_000_000;
+  const bubbles: Bubble[] = [
+    {
+      kind: "user",
+      itemId: messageId,
+      content: [{ type: "input_text", text }],
+      createdAtS,
+    },
+    {
+      kind: "assistant",
+      responseId: messageId,
+      stableId: "highlight_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "highlight_text", text, final: true }],
+      createdAtS,
+    },
+  ];
+
+  it.each(bubbles)("keeps the $kind highlight inside the content bubble", (bubble) => {
+    useChatStore.setState({ flashItemId: null });
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={bubble} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+    const highlightSelector = ".animate-message-highlight";
+    expect(container.querySelector(highlightSelector)).toBeNull();
+
+    act(() => useChatStore.setState({ flashItemId: messageId }));
+
+    const highlight = screen.getByText(text).closest(highlightSelector);
+    expect(highlight).not.toBeNull();
+    expect(container.querySelectorAll(highlightSelector)).toHaveLength(1);
+    expect(screen.getByTestId("message-bubble")).not.toHaveClass("animate-message-highlight");
+    expect(screen.getByTestId("message-timestamp").closest(highlightSelector)).toBeNull();
+    for (const button of screen.getAllByRole("button")) {
+      expect(button.closest(highlightSelector)).toBeNull();
+    }
+
+    act(() => useChatStore.setState({ flashItemId: "another_message" }));
+    expect(container.querySelector(highlightSelector)).toBeNull();
+
+    act(() => useChatStore.setState({ flashItemId: messageId }));
+    expect(screen.getByText(text).closest(highlightSelector)).not.toBeNull();
+    act(() => useChatStore.setState({ flashItemId: null }));
+    expect(container.querySelector(highlightSelector)).toBeNull();
+  });
 });
 
 describe("UserBubble literal text", () => {
@@ -145,6 +299,36 @@ describe("AssistantBubble error retry", () => {
 
     expect(screen.queryByTestId("error-pill")).toBeNull();
     expect(useChatStore.getState().failedSendDraft).toBe(draft);
+  });
+
+  it("continues a transient upstream failure in place instead of resuming the runner", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    render(<BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+    });
+  });
+
+  it("continues a dropped harness stream in place instead of resuming the runner", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    render(<BubbleView bubble={errorBubble("connection_error")} isLastAssistant />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_retry/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+    });
   });
 
   it("coalesces retry clicks from separate rate-limit cards in the same turn", async () => {
@@ -274,5 +458,201 @@ describe("AssistantBubble error retry", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_retry/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
+  });
+});
+
+describe("AssistantBubble sealed side-chat recovery", () => {
+  it("removes recovery actions when the side chat is sealed but keeps the error", () => {
+    const view = render(
+      <BubbleView bubble={errorBubble("required_terminal_exited")} recoveryDisabled />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(screen.getByTestId("error-pill")).toHaveTextContent("The agent's terminal exited");
+
+    view.rerender(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
+
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeInTheDocument();
+  });
+
+  it.each([null, "conv_child"])(
+    "refreshes the resumed session's labels (scope=%s)",
+    async (scope) => {
+      const client = new QueryClient();
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ error: { code: "conflict", message: "This side chat has ended." } }, 409),
+      );
+      render(
+        <QueryClientProvider client={client}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={errorBubble("required_terminal_exited")} />
+          </ConversationScopeContext.Provider>
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+      await waitFor(() =>
+        expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", scope ?? "conv_retry"] }),
+      );
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(`/v1/sessions/${scope ?? "conv_retry"}/events`);
+      expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended.");
+    },
+  );
+
+  it("preserves the error when rendered without a query provider", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ error: { code: "conflict", message: "This side chat has ended." } }, 409),
+    );
+    render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended."),
+    );
+  });
+});
+
+describe("UserBubble shell prompts", () => {
+  it("preserves shell syntax and attachment-like text literally", () => {
+    const command = "printf '%s\\n' '**hi**' '[Attached: /tmp/file]' '`pwd`'\necho done";
+    const bubble: Extract<Bubble, { kind: "user" }> = {
+      kind: "user",
+      itemId: "shell-input",
+      content: [{ type: "input_text", text: `!${command}` }],
+      shellCommand: command,
+    };
+    render(<BubbleView bubble={bubble} />);
+
+    const prompt = screen.getByTestId("message-bubble");
+    expect(prompt).toHaveAttribute("data-role", "user");
+    expect(prompt).toHaveAttribute("data-user-message-id", "shell-input");
+    expect(prompt.querySelector("pre")?.textContent).toBe(`!${command}`);
+    expect(screen.getByTestId("copy-message-link")).toBeEnabled();
+  });
+});
+
+describe("UserBubble long-prompt collapse", () => {
+  const COLLAPSE_THRESHOLD = 12000;
+  const TAIL = "UNIQUE_TAIL";
+
+  // Overflowing ASCII characters followed by the tail
+  const LONG_TEXT = "a".repeat(COLLAPSE_THRESHOLD) + TAIL;
+  const EMOJI_AT_BOUNDARY = "a".repeat(COLLAPSE_THRESHOLD - 1) + "🔥" + "b".repeat(100);
+  const SHORT_TEXT = "Hello, world!";
+
+  function userBubble(text: string): Extract<Bubble, { kind: "user" }> {
+    return {
+      kind: "user",
+      itemId: "user_collapse_test",
+      content: [{ type: "input_text", text }],
+    };
+  }
+
+  it("renders a short prompt fully without a collapse button", () => {
+    render(<BubbleView bubble={userBubble(SHORT_TEXT)} isLastAssistant={false} />);
+
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(SHORT_TEXT);
+    expect(screen.queryByRole("button", { name: /show full prompt/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
+  });
+
+  it("hides the tail when collapsed, shows it when expanded, hides it again when re-collapsed", () => {
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+
+    // Initially collapsed
+    expect(bubble).not.toHaveTextContent(TAIL);
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+
+    // After expanding
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    expect(bubble).toHaveTextContent(TAIL);
+
+    // After collapsing again
+    fireEvent.click(screen.getByRole("button", { name: /collapse prompt/i }));
+    expect(bubble).not.toHaveTextContent(TAIL);
+  });
+
+  it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
+    const writtenTexts: string[] = [];
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        writeText: vi.fn((text: string) => {
+          writtenTexts.push(text);
+          return Promise.resolve();
+        }),
+      },
+    });
+
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const copyButton = screen.getByRole("button", { name: /^copy$/i });
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(writtenTexts).toHaveLength(1));
+    expect(writtenTexts[0]).toBe(LONG_TEXT);
+    expect(writtenTexts[0]).toContain(TAIL);
+  });
+
+  it("does not corrupt an emoji at slice boundary", () => {
+    render(<BubbleView bubble={userBubble(EMOJI_AT_BOUNDARY)} isLastAssistant={false} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+
+    expect(bubble).not.toHaveTextContent("🔥");
+    expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
+    expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
+  });
+});
+
+describe("AssistantBubble copy", () => {
+  const MARKDOWN = "## Findings\n\nA **bold** claim and `code`.";
+
+  function assistantBubble(text: string): Extract<Bubble, { kind: "assistant" }> {
+    return {
+      kind: "assistant",
+      responseId: "resp_copy",
+      stableId: "copy_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "copy_text", text, final: true }],
+      createdAtS: 1_700_000_000,
+    };
+  }
+
+  it("offers rendered HTML alongside the markdown so a rich-text paste keeps formatting", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    class FakeClipboardItem {
+      items: Record<string, Blob>;
+
+      constructor(items: Record<string, Blob>) {
+        this.items = items;
+      }
+    }
+
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    vi.stubGlobal("navigator", { clipboard: { write } });
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={assistantBubble(MARKDOWN)} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
+
+    await waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+
+    const [item] = write.mock.calls[0][0] as FakeClipboardItem[];
+    expect(await item.items["text/plain"].text()).toBe(MARKDOWN);
+    expect(await item.items["text/html"].text()).toBe(
+      "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
+    );
   });
 });

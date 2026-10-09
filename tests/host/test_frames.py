@@ -25,6 +25,7 @@ from omnigent.host.frames import (
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
+    HostImportLocalSessionChunkFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
@@ -35,13 +36,21 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersFrame,
+    HostMcpServersResultFrame,
+    HostMcpToolsFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostPluginsFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentFrame,
+    HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
     HostStatFrame,
@@ -50,9 +59,12 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    ImportLocalSessionChunkAssembler,
+    ImportSessionChunkingUnsupportedError,
     classify_launch_refusal,
     decode_host_frame,
     encode_host_frame,
+    encode_import_local_session_frames,
     workspace_missing_message,
 )
 
@@ -60,9 +72,18 @@ from omnigent.host.frames import (
 def test_import_local_frames_round_trip() -> None:
     """Request, per-session, and done frames survive the tunnel (title + source)."""
     request = decode_host_frame(
-        encode_host_frame(HostImportLocalFrame(request_id="req_imp", source="claude", limit=3))
+        encode_host_frame(
+            HostImportLocalFrame(
+                request_id="req_imp",
+                source="claude",
+                limit=3,
+                allow_session_chunks=True,
+            )
+        )
     )
-    assert request == HostImportLocalFrame(request_id="req_imp", source="claude", limit=3)
+    assert request == HostImportLocalFrame(
+        request_id="req_imp", source="claude", limit=3, allow_session_chunks=True
+    )
 
     exact_request = decode_host_frame(
         encode_host_frame(
@@ -70,6 +91,7 @@ def test_import_local_frames_round_trip() -> None:
                 request_id="req_exact",
                 source="codex",
                 session_id="0198d07d-session",
+                allow_session_chunks=True,
             )
         )
     )
@@ -77,7 +99,21 @@ def test_import_local_frames_round_trip() -> None:
         request_id="req_exact",
         source="codex",
         session_id="0198d07d-session",
+        allow_session_chunks=True,
     )
+
+    legacy_request = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.import_local",
+                "request_id": "req_legacy",
+                "source": "claude",
+                "limit": 1,
+            }
+        )
+    )
+    assert isinstance(legacy_request, HostImportLocalFrame)
+    assert legacy_request.allow_session_chunks is False
 
     session = decode_host_frame(
         encode_host_frame(
@@ -146,6 +182,17 @@ def test_import_local_frames_round_trip() -> None:
             status="ok",
             skills=[{"name": "toolkit:review", "description": "Review changes"}],
         ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
+            status="ok",
+            skills=[
+                {
+                    "name": "asd-ste100",
+                    "description": "Write in Simplified Technical English",
+                    "display_name": "Simplified Technical English (ASD-STE100)",
+                }
+            ],
+        ),
         HostSkillsFrame(
             request_id="session",
             harness="session",
@@ -171,7 +218,14 @@ def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame
 
 
 @pytest.mark.parametrize(
-    "skills", [{}, ["review"], [{"name": "review"}], [{"name": 1, "description": "x"}]]
+    "skills",
+    [
+        {},
+        ["review"],
+        [{"name": "review"}],
+        [{"name": 1, "description": "x"}],
+        [{"name": "review", "description": "x", "display_name": 1}],
+    ],
 )
 def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
     with pytest.raises(ValueError):
@@ -180,6 +234,344 @@ def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
                 {"kind": "host.skills_result", "request_id": "r", "status": "ok", "skills": skills}
             )
         )
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostMcpServersFrame(request_id="req_mcp"),
+        HostMcpServersResultFrame(request_id="req_mcp", status="ok"),
+        HostMcpServersResultFrame(
+            request_id="req_mcp",
+            status="ok",
+            mcp_servers=[
+                {"name": "github", "harness": "claude", "transport": "stdio", "scope": "user"},
+                {
+                    "name": "figma",
+                    "harness": "cursor",
+                    "transport": "http",
+                    "scope": "user",
+                    "plugin": "figma",
+                    "url_host": "mcp.figma.com",
+                },
+            ],
+        ),
+        HostMcpServersResultFrame(request_id="req_mcp", status="failed", error="boom"),
+    ],
+)
+def test_mcp_servers_frames_round_trip(
+    frame: HostMcpServersFrame | HostMcpServersResultFrame,
+) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [
+                    {
+                        "name": "github",
+                        "harness": "claude",
+                        "transport": "stdio",
+                        "scope": "user",
+                        "env": {"TOKEN": "secret"},
+                        "command": "secret",
+                    }
+                ],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [
+        {"name": "github", "harness": "claude", "transport": "stdio", "scope": "user"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "servers", [{}, ["github"], [{"name": "github"}], [{"name": 1, "harness": "claude"}]]
+)
+def test_mcp_servers_result_rejects_malformed_inventory(servers: object) -> None:
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.mcp_servers_result",
+                    "request_id": "r",
+                    "status": "ok",
+                    "mcp_servers": servers,
+                }
+            )
+        )
+
+
+def test_import_local_session_chunk_frame_round_trip() -> None:
+    """A session slice survives the tunnel with its ordering metadata."""
+    chunk = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionChunkFrame(
+                request_id="req_imp", total=3, seq=2, last=True, data='{"partial": tru'
+            )
+        )
+    )
+    assert chunk == HostImportLocalSessionChunkFrame(
+        request_id="req_imp", total=3, seq=2, last=True, data='{"partial": tru'
+    )
+
+
+def _session_with_payload(payload: str) -> HostImportedLocalSession:
+    """A one-item session whose size is driven by *payload*."""
+    return HostImportedLocalSession(
+        external_session_id="s_big",
+        workspace="/repo",
+        items=[{"type": "message", "response_id": "r1", "data": {"text": payload}}],
+        title="big session",
+        source="claude",
+    )
+
+
+def test_encode_import_local_session_frames_small_session_is_one_frame() -> None:
+    """A session under the chunk threshold rides in one whole-session frame."""
+    frames = list(
+        encode_import_local_session_frames(
+            "req_one", 1, _session_with_payload("hi"), allow_chunks=True
+        )
+    )
+
+    assert len(frames) == 1
+    decoded = decode_host_frame(frames[0])
+    assert isinstance(decoded, HostImportLocalSessionFrame)
+    assert decoded.session.external_session_id == "s_big"
+
+
+def test_encode_import_local_session_frames_preserves_legacy_framing() -> None:
+    """An older server still receives a 10 MiB session as one legacy frame."""
+
+    frames = list(
+        encode_import_local_session_frames(
+            "req_legacy",
+            1,
+            _session_with_payload("x" * (10 * 1024 * 1024)),
+            allow_chunks=False,
+        )
+    )
+
+    assert len(frames) == 1
+    assert isinstance(decode_host_frame(frames[0]), HostImportLocalSessionFrame)
+
+
+def test_encode_import_local_session_frames_rejects_unsafe_legacy_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session beyond an older server's cap fails before dropping the tunnel."""
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
+    monkeypatch.setattr("omnigent.host.frames.RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 128)
+
+    with pytest.raises(ImportSessionChunkingUnsupportedError):
+        list(
+            encode_import_local_session_frames(
+                "req_legacy", 1, _session_with_payload("x" * 500), allow_chunks=False
+            )
+        )
+
+
+def test_encode_import_local_session_frames_slices_oversized_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An oversized session is sliced into ordered chunk frames that reassemble."""
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
+    session = _session_with_payload("x" * 500)
+
+    frames = [
+        decode_host_frame(text)
+        for text in encode_import_local_session_frames("req_big", 2, session, allow_chunks=True)
+    ]
+
+    assert len(frames) > 1
+    assert all(isinstance(f, HostImportLocalSessionChunkFrame) for f in frames)
+    assert [f.seq for f in frames] == list(range(len(frames)))
+    assert [f.last for f in frames] == [False] * (len(frames) - 1) + [True]
+    assert all(f.request_id == "req_big" and f.total == 2 for f in frames)
+    # Every slice respects the configured size, so no frame can grow past
+    # the tunnel's message cap however large the session is.
+    assert all(len(f.data) <= 64 for f in frames)
+
+    assembler = ImportLocalSessionChunkAssembler()
+    reassembled = [assembler.add(f) for f in frames]
+    assert reassembled[:-1] == [None] * (len(frames) - 1)
+    assert reassembled[-1] == session
+
+
+def _session_json(session: HostImportedLocalSession) -> str:
+    """The wire ``session`` object a chunked stream reassembles into."""
+    return json.dumps(
+        {
+            "external_session_id": session.external_session_id,
+            "workspace": session.workspace,
+            "items": session.items,
+            "title": session.title,
+            "source": session.source,
+        }
+    )
+
+
+def test_chunk_assembler_fails_corrupt_sequence_once_then_recovers() -> None:
+    """A slice gap fails that session as soon as it is seen; the next session assembles."""
+    assembler = ImportLocalSessionChunkAssembler()
+    with pytest.raises(ValueError, match="out of order"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(request_id="r", total=1, seq=1, last=False, data="{}")
+        )
+    # Already reported once: the failed session's remaining slices are skipped.
+    assert assembler.in_progress is False
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(request_id="r", total=1, seq=2, last=True, data="")
+        )
+        is None
+    )
+
+    session = _session_with_payload("ok")
+    session_json = _session_json(session)
+    half = len(session_json) // 2
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=0, last=False, data=session_json[:half]
+            )
+        )
+        is None
+    )
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=1, last=True, data=session_json[half:]
+            )
+        )
+        == session
+    )
+
+
+def test_chunk_assembler_starts_new_session_after_truncated_one() -> None:
+    """A first slice arriving mid-session flags the unfinished predecessor and starts fresh."""
+    assembler = ImportLocalSessionChunkAssembler()
+    session = _session_with_payload("ok")
+    session_json = _session_json(session)
+    half = len(session_json) // 2
+    opening = HostImportLocalSessionChunkFrame(
+        request_id="r", total=2, seq=0, last=False, data=session_json[:half]
+    )
+    assert assembler.add(opening) is None
+    assert assembler.in_progress is True
+
+    # The predecessor never sent its final slice; the caller counts it as failed.
+    assert assembler.opens_new_session(opening) is True
+    assert assembler.add(opening) is None
+    assert assembler.buffered_chars == half
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=2, seq=1, last=True, data=session_json[half:]
+            )
+        )
+        == session
+    )
+
+    # A session that already failed is not flagged again at the next boundary.
+    with pytest.raises(ValueError, match="out of order"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(request_id="r", total=2, seq=3, last=False, data="{")
+        )
+    assert assembler.opens_new_session(opening) is False
+
+
+def test_chunk_assembler_rejects_non_ascii_slice() -> None:
+    """Slices are json.dumps output, so a non-ASCII slice fails the session unbuffered."""
+    assembler = ImportLocalSessionChunkAssembler()
+    with pytest.raises(ValueError, match="non-ASCII"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=0, last=False, data='{"title": "café"'
+            )
+        )
+    assert assembler.buffered_chars == 0
+    assert assembler.in_progress is False
+
+
+def test_chunk_assembler_enforces_connection_budget() -> None:
+    """A slice that would push the connection past its shared cap fails the session."""
+    assembler = ImportLocalSessionChunkAssembler(max_chars=100)
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=0, last=False, data="x" * 8
+            ),
+            budget=10,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="exceeds"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=1, last=False, data="x" * 8
+            ),
+            budget=10,
+        )
+    assert assembler.buffered_chars == 0
+
+
+def test_chunk_assembler_enforces_size_cap() -> None:
+    """A chunked session past the reassembly cap fails without buffering it."""
+    assembler = ImportLocalSessionChunkAssembler(max_chars=10)
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=0, last=False, data="x" * 8
+            )
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="exceeds"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=1, seq=1, last=True, data="x" * 8
+            )
+        )
+
+
+def test_chunk_assembler_contains_recursive_json_failure() -> None:
+    """Deeply nested JSON fails one session and leaves the assembler reusable."""
+    assembler = ImportLocalSessionChunkAssembler()
+    nested = "[" * 10_000 + "0" + "]" * 10_000
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=2, seq=0, last=True, data=nested
+            )
+        )
+
+    session = _session_with_payload("ok")
+    encoded = json.dumps(
+        {
+            "external_session_id": session.external_session_id,
+            "workspace": session.workspace,
+            "items": session.items,
+            "title": session.title,
+            "source": session.source,
+        }
+    )
+    assert (
+        assembler.add(
+            HostImportLocalSessionChunkFrame(
+                request_id="r", total=2, seq=0, last=True, data=encoded
+            )
+        )
+        == session
+    )
 
 
 def test_model_options_frames_round_trip() -> None:
@@ -1268,14 +1660,14 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
-    The server stores worktree_path as the session workspace; a
-    dropped field would persist a session with no workspace.
+    Preserve the worktree root and the selected session subdirectory separately.
     """
     original = HostCreateWorktreeResultFrame(
         request_id="req_wt_1",
         status="ok",
         worktree_path="/Users/alice/myrepo-worktrees/feature-login",
         branch="feature/login",
+        workspace="/Users/alice/myrepo-worktrees/feature-login/web",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeResultFrame)
@@ -1338,7 +1730,8 @@ def test_remove_worktree_result_frame_round_trip() -> None:
 # ── host.list_worktrees frames ──────────────────────────
 
 
-def test_list_worktrees_frame_round_trip() -> None:
+@pytest.mark.parametrize("for_cleanup", [True, False])
+def test_list_worktrees_frame_round_trip(for_cleanup: bool) -> None:
     """Verify HostListWorktreesFrame survives encode → decode.
 
     A garbled repo_path would list the wrong repository's worktrees.
@@ -1346,6 +1739,7 @@ def test_list_worktrees_frame_round_trip() -> None:
     original = HostListWorktreesFrame(
         request_id="req_wt_ls_1",
         repo_path="/Users/alice/myrepo",
+        for_cleanup=for_cleanup,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostListWorktreesFrame)
@@ -1890,3 +2284,142 @@ def test_workspace_missing_message_is_the_host_spelling() -> None:
     assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
         WORKSPACE_MISSING_ERROR_CODE
     )
+
+
+def test_list_worktrees_legacy_request_defaults_to_picker_mode() -> None:
+    """Old servers do not send the cleanup-only recovery flag."""
+    frame = decode_host_frame(
+        '{"kind":"host.list_worktrees","request_id":"old", "repo_path":"/repo"}'
+    )
+    assert isinstance(frame, HostListWorktreesFrame)
+    assert frame.for_cleanup is False
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostPluginsFrame("p"),
+        HostPluginsResultFrame("p", "ok", plugins=[{"name": "tool"}]),
+        HostPluginsResultFrame("p", "failed", error="failed"),
+    ],
+)
+def test_plugins_frames_round_trip(frame) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_plugins_result_allow_list_and_malformed_payload() -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.plugins_result",
+                "request_id": "p",
+                "status": "ok",
+                "plugins": [
+                    {
+                        "name": "tool",
+                        "skill_entries": [{"id": "a" * 64, "name": "lint", "path": "/private"}],
+                        "mcp_entries": [{"id": "b" * 64, "name": "docs", "env": "secret"}],
+                        "env": {"TOKEN": "secret"},
+                        "installPath": "/private",
+                        "commands": "secret",
+                    }
+                ],
+            }
+        )
+    )
+    assert isinstance(frame, HostPluginsResultFrame)
+    assert frame.plugins == [
+        {
+            "name": "tool",
+            "skill_entries": [{"id": "a" * 64, "name": "lint"}],
+            "mcp_entries": [{"id": "b" * 64, "name": "docs"}],
+        }
+    ]
+    malformed = decode_host_frame(
+        json.dumps(
+            {"kind": "host.plugins_result", "request_id": "p", "status": "ok", "plugins": "secret"}
+        )
+    )
+    assert isinstance(malformed, HostPluginsResultFrame)
+    assert malformed.plugins is None
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostSkillContentFrame("s", "claude-native", "plugin:skill"),
+        HostSkillContentFrame("s", "claude-native", "plugin:skill", "a" * 64),
+        HostSkillContentResultFrame(
+            "s", "ok", {"name": "skill", "description": "", "content": "body", "truncated": False}
+        ),
+        HostSkillContentResultFrame("s", "failed"),
+    ],
+)
+def test_skill_content_round_trip(frame):
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_skill_content_allow_list_and_correlated_malformed_result():
+    payload = {
+        "kind": "host.skill_content_result",
+        "request_id": "s",
+        "status": "ok",
+        "skill": {
+            "name": "skill",
+            "description": "",
+            "content": "body",
+            "truncated": False,
+            "skill_dir": "/private",
+            "files": "secret",
+        },
+        "error": "private",
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostSkillContentResultFrame)
+    assert frame.skill == {
+        "name": "skill",
+        "description": "",
+        "content": "body",
+        "truncated": False,
+    }
+    assert frame.error == "private"
+    payload["skill"]["truncated"] = "yes"
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostSkillContentResultFrame)
+    assert (frame.request_id, frame.status, frame.skill) == ("s", "failed", None)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostMcpToolsFrame("m", "claude", "odd/server", "toolkit"),
+        HostMcpToolsFrame("m", "claude", "odd/server", "toolkit", "a" * 64),
+        HostMcpToolsResultFrame(
+            "m", "ok", tools=[{"name": "read", "description": None}], connection="connected"
+        ),
+        HostMcpToolsResultFrame("m", "failed"),
+    ],
+)
+def test_mcp_tools_round_trip(frame):
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_mcp_tools_allow_list_and_correlated_malformed_result():
+    payload = {
+        "kind": "host.mcp_tools_result",
+        "request_id": "m",
+        "status": "ok",
+        "tools": [{"name": "read", "description": None, "inputSchema": {"secret": "value"}}],
+        "connection": "connected",
+        "truncated": False,
+        "env": {"TOKEN": "secret"},
+        "error": "private",
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpToolsResultFrame)
+    assert frame.tools == [{"name": "read", "description": None}]
+    assert frame.error == "private"
+    payload["tools"] = "private"
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostMcpToolsResultFrame)
+    assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
