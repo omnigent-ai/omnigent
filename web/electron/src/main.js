@@ -4746,7 +4746,7 @@ function registerIpc() {
           ["http:", "https:"].includes(parsed.protocol) &&
           ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
         ) {
-          return "If this session runs on Arca, open New session > Host > Reconnect to Arca (Run on Arca if not remembered), complete the connect flow, then return to this session and retry. Other hosts remain ineligible.";
+          return "If this session runs on Arca, open New session > Host > Connect to Arca, complete the connect flow, then return to this session and retry. Other hosts remain ineligible.";
         }
       } catch {
         // Invalid URLs keep the policy's original error.

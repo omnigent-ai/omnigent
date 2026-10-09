@@ -1,4 +1,4 @@
-/** Isaac seeds "<user>'s arca"; accept that suffix or the id saved by Run on Arca. */
+/** Isaac seeds "<user>'s arca"; accept that suffix or the id saved by Connect to Arca. */
 
 import type { Host } from "@/hooks/useHosts";
 
@@ -14,7 +14,7 @@ export function isArcaHost(
   );
 }
 
-/** The host id last connected via Run on Arca, or null. */
+/** The host id last connected via Connect to Arca, or null. */
 export function readArcaHostId(): string | null {
   try {
     return localStorage.getItem(ARCA_HOST_ID_STORAGE_KEY);

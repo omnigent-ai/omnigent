@@ -4908,7 +4908,6 @@ export function NewChatLandingScreen() {
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
   // Reconnect remains available to recapture daemon identity after a desktop restart.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
-  const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
   const showArcaOption = arcaEnabled;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
@@ -6672,11 +6671,7 @@ export function NewChatLandingScreen() {
                               <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                             </span>
                             <span>
-                              {connectingArca
-                                ? "Connecting to Arca…"
-                                : arcaHostOnline
-                                  ? "Reconnect to Arca"
-                                  : "Run on Arca"}
+                              {connectingArca ? "Connecting to Arca…" : "Connect to Arca"}
                             </span>
                           </DropdownMenuItem>
                         )}
