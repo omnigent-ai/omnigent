@@ -486,6 +486,7 @@ async def test_rejected_native_switch_restores_saved_model(
     assert runner_post.call_args.kwargs["json"] == {
         "type": "model_change",
         "model": forwarded_model,
+        "rollback_on_refusal": True,
     }
     saved = env.store.get_conversation(session_id)
     assert saved is not None

@@ -2315,6 +2315,252 @@ def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
     assert "sessions_stopped=0" in result.output
 
 
+def test_host_stop_local_daemon_points_at_full_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Stopping the local daemon reminds the user the server stays up.
+
+    ``host stop`` stops hosting only; the detached local server (web UI /
+    history) keeps running, so a wedged server can look like it survived a
+    restart. The command points at the full ``stop`` to clear that up.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_local_server_confirmed_dead", lambda: True)
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "stop", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert "the local Omnigent server (web UI / history)" in result.output
+    assert f"{cli.cli_invocation()} stop" in result.output
+
+
+def test_host_stop_remote_daemon_omits_local_server_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remote ``--server`` stop says nothing about a local server."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "the local Omnigent server" not in result.output
+    assert f"{cli.cli_invocation()} stop" not in result.output
+
+
+def test_host_stop_server_url_matches_local_daemon_serving_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``host stop --server <url>`` finds a local daemon serving that url.
+
+    ``host --server <url>`` refuses to start when a local-mode daemon already
+    serves ``<url>``, so ``host stop --server <url>`` must act on that same
+    daemon. Without this it printed "No matching host daemon found" for the
+    very daemon the start error called "already running", leaving the operator
+    with no working recovery for the command the error pointed them at.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    # The local daemon must read as live for it to count as a conflict/target.
+    monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda record: True)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target) or cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "http://127.0.0.1:8123", "--daemon-only", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No matching host daemon found" not in result.output
+    assert terminated == ["local"], result.output
+
+
+def test_host_stop_foreign_daemon_reports_cleared_not_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A foreign-owned daemon is reported as cleared, never falsely "Stopped".
+
+    ``host stop`` can only drop the shared registry record for a daemon owned
+    by another user — it cannot signal the process (EPERM). It must say so
+    rather than print the contradictory "Stopped ... daemon" summary next to
+    the "owned by another user" warning.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: True)
+
+    def _eperm_kill(pid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(cli.os, "kill", _eperm_kill)
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--daemon-only", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "owned by another user" in result.output
+    assert "Cleared the registry record" in result.output
+    assert "Stopped https://server.example.com daemon" not in result.output
+
+
+def test_foreground_connect_foreign_daemon_gives_ownership_guidance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A conflict with another user's daemon points at remedies that work.
+
+    ``host stop`` cannot signal another user's process, so the "already
+    running" error must say the daemon is owned by another user and name real
+    recovery (ask them, or a private ``OMNIGENT_DATA_DIR``) instead of only
+    telling the operator to run a stop that cannot help.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid == 4242)
+    monkeypatch.setattr(cli, "_pid_is_foreign", lambda pid: True)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url, **_kw: pytest.fail(f"unexpected foreground connect: {server_url}"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "--server", "https://server.example.com/"],
+    )
+
+    assert result.exit_code != 0
+    assert "already running for this server" in result.output
+    assert "pid=4242" in result.output
+    assert "owned by another user" in result.output
+    assert "OMNIGENT_DATA_DIR" in result.output
+
+
+def test_host_stop_recycled_pid_reports_cleared_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A recycled/dead pid record is reported as cleared, not "Stopped".
+
+    The recorded pid is not the daemon that wrote the record, so there is no
+    live daemon to stop; ``host stop`` drops the stale record and must say so.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: False)
+
+    def _forbidden_kill(pid: int, sig: int) -> None:
+        raise AssertionError(f"os.kill({pid}, {sig}) reached for a recycled pid")
+
+    monkeypatch.setattr(cli.os, "kill", _forbidden_kill)
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--daemon-only", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Cleared a stale registry record" in result.output
+    assert "Stopped https://server.example.com daemon" not in result.output
+
+
+def test_pid_is_foreign_classifies_kill_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_pid_is_foreign`` maps kill(2) results: EPERM->foreign, else not."""
+
+    def _kill(result: BaseException | None):
+        def _inner(pid: int, sig: int) -> None:
+            if result is not None:
+                raise result
+
+        return _inner
+
+    monkeypatch.setattr(cli.os, "kill", _kill(PermissionError(1, "Operation not permitted")))
+    assert cli._pid_is_foreign(4242) is True
+
+    monkeypatch.setattr(cli.os, "kill", _kill(ProcessLookupError(3, "No such process")))
+    assert cli._pid_is_foreign(4242) is False
+
+    monkeypatch.setattr(cli.os, "kill", _kill(None))
+    assert cli._pid_is_foreign(4242) is False
+
+
 def test_host_http_json_marks_connection_refused_unreachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

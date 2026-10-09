@@ -11,7 +11,6 @@
 //     text frames for JSON control messages (currently only resize).
 
 import { FitAddon } from "@xterm/addon-fit";
-import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -20,6 +19,7 @@ import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/code
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
+import { TerminalLinkProvider } from "./TerminalLinkProvider";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -79,18 +79,18 @@ export function terminalTheme(isDark: boolean): ITheme {
 /**
  * Activation handler for clickable links in terminal output.
  *
- * Wired into {@link WebLinksAddon}. Suppresses the addon's default
+ * Wired into {@link TerminalLinkProvider}. Suppresses the default
  * navigation (which would replace the SPA — and the live terminal
  * session — with the link target) and opens the URL in a new tab
  * instead. ``noopener,noreferrer`` denies the opened page a handle
  * back to this window and strips the ``Referer`` header.
  *
  * Exported for direct unit testing; production code passes it to the
- * addon constructor rather than calling it directly.
+ * link provider rather than calling it directly.
  *
  * :param event: The DOM mouse event from the link click. Its default
- *     action (addon-driven navigation) is prevented.
- * :param uri: The URL the addon detected in the terminal output,
+ *     navigation is prevented.
+ * :param uri: The URL detected in the terminal output,
  *     e.g. ``"https://example.com/foo"``.
  */
 export type TerminalFileLinkListener = (uri: string) => boolean;
@@ -740,9 +740,9 @@ export class TerminalSession {
     this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
-    // Turn bare URLs in terminal output into clickable links. Without
-    // this addon xterm renders URLs as plain text.
-    this.term.loadAddon(new WebLinksAddon(activateLink));
+    // Turn bare URLs in terminal output into clickable links; xterm alone
+    // renders them as plain text.
+    this.term.registerLinkProvider(new TerminalLinkProvider(this.term, activateLink));
     this.term.open(container);
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.

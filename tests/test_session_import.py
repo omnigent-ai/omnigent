@@ -892,6 +892,24 @@ def test_load_codex_session_normalizes_response_items(tmp_path: Path) -> None:
         {
             "type": "response_item",
             "payload": {
+                "type": "function_call",
+                "name": "sleep",
+                "namespace": "container",
+                "arguments": '{"seconds":2}',
+                "call_id": "call_3",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_3",
+                "output": "slept",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "Done."}],
@@ -911,6 +929,8 @@ def test_load_codex_session_normalizes_response_items(tmp_path: Path) -> None:
     assert [item.type for item in imported.items] == [
         "message",
         "message",
+        "function_call",
+        "function_call_output",
         "function_call",
         "function_call_output",
         "function_call",
@@ -936,6 +956,15 @@ def test_load_codex_session_normalizes_response_items(tmp_path: Path) -> None:
     assert imported.items[5].data.model_dump() == {
         "call_id": "call_2",
         "output": "",
+    }
+    # The Responses backend refuses to continue a thread whose replayed
+    # namespaced call lost its namespace, so import must keep it.
+    assert imported.items[6].data.model_dump() == {
+        "agent": "codex-native-ui",
+        "name": "sleep",
+        "arguments": '{"seconds":2}',
+        "call_id": "call_3",
+        "namespace": "container",
     }
 
 
