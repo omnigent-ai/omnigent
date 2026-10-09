@@ -4838,6 +4838,39 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
 
 
 @pytest.mark.asyncio
+async def test_sys_list_models_reports_native_agy_worker_as_cli_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The serialized row for an ``antigravity-native`` worker is the CLI-login shape.
+
+    agy carries its own login, so with no Omnigent provider configured the
+    tool must report ``source: "static"`` with the agy note — never the
+    dead-worker ``source: "none"`` row that makes orchestrators skip the
+    worker.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir for the isolated provider config.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    _isolate_model_providers(monkeypatch, tmp_path, "")
+    output = await execute_tool(
+        tool_name="sys_list_models",
+        arguments="{}",
+        agent_spec=_spec_with_real_subagent("antigravity-native"),
+        conversation_id="conv_list_models_agy",
+    )
+    worker = json.loads(output)["worker"]
+    assert worker["source"] == "static"
+    assert worker["verified"] is False
+    assert worker["models"] == []
+    assert "agy" in worker["note"]
+    assert "cannot run here" not in worker["note"]
+
+
+@pytest.mark.asyncio
 async def test_sys_list_models_requires_agent_spec() -> None:
     """
     ``sys_list_models`` with no resolvable spec fails loud, not empty.

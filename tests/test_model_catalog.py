@@ -49,6 +49,7 @@ from omnigent.models.model_metadata import (
     ModelWireAPI,
 )
 from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
+from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
@@ -410,6 +411,109 @@ def test_resolve_provider_antigravity_native_aliases(
 ) -> None:
     """Every native agy spelling reaches the same provider resolver."""
     _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec(harness, auth=ApiKeyAuth(api_key="gemini-test-key"))
+    provider = resolve_model_provider(spec, harness)
+    assert provider.kind == "key"
+    assert provider.api_key == "gemini-test-key"
+
+
+@pytest.mark.parametrize(
+    "harness",
+    ["antigravity-native", "native-antigravity", "agy-native", "native-agy"],
+)
+def test_resolve_provider_antigravity_native_is_cli_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Native agy spellings with no Omnigent credential resolve to agy's own login.
+
+    agy inherits the user's Google OAuth login (or an ambient GEMINI_API_KEY)
+    itself, so an unconfigured worker is the usable subscription shape, not
+    the dead-worker ``none`` row.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :param harness: The native agy harness spelling under test.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert provider.kind == "subscription"
+    assert provider.cli == "agy"
+
+
+def test_resolve_provider_antigravity_native_configured_gemini_default_is_cli_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured ``gemini`` default leaves the native agy readout a CLI login.
+
+    The native launch seeds no Omnigent credential, so the gemini-only host
+    from the report must read as agy's own login rather than ``none``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gemini:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    gemini:\n"
+        "      base_url: https://generativelanguage.googleapis.com/v1beta/openai\n"
+        "      api_key: AIzaSyFAKEgeminiKeyForUnitTest\n",
+    )
+    provider = resolve_model_provider(_worker_spec("antigravity-native"), "antigravity-native")
+    assert provider.kind == "subscription"
+    assert provider.cli == "agy"
+
+
+def test_antigravity_native_listing_is_usable_without_omnigent_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The native agy worker row is never the dead-worker shape.
+
+    An orchestrator preflighting with ``sys_list_models`` must see the
+    subscription-style row for a signed-in agy install, not ``source: "none"``
+    with the "dispatches to this worker cannot run here" note; the credential is
+    agy's to resolve at launch, so an ambient Gemini key changes nothing.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers",
+        lambda: [
+            DetectedProvider(name="gemini", kind="key", family="gemini", source="$GEMINI_API_KEY")
+        ],
+    )
+    listing = list_models_for_worker(_worker_spec("antigravity-native"), "antigravity-native")
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert listing.models == ()
+    assert "agy" in listing.note
+    assert "cannot run here" not in listing.note
+
+
+@pytest.mark.parametrize("harness", ["antigravity", "agy", "google-antigravity"])
+def test_resolve_provider_antigravity_sdk_keeps_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """The CLI-login fallback is native-only.
+
+    The in-process Antigravity SDK harness consumes an Omnigent-resolved
+    credential (spec api-key / ``antigravity:`` block / ambient key), so
+    its spellings must keep provider-config resolution: ``none`` without a
+    credential and the supplied key with one, never an agy CLI login the
+    SDK does not use.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :param harness: The SDK antigravity harness spelling under test.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    assert resolve_model_provider(_worker_spec(harness), harness).kind == "none"
     spec = _worker_spec(harness, auth=ApiKeyAuth(api_key="gemini-test-key"))
     provider = resolve_model_provider(spec, harness)
     assert provider.kind == "key"
