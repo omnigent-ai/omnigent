@@ -96,7 +96,7 @@ def signed_in_stub_codex_host(
     host_name = f"codex-stub-{uuid.uuid4().hex[:8]}"
 
     env = {
-        "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}",
+        "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
         "HOME": str(host_home),
         "PYTHONPATH": os.pathsep.join(
             [
@@ -253,7 +253,11 @@ async def _drive_codex_picker(
                 # The trigger is icon-led, so confirm the pick through the
                 # picker's active row, then leave the composer settled.
                 row = await _reveal_agent_row(page, agent["id"])
-                codex_selected = (await row.get_attribute("data-active")) == "true"
+                try:
+                    await expect(row).to_have_attribute("data-active", "true", timeout=10_000)
+                    codex_selected = True
+                except AssertionError:
+                    codex_selected = False
                 await page.wait_for_timeout(_HOLD_MS)
                 await page.keyboard.press("Escape")
                 await expect(page.get_by_role("menu").first).to_be_hidden()

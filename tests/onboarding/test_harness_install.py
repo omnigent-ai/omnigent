@@ -1425,42 +1425,19 @@ def test_harness_cli_installed_checks_minimum_for_other_versioned_specs(
     assert hi.harness_cli_installed(key) is False
 
 
-def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """0.139.0 must read as installed, not ``version-too-low``.
-
-    A too-low codex makes ``harness_is_configured`` false, and the host then
-    refuses EVERY codex launch — plain sessions included — with a misleading
-    "run omni setup". Smart Routing's spawn hook wants 0.145.0, but that is
-    enforced where the hook is registered, so an older CLI loses only the
-    spawn gate.
-    """
-    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
-        if len(argv) >= 2 and argv[1] == "--version":
-            return subprocess.CompletedProcess(
-                args=argv, returncode=0, stdout="codex-cli 0.139.0\n", stderr=""
-            )
-        raise AssertionError(f"unexpected subprocess: {argv!r}")
-
-    monkeypatch.setattr(hi.subprocess, "run", _run)
-    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
-
-
-# 0.129.0 is the floor itself; 0.130.0 sits below the 0.131.0 bypass-hook-trust
-# flag gate and 0.133.0 above it. The whole window the capability floor admits
-# must read installed (the flag gate degrades launch args, never installability).
-@pytest.mark.parametrize("version", ["0.129.0", "0.130.0", "0.133.0"])
-def test_the_codex_floor_is_the_policy_hook_capability_floor(
+@pytest.mark.parametrize(
+    "version",
+    ["0.129.0", "0.130.0", "0.133.0", "0.139.0"],
+    ids=["policy-hook-floor", "below-bypass-flag-gate", "previously-rejected", "ci-pinned"],
+)
+def test_the_codex_floor_accepts_capable_clis(
     monkeypatch: pytest.MonkeyPatch,
     version: str,
 ) -> None:
-    """A codex at or above the policy-hook floor must read as installed.
+    """Accept the policy-hook floor and versions the onboarding floor once rejected.
 
-    The floor also feeds the host readiness map and launch gate, so a floor
-    above the capability requirement flags a working codex "outdated".
+    A too-low codex makes ``harness_is_configured`` false, so the picker flags a
+    working codex "outdated" and the host refuses every codex launch.
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 

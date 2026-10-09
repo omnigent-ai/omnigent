@@ -103,11 +103,9 @@ KIRO_KEY = "kiro"
 # - claude: `--mcp-config` (required by the native bridge) introduced long
 #   before 2026-06-01. The first Claude Code release after the cutoff is
 #   2.1.161, so use that as the supported floor.
-# - codex: the capability requirement, not the 2026-06-01 cutoff the sibling
-#   floors use: the native policy hook's trust protocol needs >= 0.129.0
-#   (``codex_native/app_server._MIN_POLICY_HOOK_CODEX_VERSION``). Newer features
-#   such as the 0.145.0 subagent-router hook gate themselves where they are
-#   registered, so an older CLI loses only that feature, not the launch.
+# - codex: capability floor, not the 2026-06-01 cutoff: the policy hook's trust
+#   protocol needs >= 0.129.0 (``app_server._MIN_POLICY_HOOK_CODEX_VERSION``);
+#   newer features (e.g. the 0.145.0 router hook) gate themselves at registration.
 # - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
 # - kimi: the harness drives Moonshot's ``kimi-code`` CLI (the ``kimi`` binary
