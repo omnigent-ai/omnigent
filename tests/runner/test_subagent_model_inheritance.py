@@ -590,13 +590,8 @@ async def test_binding_lets_foreign_multi_model_child_inherit(
 async def test_antigravity_native_child_of_claude_parent_skips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    An agy child of a Claude parent runs its own default: the native agy CLI now
-    accepts Claude ids, so only the different-vendor rule keeps a Claude-harness
-    selection from being forced onto agy's catalog.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """A Claude parent's selection is not inherited by an agy child: agy accepts
+    Claude ids, so only the different-vendor rule keeps it off agy's catalog."""
     _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
