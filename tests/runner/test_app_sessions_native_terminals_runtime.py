@@ -1171,23 +1171,26 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "source_thread",
-    [None, "019e96aa-0be2-7343-8d3b-6f914d60936b"],
-    ids=["sdk-source", "missing-codex-rollout"],
+    ("source_thread", "forked"),
+    [(None, True), ("019e96aa-0be2-7343-8d3b-6f914d60936b", True), (None, False)],
+    ids=["sdk-source", "missing-codex-rollout", "cli-import"],
 )
 async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_resumes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source_thread: str | None,
+    forked: bool,
 ) -> None:
-    """A forked codex clone builds from items when its source rollout is unavailable.
+    """A carry-history codex session builds from items when no source rollout exists.
 
-    This covers both a non-Codex source with no source thread id and an imported
-    Codex source whose rollout lives outside Omnigent's private ``CODEX_HOME``.
+    This covers a non-Codex source with no source thread id, an imported Codex
+    source whose rollout lives outside Omnigent's private ``CODEX_HOME``, and a
+    ``session import`` copy that has import labels but no fork source.
 
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param source_thread: Optional unavailable source Codex thread id.
+    :param forked: Whether the session is a fork clone or a CLI import copy.
     :returns: None.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
@@ -1197,6 +1200,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         codex_home_for_bridge_dir,
     )
     from omnigent.runner import app as runner_app_mod
+    from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -1244,10 +1248,11 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
                     "include_usage": "false",
                     "include_live_status": "false",
                 }
-                labels = {
-                    FORK_SOURCE_LABEL_KEY: source_id,
-                    FORK_CARRY_HISTORY_LABEL_KEY: "1",
-                }
+                labels = {FORK_CARRY_HISTORY_LABEL_KEY: "1"}
+                if forked:
+                    labels[FORK_SOURCE_LABEL_KEY] = source_id
+                else:
+                    labels[IMPORT_SOURCE_LABEL_KEY] = "codex"
                 if source_thread is not None:
                     labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = source_thread
                 return httpx.Response(

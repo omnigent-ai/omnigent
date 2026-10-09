@@ -9,6 +9,8 @@ import {
 } from "@/components/composer/HarnessPicker";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
   ComposerWorkspaceBar,
   ComposerWorkspaceTrigger,
@@ -1307,6 +1309,7 @@ function visibleModelLabel(label: string): string {
 }
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
+type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
@@ -1390,6 +1393,7 @@ export function AgentHarnessPicker({
   triggerTooltip,
   triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  modelCatalogAvailability,
   triggerIcon,
   selectedConfigContent,
   isEntryConfigurable,
@@ -1450,6 +1454,10 @@ export function AgentHarnessPicker({
   triggerTooltipRows?: readonly { label: string; value: string }[];
   /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
+  /** Explicit status for the selected model catalog. `unknown` means there is
+   * no known catalog because lookup is disabled or still loading; omit it for
+   * consumers without catalog state. */
+  modelCatalogAvailability?: ModelCatalogAvailability;
   /** Harness glyph rendered before the joined model / effort label. */
   triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
@@ -1500,15 +1508,20 @@ export function AgentHarnessPicker({
     : null;
   const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
   const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
+  const modelCatalogUnavailable = modelCatalogAvailability === "unavailable";
   const visibleModelText = selectedUnavailable
     ? ""
-    : triggerModelText === "Default"
+    : modelCatalogUnavailable
       ? "Models unavailable"
       : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
-    .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
+    .map((detail) =>
+      detail.label === "Model" && modelCatalogUnavailable
+        ? "Model unavailable"
+        : `${detail.label} ${compactModelTriggerLabel(detail.value)}`,
+    )
     .join(", ");
   const triggerAccessibleName = [
     hasAgents ? agentLabel : "No agents",
@@ -1525,10 +1538,15 @@ export function AgentHarnessPicker({
     : visibleEffortText;
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
-  const visibleCachedPreview = selectedUnavailable ? null : cachedPreview;
+  const visibleCachedPreview =
+    selectedUnavailable || modelCatalogUnavailable ? null : cachedPreview;
   const resolvedPreview = useMemo<NewChatPickerPreview | null>(
     () =>
-      selectedEntry && hasAgents && visibleModelText !== "Models unavailable"
+      selectedEntry &&
+      hasAgents &&
+      !selectedUnavailable &&
+      modelCatalogAvailability !== "unavailable" &&
+      modelCatalogAvailability !== "unknown"
         ? {
             agent: { name: selectedEntry.name, harness: selectedEntry.harness },
             label: triggerAccessibleName,
@@ -1540,7 +1558,8 @@ export function AgentHarnessPicker({
     [
       selectedEntry,
       hasAgents,
-      visibleModelText,
+      selectedUnavailable,
+      modelCatalogAvailability,
       triggerAccessibleName,
       triggerText,
       triggerSecondaryText,
@@ -3477,6 +3496,17 @@ export function NewChatLandingScreen() {
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
           : null;
+  const modelCatalogLookupEnabled = sandboxSelected
+    ? sandboxPreviewEnabled && sandboxInferenceConfigured
+    : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
+  const modelCatalogAvailability: ModelCatalogAvailability | undefined =
+    harnessTriggerDetails.some((row) => row.label === "Model") && !routingOn
+      ? pickerModelOptions.length > 0
+        ? "available"
+        : !modelCatalogLookupEnabled || pickerModelsLoading
+          ? "unknown"
+          : "unavailable"
+      : undefined;
   const pickerDataLoading =
     sandboxCatalogPending ||
     agentsLoading ||
@@ -5187,6 +5217,18 @@ export function NewChatLandingScreen() {
     // after the user has navigated elsewhere while this component is still
     // mounted in the outgoing transition tree.
     const createLocation = window.location.href;
+    const returnToCanvas = searchParams.has(CANVAS_QUERY_PARAM) && isFeatureEnabled(info, "canvas");
+    let createdCanvasId = selectedProject
+      ? (configProjectId ?? `name:${selectedProject}`)
+      : MAIN_CANVAS_ID;
+    const sessionLocation = (sessionId: string) =>
+      returnToCanvas ? canvasLocation(createdCanvasId, sessionId) : `/c/${sessionId}`;
+    const stillViewingLocalSession = (sessionId: string) => {
+      const destination = sessionLocation(sessionId);
+      return window.location.pathname.endsWith(
+        typeof destination === "string" ? destination : destination.pathname,
+      );
+    };
     // Remember the repos/branches for next time (seeds the picker on the next
     // visit). Only when a repo is actually set — a no-repo session leaves the
     // remembered repos untouched rather than clearing them.
@@ -5207,10 +5249,12 @@ export function NewChatLandingScreen() {
     // failure after the navigate-first jump strands a read-only phantom chat.
     const tearDownLocalConversation = () => {
       if (localConv === null) return;
-      const stillOnTempRoute = window.location.pathname.endsWith(`/c/${localConv.tempConvId}`);
+      const stillOnTempRoute = stillViewingLocalSession(localConv.tempConvId);
       const wasViewing = removeLocalConversation(localConv.tempConvId);
       // Gated on `wasViewing` (not `onScreenRef` — the landing already unmounted).
-      if (wasViewing && stillOnTempRoute) navigate("/");
+      if (wasViewing && stillOnTempRoute) {
+        navigate(returnToCanvas ? { pathname: "/", search: `?${searchParams.toString()}` } : "/");
+      }
     };
     // The draft is spent from the moment it is submitted: it belongs to the
     // session now being created, so a detour back to this screen must not
@@ -5437,7 +5481,7 @@ export function NewChatLandingScreen() {
             // real host (null for a sandbox create).
             hostId: sandboxSelected ? null : selectedHostId,
           });
-          if (localConv !== null) navigate(`/c/${localConv.tempConvId}`);
+          if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
         } catch {
           /* non-fatal: the response still opens the server session */
         }
@@ -5649,7 +5693,8 @@ export function NewChatLandingScreen() {
           // File via first-class project_id; the helper resolves the picked
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
-          await moveConversationToProject(data.id, selectedProject);
+          const filed = await moveConversationToProject(data.id, selectedProject);
+          if (filed?.project_id) createdCanvasId = filed.project_id;
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -5684,7 +5729,7 @@ export function NewChatLandingScreen() {
       // `localConv` is set only when a real agent id was resolved up front, so
       // it's safe to POST the first message with it.
       if (localConv !== null && effectiveAgentId !== null) {
-        const tempRouteSuffix = `/c/${localConv.tempConvId}`;
+        const tempConvId = localConv.tempConvId;
         promoteSessionDraft(localConv.tempConvId, data.id);
         // Hydrate the temp id onto the real id and POST the first message.
         hydrateLocalConversation(
@@ -5695,8 +5740,8 @@ export function NewChatLandingScreen() {
           files,
           localConv.pendingMsgTempId,
           skill,
-          navigate,
-          () => window.location.pathname.endsWith(tempRouteSuffix),
+          returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
+          () => stillViewingLocalSession(tempConvId),
           localProject,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
@@ -5707,7 +5752,7 @@ export function NewChatLandingScreen() {
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
         if (onScreenRef.current && window.location.href === createLocation) {
-          navigate(`/c/${data.id}`);
+          navigate(sessionLocation(data.id));
         }
       }
     } catch {
@@ -6769,6 +6814,7 @@ export function NewChatLandingScreen() {
                             : undefined
                         }
                         triggerDetails={harnessTriggerDetails}
+                        modelCatalogAvailability={modelCatalogAvailability}
                         triggerIcon={
                           selectedAgent ? (
                             <span

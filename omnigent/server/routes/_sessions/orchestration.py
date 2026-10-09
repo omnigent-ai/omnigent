@@ -3002,7 +3002,7 @@ async def _persist_external_conversation_item_unlocked(
         match_method = matched.match_method
         if drained is not None:
             cleared_pending_id = drained.pending_id
-        held_older = matched.skipped
+        held_older = [*matched.skipped, *matched.uncertain]
     elif (shell_command := _shell_command_input(item)) is not None:
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
         if drained is not None:

@@ -2828,10 +2828,9 @@ async def _post_pi_native_effort_notice(
 
 
 _CODEX_THREAD_RESET_NOTICE = (
-    "Codex reported an internal error while loading this session's saved transcript, "
-    "so Omnigent started a fresh Codex thread instead of failing the turn. The chat "
-    "history here is intact, but Codex's own memory of the earlier turns is not "
-    "restored."
+    "Codex could not load this session's saved transcript, so Omnigent started a fresh "
+    "Codex thread instead of failing the turn. The chat history here is intact, but "
+    "Codex's own memory of the earlier turns is not restored."
 )
 
 
@@ -4599,7 +4598,8 @@ async def _launch_codex_native_tui(
         resolve_harness_config,
     )
 
-    _codex_harness_cfg = load_effective_config()
+    # Read project config from the session workspace; the runner's cwd may be gone.
+    _codex_harness_cfg = load_effective_config(workspace=workspace)
     # Honor configured wrappers while keeping the host-provisioned binary
     # immune to ambient OMNIGENT_CODEX_PATH overrides.
     _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)

@@ -5405,7 +5405,10 @@ async def test_claude_native_retried_mirror_leaves_the_queue_alone() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claude_native_mirrored_slash_command_drains_its_queued_entry() -> None:
+@pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
+async def test_claude_native_mirrored_slash_command_drains_its_queued_entry(
+    prior_state: str,
+) -> None:
     """A web-typed command mirrored as a slash_command clears its own queued entry.
 
     Without this the entry outlives the executed command and the next ordinary
@@ -5421,6 +5424,10 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry() ->
     conv = store.get_conversation(sid)
     assert conv is not None
     older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    if prior_state == "uncertain":
+        pending_inputs.mark_uncertain(sid)
+    elif prior_state == "interrupted":
+        pending_inputs.mark_interrupted(sid, [older])
     pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
     body = SessionEventInput(
         type="external_conversation_item",
@@ -5446,7 +5453,13 @@ async def test_claude_native_mirrored_slash_command_drains_its_queued_entry() ->
         )
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
-        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+        assert pending_inputs.pending_ids(sid) == [older]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [] if prior_state == "interrupted" else [older]
+        )
+        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
+        assert delayed.matched is not None and delayed.matched.pending_id == older
+        assert delayed.matched.interrupted == (prior_state == "interrupted")
     finally:
         pending_inputs.reset_for_tests()
 
@@ -5662,7 +5675,10 @@ async def test_kiro_prompt_with_literal_attachment_text_matches_its_entry() -> N
 
 
 @pytest.mark.asyncio
-async def test_claude_native_failed_slash_command_append_restores_its_entry() -> None:
+@pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
+async def test_claude_native_failed_slash_command_append_restores_its_entry(
+    prior_state: str,
+) -> None:
     """A slash-command mirror whose append fails puts its queued entry back, in order."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
@@ -5673,6 +5689,10 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry() ->
     conv = store.get_conversation(sid)
     assert conv is not None
     older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    if prior_state == "uncertain":
+        pending_inputs.mark_uncertain(sid)
+    elif prior_state == "interrupted":
+        pending_inputs.mark_interrupted(sid, [older])
     command = pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
     body = SessionEventInput(
         type="external_conversation_item",
@@ -5698,10 +5718,10 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry() ->
                 store,  # type: ignore[arg-type]
             )
         assert store.appended_items == []
-        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
-            older,
-            command,
-        ]
+        assert pending_inputs.pending_ids(sid) == [older, command]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [command] if prior_state == "interrupted" else [older, command]
+        )
 
         await _persist_external_conversation_item(
             sid,
@@ -5711,7 +5731,13 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry() ->
         )
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
-        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+        assert pending_inputs.pending_ids(sid) == [older]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [] if prior_state == "interrupted" else [older]
+        )
+        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
+        assert delayed.matched is not None and delayed.matched.pending_id == older
+        assert delayed.matched.interrupted == (prior_state == "interrupted")
     finally:
         pending_inputs.reset_for_tests()
 

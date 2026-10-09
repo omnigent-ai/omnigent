@@ -116,6 +116,10 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,
+  `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
+  (real host and Codex CLI; custom, bundled, and hidden defaults on desktop and mobile),
+  `tests/e2e_ui/start_session/test_codex_catalog_availability.py::test_codex_prelaunch_label_reflects_catalog_availability`
+  (desktop and mobile; populated catalogs without a default, empty catalogs, and probe failures),
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`

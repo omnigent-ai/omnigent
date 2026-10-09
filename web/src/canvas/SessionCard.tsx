@@ -71,11 +71,16 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
       data-testid="session-card"
       data-state={state?.kind ?? "idle"}
       role="button"
+      aria-pressed={selected ?? false}
       tabIndex={0}
       aria-label={`${title}. ${label}. ${workspace}`}
       onClick={(event) => {
-        // Pointer clicks select (and start drags); only keyboard activation opens.
-        if (event.detail === 0) onOpen(conversation.id);
+        // React Flow distinguishes pointer clicks from drags; virtual clicks
+        // activate here without also bubbling to the node's click handler.
+        if (event.detail === 0) {
+          event.stopPropagation();
+          onOpen(conversation.id);
+        }
       }}
       onKeyDown={openFromKeyboard}
     >

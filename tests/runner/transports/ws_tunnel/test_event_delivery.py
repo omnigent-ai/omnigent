@@ -8,7 +8,9 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
+from omnigent.errors import ErrorCode
 from omnigent.runner.transports.ws_tunnel.event_delivery import (
     RunnerEventDispatcher,
     TunnelEventClient,
@@ -236,6 +238,38 @@ async def test_synthetic_ack_invokes_http_response_hooks() -> None:
         client.event_hooks["response"].append(response_hook)
         await client.post(_URL, json=_ITEM)
     assert hooks == [202]
+
+
+@pytest.mark.parametrize(
+    ("ack_error", "expected_status"),
+    [
+        # The server's wrong-runner refusal: the session is bound elsewhere.
+        pytest.param(ErrorCode.FORBIDDEN, 403, id="forbidden"),
+        pytest.param(ErrorCode.INVALID_INPUT, 422, id="invalid-input"),
+        pytest.param("invalid session event", 422, id="free-text-rejection"),
+    ],
+)
+async def test_non_retryable_ack_maps_to_synthetic_http_status(
+    ack_error: str, expected_status: int
+) -> None:
+    dispatcher = RunnerEventDispatcher()
+    http_posts: list[object] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        # Round-trip the ack through the wire codec like a real tunnel frame.
+        ack = decode_frame(encode_frame(EventAckFrame(frame.id, 0, ack_error)))
+        assert isinstance(ack, EventAckFrame)
+        dispatcher.acknowledge(ack)
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, http_posts) as client:
+        response = await asyncio.wait_for(client.post(_URL, json=_ITEM), timeout=2)
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": ack_error}
+    assert http_posts == []
+    assert not dispatcher.has_pending
 
 
 async def test_preview_drops_when_negotiated_tunnel_is_down() -> None:

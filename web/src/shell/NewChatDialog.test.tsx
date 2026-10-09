@@ -1973,6 +1973,27 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(readNewChatPickerOptionsCache(snapshot.key)?.models.claude).toEqual(cachedModels);
   });
 
+  it("keeps the named preview when a populated catalog becomes offline", () => {
+    const snapshot = seedResolvedPicker();
+    mockHosts([host("offline")]);
+    mockModelQueries(() => CLAUDE_MODEL_OPTIONS_RESULT);
+    useHostModelOptionsMock.mockClear();
+    renderLanding();
+
+    expect(
+      useHostModelOptionsMock.mock.calls
+        .filter(([, harness]) => harness === "claude-native")
+        .at(-1),
+    ).toEqual(["host_1", "claude-native", false, { poll: true }]);
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveTextContent("Sonnet 4.6");
+    expect(picker).toHaveTextContent("High");
+    expect(readNewChatPickerCache(snapshot.key)).toMatchObject({
+      model: "Sonnet 4.6",
+      effort: "High",
+    });
+  });
+
   describe.each(["pending", "offline", "unconfigured"])(
     "restored draft with a %s host",
     (state) => {
@@ -4721,7 +4742,7 @@ describe("NewChatLandingScreen", () => {
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
     expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "Models unavailable",
+      "Default",
     );
     expect(picker).toHaveAccessibleName("Claude Code, Model Default");
 
@@ -4732,7 +4753,59 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("keeps the Codex model visible when its default model is unresolved", () => {
+  it("shows Default and preserves Codex choices when no catalog row is marked default", () => {
+    mockModelQueries((harness) =>
+      harness === "codex-native"
+        ? {
+            ...CODEX_MODEL_OPTIONS_RESULT,
+            data: CODEX_MODEL_OPTIONS_RESULT.data.map(
+              ({ isDefault: _isDefault, ...model }) => model,
+            ),
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    selectAgent("a2");
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Codex, Model Default");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Default",
+    );
+    expect(picker).not.toHaveTextContent("Models unavailable");
+
+    openAgentModels("a2");
+    expect(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-5")).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6")).toBeVisible();
+  });
+
+  it("keeps a populated Codex catalog usable when a refresh reports an error", () => {
+    mockModelQueries((harness) =>
+      harness === "codex-native"
+        ? {
+            ...CODEX_MODEL_OPTIONS_RESULT,
+            data: CODEX_MODEL_OPTIONS_RESULT.data.map(
+              ({ isDefault: _isDefault, ...model }) => model,
+            ),
+            status: "error" as const,
+            isError: true,
+            isSuccess: false,
+            error: new Error("catalog refresh failed"),
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    selectAgent("a2");
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Codex, Model Default");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Default",
+    );
+    expect(picker).not.toHaveTextContent("Models unavailable");
+  });
+
+  it("shows unavailable only for a truly empty Codex catalog", () => {
     useHostModelOptionsMock.mockReturnValue({
       data: [],
       isLoading: false,
@@ -4742,10 +4815,38 @@ describe("NewChatLandingScreen", () => {
     selectAgent("a2");
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
-    expect(picker).toHaveAccessibleName("Codex, Model Default");
+    expect(picker).toHaveAccessibleName("Codex, Model unavailable");
     expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
       "Models unavailable",
     );
+  });
+
+  it("keeps effort details in the aria-label when a model query fails", () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { effort: "high" } }),
+    );
+    const failedClaudeModels = {
+      ...SUCCESS_QUERY_STATE,
+      data: [] as NonNullable<ReturnType<typeof useHostModelOptions>["data"]>,
+      status: "error" as const,
+      isError: true,
+      isSuccess: false,
+      error: new Error("catalog unavailable"),
+    } as const;
+    mockModelQueries((harness) =>
+      harness === "claude-native" ? failedClaudeModels : CODEX_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Models unavailable",
+    );
+    expect(within(picker).getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent(
+      "High",
+    );
+    expect(picker).toHaveAccessibleName("Claude Code, Model unavailable, Effort High");
   });
 
   it("names the Pi default model in the harness trigger from the host catalog", () => {
@@ -8403,9 +8504,7 @@ describe("NewChatLandingScreen agent picker + Edit settings", () => {
   it("summarizes the current settings across the integrated controls", () => {
     renderLanding();
     pickPermissionOption("plan");
-    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "Models unavailable",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("Default");
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
   });
 

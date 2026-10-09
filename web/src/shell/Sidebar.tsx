@@ -94,7 +94,14 @@ import {
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+  useSearchParams,
+} from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -232,6 +239,8 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -433,11 +442,13 @@ function useActiveNavItem(): {
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
+  const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
-  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
+  const isCanvasPage =
+    !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
@@ -613,6 +624,8 @@ function SidebarImpl({
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  const [searchParams] = useSearchParams();
+  const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -1186,7 +1199,7 @@ function SidebarImpl({
               </Button>
               {canvasEnabled && (
                 <PrimaryNavLink
-                  to="/canvas"
+                  to={canvasDestination.pathname + canvasDestination.search}
                   label="Canvas"
                   icon={LayoutDashboardIcon}
                   active={isCanvasPage}

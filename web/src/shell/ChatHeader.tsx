@@ -10,6 +10,7 @@ import {
   InfoIcon,
   ListIcon,
   MenuIcon,
+  Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
@@ -17,7 +18,9 @@ import {
   ShareIcon,
   TerminalIcon,
   UserPlusIcon,
+  XIcon,
 } from "lucide-react";
+import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -354,6 +357,7 @@ export function ChatHeader({
   // hover affordance — on mobile the toggle just opens the full-screen overlay,
   // so a tap's synthetic pointerenter must not trigger it.
   const isMobile = useIsMobileViewport();
+  const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
   const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const peekRequest = useRef(0);
@@ -588,10 +592,22 @@ export function ChatHeader({
       <div
         className={cn(
           "flex min-w-0 items-center gap-1 md:gap-6",
-          !sidebarOpen && "traffic-light-clearance",
+          !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
-        {!sidebarOpen && (
+        {canvas?.compact && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={canvas.closeConversation}
+            aria-label="Back to canvas"
+            className="shrink-0 gap-1 px-1.5 text-ui"
+          >
+            <ArrowLeftIcon className="size-4" />
+            Canvas
+          </Button>
+        )}
+        {!sidebarOpen && !canvas && (
           <Tooltip
             open={tooltipOpen}
             onOpenChange={(next) => {
@@ -866,6 +882,34 @@ export function ChatHeader({
         {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
             menu the desktop breadcrumb hangs off its title. */}
         {isMobile && conversationMenu}
+        {canvas && !canvas.compact && (
+          <>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={canvas.focused ? "Show canvas beside conversation" : "Focus conversation"}
+              title={canvas.focused ? "Show canvas" : "Focus conversation"}
+              onClick={canvas.toggleFocus}
+              className="shrink-0 text-muted-foreground"
+            >
+              {canvas.focused ? (
+                <PanelLeftIcon className="size-4" />
+              ) : (
+                <Maximize2Icon className="size-4" />
+              )}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Close conversation pane"
+              title="Close conversation pane"
+              onClick={canvas.closeConversation}
+              className="shrink-0 text-muted-foreground"
+            >
+              <XIcon className="size-4" />
+            </Button>
+          </>
+        )}
       </div>
     </header>
   );

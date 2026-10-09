@@ -153,7 +153,8 @@ Cross-harness journeys:
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
 - **`model-and-effort`:**
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,
-  `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`;
+  `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
+  (real host API and Codex CLI, with custom/bundled catalogs and a hidden default; desktop and mobile);
   see also [composer](./composer.md) for effort.
 - **`model-and-effort`, Codex runtime settings:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,

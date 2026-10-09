@@ -1,4 +1,7 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useConversationRedirect } from "@/hooks/useConversationRedirect";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
@@ -34,7 +37,7 @@ import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
-import { useNavigate, useParams } from "@/lib/routing";
+import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -377,6 +380,8 @@ export function ChatPage() {
   // the session exists. `switchTo` still gets the raw `urlConvId`.
   const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
   const navigate = useNavigate();
+  const { pathname, search } = useLocation();
+  const rebasePath = useRebasePath();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
@@ -442,32 +447,22 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
-    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
-    // conversation is gone) has no forward path: landing is URL-keyed, so the
-    // page would sit on a permanently read-only phantom chat. Redirect to
-    // landing instead of binding a nonexistent session.
+    // A temporary route has no client session after a reload. Return to its
+    // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
-      navigate("/", { replace: true });
+      const canvas = isCanvasPathname(pathname, rebasePath("/canvas"));
+      navigate(
+        canvas
+          ? canvasLocation(new URLSearchParams(search).get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID)
+          : "/",
+        { replace: true },
+      );
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate]);
+  }, [urlConvId, navigate, pathname, search, rebasePath]);
 
-  // Server-driven redirect: when the active conversation is superseded
-  // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
-  // away), the store records the follow-to target in
-  // `redirectToConversationId`. Perform the router navigation here (the
-  // store can't), replacing history so Back doesn't return to the
-  // cleared session, then clear the flag so it fires exactly once. Skip
-  // when we're already on the target URL.
-  const redirectToConversationId = useChatStore((s) => s.redirectToConversationId);
-  useEffect(() => {
-    if (!redirectToConversationId) return;
-    if (redirectToConversationId !== urlConvId) {
-      navigate(`/c/${redirectToConversationId}`, { replace: true });
-    }
-    useChatStore.setState({ redirectToConversationId: null });
-  }, [redirectToConversationId, urlConvId, navigate]);
+  useConversationRedirect(urlConvId);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay

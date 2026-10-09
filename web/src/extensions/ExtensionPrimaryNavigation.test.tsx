@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 const extensions = [
   {
@@ -43,6 +44,31 @@ vi.mock("./ExtensionProvider", () => ({ useExtensions: () => extensions }));
 import { ExtensionPrimaryNavigation } from "./ExtensionPrimaryNavigation";
 
 describe("ExtensionPrimaryNavigation", () => {
+  it("keeps compact links accessible and interactive without visible labels", () => {
+    const onNavigate = vi.fn();
+    render(
+      <TooltipProvider>
+        <MemoryRouter>
+          <ExtensionPrimaryNavigation
+            activePageId="acme.review.first"
+            onNavigate={onNavigate}
+            compact
+          />
+        </MemoryRouter>
+      </TooltipProvider>,
+    );
+
+    const first = screen.getByRole("link", { name: "First" });
+    const second = screen.getByRole("link", { name: "Second" });
+    expect(first).toHaveAttribute("href", "/extensions/acme.review/first");
+    expect(first).toHaveAttribute("aria-current", "page");
+    expect(second).toHaveAttribute("href", "/extensions/acme.review/second");
+    expect(first.textContent).toBe("");
+    expect(second.textContent).toBe("");
+    fireEvent.click(first);
+    expect(onNavigate).toHaveBeenCalledOnce();
+  });
+
   it("orders entries, falls back unknown icons, and marks the active page", () => {
     const onNavigate = vi.fn();
     render(

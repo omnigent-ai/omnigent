@@ -960,12 +960,12 @@ describe("index.css mobile settings title", () => {
 describe("index.css electron-mac window drag region", () => {
   const dragRule = cssBlocks
     .map(([block]) => block)
-    .find((block) => selectorOf(block) === "[data-electron-mac] .electron-drag-strip");
+    .find((block) => selectorOf(block) === "html[data-electron-mac] .electron-drag-strip");
   const controlsRule = cssBlocks
     .map(([block]) => block)
     .find(
       (block) =>
-        selectorOf(block).replace(/\s+/g, " ").startsWith("html:has([data-electron-mac]) :is(") &&
+        selectorOf(block).replace(/\s+/g, " ").startsWith("html[data-electron-mac] :is(") &&
         block.includes("-webkit-app-region: no-drag"),
     );
   let dragSelector: string;
@@ -978,7 +978,21 @@ describe("index.css electron-mac window drag region", () => {
     controlsSelector = selectorOf(controlsRule!);
   });
 
-  afterEach(cleanup);
+  // The mac shell marks <html> at boot (applyMacElectronShellAttribute).
+  const root = document.documentElement;
+  const markMacShell = () => root.setAttribute("data-electron-mac", "true");
+  const unmarkMacShell = () => root.removeAttribute("data-electron-mac");
+
+  afterEach(() => {
+    cleanup();
+    unmarkMacShell();
+  });
+
+  it("scopes the no-drag exclusions without :has() so DOM edits stay cheap", () => {
+    // `html:has(...)` restyles the whole page on DOM mutations, e.g. every
+    // keystroke in a controlled textarea.
+    expect(controlsSelector).not.toContain(":has(");
+  });
 
   it("covers the full width and height of the desktop header", () => {
     expect(dragRule).toContain("inset: 0 0 auto 0");
@@ -1022,22 +1036,19 @@ describe("index.css electron-mac window drag region", () => {
     ["div", { role: "tooltip" }],
     ["div", { contentEditable: true }],
   ])("keeps %s %j interactive inside the drag band", (tag, props) => {
-    const { container } = render(
-      createElement("div", { "data-electron-mac": "true" }, createElement(tag, props)),
-    );
-    const shell = container.firstElementChild!;
-    const control = shell.firstElementChild!;
+    markMacShell();
+    const { container } = render(createElement("div", {}, createElement(tag, props)));
+    const control = container.firstElementChild!.firstElementChild!;
     expect(control.matches(controlsSelector)).toBe(true);
-    shell.removeAttribute("data-electron-mac");
+    unmarkMacShell();
     expect(control.matches(controlsSelector)).toBe(false);
   });
 
   it.each(["", "plaintext-only", "TRUE", "True", "PLAINTEXT-ONLY", "PlainText-Only"])(
     "excludes contenteditable=%j from dragging",
     (value) => {
-      const { container } = render(
-        createElement("div", { "data-electron-mac": "true" }, createElement("div")),
-      );
+      markMacShell();
+      const { container } = render(createElement("div", {}, createElement("div")));
       const control = container.firstElementChild!.firstElementChild!;
       control.setAttribute("contenteditable", value);
       expect(control.matches(controlsSelector)).toBe(true);
@@ -1045,10 +1056,11 @@ describe("index.css electron-mac window drag region", () => {
   );
 
   it.each(["menu", "dialog", "tooltip"])("excludes portaled %s containers", (role) => {
+    markMacShell();
     const { container, getByRole } = render(
       createElement(
         "div",
-        { "data-electron-mac": "true" },
+        { className: "app-shell" },
         createPortal(createElement("div", { role }), document.body),
       ),
     );
@@ -1056,15 +1068,16 @@ describe("index.css electron-mac window drag region", () => {
     const overlay = getByRole(role);
     expect(shell.contains(overlay)).toBe(false);
     expect(overlay.matches(controlsSelector)).toBe(true);
-    shell.removeAttribute("data-electron-mac");
+    unmarkMacShell();
     expect(overlay.matches(controlsSelector)).toBe(false);
   });
 
   it("keeps unfocusable and noneditable content draggable unless explicitly opted out", () => {
+    markMacShell();
     const { container } = render(
       createElement(
         "div",
-        { "data-electron-mac": "true" },
+        {},
         createElement("span", { tabIndex: -1 }),
         createElement("span", { contentEditable: false }),
       ),
@@ -1077,10 +1090,11 @@ describe("index.css electron-mac window drag region", () => {
   });
 
   it("leaves noninteractive title-bar space draggable and other platforms unchanged", () => {
+    markMacShell();
     const { container } = render(
       createElement(
         "div",
-        { "data-electron-mac": "true" },
+        {},
         createElement("div", { className: "electron-drag-strip" }),
         createElement("span", {}, "Session title"),
       ),
@@ -1089,7 +1103,7 @@ describe("index.css electron-mac window drag region", () => {
     const strip = shell.firstElementChild!;
     expect(strip.matches(dragSelector)).toBe(true);
     expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
-    shell.removeAttribute("data-electron-mac");
+    unmarkMacShell();
     expect(strip.matches(dragSelector)).toBe(false);
   });
 });
@@ -1236,7 +1250,8 @@ describe("index.css electron-mac sidebar header", () => {
  * (z above the rail) then covers that corner — the lights sit over IT, and the
  * strip starts to the sidebar's right with nothing to clear — so the clearance
  * must drop, or the padding shoves the tabs into the middle. The rule keys off
- * `data-sidebar-open` on the app shell (set by AppShell) to do this; asserted at
+ * `data-sidebar-open` on the app shell (set by AppShell) under the
+ * `data-electron-mac` root (set on <html> at boot); asserted at
  * the CSS level because the lights are painted by macOS OUTSIDE the page, so no
  * DOM test or screenshot can see them. This selector IS the alignment.
  */
@@ -1249,7 +1264,10 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .trim();
 
-  function makeStrip(shellAttrs: Record<string, string>): HTMLElement {
+  afterEach(() => document.documentElement.removeAttribute("data-electron-mac"));
+
+  function makeStrip(macShell: boolean, shellAttrs: Record<string, string> = {}): HTMLElement {
+    if (macShell) document.documentElement.setAttribute("data-electron-mac", "true");
     const shell = document.createElement("div");
     shell.className = "app-shell";
     for (const [k, v] of Object.entries(shellAttrs)) shell.setAttribute(k, v);
@@ -1270,7 +1288,7 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {
-    const strip = makeStrip({ "data-electron-mac": "true" });
+    const strip = makeStrip(true);
     expect(strip.matches(selector)).toBe(true);
     strip.closest(".app-shell")?.remove();
   });
@@ -1278,13 +1296,13 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
   it("drops the clearance once the sidebar is reopened over the maximized rail", () => {
     // The exact bug: sidebar open covers the window corner, so the 10.5rem
     // padding has nothing to clear and would push the tabs into the middle.
-    const strip = makeStrip({ "data-electron-mac": "true", "data-sidebar-open": "true" });
+    const strip = makeStrip(true, { "data-sidebar-open": "true" });
     expect(strip.matches(selector)).toBe(false);
     strip.closest(".app-shell")?.remove();
   });
 
   it("never clears in a plain browser (no lights to avoid)", () => {
-    const strip = makeStrip({});
+    const strip = makeStrip(false);
     expect(strip.matches(selector)).toBe(false);
     strip.closest(".app-shell")?.remove();
   });
