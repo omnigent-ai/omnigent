@@ -432,7 +432,7 @@ class DatabricksAuth:
     ``~/.databrickscfg``.
 
     Use this to route LLM calls through Databricks model serving
-    (Unity AI Gateway or another Databricks-hosted endpoint) using
+    (Unity Gateway or another Databricks-hosted endpoint) using
     a named credential profile.
 
     Example YAML::
@@ -878,12 +878,13 @@ class SkillSpec:
     """
     A parsed skill from ``skills/<dir>/SKILL.md``.
 
-    The directory name is provenance only — it is recorded in
-    :attr:`skill_dir` and need not equal :attr:`name`.
+    Like Claude Code, the directory name is the invocation identifier
+    and the frontmatter ``name`` is only a human-facing label.
 
-    :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``. Taken from the
-        frontmatter, not from the directory name.
+    :param name: Invocation identifier, taken from the skill's
+        directory name, e.g. ``"asd-ste100"`` (typed as
+        ``/asd-ste100``). Bundled skills must match ``[a-z0-9-]+``.
+        Providers may namespace it, e.g. ``"plugin:asd-ste100"``.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -897,6 +898,10 @@ class SkillSpec:
         orchestration skills (frontmatter ``user-invocable: false``);
         such skills are excluded from the composer's ``/`` menu.
         Defaults to ``True`` (absent frontmatter field = invocable).
+    :param display_name: Human-facing label from the frontmatter
+        ``name``, e.g. ``"Simplified Technical English (ASD-STE100)"``.
+        May contain spaces. ``None`` when it equals :attr:`name` or the
+        source supplies no label (in-memory or CLI-listed skills).
     """
 
     name: str
@@ -904,6 +909,7 @@ class SkillSpec:
     content: str
     skill_dir: Path | None = None
     user_invocable: bool = True
+    display_name: str | None = None
 
 
 @dataclass
@@ -1054,9 +1060,9 @@ class SharePolicy(str, Enum):
     - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
       registered at all (default).
     - :attr:`NON_PUBLIC`: the agent may grant access to named users
-      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+      (emails), but NOT to ``__public__``.
     - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
-      (anonymous read of the full transcript).
+      (link access subject to server authentication and its public permission ceiling).
     """
 
     NONE = "none"
@@ -1560,7 +1566,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         session through the server API or CLI. One of
         :class:`SharePolicy`: ``none`` (default — tool not registered),
         ``non-public`` (grant named users only), or ``public`` (also
-        allow ``__public__`` anonymous read). **Defaults to
+        allow ``__public__`` link access). **Defaults to
         ``SharePolicy.NONE``.**
     """
 

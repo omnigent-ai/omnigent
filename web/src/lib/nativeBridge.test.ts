@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  applyMacElectronShellAttribute,
   getServerPicker,
   isAndroidShell,
   isElectronShell,
@@ -194,6 +195,38 @@ describe("isNativeShell / isElectronShell", () => {
     expect(isNativeShell()).toBe(false);
     delete (window as unknown as Record<string, unknown>).omnigentDesktop;
     delete (window as unknown as Record<string, unknown>).omnigentNative;
+  });
+});
+
+describe("applyMacElectronShellAttribute", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.documentElement.removeAttribute("data-electron-mac");
+  });
+
+  function setUserAgent(ua: string): void {
+    vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue(ua);
+  }
+
+  it("marks <html> in the macOS Electron shell", () => {
+    setElectron(true);
+    setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Electron/40.0.0");
+    applyMacElectronShellAttribute();
+    expect(document.documentElement).toHaveAttribute("data-electron-mac", "true");
+  });
+
+  it("leaves <html> unmarked in Electron on other platforms", () => {
+    setElectron(true);
+    setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Electron/40.0.0");
+    applyMacElectronShellAttribute();
+    expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
+  });
+
+  it("leaves <html> unmarked in a plain macOS browser", () => {
+    setElectron(false);
+    setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0");
+    applyMacElectronShellAttribute();
+    expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
   });
 });
 

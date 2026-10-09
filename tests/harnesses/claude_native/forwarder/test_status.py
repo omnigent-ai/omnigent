@@ -280,6 +280,9 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
         server.server_close()
         thread.join(timeout=5.0)
 
+    context = request["body"]["data"].pop("failure_context")
+    assert context["detail_source"] == "missing"
+    assert context["native_session_id"] == "claude-session"
     assert request["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed"},
@@ -296,6 +299,13 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
         (
             {"error": "rate_limit"},
             "Claude Code ended the turn with an API error (rate_limit).",
+        ),
+        (
+            {
+                "error": "server_error",
+                "last_assistant_message": "I am waiting for a background task.",
+            },
+            "I am waiting for a background task.",
         ),
     ],
 )
@@ -349,6 +359,14 @@ async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
         thread.join(timeout=5.0)
 
     # ``failure_detail``, not ``output``: wire output is labeled a Codex error.
+    context = request["body"]["data"].pop("failure_context")
+    assert context["native_error_category"] == payload_fields["error"]
+    assert context["detail_source"] == (
+        "hook_last_assistant_message"
+        if "last_assistant_message" in payload_fields
+        else "hook_error_category"
+    )
+    assert "native_api_error_message" not in context
     assert request["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed", "failure_detail": expected_detail},
