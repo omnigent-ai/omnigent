@@ -15,6 +15,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -122,6 +123,101 @@ def test_import_graph_is_single_threaded() -> None:
     lines = result.stdout.strip().splitlines()
     assert lines[0] == "1", result.stdout
     assert lines[-1] == "True", result.stdout
+
+
+def test_deferred_graph_keeps_the_zygote_single_threaded() -> None:
+    """The deferred graph (optional Databricks SDK) also starts no threads.
+
+    The zygote loads it after it starts serving, then keeps forking, so the
+    same fork-safety invariant applies. Checked in a fresh interpreter like
+    the eager graph above.
+    """
+    probe = "\n".join(
+        [
+            "import importlib.util",
+            "import sys",
+            "import threading",
+            "from omnigent.runner._zygote import _import_deferred_graph, _import_runner_graph",
+            "_import_runner_graph()",
+            "_import_deferred_graph()",
+            "print(threading.active_count())",
+            "has_sdk = importlib.util.find_spec('databricks.sdk') is not None",
+            "print(not has_sdk or 'databricks.sdk.config' in sys.modules)",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "1", result.stdout
+    assert lines[-1] == "True", result.stdout
+
+
+def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) -> None:
+    """A request already waiting is answered first; the deferred import runs once after."""
+    order: list[str] = []
+    real_send = _zygote._send
+
+    def _record_send(conn: socket.socket, payload: dict) -> None:
+        order.append("reply")
+        real_send(conn, payload)
+
+    imported = threading.Event()
+
+    def _record_import() -> None:
+        order.append("import")
+
+    monkeypatch.setattr(_zygote, "_send", _record_send)
+    monkeypatch.setattr(_zygote, "_import_deferred_graph", _record_import)
+
+    def _record_thread_check() -> None:
+        order.append("thread-check")
+        imported.set()
+
+    monkeypatch.setattr(_zygote, "_exit_unless_single_threaded", _record_thread_check)
+    monkeypatch.setattr(_zygote.gc, "freeze", lambda: order.append("freeze"))
+
+    daemon_side, zygote_side = socket.socketpair()
+    daemon_side.sendall(b'{"cmd": "ping"}\n')
+    server = _ZygoteServer(zygote_side)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    replies = daemon_side.makefile("r")
+    try:
+        assert json.loads(replies.readline()) == {"pong": True}
+        # A ping sent before the import finishes is (correctly) served first;
+        # wait so the second request deterministically lands after it.
+        assert imported.wait(timeout=5)
+        daemon_side.sendall(b'{"cmd": "ping"}\n')
+        assert json.loads(replies.readline()) == {"pong": True}
+    finally:
+        replies.close()
+        daemon_side.close()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    # The refreeze and fork-safety check run after the import, before any later fork.
+    assert order == ["reply", "import", "freeze", "thread-check", "reply"]
+
+
+def test_failed_deferred_preload_does_not_stop_the_zygote(monkeypatch) -> None:
+    """An optional preload that raises (e.g. an SDK OSError) leaves the zygote serving."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _failing_import(name: str, *args, **kwargs):
+        if name == "databricks.sdk.config":
+            raise OSError("credential probe failed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _failing_import)
+
+    _zygote._import_deferred_graph()  # must not raise
 
 
 def test_manager_starts_and_pings(manager: ZygoteManager) -> None:

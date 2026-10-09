@@ -133,7 +133,7 @@ class LocalImportRequest(BaseModel):
     # A specific harness, or "all" to import from every supported harness on
     # the host in one batch (each imported session keeps its own source).
     source: ImportSource | Literal["all"]
-    limit: int = Field(default=10, ge=1, le=100)
+    limit: int = Field(default=10, ge=1, le=1000)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("session_id")

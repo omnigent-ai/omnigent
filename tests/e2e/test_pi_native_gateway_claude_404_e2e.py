@@ -28,7 +28,7 @@ report cites the pre-relocation path ``omnigent/pi_native_credentials.py``):
 * **C -- latent prefix-stripping.** ``_inline_family_pi_provider`` hardcodes
   ``KEY_KIND`` in its ``normalize_model_for_provider`` call, so an override of
   ``databricks-claude-fable-5-1`` renders as ``claude-fable-5-1`` -- wrong for a
-  gateway fronting Databricks AI Gateway, which expects the prefixed endpoint
+  gateway fronting Databricks Unity Gateway, which expects the prefixed endpoint
   name. The family ``models.default`` path renders it correctly.
 
 The fail -> pass contract
