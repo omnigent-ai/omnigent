@@ -70,6 +70,17 @@ function leaveTowardFlyout(from: string, to: string) {
 }
 
 describe("HarnessPickerConfigRow hover", () => {
+  it("caps the config submenu while keeping it vertically scrollable", () => {
+    render(<ConfigPicker />);
+    openPicker();
+    fireEvent.click(screen.getByTestId("model-row"));
+    const submenu = screen.getByTestId("model-menu");
+    expect(submenu).toHaveClass("composer-agent-config-menu", "overflow-y-auto");
+    expect(submenu.className).toContain(
+      "max-h-[min(24rem,var(--radix-dropdown-menu-content-available-height,24rem))]",
+    );
+  });
+
   it.each([
     ["model", "effort"],
     ["effort", "model"],

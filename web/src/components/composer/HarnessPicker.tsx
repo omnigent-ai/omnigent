@@ -446,7 +446,7 @@ export function HarnessPickerEntry({
           <HarnessPickerSubContent
             focusSelected={focusConfig}
             onSelectedFocus={onConfigFocused}
-            className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+            className="composer-agent-menu composer-agent-config-menu max-h-[min(24rem,var(--radix-dropdown-menu-content-available-height,24rem))] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
             sideOffset={-4}
             data-testid={configTestId}
             onFocusOutside={(event) => {
@@ -564,7 +564,7 @@ export function HarnessPickerConfigRow({
         {content}
       </DropdownMenuSubTrigger>
       <HarnessPickerSubContent
-        className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+        className="composer-agent-menu composer-agent-config-menu max-h-[min(24rem,var(--radix-dropdown-menu-content-available-height,24rem))] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
         sideOffset={-4}
         data-testid={configTestId}
         onFocusOutside={(event) => {
