@@ -62,6 +62,7 @@ if (process.env.VITEST === "true") {
   });
 }"""
 
+# Add new storage-touching web test files here; the guard runs only what is listed.
 _STORAGE_TOUCHING_FILES = (
     "src/test-setup.storage.test.ts",
     "src/extensions/services/storage.test.ts",
@@ -98,9 +99,14 @@ def _run_vitest(files: tuple[str, ...], preload: Path) -> tuple[int, str]:
             timeout=900,
         )
     except subprocess.TimeoutExpired as exc:
-        output = _ANSI.sub("", f"{exc.stdout or ''}\n{exc.stderr or ''}")
+        output = _ANSI.sub("", f"{_text(exc.stdout)}\n{_text(exc.stderr)}")
         pytest.fail(f"vitest did not finish within {exc.timeout}s:\n{_tail(output)}")
     return result.returncode, _ANSI.sub("", f"{result.stdout}\n{result.stderr}")
+
+
+def _text(stream: str | bytes | None) -> str:
+    # TimeoutExpired carries raw bytes on POSIX even when run() used text mode.
+    return stream.decode(errors="replace") if isinstance(stream, bytes) else (stream or "")
 
 
 def _tail(output: str, lines: int = 40) -> str:
