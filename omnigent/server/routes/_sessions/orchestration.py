@@ -5323,6 +5323,8 @@ async def _ensure_native_terminal_ready(
     waits up to ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
     session's runner to reconnect and asks once more; the runner-side ensure
     is idempotent, so a terminal created before the drop is simply returned.
+    If the tunnel is still lost, a host-bound session's send is refused
+    with ``RUNNER_UNAVAILABLE`` rather than recorded as a boot failure.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g.
@@ -5335,6 +5337,8 @@ async def _ensure_native_terminal_ready(
         reconnect after a tunnel drop. ``None`` fails a drop immediately.
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
+    :raises OmnigentError: ``RUNNER_UNAVAILABLE`` when a host-bound session's
+        runner tunnel is lost and the probe cannot reach it.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
@@ -5351,6 +5355,11 @@ async def _ensure_native_terminal_ready(
             timeout=10.0,
         )
 
+    def _is_tunnel_loss(exc: httpx.HTTPError | ConnectionError) -> bool:
+        # A bare ConnectionError is a tunnel dropped under the request; a
+        # ConnectError is a runner already offline when it was sent.
+        return isinstance(exc, ConnectionError | httpx.ConnectError)
+
     def _transport_failure(exc: httpx.HTTPError | ConnectionError) -> _NativeTerminalEnsureOutcome:
         # WSTunnelTransport raises bare ConnectionError on tunnel close
         # ("tunnel closed before request completed"); without this clause
@@ -5364,6 +5373,13 @@ async def _ensure_native_terminal_ready(
             exc_info=exc,
             extra={"session_id": session_id},
         )
+        if conv.host_id is not None and _is_tunnel_loss(exc):
+            # A lost tunnel doesn't show the terminal failed to boot; refuse the send
+            # so the client keeps the message, instead of consuming it into a failed turn.
+            raise OmnigentError(
+                "The runner is unreachable. Reconnect the host and retry your message.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
         return _NativeTerminalEnsureOutcome(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
         )
@@ -5371,11 +5387,7 @@ async def _ensure_native_terminal_ready(
     try:
         resp = await _post_ensure()
     except (httpx.HTTPError, ConnectionError) as exc:
-        if (
-            runner_router is None
-            or conv.runner_id is None
-            or not isinstance(exc, ConnectionError | httpx.ConnectError)
-        ):
+        if runner_router is None or conv.runner_id is None or not _is_tunnel_loss(exc):
             return _transport_failure(exc)
         _logger.warning(
             "%s terminal ensure lost the runner tunnel for session=%s; waiting up to "
