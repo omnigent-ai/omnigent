@@ -7,10 +7,11 @@ on:
     - cron: "19 8 * * *"
   workflow_dispatch:
     inputs:
-      baseline_ref:
-        description: "Optional baseline ref; use the current ref for an A/A noise check"
+      compare_same_build:
+        description: "Compare the same production build twice to check measurement noise"
+        type: boolean
         required: false
-        default: ""
+        default: false
 
 permissions:
   contents: read
@@ -30,6 +31,7 @@ jobs:
   detect:
     name: Detect UI benchmark inputs
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:
@@ -47,7 +49,7 @@ jobs:
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pattern='^(web/|dev/benchmarks/|tests/benchmarks/|\.github/actions/setup-(pnpm|uv)/|\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)'
+          pattern='^(web/|omnigent/server/|dev/benchmarks/|tests/benchmarks/|\.github/actions/setup-(pnpm|uv)/|\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)'
           if printf '%s\n' "$files" | grep -qE "$pattern"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
           else
@@ -68,24 +70,21 @@ jobs:
 
       - name: Resolve baseline
         id: base
+        if: github.event_name == 'pull_request'
         env:
-          EVENT_NAME: ${{ github.event_name }}
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          BASELINE_REF: ${{ inputs.baseline_ref }}
         run: |
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            # First parent of the test merge is the exact base it was built on.
-            parents="$(git cat-file -p HEAD | awk '/^parent /{print $2}')"
-            if [ "$(printf '%s\n' "$parents" | grep -c .)" -eq 2 ]; then
-              BASELINE_REF="$(printf '%s\n' "$parents" | head -1)"
-            else
-              BASELINE_REF="$EVENT_BASE_SHA"
-            fi
+          # First parent of the test merge is the exact base it was built on.
+          parents="$(git cat-file -p HEAD | awk '/^parent /{print $2}')"
+          if [ "$(printf '%s\n' "$parents" | grep -c .)" -eq 2 ]; then
+            BASELINE_REF="$(printf '%s\n' "$parents" | head -1)"
+          else
+            BASELINE_REF="$EVENT_BASE_SHA"
           fi
           echo "ref=$BASELINE_REF" >> "$GITHUB_OUTPUT"
 
       - name: Check out baseline UI
-        if: steps.base.outputs.ref != ''
+        if: github.event_name == 'pull_request'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ steps.base.outputs.ref }}
@@ -116,7 +115,7 @@ jobs:
           pnpm --filter web run build --outDir "$RUNNER_TEMP/ui-candidate"
 
       - name: Build baseline UI
-        if: steps.base.outputs.ref != ''
+        if: github.event_name == 'pull_request'
         working-directory: ui-baseline
         run: |
           pnpm install --frozen-lockfile --filter web
@@ -127,11 +126,15 @@ jobs:
       - name: Benchmark production UI
         env:
           BASELINE_REF: ${{ steps.base.outputs.ref }}
+          COMPARE_SAME_BUILD: ${{ inputs.compare_same_build }}
         run: |
           args=()
           if [ -n "$BASELINE_REF" ]; then
             args+=(--baseline-dist "$RUNNER_TEMP/ui-baseline"
                    --baseline-revision "$(git -C ui-baseline rev-parse HEAD)")
+          elif [ "$COMPARE_SAME_BUILD" = "true" ]; then
+            args+=(--baseline-dist "$RUNNER_TEMP/ui-candidate"
+                   --baseline-revision "$(git rev-parse HEAD)")
           fi
           uv run --no-sync dev/benchmarks/ui/run.py \
             --web-dist "$RUNNER_TEMP/ui-candidate" \

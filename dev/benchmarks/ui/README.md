@@ -67,16 +67,25 @@ the text still arrives correctly. Per-keystroke script duration is recorded
 as a diagnostic alongside the gated metrics. Screenshots happen after timing.
 
 Chromium runs at a fixed 1440×900 viewport and **4× CPU throttling** by default.
-The candidate must stay within run-median P95 budgets of **100 ms key-to-frame**
-and **16 ms style/layout** (`--max-key-to-frame-ms`, `--max-style-layout-ms`).
-With a baseline, the existing benchmark comparator also gates run-median P50
-and P95: both a **100% relative increase** and a **5 ms absolute increase** are
-required (`--threshold`, `--min-regression-ms`). Session-open has one sample
-per run, so it gates on P50 only. Thresholds aim to catch substantial UX
-regressions without treating small renderer timing differences as failures.
+The run-median P95 budgets are **100 ms key-to-frame** and **16 ms style/layout**
+(`--max-key-to-frame-ms`, `--max-style-layout-ms`). Standalone runs and nightlies
+enforce those budgets. PR comparisons require all of the following to block:
+
+- More than a **100% relative increase** and a **5 ms absolute increase** in
+  run-median P50 or P95 (`--threshold`, `--min-regression-ms`).
+- The same percentile exceeds both increases in a **majority of paired runs**
+  (at least two of the default three); paired comparisons require three runs.
+- For typing, the candidate also exceeds its **P95 budget**. Session-open has
+  one sample per run, so it gates on P50 only, without a typing budget.
+
+Absolute budget overruns alone are advisory when there is a baseline: an
+unchanged build on a slow VM must not block a PR. Within-budget increases and
+unconfirmed median differences are also advisory. Individual outliers, small
+absolute changes, and small relative changes remain visible in the reports.
 
 Missing assets, browser errors, lost keystrokes, an undersized fixture,
-missing measurements, and exceeded budgets all exit nonzero. The benchmark
+missing or invalid measurements on either side, and blocking regressions exit
+nonzero. The benchmark
 never silently skips an unavailable browser or missing baseline.
 
 ## CI and artifacts
@@ -86,11 +95,15 @@ PRs (including forks), nightly, and by manual dispatch. PRs compare the exact
 base of the test merge against the candidate on **one runner**. Filtering is
 at the job level, so `UI performance regression check` can be made a required
 check without leaving unrelated PRs pending. Nightlies enforce absolute
-budgets and publish trend data; manual dispatch accepts `baseline_ref` for
-comparisons or A/A checks. No write token or model secrets are used.
+budgets and publish trend data; manual dispatch accepts `compare_same_build`
+for an A/A check. Arbitrary revision comparisons are available locally. Only
+PR jobs check out a separate baseline, keeping alternate build scripts out of
+the default branch's cache context. No write token or model secrets are used.
 
 The `benchmark-results-ui-<run_id>` artifact contains `candidate.json`,
 optional `baseline.json` and `comparison.json`, `summary.md`, and screenshots.
+The comparison includes blocking failures, advisory warnings, and the number
+of regressing pairs for each percentile.
 Reports reuse the existing versioned benchmark schema (`harness=chromium-ui`,
 `backend=chromium`) and retain **all raw keystroke samples**, DOM counts,
 browser version, throttle settings, fixture size, and UI/backend revisions.

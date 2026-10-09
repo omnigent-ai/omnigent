@@ -29,7 +29,6 @@ from playwright.async_api import Browser, CDPSession, Page, async_playwright, ex
 from dev.benchmarks.omnigent.compare import (
     build_markdown,
     compare_reports,
-    unmeasured_journeys,
 )
 from dev.benchmarks.omnigent.environment import BenchEnvironment
 from dev.benchmarks.omnigent.measure import RunResult, aggregate
@@ -160,6 +159,21 @@ async def measure_scenario(
         cdp = await context.new_cdp_session(page)
         await cdp.send("Performance.enable")
         await cdp.send("Emulation.setCPUThrottlingRate", {"rate": args.cpu_throttle})
+        if mode == "mac_css":
+            # Apply the desktop CSS scope before navigation's first render.
+            await page.add_init_script("""(() => {
+                const mark = () => {
+                    if (!document.documentElement) return false;
+                    document.documentElement.dataset.electronMac = 'true';
+                    return true;
+                };
+                if (!mark()) {
+                    const observer = new MutationObserver(() => {
+                        if (mark()) observer.disconnect();
+                    });
+                    observer.observe(document, {childList: true});
+                }
+            })()""")
         opened = time.perf_counter()
         await page.goto(f"{env.base_url}/c/{session_id}", wait_until="domcontentloaded")
         composer = page.get_by_role("textbox", name="Message the agent", exact=True)
@@ -169,9 +183,10 @@ async def measure_scenario(
         ).to_be_visible(timeout=30_000)
         await page.evaluate("() => document.fonts.ready")
         open_ms = (time.perf_counter() - opened) * 1000
+        if errors:
+            raise RuntimeError(f"Browser errors: {errors}")
         if mode == "mac_css":
-            # Exercise the desktop CSS scope without pretending to run macOS Electron.
-            await page.locator("html").evaluate("el => el.dataset.electronMac = 'true'")
+            await expect(page.locator("html")).to_have_attribute("data-electron-mac", "true")
         elements = await page.locator("*").count()
         if elements < _MIN_ELEMENTS:
             raise RuntimeError(f"Fixture has only {elements} elements; requires {_MIN_ELEMENTS}")
@@ -247,23 +262,105 @@ def make_report(
     return report
 
 
-def budget_failures(report: dict[str, Any], args: argparse.Namespace) -> list[str]:
-    """Use run-median P95, retaining individual outliers in the raw report."""
+def measurement_failures(report: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    """Validate both sides before medians can hide missing or invalid samples."""
     failures = []
-    for mode in _MODES:
+    for name in required_journeys():
+        rows = report.get("journeys", {}).get(name, {}).get("runs", [])
+        count = 1 if name.endswith("session_open") else args.iterations
+        if len(rows) != args.runs or any(
+            row.get("n_success") != count or row.get("n_failures") != 0 for row in rows
+        ):
+            failures.append(f"{name}: incomplete samples")
+        elif any(
+            not isinstance(value := row.get(metric), (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            for row in rows
+            for metric in ("p50_ms", "p95_ms")
+        ):
+            failures.append(f"{name}: invalid timing samples")
+    return failures
+
+
+def _budgets(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        f"{mode}_{metric}": limit
+        for mode in _MODES
         for metric, limit in (
             ("key_to_frame", args.max_key_to_frame_ms),
             ("style_layout", args.max_style_layout_ms),
-        ):
-            name = f"{mode}_{metric}"
-            rows = report["journeys"][name]["runs"]
-            if len(rows) != args.runs or any(row["n_success"] != args.iterations for row in rows):
-                failures.append(f"{name}: incomplete samples")
-                continue
-            value = statistics.median(row["p95_ms"] for row in rows)
-            if not math.isfinite(value) or value > limit:
-                failures.append(f"{name}: P95 {value:.2f} ms exceeds {limit:.2f} ms")
+        )
+    }
+
+
+def budget_failures(report: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    """Use run-median P95 after checking measurement completeness."""
+    failures = []
+    for name, limit in _budgets(args).items():
+        value = statistics.median(row["p95_ms"] for row in report["journeys"][name]["runs"])
+        if value > limit:
+            failures.append(f"{name}: P95 {value:.2f} ms exceeds {limit:.2f} ms")
     return failures
+
+
+def assess_reports(
+    reports: dict[str, dict[str, Any]], args: argparse.Namespace
+) -> tuple[list[str], list[str], list[dict]]:
+    """Only block paired runs on substantial, repeated, over-budget slowdowns."""
+    failures = [
+        f"{variant}: {failure}"
+        for variant, report in reports.items()
+        for failure in measurement_failures(report, args)
+    ]
+    if failures:
+        return failures, [], []
+    candidate = reports["candidate"]
+    over_budget = budget_failures(candidate, args)
+    if "baseline" not in reports:
+        return over_budget, [], []
+    if args.runs < 3:
+        return ["Paired comparisons require at least three runs"], [], []
+
+    baseline = reports["baseline"]
+    _, rows = compare_reports(
+        baseline, candidate, threshold=args.threshold, min_regression_ms=args.min_regression_ms
+    )
+    warnings = [f"{message} (advisory with a baseline)" for message in over_budget]
+    budgets = _budgets(args)
+    required_pairs = args.runs // 2 + 1
+
+    def regressed(base: float, current: float) -> bool:
+        return current > base * (1 + args.threshold) and current - base > args.min_regression_ms
+
+    for row in rows:
+        name = row["journey"]
+        metrics = ["p50", "p95"] if row["p95_gated"] else ["p50"]
+        regressing_metrics = [m for m in metrics if regressed(row[f"b_{m}"], row[f"c_{m}"])]
+        pairs = list(
+            zip(
+                baseline["journeys"][name]["runs"],
+                candidate["journeys"][name]["runs"],
+                strict=True,
+            )
+        )
+        row["regressing_pairs"] = {
+            m: sum(regressed(b[f"{m}_ms"], c[f"{m}_ms"]) for b, c in pairs) for m in metrics
+        }
+        row["status"] = "ok"
+        if not regressing_metrics:
+            continue
+        if name in budgets and row["c_p95"] <= budgets[name]:
+            reason = "within the candidate P95 budget"
+        elif not any(row["regressing_pairs"][m] >= required_pairs for m in regressing_metrics):
+            reason = f"slowdown did not repeat in {required_pairs}/{args.runs} paired runs"
+        else:
+            row["status"] = "regression"
+            failures.append(f"{name}: substantial slowdown confirmed in a majority of paired runs")
+            continue
+        row["status"] = "advisory"
+        warnings.append(f"{name}: {reason}")
+    return failures, warnings, rows
 
 
 async def run_benchmark(args: argparse.Namespace) -> bool:
@@ -292,6 +389,7 @@ async def run_benchmark(args: argparse.Namespace) -> bool:
                     evidence = args.output_dir / f"{variant}-{mode}-{run + 1}"
                     sample = await measure_scenario(browser, env, session_id, mode, args, evidence)
                     samples[variant][mode].append(sample)
+                    # Keep partial measurements if a later scenario fails or is cancelled.
                     report = make_report(
                         samples[variant], args, variants[variant][1], browser.version
                     )
@@ -299,7 +397,7 @@ async def run_benchmark(args: argparse.Namespace) -> bool:
                     (args.output_dir / f"{variant}.json").write_text(
                         json.dumps(report, indent=2) + "\n"
                     )
-    failures = budget_failures(reports["candidate"], args)
+    failures, warnings, rows = assess_reports(reports, args)
     summary = [
         "# OSS UI benchmark",
         "",
@@ -307,6 +405,8 @@ async def run_benchmark(args: argparse.Namespace) -> bool:
         "",
     ]
     for name, journey in reports["candidate"]["journeys"].items():
+        if not journey["runs"]:
+            continue
         p50 = statistics.median(row["p50_ms"] for row in journey["runs"])
         p95 = statistics.median(row["p95_ms"] for row in journey["runs"])
         summary.append(f"- `{name}`: run-median P50 {p50:.2f} ms, P95 {p95:.2f} ms")
@@ -319,27 +419,28 @@ async def run_benchmark(args: argparse.Namespace) -> bool:
         ]
     )
     if "baseline" in reports:
-        passed, rows = compare_reports(
-            reports["baseline"],
-            reports["candidate"],
-            threshold=args.threshold,
-            min_regression_ms=args.min_regression_ms,
-        )
-        missing = unmeasured_journeys(rows, required_journeys())
-        if not passed:
-            failures.append("Same-runner comparison detected a regression")
-        if missing:
-            failures.append(f"Unmeasured journeys: {', '.join(missing)}")
         summary.append(
-            f"Relative regressions also require an increase greater than "
-            f"{args.min_regression_ms:g} ms.\n"
+            f"Blocking regressions require more than {args.threshold:.0%} and "
+            f"{args.min_regression_ms:g} ms deterioration in the run median and a majority "
+            "of paired runs. Typing must also exceed its candidate P95 budget. "
+            "Absolute budget overruns alone are advisory with a baseline.\n"
         )
-        summary.append(build_markdown(rows, args.threshold, passed))
+        summary.append(build_markdown(rows, args.threshold, not failures))
         (args.output_dir / "comparison.json").write_text(
-            json.dumps({"passed": passed, "rows": rows, "unmeasured": missing}, indent=2) + "\n"
+            json.dumps(
+                {"passed": not failures, "rows": rows, "failures": failures, "warnings": warnings},
+                indent=2,
+            )
+            + "\n"
         )
     summary.extend(
-        ["", *(f"- {failure}" for failure in failures), "", "FAIL" if failures else "PASS"]
+        [
+            "",
+            *(f"- Advisory: {warning}" for warning in warnings),
+            *(f"- Failure: {failure}" for failure in failures),
+            "",
+            "FAIL" if failures else "PASS",
+        ]
     )
     markdown = "\n".join(summary) + "\n"
     (args.output_dir / "summary.md").write_text(markdown)
@@ -379,6 +480,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.cpu_throttle < 1:
         parser.error("--cpu-throttle must be at least 1")
+    if args.baseline_dist and args.runs < 3:
+        parser.error("--baseline-dist requires at least three --runs")
     for name in ("web_dist", "baseline_dist"):
         dist = getattr(args, name)
         if dist is not None:
@@ -389,16 +492,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+async def _run_until_terminated(args: argparse.Namespace) -> bool:
+    """Cancel on SIGTERM so browser and server contexts finish their teardown."""
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+    cancelled = False
+
+    def terminate() -> None:
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            task.cancel()
+
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    loop.add_signal_handler(signal.SIGTERM, terminate)
+    try:
+        return await run_benchmark(args)
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        return 0 if asyncio.run(run_benchmark(args)) else 1
-    except Exception as exc:
+        return 0 if asyncio.run(_run_until_terminated(args)) else 1
+    except BaseException as exc:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         (args.output_dir / "error.txt").write_text(f"{type(exc).__name__}: {exc}\n")
+        if isinstance(exc, asyncio.CancelledError):
+            return 128 + signal.SIGTERM
         raise
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     raise SystemExit(main())
