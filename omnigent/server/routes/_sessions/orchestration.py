@@ -12039,13 +12039,10 @@ async def _handle_mcp_tools_call(
             result_policy.data if isinstance(result_policy.data, str) else str(result_policy.data)
         )
 
-    return _mcp_ok_response(
-        rpc_id,
-        {
-            "content": [{"type": "text", "text": output}],
-            "isError": exec_data.get("isError", False),
-        },
-    )
+    result: dict[str, Any] = {"content": [{"type": "text", "text": output}]}
+    if "isError" in exec_data:
+        result["isError"] = exec_data["isError"]
+    return _mcp_ok_response(rpc_id, result)
 
 
 async def _fetch_model_options(
