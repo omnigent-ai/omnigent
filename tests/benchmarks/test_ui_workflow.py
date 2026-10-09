@@ -54,9 +54,10 @@ pytestmark = pytest.mark.skipif(not shutil.which("bash"), reason="Needs bash")
             "true",
         ),
         ([], True, "true"),
+        # Below the API cap but larger than a pipe buffer.
         (
             [{"filename": "web/src/index.css"}]
-            + [{"filename": f"docs/long/path/to/file-{i}.md"} for i in range(3000)],
+            + [{"filename": f"docs/long/path/to/file-{i}.md"} for i in range(2998)],
             False,
             "true",
         ),
@@ -76,13 +77,15 @@ pytestmark = pytest.mark.skipif(not shutil.which("bash"), reason="Needs bash")
         "rename-out",
         "rename-in",
         "api-error",
-        "large-pr",
+        "large-response",
     ),
 )
 def test_detect_ui_benchmark_changes(
     tmp_path: Path, files: list[dict[str, str]], api_failure: bool, expected: str
 ) -> None:
-    output, called_api = _detect_changes(tmp_path, files, api_failure=api_failure)
+    output, called_api = _detect_changes(
+        tmp_path, files, api_failure=api_failure, total_files=len(files)
+    )
     assert output == f"ui={expected}\n"
     assert called_api
 

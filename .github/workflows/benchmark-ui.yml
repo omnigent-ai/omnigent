@@ -144,6 +144,8 @@ jobs:
             cat artifacts/ui-benchmark/summary.md >> "$GITHUB_STEP_SUMMARY"
           elif [ -f artifacts/ui-benchmark/error.txt ]; then
             cat artifacts/ui-benchmark/error.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "UI benchmark produced no results. See the failed job steps for details." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload UI benchmark results

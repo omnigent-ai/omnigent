@@ -33,6 +33,9 @@ For a quick functional smoke run (not statistically useful):
 uv run --no-sync dev/benchmarks/ui/run.py --runs 1 --iterations 10 --warmup 3
 ```
 
+With fewer than 20 iterations, paired comparisons confirm slowdowns using P50
+only; the printed report marks P95 as ungated.
+
 To compare two revisions, build each checkout's SPA to a separate directory
 (`pnpm --filter web run build --outDir /absolute/output/path`), then run the
 candidate's driver:

@@ -122,27 +122,29 @@ def test_one_slow_run_does_not_fail_the_ui_budget() -> None:
 
 
 @pytest.mark.parametrize(
-    ("baseline", "candidate", "expected_status"),
+    ("metric", "baseline", "candidate", "expected_status"),
     [
-        ([150, 150, 150], [150, 150, 150], "ok"),  # Unchanged on a slow machine.
-        ([20, 20, 20], [22, 22, 22], "ok"),  # Small relative increase.
-        ([10, 10, 10], [20, 20, 20], "ok"),  # Exactly the relative threshold.
-        ([2, 2, 2], [7, 7, 7], "ok"),  # At the absolute noise floor.
-        ([2, 2, 2], [10, 10, 10], "advisory"),  # Still within the rendering budget.
-        ([5, 5, 5], [16, 16, 16], "advisory"),  # Exactly the rendering budget.
-        ([5, 5, 5], [16.01, 16.01, 16.01], "regression"),  # Just over the budget.
-        ([5, 5, 5], [5, 5, 200], "ok"),  # One isolated slow run.
-        ([5, 5, 100], [5, 100, 100], "advisory"),  # Medians differ; only one pair regresses.
-        ([5, 5, 5], [150, 150, 150], "regression"),  # Whole-document restyle.
-        ([5, 5, 5], [5, 50, 50], "regression"),  # Repeats in two of three pairs.
-        ([0, 0, 0], [30, 30, 30], "regression"),  # A real zero baseline is not missing data.
+        ("style_layout", [150, 150, 150], [150, 150, 150], "ok"),  # Unchanged slow machine.
+        ("style_layout", [20, 20, 20], [22, 22, 22], "ok"),  # Small relative increase.
+        ("style_layout", [10, 10, 10], [20, 20, 20], "ok"),  # Exact relative threshold.
+        ("style_layout", [2, 2, 2], [7, 7, 7], "ok"),  # Exact absolute noise floor.
+        ("style_layout", [2, 2, 2], [10, 10, 10], "advisory"),  # Within the rendering budget.
+        ("style_layout", [5, 5, 5], [16, 16, 16], "advisory"),  # Exact rendering budget.
+        ("style_layout", [5, 5, 5], [16.01, 16.01, 16.01], "regression"),  # Just over budget.
+        ("key_to_frame", [30, 30, 30], [100, 100, 100], "advisory"),  # Exact typing budget.
+        ("key_to_frame", [30, 30, 30], [100.01, 100.01, 100.01], "regression"),
+        ("style_layout", [5, 5, 5], [5, 5, 200], "ok"),  # One isolated slow run.
+        ("style_layout", [5, 5, 100], [5, 100, 100], "advisory"),  # Only one pair regresses.
+        ("style_layout", [5, 5, 5], [150, 150, 150], "regression"),  # Whole-document restyle.
+        ("style_layout", [5, 5, 5], [5, 50, 50], "regression"),  # Two of three pairs regress.
+        ("style_layout", [0, 0, 0], [30, 30, 30], "regression"),  # Zero is not missing data.
     ],
 )
 def test_paired_gate_filters_noise(
-    baseline: list[float], candidate: list[float], expected_status: str
+    metric: str, baseline: list[float], candidate: list[float], expected_status: str
 ) -> None:
     reports = {"baseline": _report(), "candidate": _report()}
-    name = "browser_style_layout"
+    name = f"browser_{metric}"
     for variant, values in (("baseline", baseline), ("candidate", candidate)):
         for run, value in zip(reports[variant]["journeys"][name]["runs"], values, strict=True):
             run["p50_ms"] = run["p95_ms"] = value
