@@ -8130,11 +8130,8 @@ async def test_handle_import_local_recovered_skip_logs_below_error(
     error: Exception,
     reason: str,
 ) -> None:
-    """A recovered per-session import skip must not produce an ERROR record.
-
-    Both the loader's expected read failures and a surprise exception type are
-    counted on the done frame and must log below ERROR while naming the cause.
-    """
+    """Both skip sites (the loader's expected read failures and a surprise exception
+    type) count the session on the done frame and log below ERROR, naming the cause."""
     from omnigent.host.frames import HostImportLocalDoneFrame, decode_host_frame
 
     host = _make_host_process()

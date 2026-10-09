@@ -33,12 +33,9 @@ def _user_record(session_id: str, cwd: str, content: str) -> str:
 
 
 def _write_claude_transcripts(home: Path, cwd: str) -> None:
-    """Write one healthy transcript and two the import loader cannot read.
-
-    The deeply nested record makes ``json.loads`` raise ``RecursionError``, which
-    escapes the loader's ``ValueError`` net into the handler's catch-all; the
-    invalid UTF-8 line raises ``UnicodeDecodeError`` inside that net.
-    """
+    """Write one healthy transcript plus two unreadable ones: a record nested past the
+    JSON recursion limit (RecursionError, reaches the handler's catch-all) and an
+    invalid UTF-8 line (UnicodeDecodeError, caught by the loader's expected-error net)."""
     project = home / ".claude" / "projects" / "-repo"
     project.mkdir(parents=True, exist_ok=True)
     (project / f"{_GOOD_ID}.jsonl").write_text(
@@ -70,12 +67,8 @@ def test_recovered_import_skips_are_not_logged_as_errors(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """The import still skips and counts unreadable transcripts, without ERROR records.
-
-    The host mirrors ERROR records to its terminal and ships them to the
-    debug-log sink, where the session-reliability KPI counts them; a recovered,
-    reported skip must stay below ERROR with no traceback.
-    """
+    """Unreadable transcripts are skipped and counted without ERROR records, which
+    reach the host terminal and the debug-log sink's session-reliability KPI."""
     _write_claude_transcripts(tmp_path, str(tmp_path))
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path,
