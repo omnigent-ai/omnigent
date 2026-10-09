@@ -1,20 +1,10 @@
 """
-Browser e2e guard: a managed Kubernetes sandbox whose workspace-prep init
-container crash-loops must fail the launch fast, and the failure banner must
-carry the init container's log tail (the git clone error).
-
-Journey: an operator runs the server with ``sandbox.provider: kubernetes``
-against a cluster whose sandbox namespace cannot reach the clone host. On the
-new-chat landing the user picks the New Sandbox host, adds a repository URL and
-sends a message; the server submits a Job whose ``workspace-prep`` init
-container keeps failing its ``git clone`` and is restarted by the kubelet (Pod
-``Pending``, init container ``CrashLoopBackOff``), so it never comes up.
-
-No cluster is reachable from the test environment, so a stub ``kubernetes``
-package on the server subprocess's PYTHONPATH replays the apiserver's view of
-that state (see ``tests/e2e/_k8s_crashloop_stub_sdk``). The server process,
-its config parsing, the managed-session create, the launcher's start wait, the
-failure-message builder and the SPA are real.
+Browser guard: after New Sandbox → repository URL → send, the "Sandbox launch
+failed" banner must appear within seconds of ``workspace-prep`` crash-looping and,
+expanded, show the init container's log tail (the clone error). The cluster is the
+stub replayed by ``tests/e2e/_k8s_crashloop_stub_sdk``; see that module for the
+scenario. The server process, its config parsing, the managed-session create, the
+launcher's start wait, the failure-message builder and the SPA are real.
 """
 
 from __future__ import annotations
@@ -27,7 +17,7 @@ from typing import Any
 
 import httpx
 import pytest
-from playwright.async_api import Response, async_playwright, expect
+from playwright.async_api import async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop
 from tests._helpers.live_server import find_free_port
@@ -50,8 +40,12 @@ _FAILFAST_MAX_S = 20.0
 
 def _agent_id(base_url: str) -> str:
     """Resolve the test agent's id from the server's agent list."""
-    agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
-    return next(agent["id"] for agent in agents if agent["name"] == AGENT_NAME)
+    response = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
+    response.raise_for_status()
+    agents = response.json()["data"]
+    matches = [agent["id"] for agent in agents if agent["name"] == AGENT_NAME]
+    assert matches, f"agent {AGENT_NAME!r} not registered; got {[a['name'] for a in agents]}"
+    return matches[0]
 
 
 async def _drive_launch_to_failure(
@@ -71,14 +65,6 @@ async def _drive_launch_to_failure(
             record_video_size={"width": 1280, "height": 900},
         )
         page = await context.new_page()
-
-        async def _capture_create(response: Response) -> None:
-            if response.request.method == "POST" and response.url.endswith("/v1/sessions"):
-                outcome["create_status"] = response.status
-                if response.ok:
-                    outcome["session_id"] = (await response.json())["id"]
-
-        page.on("response", _capture_create)
         try:
             await page.goto(f"{base_url}/")
             prompt = page.get_by_test_id("new-chat-landing-input")
@@ -105,7 +91,17 @@ async def _drive_launch_to_failure(
 
             await prompt.fill(_PROMPT)
             started = time.monotonic()
-            await page.get_by_test_id("new-chat-landing-submit").click()
+            async with page.expect_response(
+                lambda r: r.request.method == "POST" and r.url.endswith("/v1/sessions"),
+                timeout=30_000,
+            ) as created:
+                await page.get_by_test_id("new-chat-landing-submit").click()
+            create = await created.value
+            outcome["create_status"] = create.status
+            assert create.ok, (
+                f"session create failed: HTTP {create.status}: {(await create.text())[:500]}"
+            )
+            outcome["session_id"] = (await create.json())["id"]
             await page.wait_for_url("**/c/*", timeout=30_000)
 
             failed = page.get_by_test_id("sandbox-failed-indicator")

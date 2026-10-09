@@ -1,29 +1,11 @@
 """
-End-to-end guard: a crash-looping workspace-prep init container must fail the
-managed Kubernetes launch fast, with the init container's log tail attached.
-
-Journey (operator + user):
-
-1. An operator configures ``sandbox.provider: kubernetes`` on the server,
-   pointing at a cluster whose sandbox namespace cannot reach the clone host
-   (a default-deny NetworkPolicy is enough).
-2. A user creates a managed session with a repository workspace
-   (``POST /v1/sessions`` with ``host_type: "managed"`` and a repo-URL
-   ``workspace``), which makes the server's Kubernetes launcher submit a Job
-   and wait for its Pod.
-3. ``git clone`` in the ``workspace-prep`` init container fails immediately
-   and the kubelet restarts it: the Pod sits in phase ``Pending`` with the
-   init container in ``CrashLoopBackOff`` — it will never come up.
-4. The user watches the session's sandbox launch progress: it must fail
-   within seconds, name the crash-looping container, and carry a tail of its
-   log (the clone error) instead of polling out ``pod_ready_timeout_s`` with
-   Pod events only.
-
-The apiserver is unreachable from the test environment, so a stub
-``kubernetes`` package on the server subprocess's PYTHONPATH stands in for
-the cluster (see ``tests/e2e/_k8s_crashloop_stub_sdk``). Everything else is
-real: the server process, its config parsing, the managed-session HTTP
-journey, the launcher's start wait, and the failure-message builder.
+Real-server guard: an init-container crash loop must reach the managed session's
+``sandbox_status`` within seconds, naming ``workspace-prep`` and carrying its log
+tail (the clone error), instead of polling out ``pod_ready_timeout_s`` with Pod
+events only. The cluster is the stub replayed by ``tests/e2e/_k8s_crashloop_stub_sdk``;
+see that module for the scenario. The server process, its config parsing, the
+managed-session HTTP journey, the launcher's start wait and the failure-message
+builder are real.
 """
 
 from __future__ import annotations
@@ -57,9 +39,12 @@ _FAILFAST_MAX_S = 25.0
 
 def _create_managed_repo_session(base_url: str) -> str:
     """Drive the user journey: create a managed session with a repo workspace."""
-    info = httpx.get(f"{base_url}/v1/info", timeout=10.0).json()
-    assert info.get("managed_sandboxes_enabled") is True
-    agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
+    info_response = httpx.get(f"{base_url}/v1/info", timeout=10.0)
+    info_response.raise_for_status()
+    assert info_response.json().get("managed_sandboxes_enabled") is True
+    agents_response = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
+    agents_response.raise_for_status()
+    agents = agents_response.json()["data"]
     assert agents, "no agents registered on the server to bind a session to"
     response = httpx.post(
         f"{base_url}/v1/sessions",
@@ -91,8 +76,10 @@ def _await_failed_launch(
     stage = None
     while time.monotonic() < deadline:
         try:
-            snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
-        except httpx.HTTPError:
+            response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+            response.raise_for_status()
+            snapshot = response.json()
+        except (httpx.HTTPError, ValueError):
             time.sleep(_POLL_INTERVAL_S)
             continue
         status = snapshot.get("sandbox_status") or {}
