@@ -1,4 +1,5 @@
 name: Open Code Review
+run-name: "OCR #${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }} @${{ inputs.expected_head || 'current' }}"
 
 on:
   # Use trusted base-branch configuration for automatic reviews.
@@ -11,6 +12,10 @@ on:
       pr:
         description: PR number to review.
         required: true
+        type: string
+      expected_head:
+        description: Optional commit expected by the requesting Resolve session.
+        required: false
         type: string
       force:
         description: Review even if this commit already has a completed review.
@@ -121,6 +126,7 @@ jobs:
         env:
           PR_NUMBER: ${{ needs.request.outputs.pr }}
           FORCE_REVIEW: ${{ needs.request.outputs.force }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
         with:
           script: |
             const { data: pr } = await github.rest.pulls.get({
@@ -129,6 +135,9 @@ jobs:
             if (pr.state !== 'open' || pr.draft) {
               core.notice('Skipping a closed or draft PR.');
               return;
+            }
+            if (process.env.EXPECTED_HEAD && process.env.EXPECTED_HEAD !== pr.head.sha) {
+              throw new Error(`PR moved before review started (expected ${process.env.EXPECTED_HEAD}, found ${pr.head.sha}); request the new commit.`);
             }
             if (process.env.FORCE_REVIEW !== 'true') {
               const receipt = `ocr-completed-${pr.number}-${pr.head.sha}`;

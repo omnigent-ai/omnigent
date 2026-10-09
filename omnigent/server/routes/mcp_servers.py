@@ -40,6 +40,7 @@ class McpServerSummary(BaseModel):
     transport: Literal["stdio", "http"]
     scope: Literal["user"]
     plugin: str | None = None
+    source_id: str | None = None
     url_host: str | None = None
 
 

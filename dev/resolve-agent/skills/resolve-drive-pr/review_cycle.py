@@ -94,7 +94,7 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
         if not run_id:
             continue
         run = api_object(f"repos/{repository}/actions/runs/{run_id}", request)
-        trusted = (reviewer == "ocr" and run.get("event") == "pull_request_target") or (
+        trusted = run.get("event") == "pull_request_target" or (
             run.get("head_branch") == default_branch
             and run.get("event") in {"issue_comment", "workflow_dispatch"}
         )
@@ -108,15 +108,74 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
     return markers
 
 
-def ocr_receipt(repository, artifact_id):
-    result = subprocess.run(
+def review_attempts(repository, number, head, reviewer, request):
+    """Find trusted attempts and active, unpinned review requests for this PR."""
+    repo = api_object(f"repos/{repository}", request)
+    runs = api_object(
+        f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}/runs?per_page=100",
+        request,
+    )["workflow_runs"]
+    # Scan all active runs when recent history is full: a long-queued review
+    # can be older than the first page. Completed history remains bounded.
+    if len(runs) == 100:
+        for status in ("queued", "in_progress", "waiting", "pending", "requested"):
+            runs.extend(
+                pages(
+                    f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}/runs?status={status}",
+                    request,
+                    "workflow_runs",
+                )
+            )
+    label = {"polly": "Polly", "ocr": "OCR"}[reviewer]
+    return [
+        run
+        for run in runs
+        if (
+            run.get("event") == "pull_request_target"
+            or (
+                run.get("event") in {"workflow_dispatch", "issue_comment"}
+                and run.get("head_branch") == repo["default_branch"]
+            )
+        )
+        and (
+            run.get("display_title") == f"{label} #{number} @{head}"
+            or (
+                run.get("status") != "completed"
+                and (
+                    run.get("display_title") == f"{label} #{number} @current"
+                    or (
+                        run.get("event") == "pull_request_target"
+                        and any(
+                            pull.get("number") == number for pull in run.get("pull_requests", [])
+                        )
+                    )
+                )
+            )
+        )
+    ]
+
+
+def active_review_runs(repository, number, head, reviewer, request):
+    return [
+        run
+        for run in review_attempts(repository, number, head, reviewer, request)
+        if run.get("status") != "completed"
+    ]
+
+
+def artifact_zip(repository, artifact_id):
+    """Download through the caller's GitHub transport, replaceable by the CI host."""
+    return subprocess.run(
         ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"],
         check=True,
         capture_output=True,
         timeout=120,
-    )
+    ).stdout
+
+
+def ocr_receipt(repository, artifact_id):
     try:
-        with ZipFile(io.BytesIO(result.stdout)) as archive:
+        with ZipFile(io.BytesIO(artifact_zip(repository, artifact_id))) as archive:
             info = archive.getinfo("ocr-completion.json")
             if info.file_size > 65536:
                 raise RuntimeError("OCR completion receipt is too large")
@@ -314,7 +373,9 @@ def request_reviews(repository, number, state, request=gh_json):
     """Explicit dispatch is the supported bot equivalent of /review and /ocr."""
     repo = api_object(f"repos/{repository}", request)
     for name, workflow in REVIEWERS.items():
-        if not state["completed"][name]:
+        if not state["completed"][name] and not active_review_runs(
+            repository, number, state["head_sha"], name, request
+        ):
             request(
                 [
                     "api",
@@ -327,6 +388,8 @@ def request_reviews(repository, number, state, request=gh_json):
                     f"inputs[pr]={number}",
                     "-f",
                     "inputs[force]=true",
+                    "-f",
+                    f"inputs[expected_head]={state['head_sha']}",
                 ]
             )
 

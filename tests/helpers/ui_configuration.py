@@ -15,6 +15,8 @@ from tests.helpers.ui_url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
+# USD per million tokens (input, output, cache read) for the mock codex provider.
+_CODEX_MOCK_PRICING_PER_MILLION = (2.5, 10.0, 0.25)
 
 
 class ServerState(dict[str, object]):
@@ -124,6 +126,8 @@ def temp_omnigent_mock_config(
                     default: {_CLAUDE_MOCK_MODEL}
             """)
     else:  # codex
+        # The mock model is not in the pricing catalog; configured rates let
+        # the server price codex-native sessions (Session cost, per-model cost).
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-codex:
@@ -135,6 +139,10 @@ def temp_omnigent_mock_config(
                   wire_api: responses
                   models:
                     default: {_CODEX_MOCK_MODEL}
+                  pricing:
+                    input_per_million: {_CODEX_MOCK_PRICING_PER_MILLION[0]}
+                    output_per_million: {_CODEX_MOCK_PRICING_PER_MILLION[1]}
+                    cache_read_per_million: {_CODEX_MOCK_PRICING_PER_MILLION[2]}
             """)
 
     if original is not None:
