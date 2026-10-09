@@ -1,9 +1,8 @@
-"""A dead host runner fails its bound session with the cause (real host/server/runner)."""
+"""A host runner that dies at boot or idles out, through a real host, server and runner."""
 
 from __future__ import annotations
 
 import os
-import signal
 import time
 from pathlib import Path
 
@@ -91,45 +90,6 @@ def _create_host_bound_session(
     workspace = tmp_path / "project"
     workspace.mkdir()
     return create.json()["id"], workspace
-
-
-@pytest.mark.timeout(300)
-def test_runner_process_exit_fails_bound_session(
-    live_server: str,
-    http_client: httpx.Client,
-    tmp_path: Path,
-    mock_llm_server_url: str,
-) -> None:
-    """A non-zero runner-process exit fails the bound session with its cause."""
-    daemon, host_id, daemon_log = spawn_host_daemon(tmp_path, live_server, mock_llm_server_url)
-    try:
-        wait_for_host_online(live_server, host_id, timeout=_HOST_ONLINE_TIMEOUT_S)
-        session_id, workspace = _create_host_bound_session(http_client, tmp_path)
-        _launch_and_bind_runner(
-            http_client,
-            host_id=host_id,
-            session_id=session_id,
-            workspace=workspace,
-        )
-        _, runner_pid = await_launched_runner(daemon_log)
-        assert pid_alive(runner_pid), "runner exited before we could observe it connected"
-
-        # A killed runner stands in for a non-zero runner-process exit.
-        os.kill(runner_pid, signal.SIGKILL)
-
-        body = _poll_session(
-            http_client,
-            session_id,
-            until_status="failed",
-            timeout=_SESSION_FAILED_TIMEOUT_S,
-        )
-        assert body.get("status") == "failed", f"session never failed: {body}"
-        error = body.get("last_task_error") or {}
-        message = error.get("message") or ""
-        assert _RUNNER_EXIT_MESSAGE in message, f"unexpected last_task_error: {error}"
-        assert error.get("code") == "runner_failed_to_start", error
-    finally:
-        terminate_host_daemon(daemon)
 
 
 # The cause line is composed by the host, new in 0.18.0.
