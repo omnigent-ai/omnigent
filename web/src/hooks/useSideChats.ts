@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { newPendingSideChatId } from "@/lib/sideChat";
 
 interface SideChatTabsState {
   /** Open side-chat child conversation ids, in open order. */
@@ -63,7 +64,7 @@ export function useSideChats(conversationId: string) {
    *  first message (see WorkspacePanel's startPendingSideChat), then this tab is
    *  closed and the real child's tab takes over. */
   const openPending = useCallback((): string => {
-    const id = `pending:${crypto.randomUUID()}`;
+    const id = newPendingSideChatId();
     update((current) => ({ tabs: [...current.tabs, id], selected: id }));
     return id;
   }, [update]);

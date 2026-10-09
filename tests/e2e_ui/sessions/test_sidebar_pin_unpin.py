@@ -68,6 +68,24 @@ def _row(page: Page, session_id: str) -> Locator:
     return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
+def _pin_and_wait(page: Page, row: Locator, session_id: str) -> None:
+    """Click *row*'s pin button and wait for its PATCH to succeed.
+
+    Pin writes don't overlap: the UI refuses a new one while another is
+    saving, so the next pin action must wait for this one to land.
+
+    :param page: Playwright page with the sidebar open.
+    :param row: The session's sidebar row.
+    :param session_id: The session being pinned.
+    """
+    row.hover()
+    with page.expect_response(
+        lambda r: r.request.method == "PATCH" and r.url.endswith(f"/v1/sessions/{session_id}")
+    ) as patch_info:
+        row.get_by_test_id("quick-pin-conversation").click()
+    assert patch_info.value.ok, patch_info.value.status
+
+
 def test_unpin_moves_session_back_to_recent(
     page: Page,
     seeded_session: tuple[str, str],
@@ -94,8 +112,7 @@ def test_unpin_moves_session_back_to_recent(
     expect(row).to_be_visible()
 
     # Pin it.
-    row.hover()
-    row.get_by_test_id("quick-pin-conversation").click()
+    _pin_and_wait(page, row, session_id)
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
 
     # Now unpin from under the Pinned header.
@@ -112,6 +129,65 @@ def test_unpin_moves_session_back_to_recent(
     # Back under "Sessions", and no longer in "Pinned".
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+
+def test_undo_unpin_restores_pinned_slot(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Undo on the post-unpin toast re-pins the session in its old slot.
+
+    Pins ``a`` then ``b`` (``a`` on top), unpins ``a``, and clicks Undo on the
+    toast. ``a`` must return above ``b`` rather than land at the bottom as a
+    fresh pin would, and the restored order must survive a reload.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two
+        runner-bound sessions in the same server.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    title_a = f"e2e-undo-A-{uuid.uuid4().hex[:8]}"
+    _set_title(base_url, session_a, title_a)
+    _set_title(base_url, session_b, f"e2e-undo-B-{uuid.uuid4().hex[:8]}")
+    page.goto(f"{base_url}/c/{session_a}")
+
+    for session_id in (session_a, session_b):
+        row = _row(page, session_id)
+        expect(row).to_be_visible()
+        _pin_and_wait(page, row, session_id)
+        expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+    pinned_row_a = (
+        _section(page, "Pinned")
+        .locator("li")
+        .filter(has=page.locator(f'a[href="/c/{session_a}"]'))
+    )
+    _pin_and_wait(page, pinned_row_a, session_a)
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_have_count(0)
+
+    toast = page.get_by_test_id("unpin-undo-toast-item")
+    expect(toast).to_contain_text("Unpinned session")
+    expect(toast).to_contain_text(title_a)
+    with page.expect_response(
+        lambda r: r.request.method == "PATCH" and r.url.endswith(f"/v1/sessions/{session_a}")
+    ) as repin:
+        toast.get_by_role("button", name="Undo").click()
+    assert repin.value.ok, repin.value.status
+    expect(toast).to_have_count(0)
+
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+    order = _pinned_session_order(page)
+    assert order.index(f"/c/{session_a}") < order.index(f"/c/{session_b}"), (
+        f"Undo should restore the original pin slot, got {order}"
+    )
+
+    page.reload()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+    order_after = _pinned_session_order(page)
+    assert order_after.index(f"/c/{session_a}") < order_after.index(f"/c/{session_b}"), (
+        f"restored pin slot should persist across reload, got {order_after}"
+    )
 
 
 def _pinned_session_order(page: Page) -> list[str]:
@@ -198,13 +274,11 @@ def test_pinned_section_orders_by_pin_time_not_update_time(
     # Pinned group, below the older pin (a).
     row_a = _row(page, session_a)
     expect(row_a).to_be_visible()
-    row_a.hover()
-    row_a.get_by_test_id("quick-pin-conversation").click()
+    _pin_and_wait(page, row_a, session_a)
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
 
     row_b = _row(page, session_b)
-    row_b.hover()
-    row_b.get_by_test_id("quick-pin-conversation").click()
+    _pin_and_wait(page, row_b, session_b)
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
 
     # Oldest pin (a) sits above the newer pin (b).
@@ -227,3 +301,67 @@ def test_pinned_section_orders_by_pin_time_not_update_time(
     assert order_after.index(f"/c/{session_a}") < order_after.index(f"/c/{session_b}"), (
         f"pinned order must follow pin time, not the bumped updated_at, got {order_after}"
     )
+
+
+def test_drag_reorders_pinned_sessions(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """Drag a pinned row above another and verify the order persists after reload.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two
+        runner-bound sessions in the same server.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _set_title(base_url, session_a, f"e2e-drag-A-{uuid.uuid4().hex[:8]}")
+    _set_title(base_url, session_b, f"e2e-drag-B-{uuid.uuid4().hex[:8]}")
+    page.goto(f"{base_url}/c/{session_a}")
+
+    for session_id in (session_a, session_b):
+        row = _row(page, session_id)
+        expect(row).to_be_visible()
+        _pin_and_wait(page, row, session_id)
+        expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+
+    order = _pinned_session_order(page)
+    assert order.index(f"/c/{session_a}") < order.index(f"/c/{session_b}"), order
+
+    # dnd-kit's mouse sensor needs a real press-move-release past its 5px threshold.
+    source = (
+        _section(page, "Pinned")
+        .locator("li")
+        .filter(has=page.locator(f'a[href="/c/{session_b}"]'))
+    )
+    target = (
+        _section(page, "Pinned")
+        .locator("li")
+        .filter(has=page.locator(f'a[href="/c/{session_a}"]'))
+    )
+    source_box = source.bounding_box()
+    target_box = target.bounding_box()
+    assert source_box and target_box
+    page.mouse.move(source_box["x"] + 20, source_box["y"] + source_box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(target_box["x"] + 20, target_box["y"] + target_box["height"] / 2, steps=10)
+    expect(page.get_by_test_id("pin-order-insertion")).to_be_visible()
+    # Wait for the moved session's pin PATCH so the reload below reads the saved order.
+    with page.expect_response(
+        lambda r: r.request.method == "PATCH" and r.url.endswith(f"/v1/sessions/{session_b}")
+    ) as patch_info:
+        page.mouse.up()
+    assert patch_info.value.ok, patch_info.value.status
+
+    def b_above_a() -> bool:
+        current = _pinned_session_order(page)
+        return current.index(f"/c/{session_b}") < current.index(f"/c/{session_a}")
+
+    deadline = time.monotonic() + 5.0
+    while not b_above_a() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert b_above_a(), _pinned_session_order(page)
+
+    page.reload()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+    assert b_above_a(), f"reorder should persist across reload, got {_pinned_session_order(page)}"

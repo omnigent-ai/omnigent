@@ -13,13 +13,19 @@ different users.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+from omnigent.errors import ErrorCode
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
@@ -163,6 +169,100 @@ async def test_runner_status_hides_other_users_runner(
 
 
 # ── Tests: Runner binding requires ownership ─────────
+
+
+@pytest.mark.parametrize(
+    ("previous_runner", "caller", "requested_runner", "host_online", "expected_code"),
+    [
+        (None, ALICE, ALICE_RUNNER, True, ErrorCode.WRONG_REPLICA),
+        ("runner_previous", ALICE, ALICE_RUNNER, True, ErrorCode.WRONG_REPLICA),
+        (None, ALICE, BOB_RUNNER, True, ErrorCode.INVALID_INPUT),
+        (None, ALICE, ALICE_RUNNER, False, ErrorCode.INVALID_INPUT),
+        (None, BOB, ALICE_RUNNER, True, ErrorCode.FORBIDDEN),
+    ],
+)
+async def test_side_chat_binding_on_another_replica_preserves_owner_and_runner_checks(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_runner: str | None,
+    caller: str,
+    requested_runner: str,
+    host_online: bool,
+    expected_code: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "1dc34d0b40de4dcaa326713fc8badc78"
+    source = store.create_conversation(
+        runner_id=ALICE_RUNNER, host_id=host_id, workspace="/workspace"
+    )
+    side_chat = store.create_conversation(
+        runner_id=previous_runner,
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(ALICE)
+    permissions.ensure_user(BOB)
+    permissions.grant(ALICE, source.id, LEVEL_OWNER)
+    permissions.grant(ALICE, side_chat.id, LEVEL_OWNER)
+    permissions.grant(BOB, side_chat.id, LEVEL_EDIT)
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(host_id, "Remote host", ALICE)
+    if not host_online:
+        host_store.set_offline(host_id)
+    monkeypatch.setattr(auth_app.state.runner_router, "_host_store", host_store)
+
+    response = await _patch_runner(auth_client, side_chat.id, requested_runner, caller)
+
+    assert response.json()["error"]["code"] == expected_code, response.text
+    unchanged = store.get_conversation(side_chat.id)
+    assert unchanged is not None
+    assert unchanged.runner_id == previous_runner
+    assert unchanged.host_id is None
+    assert unchanged.labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
+
+
+@pytest.mark.parametrize("surface", ["patch", "json_create", "bundle_create"])
+async def test_side_chat_routing_source_is_server_owned(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    surface: str,
+) -> None:
+    """Clients cannot create routing relationships to another user's session."""
+    from tests.server.helpers import build_agent_bundle
+
+    source = await _create_session_as(auth_client, "", BOB)
+    child = await _create_session_as(auth_client, "", ALICE)
+    labels = {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source["id"]}
+    headers = {"X-Forwarded-Email": ALICE}
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(child["id"])
+    assert before is not None and before.runner_id is None
+
+    if surface == "patch":
+        response = await auth_client.patch(
+            f"/v1/sessions/{child['id']}", json={"labels": labels}, headers=headers
+        )
+    elif surface == "json_create":
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": child["agent_id"], "labels": labels}, headers=headers
+        )
+    else:
+        response = await auth_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({"labels": labels})},
+            files={
+                "bundle": ("agent.tar.gz", build_agent_bundle("side-source"), "application/gzip")
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == ErrorCode.INVALID_INPUT
+    assert SIDE_CHAT_SOURCE_LABEL_KEY in response.text
+    after = store.get_conversation(child["id"])
+    assert after is not None and after.labels == before.labels and after.runner_id is None
 
 
 async def test_bind_own_runner_succeeds(

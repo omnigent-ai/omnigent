@@ -57,7 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "customize";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "arca_shutdown_warnings";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -196,6 +196,18 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /**
+   * True when the archive PATCH accepts ``delete_worktree``. Older servers
+   * reject the unknown field, so the archive worktree prompt and setting are
+   * hidden there. Fails to ``false``.
+   */
+  archive_worktree_cleanup?: boolean;
+  /**
+   * True when the server stores user agents (``omnigent agent add``,
+   * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
+   * and the Import bundle button. Absent on older servers (off).
+   */
+  agent_install?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -254,6 +266,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  archive_worktree_cleanup: false,
   branding: null,
 };
 
@@ -355,6 +368,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

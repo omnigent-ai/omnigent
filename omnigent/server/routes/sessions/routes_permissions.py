@@ -416,7 +416,7 @@ def _to_agent_object(
     if cache is not None:
         try:
             loaded = cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             )
             harness = loaded.spec.executor.harness_kind
             if description is None:
@@ -431,7 +431,7 @@ def _to_agent_object(
             )
             # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description)
+                SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
                 for s in loaded.spec.skills
                 if s.user_invocable
             ]
