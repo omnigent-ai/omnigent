@@ -1061,7 +1061,7 @@ class SessionResourceRegistry:
             ``os_env`` presence before materialising an environment.
         """
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-        from omnigent.inner.os_env import create_os_environment
+        from omnigent.inner.os_env import agent_identity_env, create_os_environment
 
         # Prefer the CLI launch workspace so that the OS environment
         # cwd matches the filesystem-registry watch path.  Fall back
@@ -1093,6 +1093,7 @@ class SessionResourceRegistry:
             env = create_os_environment(
                 effective_spec,
                 additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+                extra_env=agent_identity_env(agent_spec),
             )
             if env is not None:
                 return env

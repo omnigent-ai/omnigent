@@ -22,6 +22,7 @@ from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import (
+    OMNIGENT_AGENT_NAME_ENV_VAR,
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
 )
@@ -53,6 +54,8 @@ from .sandbox import (
 
 if TYPE_CHECKING:
     import asyncio
+
+    from omnigent.spec.types import AgentSpec
 
     from .egress import EgressProxyHandle
     from .egress.proxy import EgressProxy
@@ -380,8 +383,10 @@ class _HelperProcessClient:
         egress_rules: list[str] | None = None,
         egress_allow_private_destinations: bool = False,
         copy_on_write_environment: CopyOnWriteEnvironment | None = None,
+        extra_env: Mapping[str, str] | None = None,
     ) -> None:
         self._copy_on_write_environment = copy_on_write_environment
+        self._extra_env = dict(extra_env or {})
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
@@ -470,6 +475,8 @@ class _HelperProcessClient:
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
         env = build_helper_env(os.environ, sandbox)
+        # Runner-provided values, set after filtering so the allowlist can't drop them.
+        env.update(self._extra_env)
         project_root = str(_project_root())
         existing_pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
@@ -861,6 +868,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
     _start_in_scratch: bool = False
     _egress_rules: list[str] | None = None
     _egress_allow_private_destinations: bool = False
+    _extra_env: Mapping[str, str] | None = None
 
     _copy_on_write_environment: CopyOnWriteEnvironment | None = None
     _owns_copy_on_write: bool = False
@@ -897,6 +905,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             egress_rules=self._egress_rules,
             egress_allow_private_destinations=self._egress_allow_private_destinations,
             copy_on_write_environment=self._copy_on_write_environment,
+            extra_env=self._extra_env,
         )
 
     async def read(
@@ -992,8 +1001,13 @@ def create_os_environment(
     copy_on_write_environment: CopyOnWriteEnvironment | None = None,
     sandbox_policy: SandboxPolicy | None = None,
     additional_read_roots: Sequence[Path] = (),
+    extra_env: Mapping[str, str] | None = None,
 ) -> OSEnvironment | None:
-    """Instantiate the configured OS environment."""
+    """Instantiate the configured OS environment.
+
+    :param extra_env: Variables added to the helper env after sandbox
+        filtering, e.g. from :func:`agent_identity_env`.
+    """
     if spec is None:
         return None
     if spec.type != "caller_process":
@@ -1033,7 +1047,18 @@ def create_os_environment(
         _start_in_scratch=spec.start_in_scratch,
         _egress_rules=egress_rules,
         _egress_allow_private_destinations=egress_allow_private,
+        _extra_env=extra_env,
     )
+
+
+def agent_identity_env(agent_spec: AgentSpec | None) -> dict[str, str]:
+    """Return the agent-identity variables for a helper started for *agent_spec*.
+
+    :param agent_spec: The agent the environment serves, or ``None``.
+    :returns: ``{"OMNIGENT_AGENT_NAME": <name>}``, or ``{}`` without a named agent.
+    """
+    name = getattr(agent_spec, "name", None)
+    return {OMNIGENT_AGENT_NAME_ENV_VAR: name} if name else {}
 
 
 def default_os_env_spec_for_type(env_type: str) -> OSEnvSpec:

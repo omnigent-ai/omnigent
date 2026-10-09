@@ -73,6 +73,10 @@ RUNNER_CONNECT_MARKER_ENV_VAR = "OMNIGENT_RUNNER_CONNECT_MARKER"
 OMNIGENT_SESSION_ENV_VAR = "OMNIGENT"
 OMNIGENT_SESSION_ENV_VALUE = "1"
 
+# Name of the agent spec a session runs, exported to sys_os_* shells so
+# per-agent tooling (credential helpers, CLI wrappers) can key on it.
+OMNIGENT_AGENT_NAME_ENV_VAR = "OMNIGENT_AGENT_NAME"
+
 # Env vars carrying the runner's control-plane auth secret. The tunnel
 # binding token is seeded into the runner process by the launcher and
 # reused as the runner-side request auth token, but must never reach a
