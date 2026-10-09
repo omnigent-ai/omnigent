@@ -11,19 +11,19 @@ Mirrors :class:`omnigent.runner.codex.goal.CodexGoalRunner`: app-scope state
 injected at construction so the class stays out of the already-large app module
 while preserving the exact behavior of the original closures.
 
-The seven uniform interrupt harnesses and six uniform stop harnesses differ
+The eight uniform interrupt harnesses and seven uniform stop harnesses differ
 only by bridge module, control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
-:data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution) and codex
-interrupt (MCP-startup + app-server ``turn/interrupt``) keep dedicated methods
-(so nine interrupt handlers total); claude stop is likewise special-cased and
-codex/pi alias stop to their interrupt handler (so seven stop handlers total).
+:data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution), codex interrupt
+(MCP-startup + app-server ``turn/interrupt``), and opencode interrupt (native
+``POST /session/{id}/abort``) keep dedicated methods; claude stop is likewise
+special-cased and codex/pi alias stop to their interrupt handler.
 
-Coverage note: antigravity-native and opencode-native have no handler here and
-:meth:`interrupt` / :meth:`stop` return ``None`` for them, so the caller falls
-through to the in-process turn cancel — unchanged from before this seam. Wiring
-their native interrupt (agy ``interrupt_turn`` / opencode ``client.abort``) is a
-deferred follow-up.
+Coverage note: opencode-native now dispatches :meth:`interrupt` to OpenCode's
+native ``POST /session/{id}/abort`` so a turn pending on the model is aborted;
+its :meth:`stop` still returns ``None`` and falls through to the in-process
+cancel. antigravity-native has no handler on either path and still falls
+through; wiring its native ``interrupt_turn`` is a deferred follow-up.
 """
 
 from __future__ import annotations
@@ -372,7 +372,7 @@ class NativeInterruptRunner:
 
         :returns: A response when this harness has an interrupt handler, else
             ``None`` so the caller falls through to the in-process turn cancel
-            (antigravity/opencode).
+            (antigravity).
         """
         agent = native_coding_agent_for_harness(harness_name)
         if agent is None:
@@ -382,6 +382,8 @@ class NativeInterruptRunner:
             return await self._claude_interrupt(conv_id)
         if key == "codex":
             return await self._codex_interrupt(conv_id)
+        if key == "opencode":
+            return await self._opencode_interrupt(conv_id)
         spec = _UNIFORM_INTERRUPT.get(key)
         if spec is None:
             return None
@@ -847,5 +849,58 @@ class NativeInterruptRunner:
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        self._defer_parent_wake_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _opencode_interrupt(self, conv_id: str) -> Response:
+        from omnigent.harnesses.opencode_native.app_server import client_for_state
+        from omnigent.harnesses.opencode_native.bridge import (
+            bridge_dir_for_bridge_id,
+            read_bridge_state,
+        )
+        from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+
+        state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
+        if state is None:
+            # No bridge state means no opencode serve/turn to abort. Return 204
+            # (not None) so the caller does not fall through to the in-process
+            # cancel, which cannot reach OpenCode's own serve process.
+            self._logger.info(
+                "OpenCode-native interrupt skipped for %s: no bridge state.", conv_id
+            )
+            return Response(status_code=204)
+        client = client_for_state(
+            base_url=state.server_base_url,
+            auth_secret=state.auth_secret,
+            directory=state.workspace,
+        )
+        try:
+            aborted = await client.abort(state.opencode_session_id)
+        except (OpenCodeClientError, httpx.HTTPError) as exc:
+            self._logger.warning(
+                "OpenCode-native abort failed for session=%s opencode_session=%s",
+                conv_id,
+                state.opencode_session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_interrupt_failed",
+                    "detail": self._client_safe_error_detail(
+                        exc, context="opencode-native interrupt"
+                    ),
+                },
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+        if not aborted:
+            # The server reports no active work, so the turn already ended and
+            # its own terminal edge owns the idle transition; nothing to wake.
+            self._logger.info(
+                "OpenCode-native interrupt found no active turn for %s.", conv_id
+            )
+            return Response(status_code=204)
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
