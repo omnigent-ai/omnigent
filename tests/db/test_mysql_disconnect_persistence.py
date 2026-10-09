@@ -268,15 +268,16 @@ def _reap_orphaned_transaction(
 
     A failover, restart, or ``wait_timeout`` kill terminates the dead session
     and releases its row locks. Severing only the TCP path leaves the orphaned
-    transaction holding the ``conversations`` row lock. While the write is in
-    flight (before the drop), record the thread id of the oldest ``RUNNING``
-    transaction -- the orphan-to-be -- and once the disconnect has fired kill
-    exactly that thread. The replay reconnects on a new thread, so it is never
-    a target; if the orphan was somehow never observed the reaper kills nothing
-    rather than risk the replay. The reaper's own connection is excluded, and it
-    connects straight to the server, bypassing the relay.
+    transaction holding the ``conversations`` row lock. Record every client
+    thread alive before the drop -- the store's pooled connection is among them
+    from the first append on -- then, once the disconnect has fired, kill the
+    transaction still ``RUNNING`` but idle (its client was severed) on one of
+    those threads. The replay reconnects only after the drop on a new thread,
+    so it is never in the pre-drop set and cannot be the target. The reaper's
+    own connection is excluded, and it connects straight to the server,
+    bypassing the relay.
     """
-    orphan_thread_id: int | None = None
+    pre_drop_threads: set[int] = set()
     conn: Any = None
     try:
         while not stop.is_set():
@@ -301,24 +302,28 @@ def _reap_orphaned_transaction(
                 with conn.cursor() as cur:
                     if not dropped:
                         cur.execute(
+                            "SELECT id FROM information_schema.processlist "
+                            "WHERE id <> CONNECTION_ID()"
+                        )
+                        pre_drop_threads.update(int(row[0]) for row in cur.fetchall())
+                    else:
+                        cur.execute(
                             "SELECT trx_mysql_thread_id "
                             "FROM information_schema.innodb_trx "
-                            "WHERE trx_state = 'RUNNING' "
+                            "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
                             "AND trx_mysql_thread_id <> CONNECTION_ID() "
-                            "ORDER BY trx_started ASC LIMIT 1"
+                            "ORDER BY trx_started ASC"
                         )
-                        row = cur.fetchone()
-                        if row is not None:
-                            orphan_thread_id = int(row[0])
-                    elif orphan_thread_id is not None:
-                        # The orphan may vanish on its own before the KILL.
-                        with contextlib.suppress(Exception):
-                            cur.execute(f"KILL {orphan_thread_id}")
-                        return
+                        for (thread_id,) in cur.fetchall():
+                            if int(thread_id) in pre_drop_threads:
+                                # The orphan may vanish on its own before the KILL.
+                                with contextlib.suppress(Exception):
+                                    cur.execute(f"KILL {int(thread_id)}")
+                                return
             except Exception:
                 conn = None
                 continue
-            if stop.wait(0.01 if not dropped else 0.05):
+            if stop.wait(0.01 if not dropped else 0.02):
                 return
     finally:
         if conn is not None:
