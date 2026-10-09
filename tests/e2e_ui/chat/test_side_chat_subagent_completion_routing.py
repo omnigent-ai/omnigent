@@ -12,9 +12,11 @@ completion — and the agent turn reacting to it — must land in the MAIN chat 
 ``before_spawn`` opens the side chat before the delegation (the control: the
 clone carries no pending agent). ``during_fork`` opens it while the fork runs
 (the reported condition). Model replies are scripted through a mock Anthropic
-endpoint; the Claude CLI, the fork, the side-chat clone, the forwarder and the
-web rendering are real. The clone lookup reads ``~/.claude/projects``, so the
-runner must keep Claude's default home (no ``CLAUDE_CONFIG_DIR`` override).
+endpoint, and the child's reply is held on the mock's gate until the side chat is
+in place, so ``during_fork`` always forks with the agent pending; the Claude CLI,
+the fork, the side-chat clone, the forwarder and the web rendering are real. The
+clone lookup reads ``~/.claude/projects``, so the runner must keep Claude's
+default home (no ``CLAUDE_CONFIG_DIR`` override).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import secrets
 import shutil
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from pathlib import Path
 
 import httpx
@@ -38,6 +40,7 @@ from tests._helpers.native_session import create_native_session
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bind_session_runner
 from tests.e2e.conftest import isolated_mock_llm_server_url as isolated_mock_llm_server_url
+from tests.e2e.conftest import release_mock_gate
 from tests.e2e_ui.chat.test_side_chat_entrypoints import _ASSISTANT, _items, _start_side_chat
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
 
@@ -67,7 +70,7 @@ class _Prompts:
         return getattr(self, name).split(":", 1)[0]
 
 
-def _script(mock_url: str, prompts: _Prompts, *, child_delay_s: float) -> None:
+def _script(mock_url: str, prompts: _Prompts) -> None:
     reset_mock_llm(mock_url)
     set_fallback_mock_llm(mock_url, _MODEL, "Acknowledged.")
     set_fallback_mock_llm(mock_url, "_policy_llm_", '{"action":"allow","reason":""}')
@@ -102,14 +105,11 @@ def _script(mock_url: str, prompts: _Prompts, *, child_delay_s: float) -> None:
         match=prompts.token("spawn"),
         required_tools=["Agent"],
     )
+    # The child's reply is parked on the mock's gate, so the fork stays pending
+    # until the test releases it.
     configure_mock_llm(
         mock_url,
-        [
-            {
-                "text": "SUB-AGENT FINDINGS: the investigated module has no leaks.",
-                "delay": child_delay_s,
-            }
-        ],
+        [{"text": "SUB-AGENT FINDINGS: the investigated module has no leaks.", "block": True}],
         match=prompts.token("child"),
         required_tools=["Bash"],
     )
@@ -140,6 +140,14 @@ def _wait_for_completion(
         if settled or time.monotonic() > deadline:
             return main_hits, side_hits
         time.sleep(2.0)
+
+
+def _wait_for_gate(mock_url: str, *, timeout_s: float) -> None:
+    """Wait until the background child's model request is parked on the mock gate."""
+    deadline = time.monotonic() + timeout_s
+    while not httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"]:
+        assert time.monotonic() < deadline, "the background sub-agent never reached the mock gate"
+        time.sleep(1.0)
 
 
 def _wait_for_reaction(
@@ -193,6 +201,7 @@ def _drive_journey(
     *,
     side_chat_order: str,
     evidence: Path,
+    mock_url: str,
 ) -> None:
     side_ids: list[str] = []
     fork_at: list[float] = []
@@ -232,9 +241,14 @@ def _drive_journey(
     if side_chat_order == "before_spawn":
         side_id = open_side_chat()
         spawn()
+        _wait_for_gate(mock_url, timeout_s=120.0)
     else:
         spawn()
+        # Fork the side chat while the child's reply is parked on the gate, so
+        # the clone is taken with the background agent still pending.
+        _wait_for_gate(mock_url, timeout_s=120.0)
         side_id = open_side_chat()
+    release_mock_gate(mock_url)
 
     evidence.mkdir(parents=True, exist_ok=True)
     (evidence / "ids.json").write_text(json.dumps({"main": session_id, "side": side_id}))
@@ -371,9 +385,7 @@ def test_fork_completion_reports_to_main_chat_not_side_chat(
             },
         )["session_id"]
         bind_session_runner(client.patch, stack.base_url, session_id, stack.runner_id)
-        _script(
-            mock_url, prompts, child_delay_s=15.0 if side_chat_order == "before_spawn" else 40.0
-        )
+        _script(mock_url, prompts)
         page: Page = request.getfixturevalue("page")
         evidence = tmp_path / "evidence"
         try:
@@ -384,8 +396,13 @@ def test_fork_completion_reports_to_main_chat_not_side_chat(
                 prompts,
                 side_chat_order=side_chat_order,
                 evidence=evidence,
+                mock_url=mock_url,
             )
         finally:
+            # Never leave the child parked on the gate: a wedged sub-agent outlives
+            # the test and blocks the stack teardown.
+            with suppress(httpx.HTTPError):
+                release_mock_gate(mock_url)
             evidence.mkdir(parents=True, exist_ok=True)
             for log in sorted((tmp_path / "stack").rglob("*.log")):
                 shutil.copy(log, evidence / f"stack-{log.name}")
