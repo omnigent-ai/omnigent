@@ -27,7 +27,7 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import CODEX_LAUNCH_DEFAULT_PREFERENCE
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -1591,7 +1591,8 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     A pinned model no visible row names (a hidden configured default is
     explicitly supported) marks NO default: crowning a different visible
     model would let the launch path pin a model the configuration never
-    selected. Without a pin, prefer Omnigent's launch default when visible;
+    selected. Without a pin, prefer the earliest of Omnigent's launch defaults
+    in the rows list (an older codex catalog may predate the newest one);
     otherwise keep Codex's own first default.
     Rows are otherwise verbatim.
 
@@ -1609,21 +1610,22 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     omnigent_default_index: int | None = None
     pinned_index: int | None = None
     pinned_key = comparable_model_id(pinned_model) if pinned_model else None
-    omnigent_default_key = comparable_model_id(CODEX_DEFAULT_MODEL)
+    omnigent_default_keys = [comparable_model_id(m) for m in CODEX_LAUNCH_DEFAULT_PREFERENCE]
+    omnigent_default_rank = len(omnigent_default_keys)
     marked: list[_JsonObject] = []
     for index, row in enumerate(rows):
         cleaned = {key: value for key, value in row.items() if key != "isDefault"}
         marked.append(cleaned)
         if codex_default_index is None and row.get("isDefault") is True:
             codex_default_index = index
-        if omnigent_default_index is None:
-            for spelling in (row.get("id"), row.get("model")):
-                if (
-                    isinstance(spelling, str)
-                    and comparable_model_id(spelling) == omnigent_default_key
-                ):
-                    omnigent_default_index = index
-                    break
+        for spelling in (row.get("id"), row.get("model")):
+            if not isinstance(spelling, str):
+                continue
+            key = comparable_model_id(spelling)
+            if key in omnigent_default_keys:
+                rank = omnigent_default_keys.index(key)
+                if rank < omnigent_default_rank:
+                    omnigent_default_rank, omnigent_default_index = rank, index
         if pinned_index is None and pinned_key is not None:
             for spelling in (row.get("id"), row.get("model")):
                 if isinstance(spelling, str) and comparable_model_id(spelling) == pinned_key:
