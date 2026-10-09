@@ -42,8 +42,9 @@ errno with no hint that the OS environment helper failed to start.
 Desired behaviour (asserted, so the test FAILS until a fix lands and PASSES
 after): a helper-spawn failure surfaces a structured, actionable reason that
 identifies the OS-environment/helper startup problem. The test still confirms the real
-spawn point is reached (``subprocess.Popen`` invoked) and that dispatch returns
-a JSON error result rather than crashing the turn.
+spawn point is reached (``subprocess.Popen`` invoked), that dispatch returns a
+JSON error result rather than crashing the turn, and that the generic dispatch
+catch-all (the reported ERROR fingerprint) never fires.
 
 Fully in-process -- needs neither a live server, a runner, nor an LLM. Run::
 
@@ -89,7 +90,8 @@ async def test_sys_os_read_helper_spawn_failure_surfaces_structured_reason(
     is surfaced) and passes once the spawn failure is wrapped in a useful reason.
 
     :param monkeypatch: Patches ``subprocess.Popen`` to raise fork-``EAGAIN``.
-    :param caplog: Captures the ``runner OSEnvironment dispatch failed`` record.
+    :param caplog: Captures any ``runner OSEnvironment dispatch failed`` record;
+        the helper client must handle the failure so none is logged.
     """
     spawn_attempts = 0
 
@@ -116,8 +118,6 @@ async def test_sys_os_read_helper_spawn_failure_surfaces_structured_reason(
         "attempted; the injected fault was never hit -- dispatch did not reach "
         "the real _start_locked spawn point"
     )
-    # Sanity: our patch is fully restored via monkeypatch teardown.
-    assert os_env_mod.subprocess.Popen is _fork_eagain_popen
 
     # Dispatch surfaces an error result instead of crashing the turn.
     result = json.loads(raw_result)
@@ -139,4 +139,12 @@ async def test_sys_os_read_helper_spawn_failure_surfaces_structured_reason(
         "sys_os_read helper-spawn failure did not identify the OS-environment "
         f"helper in its error; got {surfaced_error!r}, expected one of "
         f"{_STRUCTURED_REASON_MARKERS}"
+    )
+
+    # The helper client handled the spawn failure itself, so the generic
+    # dispatch catch-all (the reported ERROR fingerprint) must not fire.
+    catch_all = [r for r in caplog.records if r.name == "omnigent.runner.tool_dispatch"]
+    assert not catch_all, (
+        "the fork-EAGAIN spawn failure escaped the helper client and reached the "
+        f"dispatch catch-all: {[r.getMessage() for r in catch_all]!r}"
     )
