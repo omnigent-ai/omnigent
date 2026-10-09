@@ -5332,6 +5332,17 @@ def uninstall(
         click.echo("No Omnigent install detected; nothing to uninstall.", err=True)
         raise SystemExit(3)
 
+    if IS_WINDOWS:
+        # The uninstaller is a POSIX shell script, and a running omnigent.exe
+        # cannot remove its own uv tool environment on Windows anyway.
+        from omnigent.install_ledger import state_dir
+
+        raise click.ClickException(
+            "`omnigent uninstall` is not supported on native Windows. Run "
+            "`omnigent stop`, then `uv tool uninstall omnigent`. To also remove "
+            f"local state, delete {state_dir()}."
+        )
+
     script_path = _uninstall_script_path()
     args = [str(script_path)]
     args.extend(targets)
