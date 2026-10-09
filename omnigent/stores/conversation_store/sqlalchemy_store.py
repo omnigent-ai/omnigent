@@ -591,10 +591,10 @@ def _insert_labels_if_absent(
         {
             "conversation_id": conversation_id,
             "key": key,
-            "value": value[:LABEL_VALUE_MAX_LEN],
+            "value": value,
             "updated_at": updated_at,
         }
-        for key, value in defaults.items()
+        for key, value in _prepare_label_updates(defaults).items()
     ]
     stmt: Any
     if dialect == "sqlite" or is_postgresql_family(dialect):
@@ -1702,10 +1702,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Locked read-merge-write of one JSON column on conversation metadata.
 
-        Callers open the session with a literal query name and pass it here,
-        keeping the ``_session_immediate`` call (which the query-naming lint
-        requires to carry a string literal) at the public call sites rather
-        than inside this helper.
+        Callers open the named session and pass it in, so the operation name
+        stays at the public call site.
 
         Centralizes the locked read-merge-write and the single row-missing
         contract for every such primitive on this table: no row means nothing

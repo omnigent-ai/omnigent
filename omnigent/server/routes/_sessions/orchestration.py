@@ -1695,7 +1695,7 @@ def _accumulate_session_usage(
     try:
         new_current = conversation_store.increment_session_usage(session_id, delta)
     except ConversationNotFoundError:
-        # Session row deleted mid-stream: nothing left to bill or publish.
+        # Session row deleted mid-stream: no per-session total left to publish.
         new_current = None
     # Daily rollup attributes to the surviving owner (a sub-agent falls back to
     # its root), so record it even when the session row vanished and the

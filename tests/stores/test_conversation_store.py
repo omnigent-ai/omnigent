@@ -252,6 +252,37 @@ def test_create_retries_metadata_phase_after_conversation_commit(tmp_path: Path)
         assert session.query(SqlConversationMetadata).filter_by(id=conversation_id).count() == 1
 
 
+def test_mutate_session_state_replays_from_fresh_state_after_serialization_failure(
+    tmp_path: Path,
+) -> None:
+    """A serialization retry re-reads state, so one logical increment commits once.
+
+    The first attempt applies the mutation then fails at commit and rolls back;
+    the replay must re-read the persisted state (still 1) rather than reuse the
+    rolled-back in-memory dict, so the counter lands on 2, not 3.
+    """
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'conversations.db'}",
+    )
+    conv = store.create_conversation(title="omni-2111-replay")
+    store.set_session_state(conv.id, {"n": 1})
+
+    retrying_maker = _RetryOnceMaker(store._session_immediate)
+    store._session_immediate = retrying_maker
+
+    def _bump(state: dict[str, Any]) -> None:
+        state["n"] = state.get("n", 0) + 1
+
+    merged = store.mutate_session_state(conv.id, _bump)
+
+    assert retrying_maker.attempts == 2
+    assert merged["n"] == 2
+    store._session_immediate = retrying_maker._delegate
+    final = store.get_conversation(conv.id)
+    assert final is not None and final.session_state["n"] == 2
+
+
 def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> None:
     assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 

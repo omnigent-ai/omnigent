@@ -1280,7 +1280,9 @@ class ConversationStore(ABC):
         :param conversation_id: The conversation to update.
         :param mutate: Callable applied in place to the freshly read
             state, inside the locked transaction. Must not make store
-            calls of its own.
+            calls of its own, and may run more than once (transaction
+            replay), so it must tolerate replay and avoid external side
+            effects.
         :returns: The merged state as persisted.
         :raises ConversationNotFoundError: When the conversation has no
             row to merge into. Implementations must not treat an absent

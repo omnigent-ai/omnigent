@@ -308,6 +308,14 @@ def test_deleted_root_does_not_fail_the_subagent_turn(
     engine = _engine_on(_RecordingStore(conversation_store), child.id, parent.id)  # type: ignore[arg-type]
     _drop_metadata_row(conversation_store, parent.id)
 
+    # If the drop ever silently stops removing the metadata row, the mirror
+    # below would succeed and the test would pass without exercising the
+    # swallow; prove the row is gone through the public contract first.
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    with pytest.raises(ConversationNotFoundError):
+        conversation_store.mutate_session_state(parent.id, lambda _state: None)
+
     engine.apply_state_updates([_set_approved(0.05)])
 
     assert "mutate_session_state" in used, used
