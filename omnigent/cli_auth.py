@@ -568,6 +568,43 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     return access_token
 
 
+def load_or_refresh_token(server_url: str) -> str | None:
+    """Return a usable session token, renewing it from the refresh grant when it lapsed.
+
+    The access token lives an hour while its login grant lives far longer, so
+    a caller that only read the stored token would go out unauthenticated
+    long before the login actually ended.
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: A session JWT, or ``None`` when no login can authenticate.
+    """
+    token = load_token(server_url, min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS)
+    if token:
+        return token
+    refreshed = refresh_stored_token(server_url)
+    if refreshed:
+        return refreshed
+    # Renewal impossible: a near-expiry token that has not lapsed still works.
+    return load_token(server_url)
+
+
+def has_refreshable_login(server_url: str) -> bool:
+    """Report whether a stored login can authenticate now or be renewed.
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: ``True`` for a valid session token or held refresh material;
+        ``False`` for no entry, a lapsed token with nothing to renew it, or
+        a Databricks pointer record.
+    """
+    entry = _load_entry(server_url)
+    if entry is None:
+        return False
+    refresh_token = entry.get("refresh_token")
+    if isinstance(refresh_token, str) and refresh_token:
+        return True
+    return load_token(server_url) is not None
+
+
 def _coerce_expires_in(raw: object) -> float:
     """Return a sane access-token lifetime in seconds from *raw*.
 
