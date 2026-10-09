@@ -1811,6 +1811,56 @@ describe("importLocalSessions", () => {
     expect(seen).toEqual(["c1"]);
   });
 
+  it("throws with the delivered count when the stream closes before done", async () => {
+    // A proxy ending the body early drops the terminal tally. Resolving would
+    // report "Imported 0" beside sessions that did import.
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "First" }),
+        JSON.stringify({ event: "session", session_id: "c2", title: "Second" }),
+      ]),
+    );
+
+    const seen: string[] = [];
+    await expect(importLocalSessions("h", "all", 25, (s) => seen.push(s.id))).rejects.toThrow(
+      "The import stopped before it could finish. 2 sessions were imported.",
+    );
+    expect(seen).toEqual(["c1", "c2"]);
+  });
+
+  it("throws when the stream closes before done with nothing delivered", async () => {
+    fetchMock.mockResolvedValueOnce(mockNdjsonResponse([]));
+
+    await expect(importLocalSessions("h", "claude", 10)).rejects.toThrow(
+      "The import stopped before it could finish. 0 sessions were imported.",
+    );
+  });
+
+  it("resolves a by-ID import whose session arrived even without done", async () => {
+    // The one requested session was saved before it streamed, so nothing is left to do.
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([JSON.stringify({ event: "session", session_id: "c1", title: "Exact" })]),
+    );
+
+    const result = await importLocalSessions("h", "codex", 25, undefined, "session-exact");
+
+    expect(result).toEqual({
+      imported: 1,
+      alreadyImported: 0,
+      failed: 0,
+      sessions: [{ id: "c1", title: "Exact" }],
+      failures: [],
+    });
+  });
+
+  it("throws a retry message when a by-ID import ends before done with nothing delivered", async () => {
+    fetchMock.mockResolvedValueOnce(mockNdjsonResponse([]));
+
+    await expect(importLocalSessions("h", "codex", 25, undefined, "session-exact")).rejects.toThrow(
+      "The import stopped before it could finish. Try importing it again.",
+    );
+  });
+
   it("sends an exact session ID with its harness", async () => {
     fetchMock.mockResolvedValueOnce(
       mockNdjsonResponse([

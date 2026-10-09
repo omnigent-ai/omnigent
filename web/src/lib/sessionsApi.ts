@@ -578,8 +578,10 @@ function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
  * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
  * `onSession` fires for each newly imported session as its frame lands, so
  * callers list sessions live instead of waiting out the whole batch. A
- * mid-stream host failure throws after the sessions read so far have been
- * delivered through `onSession`. Against a server too old to have the streaming
+ * mid-stream host failure, or a stream that closes before its terminal `done`
+ * tally, throws after the sessions read so far have been delivered through
+ * `onSession` (a by-ID import whose one session arrived resolves instead, since
+ * it has nothing left to do). Against a server too old to have the streaming
  * endpoint (404), it falls back to the buffered `POST /v1/imports/local`, which
  * returns the whole tally at once (`onSession` then fires for every session
  * together). Either way the resolved {@link LocalImportResult} carries the
@@ -615,6 +617,7 @@ export async function importLocalSessions(
   let alreadyImported = 0;
   let failed = 0;
   let errorMessage: string | null = null;
+  let sawDone = false;
 
   const handleLine = (line: string): void => {
     let evt: Record<string, unknown>;
@@ -635,6 +638,7 @@ export async function importLocalSessions(
     } else if (evt.event === "failed") {
       failures.push(toImportFailureRef(evt));
     } else if (evt.event === "done") {
+      sawDone = true;
       imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
       alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
       failed = typeof evt.failed === "number" ? evt.failed : failures.length;
@@ -668,6 +672,21 @@ export async function importLocalSessions(
   }
 
   if (errorMessage !== null) throw new Error(errorMessage);
+  // No `done` tally arrived. A by-ID import that delivered its one session did finish;
+  // otherwise fail with what landed rather than report "Imported 0" beside listed sessions.
+  if (!sawDone) {
+    if (sessionId !== undefined) {
+      if (sessions.length === 1) {
+        return { imported: 1, alreadyImported: 0, failed: 0, sessions, failures };
+      }
+      throw new Error("The import stopped before it could finish. Try importing it again.");
+    }
+    const n = sessions.length;
+    throw new Error(
+      `The import stopped before it could finish. ${n} ${n === 1 ? "session was" : "sessions were"} ` +
+        "imported. Import again to pick up the rest.",
+    );
+  }
   return { imported, alreadyImported, failed, sessions, failures };
 }
 
