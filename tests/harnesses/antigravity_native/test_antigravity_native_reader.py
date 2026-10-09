@@ -3790,6 +3790,30 @@ def test_placeholder_recovery_keeps_waiting_without_a_typed_cascade(
     assert state.conversation_id == "agy_conv_placeholder"
 
 
+def test_placeholder_recovery_keeps_an_id_bound_during_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real id written while the scan ran (a racing cold-start) is kept: the
+    adoption write refuses to replace it and recovery reports nothing adopted."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t: _PORT)
+
+    def _scan_while_cold_start_binds(_port: int) -> dict[str, Any]:
+        (bridge_dir / "state.json").write_text(
+            json.dumps({"session_id": _SESSION_ID, "conversation_id": _OTHER_CASCADE}),
+            encoding="utf-8",
+        )
+        return _typed_body(_CASCADE_ID)
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _scan_while_cold_start_binds)
+
+    assert reader._recover_placeholder_cascade(bridge_dir) is None
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _OTHER_CASCADE
+
+
 @pytest.mark.asyncio
 async def test_supervise_reader_recovers_placeholder_and_mirrors(
     tmp_path: Path,

@@ -72,7 +72,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
-    agy_gemini_dir,
+    agy_conversation_db,
     is_placeholder_conversation_id,
     read_bridge_state,
     read_tmux_info,
@@ -877,10 +877,7 @@ def _recover_placeholder_cascade(bridge_dir: Path) -> str | None:
     cascade_id = _typed_root_cascade(summaries)
     if cascade_id is None:
         return None
-    conversation_db = (
-        agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
-    )
-    if not conversation_db.is_file():
+    if not agy_conversation_db(bridge_dir, cascade_id).is_file():
         _logger.warning(
             "agy placeholder recovery: typed cascade %s on port %s is NOT in this "
             "session's Gemini dir (a foreign agy answered the scan); refusing to adopt.",
@@ -888,7 +885,8 @@ def _recover_placeholder_cascade(bridge_dir: Path) -> str | None:
             port,
         )
         return None
-    if not update_conversation_id(bridge_dir, cascade_id):
+    # The scan above took seconds; a cold-start may have bound a real id meanwhile.
+    if not update_conversation_id(bridge_dir, cascade_id, expect_placeholder=True):
         return None
     _logger.info(
         "agy reader adopted the TUI-minted cascade past a stale placeholder "

@@ -6759,9 +6759,9 @@ async def _agy_cascade_is_locally_owned(bridge_dir: Path, cascade_id: str) -> bo
     :returns: ``True`` when the conversation db exists in this session's Gemini
         dir within the grace window.
     """
-    from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+    from omnigent.harnesses.antigravity_native.bridge import agy_conversation_db
 
-    db = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
+    db = agy_conversation_db(bridge_dir, cascade_id)
     deadline = time.monotonic() + _AGY_CASCADE_OWNERSHIP_GRACE_S
     while True:
         if await asyncio.to_thread(db.is_file):
@@ -6920,24 +6920,26 @@ async def _cold_start_agy_conversation(
             session_id,
         )
         return None
-    # The reader's placeholder recovery may have adopted agy's TUI-minted
-    # cascade while this bootstrap settled; the headless StartCascade phantom
-    # must never overwrite that live binding.
-    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
-    if state is not None and not is_placeholder_conversation_id(state.conversation_id):
-        _logger.info(
-            "Antigravity cold-start: bridge state already binds conversation %s for "
-            "session %s (the reader adopted it meanwhile); discarding cold-start "
-            "cascade %s.",
-            state.conversation_id,
-            session_id,
-            cascade_id,
-        )
-        return state.conversation_id
     # Persist the real id (replacing the ``agy_conv_*`` placeholder) so
     # ``read_bridge_state`` returns it and the reader/executor address the
-    # cold-started conversation. Offloaded (file I/O).
-    if not await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id):
+    # cold-started conversation. The write refuses to replace a real id: the
+    # reader's placeholder recovery may have adopted agy's TUI-minted cascade
+    # while this bootstrap settled, and the headless StartCascade phantom must
+    # never overwrite that live binding. Offloaded (file I/O).
+    if not await asyncio.to_thread(
+        update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
+    ):
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity cold-start: bridge state already binds conversation %s for "
+                "session %s (the reader adopted it meanwhile); discarding cold-start "
+                "cascade %s.",
+                state.conversation_id,
+                session_id,
+                cascade_id,
+            )
+            return state.conversation_id
         _logger.warning(
             "Antigravity cold-start: could not persist cold-started conversation id %s for "
             "session %s (no bridge state to update); the reader will stay on the placeholder id.",

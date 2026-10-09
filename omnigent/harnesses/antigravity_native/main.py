@@ -1314,24 +1314,26 @@ async def _cold_start_agy_conversation(
             exc_info=True,
         )
         return
-    # This cold-start runs CONCURRENTLY with the reader on the CLI path; its
-    # placeholder recovery may have adopted agy's TUI-minted cascade already,
-    # and the headless StartCascade phantom must never overwrite that binding.
-    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
-    if state is not None and not is_placeholder_conversation_id(state.conversation_id):
-        _logger.info(
-            "Antigravity cold-start: bridge state already binds conversation %s for "
-            "session %s (the reader adopted it meanwhile); discarding cold-start "
-            "cascade %s.",
-            state.conversation_id,
-            session_id,
-            cascade_id,
-        )
-        return
     # Persist the real id (replacing the placeholder) so ``read_bridge_state``
     # returns it and the reader/executor address the cold-started conversation.
-    # Offloaded (file I/O).
-    if not await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id):
+    # This cold-start runs CONCURRENTLY with the reader on the CLI path, whose
+    # placeholder recovery may have adopted agy's TUI-minted cascade already, so
+    # the write refuses to replace a real id: the headless StartCascade phantom
+    # must never overwrite that binding. Offloaded (file I/O).
+    if not await asyncio.to_thread(
+        update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
+    ):
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity cold-start: bridge state already binds conversation %s for "
+                "session %s (the reader adopted it meanwhile); discarding cold-start "
+                "cascade %s.",
+                state.conversation_id,
+                session_id,
+                cascade_id,
+            )
+            return
         _logger.warning(
             "Antigravity cold-start: could not persist cold-started conversation id %s for "
             "session %s (no bridge state to update); the reader will stay on the placeholder id.",

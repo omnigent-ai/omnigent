@@ -1516,6 +1516,11 @@ def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None
     return resolve_pane_agy_rpc_port_state(socket_path, tmux_target).port
 
 
+# Panes whose restricted-/proc fallback was already reported. The reader's
+# placeholder recovery re-resolves every few seconds, so later polls log at DEBUG.
+_FALLBACK_WARNED_PANES: set[tuple[str, str]] = set()
+
+
 def resolve_cold_start_agy_rpc_port(
     tmux_socket: Path | None,
     tmux_target: str | None,
@@ -1587,12 +1592,15 @@ def resolve_cold_start_agy_rpc_port(
                 tmux_target,
             )
             return None
-        _logger.warning(
+        pane = (str(tmux_socket), tmux_target)
+        _logger.log(
+            logging.DEBUG if pane in _FALLBACK_WARNED_PANES else logging.WARNING,
             "agy cold-start: pane agy found for target=%s but no source attributes a "
             "port for ANY agy (restricted /proc); falling back to the host-wide "
             "candidate scan — safe only while this host runs a single agy",
             tmux_target,
         )
+        _FALLBACK_WARNED_PANES.add(pane)
     candidates = _candidate_agy_rpc_ports()
     if not candidates:
         return None
