@@ -3887,16 +3887,12 @@ def test_placeholder_recovery_keeps_an_id_bound_during_the_scan(
     assert state.conversation_id == _OTHER_CASCADE
 
 
-async def _no_sleep(_seconds: float) -> None:
-    await asyncio.sleep(0)
-
-
 @pytest.mark.asyncio
 async def test_discover_records_an_adoption_before_the_port_resolves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The adopted cascade reaches ``on_adopted`` as soon as it is persisted, so a
-    reader restart before the port resolves cannot lose the --resume record."""
+    """The adopted cascade reaches ``on_adopted`` as soon as it is persisted: the
+    resume-id record is attempted right after adoption, before port resolution."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     _own_conversation_db(bridge_dir, _CASCADE_ID)
     monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
