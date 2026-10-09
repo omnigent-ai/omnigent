@@ -245,6 +245,30 @@ def test_codex_early_exit_diagnostic_failure_preserves_exit_cause(
     read_output.assert_called_once_with()
 
 
+def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
+    """An outdated Pi CLI shows the upgrade message, not the log pointer.
+
+    The raise site composes a client-safe message (installed version, floor,
+    upgrade command); the payload must carry it verbatim so the person sees
+    the remedy instead of "see the runner log".
+    """
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
+
+    remedy = (
+        "The installed Pi CLI (0.83.0) is older than the minimum Omnigent "
+        "supports (0.84.2). Upgrade with: npm install -g "
+        "@earendil-works/pi-coding-agent, then start the session again."
+    )
+    payload = _native_terminal_start_error_payload(
+        PiNativeCliOutdatedError(remedy), "Pi", session_id="conv_1"
+    )
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    assert remedy in payload["message"]
+    assert "see the runner log" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+
+
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     """An ``OmnigentError`` with a different code is not reclassified.
 
