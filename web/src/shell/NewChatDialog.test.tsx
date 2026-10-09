@@ -10729,3 +10729,299 @@ describe("managed sandbox inference models", () => {
     mounted.unmount();
   });
 });
+
+describe("managed sandbox gateway preview", () => {
+  beforeEach(setupLandingMocks);
+
+  const astra = {
+    id: "system.ai.gpt-6-astra",
+    displayName: "Astra 6",
+    supportedReasoningEfforts: ["low", "medium", "high", "max"].map((reasoningEffort) => ({
+      reasoningEffort,
+    })),
+  };
+  const catalog: SandboxModelOptions = {
+    configured: false,
+    status: "ready",
+    models: [astra],
+    configuration_revision: null,
+    provider_label: "AI Gateway",
+    default_model: null,
+  };
+  const claude = {
+    id: "system.ai.claude-opus-4-8",
+    displayName: "Gateway Opus",
+    supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+  };
+
+  function preview(data: SandboxModelOptions | undefined = catalog, error: Error | null = null) {
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data,
+      isLoading: data === undefined && error === null,
+      error,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+  }
+
+  function renderGatewaySandbox() {
+    return renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "arclet",
+      sandbox_provider_capabilities: { arclet: { gateway_models: true } },
+    });
+  }
+
+  it("offers gateway models without a host and carries Codex model and effort into create", async () => {
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(screen.getByTestId("sandbox-model-provider")).toHaveTextContent("AI Gateway");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      agent_id: "a2",
+      host_type: "managed",
+      sandbox_provider: "arclet",
+      model_override: astra.id,
+      reasoning_effort: "max",
+    });
+    expect(body.host_id).toBeUndefined();
+    expect(body.inference_configuration_revision).toBeUndefined();
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "codex-native",
+      "a2",
+      null,
+      true,
+    );
+  });
+
+  it.each(["unavailable", "empty"] as const)(
+    "offers an intentional harness default when gateway discovery is %s",
+    async (status) => {
+      preview({ ...catalog, status, models: [] });
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderGatewaySandbox();
+      selectAgent("a2");
+      openAgentModels("a2");
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+      closeMenu();
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBeUndefined();
+      expect(body.reasoning_effort).toBeUndefined();
+    },
+  );
+
+  it("waits for the selected harness's catalog without probing a host", () => {
+    mockHosts([]);
+    localStorage.setItem(LAST_AGENT_KEY, "a2");
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      error: null,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+    renderGatewaySandbox();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "waiting" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      null,
+      "codex-native",
+      false,
+      expect.any(Object),
+    );
+    preview();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ready" },
+    });
+    openAgentModels("a2");
+    expect(screen.getByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeVisible();
+    closeMenu();
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it("changes catalogs and efforts when switching Codex, Claude Code, and Polly", async () => {
+    const claudeCatalog = { ...catalog, models: [claude] };
+    vi.mocked(useSandboxModelOptions).mockImplementation(
+      (_provider, harness) =>
+        ({
+          data: harness?.startsWith("codex") ? catalog : claudeCatalog,
+          isLoading: false,
+          error: null,
+        }) as ReturnType<typeof useSandboxModelOptions>,
+    );
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("a_polly", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    closeMenu();
+    selectAgent("a1");
+    openAgentModels("a1");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    pickPrimaryOption("model", "Gateway Opus");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-max")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
+    closeMenu();
+    selectAgent("a_polly");
+    openAgentModels("a_polly");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    pickPrimaryOption("model", "Gateway Opus");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      agent_id: "a_polly",
+      model_override: claude.id,
+      reasoning_effort: "high",
+    });
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "claude-sdk",
+      "a_polly",
+      null,
+      true,
+    );
+  });
+
+  it("drops an effort unsupported by the newly selected model", async () => {
+    const glm = {
+      id: "system.ai.glm-5-2",
+      displayName: "Gateway GLM",
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+    };
+    preview({ ...catalog, models: [astra, glm] });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    pickPrimaryOption("model", "Gateway GLM");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-max")).toBeNull();
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe(glm.id);
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("requires an intentional default after an explicit model becomes unavailable", async () => {
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    closeMenu();
+    preview(catalog, new Error("Gateway temporarily unavailable"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose another model or Harness default");
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    expect(screen.getByText("Gateway temporarily unavailable")).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("keeps a harness's ordinary picker when the gateway lists nothing for it", () => {
+    preview({ ...catalog, status: "unconfigured", models: [], provider_label: null });
+    renderGatewaySandbox();
+    openAgentModels("a1");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "claude-native",
+      "a1",
+      null,
+      true,
+    );
+    expect(screen.queryByTestId("sandbox-model-provider")).toBeNull();
+    const menu = screen
+      .getByTestId("new-chat-landing-agent-models")
+      .closest<HTMLElement>('[role="menu"]')!;
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(within(menu).getByTestId("new-chat-landing-agent-model-opus")).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+  });
+
+  // The gateway catalog owns the model like a bound target does, so the
+  // per-turn router is offered only once the harness falls back to its own list.
+  it.each<[string, SandboxModelOptions, boolean]>([
+    ["owns the catalog", catalog, false],
+    [
+      "cannot serve the harness",
+      { ...catalog, status: "unconfigured", models: [], provider_label: null },
+      true,
+    ],
+  ])("offers Smart Routing only when the gateway %s", (_case, data, offered) => {
+    preview(data);
+    mockHosts([]);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "arclet",
+      sandbox_provider_capabilities: { arclet: { gateway_models: true } },
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: true, oss: true },
+    });
+    openAgentModels("a2");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" }) !== null).toBe(
+      offered,
+    );
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`) !== null).toBe(
+      !offered,
+    );
+  });
+
+  it("keeps a connected host's authoritative discovery when Arclet preview is offered", () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    preview();
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      "host_1",
+      "codex-native",
+      true,
+      expect.any(Object),
+    );
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "codex-native",
+      "a2",
+      null,
+      false,
+    );
+    expect(
+      screen.getByTestId(`new-chat-landing-agent-model-${CODEX_MODEL_OPTIONS_RESULT.data[0].id}`),
+    ).toBeVisible();
+  });
+});

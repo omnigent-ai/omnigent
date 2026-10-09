@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -19,6 +20,9 @@ from omnigent.inference_config import (
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._session_create_validation import validate_session_agent
+
+_logger = logging.getLogger(__name__)
+_GATEWAY_HOOK_TIMEOUT_S = 10.0
 
 
 def inference_service(request: Request) -> Any:
@@ -164,10 +168,16 @@ def create_sandbox_inference_router(
 
     @router.get("/sandbox-providers/{provider}/harnesses/{harness}/model-options")
     async def model_options(
-        request: Request, provider: str, harness: str, agent_id: str | None = None
+        request: Request,
+        response: Response,
+        provider: str,
+        harness: str,
+        agent_id: str | None = None,
     ) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
+        response.headers["Cache-Control"] = "private, no-store"
         auth = None
+        profile = None
         if agent_id is not None:
             # Clients read a missing agent's 404 from ``detail``; keep that shape.
             if await asyncio.to_thread(agent_store.get, agent_id) is None:
@@ -191,6 +201,7 @@ def create_sandbox_inference_router(
             ).spec
             harness = actual_harness(spec, harness)
             auth = spec.executor.auth
+            profile = spec.executor.config.get("profile") or spec.executor.profile
         try:
             snapshot = await inference_service(request).prepare(
                 provider, harness, user_id, agent_auth=auth
@@ -209,7 +220,7 @@ def create_sandbox_inference_router(
                 if isinstance(exc, OmnigentError)
                 else "Invalid inference configuration",
             }
-        return {
+        result: dict[str, Any] = {
             "configured": False,
             "models": [],
             "configuration_revision": None,
@@ -217,5 +228,35 @@ def create_sandbox_inference_router(
             "default_model": None,
             "status": "unconfigured",
         }
+        deployment = getattr(request.app.state, "sandbox_config", None)
+        target = deployment.for_provider(provider) if deployment is not None else None
+        # An agent's own provider takes precedence over the sandbox's ambient gateway.
+        if target is None or not target.managed_launch_supported or auth is not None or profile:
+            return result
+        ambient = await inference_service(request).ambient_catalog(provider, harness, user_id)
+        if ambient is not None:
+            return ambient
+        if target.gateway_model_options is not None:
+            result["provider_label"] = "AI Gateway"
+            try:
+                rows = await asyncio.wait_for(
+                    target.gateway_model_options(harness, user_id), timeout=_GATEWAY_HOOK_TIMEOUT_S
+                )
+                if not all(isinstance(row.get("id"), str) and row["id"] for row in rows):
+                    raise ValueError("gateway_model_options rows must carry a model id")
+                # Advisory rows never carry a default marker; Harness default stays a separate row.
+                models = [{**row, "isDefault": False} for row in rows]
+                result.update(models=models, status="ready" if models else "empty")
+                if not models:
+                    result["error"] = "The gateway lists no usable models for this harness."
+            except Exception:  # noqa: BLE001 - optional preview must not block a default launch
+                _logger.warning(
+                    "AI Gateway model preview failed for %s/%s", provider, harness, exc_info=True
+                )
+                result.update(
+                    status="unavailable",
+                    error="Could not load AI Gateway models. You can use Harness default.",
+                )
+        return result
 
     return router

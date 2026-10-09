@@ -18,6 +18,24 @@ configured targets; other targets do not request preview catalogs or wait on
 discovery. The new credential-reference restrictions apply to saved inference
 profiles and explicitly configured discovery credentials, not legacy host configs.
 
+### Unbound gateway previews
+
+A target without bindings can still offer an advisory catalog before any host
+exists. When `sandbox.model_discovery` names a gateway from
+`sandbox.host_config.providers`, `/v1/info` advertises `gateway_models` and the
+preview endpoint lists that gateway's harness-compatible models with
+`configured: false`: no snapshot or revision is saved, no row is marked default,
+"Harness default" stays selectable, and a discovery failure reports
+`unavailable` while leaving the default launch usable. The sandbox keeps
+resolving its own inference credential; the server uses only the discovery
+credential. Among several discoverable gateways, the provider marked `default`
+for the harness's family wins, otherwise the first configured one. A provider
+implementation can supply the same preview programmatically through
+`ManagedSandboxConfig.gateway_model_options`. Explicit choices travel as
+`model_override` and `reasoning_effort` without catalog validation, so the
+harness still validates them at launch, and efforts appear only when the
+listing itself reports reasoning metadata.
+
 ## Configuration
 
 Add providers and harness bindings to the existing `sandbox.host_config`.

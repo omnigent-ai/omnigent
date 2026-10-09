@@ -2198,6 +2198,63 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
     }
 
 
+def test_provider_ui_capabilities_advertise_gateway_models_for_unbound_discovery() -> None:
+    launcher = FakeSandboxLauncher()
+    gateway = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "api_key_ref": "env:POD_KEY",
+                    "wire_api": "responses",
+                },
+            }
+        }
+    }
+    discovery = {"gateway": {"base_url": "https://catalog.example/v1", "api_key_ref": "env:KEY"}}
+    bound = {**gateway, "inference": {"harnesses": {"codex-native": {"provider": "gateway"}}}}
+
+    async def hook(harness: str, user_id: str | None) -> list[dict[str, Any]]:
+        return []
+
+    def config(provider: str, **fields: Any) -> ManagedSandboxConfig:
+        return ManagedSandboxConfig(
+            server_url="https://s",
+            provider=provider,
+            token_ttl_s=3600,
+            launcher_factory=lambda: launcher,
+            **fields,
+        )
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            config("hooked", gateway_model_options=hook),
+            config("discovered", host_config=gateway, model_discovery=discovery),
+            config("static", host_config=gateway),
+            config("bound", host_config=bound, model_discovery=discovery),
+            config(
+                "malformed",
+                host_config={"providers": {"gateway": "nope"}},
+                model_discovery=discovery,
+            ),
+            config(
+                "malformed-inference",
+                host_config={**gateway, "inference": "nope"},
+                model_discovery=discovery,
+            ),
+        )
+    )
+    assert deployment.provider_ui_capabilities() == {
+        "hooked": {"multi_repo": False, "gateway_models": True},
+        "discovered": {"multi_repo": False, "gateway_models": True},
+        "static": {"multi_repo": False},
+        "bound": {"multi_repo": False, "inference_models": True},
+        "malformed": {"multi_repo": False},
+        "malformed-inference": {"multi_repo": False},
+    }
+
+
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
 
 
