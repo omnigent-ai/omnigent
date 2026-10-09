@@ -282,6 +282,7 @@ from omnigent.server.routes._sessions.helpers import (
     _load_agent_spec_for_session,
     _load_model_options,
     _load_model_options_from_host,
+    _log_external_error_item,
     _mcp_error_response,
     _mcp_input_required_response,
     _mcp_ok_response,
@@ -3164,7 +3165,11 @@ def _publish_persisted_external_item(
     persisted: ConversationItem,
     cleared_pending_id: str | None = None,
 ) -> None:
-    """Broadcast a newly persisted external item and drive any elicitation it resolves."""
+    """
+    Broadcast a newly persisted external item and drive any elicitation it resolves.
+
+    An error item's text is also logged; the stream's debug-log mirror keeps only its code.
+    """
     message_id = body.data.get("message_id")
     _publish_external_conversation_item(
         session_id,
@@ -3173,6 +3178,7 @@ def _publish_persisted_external_item(
         message_id=message_id if isinstance(message_id, str) else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
+    _log_external_error_item(session_id, persisted)
 
 
 async def _persist_external_conversation_items(

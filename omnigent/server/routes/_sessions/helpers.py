@@ -86,6 +86,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
+from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
@@ -4857,6 +4858,57 @@ def _failure_log_detail(error: ErrorDetail | None) -> str:
         return message
     dropped = len(message) - _FAILURE_LOG_DETAIL_MAX_CHARS
     return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
+
+
+# Error text copied into the log is clipped here; the full text stays on the item.
+_ERROR_ITEM_LOG_TEXT_MAX_CHARS: Final[int] = 300
+# Only this prefix is redacted, so a huge error message can't stall the request.
+_ERROR_ITEM_LOG_REDACT_PREFIX_CHARS: Final[int] = 4096
+
+# Error items whose text quotes part of the person's own message.
+_ERROR_ITEM_CODES_WITHOUT_LOG_TEXT: Final[frozenset[str]] = frozenset(
+    {"pi_followup_delivery_dropped"}
+)
+
+
+def _log_external_error_item(session_id: str, item: ConversationItem) -> None:
+    """Log one WARNING row carrying a persisted error item's redacted, bounded text.
+
+    The item's SSE mirror carries only its code, so without this row the debug
+    log cannot say why a harness reported the error. Info-level notices are
+    skipped, and an item whose text quotes the person's message logs its code
+    alone.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param item: The newly persisted item; anything but an error item is ignored.
+    """
+    data = item.data
+    if not isinstance(data, ErrorData) or data.level == "info":
+        return
+    if data.code in _ERROR_ITEM_CODES_WITHOUT_LOG_TEXT:
+        text = "(text withheld)"
+    else:
+        # Redact before clipping: a credential cut at the bound would otherwise
+        # survive as a fragment the redactor no longer recognises.
+        message = data.message
+        text = redact_log_text(message[:_ERROR_ITEM_LOG_REDACT_PREFIX_CHARS])
+        unredacted = max(0, len(message) - _ERROR_ITEM_LOG_REDACT_PREFIX_CHARS)
+        if len(text) > _ERROR_ITEM_LOG_TEXT_MAX_CHARS or unredacted:
+            dropped = len(text) - _ERROR_ITEM_LOG_TEXT_MAX_CHARS + unredacted
+            text = f"{text[:_ERROR_ITEM_LOG_TEXT_MAX_CHARS]}… (+{dropped} chars)"
+    _logger.warning(
+        "error item [%s]: %s",
+        data.code,
+        text,
+        extra=debug_event(
+            "error_item_published",
+            session_id=session_id,
+            code=data.code,
+            source=data.source,
+            item_id=item.id,
+            response_id=item.response_id,
+        ),
+    )
 
 
 def _publish_status(
@@ -11866,6 +11918,7 @@ __all__ = [
     "_load_agent_spec_for_session",
     "_load_model_options",
     "_load_model_options_from_host",
+    "_log_external_error_item",
     "_mcp_error_response",
     "_mcp_input_required_response",
     "_mcp_ok_response",

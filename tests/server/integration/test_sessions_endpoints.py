@@ -12777,3 +12777,177 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+def _error_item_event(
+    text: str,
+    *,
+    code: str = "RuntimeError",
+    level: str | None = None,
+    source_id: str | None = None,
+) -> dict[str, Any]:
+    """Build an ``external_conversation_item`` event that posts an ``error`` item."""
+    item_data: dict[str, Any] = {"source": "execution", "code": code, "message": text}
+    if level is not None:
+        item_data["level"] = level
+    data: dict[str, Any] = {
+        "response_id": "resp-error-item",
+        "item_type": "error",
+        "item_data": item_data,
+    }
+    if source_id is not None:
+        data["source_id"] = source_id
+    return {"type": "external_conversation_item", "data": data}
+
+
+def _error_item_log_rows(rows: list[dict[str, object]]) -> list[dict[str, Any]]:
+    """Return the error-item text rows, as the debug-logs table stores them."""
+    return [row for row in rows if row["event_name"] == "error_item_published"]
+
+
+async def test_external_error_item_logs_redacted_bounded_text_row(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A posted error item adds one WARNING row with its code, source, ids and text.
+
+    The item's SSE mirror carries only its code, so this row is what tells the
+    debug log why the harness reported the error. The text is redacted, then
+    clipped to 300 characters with the dropped remainder counted.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    text = (
+        "Pi model error: Authorization: Bearer fakeBearerToken123 api_key=fakeApiKey456 "
+        + "x" * 400
+    )
+    redacted = "Pi model error: Authorization: [REDACTED] api_key=[REDACTED] " + "x" * 400
+
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events", json=_error_item_event(text)
+        )
+    assert resp.status_code in (200, 202), resp.text
+
+    (row,) = _error_item_log_rows(rows)
+    clipped, dropped = redacted[:300], len(redacted) - 300
+    assert row["message"] == f"error item [RuntimeError]: {clipped}… (+{dropped} chars)"
+    assert row["session_id"] == session["id"]
+    # The properties the reliability dashboard's detail join selects on.
+    assert row["level"] == "WARNING"
+    assert row["logger_name"] not in {"omnigent.sse_events", "omnigent.audit_events"}
+    assert not str(row["message"]).startswith("sse ")
+    attrs = row["attributes"]
+    assert attrs["code"] == "RuntimeError"
+    assert attrs["source"] == "execution"
+    assert attrs["item_id"] == resp.json()["item_id"]
+    assert attrs["response_id"] == "resp-error-item"
+
+
+async def test_external_error_item_log_redacts_a_credential_cut_by_the_bound(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A credential that crosses the 300-character bound is redacted whole.
+
+    Clipping first would leave a key prefix too short for any redaction pattern
+    to recognise.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    text = "x" * 290 + " sk-A1b2C3d4E5f6G7h8I9j0"
+
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events", json=_error_item_event(text)
+        )
+    assert resp.status_code in (200, 202), resp.text
+
+    (row,) = _error_item_log_rows(rows)
+    message = str(row["message"])
+    assert message.startswith("error item [RuntimeError]: " + "x" * 290)
+    assert "sk-" not in message
+    assert "A1b2" not in message
+
+
+async def test_external_info_error_item_is_not_logged(client: httpx.AsyncClient) -> None:
+    """
+    An info-level notice gets no error-item row, though an error posted beside it does.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    events = [
+        _error_item_event(
+            "Codex started a fresh thread.", code="codex_thread_reset", level="info"
+        ),
+        _error_item_event("Pi model error: overloaded"),
+    ]
+
+    with capture_debug_rows("server") as rows:
+        for event in events:
+            resp = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+            assert resp.status_code in (200, 202), resp.text
+
+    assert [row["attributes"]["code"] for row in _error_item_log_rows(rows)] == ["RuntimeError"]
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert sorted(item["code"] for item in items if item["type"] == "error") == [
+        "RuntimeError",
+        "codex_thread_reset",
+    ]
+
+
+async def test_external_error_item_deduplicated_retry_is_not_logged_again(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A retried or repeated error item (same ``source_id``) logs one row, not one per post.
+
+    Covers the per-entry route and an array body that repeats an item.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    url = f"/v1/sessions/{session['id']}/events"
+    event = _error_item_event("Pi model error: overloaded", source_id="pi:error-1")
+    other = _error_item_event("Pi model error: quota exceeded", source_id="pi:error-2")
+
+    with capture_debug_rows("server") as rows:
+        first = await client.post(url, json=event)
+        retry = await client.post(url, json=event)
+    assert first.status_code in (200, 202), first.text
+    assert retry.json()["item_id"] == first.json()["item_id"]
+    assert len(_error_item_log_rows(rows)) == 1
+
+    with capture_debug_rows("server") as batch_rows:
+        batch = await client.post(url, json=[event, other, other])
+    assert batch.status_code == 202, batch.text
+    item_ids = [ack["item_id"] for ack in batch.json()]
+    assert item_ids[0] == first.json()["item_id"]
+    assert item_ids[1] == item_ids[2]
+    (row,) = _error_item_log_rows(batch_rows)
+    assert row["attributes"]["item_id"] == item_ids[1]
+
+
+async def test_external_pi_followup_dropped_error_item_logs_no_text(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A dropped Pi follow-up quotes part of the person's queued message, so only its code is logged.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    text = (
+        "Omnigent: a queued follow-up message (id msg-1) could not be delivered to Pi after "
+        '3 attempts and was dropped. Content preview: "synthetic queued words"'
+    )
+
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=_error_item_event(text, code="pi_followup_delivery_dropped"),
+        )
+    assert resp.status_code in (200, 202), resp.text
+
+    (row,) = _error_item_log_rows(rows)
+    assert row["message"] == "error item [pi_followup_delivery_dropped]: (text withheld)"
+    assert row["attributes"]["code"] == "pi_followup_delivery_dropped"
+    assert "synthetic queued words" not in str(rows)
