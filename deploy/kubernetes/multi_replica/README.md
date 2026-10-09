@@ -44,14 +44,14 @@ flowchart LR
 ## Enable routing in Omnigent
 
 Use an Omnigent version containing the OSS routing options on both the server
-and external host. The example builds the server from this checkout.
+and external host. The example builds the server from the main branch of the
+Omnigent GitHub repository.
 
 - Start the host with `OMNIGENT_HOST_SLICE_KEY_ENABLED=1`. It passes this setting
   to its runners. The Python client includes the host ID in HTTP requests and
   tunnel connections.
-- Build the browser with `VITE_OMNIGENT_HOST_ROUTING=true`. The Dockerfile accepts
-  this as a build argument, and `run.sh up` supplies it. Setting it only in a
-  running server pod does not change an already built browser bundle.
+- Build the browser with `VITE_OMNIGENT_HOST_ROUTING=true`. This tells the browser
+  to include the host ID in requests so NGINX can route them to the right server.
 - The browser keeps the host ID on terminal reconnects. Dropping the ID could
   send the next connection to a different replica.
 
@@ -101,11 +101,13 @@ differently; this example depends on F5's reload behavior.
 
 ## Run the example
 
-Install Docker, kind, kubectl, and uv. The automated check uses Docker host
+Install Git, Docker, kind, kubectl, and uv. The automated check uses Docker host
 networking, so it requires Linux or Docker Desktop with host networking
-enabled. From the repository root:
+enabled. Clone the main branch of the Omnigent repository, then run:
 
 ```bash
+git clone --branch main https://github.com/omnigent-ai/omnigent.git
+cd omnigent
 uv sync --frozen
 deploy/kubernetes/multi_replica/run.sh up
 deploy/kubernetes/multi_replica/run.sh verify
