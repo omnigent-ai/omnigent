@@ -72,12 +72,14 @@ function setScrollMetrics(
 
 describe("KeepBottomOnViewportResize", () => {
   let resize: (() => void) | null;
+  let observed: Element[];
   let disconnectSpy = vi.fn<() => void>();
   let nextFrameId: number;
   let frames: Map<number, FrameRequestCallback>;
 
   beforeEach(() => {
     resize = null;
+    observed = [];
     disconnectSpy.mockClear();
     nextFrameId = 1;
     frames = new Map();
@@ -92,7 +94,9 @@ describe("KeepBottomOnViewportResize", () => {
       constructor(callback: ResizeObserverCallback) {
         resize = () => callback([], this as unknown as ResizeObserver);
       }
-      observe() {}
+      observe(target: Element) {
+        observed.push(target);
+      }
       disconnect() {
         disconnectSpy();
       }
@@ -138,6 +142,18 @@ describe("KeepBottomOnViewportResize", () => {
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
     return { metrics, scrollRoot };
+  }
+
+  function makeContentRoot() {
+    const content = document.createElement("div");
+    stickContext.contentRef.current = content;
+    return content;
+  }
+
+  function lockToBottom() {
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
   }
 
   it("keeps a bottom-locked transcript pinned after its viewport shrinks", () => {
@@ -207,16 +223,160 @@ describe("KeepBottomOnViewportResize", () => {
     expect(metrics.scrollTop).toBe(1250);
   });
 
-  it("ignores content-only resize notifications", () => {
-    const { metrics } = makeScrollRoot();
-    stickContext.isAtBottom = true;
+  it("pins a bottom-locked transcript before paint when its content grows", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    const content = makeContentRoot();
+    lockToBottom();
     render(<KeepBottomOnViewportResize />);
 
-    metrics.scrollHeight = 2200;
+    metrics.scrollHeight = 2900;
     act(() => resize?.());
 
+    // Written inside the resize callback, before the frame paints.
+    expect(metrics.scrollTop).toBe(2900 - 700 - 1);
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledWith("instant");
+    expect(frames.size).toBe(1);
+    // Growth shows up on the content box; the scroll container's own box is unchanged.
+    expect(observed).toEqual([scrollRoot, content]);
+  });
+
+  it("pins a bottom-locked transcript before paint when its content grows in steps", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    makeContentRoot();
+    lockToBottom();
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollHeight = 2400;
+    act(() => resize?.());
+    expect(metrics.scrollTop).toBe(2400 - 700 - 1);
+    // The next growth can land before the pin's own scroll event is delivered;
+    // that event then reads the view off the new bottom, not the reader leaving.
+    metrics.scrollHeight = 2900;
+    fireEvent.scroll(scrollRoot);
+
+    act(() => resize?.());
+    expect(metrics.scrollTop).toBe(2900 - 700 - 1);
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(2);
+  });
+
+  it("pins a bottom-locked transcript before paint when a row grows through the shared handle", () => {
+    // A mounted row that grows lengthens the scroller's overflow before the
+    // content box changes; the transcript runs the check from its own measure.
+    const { metrics } = makeScrollRoot();
+    makeContentRoot();
+    lockToBottom();
+    const pinRef = { current: null as (() => void) | null };
+    const { unmount } = render(<KeepBottomOnViewportResize pinRef={pinRef} />);
+
+    metrics.scrollHeight = 2900;
+    act(() => pinRef.current?.());
+
+    expect(metrics.scrollTop).toBe(2900 - 700 - 1);
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+    expect(frames.size).toBe(1);
+
+    unmount();
+    expect(pinRef.current).toBeNull();
+  });
+
+  it("drops the follow-up pin once the reader escapes", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    makeContentRoot();
+    lockToBottom();
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollHeight = 2900;
+    act(() => resize?.());
+    expect(metrics.scrollTop).toBe(2900 - 700 - 1);
+    expect(frames.size).toBe(1);
+    // A wheel-up before the next frame; the library marks the escape at once.
+    metrics.scrollTop = 1800;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    fireEvent.scroll(scrollRoot);
+    flushFrames();
+
+    expect(metrics.scrollTop).toBe(1800);
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a reader who scrolled up alone when content grows", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    makeContentRoot();
+    lockToBottom();
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollTop = 900;
+    fireEvent.scroll(scrollRoot);
+    metrics.scrollHeight = 2900;
+    act(() => resize?.());
+
+    expect(metrics.scrollTop).toBe(900);
     expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
     expect(frames.size).toBe(0);
+  });
+
+  it("does not pin content growth while the bottom lock is released", () => {
+    // Loading older history from the bottom releases the lock before the page
+    // lands above the reader; that growth must not be answered by a snap down.
+    const { metrics } = makeScrollRoot();
+    makeContentRoot();
+    lockToBottom();
+    render(<KeepBottomOnViewportResize />);
+
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    metrics.scrollHeight = 2900;
+    act(() => resize?.());
+
+    expect(metrics.scrollTop).toBe(1300);
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+
+  it("ignores content shrinking", () => {
+    const { metrics } = makeScrollRoot();
+    makeContentRoot();
+    lockToBottom();
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollHeight = 1961;
+    act(() => resize?.());
+
+    expect(metrics.scrollTop).toBe(1300);
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+
+  it("holds the pin while the reader is selecting transcript text", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    makeContentRoot();
+    scrollRoot.append("reply text");
+    document.body.append(scrollRoot);
+    lockToBottom();
+    render(<KeepBottomOnViewportResize />);
+    const selection = document.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(scrollRoot);
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    try {
+      metrics.scrollHeight = 2900;
+      act(() => resize?.());
+      expect(metrics.scrollTop).toBe(1300);
+      expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+
+      selection.removeAllRanges();
+      metrics.scrollHeight = 3000;
+      act(() => resize?.());
+      expect(metrics.scrollTop).toBe(3000 - 700 - 1);
+      expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+    } finally {
+      selection.removeAllRanges();
+      scrollRoot.remove();
+    }
   });
 
   it("disconnects the observer and cancels a queued follow-up frame", () => {

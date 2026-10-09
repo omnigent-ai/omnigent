@@ -90,6 +90,17 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 // VirtualBubbleList touches, so its real path doesn't throw under jsdom.
 const ROW = 200;
 vi.mock("@tanstack/react-virtual", () => ({
+  // The library's default row measurement, for consumers that wrap it.
+  measureElement: (
+    element: Element,
+    entry: ResizeObserverEntry | undefined,
+    instance: { options: { horizontal?: boolean } },
+  ) => {
+    const box = entry?.borderBoxSize?.[0];
+    if (box) return Math.round(instance.options.horizontal ? box.inlineSize : box.blockSize);
+    const rect = element.getBoundingClientRect();
+    return instance.options.horizontal ? rect.width : rect.height;
+  },
   useVirtualizer: ({
     count,
     getItemKey,

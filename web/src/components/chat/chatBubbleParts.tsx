@@ -1204,56 +1204,88 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
-/** Keep bottom-locked readers pinned when the composer changes viewport height. */
-export function KeepBottomOnViewportResize() {
+/** Keep bottom-locked readers pinned before the frame paints when the viewport shrinks
+ *  (the composer grows) or the content grows (a reply lands). `pinRef` receives the
+ *  growth check so the transcript can run it when a mounted row grows. */
+export function KeepBottomOnViewportResize({
+  pinRef,
+}: {
+  pinRef?: React.RefObject<(() => void) | null>;
+} = {}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef?: React.RefObject<HTMLElement>;
+    contentRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
+  const contentRef = ctx.contentRef;
   const state = ctx.state;
   const scrollToBottom = ctx.scrollToBottom;
 
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
-    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
     let clientHeight = el.clientHeight;
+    let scrollHeight = el.scrollHeight;
+    // Within a pixel of the bottom, of the live geometry or of the one last
+    // delivered: a growth can land before the scroll event of the pin that
+    // answered the previous one, and that event must not read as leaving.
+    const isAtBottom = () =>
+      el.scrollHeight - el.clientHeight - el.scrollTop <= 1 ||
+      scrollHeight - clientHeight - el.scrollTop <= 1;
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtBottom();
     let frame: number | null = null;
     const onScroll = () => {
-      wasBottomLocked = isPhysicallyAtBottom();
+      wasBottomLocked = isAtBottom();
     };
-    const observer = new ResizeObserver(() => {
-      const nextHeight = el.clientHeight;
-      if (nextHeight === clientHeight) return;
-      clientHeight = nextHeight;
-      if (!wasBottomLocked) return;
-      // Gecko delivers this callback before the frame paints, but the
-      // library's scrollToBottom always lands a frame later (it defers
-      // through a rAF promise), so the shrink paints with the transcript
-      // shoved up before the follow-up pin snaps it back — a visible
-      // bounce on every wrapped composer line. Pin synchronously here
-      // first; the async pins below stay as a safety net for engines that
-      // deliver the callback after paint. Target the library's park
-      // position (one pixel short) so the settle is identical whether our
-      // write or the library's lands last.
+    const isSelecting = () => {
+      const selection = document.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+      const node = selection.getRangeAt(0).commonAncestorContainer;
+      return el.contains(node) || node.contains(el);
+    };
+    // Growth is answered only while the lock is live and no selection is being
+    // dragged: a history page landing above the reader releases the lock first,
+    // and the library holds its own correction under a selection.
+    const lockLive = () => state.isAtBottom && !state.escapedFromLock && !isSelecting();
+    // Target the library's park position (one pixel short) so the settle is
+    // identical whether our write or the library's lands last.
+    const pin = () => {
       el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
       scrollToBottom("instant");
+    };
+    const settle = () => {
+      const viewportChanged = el.clientHeight !== clientHeight;
+      const contentGrew = el.scrollHeight > scrollHeight;
+      clientHeight = el.clientHeight;
+      scrollHeight = el.scrollHeight;
+      if (!viewportChanged && !contentGrew) return;
+      if (!wasBottomLocked) return;
+      if (!viewportChanged && !lockLive()) return;
+      // The library corrects a frame later (a rAF promise), so the change would
+      // paint off the bottom first, and a long task after that paint holds the
+      // correction back as long as it runs. Pin now; the rAF pin stays as a net.
+      pin();
       if (frame !== null) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = null;
-        el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
-        scrollToBottom("instant");
+        // The reader may have wheeled away in between; never yank them back.
+        if (lockLive()) pin();
       });
-    });
+    };
+    const observer = new ResizeObserver(settle);
     el.addEventListener("scroll", onScroll, { passive: true });
-    observer.observe(el);
+    observer.observe(el); // viewport height
+    // Content growth changes scrollHeight, which the container's own box never reports.
+    const content = contentRef?.current;
+    if (content) observer.observe(content);
+    if (pinRef) pinRef.current = settle;
     return () => {
       el.removeEventListener("scroll", onScroll);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
+      if (pinRef?.current === settle) pinRef.current = null;
     };
-  }, [scrollRef, scrollToBottom, state]);
+  }, [contentRef, pinRef, scrollRef, scrollToBottom, state]);
 
   return null;
 }
