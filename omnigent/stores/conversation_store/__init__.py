@@ -1253,8 +1253,7 @@ class ConversationStore(ABC):
 
         A caller applying updates to state it read earlier wants
         :meth:`mutate_session_state` instead: two writers each holding their
-        own snapshot lose each other's changes here, which is why policy
-        evaluation no longer uses this method.
+        own snapshot lose each other's changes here.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.

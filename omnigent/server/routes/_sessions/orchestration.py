@@ -1695,11 +1695,14 @@ def _accumulate_session_usage(
     try:
         new_current = conversation_store.increment_session_usage(session_id, delta)
     except ConversationNotFoundError:
-        # Session deleted mid-stream: no row to bill or publish. Dropping the
-        # increment is better than failing the relay loop over a deleted session.
-        return None
-    # Per-user daily rollup (policy-gated; this is the per-turn delta).
+        # Session row deleted mid-stream: nothing left to bill or publish.
+        new_current = None
+    # Daily rollup attributes to the surviving owner (a sub-agent falls back to
+    # its root), so record it even when the session row vanished and the
+    # per-session increment above was dropped.
     _record_daily_cost(conv, cost_delta, conversation_store)
+    if new_current is None:
+        return None
     return _priced_cost_for_display(new_current)
 
 

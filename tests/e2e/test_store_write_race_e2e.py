@@ -6,7 +6,7 @@ so concurrent updates are silently lost, and neither path
 distinguishes an absent row from an empty one (phantom usage writes,
 orphan label rows).
 
-All four tests drive the REAL production components — the
+All five tests drive the REAL production components — the
 :class:`SqlAlchemyConversationStore`, :func:`build_policy_engine`, and
 :meth:`PolicyEngine.apply_state_updates` — against a real SQLite
 database, constructing the exact interleavings from the report
@@ -125,14 +125,15 @@ class _SeedWindowRacingStore:
         if name in ("set_labels", "seed_labels_if_absent"):
             real = getattr(self._inner, name)
 
-            def hooked(conversation_id: str, updates: Any, *args: Any, **kwargs: Any) -> Any:
+            def hooked(*args: Any, **kwargs: Any) -> Any:
+                conversation_id = kwargs.get("conversation_id", args[0] if args else None)
                 if not self.raced and conversation_id == self._conversation_id:
                     self.raced = True
                     # The concurrent policy write: a real caller sets
                     # integrity="0" via the normal label-write path,
                     # after the seeder's snapshot read.
-                    self._inner.set_labels(conversation_id, {"integrity": "0"})
-                return real(conversation_id, updates, *args, **kwargs)
+                    self._inner.set_labels(self._conversation_id, {"integrity": "0"})
+                return real(*args, **kwargs)
 
             return hooked
         return getattr(self._inner, name)

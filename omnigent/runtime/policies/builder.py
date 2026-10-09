@@ -1139,6 +1139,8 @@ def _seed_and_load_labels(
     try:
         return conversation_store.seed_labels_if_absent(conversation_id, declared)
     except ConversationNotFoundError as err:
+        # The row vanished during an in-flight build (concurrent delete), so this
+        # is a state conflict rather than a plain missing resource.
         raise OmnigentError(
             f"Conversation {conversation_id!r} has no row to seed labels into.",
             code=ErrorCode.CONFLICT,

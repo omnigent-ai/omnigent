@@ -1648,6 +1648,46 @@ def test_delete_of_the_same_key_name_on_a_top_level_session_removes_it(
     assert SESSION_COST_ASK_APPROVED_STATE_KEY not in persisted, persisted
 
 
+def test_unrelated_write_retains_an_inherited_root_key_in_the_hot_cache(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A sub-agent's unrelated local write keeps its inherited approval in the hot
+    cache without ever persisting it to the child row.
+
+    The inherited key lives only in the engine's cache (seeded from the root at
+    construction, never written to the child). An unrelated SET returns a merged
+    child state that never held it, so the overlay must PRESERVE it rather than
+    treat it as "gone" — the positive counterpart to the delete-overlay tests,
+    which only exercise keys this call named.
+    """
+    from omnigent.policies.schema import SESSION_COST_ASK_APPROVED_STATE_KEY
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    parent = conversation_store.create_conversation()
+    conversation_store.set_session_state(parent.id, {SESSION_COST_ASK_APPROVED_STATE_KEY: 0.05})
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    spec = AgentSpec(spec_version=1, name="x")
+    engine = build_policy_engine(
+        spec=spec, conversation_id=child.id, conversation_store=conversation_store
+    )
+    assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
+
+    engine.apply_state_updates([StateUpdate(key="risk", action=StateUpdateAction.SET, value=1)])
+
+    # Inherited approval retained in the hot cache alongside the new local key ...
+    assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05, engine.session_state
+    assert engine.session_state["risk"] == 1, engine.session_state
+
+    # ... but never written down to the child row: the local SET persists, the
+    # inherited key stays cache-only.
+    child_state = dict(conversation_store.get_conversation(child.id).session_state)
+    assert SESSION_COST_ASK_APPROVED_STATE_KEY not in child_state, child_state
+    assert child_state["risk"] == 1, child_state
+
+
 def test_supplied_root_is_a_hint_that_gets_verified(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -646,7 +646,7 @@ class PolicyEngine:
                 self._root_conversation_id, lambda state: _apply_one(state, op)
             )
         except ConversationNotFoundError:
-            _logger.debug(
+            _logger.warning(
                 "root conversation %s gone; cost-ask approval kept in memory only",
                 self._root_conversation_id,
             )
