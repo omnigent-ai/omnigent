@@ -10,6 +10,11 @@ Two families: **HTTP/API journeys** (server + DB, no runner/LLM — fast and
 low-noise) and **full-turn journeys** (a real agent turn through the runner +
 a zero-latency mock LLM). See *Journeys* below.
 
+The companion [OSS UI benchmark](../ui/README.md) drives the production SPA in
+Chromium against the same isolated server lifecycle. It measures populated
+session opening, composer key-to-frame latency, and per-keystroke style/layout
+work, with a same-runner base-versus-PR gate and nightly JSON artifacts.
+
 By default the server boots a fresh, empty SQLite DB, which gives best-case
 numbers that don't move with load. For meaningful results, point it at a
 **pre-seeded corpus** (`seed.py`) and, ideally, at **Postgres** — production

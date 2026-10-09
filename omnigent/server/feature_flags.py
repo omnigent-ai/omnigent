@@ -25,6 +25,7 @@ class Feature(StrEnum):
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     HARNESS_SETTINGS_UI = "harness_settings_ui"
+    CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Harnesses settings page with per-harness MCPs, skills, and plugins",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
+        description="Manage reusable custom agents from Settings",
+        owner="web",
+        review_by_release="0.18.0",
     ),
 )
 

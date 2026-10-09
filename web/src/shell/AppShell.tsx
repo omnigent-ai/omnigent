@@ -12,7 +12,6 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
-import { CanvasSidebarRail } from "@/canvas/CanvasSidebarRail";
 import { CANVAS_CONVERSATION_MIN_WIDTH, CanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
@@ -897,7 +896,7 @@ export function AppShell() {
   } = useResizableInlinePanel(
     rootSessionId,
     inlinePanelMinWidth,
-    (sidebarOpen ? sidebarWidth : canvasMode ? 56 : 0) + (canvasMode ? canvasReservedWidth : 0),
+    (sidebarOpen ? sidebarWidth : 0) + (canvasMode ? canvasReservedWidth : 0),
     rootSessionResolved,
     canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
   );
@@ -1700,10 +1699,13 @@ export function AppShell() {
     setSidebarOpen(false);
     setSidebarPeek(false);
   }, [setSidebarOpen]);
-  const handleSidebarOpen = useCallback(() => {
-    setSidebarOpen(true);
-    setSidebarPeek(false);
-  }, [setSidebarOpen]);
+  const handleSidebarOpen = useCallback(
+    (peek = false) => {
+      setSidebarOpen(!peek);
+      setSidebarPeek(peek);
+    },
+    [setSidebarOpen],
+  );
   const handleOpenSearch = useCallback(() => {
     setSessionSearch(false);
     setCommandPaletteOpen(true);
@@ -2407,9 +2409,6 @@ export function AppShell() {
               onOpenSearch={handleOpenSearch}
             />
 
-            {canvasMode && !sidebarOpen && (
-              <CanvasSidebarRail onExpand={handleSidebarOpen} onSearch={handleOpenSearch} />
-            )}
             {/* Content region (everything right of the sidebar): a relative
           flex row holding the chat+workspace group and the push panels
           as siblings. */}
@@ -2418,6 +2417,7 @@ export function AppShell() {
               conversationId={conversationId}
               minConversationWidth={workspacePanelVisible ? preferredConversationWidth : undefined}
               onCanvasWidthChange={setCanvasReservedWidth}
+              onOpenSidebar={sidebarOpen ? undefined : handleSidebarOpen}
             >
               {/* Chat + workspace group. The full-width header overlay is
             scoped to this group, so it spans the chat *and* the right
@@ -2454,15 +2454,7 @@ export function AppShell() {
                     // the floating card (and in the title-bar strip on mac).
                     sidebarOpen={sidebarOpen}
                     settingsMode={inSettings}
-                    onOpenSidebar={(peek?: boolean) => {
-                      if (peek) {
-                        setSidebarPeek(true);
-                        setSidebarOpen(false);
-                      } else {
-                        setSidebarOpen(true);
-                        setSidebarPeek(false);
-                      }
-                    }}
+                    onOpenSidebar={handleSidebarOpen}
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}

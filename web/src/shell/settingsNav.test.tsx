@@ -22,6 +22,8 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
+  customAgentsEnabled: false as boolean | undefined,
+  agentInstall: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -29,6 +31,10 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    features: {
+      custom_agents_settings_ui: mocks.customAgentsEnabled,
+    },
+    agent_install: mocks.agentInstall,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -62,6 +68,8 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
+  mocks.customAgentsEnabled = false;
+  mocks.agentInstall = false;
 });
 afterEach(cleanup);
 
@@ -330,13 +338,6 @@ describe("SettingsSidebarBody", () => {
 });
 
 describe("useSettingsRoute", () => {
-  function routeHook(path: string) {
-    const w = ({ children }: { children: ReactNode }) => (
-      <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
-    );
-    return renderHook(() => useSettingsRoute(), { wrapper: w }).result.current;
-  }
-
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the
     // sidebar's `inSettings` gate stays true and the settings nav stays put —
@@ -429,6 +430,65 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/ml/omnigent-embed/settings/members")).toEqual({
       inSettings: true,
       section: "members",
+    });
+  });
+});
+
+function routeHook(path: string) {
+  const w = ({ children }: { children: ReactNode }) => (
+    <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
+  );
+  return renderHook(() => useSettingsRoute(), { wrapper: w }).result.current;
+}
+
+describe("custom agent settings availability", () => {
+  it.each([
+    [undefined, true],
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])("gates nav and direct routes with flag=%s and API=%s", (flag, api) => {
+    mocks.customAgentsEnabled = flag;
+    mocks.agentInstall = api;
+    renderBody();
+    const enabled = flag === true && api;
+    expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(enabled);
+    expect(!!screen.queryByRole("heading", { name: "Customize" })).toBe(enabled);
+    const group = screen.getByRole("heading", { name: enabled ? "Customize" : "General" });
+    expect(group.parentElement).toContainElement(screen.getByTestId("settings-nav-harnesses"));
+    if (enabled) {
+      expect(group.parentElement).toContainElement(
+        screen.getByTestId("settings-nav-custom-agents"),
+      );
+    }
+    for (const suffix of ["", "/new", "/agent-1"]) {
+      expect(routeHook(`/settings/custom-agents${suffix}`).section).toBe(
+        flag && api ? "custom-agents" : "general",
+      );
+    }
+  });
+
+  it("groups Harnesses and Custom agents under Customize and parses embedded detail routes", () => {
+    mocks.customAgentsEnabled = true;
+    mocks.agentInstall = true;
+    const groups = settingsNavGroups(false, true, false, false, false, true);
+    expect(groups.map((group) => group.title)).toEqual([
+      "General",
+      "Customize",
+      "Desktop",
+      "Archived",
+    ]);
+    expect(
+      groups.find((group) => group.title === "Customize")?.items.map((item) => item.id),
+    ).toEqual(["harnesses", "custom-agents"]);
+    expect(
+      groups.flatMap((group) => group.items).filter((item) => item.id === "harnesses"),
+    ).toHaveLength(1);
+    expect(routeHook("/ml/omnigent-embed/settings/custom-agents/agent-1")).toEqual({
+      inSettings: true,
+      section: "custom-agents",
+      agentId: "agent-1",
     });
   });
 });

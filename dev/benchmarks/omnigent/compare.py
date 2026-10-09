@@ -360,9 +360,14 @@ def build_markdown(
 
     for row in rows:
         status = row["status"]
-        emoji = {"regression": "🔴", "failed": "❌", "new": "🆕", "ok": "✅", "skipped": "⚠️"}.get(
-            status, status
-        )
+        emoji = {
+            "regression": "🔴",
+            "failed": "❌",
+            "new": "🆕",
+            "ok": "✅",
+            "skipped": "⚠️",
+            "advisory": "⚠️",
+        }.get(status, status)
         b_p50 = _fmt_ms(row["b_p50"])
         c_p50 = _fmt_ms(row["c_p50"])
         d_p50 = _fmt_delta(row["delta_p50"])
@@ -381,7 +386,7 @@ def build_markdown(
         lines += ["", _UNGATED_P95_NOTE]
     lines.append("")
     verdict = (
-        "**PASS** — no regressions detected."
+        "**PASS** — no blocking regressions detected."
         if passed
         else "**FAIL** — regression(s) or failed journey(s) detected."
     )

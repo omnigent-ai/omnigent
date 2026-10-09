@@ -19,11 +19,9 @@ const ICONS: Record<string, LucideIcon> = {
 export function ExtensionPrimaryNavigation({
   activePageId,
   onNavigate,
-  compact = false,
 }: {
   activePageId: string | null;
   onNavigate?: (event: MouseEvent<HTMLAnchorElement>) => void;
-  compact?: boolean;
 }) {
   // V1 owns one slot between Inbox and Usage. `order` is deterministic within
   // that extension-owned slot; it does not reorder core navigation rows.
@@ -50,7 +48,6 @@ export function ExtensionPrimaryNavigation({
         onClick={onNavigate}
         componentId={`sidebar.extension.${navigation.id}`}
         testId={`extension-nav-${navigation.id}`}
-        compact={compact}
       />
     );
   });

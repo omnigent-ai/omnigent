@@ -26,6 +26,7 @@ def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "harness_settings_ui": True,
+        "custom_agents_settings_ui": False,
     }
 
 

@@ -39,10 +39,12 @@ export function BackButton({
   label,
   to,
   onClick,
+  componentId = "settings.harnesses.back",
 }: {
   label: string;
   to?: string;
   onClick?: () => void;
+  componentId?: string;
 }) {
   return (
     <Button
@@ -53,7 +55,7 @@ export function BackButton({
       onClick={onClick}
     >
       {to !== undefined ? (
-        <Link to={to} componentId="settings.harnesses.back">
+        <Link to={to} componentId={componentId}>
           <ArrowLeftIcon />
           {label}
         </Link>
