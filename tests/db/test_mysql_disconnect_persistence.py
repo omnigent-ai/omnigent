@@ -1,5 +1,5 @@
-"""Regression against a real MySQL server: a transient statement disconnect
-must be retried so a session-persistence write persists exactly once.
+"""Real-MySQL regression: a transient statement disconnect during a
+session-persistence write must be replayed so the append persists exactly once.
 
 :func:`omnigent.db.utils.run_write_transaction` replays CockroachDB
 serialization failures (40001) and MySQL deadlock victims (1213). A
@@ -9,22 +9,18 @@ server during query") or 2006 ("MySQL server has gone away") on the
 SQLAlchemy ``OperationalError`` that the server maps to an HTTP 500 with a
 ``Database error:`` log, the KPI signature this guards against.
 
-This test drives the real ``SqlAlchemyConversationStore.append()`` against a
-real MySQL 8.0 server (the reported ``mysql+pymysql://`` deployment), fronts it
-with a TCP relay that severs the connection mid-statement on that write, and
-asserts the item still persists exactly once.
-
-A real disconnect (failover, restart, a ``wait_timeout`` kill) also releases
-the dead session's row locks. Severing only the TCP path would leave the
-orphaned transaction holding the ``conversations`` row lock until InnoDB's
-lock-wait timeout, so a background reaper kills that transaction once the
-disconnect has fired, mimicking that server-side teardown.
+The test drives the real ``SqlAlchemyConversationStore.append()`` against a
+throwaway MySQL 8.0 server (the reported ``mysql+pymysql://`` deployment) and a
+TCP relay (``_DropRelay``) that severs the connection on that write; a
+background reaper (``_reap_orphaned_transaction``) frees the locks the cut would
+otherwise strand.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import socket
 import struct
@@ -56,6 +52,17 @@ def _find_mysqld() -> str | None:
     if found:
         return found
     return "/usr/sbin/mysqld" if os.path.exists("/usr/sbin/mysqld") else None
+
+
+def _mysqld_major_minor(mysqld: str) -> tuple[int, int] | None:
+    try:
+        out = subprocess.run(
+            [mysqld, "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"Ver (\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else None
 
 
 def _free_port() -> int:
@@ -263,15 +270,13 @@ def _reap_orphaned_transaction(
     and releases its row locks. Severing only the TCP path leaves the orphaned
     transaction holding the ``conversations`` row lock. While the write is in
     flight (before the drop), record the thread id of the oldest ``RUNNING``
-    transaction -- the orphan-to-be; once the disconnect has fired, kill that
-    exact thread. The replay reconnects on a new thread, so it is never the
-    target. The cold fallback, used only if the orphan was never observed, is
-    bounded to transactions that started no later than the drop, so it cannot
-    hit the replay either. The reaper's own connection is excluded, and it
+    transaction -- the orphan-to-be -- and once the disconnect has fired kill
+    exactly that thread. The replay reconnects on a new thread, so it is never
+    a target; if the orphan was somehow never observed the reaper kills nothing
+    rather than risk the replay. The reaper's own connection is excluded, and it
     connects straight to the server, bypassing the relay.
     """
     orphan_thread_id: int | None = None
-    drop_time: Any = None
     conn: Any = None
     try:
         while not stop.is_set():
@@ -305,28 +310,11 @@ def _reap_orphaned_transaction(
                         row = cur.fetchone()
                         if row is not None:
                             orphan_thread_id = int(row[0])
-                    else:
-                        if drop_time is None:
-                            cur.execute("SELECT NOW(6)")
-                            drop_time = cur.fetchone()[0]
-                        target = orphan_thread_id
-                        if target is None:
-                            cur.execute(
-                                "SELECT trx_mysql_thread_id "
-                                "FROM information_schema.innodb_trx "
-                                "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
-                                "AND trx_started <= %s "
-                                "AND trx_mysql_thread_id <> CONNECTION_ID() "
-                                "ORDER BY trx_started ASC LIMIT 1",
-                                (drop_time,),
-                            )
-                            row = cur.fetchone()
-                            target = int(row[0]) if row is not None else None
-                        if target is not None:
-                            # The orphan may vanish on its own before the KILL.
-                            with contextlib.suppress(Exception):
-                                cur.execute(f"KILL {target}")
-                            return
+                    elif orphan_thread_id is not None:
+                        # The orphan may vanish on its own before the KILL.
+                        with contextlib.suppress(Exception):
+                            cur.execute(f"KILL {orphan_thread_id}")
+                        return
             except Exception:
                 conn = None
                 continue
@@ -343,16 +331,30 @@ def mysql_server() -> Iterator[_MySQLServer]:
     mysqld = _find_mysqld()
     if mysqld is None:
         pytest.skip("mysqld not available")
-    server = _MySQLServer(mysqld)
-    try:
-        server.start()
-    except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
-        server.stop()
-        pytest.skip(f"could not start a local mysqld: {exc}")
-    try:
-        yield server
-    finally:
-        server.stop()
+    version = _mysqld_major_minor(mysqld)
+    if version is not None and version >= (8, 4):
+        # mysql_native_password is disabled in 8.4 and removed in 9.0, and
+        # --skip-ssl is gone post-8.0; this regression targets the reported
+        # MySQL 8.0 deployment, so skip newer servers deliberately.
+        pytest.skip(f"mysqld {version[0]}.{version[1]} is newer than this test's MySQL 8.0 setup")
+    # Retry once on a fresh port to absorb a port-selection race; a present,
+    # supported mysqld that still will not start is a real fixture regression
+    # (bad init SQL or flags), so surface it instead of skipping silently.
+    last_exc: Exception | None = None
+    for _ in range(2):
+        server = _MySQLServer(mysqld)
+        try:
+            server.start()
+        except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
+            server.stop()
+            last_exc = exc
+            continue
+        try:
+            yield server
+            return
+        finally:
+            server.stop()
+    raise RuntimeError(f"could not start a local mysqld: {last_exc}")
 
 
 @pytest.fixture
@@ -431,4 +433,7 @@ def test_transient_mysql_disconnect_persists_session_write(
     assert texts.count("second message") == 1, (
         f"the user message did not persist exactly once after a transient "
         f"disconnect; conversation items were {texts!r}."
+    )
+    assert texts.count("first message") == 1, (
+        f"the replay disturbed the already-committed message; conversation items were {texts!r}."
     )
