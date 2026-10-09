@@ -881,31 +881,31 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
   // The row containing the fixed nav tabs — the tab strip.
   const strip = () => screen.getByRole("tab", { name: /files/i }).closest("div.border-b")!;
 
-  it("keeps exactly one ml-auto in the strip with no open tabs (maximize pins right)", () => {
+  it("keeps exactly one ml-auto in the strip with no open tabs (picker pins trailing controls right)", () => {
     // Two ml-auto siblings split the free space and strand the nav group
-    // mid-strip. With no open tabs the single ml-auto lives on the maximize
-    // button; the nav group must NOT also carry one.
+    // mid-strip. With no open tabs the single ml-auto lives on the panel picker
+    // wrapper; the nav group must NOT also carry one.
     renderWorkspace({ openFiles: [], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
-    // It's the maximize button's wrapper (pins the button right).
-    const fullScreen = screen.getByRole("button", { name: "Full screen" });
-    expect(fullScreen.parentElement).toHaveClass("ml-auto");
+    // The picker pins the trailing controls right.
+    const picker = screen.getByRole("button", { name: "Select panel" });
+    expect(picker.parentElement).toHaveClass("ml-auto");
     // The nav tablist stays left — no ml-auto.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
   });
 
-  it("keeps exactly one ml-auto in the strip with open tabs (nav tabs stay left, maximize pins right)", () => {
+  it("keeps exactly one ml-auto in the strip with open tabs (picker pins trailing controls right)", () => {
     // The nav tabs stay anchored on the LEFT with open tabs — the open-tabs
-    // region renders to their right and the maximize button keeps the row's
+    // region renders to their right and the panel picker keeps the row's
     // single ml-auto. Two ml-auto siblings would split the free space.
     renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
     // The nav tablist stays left — no ml-auto of its own.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
-    // The maximize button owns the single ml-auto, pinning it right.
-    expect(screen.getByRole("button", { name: "Full screen" }).parentElement).toHaveClass(
+    // The panel picker owns the single ml-auto, pinning the controls right.
+    expect(screen.getByRole("button", { name: "Select panel" }).parentElement).toHaveClass(
       "ml-auto",
     );
     // The divider is present (separating the nav tabs from the open tabs) and
@@ -915,7 +915,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     expect(divider).not.toHaveClass("ml-auto");
   });
 
-  it("does not leave a phantom gap: empty tab strips render nothing, so the '+' hugs the last tab", () => {
+  it("renders only populated tab strips in the scroll viewport", () => {
     // FileTabsStrip / TerminalTabsStrip must return null when empty — an empty
     // wrapper would still occupy a slot in the scroller's gap and offset the
     // trailing "+". With a file open (and no shells) the scroller should hold
@@ -1122,5 +1122,52 @@ describe("WorkspacePanel mobile side chats", () => {
 
     expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+});
+
+describe("WorkspacePanel panel picker", () => {
+  it("selects a file by full path, distinguishing duplicate basenames", () => {
+    const { openFileViewer } = renderWorkspace({
+      openFiles: ["src/index.ts", "tests/index.ts"],
+      selectedFilePath: "src/index.ts",
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "src/index.ts" })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "tests/index.ts" }));
+    expect(openFileViewer).toHaveBeenCalledWith("tests/index.ts");
+  });
+
+  it("lists available permanent panels and switches to them", () => {
+    const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    for (const name of ["Changes", "Pull Requests", "Agents"]) {
+      expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pull Requests" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("github");
+  });
+
+  it("selects an open terminal", () => {
+    const { openTerminalTab } = renderWorkspace({ openTerminals: ["terminal:zsh"] });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "zsh" }));
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
+  });
+
+  it("selects browser and side-chat tabs", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-one"],
+      openSideChats: ["pending:one"],
+    });
+    const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Browser 1" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
   });
 });

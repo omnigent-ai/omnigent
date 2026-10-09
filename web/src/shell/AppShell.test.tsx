@@ -2829,6 +2829,28 @@ describe("Right workspace card visibility", () => {
     await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
   });
 
+  it("focuses the workspace toolbar when its selected fixed tab is hidden", async () => {
+    writeSessionWorkspaceState("conv_compact_workspace", {
+      open: true,
+      rightRailTab: "changes",
+      openFiles: ["README.md"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_compact_workspace", permission_level: null }]);
+    renderShell("/c/conv_compact_workspace");
+    const selected = screen.getByRole("tab", { name: /changes/i });
+    Object.defineProperty(selected, "checkVisibility", { value: () => false });
+
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+
+    await waitFor(() =>
+      expect(screen.getByRole("toolbar", { name: "Workspace tabs" })).toHaveFocus(),
+    );
+  });
+
   it("mounts an expandable pending card for a temporary session", () => {
     writeSessionWorkspaceState("temp:12345678", { open: true });
     mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
