@@ -135,6 +135,33 @@ def test_pending_count_hook_persists_publish_and_resolve(
     ]
 
 
+def test_hook_leaked_past_reset_for_tests_poisons_later_persist_writes(
+    request: pytest.FixtureRequest, recording_store: _RecordingStore
+) -> None:
+    """A later test's own count write must reach its freshly wired store.
+
+    Models two tests sharing a process: the first registers the persist
+    hook and tears down with ``reset_for_tests`` alone; the second wires
+    its store, publishes, and then writes the same conversation/count
+    itself. A hook that outlives the reset writes on the publish and stamps
+    the dedupe cache, so the second test's identical write is dropped.
+    """
+    request.addfinalizer(pending_elicitations.reset_for_tests)
+    pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    pending_elicitations.reset_for_tests()
+
+    session_live_state.configure(recording_store)  # type: ignore[arg-type]
+    pending_elicitations.record_publish(
+        "conv_1", {"type": "response.elicitation_request", "elicitation_id": "elicit_1"}
+    )
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+    leaked_writes = list(recording_store.pending_writes)
+
+    session_live_state.persist_pending_count("conv_1", 1)
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+    assert (leaked_writes, recording_store.pending_writes) == ([], [("conv_1", 1)])
+
+
 def test_runner_liveness_touch_and_clear_pass_through(
     recording_store: _RecordingStore,
 ) -> None:
