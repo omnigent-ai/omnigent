@@ -73,3 +73,36 @@ export function formatBytes(bytes: number): string {
   }
   return `${bytes} B`;
 }
+
+function modifiedDate(modifiedAt: number): Date {
+  // Filesystem payloads use Unix seconds; tolerate milliseconds for callers
+  // that already hold a JavaScript timestamp.
+  return new Date(modifiedAt < 10_000_000_000 ? modifiedAt * 1000 : modifiedAt);
+}
+
+export function formatEditedRelative(modifiedAt: number, now = Date.now()): string {
+  const elapsedSeconds = Math.max(0, Math.floor((now - modifiedDate(modifiedAt).getTime()) / 1000));
+  if (elapsedSeconds < 60) return "just now";
+  if (elapsedSeconds < 3600) return `${Math.floor(elapsedSeconds / 60)} min ago`;
+  if (elapsedSeconds < 86_400) return `${Math.floor(elapsedSeconds / 3600)} hr ago`;
+  const days = Math.floor(elapsedSeconds / 86_400);
+  return days < 30 ? `${days}d ago` : modifiedDate(modifiedAt).toLocaleDateString();
+}
+
+export function formatEditedCompact(modifiedAt: number, now = Date.now()): string {
+  const elapsedSeconds = Math.max(0, Math.floor((now - modifiedDate(modifiedAt).getTime()) / 1000));
+  if (elapsedSeconds < 60) return "now";
+  if (elapsedSeconds < 3600) return `${Math.floor(elapsedSeconds / 60)}m`;
+  if (elapsedSeconds < 86_400) return `${Math.floor(elapsedSeconds / 3600)}h`;
+  if (elapsedSeconds < 604_800) return `${Math.floor(elapsedSeconds / 86_400)}d`;
+  return modifiedDate(modifiedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+export function formatEditedAbsolute(modifiedAt: number): string {
+  return modifiedDate(modifiedAt).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
