@@ -521,6 +521,13 @@ def _default_model_provider_id(provider: PiProviderConfig, rendered: _PiModelsCo
     return provider.provider_id
 
 
+def pi_own_login_serves_reference(reference: str | None, agent_dir: Path | None = None) -> bool:
+    """Return whether Pi's own logged-in catalog serves the qualified *reference*."""
+    if not reference:
+        return False
+    return any(option["id"] == reference for option in pi_own_login_model_options(agent_dir))
+
+
 def pi_native_model_options(
     *,
     config_loader: Callable[[], dict[str, object]] | None = None,
@@ -1770,7 +1777,25 @@ def resolve_pi_native_provider(
     unmanaged_prefix_warning: str | None = None
     if selection is not None:
         _, model = selection
+    # An unqualified slash id either names a configured provider or is the
+    # endpoint's (or Pi's own) model naming; both branches below need the split.
+    prefix = bare = ""
+    names_configured_provider = False
+    if selection is None and model and "/" in model:
+        prefix, _, bare = model.partition("/")
+        providers = config.get("providers")
+        names_configured_provider = (
+            bool(bare) and isinstance(providers, dict) and prefix in providers
+        )
     try:
+        # Preserve Pi-login references unless they name a configured provider.
+        if bare and not names_configured_provider and pi_own_login_serves_reference(model):
+            _LOGGER.info(
+                "pi-native: model %r is served by Pi's own %r login; Pi will use its own login.",
+                model,
+                prefix,
+            )
+            return None
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
         # default exactly like the rest of the codebase — an explicit pi default
@@ -1796,25 +1821,19 @@ def resolve_pi_native_provider(
                 "surface; Pi will use its own login."
             )
             return None
-        if selection is None and model and "/" in model:
-            prefix, _, bare = model.partition("/")
-            providers = config.get("providers")
-            # A picker override can arrive qualified by the omnigent provider
-            # name ("rpw-fable/databricks-claude-fable-5-1"); registering it
-            # verbatim renders a slash id no endpoint serves. Split only when
-            # the prefix names a configured provider — any other slash id is
-            # the endpoint's own model naming (e.g. "openai/gpt-4o" on
-            # OpenRouter, "zai-org/GLM-4.7") and must stay verbatim.
-            if bare and isinstance(providers, dict) and prefix in providers:
-                if prefix != entry.name:
-                    unmanaged_prefix_warning = (
-                        f"The model override '{model}' names provider "
-                        f"'{prefix}', but this Pi session is served by "
-                        f"provider '{entry.name}'; the model '{bare}' was "
-                        f"requested from '{entry.name}' instead."
-                    )
-                    _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
-                model = bare
+        # Split only when the prefix names a configured provider; any other
+        # slash id is the endpoint's own model naming (e.g. "openai/gpt-4o"
+        # on OpenRouter) and must stay verbatim.
+        if names_configured_provider:
+            if prefix != entry.name:
+                unmanaged_prefix_warning = (
+                    f"The model override '{model}' names provider "
+                    f"'{prefix}', but this Pi session is served by "
+                    f"provider '{entry.name}'; the model '{bare}' was "
+                    f"requested from '{entry.name}' instead."
+                )
+                _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
+            model = bare
         if entry.kind == DATABRICKS_KIND:
             resolved = _databricks_pi_provider(entry, model=model)
         elif entry.kind == CLI_CONFIG_KIND:

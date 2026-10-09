@@ -14,13 +14,16 @@ from omnigent.harnesses.pi_native import credentials as creds
 
 
 @pytest.fixture(autouse=True)
-def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_host_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
     )
+    # The resolver consults Pi's own login catalog (~/.pi/agent by default);
+    # point it at an empty dir so a developer's real login can't flip outcomes.
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(tmp_path / "pi-agent"))
 
 
 def _databricks_config() -> dict[str, object]:
@@ -724,6 +727,105 @@ def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
 
     assert provider is not None
     assert provider.model == "claude-opus-4-7"
+
+
+def _openrouter_default_pi_config() -> dict[str, object]:
+    return {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-or-testkey",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+
+
+def _seed_pi_login_catalog(agent_dir: Path, provider_id: str, model_ids: list[str]) -> None:
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "auth.json").write_text(json.dumps({provider_id: {"type": "oauth"}}))
+    (agent_dir / "models-store.json").write_text(
+        json.dumps({provider_id: {"models": [{"id": model_id} for model_id in model_ids]}})
+    )
+
+
+def test_pi_own_login_reference_classification(tmp_path: Path) -> None:
+    _seed_pi_login_catalog(tmp_path, "openai-codex", ["gpt-5.6-sol"])
+
+    assert creds.pi_own_login_serves_reference("openai-codex/gpt-5.6-sol", tmp_path)
+    assert not creds.pi_own_login_serves_reference("anthropic/claude-opus-5", tmp_path)
+    assert not creds.pi_own_login_serves_reference("openai-codex/gpt-4o", tmp_path)
+    assert not creds.pi_own_login_serves_reference("gpt-5.6-sol", tmp_path)
+    assert not creds.pi_own_login_serves_reference("/gpt-5.6-sol", tmp_path)
+    assert not creds.pi_own_login_serves_reference("openai-codex/", tmp_path)
+    assert not creds.pi_own_login_serves_reference(None, tmp_path)
+    assert not creds.pi_own_login_serves_reference("", tmp_path)
+
+
+def test_pi_own_login_reference_matches_slash_bearing_model_id(tmp_path: Path) -> None:
+    _seed_pi_login_catalog(tmp_path, "openrouter", ["qwen/qwen3-coder"])
+
+    assert creds.pi_own_login_serves_reference("openrouter/qwen/qwen3-coder", tmp_path)
+    assert not creds.pi_own_login_serves_reference("openrouter/qwen", tmp_path)
+
+
+def test_resolve_prefers_pi_own_login_for_served_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_pi_login_catalog(tmp_path, "openai-codex", ["gpt-5.6-sol"])
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="openai-codex/gpt-5.6-sol", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is None
+
+
+def test_resolve_keeps_gateway_routing_for_unserved_slash_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="openai/gpt-4o-mini", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is not None
+    assert provider.model == "openai/gpt-4o-mini"
+
+
+def test_resolve_configured_provider_prefix_wins_over_pi_own_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_pi_login_catalog(tmp_path, "openrouter", ["gpt-4o-mini"])
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="openrouter/gpt-4o-mini", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is not None
+    assert provider.model == "gpt-4o-mini"
+
+
+def test_resolve_managed_selection_stays_managed_despite_pi_own_login_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit managed pick keeps managed routing even if Pi's login serves the same id."""
+    _seed_pi_login_catalog(tmp_path, "openai-codex", ["gpt-5.6-sol"])
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="omnigent/openai-codex/gpt-5.6-sol", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is not None
+    assert provider.model == "openai-codex/gpt-5.6-sol"
 
 
 def test_subscription_default_returns_none() -> None:
@@ -2122,13 +2224,20 @@ def test_provider_qualified_override_split_to_configured_provider() -> None:
     assert not [mid for mid in ids if "/" in mid]
 
 
-def test_override_qualified_by_other_configured_provider_warns() -> None:
+@pytest.mark.parametrize("pi_login_serves_reference", [False, True])
+def test_override_qualified_by_other_configured_provider_warns(
+    pi_login_serves_reference: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Naming a configured provider other than the serving one warns.
 
     The session is served by the pi-default provider, so a model picked from
     another configured provider is requested from the default instead — say
-    so rather than silently reinterpreting the value.
+    so rather than silently reinterpreting the value. The configured prefix
+    keeps precedence even when Pi's own login serves the same reference.
     """
+    if pi_login_serves_reference:
+        _seed_pi_login_catalog(tmp_path, "other-gw", ["databricks-claude-fable-5-1"])
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
     config = _rpw_fable_anthropic_gateway()
     config["providers"]["other-gw"] = {
         "kind": "gateway",
