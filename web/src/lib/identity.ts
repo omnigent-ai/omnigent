@@ -17,7 +17,12 @@
 
 import { stripBasePath, withBasePath } from "./basePath";
 import { getCachedServerInfo } from "./capabilities";
-import { getOmnigentHostConfig, hostFetch, isDatabricksWorkspace } from "./host";
+import {
+  getOmnigentHostConfig,
+  getOmnigentServerIdentity,
+  hostFetch,
+  isDatabricksWorkspace,
+} from "./host";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -295,6 +300,30 @@ let serverLoginUrl: string | null = null;
 // navigations. Boot also reads this to skip mounting the app when the
 // session is already on its way out (see `isLoginRedirectPending`).
 let loginRedirectPending = false;
+// Server the cached identity was read from (`undefined` until first bound). A
+// host can repoint the app at another Server in place, so the cache is dropped
+// when it changes; keyed on the Server, not the (re-render-bumped) generation.
+let identityServer: string | null | undefined;
+
+/**
+ * Drop the cached identity when the host has switched Servers. Every reader
+ * below calls this first, so no synchronous caller sees the previous Server's
+ * user or admin flag; standalone has one Server per page, so it never fires.
+ */
+function syncIdentityServer(): void {
+  const server = getOmnigentServerIdentity();
+  if (identityServer === undefined) {
+    identityServer = server;
+    return;
+  }
+  if (server === identityServer) return;
+  identityServer = server;
+  currentUserId = null;
+  currentIsAdmin = false;
+  identityResolved = false;
+  identityPromise = null;
+  serverLoginUrl = null;
+}
 
 /**
  * Hand the browser to `loginUrl`, at most once per document.
@@ -352,11 +381,18 @@ function isOnLoginPath(): boolean {
  * redirects the browser to the login page.
  */
 export async function resolveIdentity(): Promise<string | null> {
+  syncIdentityServer();
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
+  // The Server this probe is asking. Compared against the live host config
+  // when it answers, so a reply that lands after the host switched Servers is
+  // discarded instead of being cached for the Server that never sent it.
+  const probeServer = getOmnigentServerIdentity();
+  const isStale = () => getOmnigentServerIdentity() !== probeServer;
   identityPromise = (async () => {
     try {
       const res = await hostFetch("/v1/me");
+      if (isStale()) return null;
       if (res.status === 401) {
         // OIDC / accounts mode: server requires authentication.
         // Redirect to the login URL provided in the response body —
@@ -367,6 +403,7 @@ export async function resolveIdentity(): Promise<string | null> {
             user_id: null;
             login_url?: string;
           };
+          if (isStale()) return null;
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
@@ -383,12 +420,14 @@ export async function resolveIdentity(): Promise<string | null> {
           user_id: string | null;
           is_admin?: boolean;
         };
+        if (isStale()) return null;
         currentUserId = data.user_id;
         currentIsAdmin = data.is_admin ?? false;
       }
     } catch {
       // Server unreachable — leave as null.
     }
+    if (isStale()) return null;
     identityResolved = true;
     return currentUserId;
   })();
@@ -397,6 +436,7 @@ export async function resolveIdentity(): Promise<string | null> {
 
 /** Return the cached user ID (null before resolveIdentity completes). */
 export function getCurrentUserId(): string | null {
+  syncIdentityServer();
   return currentUserId;
 }
 
@@ -406,6 +446,7 @@ export function getCurrentUserId(): string | null {
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */
 export function getCurrentIsAdmin(): boolean {
+  syncIdentityServer();
   return currentIsAdmin;
 }
 
@@ -415,6 +456,7 @@ export function getCurrentIsAdmin(): boolean {
  * resolves and for the `"local"` sentinel, so those stay unlabeled.
  */
 export function getCurrentAuthorId(): string | null {
+  syncIdentityServer();
   if (currentUserId === null || currentUserId === RESERVED_USER_LOCAL) {
     return null;
   }
@@ -452,6 +494,7 @@ export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
+  syncIdentityServer();
   const headers = new Headers(init?.headers);
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);

@@ -10,6 +10,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-embed
+dist-e2e-embed-host
 dist-ssr
 coverage
 *.local
