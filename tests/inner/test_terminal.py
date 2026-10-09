@@ -3718,3 +3718,39 @@ async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) 
     assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
     assert plain["screen"] == joined["screen"]
     assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+async def test_launch_delivers_argv_over_tmux_command_cap_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path
+) -> None:
+    """A pane argv larger than tmux's ~16KB per-command cap still launches intact.
+
+    Large agent instructions ride the CLI argv (``--append-system-prompt``), and
+    tmux rejects one oversized client command with "command too long".
+    """
+    # ``close()`` removes the private dir, so the pane's output lives beside it.
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    output = tmp_path / "argv.json"
+    script = (
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+    )
+    expected = ["--append-system-prompt", "x" * 20_000]
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=private_dir,
+        command=sys.executable,
+        args=["-c", script, str(output), *expected],
+        keep_alive_after_exit=True,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        async with asyncio.timeout(10):
+            while await instance.is_alive():
+                await asyncio.sleep(0.05)
+    finally:
+        await instance.close()
+    assert json.loads(output.read_text()) == expected
