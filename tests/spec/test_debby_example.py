@@ -26,14 +26,8 @@ _DEBBY_DIR = _REPO_ROOT / "examples" / "debby"
 _PACKAGED_DEBBY_DIR = _REPO_ROOT / "omnigent" / "resources" / "examples" / "debby"
 
 
-def test_debby_gpt_head_uses_codex_not_openai_agents() -> None:
-    """The GPT head runs on ``codex-native`` with an unsandboxed ``os_env``.
-
-    Flipping to the SDK ``codex`` harness reintroduces the reported
-    signer-backed startup failure; ``openai-agents`` with no pinned model
-    silently routes to ambient Databricks credentials; dropping the explicit
-    ``os_env`` makes the native terminal require ``bwrap`` on Linux.
-    """
+def test_debby_gpt_head_uses_codex_native_unsandboxed() -> None:
+    """The GPT head uses ``codex-native`` and keeps the unsandboxed ``os_env``."""
     spec = parse(_DEBBY_DIR)
     by_name = {sub.name: sub for sub in spec.sub_agents}
 
