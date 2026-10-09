@@ -25,7 +25,7 @@ import builtins
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import httpx
@@ -180,6 +180,30 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param runner_online: ``True`` iff a runner tunnel is currently
+        registered for this session. ``None`` when liveness was not
+        requested (``include_liveness=False``) or the server has no
+        liveness lookup wired — never a stand-in for "offline".
+    :param host_online: Whether the session's host tunnel is live.
+        ``None`` when liveness was not requested or the session has no
+        host (CLI/local).
+    :param host_resumable: Whether the session is bound to a dormant
+        managed host the server can wake in place. ``None`` when
+        liveness was not requested.
+    :param total_cost_usd: Cumulative priced cost over this session's
+        subtree, e.g. ``11.19``. ``None`` when never priced, and also
+        when usage was not requested (``usage_included=False``).
+    :param usage_by_model: Per-model breakdown of the same subtree
+        usage as raw dicts, keyed by harness model id. ``None`` when no
+        per-model usage was recorded, and also when usage was not
+        requested.
+    :param usage_included: ``False`` when the snapshot was fetched with
+        ``include_usage=False``. The usage fields above are then unknown
+        rather than zero, so a caller must not read them as spend.
+    :param items_included: ``False`` when the snapshot was fetched with
+        ``include_items=False``. The server returns ``items=[]`` either
+        way, so an empty ``items`` means "none committed" only when this
+        is ``True``.
     """
 
     id: str
@@ -201,6 +225,13 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    runner_online: bool | None = None
+    host_online: bool | None = None
+    host_resumable: bool | None = None
+    total_cost_usd: float | None = None
+    usage_by_model: dict[str, dict[str, Any]] | None = None
+    usage_included: bool = True
+    items_included: bool = True
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -217,6 +248,8 @@ class Session:
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
         raw_updated_at = raw.get("updated_at")
+        raw_cost = raw.get("total_cost_usd")
+        usage_by_model_raw = raw.get("usage_by_model")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
@@ -237,6 +270,13 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            runner_online=raw.get("runner_online"),
+            host_online=raw.get("host_online"),
+            host_resumable=raw.get("host_resumable"),
+            total_cost_usd=float(raw_cost) if raw_cost is not None else None,
+            usage_by_model=(usage_by_model_raw if isinstance(usage_by_model_raw, dict) else None),
+            # Older servers predate the indicator and always aggregate usage.
+            usage_included=bool(raw.get("usage_included", True)),
         )
 
 
@@ -1027,7 +1067,15 @@ class SessionsNamespace:
         nodes = await self.child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
         return any(child_summary_busy(node) for node in nodes)
 
-    async def get(self, session_id: str) -> Session:
+    async def get(
+        self,
+        session_id: str,
+        *,
+        include_items: bool = True,
+        include_liveness: bool = True,
+        include_usage: bool = True,
+        refresh_state: bool = False,
+    ) -> Session:
         """
         Fetch the current snapshot of a session.
 
@@ -1036,17 +1084,54 @@ class SessionsNamespace:
         queued inputs — clients use this on reconnect to reconcile
         state observed via :meth:`stream`.
 
+        An orchestrator polling for lifecycle state only (has the agent
+        finished?) can skip the three expensive parts of the snapshot::
+
+            session = await client.sessions.get(
+                session_id, include_items=False, include_liveness=False,
+                include_usage=False,
+            )
+
+        Each flag that is skipped leaves its fields unknown rather than
+        empty: usage reads ``None`` with ``usage_included=False``,
+        liveness reads ``None``, and ``items_included`` is ``False``
+        beside the empty ``items`` the server returns either way.
+
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param include_items: When ``False``, skip the committed-items
+            read, the most expensive part of the snapshot.
+        :param include_liveness: When ``False``, skip the runner/host
+            liveness lookup.
+        :param include_usage: When ``False``, skip the subtree usage
+            aggregation.
+        :param refresh_state: When ``True``, refresh runner-derived
+            overlays from the live session instead of serving cached
+            state. Costs a runner round-trip.
         :returns: The current :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
         """
+        # Only non-default flags go on the wire, so an existing caller's
+        # request is unchanged and an older server keeps its own defaults.
+        params: dict[str, str] = {}
+        if not include_items:
+            params["include_items"] = "false"
+        if not include_liveness:
+            params["include_liveness"] = "false"
+        if not include_usage:
+            params["include_usage"] = "false"
+        if refresh_state:
+            params["refresh_state"] = "true"
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}",
+            params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
+        session = Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
+        # The server returns items=[] whether they were excluded or the
+        # session has none, so the request is what tells the two apart.
+        return replace(session, items_included=include_items)
 
     async def post_event(
         self,

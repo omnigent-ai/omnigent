@@ -303,6 +303,162 @@ async def test_get_agent_name_defaults_to_none_when_omitted() -> None:
     assert session.agent_name is None
 
 
+@pytest.mark.asyncio
+async def test_get_sends_no_snapshot_params_by_default() -> None:
+    """A default fetch keeps the request it has always sent.
+
+    The server's own defaults are the full snapshot, so sending the flags
+    explicitly would be noise, and an older server that predates one of
+    them would see an unknown query parameter.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert captured["url"] == "http://srv/v1/sessions/conv_abc"
+    assert session.items_included is True
+    assert session.usage_included is True
+
+
+@pytest.mark.asyncio
+async def test_get_serializes_lightweight_snapshot_flags() -> None:
+    """Each non-default flag reaches the server as its query parameter."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.get(
+            "conv_abc",
+            include_items=False,
+            include_liveness=False,
+            include_usage=False,
+            refresh_state=True,
+        )
+    finally:
+        await client.aclose()
+
+    assert captured["params"] == {
+        "include_items": "false",
+        "include_liveness": "false",
+        "include_usage": "false",
+        "refresh_state": "true",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_reduced_snapshot_reports_excluded_data_as_unknown() -> None:
+    """Excluded usage is not zero spend, and excluded liveness is not offline.
+
+    A poller that read the reduced snapshot's blanks as measurements would
+    report a session as costing nothing and its runner as down, which is
+    the failure this distinction exists to prevent.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        payload = _session_response_body()
+        # What the server sends back for include_usage=false,
+        # include_liveness=false: null fields plus the usage indicator.
+        payload.update(
+            {
+                "runner_online": None,
+                "host_online": None,
+                "host_resumable": None,
+                "total_cost_usd": None,
+                "usage_by_model": None,
+                "usage_included": False,
+            }
+        )
+        return httpx.Response(200, json=payload)
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get(
+            "conv_abc",
+            include_items=False,
+            include_liveness=False,
+            include_usage=False,
+        )
+    finally:
+        await client.aclose()
+
+    assert session.usage_included is False
+    assert session.total_cost_usd is None
+    assert session.usage_by_model is None
+    assert session.runner_online is None
+    assert session.host_online is None
+    assert session.host_resumable is None
+    # The server returns [] for an excluded transcript too, so the flag is
+    # the only thing separating "not asked for" from "none committed".
+    assert session.items == []
+    assert session.items_included is False
+
+
+@pytest.mark.asyncio
+async def test_get_full_snapshot_keeps_measured_zero_and_offline() -> None:
+    """The counterpart: a measured 0.0 and a real ``False`` survive parsing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        payload = _session_response_body()
+        payload.update(
+            {
+                "runner_online": False,
+                "host_online": True,
+                "host_resumable": False,
+                "total_cost_usd": 0.0,
+                "usage_by_model": {"claude-sonnet-4-6": {"input_tokens": 12000}},
+                "usage_included": True,
+            }
+        )
+        return httpx.Response(200, json=payload)
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.usage_included is True
+    assert session.total_cost_usd == 0.0
+    assert session.usage_by_model == {"claude-sonnet-4-6": {"input_tokens": 12000}}
+    assert session.runner_online is False
+    assert session.host_online is True
+    assert session.host_resumable is False
+
+
+@pytest.mark.asyncio
+async def test_get_usage_included_defaults_to_true_on_older_servers() -> None:
+    """A server predating the indicator always aggregated usage."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        payload = _session_response_body()
+        payload["total_cost_usd"] = 1.25
+        return httpx.Response(200, json=payload)
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.usage_included is True
+    assert session.total_cost_usd == 1.25
+
+
 # ── bind_runner() ────────────────────────────────────────────────────
 
 
