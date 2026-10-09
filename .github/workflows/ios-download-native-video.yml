@@ -37,37 +37,30 @@ jobs:
           set -euo pipefail
           git show 3a845634d^:web/ios/Omnigent/OmnigentWebView.swift > web/ios/Omnigent/OmnigentWebView.swift
           git show 3a845634d^:web/ios/Omnigent.xcodeproj/project.pbxproj > web/ios/Omnigent.xcodeproj/project.pbxproj
-          xcodebuild test \
+          xcodebuild build-for-testing \
             -project web/ios/Omnigent.xcodeproj \
             -scheme Omnigent \
             -configuration Debug \
             -destination "platform=iOS Simulator,id=$DEVICE_ID" \
-            -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
-            CODE_SIGNING_ALLOWED=NO > /tmp/before-xcodebuild.log 2>&1 &
-          TEST_PID=$!
-          BOOTED=0
-          for attempt in {1..600}; do
-            if xcrun simctl list devices | grep "$DEVICE_ID" | grep -q '(Booted)'; then
-              BOOTED=1
-              break
-            fi
-            if ! kill -0 "$TEST_PID" 2>/dev/null; then
-              cat /tmp/before-xcodebuild.log
-              wait "$TEST_PID"
-              exit $?
-            fi
-            sleep 1
-          done
-          test "$BOOTED" -eq 1
+            -derivedDataPath /tmp/before-derived \
+            CODE_SIGNING_ALLOWED=NO
+          xcrun simctl boot "$DEVICE_ID" > /tmp/simulator-boot.log 2>&1 &
+          sleep 30
           xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/before.mp4 &
           VIDEO_PID=$!
           set +e
-          wait "$TEST_PID"
+          xcodebuild test-without-building \
+            -project web/ios/Omnigent.xcodeproj \
+            -scheme Omnigent \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -derivedDataPath /tmp/before-derived \
+            -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
+            CODE_SIGNING_ALLOWED=NO
           TEST_STATUS=$?
           set -e
           kill -INT "$VIDEO_PID"
           wait "$VIDEO_PID" || true
-          cat /tmp/before-xcodebuild.log
           test "$TEST_STATUS" -eq 0
 
       - name: Record after fix
@@ -78,14 +71,22 @@ jobs:
           cp /tmp/OmnigentWebView.fixed.swift web/ios/Omnigent/OmnigentWebView.swift
           cp /tmp/project.fixed.pbxproj web/ios/Omnigent.xcodeproj/project.pbxproj
           xcrun simctl uninstall "$DEVICE_ID" ai.omnigent.ios 2>/dev/null || true
-          xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/after.mp4 &
-          VIDEO_PID=$!
-          set +e
-          xcodebuild test \
+          xcodebuild build-for-testing \
             -project web/ios/Omnigent.xcodeproj \
             -scheme Omnigent \
             -configuration Debug \
             -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -derivedDataPath /tmp/after-derived \
+            CODE_SIGNING_ALLOWED=NO
+          xcrun simctl io "$DEVICE_ID" recordVideo --codec=h264 /tmp/after.mp4 &
+          VIDEO_PID=$!
+          set +e
+          xcodebuild test-without-building \
+            -project web/ios/Omnigent.xcodeproj \
+            -scheme Omnigent \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -derivedDataPath /tmp/after-derived \
             -only-testing:OmnigentUITests/OmnigentUITests/testNativeDownloadVideo \
             CODE_SIGNING_ALLOWED=NO
           TEST_STATUS=$?
