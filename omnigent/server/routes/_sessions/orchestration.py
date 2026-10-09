@@ -1311,6 +1311,7 @@ def _build_session_response(
     runner_online: bool | None = None,
     host_online: bool | None = None,
     host_resumable: bool = False,
+    host_type: Literal["external", "managed"] = "external",
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
@@ -1431,6 +1432,7 @@ def _build_session_response(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
+        host_type=host_type,
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
@@ -12601,10 +12603,14 @@ async def _get_session_snapshot(
     # liveness arrives via the poll/stream). One indexed host read, gated to
     # host-bound sessions.
     host_resumable = False
-    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
+    host_type: Literal["external", "managed"] = "external"
+    if host_store is not None and conv.host_id is not None:
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
-            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+            if host_for_resume.sandbox_provider is not None:
+                host_type = "managed"
+            if sandbox_config is not None:
+                host_resumable = host_resume_supported(host_for_resume, sandbox_config)
     response = _build_session_response(
         conv,
         items,
@@ -12622,6 +12628,7 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
+        host_type=host_type,
         pending_elicitation_events=await asyncio.to_thread(
             _pending_elicitation_snapshot_for_session,
             conv_store,

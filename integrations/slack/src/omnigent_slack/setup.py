@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -122,8 +122,14 @@ class SetupFlow:
         # is used.
         self._enrollment_url = enrollment_url
         self._logger = logging.getLogger(__name__)
+        self._resume_handler: Callable[[dict[str, Any], Any], Awaitable[None]] | None = None
 
-    def register(self, app: AsyncApp) -> None:
+    def register(
+        self,
+        app: AsyncApp,
+        resume_handler: Callable[[dict[str, Any], Any], Awaitable[None]] | None = None,
+    ) -> None:
+        self._resume_handler = resume_handler
         app.command(COMMAND_NAME)(self._handle_config_command)
         app.action(ACTION_SETUP_START)(self._handle_setup_start)
         app.view(CALLBACK_SELECT_MODAL)(self._handle_select_submit)
@@ -171,6 +177,10 @@ class SetupFlow:
             )
             return
         subcommand = str(command.get("text") or "").split()[:1]
+
+        if subcommand and subcommand[0].lower() == "resume" and self._resume_handler:
+            await self._resume_handler(command, client)
+            return
 
         if subcommand and subcommand[0].lower() == "logout":
             await self._handle_logout(team_id=team_id, user_id=user_id, client=client)
