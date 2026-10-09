@@ -245,6 +245,93 @@ def test_codex_early_exit_diagnostic_failure_preserves_exit_cause(
     read_output.assert_called_once_with()
 
 
+def test_claude_early_exit_surfaces_classified_diagnosis(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-Codex runtime's exit-at-spawn is classified like Codex's.
+
+    The exit status and captured output ride on the exception for every
+    runtime, so a Claude terminal whose CLI reports missing credentials must
+    surface the shared diagnosis instead of the generic log pointer — without
+    echoing the raw pane text.
+    """
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+        command="claude",
+    )
+    instance._remember_exit_status("1 1")
+    monkeypatch.setattr(instance, "last_exit_text", lambda: "Not logged in · Please run /login")
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+    )
+
+    message = payload["message"]
+    assert "Agent isn't signed in" in message
+    assert "no valid credentials" in message
+    assert "/login" in message
+    assert "Native Claude terminal failed to start" not in message
+    assert "see the runner log" not in message
+    # The diagnosis is rendered, never the raw pane text.
+    assert "Not logged in" not in message
+    assert _ERROR_ID_RE.search(message) is not None
+
+
+def test_pi_early_exit_without_match_falls_back_to_exit_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unclassified exit keeps the runtime's exit summary plus gated output."""
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    instance = TerminalInstance(
+        name="pi",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+        command="pi",
+    )
+    instance._remember_exit_status("1 3")
+    monkeypatch.setattr(instance, "last_exit_text", lambda: "some unrecognized pane text")
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Pi", session_id="conv_1"
+    )
+
+    message = payload["message"]
+    assert "Pi terminal exited with status 3 before becoming available." in message
+    assert "Pi startup terminal output:\nsome unrecognized pane text" in message
+    assert "Native Pi terminal failed to start" not in message
+
+
+def test_claude_early_exit_output_gated_when_capture_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With stderr capture disabled, a non-Codex exit reads no pane output."""
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+        command="claude",
+    )
+    instance._remember_exit_status("1 1")
+    read_output = Mock(side_effect=AssertionError("capture is disabled"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+    )
+
+    message = payload["message"]
+    assert "Claude terminal exited with status 1 before becoming available." in message
+    assert "startup terminal output:" not in message
+    read_output.assert_not_called()
+
+
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     """An ``OmnigentError`` with a different code is not reclassified.
 
