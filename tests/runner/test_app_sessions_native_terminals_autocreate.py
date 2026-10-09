@@ -605,6 +605,131 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
     assert "--provider" not in args
 
 
+def _pi_launch_test_stubs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probed_version: tuple[int, int, int] | None,
+) -> dict[str, Any]:
+    """Stub the Pi launch environment; return the registry's capture dict.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param probed_version: Version the ``pi --version`` probe reports.
+    :returns: Dict the fake registry fills when a terminal launches.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(pi_native, "pi_version", lambda _exe: probed_version)
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, spec: Any, **_kwargs: Any
+        ) -> SessionResourceView:
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    captured["registry"] = _FakeResourceRegistry()
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_outdated_cli_fails_with_upgrade_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Pi CLI below the floor fails the launch with the upgrade path named.
+
+    An old ``pi`` exits 1 on ``--provider omnigent``; the launch must refuse
+    before spawning anything and name the installed version, the floor, and
+    the installer's upgrade command instead of a generic start failure.
+    """
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
+    from omnigent.onboarding.harness_install import (
+        PI_KEY,
+        harness_install_display,
+        harness_install_spec,
+    )
+
+    captured = _pi_launch_test_stubs(tmp_path, monkeypatch, (0, 83, 0))
+
+    with pytest.raises(PiNativeCliOutdatedError) as excinfo:
+        await _auto_create_pi_terminal(
+            "47f049b9d13df4db397c7f46859b825f",
+            captured["registry"],  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+
+    message = str(excinfo.value)
+    min_version = harness_install_spec(PI_KEY)
+    assert min_version is not None and min_version.min_version is not None
+    assert "0.83.0" in message
+    assert min_version.min_version in message
+    assert harness_install_display(PI_KEY) in message
+    # The launch was refused before any terminal was spawned.
+    assert "spec" not in captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version_kind", ["at_floor", "unknown"])
+async def test_auto_create_pi_terminal_cli_version_at_floor_or_unknown_proceeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version_kind: str,
+) -> None:
+    """A Pi at the floor — or an unprobeable version — launches as today.
+
+    The floor is inclusive, and an unknown probe result must fail open so a
+    Pi whose ``--version`` output changes shape keeps working.
+    """
+    from omnigent.onboarding.harness_install import PI_KEY, harness_install_spec
+
+    probed: tuple[int, int, int] | None = None
+    if version_kind == "at_floor":
+        spec = harness_install_spec(PI_KEY)
+        assert spec is not None and spec.min_version is not None
+        floor_parts = [int(part) for part in spec.min_version.split(".")]
+        probed = (floor_parts[0], floor_parts[1], floor_parts[2])
+    captured = _pi_launch_test_stubs(tmp_path, monkeypatch, probed)
+
+    await _auto_create_pi_terminal(
+        "47f049b9d13df4db397c7f46859b825f",
+        captured["registry"],  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert captured["spec"].command == "pi"
+
+
 @pytest.mark.asyncio
 async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolated_env(
     tmp_path: Path,
