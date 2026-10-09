@@ -125,47 +125,21 @@ def test_client_ssl_context_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_explicit_trust_sources_returns_configured_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """A configured, non-empty ``SSL_CERT_DIR`` is surfaced as the capath."""
+    """A configured ``SSL_CERT_DIR`` that exists is surfaced as the capath."""
     capath = _hashed_cert_dir(tmp_path)
     monkeypatch.setenv("SSL_CERT_DIR", str(capath))
     assert explicit_trust_sources() == (None, str(capath))
 
 
-@pytest.mark.parametrize(
-    ("make_path", "label"),
-    [
-        (lambda tmp: tmp / "gone", "missing"),
-        (lambda tmp: (tmp / "empty").mkdir() or tmp / "empty", "empty"),
-    ],
-)
-def test_explicit_trust_sources_ignores_unusable_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture, make_path, label
-) -> None:
-    """A missing or empty ``SSL_CERT_DIR`` is logged and ignored, never raised or trusted."""
-    monkeypatch.setenv("SSL_CERT_DIR", str(make_path(tmp_path)))
-    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
-        assert explicit_trust_sources() == (None, None), label
-    assert "SSL_CERT_DIR" in caplog.text
-
-
-def test_explicit_trust_sources_rejects_directory_as_bundle(
+def test_explicit_trust_sources_ignores_missing_paths(
     monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """``SSL_CERT_FILE`` must name a regular file; a directory is dropped."""
-    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path))
+    """Rotated-away ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` are logged and dropped, never raised."""
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "rotated-away-ca.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "rotated-away-certs"))
     with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
         assert explicit_trust_sources() == (None, None)
-    assert "SSL_CERT_FILE" in caplog.text
-
-
-def test_explicit_trust_sources_prefer_file_over_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """With both variables usable, the bundle is the whole explicit trust set."""
-    bundle = _one_root_bundle(tmp_path)
-    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
-    monkeypatch.setenv("SSL_CERT_DIR", str(_hashed_cert_dir(tmp_path)))
-    assert explicit_trust_sources() == (str(bundle), None)
+    assert "SSL_CERT_FILE" in caplog.text and "SSL_CERT_DIR" in caplog.text
 
 
 def test_explicit_trust_sources_ignore_compiled_in_defaults(
@@ -208,7 +182,11 @@ def test_client_ssl_context_file_only_excludes_default_directory(
 def test_client_ssl_context_file_wins_over_configured_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """An inherited ``SSL_CERT_DIR`` must not widen a restricted ``SSL_CERT_FILE``."""
+    """With both variables set, the bundle is the whole explicit trust set.
+
+    An inherited ``SSL_CERT_DIR`` must not widen a restricted ``SSL_CERT_FILE``,
+    matching httpx's ``trust_env`` precedence.
+    """
     bundle = _one_root_bundle(tmp_path)
     monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
     monkeypatch.setenv("SSL_CERT_DIR", str(_hashed_cert_dir(tmp_path)))
@@ -217,6 +195,7 @@ def test_client_ssl_context_file_wins_over_configured_directory(
 
     ctx = client_ssl_context()
 
+    assert explicit_trust_sources() == (str(bundle), None)
     assert seen == [(str(bundle), None)]
     assert len(ctx.get_ca_certs()) == 1
 
@@ -239,6 +218,39 @@ def test_client_ssl_context_directory_only_excludes_default_bundle(
 
     assert seen == [(None, str(capath))]
     assert ctx.get_ca_certs() == []
+
+
+@pytest.mark.parametrize(
+    ("variable", "make_source"),
+    [
+        ("SSL_CERT_FILE", lambda tmp: (tmp / "empty.pem").write_bytes(b"") or tmp / "empty.pem"),
+        ("SSL_CERT_FILE", lambda tmp: tmp),
+        ("SSL_CERT_DIR", lambda tmp: (tmp / "empty-certs").mkdir() or tmp / "empty-certs"),
+    ],
+    ids=["zero-byte-file", "directory-as-file", "empty-directory"],
+)
+def test_client_ssl_context_existing_empty_source_trusts_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+    variable: str,
+    make_source,
+) -> None:
+    """An existing but empty or malformed explicit source fails closed.
+
+    It must neither raise at construction nor gain default roots; it keeps
+    verifying with an empty trust set, and the operator is warned.
+    """
+    monkeypatch.setenv(variable, str(make_source(tmp_path)))
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
+
+    with caplog.at_level(logging.WARNING, logger=tls_module.__name__):
+        ctx = client_ssl_context()
+
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert ctx.get_ca_certs() == []
+    assert "trusting no roots" in caplog.text
 
 
 def test_client_ssl_context_stale_explicit_sources_fall_back(
@@ -264,7 +276,7 @@ def test_client_ssl_context_stale_explicit_sources_fall_back(
 def test_client_ssl_context_survives_bundle_vanishing_mid_build(
     monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A bundle rotated away between the usability check and loading still yields a context."""
+    """A bundle rotated away between the existence check and loading still yields a context."""
     bundle = _one_root_bundle(tmp_path)
     monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
     monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))

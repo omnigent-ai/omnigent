@@ -844,9 +844,7 @@ def open_server_client(
     # A proxy cannot reach a loopback server, so local targets bypass it.
     trust_env = not is_loopback_url(server_url)
     if trust_env and transport is None:
-        # trust_env makes httpx load SSL_CERT_FILE/SSL_CERT_DIR eagerly at
-        # construction (even for http URLs); a stale path would raise. Resolve
-        # trust through util.tls instead: validated bundle, certifi fallback.
+        # Resolve CA paths before httpx eagerly loads environment trust.
         from omnigent.util.tls import client_ssl_context
 
         kwargs["verify"] = client_ssl_context()

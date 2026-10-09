@@ -1312,6 +1312,36 @@ def test_open_server_client_https_honors_ssl_cert_dir_only(
         assert _get_health_status(open_server_client(base_url)) == 200
 
 
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_open_server_client_existing_empty_ca_source_trusts_nothing(
+    token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache, variable: str
+) -> None:
+    """An existing but empty CA source restricts trust to nothing.
+
+    Construction must succeed, no default roots may be introduced, and the
+    handshake must fail closed.
+    """
+    import omnigent.util.tls as tls_module
+    from omnigent.cli_auth import open_server_client
+
+    cert_path, key_path = _self_signed_server_cert(tmp_path)
+    _direct_remote_env(monkeypatch)
+    _treat_server_as_remote(monkeypatch)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    empty = tmp_path / "empty-source"
+    if variable == "SSL_CERT_FILE":
+        empty.write_bytes(b"")
+    else:
+        empty.mkdir()
+    monkeypatch.setenv(variable, str(empty))
+
+    with _https_listener(cert_path, key_path) as base_url:
+        client = open_server_client(base_url)
+        assert tls_module.client_ssl_context().get_ca_certs() == []
+        with pytest.raises(httpx.ConnectError, match=r"(?i)certificate verify"):
+            _get_health_status(client)
+
+
 def test_open_server_client_https_stale_ssl_cert_file_keeps_verifying(
     token_dir, monkeypatch: pytest.MonkeyPatch, tmp_path, reset_tls_context_cache
 ) -> None:

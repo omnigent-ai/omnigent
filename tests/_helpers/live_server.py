@@ -127,14 +127,12 @@ def isolated_local_server(
     bootstrap: str = "from omnigent.cli import main\n\nmain()\n",
     poll_interval: float = 0.5,
     health_timeout: float = 120.0,
-    host: str = "127.0.0.1",
 ) -> Iterator[str]:
     """Run this checkout's single-user server; yield its URL and retain server.log.
 
     Supply a bootstrap only when the scenario needs a fault installed before
     the CLI starts. Existing profile/compatibility tests should use
-    :func:`start_live_server` instead. *host* is the bind address; the yielded
-    URL always addresses the loopback interface.
+    :func:`start_live_server` instead.
     """
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -147,7 +145,7 @@ def isolated_local_server(
                 bootstrap,
                 "server",
                 "--host",
-                host,
+                "127.0.0.1",
                 "--port",
                 str(port),
                 "--database-uri",

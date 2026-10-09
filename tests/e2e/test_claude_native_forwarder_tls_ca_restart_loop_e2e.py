@@ -1,10 +1,12 @@
 """E2E regression: a stale ``SSL_CERT_FILE`` must not stop the supervised Claude
 transcript forwarder from persisting a session's transcript items.
 
-A real ``omnigent server`` subprocess is reached at a non-loopback alias so
-``open_server_client`` takes its remote-server branch; a seeded one-turn JSONL
-transcript replaces a live Claude CLI, and delivery is checked through the
-session items API that the web chat view renders.
+The real ``supervise_forwarder`` runs against a real local ``omnigent server``
+with the loopback classification overridden, so ``open_server_client`` takes
+its remote-server branch (``trust_env=True`` plus the shared verifying
+context). A seeded one-turn JSONL transcript replaces a live Claude CLI, and
+delivery is checked through the session items API that the web chat view
+renders.
 
 Run::
 
@@ -21,7 +23,6 @@ import contextlib
 import json
 import logging
 import shutil
-import socket
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -49,52 +50,6 @@ _USER_BUG = "marker-user-stale-ca"
 _ASSISTANT_BUG = "marker-assistant-stale-ca"
 
 _CRASH_LOG_PREFIX = "Claude transcript forwarder crashed"
-
-
-def _nonloopback_url_candidates(port: int) -> list[str]:
-    """Ordered non-loopback ``http://host:port`` URLs that may reach the local listener.
-
-    Most production-faithful first: the machine's primary IPv4, then ``0.0.0.0``
-    (Linux routes it locally), then ``::ffff:127.0.0.1`` (its classification
-    varies by interpreter). The caller verifies reachability against ``/health``.
-
-    :param port: The port the local server is bound to.
-    :returns: Candidate URLs, non-loopback-classified only.
-    """
-    from omnigent_client._http import is_loopback_url
-
-    hosts: list[str] = []
-    with contextlib.suppress(OSError):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect(("8.8.8.8", 80))  # no packets sent; selects the route
-            hosts.append(probe.getsockname()[0])
-    with contextlib.suppress(OSError):
-        hosts.append(socket.gethostbyname(socket.gethostname()))
-    hosts.extend(["0.0.0.0", "::ffff:127.0.0.1"])
-
-    seen: set[str] = set()
-    urls: list[str] = []
-    for host in hosts:
-        if not host or host in seen:
-            continue
-        seen.add(host)
-        url = f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
-        if not is_loopback_url(url):
-            urls.append(url)
-    return urls
-
-
-def _select_reachable_nonloopback_url(port: int) -> str | None:
-    """Return the first candidate non-loopback URL whose ``/health`` answers 200.
-
-    :param port: The port the local server is bound to.
-    :returns: A reachable non-loopback URL, or ``None`` when none qualifies.
-    """
-    for url in _nonloopback_url_candidates(port):
-        with contextlib.suppress(httpx.HTTPError):
-            if _http.get(f"{url}/health", timeout=2.0).status_code == 200:
-                return url
-    return None
 
 
 def _seed_conversation_transcript(
@@ -193,7 +148,7 @@ async def _drive_supervisor_until(
     The supervisor never returns on its own; it is cancelled once the predicate
     holds or the budget runs out.
 
-    :param base_url: Server base URL the forwarder posts to (the non-loopback alias).
+    :param base_url: Server base URL the forwarder posts to.
     :param session_id: Conversation the forwarder mirrors into.
     :param bridge_dir: Seeded native Claude bridge directory.
     :param done: Early-exit predicate over the captured crash records.
@@ -238,11 +193,10 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
 ) -> None:
     """A stale ``SSL_CERT_FILE`` must not crash-loop the transcript forwarder.
 
-    Control leg: a valid bundle at the non-loopback URL mirrors the seeded
-    transcript, proving the harness. Stale leg: ``SSL_CERT_FILE`` names a missing
-    file; the transcript must still be mirrored and the supervisor must not have
-    crash-restarted repeatedly. On the unfixed build the stale leg crash-loops
-    with ``FileNotFoundError`` and mirrors nothing.
+    Control leg: a valid bundle persists the seeded transcript, proving the
+    harness. Stale leg: ``SSL_CERT_FILE`` names a missing file; the transcript
+    must still be persisted with no crash-restart. On the unfixed build the
+    stale leg crash-loops with ``FileNotFoundError`` and persists nothing.
 
     :param tmp_path: Per-test temp dir (server DB, artifacts, bridge dirs).
     :param monkeypatch: Shapes this process's env for the in-process forwarder legs.
@@ -250,8 +204,9 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
     import omnigent.util.tls as tls_module
     from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
 
-    # The in-process forwarder legs must connect directly (trust_env=True
-    # would otherwise route the non-loopback URL through any ambient proxy).
+    # Take the remote-server branch of open_server_client against the local
+    # server: classify every URL as non-loopback and connect without proxies.
+    monkeypatch.setattr("omnigent_client._http.is_loopback_url", lambda _url: False)
     for name in (
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -266,22 +221,11 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
     workspace.mkdir()
     bridges: list[Path] = []
     try:
-        # Bind all interfaces so a non-loopback alias (the trust_env branch)
-        # and the loopback control-plane calls both reach the server.
-        with isolated_local_server(tmp_path, host="0.0.0.0") as local_url:
-            port = int(local_url.rsplit(":", 1)[1])
-            remote_style_url = _select_reachable_nonloopback_url(port)
-            if remote_style_url is None:
-                pytest.skip(
-                    "no reachable non-loopback alias for the local server; cannot "
-                    "drive the open_server_client trust_env=True branch under test"
-                )
-
-            # ---- Control leg: healthy SSL_CERT_FILE at the same non-loopback URL.
-            # Proves the harness itself works (server reachable, forwarder mirrors)
-            # so the stale-leg assertion cannot fail for environmental reasons.
+        with isolated_local_server(tmp_path) as base_url:
+            # ---- Control leg: healthy SSL_CERT_FILE. Proves the harness itself
+            # works so the stale-leg assertion cannot fail for environmental reasons.
             control_session = str(
-                create_native_session(_http, local_url, harness="claude")["session_id"]
+                create_native_session(_http, base_url, harness="claude")["session_id"]
             )
             control_bridge = prepare_bridge_dir(control_session, workspace=workspace)
             bridges.append(control_bridge)
@@ -291,13 +235,13 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
 
             def _control_done(_cap: _CrashLogCapture) -> bool:
                 return (
-                    _count_marker(local_url, control_session, _USER_CONTROL) >= 1
-                    and _count_marker(local_url, control_session, _ASSISTANT_CONTROL) >= 1
+                    _count_marker(base_url, control_session, _USER_CONTROL) >= 1
+                    and _count_marker(base_url, control_session, _ASSISTANT_CONTROL) >= 1
                 )
 
             control_cap = asyncio.run(
                 _drive_supervisor_until(
-                    base_url=remote_style_url,
+                    base_url=base_url,
                     session_id=control_session,
                     bridge_dir=control_bridge,
                     done=_control_done,
@@ -306,19 +250,18 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
             )
             server_tail = (tmp_path / "server.log").read_text()[-2000:]
             assert (
-                _count_marker(local_url, control_session, _USER_CONTROL) >= 1
-                and _count_marker(local_url, control_session, _ASSISTANT_CONTROL) >= 1
+                _count_marker(base_url, control_session, _USER_CONTROL) >= 1
+                and _count_marker(base_url, control_session, _ASSISTANT_CONTROL) >= 1
             ), (
                 "control-leg invariant: with a VALID SSL_CERT_FILE the forwarder "
-                "must mirror the seeded transcript through the non-loopback URL "
-                f"({remote_style_url}); crashes={control_cap.crashes} -- the "
-                f"environment (not the bug) is broken. server log tail:\n{server_tail}"
+                f"must persist the seeded transcript; crashes={control_cap.crashes} -- "
+                f"the environment (not the bug) is broken. server log tail:\n{server_tail}"
             )
 
             # ---- Stale leg: SSL_CERT_FILE names a CA bundle that was rotated away.
-            # Same server and non-loopback URL; only the env differs.
+            # Same server; only the env differs.
             bug_session = str(
-                create_native_session(_http, local_url, harness="claude")["session_id"]
+                create_native_session(_http, base_url, harness="claude")["session_id"]
             )
             bug_bridge = prepare_bridge_dir(bug_session, workspace=workspace)
             bridges.append(bug_bridge)
@@ -336,46 +279,44 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
                 if len(cap.crashes) >= 3:
                     return True
                 return (
-                    _count_marker(local_url, bug_session, _USER_BUG) >= 1
-                    and _count_marker(local_url, bug_session, _ASSISTANT_BUG) >= 1
+                    _count_marker(base_url, bug_session, _USER_BUG) >= 1
+                    and _count_marker(base_url, bug_session, _ASSISTANT_BUG) >= 1
                 )
 
             bug_cap = asyncio.run(
                 _drive_supervisor_until(
-                    base_url=remote_style_url,
+                    base_url=base_url,
                     session_id=bug_session,
                     bridge_dir=bug_bridge,
                     done=_bug_done,
                     budget_s=_DRIVE_BUDGET_S,
                 )
             )
-            user_mirrored = _count_marker(local_url, bug_session, _USER_BUG)
-            assistant_mirrored = _count_marker(local_url, bug_session, _ASSISTANT_BUG)
+            user_mirrored = _count_marker(base_url, bug_session, _USER_BUG)
+            assistant_mirrored = _count_marker(base_url, bug_session, _ASSISTANT_BUG)
             crash_kinds = sorted({exc for _, exc in bug_cap.crashes})
 
             # On the unfixed build every restart re-raises the identical
-            # FileNotFoundError while building the HTTP client; nothing is mirrored.
+            # FileNotFoundError while building the HTTP client; nothing is persisted.
             assert user_mirrored >= 1 and assistant_mirrored >= 1, (
                 "A stale SSL_CERT_FILE (missing CA bundle file) killed Claude "
                 "transcript forwarding: the forwarder crash-looped "
                 f"{len(bug_cap.crashes)} times (exception types: {crash_kinds}, "
                 f"first: {bug_cap.crashes[0][0] if bug_cap.crashes else 'none'}) "
-                "and mirrored "
+                "and persisted "
                 f"user={user_mirrored} assistant={assistant_mirrored} of the "
-                "seeded transcript items into the conversation store (expected "
-                ">=1 each; the control leg with a valid SSL_CERT_FILE mirrored "
-                "both). open_server_client must not let a stale CA env var kill "
-                "plain-http forwarding, and supervise_forwarder must not restart "
-                "a deterministic startup crash forever."
+                "seeded transcript items (expected >=1 each; the control leg with a "
+                "valid SSL_CERT_FILE persisted both). open_server_client must not "
+                "let a stale CA env var kill plain-http forwarding, and "
+                "supervise_forwarder must not restart a deterministic startup crash."
             )
 
-            # Restart-loop containment: once forwarding works, the supervisor must
-            # not have burned through repeated identical startup crashes first.
-            assert len(bug_cap.crashes) <= 1, (
+            # A stale bundle is tolerated at client construction, so the supervisor
+            # never has anything to restart.
+            assert bug_cap.crashes == [], (
                 "transcript forwarding eventually worked, but the supervisor "
                 f"still crash-restarted {len(bug_cap.crashes)} times on the stale "
-                f"SSL_CERT_FILE (exception types: {crash_kinds}); a deterministic "
-                "startup crash must not restart-loop"
+                f"SSL_CERT_FILE (exception types: {crash_kinds})"
             )
     finally:
         for bridge in bridges:

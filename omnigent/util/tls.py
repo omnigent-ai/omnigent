@@ -22,7 +22,6 @@ from __future__ import annotations
 import logging
 import os
 import ssl
-import stat
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -54,65 +53,58 @@ def resolve_ca_file() -> str:
     return certifi.where()
 
 
-def _usable_bundle(path: str) -> bool:
-    """Report whether *path* is a non-empty regular file (one ``stat``, no check/use race)."""
+def _exists(path: str) -> bool:
+    """Report whether *path* exists (one ``stat``; any error reads as missing)."""
     try:
-        st = Path(path).stat()
+        Path(path).stat()
     except OSError:
         return False
-    return stat.S_ISREG(st.st_mode) and st.st_size > 0
-
-
-def _usable_cert_dir(path: str) -> bool:
-    """Report whether *path* is a directory holding at least one entry."""
-    try:
-        return any(Path(path).iterdir())
-    except OSError:
-        return False
+    return True
 
 
 def explicit_trust_sources() -> tuple[str | None, str | None]:
-    """Return the operator-configured ``(cafile, capath)`` to trust, at most one set.
+    """Return the configured ``(cafile, capath)`` to honor, at most one of them.
 
     Only the ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` environment variables count as
     configuration; OpenSSL's compiled-in defaults are fallbacks and are never
-    mixed into an explicitly restricted trust set. A usable file takes
-    precedence over the directory, as in httpx's ``trust_env`` handling, so an
-    inherited ``SSL_CERT_DIR`` cannot widen a restricted bundle. A configured
-    path that is missing or empty (a rotated bundle) is logged and dropped
-    instead of raised.
+    mixed into an explicit trust set. An existing file takes precedence over the
+    directory, as in httpx's ``trust_env`` handling. A configured path that no
+    longer exists (a rotated bundle) is logged and dropped instead of raised.
 
     :returns: ``(cafile, None)``, ``(None, capath)``, or ``(None, None)``.
     """
     paths = ssl.get_default_verify_paths()
     cafile = os.environ.get(paths.openssl_cafile_env) or None
     capath = os.environ.get(paths.openssl_capath_env) or None
-    if cafile is not None and not _usable_bundle(cafile):
-        logger.warning(
-            "%s=%s is not a usable CA bundle; ignoring it", paths.openssl_cafile_env, cafile
-        )
+    if cafile is not None and not _exists(cafile):
+        logger.warning("%s=%s does not exist; ignoring it", paths.openssl_cafile_env, cafile)
         cafile = None
-    if capath is not None and not _usable_cert_dir(capath):
-        logger.warning(
-            "%s=%s is not a usable CA directory; ignoring it", paths.openssl_capath_env, capath
-        )
+    if capath is not None and not _exists(capath):
+        logger.warning("%s=%s does not exist; ignoring it", paths.openssl_capath_env, capath)
         capath = None
     if cafile is not None:
         capath = None
     return cafile, capath
 
 
+def _no_trust_context() -> ssl.SSLContext:
+    """Build a verifying client context that trusts no roots, so handshakes fail closed."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
 def client_ssl_context() -> ssl.SSLContext:
     """Return a cached verifying client SSL context.
 
-    Trusts a usable ``SSL_CERT_FILE`` alone, otherwise a usable ``SSL_CERT_DIR``
-    alone. When neither is usable — unset, or rotated away — it
-    deliberately falls back to the OS bundle or certifi via
-    :func:`resolve_ca_file` instead of failing closed: a stale path is a broken
-    configuration rather than a narrower trust policy, and verification itself
-    is never disabled. Built once so reconnect loops do not re-read the bundle;
-    keeps :func:`ssl.create_default_context`'s hostname checking and
-    ``CERT_REQUIRED``.
+    Built once so reconnect loops do not re-read the bundle. An existing
+    configured source (:func:`explicit_trust_sources`) is honored exactly, so an
+    empty or malformed one trusts nothing instead of gaining default roots. Only
+    a missing path falls back to the OS bundle or certifi via
+    :func:`resolve_ca_file`: a rotated-away bundle is a broken configuration,
+    not a narrower trust policy. Verification is never disabled.
 
     :returns: A shared :class:`ssl.SSLContext`.
     """
@@ -123,8 +115,27 @@ def client_ssl_context() -> ssl.SSLContext:
         if cafile is not None or capath is not None:
             try:
                 context = ssl.create_default_context(cafile=cafile, capath=capath)
-            except OSError:
-                logger.warning("Configured CA source vanished while loading; using default roots")
+            except FileNotFoundError:
+                logger.warning(
+                    "Configured CA source (cafile=%s, capath=%s) vanished while loading; "
+                    "using default roots",
+                    cafile,
+                    capath,
+                )
+            except OSError as exc:  # includes ssl.SSLError for an empty or malformed bundle
+                logger.warning(
+                    "Configured CA source (cafile=%s, capath=%s) could not be loaded (%s); "
+                    "trusting no roots",
+                    cafile,
+                    capath,
+                    exc,
+                )
+                context = _no_trust_context()
+            else:
+                if capath is not None and not any(Path(capath).iterdir()):
+                    logger.warning(
+                        "SSL_CERT_DIR=%s holds no certificates; trusting no roots", capath
+                    )
         if context is None:
             context = ssl.create_default_context(cafile=resolve_ca_file())
         _client_ssl_context = context
