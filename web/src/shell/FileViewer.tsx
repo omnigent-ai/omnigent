@@ -171,11 +171,18 @@ export function classifyAndRemapComments(
       fileContent.length,
       c.start_index + c.anchor_content.length + SEARCH_WINDOW,
     );
-    const nearbyIdx = fileContent.indexOf(c.anchor_content, windowStart);
-    const idx =
-      nearbyIdx !== -1 && nearbyIdx <= windowEnd
-        ? nearbyIdx
-        : fileContent.indexOf(c.anchor_content);
+    let nearbyIdx = -1;
+    let nearbyDistance = Number.POSITIVE_INFINITY;
+    let from = fileContent.indexOf(c.anchor_content, windowStart);
+    while (from !== -1 && from <= windowEnd) {
+      const distance = Math.abs(from - c.start_index);
+      if (distance < nearbyDistance) {
+        nearbyIdx = from;
+        nearbyDistance = distance;
+      }
+      from = fileContent.indexOf(c.anchor_content, from + 1);
+    }
+    const idx = nearbyIdx !== -1 ? nearbyIdx : fileContent.indexOf(c.anchor_content);
     if (idx === -1) {
       // Anchor not found anywhere — keep at stored offsets rather than dropping.
       open.push(c);

@@ -95,8 +95,56 @@ def close_anyio_subprocess_transport(anyio_proc: Any) -> None:  # type: ignore[e
     close_subprocess_transport(inner)
 
 
+async def terminate_direct_subprocess(
+    proc: Any,  # type: ignore[explicit-any]
+    *,
+    terminate_timeout: float,
+    kill_timeout: float,
+) -> bool:
+    """Terminate only *proc* and reap it without touching its process group.
+
+    This is for disposable client processes such as ``tmux attach``. Their
+    parent tmux server and pane are owned elsewhere and must never receive a
+    group signal.
+
+    :param proc: An asyncio subprocess handle for the disposable client.
+    :param terminate_timeout: Seconds to wait after ``proc.terminate()``.
+    :param kill_timeout: Seconds to wait after ``proc.kill()``.
+    :returns: ``True`` when the direct child was reaped.
+    """
+    reaped = getattr(proc, "returncode", None) is not None
+    try:
+        if not reaped:
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=terminate_timeout)
+            except Exception:  # noqa: BLE001 - force-kill is the bounded backstop
+                if getattr(proc, "returncode", None) is None:
+                    with contextlib.suppress(Exception):
+                        proc.kill()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
+            reaped = getattr(proc, "returncode", None) is not None
+        return reaped
+    finally:
+        close_subprocess_transport(proc)
+
+
+async def await_cleanup_task(task: asyncio.Task[Any]) -> None:  # type: ignore[explicit-any]
+    """Await cleanup despite repeated caller cancellation, then propagate errors."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    task.result()
+
+
 __all__ = [
+    "await_cleanup_task",
     "close_anyio_subprocess_transport",
     "close_subprocess_transport",
+    "terminate_direct_subprocess",
     "terminate_subprocess",
 ]

@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from pydantic import TypeAdapter
 
 from omnigent.runner import create_runner_app
+from omnigent.runner.app import _is_context_overflow_error
 from omnigent.server.schemas import FailedEvent, ServerStreamEvent
 from omnigent.spec.types import AgentSpec
 from tests.runner.conftest import (
@@ -169,3 +170,72 @@ async def test_context_overflow_preserves_a_valid_queued_failure() -> None:
     error = await _assert_failure_on_both_streams(app, source="llm")
     assert error["code"] == "context_length_exceeded"
     assert error["type"] == "_ContextWindowOverflow"
+
+
+@pytest.mark.asyncio
+async def test_content_length_cap_failure_is_normalized_to_context_overflow() -> None:
+    """A byte-cap rejection surfaced by the harness classifies as a context overflow."""
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_test"}}),
+            _sse(
+                {
+                    "type": "response.failed",
+                    "error": {
+                        "code": "unknown_error",
+                        "message": (
+                            'LLM returned HTTP 400: {"error_code":"BAD_REQUEST",'
+                            '"message":"Server received a request which exceeds '
+                            "maximum allowed content length. "
+                            'RequestSize(bytes): 33967957, Limit(bytes): 33554432"}'
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    error = await _assert_failure_on_both_streams(app, source="llm")
+    assert error["code"] == "context_length_exceeded"
+    assert error["type"] == "_ContextWindowOverflow"
+    # The raw rejection — including its RequestSize/Limit bytes — survives
+    # normalization rather than being replaced by a token-count approximation,
+    # so the expandable detail still names the real cause.
+    assert "exceeds maximum allowed content length" in error["message"]
+    assert "RequestSize(bytes): 33967957" in error["message"]
+    assert "Limit(bytes): 33554432" in error["message"]
+
+
+def _overflow_event(message: str) -> dict[str, Any]:
+    return {"type": "response.failed", "error": {"message": message}}
+
+
+def test_byte_cap_rejection_classifies_as_overflow_without_inversion() -> None:
+    """A byte-cap rejection reads actual > max despite reporting bytes."""
+    message = (
+        "Server received a request which exceeds maximum allowed content "
+        "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+    )
+    overflow = _is_context_overflow_error(_overflow_event(message))
+    assert overflow is not None
+    max_tokens, actual_tokens, detail = overflow
+    # Each byte count is divided by the 4-byte token estimate, so the request
+    # reads above the limit rather than being inverted into actual < max.
+    assert max_tokens == 33554432 // 4
+    assert actual_tokens == 33967957 // 4
+    assert actual_tokens > max_tokens
+    # The complete raw rejection is carried through once for the error detail.
+    assert detail == message
+
+
+def test_content_length_phrase_without_sizes_is_not_overflow() -> None:
+    """A size-less content-length phrase stays generic, like the native path."""
+    assert (
+        _is_context_overflow_error(
+            _overflow_event("request exceeds maximum allowed content length")
+        )
+        is None
+    )

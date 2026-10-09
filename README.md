@@ -519,6 +519,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Share with everyone who can sign in.** Admins can allow public Edit in
+  **Settings > Sharing > Maximum public permission**. Owners then choose
+  **Share > General access > Edit**. The default stays Read.
 - **Leave a shared session.** Done with a session someone shared with you?
   Pick **Leave session** from its sidebar row menu to drop it from your
   sidebar. Nothing is deleted — the owner keeps it and can share it again.
