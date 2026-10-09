@@ -9342,23 +9342,14 @@ async def _codex_bridge_torn_down_for_live_pane(
     """
     Return whether a codex session's bridge was torn out from under a live pane.
 
-    :func:`_delete_native_bridge_dirs` (session delete / resource cleanup)
-    removes the whole bridge dir, but the tmux pane can outlive that teardown.
-    A turn delivered afterwards finds neither ``state.json`` nor a recorded
-    startup error, waits out the executor's poll, and fails with the generic
-    "Codex native bridge state is missing" — and nothing regenerates those
-    files while the live pane keeps the per-turn self-heal a no-op. The
-    teardown signature is every runner-written bridge file being gone (see
-    :func:`~omnigent.harnesses.codex_native.bridge.bridge_torn_down`): a cold
-    boot that has not yet written ``state.json`` still has its launch-seeded
-    ``bridge.json``, and a recorded startup failure keeps
-    ``startup_error.json``, so neither is flagged. The session-id-keyed dir is
-    checked first (a stat-only fast path); a rotated bridge-id label (a ``/new``
-    fork) is resolved only when that dir is already torn down, and a rotated
-    session is deliberately not flagged: the relaunch this heal triggers seeds
-    the session-id dir, so it cannot restore the executor's rotated dir and
-    would only kill a live pane. A healthy non-forked turn never pays the label
-    lookup.
+    :func:`_delete_native_bridge_dirs` removes the bridge dir while the tmux
+    pane can outlive it; the next turn then finds no bridge state and fails
+    with the generic "bridge state is missing". The teardown signature is every
+    runner-written bridge file being gone
+    (:func:`~omnigent.harnesses.codex_native.bridge.bridge_torn_down`), which a
+    cold boot (launch-seeded ``bridge.json``) or a recorded startup failure
+    never matches. The session-id dir is checked first with a stat-only fast
+    path; the label lookup runs only when that dir is torn down.
 
     :param server_client: Omnigent server client used to resolve a rotated
         bridge-id label. ``None`` checks only the session-id-keyed dir.
@@ -9382,11 +9373,9 @@ async def _codex_bridge_torn_down_for_live_pane(
     )
     bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
     if bridge_id and bridge_id != session_id:
-        # A rotated label (a /new fork) points the executor at
-        # bridge_dir_for_bridge_id(bridge_id), but the relaunch this heal
-        # triggers seeds the session-id dir (prepare_bridge_dir(session_id)).
-        # Relaunching cannot restore the rotated dir and would only close a
-        # live pane, so leave a forked session to its existing path.
+        # A rotated label (a /new fork) points the executor at the rotated dir,
+        # but the relaunch seeds only the session-id dir: it cannot restore
+        # delivery and would only close a live pane.
         return False
     return True
 
