@@ -203,7 +203,9 @@ class HarnessSpawnError(RuntimeError):
     conversation id, an exit code, or a timeout — never filesystem paths,
     hostnames, or environment values — so the runner's error path may relay
     it verbatim to callers and telemetry instead of redacting the cause to a
-    log pointer. Every raise site MUST keep its message within that contract.
+    log pointer. Every raise site MUST keep its message within that contract
+    and short: the relayed failure is persisted as a bounded label that must
+    still end with the runner-log pointer.
     """
 
 
