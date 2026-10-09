@@ -14,7 +14,9 @@
 #
 # Debby's two heads run on the claude-sdk and codex-native harnesses, so
 # configure both a Claude and an OpenAI provider first (e.g. `omnigent setup`,
-# or export ANTHROPIC_API_KEY and OPENAI_API_KEY).
+# or export ANTHROPIC_API_KEY and OPENAI_API_KEY). The codex-native head also
+# needs the Codex CLI installed (and, on Linux, `bwrap` for the terminal
+# sandbox).
 
 spec_version: 1
 name: debby
