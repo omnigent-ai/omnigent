@@ -1424,11 +1424,11 @@ def test_no_provider_api_key_path_unchanged(config_home: Path) -> None:
 def test_codex_legacy_databricks_profile_fails_without_broker_policy(
     config_home: Path,
 ) -> None:
-    """A legacy Databricks route cannot bypass the signer policy."""
+    """A legacy Databricks route still runs only through the signer."""
     _write_config(config_home, {})
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="active os_env sandbox"):
+    with pytest.raises(OmnigentError, match="ucode Codex state"):
         _build_codex_spawn_env(spec, workdir=None)
 
 
@@ -1444,7 +1444,7 @@ def test_legacy_profile_still_suppresses_global_default_provider(config_home: Pa
     _write_config(config_home, _openai_default_config())  # global default exists
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="active os_env sandbox"):
+    with pytest.raises(OmnigentError, match="ucode Codex state"):
         _build_codex_spawn_env(spec, workdir=None)
 
 
@@ -1538,24 +1538,55 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
     assert "sh -c arbitrary" not in generated
 
 
-def test_codex_databricks_broker_fails_without_model_egress(config_home: Path) -> None:
+@pytest.mark.parametrize("declares_os_env", [False, True])
+def test_codex_databricks_broker_contains_specs_that_do_not_opt_in(
+    config_home: Path,
+    declares_os_env: bool,
+) -> None:
+    """
+    A Databricks-routed codex spec without a sandbox or grant still runs, contained.
+
+    It gets the platform sandbox and the provider's single model route. A spec
+    with ``os_env`` is updated in place so its OS tools share that sandbox; a
+    spec without ``os_env`` gains no OS tools.
+    """
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
 
     _write_config(config_home, {})
+    endpoint = "https://workspace.databricks.com/ai-gateway/codex/v1"
     spec = _make_spec(
         harness="codex",
         model="databricks-gpt-5",
         auth=DatabricksAuth(profile="test-dbx-ws"),
-        os_env=OSEnvSpec(
-            sandbox=OSEnvSandboxSpec(
-                type="linux_bwrap",
-                egress_rules=["* workspace.databricks.com/**"],
-            )
-        ),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")) if declares_os_env else None,
     )
+    with (
+        patch(
+            "omnigent.runtime.workflow.get_workspace_url_for_profile",
+            return_value="https://workspace.databricks.com",
+        ),
+        patch(
+            "omnigent.runtime.workflow.read_ucode_state",
+            return_value=UcodeWorkspaceState(
+                workspace_url="https://workspace.databricks.com",
+                agents={"codex": UcodeAgentState(model="databricks-gpt-5", base_url=endpoint)},
+            ),
+        ),
+    ):
+        env = _build_codex_spawn_env(spec, workdir=None)
 
-    with pytest.raises(OmnigentError, match="model_egress"):
-        _build_codex_spawn_env(spec, workdir=None)
+    platform_type = _default_sandbox_for_platform().type
+    assert json.loads(env["HARNESS_CODEX_OS_ENV"])["sandbox"]["type"] == platform_type
+    assert json.loads(env["HARNESS_CODEX_MODEL_EGRESS"]) == [
+        "POST workspace.databricks.com/ai-gateway/codex/v1/responses"
+    ]
+    if declares_os_env:
+        assert spec.os_env is not None and spec.os_env.sandbox is not None
+        assert spec.os_env.sandbox.type == platform_type
+    else:
+        assert spec.os_env is None
 
 
 def test_codex_databricks_broker_rejects_ordinary_egress_rules(
