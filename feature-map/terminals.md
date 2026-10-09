@@ -40,7 +40,8 @@ reattach when the session moves to another host.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
-- Select an open shell from the rail's shell list; close it from its tab.
+- Select an open shell from the rail's shell list or from the tab strip's
+  **Select panel** menu; close it from its tab.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.

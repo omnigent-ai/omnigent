@@ -2,6 +2,10 @@ import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 
+// Narrowest slot that gets arrow buttons, and the smallest arrow scroll step.
+// tests/browser_ui/files/test_workspace_tab_overflow.py asserts the same width.
+const MIN_SCROLLER_WIDTH_PX = 80;
+
 /** Scroll open tabs while keeping navigation controls outside the viewport. */
 export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -16,7 +20,9 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
     if (!container || !viewport || !content) return;
     const measure = () => {
       // Compare with the full slot so the arrows cannot sustain overflow.
-      const arrows = content.clientWidth > container.clientWidth + 1 && container.clientWidth >= 80;
+      const arrows =
+        content.clientWidth > container.clientWidth + 1 &&
+        container.clientWidth >= MIN_SCROLLER_WIDTH_PX;
       const left = viewport.scrollLeft > 1;
       const right = viewport.scrollWidth - viewport.clientWidth - viewport.scrollLeft > 1;
       setEdges((previous) =>
@@ -37,10 +43,14 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
       viewport.scrollLeft += delta * unit;
       measure();
     };
-    const observer = new ResizeObserver(() => {
-      content
-        .querySelector<HTMLElement>('[aria-current="true"], [aria-selected="true"]')
-        ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const observer = new ResizeObserver((entries) => {
+      // Only a resized slot re-reveals the selected tab; tab content changing
+      // (a tab closing, a label resolving) keeps the user's scroll position.
+      if (entries.some((entry) => entry.target !== content)) {
+        content
+          .querySelector<HTMLElement>('[aria-current="true"], [aria-selected="true"]')
+          ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
       measure();
     });
     observer.observe(container);
@@ -59,7 +69,9 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
   const scroll = (direction: number) => {
     const viewport = viewportRef.current;
     if (!viewport) return;
-    viewport.scrollBy({ left: direction * Math.max(80, viewport.clientWidth * 0.8) });
+    viewport.scrollBy({
+      left: direction * Math.max(MIN_SCROLLER_WIDTH_PX, viewport.clientWidth * 0.8),
+    });
   };
   return (
     <div ref={containerRef} className="no-drag flex min-w-0 flex-1 items-center">

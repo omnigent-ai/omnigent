@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -18,8 +20,22 @@ from tests.browser_ui.files.test_file_line_navigation import (
 seeded_session = seeded_session_fixture
 
 
+@pytest.fixture(scope="session")
+def browser_type_launch_args(browser_type_launch_args: dict[str, Any]) -> dict[str, Any]:
+    # Headless Chromium hides scrollbars by default; a user's browser draws them.
+    return {
+        **browser_type_launch_args,
+        "ignore_default_args": [
+            *browser_type_launch_args.get("ignore_default_args", []),
+            "--hide-scrollbars",
+        ],
+    }
+
+
 @pytest.mark.parametrize("width", [240, 360, 472, 900])
-def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, width: int) -> None:
+def test_workspace_tab_overflow(
+    page: Page, seeded_session: BrowserSession, width: int, tmp_path: Path
+) -> None:
     files = {f"src/long-panel-name-{index}.md": f"# Panel {index}" for index in range(12)}
     paths = list(files)
     _mock_markdown_files(page, seeded_session, files)
@@ -44,6 +60,12 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     toolbar = page.get_by_role("toolbar", name="Workspace tabs")
     viewport = toolbar.locator("[data-workspace-tabs-viewport]")
     expect(viewport).to_be_visible(timeout=30_000)
+    fixed_panel_tabs = toolbar.locator('[data-workspace-tab="changes"]')
+    if width < 400:
+        # Narrow rails move the fixed panels into the picker to leave room for tabs.
+        expect(fixed_panel_tabs).to_be_hidden()
+    else:
+        expect(fixed_panel_tabs).to_be_visible()
     expect(toolbar.get_by_role("button", name="Scroll tabs right")).to_be_enabled()
     expect(toolbar.get_by_role("button", name="Scroll tabs left")).to_be_disabled()
     assert viewport.evaluate("el => getComputedStyle(el).scrollbarWidth") == "none"
@@ -87,7 +109,7 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     expect(page.get_by_role("menuitem", name=paths[0], exact=True)).to_have_attribute(
         "aria-current", "true"
     )
-    page.screenshot(path=f"/tmp/omnigent-tab-picker-{width}.png")
+    page.screenshot(path=tmp_path / f"omnigent-tab-picker-{width}.png")
     page.get_by_role("menuitem", name=paths[-1], exact=True).click()
     expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text("Panel 11")
     active_tab = viewport.locator('[role="button"][aria-current="true"]')
@@ -99,7 +121,7 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
             return visibleWidth >= Math.min(a.width, v.width) - 1;
         }"""
     )
-    page.screenshot(path=f"/tmp/omnigent-tabs-{width}.png")
+    page.screenshot(path=tmp_path / f"omnigent-tabs-{width}.png")
 
     # Resize through fullscreen and back with the last tab selected.
     toolbar.get_by_role("button", name="Full screen", exact=True).click()

@@ -924,10 +924,11 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     renderWorkspace({ openFiles: ["src/App.tsx"] });
 
     const plus = screen.getByRole("button", { name: "Open new" });
-    // Scroller is the "+" wrapper's preceding sibling; it holds only the tabs.
-    const tabsRegion = plus.parentElement!.previousElementSibling as HTMLElement;
-    expect(tabsRegion.children).toHaveLength(1);
-    expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+    // The scroller precedes the "+" wrapper; its viewport content holds only the tabs.
+    const scroller = plus.parentElement!.previousElementSibling as HTMLElement;
+    const content = scroller.querySelector("[data-workspace-tabs-viewport] > *") as HTMLElement;
+    expect(content.children).toHaveLength(1);
+    expect(content).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
   });
 
   it("gives the full-screen button no left padding", () => {
