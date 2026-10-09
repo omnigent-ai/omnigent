@@ -10189,6 +10189,8 @@ async def _session_labels_for_runner_spawn(
         ``"conv_abc123"``.
     :returns: String label mapping. Empty on lookup failure.
     """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
     path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
     try:
         resp = await server_client.get(
@@ -10203,7 +10205,9 @@ async def _session_labels_for_runner_spawn(
             extra={"session_id": session_id},
         )
         return {}
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, DatabricksAuthError) as exc:
+        # DatabricksAuthError: the host credential service couldn't sign the
+        # request. Like any other lookup failure, that must not fail the turn.
         _logger.warning(
             "Failed to resolve session labels; session=%s error=%s",
             session_id,
