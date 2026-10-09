@@ -2,6 +2,7 @@ import XCTest
 
 @testable import Omnigent
 
+@MainActor
 final class DownloadFilenameTests: XCTestCase {
   func testKeepsServerSuggestedFilename() {
     XCTAssertEqual(
