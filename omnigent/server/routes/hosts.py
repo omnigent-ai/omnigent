@@ -865,6 +865,17 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        if agent_store is not None and agent_cache is not None:
+            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+            await asyncio.to_thread(
+                require_session_registry_mcp_support,
+                target.conv,
+                conn.hello.capabilities,
+                component="host",
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+            )
         set_current_session_id(body.session_id)
         add_audit_attrs(session_id=body.session_id, host_id=host_id)
 

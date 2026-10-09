@@ -121,7 +121,7 @@ export function useSessionAgent(sessionId: string | null) {
 
 export interface UpsertMcpServerInput {
   name: string;
-  transport: "http" | "stdio";
+  transport: "http" | "stdio" | "registry";
   description?: string | null;
   url?: string | null;
   headers?: Record<string, string> | null;

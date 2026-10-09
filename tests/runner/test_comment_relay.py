@@ -14,6 +14,7 @@ the runner-side wiring that the e2e test cannot pinpoint when it fails.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
@@ -21,7 +22,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -35,8 +36,10 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
-from omnigent.spec.types import AgentSpec, ToolsConfig
+from omnigent.runner.native import ResolvedSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
 from omnigent.terminals import TerminalListEntry
+from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 # Matches ``_TOOL_RELAY_FILE`` in ``omnigent.harnesses.claude_native.bridge``.
@@ -109,6 +112,13 @@ class _StubResourceRegistry:
 
     def note_terminal_control_request(self, session_id: str, action: str) -> None:
         """No terminal is running, so control requests have no lifecycle evidence."""
+
+    def note_session_turn_started(self, session_id: str) -> None:
+        """No terminal is running, so turns have no lifecycle evidence."""
+
+    def uses_copy_on_write(self, session_id: str) -> bool:
+        """The stub has no sandbox environment."""
+        return False
 
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
         """
@@ -504,6 +514,7 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
             *,
             json: dict[str, Any],
             timeout: float = 60.0,
+            headers: dict[str, str] | None = None,
         ) -> httpx.Response:
             """Record the request and return a valid MCP tools/call response.
 
@@ -1041,8 +1052,9 @@ def _sub_agent_enum(relay_file: Path) -> set[str]:
 def _switch_app(
     tmp_path: Path,
     server_client: _SwitchableServerClient,
-    specs: dict[str, AgentSpec],
+    specs: dict[str, AgentSpec | ResolvedSpec],
     resource_registry: _StubResourceRegistry | None = None,
+    process_manager: _FakeProcessManager | None = None,
 ) -> FastAPI:
     """
     Build a runner app that resolves each agent id to a distinct spec.
@@ -1052,14 +1064,18 @@ def _switch_app(
     :param specs: Agent id → spec the resolver hands back.
     :param resource_registry: Registry stub. ``None`` builds the default
         non-spawning one.
+    :param process_manager: Optional scripted harness process manager.
     :returns: The runner FastAPI app.
     """
 
-    async def spec_resolver(agent_id: str, session_id: str | None) -> AgentSpec | None:
+    async def spec_resolver(
+        agent_id: str, session_id: str | None
+    ) -> AgentSpec | ResolvedSpec | None:
         del session_id
         return specs.get(agent_id)
 
     return create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
         resource_registry=resource_registry or _StubResourceRegistry(tmp_path),
         server_client=server_client,  # type: ignore[arg-type]  # duck-typed for test
         spec_resolver=spec_resolver,
@@ -1088,6 +1104,119 @@ async def _reset_state(client: httpx.AsyncClient, session_id: str) -> None:
     """
     resp = await client.post(f"/v1/sessions/{session_id}/reset-state")
     assert resp.status_code == 200, f"reset-state failed: {resp.text}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["registry", "http"])
+@pytest.mark.parametrize("fail_once", [False, True])
+async def test_native_relay_discovers_session_mcp_tools_through_gateway(
+    tmp_path: Path,
+    transport: Literal["registry", "http"],
+    fail_once: bool,
+) -> None:
+    """Native relays recover discovery on turns and withdraw tools on agent changes."""
+    requests: list[str] = []
+
+    class GatewayClient(_SwitchableServerClient):
+        """Return per-service schemas for registry tools and session schemas otherwise."""
+
+        async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            """Simulate discovery success or a temporary gateway outage."""
+            if kwargs.get("json", {}).get("method") != "tools/list":
+                return self._Response({})
+            requests.append(url)
+            if fail_once and len(requests) == 1:
+                raise httpx.ConnectError("gateway unavailable")
+            return self._Response(
+                {
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "get_me" if transport == "registry" else "github__get_me",
+                                "description": "Read the connected profile",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }
+                        ]
+                    }
+                }
+            )
+
+    server_client = GatewayClient("with-mcp")
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        mcp_servers=[
+            MCPServerConfig(
+                name="github",
+                transport=transport,
+                url="https://mcp.example.com" if transport == "http" else None,
+            )
+        ],
+    )
+    turn_finished = asyncio.Event()
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ],
+        stream_finished=turn_finished,
+    )
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {
+            "with-mcp": ResolvedSpec(spec=spec, workdir=tmp_path),
+            "without-mcp": _spec_without_terminals(),
+        },
+        process_manager=_FakeProcessManager(harness_client),
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                names = _relay_tool_names(relay_file)
+                assert ("github__get_me" in names) is not fail_once
+                assert "list_comments" in names
+                assert requests == [
+                    "/v1/mcp/github"
+                    if transport == "registry"
+                    else f"/v1/sessions/{session_id}/mcp"
+                ]
+
+                await _launch_bridged(client, session_id)
+                assert len(requests) == 1
+                assert _relay_tool_names(relay_file) == names
+
+                response = await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "with-mcp",
+                        "content": [{"type": "input_text", "text": "Try again"}],
+                    },
+                )
+                assert response.status_code == 202, response.text
+                await asyncio.wait_for(turn_finished.wait(), timeout=5.0)
+                assert len(harness_client.posted_bodies) == 1
+                assert {"github__get_me", "list_comments"} <= _relay_tool_names(relay_file)
+                discovery_count = len(requests)
+                assert discovery_count > 1
+
+                server_client.agent_id = "without-mcp"
+                await _reset_state(client, session_id)
+                await _launch_bridged(client, session_id)
+                assert "github__get_me" not in _relay_tool_names(relay_file)
+                assert len(requests) == discovery_count
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio
