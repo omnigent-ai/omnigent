@@ -187,6 +187,7 @@ Join on `connection_id` and compare `tunnel_side = server` with `runner`:
 | `app_ping_rtt_s` | Server-local elapsed time from starting the matching ping send to consuming its pong; excludes queue wait, may include send delay. Uses the echoed token only for matching, not as a clock. |
 | `last_received_frame_age_s` | Time since a WebSocket message was received, including messages later dropped as non-text or malformed. |
 | `last_sent_frame_age_s` | Time since an application-frame send completed successfully. |
+| `psi_cpu_some_avg10`, `psi_cpu_some_avg60`, `psi_memory_full_avg10`, `psi_memory_full_avg60`, `psi_memory_full_avg300`, `psi_io_full_avg60`, `loadavg_1m`, `mem_available_mb`, `process_rss_mb` | Runner side only. Machine-wide Linux pressure (PSI percent), the 1-minute load and `MemAvailable`, plus this process's RSS in MiB, read from procfs when the snapshot is taken; null where unavailable. Memory `full` marks thrash, CPU `some` starvation, IO `full` a stalled disk; all low next to a long `loop_lag_max_s` points outside the guest. |
 
 All durations use local monotonic time. Maxima cover this connection's lifetime;
 their accompanying `_max_age_s` fields distinguish old congestion from delays
