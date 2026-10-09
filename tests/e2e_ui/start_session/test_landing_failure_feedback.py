@@ -176,14 +176,22 @@ async def scripted_host(
         try:
             yield await _wait_host_online(base_url), seen
         finally:
+            # Suppress only the cancellation; a real error from _serve_host must
+            # propagate so a crashed responder isn't hidden behind a later timeout.
             serve_task.cancel()
-            await asyncio.gather(serve_task, return_exceptions=True)
+            with contextlib.suppress(asyncio.CancelledError):
+                await serve_task
 
 
 async def _wait_host_online(base_url: str) -> str:
     async with httpx.AsyncClient(trust_env=False) as client:
         for _ in range(100):
             resp = await client.get(f"{base_url}/v1/hosts")
+            if resp.status_code != 200:
+                # Server still warming up: retry rather than let a non-JSON body
+                # mask the "host never came online" diagnosis.
+                await asyncio.sleep(0.1)
+                continue
             for host in resp.json().get("hosts", []):
                 if host["name"] == HOST_NAME and host["status"] == "online":
                     return str(host["host_id"])
@@ -284,7 +292,11 @@ async def _drive_prompt_journey(base_url: str, browser_name: str, output: Path) 
                 await composer.click()
                 await composer.press_sequentially(PROMPT, delay=25)
                 await expect(composer).to_have_value(PROMPT)
-                await page.wait_for_timeout(1_000)
+                # Enter is a no-op until the create guard opens; wait for the submit
+                # control to enable so the host-backed workspace validation settled.
+                await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled(
+                    timeout=15_000
+                )
                 await composer.press("Enter")
 
                 await expect(
@@ -302,8 +314,12 @@ async def _drive_prompt_journey(base_url: str, browser_name: str, output: Path) 
                 await page.screenshot(path=str(output / "landing-after-start-new-chat.png"))
                 await expect(composer).to_have_value(PROMPT, timeout=5_000)
             finally:
-                await context.close()
-                await browser.close()
+                # Chain teardown so a context.close() failure still closes the
+                # browser and runs session cleanup rather than leaking both.
+                try:
+                    await context.close()
+                finally:
+                    await browser.close()
                 (output / "created-sessions.json").write_text(json.dumps(created))
                 async with httpx.AsyncClient(trust_env=False) as client:
                     for entry in created:
@@ -353,6 +369,14 @@ async def _drive_picker_journey(base_url: str, browser_name: str, output: Path) 
                     f"host received {seen.count('host.list_dir')} list_dir request(s); "
                     f"listing samples (s, text): {samples}"
                 )
+                # The feedback must be the server's connectivity error, not an
+                # empty-directory render: the host never answers list_dir, so a
+                # blank-but-not-loading listing would be a regression.
+                error = page.get_by_test_id("workspace-picker-error")
+                await expect(error).to_be_visible(timeout=2_000)
+                await expect(error).to_contain_text("did not respond to list_dir")
             finally:
-                await context.close()
-                await browser.close()
+                try:
+                    await context.close()
+                finally:
+                    await browser.close()

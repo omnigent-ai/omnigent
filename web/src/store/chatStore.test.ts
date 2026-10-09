@@ -18075,10 +18075,9 @@ describe("chatStore — interaction_phase analytics", () => {
   });
 });
 
-// A failed send hands its text back as the conversation's failedSendDraft,
-// but when the session itself failed to LOAD no composer ever renders to
-// drain it. The load-error screen peeks this draft to hand it to the landing
-// composer, and clears it only once that restore is confirmed.
+// A failed session load never renders the composer that would drain
+// failedSendDraft; the load-error screen peeks it for the landing composer and
+// clears it only on confirmed restore.
 describe("peekFailedSendDraft / clearFailedSendDraft", () => {
   function strandDraft(): { entry: ReturnType<typeof conversationRegistry.acquire>; file: File } {
     const entry = conversationRegistry.acquire("conv_load_failed");

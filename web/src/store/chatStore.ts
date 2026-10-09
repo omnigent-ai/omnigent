@@ -500,16 +500,14 @@ export function removeLocalConversation(tempConvId: string): boolean {
 /**
  * Peek the first message a failed-to-load conversation stranded.
  *
- * A failed send hands its text back as that conversation's
- * `failedSendDraft`, expecting the in-session composer to drain it — but
- * when the session's own load fails, the error screen replaces the whole
- * page and that composer never renders, so the text would be silently
- * lost. The load-error screen reads it here to recover it for the landing
- * composer, then calls `clearFailedSendDraft` only once the restore is
- * confirmed — a refused restore must leave the stranded copy in place.
+ * Reads the `failedSendDraft` without consuming it; the load-error screen
+ * clears it (via `clearFailedSendDraft`) only after the landing composer
+ * accepts the transfer, so a refused restore keeps the stranded copy. Only
+ * the text and attachments come back: the landing composer has no message to
+ * quote, so a stored reply draft is intentionally dropped on restore.
  *
  * @param conversationId The failed conversation's id, e.g. `"conv_abc"`.
- * @returns The stranded text + attachments, or `null` when none.
+ * @returns The stranded text + a copy of its attachments, or `null` when none.
  */
 export function peekFailedSendDraft(
   conversationId: string,
@@ -517,7 +515,9 @@ export function peekFailedSendDraft(
   const state = setterForState(conversationId);
   const draft = state?.failedSendDraft ?? null;
   if (draft === null || draft.conversationId !== conversationId) return null;
-  return { text: draft.text, files: draft.files };
+  // Copy the files: peek must leave the stored draft intact for a refused
+  // restore, so a caller mutating the array can't corrupt it.
+  return { text: draft.text, files: [...draft.files] };
 }
 
 /** Drop a stranded draft (and its retry id) after a confirmed restore. */

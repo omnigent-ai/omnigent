@@ -10522,10 +10522,9 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
   });
 });
 
-// A create that succeeded but whose session never became viewable strands the
-// typed text with no composer to surface it. The load-error screen hands the
-// text back through restoreLandingDraftMessage; the next landing visit must
-// restore it — without clobbering anything the user has composed since.
+// A create that succeeded but never became viewable strands the typed text;
+// restoreLandingDraftMessage hands it back so the next landing visit restores
+// it without clobbering anything the user has composed since.
 describe("restoreLandingDraftMessage", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {
@@ -10574,6 +10573,30 @@ describe("restoreLandingDraftMessage", () => {
     expect(restoreLandingDraftMessage("   ", [])).toBe(false);
     renderLanding();
     expect(landingValue()).toBe("");
+  });
+
+  it("restores an attachment-only stranded message", () => {
+    const file = new File(["x"], "stranded.txt", { type: "text/plain" });
+    expect(restoreLandingDraftMessage("", [file])).toBe(true);
+    renderLanding();
+    expect(landingValue()).toBe("");
+    // The chip proves the file survived the transfer and the remount.
+    expect(screen.getByText("stranded.txt")).toBeTruthy();
+  });
+
+  it("refuses when the newer draft holds only attachments", () => {
+    renderLanding();
+    const kept = new File(["x"], "kept.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [kept] },
+    });
+    // Unmount stashes the attachment-only draft (blank message, one file).
+    cleanup();
+    expect(restoreLandingDraftMessage("stranded text", [])).toBe(false);
+    renderLanding();
+    expect(landingValue()).toBe("");
+    expect(screen.getByText("kept.txt")).toBeTruthy();
+    expect(screen.queryByText("stranded text")).toBeNull();
   });
 });
 

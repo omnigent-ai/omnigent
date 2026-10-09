@@ -207,11 +207,9 @@ describe("useHostFilesystem", () => {
   });
 });
 
-// The listing must not retry a deterministic 4xx (retries keep the query
-// pending, leaving the previous directory's rows on screen behind the
-// placeholder), nor a 502/504 host-connectivity verdict (each silent retry
-// repeats the server's whole list_dir timeout behind a bare loading row),
-// but must still retry transient failures up to the cap.
+// The listing must not retry a deterministic 4xx or a 502/504
+// host-connectivity verdict, but must still retry transient failures up to
+// the cap.
 describe("shouldRetryHostFilesystem", () => {
   function withStatus(status: number): Error {
     const err = new Error(`HTTP ${status}`) as Error & { status?: number };

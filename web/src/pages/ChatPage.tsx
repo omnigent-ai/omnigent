@@ -485,9 +485,11 @@ export function ChatPage() {
       setInitialPrompt(null);
       return;
     }
-    const cached = consumedInitialPromptRef.current;
-    const prompt =
-      cached?.conversationId === urlConvId ? cached.prompt : consumePendingInitialPrompt(urlConvId);
+    const prompt = resolveCachedInitialPrompt(
+      consumedInitialPromptRef.current,
+      urlConvId,
+      consumePendingInitialPrompt,
+    );
     consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
     setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
   }, [urlConvId]);
@@ -1119,6 +1121,11 @@ export function ChatPage() {
               ? initialPrompt.prompt
               : null
           }
+          // The prompt now lives in the landing composer; mark this id's
+          // cached source consumed so a browser-back can't re-dispatch it.
+          onStrandedPromptRetired={() => {
+            consumedInitialPromptRef.current = { conversationId: urlConvId, prompt: null };
+          }}
         />
       );
     }
@@ -1949,31 +1956,34 @@ function HydratingPlaceholder() {
  * conversation id in the URL — surfaces quickly because the store's
  * items fetch disables retries.
  */
-function ConversationLoadError({
+export function ConversationLoadError({
   conversationId,
   error,
   strandedPrompt,
+  onStrandedPromptRetired,
 }: {
   conversationId: string;
   error: Error;
   strandedPrompt: PendingInitialPrompt | null;
+  onStrandedPromptRetired: () => void;
 }) {
   const navigate = useNavigate();
-  // The session never became viewable, so its composer never rendered — hand
-  // any stranded first message back to the landing composer before leaving.
-  // A failed send's returned draft wins (it is the settled truth); a
-  // consumed-but-never-dispatched initial prompt covers the path where the
-  // auto-send gates never opened.
+  // The failed session's composer never rendered, so hand any stranded first
+  // message back to the landing composer; a failed send's draft wins over a
+  // consumed-but-never-dispatched initial prompt.
   const startNewChat = () => {
+    const failedDraft = peekFailedSendDraft(conversationId);
     const stranded =
-      peekFailedSendDraft(conversationId) ??
+      failedDraft ??
       (strandedPrompt !== null
         ? { text: strandedPrompt.text, files: strandedPrompt.files ?? [] }
         : null);
-    // Clear the store copy only once the landing draft accepted the text — a
-    // newer draft refuses the restore and must not destroy the stranded copy.
+    // Retire the source only once the landing draft accepted the text, so a
+    // browser-back can't auto-send a second copy; a newer draft refuses and
+    // keeps the stranded copy. Retiring the ChatPage cache uses the callback.
     if (stranded !== null && restoreLandingDraftMessage(stranded.text, stranded.files)) {
-      clearFailedSendDraft(conversationId);
+      if (failedDraft !== null) clearFailedSendDraft(conversationId);
+      else onStrandedPromptRetired();
     }
     navigate("/");
   };
@@ -4173,6 +4183,19 @@ export function computeShowsWorking(
   // proof — the user just dispatched — so it also survives the gate.
   if (options.runnerOnline === false && !isWorking && !options.localSendInFlight) return false;
   return isWorking || options.localSendInFlight === true || (options.backgroundTaskCount ?? 0) > 0;
+}
+
+/**
+ * Read the carried initial prompt once per conversation id. A matching cache
+ * entry wins (including a retired `null`); otherwise destructively consume the
+ * module entry so a later mount or browser-back cannot re-dispatch it.
+ */
+export function resolveCachedInitialPrompt(
+  cache: { conversationId: string; prompt: PendingInitialPrompt | null } | null,
+  conversationId: string,
+  consume: (conversationId: string) => PendingInitialPrompt | null,
+): PendingInitialPrompt | null {
+  return cache?.conversationId === conversationId ? cache.prompt : consume(conversationId);
 }
 
 /**
