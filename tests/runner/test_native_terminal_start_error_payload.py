@@ -64,7 +64,14 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     assert payload["error_id"] == match.group(1)
 
 
-def test_other_causes_keep_generic_startup_failure_code() -> None:
+@pytest.mark.parametrize(
+    "cause",
+    [
+        RuntimeError("tmux server exited before the pane was ready"),
+        FileNotFoundError("missing executable"),
+    ],
+)
+def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> None:
     """A non-lifecycle cause keeps the generic startup-defect code.
 
     The reclassification is scoped to the missing-agent lifecycle condition;
@@ -72,7 +79,7 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     ``native_terminal_start_failed`` terminal-startup defect.
     """
     payload = _native_terminal_start_error_payload(
-        RuntimeError("tmux server exited before the pane was ready"),
+        cause,
         "Claude",
         session_id="conv_1",
     )
@@ -89,6 +96,10 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
         (OSError(28, "No space left on device"), "host"),
         (
             OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
+            "user",
+        ),
+        (
+            OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
             "user",
         ),
     ],
@@ -249,17 +260,20 @@ def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     assert "agent no longer exists" not in payload["message"]
 
 
-@pytest.mark.parametrize("missing_agent", [False, True])
+@pytest.mark.parametrize(
+    "lifecycle_code",
+    [None, ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING],
+)
 def test_startup_failure_diagnostics_belong_to_failing_child(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    missing_agent: bool,
+    lifecycle_code: ErrorCode | None,
 ) -> None:
     """A shared runner's parent must not receive a child's startup failure evidence."""
     monkeypatch.setattr(orchestration, "runner_primary_session_id", lambda: "parent-session")
     private_detail = "private launch configuration"
-    if missing_agent:
-        exc = OmnigentError(private_detail, code=ErrorCode.SESSION_AGENT_MISSING)
+    if lifecycle_code is not None:
+        exc = OmnigentError(private_detail, code=lifecycle_code)
     else:
         exc = RuntimeError(private_detail)
         exc.__cause__ = httpx.ReadTimeout("private upstream URL")
@@ -281,7 +295,7 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
     assert attributes["exception_type"] == type(exc).__name__
     assert private_detail not in str(attributes)
     assert private_detail not in payload["message"]
-    if missing_agent:
+    if lifecycle_code is not None:
         assert row["stack_trace"] is None
     else:
         assert attributes["exception_cause_type"] == "ReadTimeout"
@@ -291,17 +305,17 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
         assert "(cause ReadTimeout)" in payload["message"]
 
 
-def test_ensure_response_for_a_removed_agent_is_410() -> None:
-    """A removed agent is the session's state, not a runner failure: 410, the status
-    of ``session_agent_missing`` (as for a fork of it). Other failures stay 500."""
+@pytest.mark.parametrize("code", [ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING])
+def test_ensure_response_for_a_removed_session_resource_is_410(code: ErrorCode) -> None:
+    """A removed session resource is a lifecycle condition, not a runner failure."""
     removed = _native_terminal_start_error_response(
-        OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
-        "Claude",
-        session_id="conv_1",
+        OmnigentError("resource gone", code=code), "Claude", session_id="conv_1"
     )
     assert removed.status_code == 410
-    assert json.loads(removed.body)["error"]["code"] == ErrorCode.SESSION_AGENT_MISSING
+    assert json.loads(removed.body)["error"]["code"] == code
 
+
+def test_ensure_response_for_other_failure_is_500() -> None:
     other = _native_terminal_start_error_response(
         OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR), "Claude", session_id="conv_1"
     )

@@ -34,11 +34,12 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
 import { serializeReplyDraft } from "@/lib/replyDraft";
-import { interrupt, stopSession } from "@/lib/sessionsApi";
+import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
@@ -70,10 +71,6 @@ function writeInheritedBoundary(childId: string, ids: Set<string>): void {
   }
 }
 
-// Read-only (dead, restored) Codex side chats we've already stopped this
-// session, so re-selecting the tab doesn't re-fire stop_session each time.
-const killedSideChats = new Set<string>();
-
 // Accurate for every harness: a side chat is a fork that stays out of the main
 // thread. It is NOT reliably ephemeral — a non-Codex side chat is a persisted
 // fork (hidden from the sidebar), so the copy doesn't promise it disappears.
@@ -103,8 +100,7 @@ export function SideChatPane({
 }: {
   childId: string;
   onStart?: (text: string) => Promise<void>;
-  /** A dead, restored Codex side chat: show the transcript but no composer, and
-   *  stop its session. Defaults to false (a live, sendable side chat). */
+  /** A dead, restored Codex side chat: show the transcript without a composer. */
   readOnly?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
@@ -118,15 +114,6 @@ export function SideChatPane({
   useEffect(() => {
     if (!pending) void ensureConversationStreamed(childId);
   }, [pending, childId]);
-  // A restored, read-only Codex side chat is a dead ephemeral fork; stop its
-  // session once (best-effort) so nothing lingers server-side.
-  useEffect(() => {
-    if (readOnly && !pending && !killedSideChats.has(childId)) {
-      killedSideChats.add(childId);
-      void stopSession(childId).catch(() => {});
-    }
-  }, [readOnly, pending, childId]);
-
   // A real tab reads the child entry; a pending tab has none (null → empty).
   const state = useConversationEntryState(pending ? null : childId);
   const {
@@ -372,6 +359,8 @@ function SideChatComposer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
   const dictation = useDictationInsert(text, setText, textareaRef);
+  useAutoGrowTextarea(textareaRef, text);
+
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
   const draft = useChatStore((s) => s.sideChatDrafts[childId]);

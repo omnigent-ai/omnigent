@@ -1,11 +1,10 @@
-// Build for the desktop server selector v2 (the gated "connect to a server"
-// screen, an alternative to the hand-written electron/setup/index.html).
+// Build for the desktop server selector V2.
 //
 // Produces a self-contained page (server-selector-v2.html + hashed JS/CSS) that
-// mounts LoginPageV2 wired to the shell's `omnigentSetup` preload bridge. The
+// mounts ServerSelectorV2 wired to the shell's `omnigentSetup` preload bridge. The
 // output lands directly in the Electron shell package (`electron/server-selector-v2/`)
-// so electron-builder ships it and the shell can load it from a file:// window
-// when OMNIGENT_SERVER_SELECTOR_V2=1. Run via `bun run build:server-selector-v2`.
+// so electron-builder ships it and the shell can load it from a file:// window.
+// Run via `pnpm run build:server-selector-v2`.
 //
 // Mirrors vite.update-overlay.config.ts: relative base for file:// loading, no
 // publicDir (the page needs none of the web app's PWA assets), same `@` alias.

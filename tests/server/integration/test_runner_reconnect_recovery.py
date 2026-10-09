@@ -516,8 +516,21 @@ async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
             for record in caplog.records
             if record.name == "omnigent.server.app" and record.levelno >= logging.ERROR
         ]
-        assert bool(errors) is not superseded
+        transport_warnings = [
+            record
+            for record in caplog.records
+            if record.name == "omnigent.server.app"
+            and record.levelno == logging.WARNING
+            and "Lost runner tunnel" in record.getMessage()
+        ]
         if superseded:
+            assert not errors
             assert any(
                 "Stopped recovering session" in record.getMessage() for record in caplog.records
             )
+        elif error_type is httpx.ConnectError:
+            # A transport loss on the live tunnel is retried by the next reconnect.
+            assert not errors
+            assert transport_warnings
+        else:
+            assert errors

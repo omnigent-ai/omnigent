@@ -559,7 +559,7 @@ describe("Sidebar session list", () => {
       renderSidebar();
 
       const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-      expect(scroller).toHaveClass("overflow-y-auto", "md:mr-1", "[scrollbar-width:thin]");
+      expect(scroller).toHaveClass("overflow-y-auto", "px-2", "[scrollbar-width:thin]");
       expect(scroller.className).toContain("[&::-webkit-scrollbar]:w-2");
       expect(scroller).not.toHaveClass("[scrollbar-width:none]");
       expect(scroller.className).not.toContain("[&::-webkit-scrollbar]:hidden");
@@ -1062,6 +1062,20 @@ describe("Sidebar session list", () => {
     expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
     expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
+
+  it.each(["/canvas", "/canvas/c/conv_one"])(
+    "keeps the Canvas navigation destination on the selected project at %s",
+    (pathname) => {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      renderSidebar(true, `${pathname}?canvas=project`, undefined, {
+        ...FALLBACK_SERVER_INFO,
+        features: { canvas: true },
+      });
+
+      expect(screen.getByTestId("canvas-nav")).toHaveAttribute("href", "/canvas?canvas=project");
+      expect(screen.getByTestId("canvas-nav")).toHaveAttribute("aria-current", "page");
+    },
+  );
 
   it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);

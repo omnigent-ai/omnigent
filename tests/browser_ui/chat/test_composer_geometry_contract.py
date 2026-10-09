@@ -1074,6 +1074,9 @@ def test_panel_resize_does_not_summon_a_ghost_scrollbar(
     page.get_by_role("button", name="Expand right panel").click()
     workspace = page.get_by_role("complementary", name="Workspace")
     expect(workspace).to_be_visible()
+    workspace.evaluate(
+        "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+    )
     before = _fully_visible_state(page)
     handle = box(workspace.get_by_label("Resize panel"))
     x, y = handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2

@@ -1289,12 +1289,8 @@ def register_resource_routes(
             },
         )
 
-    # ── GitHub integration (read-only): PR metadata + the PR's files / diff ──
-    # The list and patch come from the ``gh`` CLI (the PR's "Files changed");
-    # only the per-file expand-context reader uses ``git show``. See
-    # omnigent.runner.github_resource. Each shells out synchronously, so it is
-    # offloaded to a thread like the changed-files / diff routes above (a blocked
-    # loop 503s the session).
+    # Pull request reads use the provider dispatcher; route names stay compatible.
+    # Provider calls block on a CLI or API, so run them outside the event loop.
 
     async def _github_workspace_root(session_id: str) -> str:
         """Resolve the workspace root for GitHub routes, or 404 when headless."""
@@ -1308,10 +1304,10 @@ def register_resource_routes(
         return root
 
     async def _github_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
-        from omnigent.runner import github_resource
+        from omnigent.runner import pr_resource
 
         root = await _github_workspace_root(session_id)
-        function = getattr(github_resource, operation)
+        function = getattr(pr_resource, operation)
         try:
             result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
         except ValueError as exc:
@@ -1320,15 +1316,15 @@ def register_resource_routes(
 
     @app.get("/v1/sessions/{session_id}/resources/github")
     async def read_github_info(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_info", pr_url=pr_url)
+        return await _github_call(session_id, "pr_info", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
     async def read_github_changes(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_changed_files", pr_url=pr_url)
+        return await _github_call(session_id, "pr_changed_files", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
     async def read_github_pr_diff(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_pr_diff", pr_url=pr_url)
+        return await _github_call(session_id, "pr_diff", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
@@ -1346,7 +1342,7 @@ def register_resource_routes(
             raise HTTPException(status_code=400, detail="Invalid path")
         return await _github_call(
             session_id,
-            "github_file_diff",
+            "pr_file_diff",
             base=base or "",
             path=relative_path,
             pr_url=pr_url,
@@ -1369,7 +1365,7 @@ def register_resource_routes(
         body = await request.json()
         return await _github_call(
             session_id,
-            "set_github_preference",
+            "set_pr_preference",
             account=body.get("account"),
             remote=body.get("remote"),
             pr_url=body.get("pr_url"),
@@ -1388,10 +1384,20 @@ def register_resource_routes(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         download: bool = False,
+        # ``reach`` admits a workspace symlink whose target lies outside the
+        # workspace but within the environment's reach. Only the server sends
+        # it, for a caller who may browse that target by absolute path.
+        scope: str = Query(default="workspace", pattern="^(workspace|reach)$"),
     ) -> Response:
         await _require_os_env(session_id)
+        follow_outward_links = scope == "reach"
         if download:
-            return await _fs_download(session_id, environment_id, relative_path)
+            return await _fs_download(
+                session_id,
+                environment_id,
+                relative_path,
+                follow_outward_links=follow_outward_links,
+            )
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -1400,6 +1406,7 @@ def register_resource_routes(
             after=after,
             before=before,
             order=order,
+            follow_outward_links=follow_outward_links,
         )
 
     @app.put(
@@ -1546,6 +1553,8 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,
         path: str,
+        *,
+        follow_outward_links: bool = False,
     ) -> StreamingResponse:
         """Serve a file's complete bytes as an attachment.
 
@@ -1557,6 +1566,8 @@ def register_resource_routes(
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
+        :param follow_outward_links: Admit a workspace symlink whose target
+            lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``.
         :raises InvalidPath: If the path names a directory.
         :raises FilesystemPathNotFound: If nothing the caller may see exists
@@ -1567,7 +1578,8 @@ def register_resource_routes(
         await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
-        fobj, resolved, size = await CallerProcessFilesystem(env).open_download(path)
+        fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
+        fobj, resolved, size = await fs.open_download(path)
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
@@ -1613,6 +1625,7 @@ def register_resource_routes(
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        follow_outward_links: bool = False,
     ) -> JSONResponse:
         from omnigent.runner.environment_filesystem import _MAX_READ_BYTES, CallerProcessFilesystem
 
@@ -1624,7 +1637,7 @@ def register_resource_routes(
             agent_spec,
         )
 
-        fs = CallerProcessFilesystem(env)
+        fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         resolved = fs._resolve(path)
 
         if resolved.is_dir():

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ComponentType, ReactNode, Ref } from "react";
 
 import { getBasePath, withBasePath } from "./basePath.ts";
 
@@ -94,7 +94,24 @@ export type OmnigentAnalyticsEvent =
       durationMs?: number;
     };
 
+/**
+ * Trusted host renderer for untrusted HTML. Before executing any supplied HTML,
+ * enforce sandboxing and an opaque or separate, unprivileged origin that prevents
+ * access to the host app. Expose the content iframe before forwarding every load.
+ */
+export interface HtmlPreviewFrameProps {
+  /** Prepared HTML includes an inline comment bridge; the frame's CSP must allow it. */
+  htmlContent: string;
+  iframeRef: Ref<HTMLIFrameElement>;
+  onLoad: () => void;
+}
+
 export interface OmnigentHostConfig {
+  /**
+   * Install before the app mounts and keep the component identity stable for that
+   * mount. Omitted by older hosts, which retain the sandboxed srcdoc preview.
+   */
+  htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
   /** Stable server/workspace identity used to scope browser-local extension storage. */
   serverIdentity?: string;
   /**
@@ -173,6 +190,10 @@ let hostConfig: OmnigentHostConfig = {};
 let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 let embedScopeRoot: HTMLElement | null = null;
+
+export function getOmnigentHtmlPreviewFrame(): OmnigentHostConfig["htmlPreviewFrame"] {
+  return hostConfig.htmlPreviewFrame;
+}
 
 export function getOmnigentServerIdentity(): string | null {
   if (hostConfig.serverIdentity?.trim()) return hostConfig.serverIdentity.trim();

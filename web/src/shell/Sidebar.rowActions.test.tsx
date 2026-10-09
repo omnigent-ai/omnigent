@@ -20,6 +20,12 @@ import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { sessionActionRestrictions, type SessionActionSource } from "@/lib/sessionCapabilities";
+
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: (_id: string, source: SessionActionSource) =>
+    sessionActionRestrictions(source),
+}));
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -93,6 +99,11 @@ vi.mock("@/hooks/useConversations", async () => {
     useTogglePinnedConversation: () => ({
       mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
         mocks.pinnedStore.toggle(id, pinned),
+      // Unpin goes through mutateAsync so the Undo pill waits for the write.
+      mutateAsync: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        mocks.pinnedStore.toggle(id, pinned);
+        return Promise.resolve({});
+      },
     }),
     useRenameConversation: () => mocks.rename,
     useLeaveSession: () => mocks.leave,
@@ -1125,6 +1136,17 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("keeps Fork visible but unavailable for a managed source", () => {
+    mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
+
   it("opens the fork dialog for the selected session", () => {
     renderSidebar();
 

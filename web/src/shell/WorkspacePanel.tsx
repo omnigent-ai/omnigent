@@ -4,6 +4,7 @@ import {
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
+  GitPullRequestIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
@@ -27,7 +28,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 import { ALT_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 import { defaultWorkspaceTabs, readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
@@ -59,11 +59,10 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -649,7 +648,7 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
-  /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
+  /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
@@ -878,8 +877,8 @@ function WorkspacePanelImpl({
   // pending tab stays put and is rekeyed to the real child once it arrives (via
   // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
   // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side + launches a
-  // runner on the parent's host. Rejects so the composer re-enables and keeps
+  // kept prompt-cache-warm); every other harness forks server-side and reuses
+  // the parent's live runner. Rejects so the composer re-enables and keeps
   // the typed text for a retry.
   const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
     if (usesNativeSideChatFork(sideChatHarness)) {
@@ -940,7 +939,7 @@ function WorkspacePanelImpl({
         childId={selectedSideChat}
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
         // A Codex side chat restored after a restart is a dead ephemeral
-        // fork: show it read-only (and kill it) rather than let the user
+        // fork: show it read-only rather than let the user
         // send into a thread that no longer exists.
         readOnly={
           usesNativeSideChatFork(sideChatHarness) &&
@@ -949,10 +948,15 @@ function WorkspacePanelImpl({
         }
       />
     );
-  // Close a side-chat tab: stop the child's runner (real children only) so its
-  // compute is freed, then drop the browser-local tab.
-  const closeSideChat = (childId: string) => {
-    if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
+  const closeSideChat = async (childId: string) => {
+    if (!childId.startsWith("pending:")) {
+      try {
+        await stopSession(childId);
+      } catch {
+        toast.error("Couldn't close side chat. Try again.");
+        return;
+      }
+    }
     // The tab is gone, so its unsent text/attachments and any seeded question
     // that never got to send have nowhere to return to.
     useChatStore.getState().clearSideChatComposer(childId);
@@ -1087,17 +1091,17 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     github: (pending || showGithubTab) && (
-      <WorkspaceTabTooltip key="github" label="GitHub" shortcut={shortcutFor("github")}>
+      <WorkspaceTabTooltip key="github" label="Pull Requests" shortcut={shortcutFor("github")}>
         <TabsTrigger
           value="github"
-          aria-label="GitHub"
+          aria-label="Pull Requests"
           aria-keyshortcuts={shortcutFor("github")}
           data-workspace-tab="github"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
-          <GithubMono size={16} />
-          <span className="sr-only">GitHub</span>
+          <GitPullRequestIcon />
+          <span className="sr-only">Pull Requests</span>
         </TabsTrigger>
       </WorkspaceTabTooltip>
     ),
@@ -1130,7 +1134,7 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
-  return (
+  const rail = (
     <aside
       aria-label="Workspace"
       aria-hidden={!open}
@@ -1246,7 +1250,7 @@ function WorkspacePanelImpl({
                 it hugs the last tab when they fit and stays pinned when they
                 don't. overflow-y-hidden stops overflow-x:auto from spawning a
                 vertical scrollbar that eats horizontal space. */}
-              <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+              <div className="no-drag flex min-w-0 items-center gap-0.5 overflow-x-auto overflow-y-hidden [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
                 <FileTabsStrip
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
@@ -1457,7 +1461,7 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : rightRailTab === "github" && showGithubTab ? (
-            <GithubPanel conversationId={conversationId} />
+            <PullRequestPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : (
@@ -1475,76 +1479,80 @@ function WorkspacePanelImpl({
           )}
         </div>
       </div>
-      {/* The rail is `hidden` on phones, so the drawer is portaled out of it. */}
-      {isMobile &&
-        createPortal(
-          <MobilePanelDrawer
-            open={mobileSideChatsOpen}
-            title="Side chats"
-            onClose={() => onMobileSideChatsOpenChange?.(false)}
-            testId="side-chats-panel-drawer"
-            // Keep live side-chat work mounted while the drawer is closed.
-            keepMounted
-          >
-            <div
-              role="tablist"
-              aria-label="Side chats"
-              className="flex shrink-0 items-center gap-1 overflow-x-auto border-border border-b px-2 py-1.5"
-            >
-              {sideChats.tabs.map((childId, index) => {
-                const active = sideChats.selected === childId;
-                const label = `Side chat ${index + 1}`;
-                return (
-                  <div
-                    key={childId}
-                    className={cn(
-                      "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
-                      active ? "bg-muted text-foreground" : "text-muted-foreground",
-                    )}
-                  >
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={active}
-                      onClick={() => sideChats.select(childId)}
-                    >
-                      {label}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Close ${label}`}
-                      className="flex size-6 items-center justify-center rounded"
-                      onClick={() => closeSideChat(childId)}
-                    >
-                      <XIcon className="size-3.5" />
-                    </button>
-                  </div>
-                );
-              })}
-              {onNewSideChat && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label="New side chat"
-                  onClick={onNewSideChat}
-                >
-                  <PlusIcon className="size-4" />
-                </Button>
-              )}
-            </div>
-            {selectedSideChatPane ?? (
-              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-                <MessagesSquareIcon className="size-6 text-muted-foreground" />
-                <p className="max-w-[36ch] text-sm text-muted-foreground">
-                  Tap + to ask a question without affecting the main conversation.
-                </p>
-              </div>
-            )}
-          </MobilePanelDrawer>,
-          document.body,
-        )}
     </aside>
+  );
+  return (
+    <>
+      {rail}
+      {/* The rail is `hidden` on phones, so the drawer renders beside it. A
+        portal to the body would escape the embed's scoped styles. */}
+      {isMobile && (
+        <MobilePanelDrawer
+          open={mobileSideChatsOpen}
+          title="Side chats"
+          onClose={() => onMobileSideChatsOpenChange?.(false)}
+          testId="side-chats-panel-drawer"
+          // Keep live side-chat work mounted while the drawer is closed.
+          keepMounted
+        >
+          <div
+            role="tablist"
+            aria-label="Side chats"
+            className="flex shrink-0 items-center gap-1 overflow-x-auto border-border border-b px-2 py-1.5"
+          >
+            {sideChats.tabs.map((childId, index) => {
+              const active = sideChats.selected === childId;
+              const label = `Side chat ${index + 1}`;
+              return (
+                <div
+                  key={childId}
+                  className={cn(
+                    "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
+                    active ? "bg-muted text-foreground" : "text-muted-foreground",
+                  )}
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => sideChats.select(childId)}
+                  >
+                    {label}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Close ${label}`}
+                    className="flex size-6 items-center justify-center rounded"
+                    onClick={() => closeSideChat(childId)}
+                  >
+                    <XIcon className="size-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+            {onNewSideChat && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="New side chat"
+                onClick={onNewSideChat}
+              >
+                <PlusIcon className="size-4" />
+              </Button>
+            )}
+          </div>
+          {selectedSideChatPane ?? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+              <MessagesSquareIcon className="size-6 text-muted-foreground" />
+              <p className="max-w-[36ch] text-sm text-muted-foreground">
+                Tap + to ask a question without affecting the main conversation.
+              </p>
+            </div>
+          )}
+        </MobilePanelDrawer>
+      )}
+    </>
   );
 }
 

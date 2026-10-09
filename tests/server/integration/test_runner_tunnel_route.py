@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -20,6 +21,7 @@ from starlette.requests import HTTPConnection
 from omnigent.errors import OmnigentError
 from omnigent.runner import create_runner_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
     EventAckFrame,
@@ -27,6 +29,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     EventReadyFrame,
     HelloFrame,
     PingFrame,
+    PongFrame,
     RequestFrame,
     decode_frame,
     encode_frame,
@@ -376,6 +379,12 @@ async def test_ws_tunnel_status_reports_registration(
     assert disconnected["reason"] == "runner shutdown"
     assert disconnected["ended_by"] == "tunnel-receive"
     assert disconnected["connection_age_s"] >= 0
+    assert disconnected["tunnel_side"] == "server"
+    assert disconnected["protocol_keepalive_source"] == "unavailable_from_asgi"
+    assert "protocol_ping_timeout_s" not in disconnected
+    assert disconnected["app_ping_interval_s"] == 30.0
+    assert disconnected["app_silence_timeout_s"] == 90.0
+    assert disconnected["last_received_frame_age_s"] >= 0
     assert registry.get(_RUNNER_ID) is None
 
 
@@ -2170,6 +2179,9 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert timeouts[0]["connection_id"] == "conn-silent-1"
     assert timeouts[0]["connection_age_s"] >= 0
     assert timeouts[0]["silent_s"] > 0
+    assert timeouts[0]["app_silence_timeout_s"] == 0.02
+    assert timeouts[0]["last_received_frame_age_s"] >= 0
+    assert timeouts[0]["last_app_pong_received_age_s"] is None
     ends = _tunnel_end_events(caplog)
     assert len(ends) == 1
     assert ends[0]["phase"] == "disconnected"
@@ -2180,6 +2192,102 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert ends[0]["reason"] == (
         "tunnel retired by server; reconnect" if retire_during_timeout else "ping timeout"
     )
+
+
+async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 1000)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-heartbeat")
+        ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
+        assert isinstance(ping, PingFrame)
+        await communicator.send_input(
+            {"type": "websocket.receive", "text": encode_frame(PongFrame(ts=ping.ts))}
+        )
+        session = route_app.registry.get(_RUNNER_ID)
+        assert session is not None
+        async with asyncio.timeout(budget(1)):
+            while session.diagnostics.snapshot()["last_app_pong_received_age_s"] is None:
+                await asyncio.sleep(0.001)
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(communicator.future, timeout=budget(1))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    row = _tunnel_end_events(caplog)[0]
+    assert row["connection_id"] == "conn-heartbeat"
+    assert row["app_ping_rtt_s"] >= 0
+    assert row["last_app_ping_sent_age_s"] >= 0
+    assert row["last_app_pong_received_age_s"] >= 0
+    assert row["outbound_queue_high_water"] >= 1
+    assert row["send_errors"] == 0
+
+
+async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The timeout still fires when the sender is stuck, and cleanup preserves proof."""
+    from omnigent.runner.transports.ws_tunnel import diagnostics as diagnostics_module
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(diagnostics_module, "_SAMPLE_INTERVAL_S", 0.005)
+    monkeypatch.setattr(diagnostics_module, "_SLOW_OPERATION_S", 0.01)
+    monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.05)
+    monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 3)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    route_app = _tunnel_route_app()
+
+    async def blocked_sender_app(scope, receive, send):
+        async def delayed_send(message):
+            if message["type"] == "websocket.send":
+                await asyncio.Future()
+            await send(message)
+
+        await route_app.app(scope, receive, delayed_send)
+
+    communicator = ApplicationCommunicator(blocked_sender_app, _websocket_scope(_TUNNEL_PATH))
+    try:
+        await communicator.send_input({"type": "websocket.connect"})
+        assert (await communicator.receive_output(timeout=budget(1)))["type"] == "websocket.accept"
+        await _send_hello(communicator, route_app.registry, connection_id="conn-blocked-send")
+        message = await communicator.receive_output(timeout=budget(2))
+        assert message["type"] == "websocket.close"
+        assert message["code"] == 4003
+        await asyncio.wait_for(communicator.future, timeout=budget(1))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    timeout = next(
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_ping_timeout"
+    )
+    closed = _tunnel_end_events(caplog)[0]
+    health = next(
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel_health"
+    )
+    assert health["connection_id"] == "conn-blocked-send"
+    assert health["tunnel_side"] == "server"
+    for row in (timeout, closed):
+        assert row["connection_id"] == "conn-blocked-send"
+        assert row["sends_in_flight"] == 1
+        assert row["oldest_tracked_send_age_s"] > 0
+        assert row["outbound_queue_depth"] >= 1
+        assert row["app_pings_queued"] >= 1
+        assert row["last_app_ping_sent_age_s"] is None
+        assert row["last_app_pong_received_age_s"] is None
+    assert route_app.registry.get(_RUNNER_ID) is None
 
 
 async def test_keepalive_loop_fires_faster_than_the_ping_interval(
@@ -2232,6 +2340,25 @@ class _FakeSenderWebSocket:
         self.sent.append(data)
 
 
+async def test_sender_diagnostics_exclude_retirement_sentinel_from_queue_depth() -> None:
+    from omnigent.server.routes import runner_tunnel
+
+    registry = TunnelRegistry()
+    ws = _FakeSenderWebSocket()
+    session = registry.register(
+        _RUNNER_ID,
+        ws,
+        HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[]),
+    )
+    await registry.send_text(session, "first")
+    await registry.send_text(session, "second")
+    registry.deregister(_RUNNER_ID, session)
+    await runner_tunnel._sender_loop(ws, session)
+    assert ws.sent == ["first", "second"]
+    assert session.diagnostics.snapshot()["outbound_queue_depth"] == 0
+    assert session.diagnostics.snapshot()["outbound_queue_high_water"] == 2
+
+
 async def test_sender_loop_swallows_send_after_close_race() -> None:
     """A send racing a concurrent close (socket already DISCONNECTED)
     ends the sender loop quietly instead of raising into the route."""
@@ -2245,8 +2372,10 @@ async def test_sender_loop_swallows_send_after_close_race() -> None:
         raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
         application_state=WebSocketState.DISCONNECTED,
     )
-    session = SimpleNamespace(runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue())
-    session.outbound_queue.put_nowait("frame")
+    session = SimpleNamespace(
+        runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     await runner_tunnel._sender_loop(ws, session)  # returns without raising
 
 
@@ -2263,8 +2392,10 @@ async def test_sender_loop_reraises_send_failure_while_connected() -> None:
         raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
         application_state=WebSocketState.CONNECTED,
     )
-    session = SimpleNamespace(runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue())
-    session.outbound_queue.put_nowait("frame")
+    session = SimpleNamespace(
+        runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     with pytest.raises(RuntimeError):
         await runner_tunnel._sender_loop(ws, session)
 
@@ -2298,8 +2429,10 @@ async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
 
     ws = WebSocket({"type": "websocket", "path": "/", "headers": []}, receive, send)
     await ws.accept()
-    session = SimpleNamespace(runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue())
-    session.outbound_queue.put_nowait("frame")
+    session = SimpleNamespace(
+        runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     sender = asyncio.create_task(runner_tunnel._sender_loop(ws, session))
     await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
     await ws.close(code=4000)

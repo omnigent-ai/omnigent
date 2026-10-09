@@ -87,7 +87,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         terminals = list(loaded.spec.terminals or {})
         # Bundled suggestions stay available while the host catalog loads.
         skills = [
-            SkillSummary(name=s.name, description=s.description)
+            SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
             for s in loaded.spec.skills
             if s.user_invocable
         ]
@@ -208,6 +208,9 @@ def install_user_agent(
             if existing is None:
                 raise
     if existing.bundle_location == location:
+        # Same files: restore the blob if it vanished while the row survived.
+        if not artifact_store.exists(location):
+            artifact_store.put(location, bundle_bytes)
         return existing
     artifact_store.put(location, bundle_bytes)
     updated = agent_store.update(agent_id, location)

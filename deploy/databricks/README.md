@@ -11,7 +11,7 @@ via [Databricks Asset Bundles](https://docs.databricks.com/aws/en/dev-tools/bund
 > **Most Databricks users want the managed offering instead.**
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) runs the server for you, wired to workspace identity,
-> Foundation Models, AI Gateway, and MLflow Tracing out of the box.
+> Foundation Models, Unity Gateway, and MLflow Tracing out of the box.
 > Enable the **Omnigent** preview in your workspace settings and follow
 > the quickstart there. Use this directory only when you need to
 > self-manage the deployment: the managed service is not in your region

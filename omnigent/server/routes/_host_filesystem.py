@@ -72,7 +72,8 @@ async def read_workspace_from_host(
     :param host_conn: Live host connection for the session's host.
     :param op: Operation name — ``"list_or_read"`` / ``"changes"`` /
         ``"diff"`` / ``"search"`` / ``"github_info"`` / ``"github_changes"`` /
-        ``"github_diff"`` / ``"github_pr_diff"``.
+        ``"github_diff"`` / ``"github_pr_diff"``. The ``github_*`` ops serve
+        every git provider; their names are stable wire ids.
     :param workspace: Absolute workspace path on the host.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments.
@@ -146,12 +147,14 @@ async def write_workspace_from_host(
     """Send a ``host.fs_write_request`` frame and await its result.
 
     The write counterpart of :func:`read_workspace_from_host` — for the small set
-    of host-servable writes (currently ``"github_set_preference"``) so a
-    preference change works when the session's runner is offline. Shares the
+    of host-servable writes (currently ``"github_set_preference"`` and
+    ``"github_prs_update"``) so a preference change or a PR attach/remove works
+    when the session's runner is offline. Shares the
     result frame, the ``pending_fs_requests`` correlation map, and the error
     mapping with reads.
 
-    :param op: Write op name — currently ``"github_set_preference"``.
+    :param op: Write op name — currently ``"github_set_preference"`` or
+        ``"github_prs_update"``.
     :param params: Operation-specific arguments, e.g. ``{"account": ...}``.
     :returns: The refreshed payload on success.
     :raises HostFsError: When the host reports a failure (reproduces the runner's

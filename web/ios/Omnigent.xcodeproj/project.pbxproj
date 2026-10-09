@@ -62,9 +62,20 @@
 		B10000000000000000000021 /* DatabricksWebContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* DatabricksWebContext.swift */; };
 		B10000000000000000000022 /* DatabricksSessionClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000022 /* DatabricksSessionClient.swift */; };
 		B10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */; };
+		B10000000000000000000024 /* WebAuthenticationBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000024 /* WebAuthenticationBrowser.swift */; };
+		B10000000000000000000025 /* ServerManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000025 /* ServerManifest.swift */; };
+		B10000000000000000000026 /* OAuthSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000026 /* OAuthSupport.swift */; };
+		B10000000000000000000027 /* OidcCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000027 /* OidcCredentialStore.swift */; };
+		B10000000000000000000028 /* OidcCredentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000028 /* OidcCredentials.swift */; };
+		B10000000000000000000029 /* OidcWebSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000029 /* OidcWebSession.swift */; };
 		B20000000000000000000010 /* DatabricksWebContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* DatabricksWebContextTests.swift */; };
 		B20000000000000000000011 /* DatabricksSessionClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* DatabricksSessionClientTests.swift */; };
 		B20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */; };
+		B20000000000000000000013 /* WebAuthenticationBrowserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* WebAuthenticationBrowserTests.swift */; };
+		B20000000000000000000014 /* ServerManifestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* ServerManifestTests.swift */; };
+		B20000000000000000000015 /* OidcCredentialsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* OidcCredentialsTests.swift */; };
+		B20000000000000000000016 /* OidcCredentialStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* OidcCredentialStoreTests.swift */; };
+		B20000000000000000000017 /* OidcWebSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* OidcWebSessionTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -145,9 +156,20 @@
 		A10000000000000000000021 /* DatabricksWebContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWebContext.swift; sourceTree = "<group>"; };
 		A10000000000000000000022 /* DatabricksSessionClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksSessionClient.swift; sourceTree = "<group>"; };
 		A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWorkspaceBootstrap.swift; sourceTree = "<group>"; };
+		A10000000000000000000024 /* WebAuthenticationBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebAuthenticationBrowser.swift; sourceTree = "<group>"; };
+		A10000000000000000000025 /* ServerManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManifest.swift; sourceTree = "<group>"; };
+		A10000000000000000000026 /* OAuthSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthSupport.swift; sourceTree = "<group>"; };
+		A10000000000000000000027 /* OidcCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentialStore.swift; sourceTree = "<group>"; };
+		A10000000000000000000028 /* OidcCredentials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentials.swift; sourceTree = "<group>"; };
+		A10000000000000000000029 /* OidcWebSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcWebSession.swift; sourceTree = "<group>"; };
 		A20000000000000000000010 /* DatabricksWebContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWebContextTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000011 /* DatabricksSessionClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksSessionClientTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWorkspaceBootstrapTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000013 /* WebAuthenticationBrowserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebAuthenticationBrowserTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000014 /* ServerManifestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManifestTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000015 /* OidcCredentialsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentialsTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000016 /* OidcCredentialStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcCredentialStoreTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000017 /* OidcWebSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcWebSessionTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -228,6 +250,12 @@
 				A10000000000000000000021 /* DatabricksWebContext.swift */,
 				A10000000000000000000022 /* DatabricksSessionClient.swift */,
 				A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */,
+				A10000000000000000000024 /* WebAuthenticationBrowser.swift */,
+				A10000000000000000000025 /* ServerManifest.swift */,
+				A10000000000000000000026 /* OAuthSupport.swift */,
+				A10000000000000000000027 /* OidcCredentialStore.swift */,
+				A10000000000000000000028 /* OidcCredentials.swift */,
+				A10000000000000000000029 /* OidcWebSession.swift */,
 				A1000000000000000000001D /* Omnigent.entitlements */,
 				A1000000000000000000000D /* Assets.xcassets */,
 				A10000000000000000000013 /* PrivacyInfo.xcprivacy */,
@@ -261,6 +289,11 @@
 				A20000000000000000000010 /* DatabricksWebContextTests.swift */,
 				A20000000000000000000011 /* DatabricksSessionClientTests.swift */,
 				A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */,
+				A20000000000000000000013 /* WebAuthenticationBrowserTests.swift */,
+				A20000000000000000000014 /* ServerManifestTests.swift */,
+				A20000000000000000000015 /* OidcCredentialsTests.swift */,
+				A20000000000000000000016 /* OidcCredentialStoreTests.swift */,
+				A20000000000000000000017 /* OidcWebSessionTests.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -444,6 +477,12 @@
 				B10000000000000000000021 /* DatabricksWebContext.swift in Sources */,
 				B10000000000000000000022 /* DatabricksSessionClient.swift in Sources */,
 				B10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift in Sources */,
+				B10000000000000000000024 /* WebAuthenticationBrowser.swift in Sources */,
+				B10000000000000000000025 /* ServerManifest.swift in Sources */,
+				B10000000000000000000026 /* OAuthSupport.swift in Sources */,
+				B10000000000000000000027 /* OidcCredentialStore.swift in Sources */,
+				B10000000000000000000028 /* OidcCredentials.swift in Sources */,
+				B10000000000000000000029 /* OidcWebSession.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -472,6 +511,11 @@
 				B20000000000000000000010 /* DatabricksWebContextTests.swift in Sources */,
 				B20000000000000000000011 /* DatabricksSessionClientTests.swift in Sources */,
 				B20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift in Sources */,
+				B20000000000000000000013 /* WebAuthenticationBrowserTests.swift in Sources */,
+				B20000000000000000000014 /* ServerManifestTests.swift in Sources */,
+				B20000000000000000000015 /* OidcCredentialsTests.swift in Sources */,
+				B20000000000000000000016 /* OidcCredentialStoreTests.swift in Sources */,
+				B20000000000000000000017 /* OidcWebSessionTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -133,7 +133,7 @@ deploy/
 > **On Databricks?** The fully managed
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) is the recommended path: Databricks operates the server for
-> you, wired to workspace identity, Foundation Models, AI Gateway, and
+> you, wired to workspace identity, Foundation Models, Unity Gateway, and
 > MLflow Tracing. Enable the **Omnigent** preview in your workspace
 > settings. The self-managed Databricks Apps bundle above is for when
 > you need control the managed service does not expose yet.

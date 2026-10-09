@@ -5,7 +5,6 @@ const assert = require("node:assert/strict");
 const { createArcaAutoConnect } = require("../src/arca_autoconnect");
 
 const SERVER = "https://workspace.cloud.databricks.com/ml/omnigents";
-const ORIGIN = "https://workspace.cloud.databricks.com";
 
 /** A controllable startConnect: each call records itself and waits for finish(). */
 function fakeConnects() {
@@ -29,7 +28,7 @@ function harness({ eligible = true } = {}) {
     isEligible: () => eligible,
     startConnect: connects.startConnect,
     commandLine: () => "arca ssh isaac omni host",
-    onStatus: (origin, status) => events.push({ origin, status }),
+    onStatus: (target, status) => events.push({ target, status }),
     now: () => 1000,
   });
   return { auto, events, runs: connects.runs };
@@ -43,13 +42,13 @@ describe("arca auto-connect", () => {
     assert.equal(runs.length, 0);
   });
 
-  it("runs once per origin and shares the in-flight run", async () => {
+  it("runs once per target and shares the in-flight run", async () => {
     const { auto, runs, events } = harness();
     const first = auto.ensure(SERVER);
-    const second = auto.ensure(`${ORIGIN}/other`);
+    const second = auto.ensure(`${SERVER}/`);
     assert.equal(runs.length, 1);
     assert.equal(auto.getStatus(SERVER).state, "starting");
-    assert.equal(events[0].origin, ORIGIN);
+    assert.equal(events[0].target, SERVER);
     assert.equal(events[0].status.command, "arca ssh isaac omni host");
 
     runs[0].finish({ ok: true, alreadyRunning: false });
@@ -63,13 +62,35 @@ describe("arca auto-connect", () => {
     assert.equal(runs.length, 1);
   });
 
+  it("keeps workspace selectors separate when sharing runs, status, and retries", async () => {
+    const { auto, runs } = harness();
+    const firstTarget = "https://account.databricks.com/omnigent?o=123";
+    const secondTarget = "https://account.databricks.com/omnigent?o=456";
+    const first = auto.ensure(firstTarget);
+    assert.equal(auto.inFlight(secondTarget), null);
+    const second = auto.ensure(secondTarget);
+    assert.equal(runs.length, 2);
+    runs[0].finish({ ok: true });
+    runs[1].finish({ ok: false, errorKind: "omni-auth" });
+    await Promise.all([first, second]);
+    assert.equal(auto.getStatus(firstTarget).state, "online");
+    assert.equal(auto.getStatus(secondTarget).state, "failed");
+    const retry = auto.retry(secondTarget);
+    assert.equal(runs[2].serverUrl, secondTarget);
+    runs[2].finish({ ok: true });
+    await retry;
+    assert.equal(runs.length, 3);
+  });
+
   it("reports a warm launch as already running", async () => {
     const { auto, runs } = harness();
     const pending = auto.ensure(SERVER);
-    runs[0].finish({ ok: true, alreadyRunning: true });
+    const identity = { serverUrl: SERVER, hostId: "a".repeat(32) };
+    runs[0].finish({ ok: true, alreadyRunning: true, identity });
     const status = await pending;
     assert.equal(status.state, "online");
     assert.equal(status.alreadyRunning, true);
+    assert.deepEqual(status.identity, identity);
   });
 
   it("keeps the failure kind and output tail, and retries only after a failure", async () => {

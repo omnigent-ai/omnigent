@@ -27,6 +27,7 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.native.input_diagnostics import input_delivery_scope
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -105,6 +106,8 @@ class _FakeCodexNativeClient:
         :returns: Codex-shaped response payload.
         """
         type(self).requests.append((method, params))
+        if method == "model/list":
+            return {"result": {"data": [], "nextCursor": None}}
         if method == "turn/start":
             turn_id = f"turn_{type(self).next_turn}"
             type(self).next_turn += 1
@@ -153,9 +156,76 @@ def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
     return asyncio.run(run())
 
 
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"])
+@pytest.mark.parametrize(
+    "rpc_reply",
+    [
+        None,
+        {},
+        {"result": {"turn": {"id": ""}, "turnId": ""}},
+        {"result": {"turn": {"id": 7}, "turnId": 7}},
+        {"result": []},
+    ],
+    ids=["turn-id", "missing-result", "empty-id", "invalid-id", "invalid-result"],
+)
+def test_codex_delivery_records_input_and_accepted_native_turn(
+    active_turn_id: str | None,
+    rpc_reply: dict[str, Any] | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+
+    class _DeliveryReplyClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            reply = await super().request(method, params)
+            if method in {"turn/start", "turn/steer"} and rpc_reply is not None:
+                return rpc_reply
+            return reply
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _DeliveryReplyClient
+    )
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
+    identity = {
+        "input_stable_id": "a" * 32,
+        "pending_id": "pending_" + "b" * 32,
+        "delivery_attempt_id": "c" * 32,
+        "input_enqueued_at_ms": 12345,
+    }
+    with input_delivery_scope(identity, response_id="resp_delivery"):
+        events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "private prompt")
+    assert isinstance(events[0], TurnComplete)
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "codex_native_delivery_finished"
+    ]
+    attrs = record.attributes
+    assert {key: attrs[key] for key in identity} == identity
+    assert attrs["response_id"] == "resp_delivery"
+    assert attrs["stage"] == ("turn_steer" if active_turn_id else "turn_start")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    if rpc_reply is None:
+        assert attrs["native_turn_id"] == ("turn_steered" if active_turn_id else "turn_1")
+        assert attrs["outcome"] == "rpc_accepted"
+        assert state.active_turn_id == attrs["native_turn_id"]
+    else:
+        assert attrs["native_turn_id"] is None
+        assert attrs["outcome"] == "rpc_accepted_missing_turn_id"
+        assert state.active_turn_id == active_turn_id
+    assert "private prompt" not in json.dumps(attrs)
+
+
 def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A web-started Codex turn returns after app-server accepts it.
@@ -187,12 +257,18 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
     events = _collect_turn_events(executor, "first")
     state = read_bridge_state(tmp_path)
 
     assert [type(event) for event in events] == [TurnComplete]
     assert state is not None
     assert state.active_turn_id == "turn_1"
+    assert not any(
+        getattr(record, "event_name", None)
+        in {"codex_native_delivery_attempt", "codex_native_delivery_finished"}
+        for record in caplog.records
+    )
     assert _FakeCodexNativeClient.requests == [
         (
             "turn/start",
@@ -899,6 +975,7 @@ def test_next_web_message_starts_new_codex_turn_after_forwarder_marks_idle(
 def test_stale_completed_turn_steer_retries_once_as_new_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Codex's explicit no-active-turn response reconciles and starts once."""
 
@@ -924,7 +1001,9 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
     _seed_bridge(tmp_path, active_turn_id="turn_completed")
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    events = _collect_turn_events(executor, "follow up")
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
+    with input_delivery_scope({"input_stable_id": "a" * 32}):
+        events = _collect_turn_events(executor, "follow up")
 
     assert [type(event) for event in events] == [TurnComplete]
     assert [method for method, _params in _StaleSteerClient.requests] == [
@@ -935,6 +1014,17 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_1"
+    outcomes = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_delivery_finished"
+    ]
+    assert [(a["stage"], a["outcome"], a["native_turn_id"]) for a in outcomes] == [
+        ("turn_steer", "rpc_error", "turn_completed"),
+        ("turn_start", "rpc_accepted", "turn_1"),
+    ]
+    assert outcomes[1]["requested_native_turn_id"] is None
+    assert all(a["input_stable_id"] == "a" * 32 for a in outcomes)
 
 
 @pytest.mark.parametrize(
@@ -945,13 +1035,16 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
             CodexAppServerResponseError({"code": -32600, "message": "invalid turn id"}),
             id="other-json-rpc-error",
         ),
+        pytest.param(asyncio.CancelledError(), id="cancelled"),
     ],
 )
+@pytest.mark.parametrize("live_injection", [False, True])
 def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    error: Exception,
+    error: BaseException,
     caplog: pytest.LogCaptureFixture,
+    live_injection: bool,
 ) -> None:
     """Only Codex's explicit idle semantic is safe to retry."""
 
@@ -973,28 +1066,75 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     )
     _seed_bridge(tmp_path, active_turn_id="turn_maybe_active")
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
 
-    events = _collect_turn_events(executor, "do not duplicate")
+    with input_delivery_scope({"input_stable_id": "a" * 32}, response_id="resp_delivery"):
+        if isinstance(error, asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
+                if live_injection:
+                    asyncio.run(executor.enqueue_session_message("main", "do not duplicate"))
+                else:
+                    _collect_turn_events(executor, "do not duplicate")
+        elif live_injection:
+            assert (
+                asyncio.run(executor.enqueue_session_message("main", "do not duplicate")) is False
+            )
+        else:
+            events = _collect_turn_events(executor, "do not duplicate")
+            assert [type(event) for event in events] == [ExecutorError]
 
-    assert [type(event) for event in events] == [ExecutorError]
     assert [method for method, _params in _FailingSteerClient.requests] == ["turn/steer"]
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_maybe_active"
+    rpc_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None)
+        in {"codex_native_delivery_attempt", "codex_native_delivery_finished"}
+    ]
+    assert [record.event_name for record in rpc_records] == [
+        "codex_native_delivery_attempt",
+        "codex_native_delivery_finished",
+    ]
+    assert (
+        rpc_records[0].attributes["native_rpc_attempt_id"]
+        == rpc_records[1].attributes["native_rpc_attempt_id"]
+    )
+    for record in rpc_records:
+        assert record.attributes["input_stable_id"] == "a" * 32
+        assert record.attributes["response_id"] == "resp_delivery"
+        assert record.attributes["requested_native_turn_id"] == "turn_maybe_active"
+        assert "do not duplicate" not in repr(record.attributes)
+    assert rpc_records[1].attributes["exception_type"] == type(error).__name__
+    assert rpc_records[1].attributes["outcome"] == (
+        "cancelled" if isinstance(error, asyncio.CancelledError) else "rpc_error"
+    )
+    if isinstance(error, asyncio.CancelledError):
+        assert not any(
+            getattr(record, "event_name", None) == "codex_turn_injection_failed"
+            for record in caplog.records
+        )
+        return
 
     from omnigent.debug_logging import record_to_row
 
-    record = next(
+    [record] = [
         record
         for record in caplog.records
-        if record.getMessage() == "Codex native turn injection failed"
-    )
+        if getattr(record, "event_name", None) == "codex_turn_injection_failed"
+    ]
     row = record_to_row(record, source="runner")
     assert row["session_id"] == state.session_id
     assert row["event_name"] == "codex_turn_injection_failed"
     attrs = row["attributes"]
     assert row["turn_id"] == "turn_maybe_active"
+    assert attrs["initial_native_turn_id"] == "turn_maybe_active"
     assert attrs["thread_id"] == state.thread_id
+    assert attrs["exception_type"] == type(error).__name__
+    assert attrs["input_stable_id"] == "a" * 32
+    assert attrs["response_id"] == "resp_delivery"
+    assert attrs["outcome"] == "error"
     if isinstance(error, CodexAppServerResponseError):
         assert attrs["rpc_error_code"] == "-32600"
     else:
@@ -1002,9 +1142,12 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     assert "do not duplicate" not in json.dumps(attrs)
 
 
+@pytest.mark.parametrize("recovery_fails", [False, True])
 def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    recovery_fails: bool,
 ) -> None:
     """A concurrent turn B is steered, never cleared or double-started."""
 
@@ -1022,6 +1165,10 @@ def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
                     {"code": -32600, "message": "no active turn to steer"}
                 )
             if method == "turn/steer":
+                if recovery_fails:
+                    raise CodexAppServerResponseError(
+                        {"code": -32603, "message": "second RPC failed"}
+                    )
                 return {"result": {"turnId": "turn_b"}}
             raise AssertionError(f"recovery must not double-start: {method}")
 
@@ -1034,9 +1181,11 @@ def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
     _seed_bridge(tmp_path, active_turn_id="turn_a")
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    events = _collect_turn_events(executor, "follow up")
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
+    with input_delivery_scope({"input_stable_id": "a" * 32}):
+        events = _collect_turn_events(executor, "follow up")
 
-    assert [type(event) for event in events] == [TurnComplete]
+    assert [type(event) for event in events] == [ExecutorError if recovery_fails else TurnComplete]
     assert [
         (method, params.get("expectedTurnId")) for method, params in _RacingSteerClient.requests
     ] == [("turn/steer", "turn_a"), ("turn/steer", "turn_b")]
@@ -1044,6 +1193,27 @@ def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_b"
+    attempts = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_delivery_attempt"
+    ]
+    outcomes = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_delivery_finished"
+    ]
+    assert len(attempts) == len(outcomes) == 2
+    assert len({a["native_rpc_attempt_id"] for a in attempts}) == 2
+    assert [a["native_rpc_attempt_id"] for a in attempts] == [
+        a["native_rpc_attempt_id"] for a in outcomes
+    ]
+    assert [a["native_turn_id"] for a in outcomes] == ["turn_a", "turn_b"]
+    assert [a["outcome"] for a in outcomes] == [
+        "rpc_error",
+        "rpc_error" if recovery_fails else "rpc_accepted",
+    ]
+    assert all(a["input_stable_id"] == "a" * 32 for a in outcomes)
 
 
 def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
@@ -1305,6 +1475,7 @@ def test_web_model_pick_applied_via_thread_settings_update(
     )
 
     assert _FakeCodexNativeClient.requests == [
+        ("model/list", {"includeHidden": True}),
         (
             "thread/settings/update",
             {
@@ -1354,6 +1525,137 @@ def test_model_settings_update_mirrors_model_into_config_toml(
     _run_turn_with_config(executor, "hello", ExecutorConfig(model="gpt-5.6-luna"))
 
     assert read_codex_config_model(tmp_path) == "gpt-5.6-luna"
+
+
+def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
+    """Return a fresh fake whose catalog lists ``gpt-5.6-sol`` with *supported* efforts."""
+
+    class CatalogClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+        created = []
+        next_turn = 1
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "model/list":
+                type(self).requests.append((method, params))
+                return {
+                    "result": {
+                        "data": [
+                            {
+                                "id": "gpt-5.6-sol",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": value} for value in supported
+                                ],
+                            }
+                        ],
+                        "nextCursor": None,
+                    }
+                }
+            return await super().request(method, params)
+
+    return CatalogClient
+
+
+@pytest.mark.parametrize(
+    ("requested", "inherited", "supported", "expected", "model_override"),
+    [
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "max", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "max", None),
+        ("ultra", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "ultra", None),
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", "databricks-gpt-5-6-sol"),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", "databricks-gpt-5-6-sol"),
+    ],
+)
+def test_dispatch_uses_model_supported_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested: str | None,
+    inherited: str,
+    supported: list[str],
+    expected: str,
+    model_override: str | None,
+) -> None:
+    """Explicit and inherited efforts are checked before starting the next turn."""
+    CatalogClient = _catalog_client(supported)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", CatalogClient
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        f'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "{inherited}"\n'
+    )
+
+    _run_turn_with_config(
+        CodexNativeExecutor(bridge_dir=tmp_path),
+        "hello",
+        ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
+    )
+
+    updates = [
+        params for method, params in CatalogClient.requests if method == "thread/settings/update"
+    ]
+    if requested is not None or inherited != expected:
+        assert len(updates) == 1
+        assert updates[0]["effort"] == expected
+    elif model_override is not None:
+        assert updates == [{"threadId": "thread_123", "model": model_override}]
+    else:
+        assert updates == []
+    assert CatalogClient.requests[-1][0] == "turn/start"
+    assert read_codex_config_effort(tmp_path) == expected
+
+    if requested == "minimal" and model_override is None:
+        _start_state(tmp_path)
+        _run_turn_with_config(
+            CodexNativeExecutor(bridge_dir=tmp_path),
+            "next turn",
+            ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
+        )
+        assert [
+            params["effort"]
+            for method, params in CatalogClient.requests
+            if method == "thread/settings/update"
+        ] == [expected, expected]
+    assert sum(method == "model/list" for method, _params in CatalogClient.requests) == 1
+    assert read_codex_config_model(tmp_path) == (model_override or "gpt-5.6-sol")
+
+
+def test_dispatch_validates_an_effort_whose_config_write_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Turn dispatch checks a recorded applied effort, not the stale config value."""
+    from omnigent.harnesses.codex_native.bridge import (
+        read_unmirrored_codex_settings,
+        write_unmirrored_codex_settings,
+    )
+
+    CatalogClient = _catalog_client(["low", "medium", "high", "xhigh"])
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", CatalogClient
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n')
+    # A live update applied max, but its config write failed.
+    write_unmirrored_codex_settings(tmp_path, {"effort": "max"})
+
+    _run_turn_with_config(
+        CodexNativeExecutor(bridge_dir=tmp_path), "hello", ExecutorConfig(model=None, extra={})
+    )
+
+    updates = [
+        params for method, params in CatalogClient.requests if method == "thread/settings/update"
+    ]
+    assert updates == [{"threadId": "thread_123", "effort": "xhigh"}]
+    assert read_codex_config_effort(tmp_path) == "xhigh"
+    assert read_unmirrored_codex_settings(tmp_path) == {}
 
 
 def test_effort_only_settings_update_leaves_config_toml_model(
@@ -1516,40 +1818,6 @@ def test_settings_update_drops_invalid_effort_keeps_model(
     assert method == "thread/settings/update"
     assert params["model"] == "gpt-5.3-codex"
     assert "effort" not in params
-
-
-@pytest.mark.parametrize("effort", ["ultra", "max"])
-def test_settings_update_forwards_codex_high_reasoning_levels(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    effort: str,
-) -> None:
-    """
-    Sol's ``max``/``ultra`` reach the wire instead of coercing to ``xhigh``.
-
-    Codex advertises these as per-model reasoning levels and honors a turn at
-    them (Sol's ``ultra`` runs subagents), so a web-picked level must ride
-    through on ``thread/settings/update`` unchanged rather than being clamped.
-    """
-    _FakeCodexNativeClient.requests = []
-    _FakeCodexNativeClient.created = []
-    _FakeCodexNativeClient.next_turn = 1
-    monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
-        _FakeCodexNativeClient,
-    )
-    _start_state(tmp_path)
-    executor = CodexNativeExecutor(bridge_dir=tmp_path)
-
-    _run_turn_with_config(
-        executor,
-        "hi",
-        ExecutorConfig(model="gpt-5.6-sol", extra={"reasoning_effort": effort}),
-    )
-
-    method, params = _FakeCodexNativeClient.requests[0]
-    assert method == "thread/settings/update"
-    assert params["effort"] == effort
 
 
 def test_run_turn_surfaces_recorded_startup_error(

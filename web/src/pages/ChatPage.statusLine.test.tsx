@@ -30,8 +30,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => useGithubInfoMock(),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => usePullRequestInfoMock(),
 }));
 vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
   ...(await importOriginal<typeof FileViewerContextModule>()),
@@ -77,13 +77,13 @@ const {
   useSessionMock,
   useHostsMock,
   useSessionHostOnlineMock,
-  useGithubInfoMock,
+  usePullRequestInfoMock,
   openGithubTabMock,
 } = vi.hoisted(() => ({
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
-  useGithubInfoMock: vi.fn(),
+  usePullRequestInfoMock: vi.fn(),
   openGithubTabMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -180,7 +180,7 @@ describe("Composer status line (branch + context ring)", () => {
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
-    useGithubInfoMock.mockReset().mockReturnValue({ data: undefined });
+    usePullRequestInfoMock.mockReset().mockReturnValue({ data: undefined });
     useComposerGitStatusMock.mockReset().mockReturnValue(composerGitStatus());
     openGithubTabMock.mockReset();
     useChatStore.setState({

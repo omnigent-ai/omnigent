@@ -10,6 +10,7 @@
   --popover: #ffffff;
   --popover-foreground: #11171c;
   --primary: #11171c;
+  --link: #1967b5;
   --primary-foreground: #ffffff;
   --selection-background: rgba(240, 1, 150, 0.1);
   --selection-foreground: #651249;
@@ -56,6 +57,7 @@
   --popover: rgba(26, 33, 41, 0.8);
   --popover-foreground: oklch(0.965 0.003 240);
   --primary: #e8ecf0;
+  --link: #72b7f5;
   --primary-foreground: #11171c;
   --selection-background: rgba(240, 1, 150, 0.15);
   --selection-foreground: #f9a8d4;
@@ -107,6 +109,7 @@
   --popover: #ffffff;
   --popover-foreground: #1e1a2b;
   --primary: #7c3aed;
+  --link: #7c3aed;
   --primary-foreground: #ffffff;
   --selection-background: rgba(124, 58, 237, 0.15);
   --selection-foreground: #1e1a2b;
@@ -153,6 +156,7 @@
   --popover: rgba(33, 34, 44, 0.92);
   --popover-foreground: #f8f8f2;
   --primary: #bd93f9;
+  --link: #be95f9;
   --primary-foreground: #282a36;
   --selection-background: rgba(189, 147, 249, 0.33);
   --selection-foreground: #f8f8f2;
@@ -202,6 +206,7 @@
   --popover: #ffffff;
   --popover-foreground: #1f2328;
   --primary: #1f883d;
+  --link: #0968d9;
   --primary-foreground: #ffffff;
   --selection-background: rgba(31, 136, 61, 0.15);
   --selection-foreground: #1f2328;
@@ -248,6 +253,7 @@
   --popover: rgba(22, 27, 34, 0.9);
   --popover-foreground: #e6edf3;
   --primary: #238636;
+  --link: #58a6ff;
   --primary-foreground: #ffffff;
   --selection-background: rgba(35, 134, 54, 0.39);
   --selection-foreground: #e6edf3;
@@ -294,6 +300,7 @@
   --popover: #ffffff;
   --popover-foreground: #4c4f69;
   --primary: #8839ef;
+  --link: #8739ec;
   --primary-foreground: #ffffff;
   --selection-background: rgba(136, 57, 239, 0.15);
   --selection-foreground: #4c4f69;
@@ -340,6 +347,7 @@
   --popover: rgba(24, 24, 37, 0.92);
   --popover-foreground: #cdd6f4;
   --primary: #cba6f7;
+  --link: #cba6f7;
   --primary-foreground: #1e1e2e;
   --selection-background: rgba(203, 166, 247, 0.26);
   --selection-foreground: #f5e0dc;
@@ -389,6 +397,7 @@
   --popover: #fffdf2;
   --popover-foreground: #3c3836;
   --primary: #d65d0e;
+  --link: #9d360a;
   --primary-foreground: #ffffff;
   --selection-background: rgba(214, 93, 14, 0.18);
   --selection-foreground: #3c3836;
@@ -435,6 +444,7 @@
   --popover: rgba(29, 32, 33, 0.92);
   --popover-foreground: #ebdbb2;
   --primary: #fe8019;
+  --link: #fe8019;
   --primary-foreground: #282828;
   --selection-background: rgba(254, 128, 25, 0.34);
   --selection-foreground: #ebdbb2;
@@ -484,6 +494,7 @@
   --popover: #eee8d5;
   --popover-foreground: #657b83;
   --primary: #268bd2;
+  --link: #026287;
   --primary-foreground: #fdf6e3;
   --selection-background: rgba(38, 139, 210, 0.15);
   --selection-foreground: #073642;
@@ -530,6 +541,7 @@
   --popover: #073642;
   --popover-foreground: #839496;
   --primary: #268bd2;
+  --link: #6ab8d0;
   --primary-foreground: #fdf6e3;
   --selection-background: rgba(38, 139, 210, 0.42);
   --selection-foreground: #eee8d5;
@@ -576,6 +588,7 @@
   --popover: #e5e9f0;
   --popover-foreground: #2e3440;
   --primary: #5e81ac;
+  --link: #355e86;
   --primary-foreground: #eceff4;
   --selection-background: rgba(94, 129, 172, 0.25);
   --selection-foreground: #2e3440;
@@ -622,6 +635,7 @@
   --popover: rgba(46, 52, 64, 0.92);
   --popover-foreground: #eceff4;
   --primary: #88c0d0;
+  --link: #8fc4d3;
   --primary-foreground: #2e3440;
   --selection-background: rgba(136, 192, 208, 0.25);
   --selection-foreground: #eceff4;
@@ -671,6 +685,7 @@
   --popover: var(--custom-light-popover);
   --popover-foreground: var(--custom-light-popover-foreground);
   --primary: var(--custom-light-primary);
+  --link: var(--custom-light-link);
   --primary-foreground: var(--custom-light-primary-foreground);
   --selection-background: var(--custom-light-selection-background);
   --selection-foreground: var(--custom-light-selection-foreground);
@@ -717,6 +732,7 @@
   --popover: var(--custom-dark-popover);
   --popover-foreground: var(--custom-dark-popover-foreground);
   --primary: var(--custom-dark-primary);
+  --link: var(--custom-dark-link);
   --primary-foreground: var(--custom-dark-primary-foreground);
   --selection-background: var(--custom-dark-selection-background);
   --selection-foreground: var(--custom-dark-selection-foreground);

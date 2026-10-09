@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -172,7 +172,7 @@ def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> No
 @pytest.mark.parametrize(
     "harness,expected",
     [
-        ("claude-native", {"project", "user", "toolkit:review"}),
+        ("claude-native", {"project", "user", "agents", "toolkit:review"}),
         ("codex-native", {"codex-user"}),
     ],
 )
@@ -308,7 +308,14 @@ async def test_host_answers_launch_settings(monkeypatch, fails):
     from omnigent.host.harness_startup import HarnessStartup
 
     expected = HarnessStartup(
-        command="claude", resolved_path=None, command_source="default", arg_count=2
+        command="claude",
+        resolved_path=None,
+        command_source="default",
+        arg_count=2,
+        args=["--model", "opus"],
+        configured_command="env",
+        configured_args=["TOKEN=visible-value", "claude", "--model", "opus"],
+        environment={"inherit": True, "variables": {"TOKEN": "visible-value"}, "unset": []},
     )
 
     def describe(harness):
@@ -326,7 +333,8 @@ async def test_host_answers_launch_settings(monkeypatch, fails):
     assert decode_host_frame(ws.sent[-1]) == HostHarnessStartupResultFrame(
         "startup", None if fails else expected
     )
-    assert "SECRET" not in ws.sent[-1]
+    if fails:
+        assert "SECRET" not in ws.sent[-1]
 
 
 async def test_host_answers_mcp_inventory_over_the_tunnel(
@@ -489,6 +497,9 @@ async def test_handle_model_options_uses_host_pi_configuration(
                 "displayName": "omnigent-openai/GPT 5.6 Sol",
             }
         ],
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
     )
     host = _make_host_process()
 
@@ -4107,6 +4118,40 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
 
 
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+def test_forge_config_paths_survive_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server_url: str | None
+) -> None:
+    from omnigent.cli import _build_host_daemon_env
+
+    selectors = {
+        "GLAB_CONFIG_DIR": str(tmp_path / "glab"),
+        "GH_CONFIG_DIR": str(tmp_path / "gh"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_CONFIG_DIRS": str(tmp_path / "system-config"),
+    }
+    for name, value in selectors.items():
+        monkeypatch.setenv(name, value)
+    for name in ("GITLAB_TOKEN", "GLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.setenv(name, "must-not-forward")
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:8000",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace=str(tmp_path),
+        parent_pid=42,
+    )
+    for env in (daemon_env, runner_env):
+        for name, value in selectors.items():
+            assert env[name] == value
+        for name in ("GITLAB_TOKEN", "GLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            assert name not in env
+
+
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
 @pytest.mark.parametrize("setting", [None, "1", "0"])
 async def test_harness_stderr_opt_in_survives_daemon_and_runner_hops(
     monkeypatch: pytest.MonkeyPatch,
@@ -6036,6 +6081,65 @@ def test_run_host_process_exits_nonzero_on_fatal(
     assert "HTTP 403" in err
 
 
+def _host_exit_reasons(caplog: pytest.LogCaptureFixture) -> list[object]:
+    return [
+        r.attributes["reason"]  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_exiting"
+    ]
+
+
+def test_run_host_process_logs_fatal_exit_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fatal tunnel failure is logged, not only printed, so the sink sees it."""
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    _patch_connect(monkeypatch, _ConnectSpy([_invalid_status(403)]))
+
+    with pytest.raises(SystemExit):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == ["fatal_connect"]
+    assert any(getattr(r, "event_name", None) == "host_started" for r in caplog.records)
+
+
+def test_run_host_process_logs_clean_exit_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    run_host_process(
+        server_url="https://app.example.databricks.com",
+        config_path=tmp_path / "config.yaml",
+    )
+
+    assert _host_exit_reasons(caplog) == ["clean"]
+
+
+def test_run_host_process_logs_crash_during_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A setup crash is reported even when the caller catches it before excepthook."""
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+
+    def _boom(*_args: object) -> None:
+        raise RuntimeError("setup exploded")
+
+    monkeypatch.setattr("omnigent.git_credential_github.configure_host_git", _boom)
+
+    with pytest.raises(RuntimeError, match="setup exploded"):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == ["uncaught"]
+
+
 async def test_run_host_process_invalid_host_id_exits_actionably(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -6287,6 +6391,9 @@ async def test_handle_model_options_serves_codex_probe_rows_and_caches(
         ]
 
     monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _fake_probe)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
 
     first = await host._handle_model_options(
@@ -6420,6 +6527,9 @@ async def test_model_options_frame_replies_off_the_receive_loop(
         return [{"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"}]
 
     monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _slow_probe)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
     ws = _RecordingWS()
     raw = encode_host_frame(HostModelOptionsFrame(request_id="req_slow", harness="codex-native"))
@@ -8257,8 +8367,8 @@ async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
 async def test_dispatch_fs_write_op_routes_github_set_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The write dispatcher forwards to github_resource.set_github_preference."""
-    from omnigent.runner import github_resource
+    """The write dispatcher forwards to pr_resource.set_pr_preference."""
+    from omnigent.runner import pr_resource
 
     seen: dict[str, object] = {}
 
@@ -8266,7 +8376,7 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
         seen.update({"root": root, "account": account, "remote": remote})
         return {"object": "session.github.info", "ok": True}
 
-    monkeypatch.setattr(github_resource, "set_github_preference", fake_set)
+    monkeypatch.setattr(pr_resource, "set_pr_preference", fake_set)
     out = HostProcess._dispatch_fs_write_op(
         "/ws/omnigent",
         "github_set_preference",
@@ -8532,3 +8642,33 @@ async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, sta
     )
     assert result.status == status
     assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
+
+
+@pytest.mark.parametrize(
+    ("serve", "expected"),
+    [
+        (lambda: True, "lifecycle_lost"),
+        (lambda: (_ for _ in ()).throw(SystemExit(None)), "clean"),
+        (lambda: (_ for _ in ()).throw(SystemExit(0)), "clean"),
+        (lambda: (_ for _ in ()).throw(SystemExit(3)), "exit"),
+        (lambda: (_ for _ in ()).throw(KeyboardInterrupt()), "interrupted"),
+    ],
+    ids=["lifecycle-lost", "system-exit-none", "system-exit-0", "system-exit-3", "ctrl-c"],
+)
+def test_run_host_process_classifies_how_the_host_ended(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    serve: Callable[[], bool],
+    expected: str,
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    monkeypatch.setattr("omnigent.host.connect._serve_host_until_exit", lambda *_a, **_k: serve())
+
+    with contextlib.suppress(SystemExit, KeyboardInterrupt):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == [expected]

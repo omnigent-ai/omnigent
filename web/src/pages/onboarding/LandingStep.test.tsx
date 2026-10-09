@@ -104,7 +104,7 @@ describe("LandingStep", () => {
 
     fireEvent.change(input, { target: { value: "https://typed.example.com/x" } });
     fireEvent.click(screen.getByRole("button", { name: "Join server" }));
-    expect(props.onJoinUrl).toHaveBeenCalledWith("https://typed.example.com/x");
+    expect(props.onJoinUrl).toHaveBeenCalledWith("https://typed.example.com/");
   });
 
   it("shows a connect error above the preset CTA", () => {

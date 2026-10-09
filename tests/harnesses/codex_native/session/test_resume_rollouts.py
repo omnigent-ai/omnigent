@@ -537,6 +537,66 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
     )
 
 
+def test_rollout_records_keep_function_call_namespace() -> None:
+    """Replay keeps a tool call's namespace; default-namespace calls stay bare."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_sleep",
+                "response_id": "codex_turn_1",
+                "type": "function_call",
+                "name": "sleep",
+                "namespace": "container",
+                "arguments": '{"seconds":2}',
+                "call_id": "call_sleep",
+            },
+            {
+                "id": "fco_sleep",
+                "response_id": "codex_turn_1",
+                "type": "function_call_output",
+                "call_id": "call_sleep",
+                "output": "slept",
+            },
+            {
+                "id": "fc_shell",
+                "response_id": "codex_turn_1",
+                "type": "function_call",
+                "name": "shell",
+                "arguments": '{"command":"ls"}',
+                "call_id": "call_shell",
+            },
+        ],
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+
+    calls = [
+        record["payload"]
+        for record in records
+        if record["type"] == "response_item" and record["payload"]["type"] == "function_call"
+    ]
+    assert calls == [
+        {
+            "type": "function_call",
+            "name": "sleep",
+            "namespace": "container",
+            "arguments": '{"seconds":2}',
+            "call_id": "call_sleep",
+            "id": "fc_sleep",
+        },
+        {
+            "type": "function_call",
+            "name": "shell",
+            "arguments": '{"command":"ls"}',
+            "call_id": "call_shell",
+            "id": "fc_shell",
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     tmp_path: Path,

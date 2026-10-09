@@ -46,11 +46,12 @@ function keysFor(label: string): string[] {
 }
 
 describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter for a new line by default", () => {
+  it("shows Enter to send and Shift+Enter or Alt+Enter for a new line by default", () => {
     render(<KeyboardShortcutsList />);
 
     expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵", "Alt", "↵"]);
+    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("⇧↵orAlt↵");
   });
 
   it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {

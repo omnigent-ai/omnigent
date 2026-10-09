@@ -22,10 +22,10 @@ contextBridge.exposeInMainWorld("arcaConnect", {
   cancel: () => ipcRenderer.send("arca-connect:cancel"),
   /** `{ serverUrl, command }` once the flow is ready. */
   onInit: (callback) => on("arca-connect:init", callback),
-  /** The command was spawned. */
+  /** `{ login, command }` when a command was spawned. */
   onStarted: (callback) => on("arca-connect:started", callback),
   /** A chunk of live stdout/stderr. */
   onOutput: (callback) => on("arca-connect:output", callback),
-  /** `{ ok, error }` when the command settles. */
+  /** `{ ok, error, authRequired?, command? }` after a command or before sign-in consent. */
   onDone: (callback) => on("arca-connect:done", callback),
 });

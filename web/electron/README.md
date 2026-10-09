@@ -469,6 +469,71 @@ sequenceDiagram
     S-->>A: result JSON (or clean timeout)
 ```
 
+### Manual previews with Companion
+
+To preview an app running on a remote development host (such as Arca), use
+Companion or another external forwarding tool to make its port available on
+your desktop machine. Companion is an external prerequisite for the Arca-to-Mac
+workflow; Omnigent does not establish or verify forwarding or resolve local
+port collisions.
+
+1. Ask the agent to start the app on the remote host and report its URL.
+2. Use Companion to forward the app's port to your Mac. Check the actual
+   forwarded address: the local port may differ from the remote port.
+3. In the Omnigent desktop app, open the session's Workspace **+** menu and
+   choose **Browser**. Type the forwarded URL, for example
+   `http://localhost:5273/`, in the address bar and press Enter. Here
+   `localhost` is the desktop machine, not the agent's remote host.
+4. Hide and reopen the Workspace, or switch tabs or sessions and return.
+   The existing page is retained without navigating or reloading it. Closing
+   the Browser tab destroys that view; opening a new tab does not restore it.
+
+If the page is unreachable, check that the app is still running and that the
+forwarded URL reaches the intended app in your Mac's regular browser. Check
+Companion's forwarding and local port selection separately. Normal TLS, CORS,
+authentication, and local-network permission rules still apply. This pane is
+desktop-only; it is not available in the plain web UI.
+
+For local or unrecognized hosts, `browser_navigate` keeps its restrictions on
+localhost and private addresses, even after you open a page manually.
+A manually opened page in the session's
+agent browser view remains available to existing agent inspection and
+interaction, including navigation caused by interacting with the page. Manual
+opening is therefore not a read-only boundary for that view. The user-created
+Browser tab opened through **+** > **Browser** is separate from the agent relay
+and is not targeted by the session's agent browser actions.
+
+### Agent previews on Arca
+
+On a Databricks-managed server with internal desktop features enabled, an
+Arca session's agent can open and inspect an app through Companion forwarding
+using the existing browser tools and tool approval or autoapproval policy.
+Provide the actual forwarded URL to the agent; its local port may differ from
+the app's remote port. Omnigent does not establish or verify forwarding or
+prove that the local endpoint belongs to the Arca host.
+
+The desktop captures the remote daemon's exact host ID during its existing
+Arca connect flow, including when the daemon is already running. Only a
+source session on that host, or a subagent inheriting that host, is eligible.
+An older CLI or an unrecognized, failed, or missing identity leaves localhost
+navigation denied; the remembered host-picker label alone does not grant it.
+Eligibility is scoped to the selected server/workspace, not all sessions on
+a Databricks server.
+
+After restarting the desktop, or if automatic connect fails, open **New
+session** > **Host** > **Reconnect to Arca** (or **Run on Arca** if the host
+is not remembered). Complete the existing connect console, then select your
+original session in the sidebar and retry the browser tool. Reconnecting can
+capture identity from an already-running daemon; it does not create a new
+session or change automatic-connect preferences. Failed or unrecognized
+capture keeps localhost denied, and the connect action remains available.
+
+The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
+redirects and links that would open a new window (which stay in the same pane).
+Other loopback addresses, private-network and metadata destinations, and
+non-web schemes remain restricted. Existing tool approvals are unchanged;
+whether a tool call asks for approval depends on the harness and its policy.
+
 ### Local network permission
 
 Sites in the embedded pane can ask for **local network access**, including
@@ -574,7 +639,7 @@ bounds sync. Without this signal the pane would gate itself off forever and the
 embedded browser would stay invisible. (`browserViewRegistry.test.js` locks the
 create-signal → setActive → attached transition.)
 
-**Toolbar.** When a view is attached, `BrowserPane` renders a user-facing
+**Toolbar.** Even before a page is opened, `BrowserPane` renders a user-facing
 toolbar above the page: back / forward / reload, a DevTools toggle, and an
 editable URL bar (Enter navigates; the typed value is normalized to add a
 scheme — a dotless host like `localhost` gets `http://`, everything else
@@ -681,6 +746,13 @@ name; output lands in `electron/dist-dev/` (the DMG is named
 `Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
 install production desktop updates. `build:mac:release` retains
 `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+
+macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
+`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
+Public macOS users and Windows/Linux keep the legacy
+default. The setup-page switch still persists an explicit choice on every
+platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
+choice. A saved server still reconnects on launch.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly

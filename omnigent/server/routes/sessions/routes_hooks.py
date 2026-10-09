@@ -1640,7 +1640,7 @@ def register_hooks_routes(
         # Claude Code session never gets a Codex suggestion.
         cross_harness = auto_harness_session(conv, parent)
         # Which families the spawn may land on decides which router can serve it:
-        # off the AI Gateway the built-in judge answers, from the live catalog
+        # off the Unity Gateway the built-in judge answers, from the live catalog
         # alone (the static table's databricks-* ids are unreachable there).
         gateway_backed = await _spawn_gateway_backed(
             request,
@@ -1758,7 +1758,7 @@ def register_hooks_routes(
                 )
 
         # This pane's own family decides which router can serve its first turn.
-        # A create off the AI Gateway now succeeds (the built-in judge answers),
+        # A create off the Unity Gateway now succeeds (the built-in judge answers),
         # so this hook must make the same choice the composer path does.
         turn_gateway_backed = (
             await _spawn_gateway_backed(request, conv, (route_request.harness,))

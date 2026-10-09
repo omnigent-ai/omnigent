@@ -83,15 +83,17 @@ def _merge_effective_config(
     return merged
 
 
-def load_effective_config() -> _Config:
-    """Merge user and project config, with project values taking precedence.
+def load_effective_config(*, workspace: str | Path | None = None) -> _Config:
+    """Merge global and project config, with project values taking precedence.
 
     The ``harness`` mapping is deep-merged (per-harness sub-keys, local
     winning per-field) so a project's per-harness overrides augment —
     rather than replace — the user's global ones. Every other key is a
-    shallow replace.
+    shallow replace. When supplied, *workspace* selects the project config
+    directory instead of the process cwd.
     """
-    return _merge_effective_config(load_global_config(), load_local_config())
+    local_path = Path(workspace) / _LOCAL_CONFIG_RELPATH if workspace is not None else None
+    return _merge_effective_config(load_global_config(), load_local_config(local_path))
 
 
 def save_global_config(

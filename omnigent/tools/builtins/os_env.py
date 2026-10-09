@@ -38,6 +38,7 @@ from typing import Any
 
 from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, OSEnvironment
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.json_serialization import json_dumps_transport_safe
 
 _logger = logging.getLogger(__name__)
 
@@ -170,9 +171,9 @@ class _OSEnvBackedTool(Tool):
         try:
             kwargs = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError as exc:
-            return json.dumps({"error": f"malformed arguments JSON: {exc}"})
+            return json_dumps_transport_safe({"error": f"malformed arguments JSON: {exc}"})
         if not isinstance(kwargs, dict):
-            return json.dumps({"error": "arguments must be a JSON object"})
+            return json_dumps_transport_safe({"error": "arguments must be a JSON object"})
         import asyncio
 
         # Surface every failure to the LLM as a structured error
@@ -182,8 +183,8 @@ class _OSEnvBackedTool(Tool):
             result = asyncio.run(self._invoke_async(kwargs))
         except Exception as exc:
             _logger.exception("%s failed", self.name())
-            return json.dumps({"error": str(exc)})
-        return json.dumps(result, ensure_ascii=False)
+            return json_dumps_transport_safe({"error": str(exc)})
+        return json_dumps_transport_safe(result)
 
     async def _invoke_async(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """

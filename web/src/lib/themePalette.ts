@@ -70,6 +70,7 @@ export interface PaletteTokens {
   popover: string;
   popoverForeground: string;
   primary: string;
+  link: string;
   primaryForeground: string;
   selectionBackground: string;
   selectionForeground: string;
@@ -110,6 +111,7 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   popover: "popover",
   popoverForeground: "popover-foreground",
   primary: "primary",
+  link: "link",
   primaryForeground: "primary-foreground",
   selectionBackground: "selection-background",
   selectionForeground: "selection-foreground",
@@ -188,6 +190,7 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarActive: "color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar))",
     sidebarActiveForeground: "var(--sidebar-foreground)",
     sidebarBackground: "var(--sidebar)",
+    link: tokens.ring,
     ...tokens,
   };
 }
@@ -230,6 +233,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#ffffff",
         popoverForeground: "#11171c",
         primary: "#11171c",
+        link: "#1967b5",
         primaryForeground: "#ffffff",
         // Selection is the brand tint that also marks the sidebar's active
         // row, not an opaque primary block (near-black on this palette).
@@ -261,6 +265,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#181f25",
         popover: "rgba(26, 33, 41, 0.8)",
         primary: "#e8ecf0",
+        link: "#72b7f5",
         primaryForeground: "#11171c",
         // pink-300 rather than the sidebar's pink-400 so selected text stays
         // >= 4.5:1 over the tinted code and muted surfaces.
@@ -337,6 +342,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#343746",
         popover: "rgba(33, 34, 44, 0.92)",
         primary: "#bd93f9",
+        link: "#be95f9",
         primaryForeground: "#282a36",
         secondary: "#343746",
         muted: "#3b3d4d",
@@ -374,6 +380,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         card: "#ffffff",
         cardSolid: "#ffffff",
         primary: "#1f883d",
+        link: "#0968d9",
         primaryForeground: "#ffffff",
         secondary: "#eaeef2",
         muted: "#eaeef2",
@@ -431,6 +438,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         card: "#ffffff",
         cardSolid: "#ffffff",
         primary: "#8839ef",
+        link: "#8739ec",
         primaryForeground: "#ffffff",
         secondary: "#e6e9ef",
         muted: "#e6e9ef",
@@ -492,6 +500,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         card: "#fffdf2",
         cardSolid: "#fffdf2",
         primary: "#d65d0e",
+        link: "#9d360a",
         primaryForeground: "#ffffff",
         secondary: "#ebdbb2",
         muted: "#ebdbb2",
@@ -557,6 +566,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         card: "#eee8d5",
         cardSolid: "#eee8d5",
         primary: "#268bd2",
+        link: "#026287",
         primaryForeground: "#fdf6e3",
         secondary: "#eee8d5",
         // Keep interactive rows visible over the base2 popover surface.
@@ -582,6 +592,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#073642",
         popover: "#073642",
         primary: "#268bd2",
+        link: "#6ab8d0",
         primaryForeground: "#fdf6e3",
         secondary: "#073642",
         // Keep interactive rows visible over the base02 popover surface.
@@ -620,6 +631,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         card: "#e5e9f0",
         cardSolid: "#e5e9f0",
         primary: "#5e81ac",
+        link: "#355e86",
         primaryForeground: "#eceff4",
         secondary: "#d8dee9",
         muted: "#d8dee9",
@@ -644,6 +656,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         cardSolid: "#3b4252",
         popover: "rgba(46, 52, 64, 0.92)",
         primary: "#88c0d0",
+        link: "#8fc4d3",
         primaryForeground: "#2e3440",
         secondary: "#3b4252",
         muted: "#434c5e",

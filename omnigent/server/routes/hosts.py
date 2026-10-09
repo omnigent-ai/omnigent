@@ -62,7 +62,12 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
+from omnigent.server.routes._host_launch import (
+    LAUNCH_TIMEOUT_ENV_VAR,
+    host_absent_error,
+    resolve_host_launch,
+    resolve_launch_timeout_s,
+)
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
@@ -99,7 +104,6 @@ def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
     task.add_done_callback(_done)
 
 
-_LAUNCH_RESULT_TIMEOUT_S = 30.0
 # Per-call timeout for host.list_dir round-trips. Listing is a single
 # scandir + sort on the host side; 5s is generous for transient
 # network slowness without making the picker feel hung.
@@ -1133,17 +1137,22 @@ def create_hosts_router(
                 detail="host connection was replaced",
             ) from None
 
+        launch_timeout_s = resolve_launch_timeout_s()
         try:
             result = await asyncio.wait_for(
                 future,
-                timeout=_LAUNCH_RESULT_TIMEOUT_S,
+                timeout=launch_timeout_s,
             )
         except asyncio.TimeoutError:
             conn.pending_launches.pop(request_id, None)
             await _rollback_failed_launch()
             raise HTTPException(
                 status_code=504,
-                detail="host did not respond to launch request",
+                detail=(
+                    f"host did not respond to launch request within "
+                    f"{launch_timeout_s:g}s (raise {LAUNCH_TIMEOUT_ENV_VAR} "
+                    f"if this launch needs longer)"
+                ),
             ) from None
 
         if result.get("status") == "failed":

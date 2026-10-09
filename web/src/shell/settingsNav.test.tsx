@@ -22,7 +22,6 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
-  harnessesEnabled: true,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -30,7 +29,6 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { harness_settings_ui: mocks.harnessesEnabled },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -64,7 +62,6 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
-  mocks.harnessesEnabled = true;
 });
 afterEach(cleanup);
 
@@ -76,6 +73,11 @@ describe("settingsNavGroups", () => {
       label: "General",
       icon: SettingsIcon,
     });
+    expect(general?.items.slice(0, 3).map((item) => item.id)).toEqual([
+      "general",
+      "appearance",
+      "harnesses",
+    ]);
   });
 
   it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
@@ -412,17 +414,6 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: "harnesses",
       harness: "claude-native",
-    });
-  });
-
-  it("falls back to General for a harnesses deep link when the feature is disabled", () => {
-    mocks.harnessesEnabled = false;
-    // Disabled (the default deploy) → the section resolves to General instead
-    // of an empty harnesses page, and no harness is set.
-    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "general" });
-    expect(routeHook("/settings/harnesses/claude-native")).toEqual({
-      inSettings: true,
-      section: "general",
     });
   });
 

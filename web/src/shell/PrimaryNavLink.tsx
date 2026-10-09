@@ -1,6 +1,7 @@
 import type { MouseEvent, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
@@ -18,6 +19,7 @@ export interface PrimaryNavLinkProps {
   testId?: string;
   onClick?: (event: MouseEvent<HTMLAnchorElement>) => void;
   trailing?: ReactNode;
+  compact?: boolean;
 }
 
 export function PrimaryNavLink({
@@ -29,14 +31,15 @@ export function PrimaryNavLink({
   testId,
   onClick,
   trailing,
+  compact = false,
 }: PrimaryNavLinkProps) {
-  return (
+  const link = (
     <Button
       asChild
       variant="ghost"
       className={cn(
-        SIDEBAR_ROW,
-        "w-full justify-start border-0 font-normal",
+        compact ? "size-8 justify-center border-0 p-0" : SIDEBAR_ROW,
+        !compact && "w-full justify-start border-0 font-normal",
         HOVER_HIGHLIGHT,
         active && ACTIVE_HIGHLIGHT,
       )}
@@ -46,6 +49,7 @@ export function PrimaryNavLink({
         to={to}
         onClick={onClick}
         componentId={componentId}
+        aria-label={compact ? label : undefined}
         aria-current={active ? "page" : undefined}
       >
         <Icon
@@ -54,9 +58,17 @@ export function PrimaryNavLink({
             active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
           )}
         />
-        {label}
-        {trailing}
+        {!compact && label}
+        {!compact && trailing}
       </Link>
     </Button>
+  );
+  return compact ? (
+    <Tooltip>
+      <TooltipTrigger asChild>{link}</TooltipTrigger>
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
+  ) : (
+    link
   );
 }

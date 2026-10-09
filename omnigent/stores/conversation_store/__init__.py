@@ -121,8 +121,11 @@ PINNED_LABEL_KEY = "omnigent.pinned"
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
-# otherwise behaves like any other session (its own runner, transcript).
+# keeps its own transcript and may share its parent's runner.
 SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
+
+# Server-owned routing ancestry; it does not require a workspace or own a runner.
+SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
@@ -215,6 +218,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
 }
 
@@ -231,6 +236,22 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+@dataclass(frozen=True)
+class ConversationUpdateResult:
+    """Result of updating a conversation and its requested model settings.
+
+    :param conversation: The conversation after the update has been persisted.
+    :param reasoning_effort_changed: Whether a requested reasoning-effort
+        value changed from the value on the locked AP row.
+    :param model_override_changed: Whether a requested model override changed
+        from the value on the locked AP row.
+    """
+
+    conversation: Conversation
+    reasoning_effort_changed: bool
+    model_override_changed: bool
 
 
 @dataclass(frozen=True)
@@ -969,6 +990,60 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def update_conversation_with_changes(
+        self,
+        conversation_id: str,
+        title: str | None = None,
+        reasoning_effort: str | None = None,
+        _unset_reasoning_effort: bool = False,
+        model_override: str | None = None,
+        _unset_model_override: bool = False,
+        cost_control_mode_override: str | None = None,
+        _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
+        harness_override: str | None = None,
+        _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
+        terminal_launch_args: list[str] | None = None,
+        archived: bool | None = None,
+        reported_model: str | None = None,
+    ) -> ConversationUpdateResult | None:
+        """Update a conversation and report requested model-setting changes.
+
+        The returned change flags describe only the explicitly requested
+        ``reasoning_effort`` and ``model_override`` updates. A request that
+        writes the value already stored, including an explicit clear of an
+        already-``None`` value, reports ``False``.
+        """
+        ...
+
+    @abstractmethod
+    def restore_session_settings_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        previous: Conversation,
+        attempted: Conversation,
+        restore_effort: bool = True,
+        restore_model: bool = False,
+    ) -> None:
+        """Restore a refused effort update without overwriting a newer selection.
+
+        Each setting is compared and restored atomically. When ``restore_model``
+        is true, also undo the model selection from a combined PATCH that was
+        aborted before forwarding its model change. Preserve other overrides.
+
+        :param conversation_id: Conversation whose settings were refused.
+        :param previous: Snapshot before persisting the requested settings.
+        :param attempted: Snapshot returned by that persistence operation.
+        :param restore_effort: Whether the refused effort needs rollback; false when
+            a newer write already replaced it.
+        :param restore_model: Whether the unforwarded model change also needs rollback.
         """
         ...
 

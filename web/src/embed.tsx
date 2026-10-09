@@ -44,6 +44,7 @@ import {
 } from "./lib/host";
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
+import { isMacElectronShell } from "./lib/nativeBridge";
 import {
   applyStoredUiFontSize,
   applyUiFontFamily,
@@ -65,7 +66,7 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 
-export type { OmnigentHostConfig } from "./lib/host";
+export type { HtmlPreviewFrameProps, OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
 
 // Re-export the host-config setter so the host can install transport config
@@ -171,7 +172,9 @@ function OmnigentProviders({
     initChatStore(hostQueryClient);
     // Resolve a session's routing host on demand (a hostless sub-agent child
     // walks up to its host-bound ancestor) before host-scoped requests key.
-    setSessionHostResolver((sessionId) => prefetchSessionHostChain(hostQueryClient, sessionId));
+    setSessionHostResolver((sessionId, options) =>
+      prefetchSessionHostChain(hostQueryClient, sessionId, options),
+    );
     void resolveIdentity();
     return null;
   });
@@ -210,7 +213,12 @@ function OmnigentProviders({
     //     the Radix portal root, so both the app and its overlays read the dark
     //     token overrides. Light mode = no class → inherits the scope root's
     //     light tokens.
-    <div ref={scopeRootRef} className="omnigent-app" style={{ height: "100%", width: "100%" }}>
+    <div
+      ref={scopeRootRef}
+      className="omnigent-app"
+      data-electron-mac={isMacElectronShell() ? "true" : undefined}
+      style={{ height: "100%", width: "100%" }}
+    >
       <div
         ref={scopeRef}
         className={isDarkMode ? "dark" : undefined}

@@ -47,6 +47,7 @@ struct AppRootView: View {
           // resolves against an un-polluted server identity.
           loadSucceeded: {
             guard isCurrentServer(serverURL) else { return }
+            settings.connectionSucceeded()
             settings.rememberRecentServer(serverURL)
           },
           signedOut: { context, cleanup in
@@ -65,6 +66,12 @@ struct AppRootView: View {
                 }
               }
             }
+          },
+          serverURL: serverURL,
+          serverSignedOut: { signedOutURL, message in
+            settings.stopAutoOpening(oidcServer: signedOutURL)
+            guard isCurrentServer(serverURL) else { return }
+            mode = .setup(prefill: serverURL.absoluteString, error: message)
           }
         )
         .id(DatabricksWebContext.contextIdentity(for: serverURL))
@@ -99,6 +106,8 @@ struct AppRootView: View {
           }
           return
         }
+        // A server that refused the last sign-in stays on the Connect screen, prefilled.
+        guard settings.autoOpenServerURL == saved else { return }
         mode = .web(serverURL: url, path: nil)
       }
     }

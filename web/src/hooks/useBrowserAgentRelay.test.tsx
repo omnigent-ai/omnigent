@@ -1,4 +1,6 @@
 import { renderHook } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // supportsBrowser gates the whole relay; force it true so the hook registers.
@@ -13,12 +15,25 @@ const authenticatedFetch = vi.fn();
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: (...args: unknown[]) => authenticatedFetch(...args),
 }));
+const getSessionSlim = vi.fn();
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
+import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
 
 const CONV = "conv_relay";
+const renderRelay = (visibleId: string | null | undefined = CONV, client = new QueryClient()) => {
+  return renderHook(({ id }) => useBrowserAgentRelay(id), {
+    initialProps: { id: visibleId },
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+};
 
 /** Build a `browser.action_request` event for the bus. */
 function actionEvent(
@@ -61,7 +76,7 @@ async function runAction(
   opts: { expectResult?: boolean; source?: string } = {},
 ): Promise<void> {
   const { expectResult = true, source = CONV } = opts;
-  renderHook(() => useBrowserAgentRelay(CONV));
+  renderRelay();
   emitBrowserActionRequest(evt, source);
   if (expectResult) {
     await vi.waitFor(() => {
@@ -96,6 +111,15 @@ function postedResult(): Record<string, unknown> {
 
 beforeEach(() => {
   authenticatedFetch.mockReset();
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: null,
+    parentSessionId: null,
+  }));
+  for (const id of [CONV, "conv_visible_B", "conv_background_A", "parent", "middle", "root"]) {
+    setSessionHost(id, null);
+    setSessionParent(id, null);
+  }
 });
 
 afterEach(() => {
@@ -167,7 +191,7 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     const bridge = installBridge();
     authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
 
-    renderHook(() => useBrowserAgentRelay(VISIBLE));
+    renderRelay(VISIBLE);
     emitBrowserActionRequest(actionEvent("navigate", { url: "https://a" }), BACKGROUND);
 
     await vi.waitFor(() => {
@@ -196,12 +220,346 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     );
     expect(resultUrl).toContain(`/v1/sessions/${BACKGROUND}/browser/action_result/`);
   });
+
+  it("completes the source session's screenshot when the visible session changes mid-claim", async () => {
+    const bridge = installBridge();
+    let resolveClaim!: (response: Response) => void;
+    authenticatedFetch
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          }),
+      )
+      .mockResolvedValue(jsonResponse({}));
+    const hook = renderRelay(CONV);
+    emitBrowserActionRequest(actionEvent("screenshot"), "conv_background_A");
+    await vi.waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    hook.rerender({ id: "conv_visible_B" });
+    resolveClaim(WON);
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: true,
+        data_url: "data:image/png;base64,AAA",
+      }),
+    );
+    expect(bridge.browserScreenshot).toHaveBeenCalledWith("conv_background_A");
+    expect(authenticatedFetch.mock.calls[0][0]).toContain(
+      "/v1/sessions/conv_background_A/browser/action_claim/",
+    );
+    expect(authenticatedFetch.mock.calls[1][0]).toContain(
+      "/v1/sessions/conv_background_A/browser/action_result/",
+    );
+  });
+
+  it("cancels a pending claimed action when leaving all conversations", async () => {
+    const bridge = installBridge();
+    let resolveClaim!: (response: Response) => void;
+    authenticatedFetch
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveClaim = resolve;
+          }),
+      )
+      .mockResolvedValue(jsonResponse({}));
+    const hook = renderRelay();
+    emitBrowserActionRequest(actionEvent("screenshot"), "conv_background_A");
+    await vi.waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    hook.rerender({ id: null });
+    resolveClaim(WON);
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: false,
+        error: "browser relay context changed",
+      }),
+    );
+    expect(bridge.browserScreenshot).not.toHaveBeenCalled();
+    emitBrowserActionRequest(actionEvent("screenshot", {}, "later"), "conv_background_A");
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("useBrowserAgentRelay — action dispatch", () => {
   beforeEach(() => {
     // Every dispatch test wins the claim, then a benign result POST.
     authenticatedFetch.mockResolvedValue(WON);
+  });
+  it("derives inherited provenance from the source session, never model args or visible host", async () => {
+    const bridge = installBridge();
+    setSessionHost(CONV, "local-host");
+    setSessionHost("parent", "arca-host");
+    setSessionParent("conv_background_A", "parent");
+    getSessionSlim.mockImplementation(async (id: string) => ({
+      id,
+      hostId: id === "parent" ? "arca-host" : null,
+      parentSessionId: id === "parent" ? null : "parent",
+    }));
+    await runAction(
+      actionEvent("navigate", {
+        url: "http://localhost:5173",
+        sourceHostId: "forged",
+        isArca: true,
+      }),
+      { source: "conv_background_A" },
+    );
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "arca-host" },
+    );
+    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
+  });
+
+  it("loads a child's own host before granting eligibility from a parent-list hint", async () => {
+    const bridge = installBridge();
+    setSessionHost("parent", "arca-host");
+    setSessionParent("conv_background_A", "parent");
+    getSessionSlim.mockResolvedValue({
+      id: "conv_background_A",
+      hostId: "other-host",
+      parentSessionId: "parent",
+    });
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173" }), {
+      source: "conv_background_A",
+    });
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "other-host" },
+    );
+  });
+
+  it("uses an authoritative cached child snapshot without refetching or trusting parent hints", async () => {
+    const bridge = installBridge();
+    const client = new QueryClient();
+    client.setQueryData(["session", "conv_background_A"], {
+      id: "conv_background_A",
+      hostId: "other-host",
+      parentSessionId: "parent",
+    });
+    setSessionHost("parent", "arca-host");
+    setSessionParent("conv_background_A", "parent");
+    renderRelay(CONV, client);
+    emitBrowserActionRequest(
+      actionEvent("navigate", { url: "http://localhost:5173" }),
+      "conv_background_A",
+    );
+    await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
+    expect(getSessionSlim).not.toHaveBeenCalled();
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "other-host" },
+    );
+  });
+
+  it("reads an unloaded intermediate's own host instead of borrowing a distant Arca hint", async () => {
+    const bridge = installBridge();
+    setSessionParent(CONV, "middle");
+    setSessionParent("middle", "root");
+    setSessionHost("root", "arca-host");
+    getSessionSlim.mockImplementation(async (id: string) => ({
+      id,
+      hostId: id === "middle" ? "other-host" : null,
+      parentSessionId: id === CONV ? "middle" : "root",
+    }));
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173" }));
+    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual([CONV, "middle"]);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      CONV,
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "other-host" },
+    );
+  });
+
+  it("inherits only through authoritative hostless hops and reuses cached ancestor snapshots", async () => {
+    const bridge = installBridge();
+    const client = new QueryClient();
+    client.setQueryData(["session", "middle"], {
+      id: "middle",
+      hostId: null,
+      parentSessionId: "root",
+    });
+    client.setQueryData(["session", "root"], {
+      id: "root",
+      hostId: "arca-host",
+      parentSessionId: null,
+    });
+    const fetchQuery = vi.spyOn(client, "fetchQuery");
+    setSessionParent(CONV, "middle");
+    setSessionParent("middle", "root");
+    setSessionHost("root", "arca-host");
+    getSessionSlim.mockResolvedValue({ id: CONV, hostId: null, parentSessionId: "middle" });
+    renderRelay(CONV, client);
+    emitBrowserActionRequest(actionEvent("navigate", { url: "http://localhost:5173" }), CONV);
+    await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
+    expect(fetchQuery.mock.calls.map(([query]) => query.queryKey)).toEqual([
+      ["session", CONV],
+      ["session", "middle"],
+      ["session", "root"],
+    ]);
+    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual([CONV]);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      CONV,
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "arca-host" },
+    );
+  });
+
+  it.each(["lookup failure", "cycle"])(
+    "does not borrow a distant host hint when authoritative ancestry ends in %s",
+    async (failure) => {
+      const bridge = installBridge();
+      const client = new QueryClient();
+      client.setQueryData(["session", "root"], {
+        id: "root",
+        hostId: "arca-host",
+        parentSessionId: null,
+      });
+      setSessionParent(CONV, "middle");
+      setSessionParent("middle", "root");
+      setSessionHost("root", "arca-host");
+      getSessionSlim.mockImplementation(async (id: string) => {
+        if (id === "middle" && failure === "lookup failure") {
+          throw new Error("ancestor unavailable");
+        }
+        return { id, hostId: null, parentSessionId: id === CONV ? "middle" : CONV };
+      });
+      renderRelay(CONV, client);
+      emitBrowserActionRequest(actionEvent("navigate", { url: "http://localhost:5173" }), CONV);
+      await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
+      expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual([CONV, "middle"]);
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        CONV,
+        "http://localhost:5173",
+        undefined,
+        { force: true, agent: true },
+      );
+    },
+  );
+
+  it.each(["http://localhost:5173", "https://example.com"])(
+    "does not authorize an inherited hint after the source lookup fails (%s)",
+    async (url) => {
+      const bridge = installBridge();
+      setSessionHost("parent", "arca-host");
+      setSessionParent("conv_background_A", "parent");
+      getSessionSlim.mockRejectedValue(new Error("source unavailable"));
+      await runAction(actionEvent("navigate", { url }), { source: "conv_background_A" });
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        "conv_background_A",
+        url,
+        undefined,
+        { force: true, agent: true },
+      );
+      expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A"]);
+    },
+  );
+
+  it("fetches missing source metadata and leaves failed/unknown resolution unprivileged", async () => {
+    const bridge = installBridge();
+    getSessionSlim.mockRejectedValue(new Error("unknown session"));
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173", isArca: true }));
+    expect(getSessionSlim).toHaveBeenCalledWith(CONV);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      CONV,
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true },
+    );
+  });
+
+  it("keeps source-host resolution alive across visible-session switches", async () => {
+    const bridge = installBridge();
+    let resolveHost!: (source: unknown) => void;
+    getSessionSlim.mockImplementation((id: string) =>
+      id === "parent"
+        ? new Promise((resolve) => {
+            resolveHost = resolve;
+          })
+        : Promise.resolve({ id, hostId: null, parentSessionId: "parent" }),
+    );
+    const hook = renderRelay();
+    emitBrowserActionRequest(
+      actionEvent("navigate", { url: "http://localhost:5173" }),
+      "conv_background_A",
+    );
+    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith("parent"));
+    hook.rerender({ id: "conv_visible_B" });
+    setSessionHost("conv_visible_B", "local-host");
+    resolveHost({ id: "parent", hostId: "arca-host", parentSessionId: null });
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: true,
+        data: { final_url: "http://localhost:5173" },
+      }),
+    );
+    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "arca-host" },
+    );
+    expect(authenticatedFetch.mock.calls[1][0]).toContain(
+      "/v1/sessions/conv_background_A/browser/action_result/",
+    );
+  });
+
+  it("does not dispatch a stale metadata resolution after relay unmount", async () => {
+    const bridge = installBridge();
+    let resolve!: (source: unknown) => void;
+    getSessionSlim.mockImplementation(
+      () =>
+        new Promise((r) => {
+          resolve = r;
+        }),
+    );
+    const hook = renderRelay();
+    emitBrowserActionRequest(actionEvent("navigate", { url: "http://localhost:5173" }), CONV);
+    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith(CONV));
+    hook.unmount();
+    resolve({ id: CONV, hostId: "arca-host", parentSessionId: null });
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: false,
+        error: "browser relay context changed",
+      }),
+    );
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("keeps the authoritative source lookup alive across visible-session switches", async () => {
+    const bridge = installBridge();
+    let resolve!: (source: unknown) => void;
+    getSessionSlim.mockImplementation(
+      () =>
+        new Promise((r) => {
+          resolve = r;
+        }),
+    );
+    const hook = renderRelay();
+    emitBrowserActionRequest(
+      actionEvent("navigate", { url: "http://localhost:5173" }),
+      "conv_background_A",
+    );
+    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith("conv_background_A"));
+    hook.rerender({ id: "conv_visible_B" });
+    setSessionHost("conv_visible_B", "local-host");
+    resolve({ id: "conv_background_A", hostId: "arca-host", parentSessionId: null });
+    await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      { force: true, agent: true, sourceHostId: "arca-host" },
+    );
   });
 
   it("navigate: reports the final_url and marks it agent+force", async () => {
@@ -348,7 +706,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
       .mockResolvedValueOnce(WON)
       .mockRejectedValueOnce(new Error("result POST network error"));
 
-    renderHook(() => useBrowserAgentRelay(CONV));
+    renderRelay();
     emitBrowserActionRequest(actionEvent("screenshot"), CONV);
 
     await vi.waitFor(() => {
@@ -365,7 +723,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     // absent — getBrowserDesktop() returns null, so the handler bails before claim.
     (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 
-    renderHook(() => useBrowserAgentRelay(CONV));
+    renderRelay();
     emitBrowserActionRequest(actionEvent("screenshot"), CONV);
     await Promise.resolve();
     await Promise.resolve();
