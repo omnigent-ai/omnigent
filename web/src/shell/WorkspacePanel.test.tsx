@@ -1156,9 +1156,10 @@ describe("WorkspacePanel panel picker", () => {
     fireEvent.pointerDown(item, { button: 0 });
     fireEvent.click(item);
     await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
-    // Radix restores focus on a timer; give it the chance before asserting.
+    // Radix restores focus from a setTimeout(0) queued at unmount; a timer
+    // queued after it runs after it, so this flush is ordered, not a guess.
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 50);
+      setTimeout(resolve, 0);
     });
     expect(trigger).not.toHaveFocus();
   });

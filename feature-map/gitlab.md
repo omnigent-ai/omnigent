@@ -18,7 +18,9 @@ reads the MR; agent CLI and MCP writes associate it with the session.
 
 ## How to get to it (user POV)
 
-- `desktop-rail`: open a session's Workspace sidepanel and choose Pull Requests.
+- `desktop-rail`: open a session's Workspace sidepanel and choose Pull Requests;
+  when the rail is narrow and tabs are open, pick it from the tab strip's
+  **Select panel** menu.
 - `desktop-composer`: click the MR number beside the session composer.
 - `mobile-composer`: tap the MR number to open its full-screen panel.
 - `canvas`: enable Canvas, open it, and follow an MR link on a session card.

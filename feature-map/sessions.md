@@ -118,12 +118,14 @@ parent composer, or choose **Start a new side chat** from the composer's add
 tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
 side chats open in a drawer. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running. A
-chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace.
+chat with its tab's close button; the parent and sibling chats keep running.
+Switch between open side chats from their tabs or from the tab strip's **Select
+panel** menu. A chat-only side chat can also send messages from its direct
+`/c/<child_id>` URL without choosing a workspace.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
-⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
+⌘/Ctrl+Alt+B; open browser tabs are also listed in the tab strip's **Select
+panel** menu. Agent browser requests and chat links with in-app opening enabled
 create or select a closable Browser soft tab automatically.
 
 **Desktop recent sessions:** hold Control and press Tab to open the five most

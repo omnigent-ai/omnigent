@@ -1481,6 +1481,7 @@ export function AppShell() {
     const selectedTab = tabList?.querySelector<HTMLElement>(
       '[role="tab"][aria-selected="true"], [role="button"][aria-current="true"]',
     );
+    // Browsers without checkVisibility (Safari < 17.4) treat the tab as visible.
     const visibleSelectedTab = (selectedTab?.checkVisibility?.() ?? true) ? selectedTab : null;
     (visibleSelectedTab ?? tabList)?.focus();
   }, []);

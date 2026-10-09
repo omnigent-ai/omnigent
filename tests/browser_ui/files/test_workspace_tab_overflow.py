@@ -122,6 +122,13 @@ def test_workspace_tab_overflow(
         "offset => document.querySelector('[data-workspace-tabs-viewport]').scrollLeft > offset",
         arg=offset,
     )
+    # A plain vertical wheel over the strip also moves it sideways.
+    offset = viewport.evaluate("el => el.scrollLeft")
+    page.mouse.wheel(0, 150)
+    page.wait_for_function(
+        "offset => document.querySelector('[data-workspace-tabs-viewport]').scrollLeft > offset",
+        arg=offset,
+    )
 
     toolbar.get_by_role("button", name="Select panel").click()
     expect(page.get_by_role("menuitem", name=paths[0], exact=True)).to_have_attribute(

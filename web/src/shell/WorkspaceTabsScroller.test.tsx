@@ -48,21 +48,23 @@ describe("WorkspaceTabsScroller", () => {
     const content = viewport.firstElementChild!;
     const container = viewport.parentElement!;
     expect(observed).toEqual(expect.arrayContaining([container, viewport, content]));
-    expect(callbacks).toHaveLength(1);
+    const notify = (entries: { target: Element }[]) => {
+      for (const callback of callbacks) callback(entries);
+    };
     scrollIntoView.mockClear();
 
     // Closing another tab or a label resolving only resizes the content; the
     // user's manual scroll position must survive that.
-    callbacks[0]([{ target: content }]);
+    notify([{ target: content }]);
     expect(scrollIntoView).not.toHaveBeenCalled();
 
     // The rail (slot) changing width re-reveals the selected tab.
-    callbacks[0]([{ target: container }]);
+    notify([{ target: container }]);
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView.mock.instances[0]).toBe(selected);
 
     // Arrows mounting or unmounting change the viewport's width too.
-    callbacks[0]([{ target: viewport }, { target: content }]);
+    notify([{ target: viewport }, { target: content }]);
     expect(scrollIntoView).toHaveBeenCalledTimes(2);
   });
 });

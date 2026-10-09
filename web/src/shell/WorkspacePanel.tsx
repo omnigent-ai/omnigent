@@ -1285,7 +1285,6 @@ function WorkspacePanelImpl({
               {tabOrder.map((tab) => tabTriggers[tab])}
             </TabsList>
           </Tabs>
-          {/* The divider follows the fixed panel icons' visibility. */}
           <div
             aria-hidden
             className={cn(
@@ -1426,7 +1425,6 @@ function WorkspacePanelImpl({
               liveness={liveness}
             />
           )}
-          {/* The picker and fullscreen toggle form the trailing control group. */}
           <DropdownMenu
             onOpenChange={(isOpen) => {
               if (isOpen) pickerInputRef.current = "keyboard";

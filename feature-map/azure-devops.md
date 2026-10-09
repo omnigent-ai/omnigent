@@ -15,7 +15,8 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 
 ## How to get to it (user POV)
 
-- `desktop-rail`: open Workspace and choose Pull Requests.
+- `desktop-rail`: open Workspace and choose Pull Requests; when the rail is
+  narrow and tabs are open, pick it from the tab strip's **Select panel** menu.
 - `desktop-composer`: click the request number beside the session composer.
 - `mobile-composer`: tap the request number to open the full-screen panel.
 - `canvas`: when Canvas is enabled, follow a request link on a session card.
