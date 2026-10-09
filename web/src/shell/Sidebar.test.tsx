@@ -726,6 +726,124 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
+  describe("machine filter", () => {
+    const laptop = { host_id: "host_laptop", name: "laptop", owner: "me", status: "online" };
+    const desktop = { host_id: "host_desktop", name: "desktop", owner: "me", status: "offline" };
+
+    function openFilterMenu() {
+      fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+        button: 0,
+        ctrlKey: false,
+        pointerType: "mouse",
+      });
+    }
+
+    function selectHostFilter(value: string) {
+      openFilterMenu();
+      fireEvent.click(screen.getByTestId(`session-host-filter-${value}`));
+    }
+
+    beforeEach(() => {
+      useHostsMock.mockReturnValue({ data: [laptop, desktop] });
+    });
+
+    it("narrows Sessions to one machine and keeps the pick across a remount", () => {
+      mockConversations([
+        conv("conv_laptop", "Codex", { host_id: "host_laptop" }),
+        conv("conv_desktop", "Codex", { host_id: "host_desktop" }),
+        conv("conv_local", "Codex", { host_id: null }),
+      ]);
+      renderSidebar();
+
+      openFilterMenu();
+      expect(screen.getByText("Machine")).toBeInTheDocument();
+      expect(screen.getByTestId("session-host-filter-all")).toHaveAttribute("aria-checked", "true");
+      for (const value of ["local", "host:host_laptop", "host:host_desktop"]) {
+        expect(screen.getByTestId(`session-host-filter-${value}`)).toBeInTheDocument();
+      }
+      fireEvent.click(screen.getByTestId("session-host-filter-host:host_laptop"));
+
+      expect(screen.getByText("conv_laptop")).toBeInTheDocument();
+      expect(screen.queryByText("conv_desktop")).toBeNull();
+      expect(screen.queryByText("conv_local")).toBeNull();
+      expect(screen.getByTestId("session-filter")).toHaveAttribute("data-active", "true");
+      expect(screen.getByTestId("session-filter")).toHaveAccessibleName("Filter sessions · laptop");
+
+      // A fresh mount re-reads localStorage, so a reload stays on the machine.
+      cleanup();
+      renderSidebar();
+      expect(screen.getByText("conv_laptop")).toBeInTheDocument();
+      expect(screen.queryByText("conv_desktop")).toBeNull();
+
+      selectHostFilter("local");
+      expect(screen.getByText("conv_local")).toBeInTheDocument();
+      expect(screen.queryByText("conv_laptop")).toBeNull();
+
+      selectHostFilter("all");
+      for (const id of ["conv_laptop", "conv_desktop", "conv_local"]) {
+        expect(screen.getByText(id)).toBeInTheDocument();
+      }
+      expect(screen.getByTestId("session-filter")).toHaveAttribute("data-active", "false");
+    });
+
+    it("combines with the display filter", () => {
+      mockConversations([
+        conv("conv_mine_laptop", "Codex", { host_id: "host_laptop" }),
+        conv("conv_shared_laptop", "Codex", {
+          host_id: "host_laptop",
+          owner: "other@example.com",
+        }),
+        conv("conv_shared_desktop", "Codex", {
+          host_id: "host_desktop",
+          owner: "other@example.com",
+        }),
+      ]);
+      renderSidebar();
+
+      selectSessionFilter("shared");
+      selectHostFilter("host:host_laptop");
+
+      expect(screen.getByText("conv_shared_laptop")).toBeInTheDocument();
+      expect(screen.queryByText("conv_mine_laptop")).toBeNull();
+      expect(screen.queryByText("conv_shared_desktop")).toBeNull();
+    });
+
+    it("leaves pinned sessions visible, like the display filter", () => {
+      seedPins(["conv_desktop"]);
+      mockConversations([
+        conv("conv_laptop", "Codex", { host_id: "host_laptop" }),
+        conv("conv_desktop", "Codex", { host_id: "host_desktop" }),
+      ]);
+      renderSidebar();
+
+      selectHostFilter("host:host_laptop");
+
+      expect(screen.getByText("conv_laptop")).toBeInTheDocument();
+      expect(screen.getByText("conv_desktop")).toBeInTheDocument();
+    });
+
+    it("says so when the machine has no sessions", () => {
+      mockConversations([conv("conv_laptop", "Codex", { host_id: "host_laptop" })]);
+      renderSidebar();
+
+      selectHostFilter("host:host_desktop");
+
+      expect(screen.queryByText("conv_laptop")).toBeNull();
+      expect(screen.getByText("No sessions on this machine")).toBeInTheDocument();
+    });
+
+    it("hides the machine group when there is only one machine to pick", () => {
+      useHostsMock.mockReturnValue({ data: [laptop] });
+      mockConversations([conv("conv_laptop", "Codex", { host_id: "host_laptop" })]);
+      renderSidebar();
+
+      openFilterMenu();
+
+      expect(screen.getByText("Display")).toBeInTheDocument();
+      expect(screen.queryByText("Machine")).toBeNull();
+    });
+  });
+
   it("withholds the conversation list until identity is ready", () => {
     mockConversations([conv("conv_mine", "Claude Code")]);
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
