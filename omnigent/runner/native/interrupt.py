@@ -20,11 +20,11 @@ two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 special-cased and codex/pi alias stop to their interrupt handler.
 
 Coverage note: opencode-native dispatches :meth:`interrupt` to OpenCode's native
-``POST /session/{id}/abort`` so a turn pending on the model is aborted; when no
-bridge state is readable yet (serve still starting) it returns ``None`` and falls
-through to the in-process cancel. Its :meth:`stop` returns ``None`` and falls
-through. antigravity-native has no handler on either path and falls through;
-wiring its native ``interrupt_turn`` is a deferred follow-up.
+``POST /session/{id}/abort``; the aborted turn's forwarder stamps the terminal
+edge with a cancelled outcome, so the dispatch settles as cancelled. When bridge
+state is unavailable during startup, it returns ``None`` and falls through to the
+in-process cancel. Its :meth:`stop` returns ``None`` and falls through, as does
+antigravity-native on both paths.
 """
 
 from __future__ import annotations
@@ -904,8 +904,7 @@ class NativeInterruptRunner:
                 conv_id,
             )
             return None
-        # A confirmed abort owns the cancellation; defer the parent wake so the
-        # abort's idle edge settles the dispatch as cancelled, as the other
-        # native interrupt handlers do.
-        self._defer_parent_wake_after_native_interrupt(conv_id)
+        # The native turn is aborting; its forwarder stamps the terminal edge
+        # with a cancelled outcome, which settles the dispatch. Short-circuit
+        # the in-process cancel so it does not also run.
         return Response(status_code=204)
