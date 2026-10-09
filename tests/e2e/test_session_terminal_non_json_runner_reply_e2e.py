@@ -17,7 +17,9 @@ from fastapi.responses import JSONResponse
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import (
-    _globals,
+    get_runner_client,
+    get_runner_direct_attach_resolver,
+    get_runner_router,
     set_runner_client,
     set_runner_direct_attach_resolver,
     set_runner_router,
@@ -25,11 +27,9 @@ from omnigent.runtime import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import create_sessions_router
 
-# A claude-native terminal session: the native-bootstrap request shape
-# (terminal="claude", session_key="main", ensure_native_terminal=True) is
-# exempt from the agent-spec terminal-declaration gate, so it reaches the
-# runner proxy without needing a full agent spec loaded -- the same path the
-# web UI uses to open the session's native terminal.
+# Native-bootstrap requests (terminal="claude", session_key="main",
+# ensure_native_terminal=True) are exempt from the agent-spec terminal gate,
+# so they reach the runner proxy without a loaded spec, like the web UI path.
 _SESSION_ID = "64a784c3aa907d1774f44313546947c6"
 _TERMINALS_PATH = f"/v1/sessions/{_SESSION_ID}/resources/terminals"
 _UNHANDLED_LOG_PREFIX = "Unhandled exception"
@@ -141,9 +141,9 @@ class _FakeRunnerRouter:
 @pytest.fixture
 def runner_globals_reset() -> Iterator[None]:
     """Save/restore the process-global runner client + router + resolver."""
-    prior_client = _globals._runner_client
-    prior_router = _globals._runner_router
-    prior_direct = _globals._runner_direct_attach_resolver
+    prior_client = get_runner_client()
+    prior_router = get_runner_router()
+    prior_direct = get_runner_direct_attach_resolver()
     set_runner_client(None)
     set_runner_router(None)
     set_runner_direct_attach_resolver(None)
@@ -214,9 +214,7 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 @pytest.mark.parametrize(
     ("body", "content_type", "scenario"),
     [
-        # An empty body -> "Expecting value: line 1 column 1 (char 0)".
         ("", "text/html", "empty body"),
-        # An intermediary that returns an HTML 502 page instead of JSON.
         ("<html><body>502 Bad Gateway</body></html>", "text/html", "html error page"),
     ],
 )
@@ -228,7 +226,7 @@ async def test_terminal_create_non_json_runner_reply_is_handled(
     scenario: str,
 ) -> None:
     """Terminal creation must map an invalid runner body to HTTP 502."""
-    runner = _NonJsonRunnerClient(body=body, status_code=502, content_type=content_type)
+    runner = _NonJsonRunnerClient(body=body, status_code=200, content_type=content_type)
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     set_runner_client(runner)  # type: ignore[arg-type]
 
@@ -242,7 +240,6 @@ async def test_terminal_create_non_json_runner_reply_is_handled(
             },
         )
 
-    # The real proxy path executed: the terminal-create POST reached the runner.
     assert ("POST", _TERMINALS_PATH) in runner.calls, (
         f"[{scenario}] expected the route to proxy the terminal-create POST to "
         f"the runner; saw calls: {runner.calls!r}"
@@ -253,21 +250,16 @@ async def test_terminal_create_non_json_runner_reply_is_handled(
         for record in caplog.records
         if record.getMessage().startswith(_UNHANDLED_LOG_PREFIX)
     ]
-
-    # Primary signal: the non-JSON reply must NOT escape as an unhandled
-    # JSONDecodeError. Broken behavior logs
-    # "Unhandled exception: Expecting value: line 1 column 1 (char 0)".
+    # A non-JSON runner reply must become a handled 502, never an unhandled exception.
     assert not unhandled, (
         f"[{scenario}] a non-JSON runner reply raised an unhandled exception in "
         f"_proxy_post_to_runner (unguarded resp.json()); server logged {unhandled!r}. "
         "It must be handled like the GET proxy, which returns a graceful 502."
     )
-
-    # The intended graceful mapping: the same 502 the GET proxy already returns
-    # for a non-JSON runner reply -- not the unhandled-exception HTTP 500.
     assert resp.status_code == 502, (
         f"[{scenario}] expected a graceful HTTP 502 for a non-JSON runner reply "
         f"(matching _proxy_get_to_runner's 'runner resource endpoint returned "
         f"invalid JSON'); got {resp.status_code}: {resp.text[:200]!r}. "
         "HTTP 500 means the JSONDecodeError is still unhandled."
     )
+    assert resp.json()["detail"] == "runner resource endpoint returned invalid JSON"

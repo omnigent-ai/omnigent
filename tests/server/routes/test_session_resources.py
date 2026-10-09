@@ -3914,6 +3914,11 @@ async def test_filesystem_delete_proxies_to_runner(
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
             None,
         ),
+        (
+            "POST",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            {"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+        ),
     ],
 )
 async def test_mutating_proxy_maps_non_json_runner_reply_to_502(
@@ -3922,19 +3927,10 @@ async def test_mutating_proxy_maps_non_json_runner_reply_to_502(
     url: str,
     body: dict[str, Any] | None,
 ) -> None:
-    """A non-JSON runner reply to a mutating proxy surfaces as a graceful 502.
+    """A non-JSON runner reply to a mutating proxy surfaces as the GET proxy's 502.
 
-    A runner -- or an intermediary between the server and the runner -- can
-    answer a proxied request with an empty or HTML body instead of JSON. The
-    POST/PUT/PATCH/DELETE proxies must map that to the same 502 the GET proxy
-    already returns, not let ``json.JSONDecodeError`` escape as an unhandled
-    exception (an HTTP 500).
-
-    :param client: httpx client bound to the sessions router app.
-    :param method: HTTP method to drive.
-    :param url: Route under test (also the runner-relative proxy path).
-    :param body: JSON request body, or ``None`` for body-less methods.
-    :returns: None.
+    An empty or HTML body from the runner (or an intermediary in front of it)
+    must not escape as an unhandled ``json.JSONDecodeError`` (HTTP 500).
     """
     fake_runner = _FakeRunnerClient(
         text_responses={url: (502, "", {"content-type": "text/html"})},
