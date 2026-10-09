@@ -159,7 +159,6 @@ def test_send_cursor_pane_keys_invokes_tmux_send_keys(
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: True)
     monkeypatch.setattr(cnb, "_run_tmux", lambda sp, *a: calls.append((sp, a)))
 
     cnb.send_cursor_pane_keys(tmp_path, "y")
@@ -178,40 +177,33 @@ def test_send_cursor_pane_keys_raises_without_target(
         cnb.send_cursor_pane_keys(tmp_path, "y")
 
 
-def test_send_cursor_pane_keys_dead_pane_raises_pane_gone(
+def test_send_cursor_pane_keys_confirmed_gone_pane_raises_pane_gone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A torn-down pane is reported as gone, not as a tmux delivery failure."""
+    """A send-keys failure that the re-probe confirms as teardown is reported as gone."""
+
+    def _connect_error(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): no server running on sock")
+
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
+    monkeypatch.setattr(cnb, "_run_tmux", _connect_error)
     monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: False)
     with pytest.raises(cnb.CursorPaneGoneError):
         cnb.send_cursor_pane_keys(tmp_path, "Escape")
 
 
-def test_send_cursor_pane_keys_teardown_race_raises_pane_gone(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("recheck", [True, None])
+def test_send_cursor_pane_keys_send_failure_without_confirmed_teardown_stays_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, recheck: bool | None
 ) -> None:
-    """A send-keys failure on a pane that died mid-send is reported as gone."""
-    alive = iter([True, False])  # pre-check passes; the post-failure recheck sees the death
+    """A send failure stays a genuine error unless the re-probe confirms teardown.
 
-    def _connect_error(_sp: str, *_a: str) -> None:
-        raise RuntimeError("tmux command failed (rc=1): error connecting to sock")
-
-    monkeypatch.setattr(
-        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
-    )
-    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: next(alive))
-    monkeypatch.setattr(cnb, "_run_tmux", _connect_error)
-    with pytest.raises(cnb.CursorPaneGoneError):
-        cnb.send_cursor_pane_keys(tmp_path, "Escape")
-
-
-def test_send_cursor_pane_keys_live_pane_failure_stays_an_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A send-keys failure while the pane is alive is a genuine delivery error."""
+    ``True`` is a live pane; ``None`` is an inconclusive probe (a hung tmux or an
+    operational failure such as a permission error). Neither confirms the pane is
+    gone, so the original delivery error (and its ERROR log) must survive.
+    """
 
     def _tmux_error(_sp: str, *_a: str) -> None:
         raise RuntimeError("tmux command failed (rc=1): unknown key")
@@ -219,29 +211,63 @@ def test_send_cursor_pane_keys_live_pane_failure_stays_an_error(
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: True)
     monkeypatch.setattr(cnb, "_run_tmux", _tmux_error)
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: recheck)
     with pytest.raises(RuntimeError) as excinfo:
         cnb.send_cursor_pane_keys(tmp_path, "Escape")
     assert not isinstance(excinfo.value, cnb.CursorPaneGoneError)
 
 
-def test_send_cursor_pane_keys_unanswered_probe_keeps_delivery_error(
+def test_send_cursor_pane_keys_operational_probe_failure_stays_an_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An unanswered liveness probe (hung tmux) does not turn a send failure into teardown."""
+    """A nonzero probe that does not confirm absence keeps the delivery error.
 
-    def _timed_out(_sp: str, *_a: str) -> None:
-        raise RuntimeError("tmux command timed out after 10.0s")
+    A live pane whose socket is momentarily inaccessible makes ``has-session``
+    exit nonzero with ``Permission denied``; that must not be read as the pane
+    being gone. Drives the real ``_probe_session`` so the classification itself
+    is under test, not a stub.
+    """
+
+    def _tmux_error(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): error connecting (Permission denied)")
+
+    def _permission_denied(*_a: object, **_k: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="error connecting to sock (Permission denied)"
+        )
 
     monkeypatch.setattr(
         cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
     )
-    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: None)
-    monkeypatch.setattr(cnb, "_run_tmux", _timed_out)
+    monkeypatch.setattr(cnb, "_run_tmux", _tmux_error)
+    monkeypatch.setattr(cnb.subprocess, "run", _permission_denied)
     with pytest.raises(RuntimeError) as excinfo:
         cnb.send_cursor_pane_keys(tmp_path, "Escape")
     assert not isinstance(excinfo.value, cnb.CursorPaneGoneError)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (0, "", True),
+        (1, "no server running on sock", False),
+        (1, "error connecting to sock (No such file or directory)", False),
+        (1, "can't find session: main", False),
+        (1, "error connecting to sock (Permission denied)", None),
+        (1, "", None),
+    ],
+)
+def test_probe_session_classifies_has_session_outcomes(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stderr: str, expected: bool | None
+) -> None:
+    """``_probe_session`` reports True/False only for a definitive answer, else ``None``."""
+
+    def _run(*_a: object, **_k: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(cnb.subprocess, "run", _run)
+    assert cnb._probe_session("sock", "main") is expected
 
 
 def test_probe_session_reports_unanswered_probe_as_none(

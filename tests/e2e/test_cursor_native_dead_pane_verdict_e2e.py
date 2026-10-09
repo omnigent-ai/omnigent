@@ -1,24 +1,17 @@
-"""E2E guard: a Cursor approval verdict delivered to a torn-down TUI pane must
-not be logged as an operational error.
+"""E2E guard: delivering a Cursor approval verdict to a torn-down TUI pane must
+not log the tracked operational-error signature.
 
-The cursor-native harness answers a web approval card by sending tmux keystrokes
-into the runner-owned pane that hosts cursor-agent. When that pane has already
-exited (session teardown, runner disconnect, or the user ending the run) its
-tmux socket is gone, so the keystroke cannot land. That is expected teardown:
-dropping the verdict is the only possible outcome and belongs below ERROR, not
-at it.
-
-This drives the real bridge + permissions delivery path against a real tmux pane
-that is created, advertised exactly as the runner advertises it, and then torn
-down mid-flight. Delivering the decline sequence (Escape, Enter) that a Reject
-verdict sends must report the keystroke as undelivered without logging the
-tracked error signature.
+The harness answers a web card by sending tmux keystrokes into the runner-owned
+cursor-agent pane. Once that pane exits its socket is gone, so the keystroke can
+only be dropped — expected teardown that belongs below ERROR. This drives the
+real bridge + permissions path against a real tmux pane advertised then torn down
+mid-flight, asserting the Reject sequence (Escape, Enter) is reported undelivered
+without the signature.
 """
 
 import logging
 import shutil
 import subprocess
-import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -43,15 +36,6 @@ _SESSION_ID = "1080588264878826"
 _DECLINE_SEQUENCE = ("Escape", "Enter")
 
 
-class _RecordCollector(logging.Handler):
-    def __init__(self) -> None:
-        super().__init__()
-        self.records: list[logging.LogRecord] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.records.append(record)
-
-
 def _kill_tmux_pane(socket_path: Path) -> None:
     subprocess.run(
         ["tmux", "-S", str(socket_path), "kill-server"],
@@ -62,11 +46,12 @@ def _kill_tmux_pane(socket_path: Path) -> None:
 
 
 @pytest.fixture
-def cursor_bridge_with_live_pane() -> Iterator[tuple[Path, Path]]:
+def cursor_bridge_with_live_pane(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[Path, Path]]:
     """A cursor-native bridge dir advertising a real, live tmux pane."""
-    socket_dir = Path(tempfile.mkdtemp(prefix="omnigent-terminal-"))
-    bridge_dir = Path(tempfile.mkdtemp(prefix="cursor-native-bridge-"))
-    socket_path = socket_dir / "tmux.sock"
+    socket_path = tmp_path_factory.mktemp("cursor-terminal") / "tmux.sock"
+    bridge_dir = tmp_path_factory.mktemp("cursor-native-bridge")
     subprocess.run(
         ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "cursor", "sleep 600"],
         check=True,
@@ -77,12 +62,11 @@ def cursor_bridge_with_live_pane() -> Iterator[tuple[Path, Path]]:
         yield bridge_dir, socket_path
     finally:
         _kill_tmux_pane(socket_path)
-        shutil.rmtree(socket_dir, ignore_errors=True)
-        shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
 async def test_cursor_decline_verdict_to_dead_pane_is_not_an_error_signature(
     cursor_bridge_with_live_pane: tuple[Path, Path],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     bridge_dir, socket_path = cursor_bridge_with_live_pane
 
@@ -94,22 +78,14 @@ async def test_cursor_decline_verdict_to_dead_pane_is_not_an_error_signature(
     _kill_tmux_pane(socket_path)
     assert not socket_path.exists()
 
-    collector = _RecordCollector()
-    logger = logging.getLogger(_PERMISSIONS_LOGGER)
-    previous_level = logger.level
-    logger.addHandler(collector)
-    logger.setLevel(logging.DEBUG)
-    try:
+    with caplog.at_level(logging.DEBUG, logger=_PERMISSIONS_LOGGER):
         delivered = await _send_cursor_keys(bridge_dir, _SESSION_ID, *_DECLINE_SEQUENCE)
-    finally:
-        logger.removeHandler(collector)
-        logger.setLevel(previous_level)
 
     assert delivered is False
 
     error_signatures = [
         record
-        for record in collector.records
+        for record in caplog.records
         if record.levelno >= logging.ERROR and _ERROR_SIGNATURE in record.getMessage()
     ]
     assert not error_signatures, (
