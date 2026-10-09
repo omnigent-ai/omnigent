@@ -23,7 +23,7 @@ when the result is empty. Like minimatch, a character class the regex engine
 rejects (e.g. a reversed range ``[z-a]``) makes its pattern match nothing
 rather than raise.
 
-Verified against Pi 0.84.2 (``core/model-resolver.js``, minimatch 10);
+Verified against Pi 0.85.1 (``core/model-resolver.js``, minimatch 10);
 re-verify when the pinned Pi resolver changes.
 """
 
