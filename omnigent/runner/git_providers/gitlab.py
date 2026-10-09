@@ -402,15 +402,26 @@ class GitLabPullRequests:
     def pr_title(
         self, root: str, reference: PullRequestRef, deadline: float
     ) -> tuple[str | None, bool]:
+        title, _, timed_out = self.pr_title_and_state(root, reference, deadline)
+        return title, timed_out
+
+    def pr_title_and_state(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[str | None, str | None, bool]:
         from omnigent.runner.gitlab_client import GitLabTimeoutError
 
         try:
-            title = _mr(_client(root, reference.host, deadline), reference).get("title")
-            return (title.strip() or None if isinstance(title, str) else None), False
+            mr = _mr(_client(root, reference.host, deadline), reference)
         except GitLabTimeoutError:
-            return None, True
+            return None, None, True
         except ValueError:
-            return None, False
+            return None, None, False
+        title = mr.get("title")
+        return (
+            title.strip() or None if isinstance(title, str) else None,
+            _STATES.get(str(mr.get("state"))),
+            False,
+        )
 
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         _mr(_client(root, reference.host), reference)

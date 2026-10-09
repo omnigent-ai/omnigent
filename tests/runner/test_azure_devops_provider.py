@@ -1422,6 +1422,25 @@ def test_pr_title_after_the_deadline_sends_nothing(
     assert ado_transport.requests == []
 
 
+@pytest.mark.parametrize(
+    "status,state", [("active", "OPEN"), ("completed", "MERGED"), ("abandoned", "CLOSED")]
+)
+def test_title_lookup_reads_the_normalized_state(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    status: str,
+    state: str,
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(status=status, title="Add CI"))
+
+    assert facet.pr_title_and_state(str(tmp_path), reference(), time.monotonic() + 1.5) == (
+        "Add CI",
+        state,
+        False,
+    )
+
+
 def test_titles_are_available_with_a_token(
     facet: AzureDevOpsPullRequests, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

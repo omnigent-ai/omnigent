@@ -104,6 +104,7 @@ import {
   PullRequestPanel,
   derivePullRequestPanelState,
   LARGE_DIFF_THRESHOLD,
+  selectDefaultPr,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -1664,5 +1665,141 @@ describe("session PR selection", () => {
     };
     renderPanel();
     expect(usePullRequestChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
+  });
+});
+
+describe("selectDefaultPr", () => {
+  const pr = (url: string, prState?: string | null): PullRequestAssociation => ({
+    url,
+    host: "github.com",
+    repository: "example/repo",
+    number: 1,
+    relationship: "created",
+    state: prState,
+  });
+
+  it("returns undefined for an empty list", () => {
+    expect(selectDefaultPr([])).toBeUndefined();
+  });
+
+  it("prefers OPEN over MERGED", () => {
+    const open = pr("https://github.com/a/b/pull/1", "OPEN");
+    const merged = pr("https://github.com/a/b/pull/2", "MERGED");
+    expect(selectDefaultPr([merged, open])).toBe(open.url);
+    expect(selectDefaultPr([open, merged])).toBe(open.url);
+  });
+
+  it("prefers OPEN over CLOSED", () => {
+    const open = pr("https://github.com/a/b/pull/1", "OPEN");
+    const closed = pr("https://github.com/a/b/pull/2", "CLOSED");
+    expect(selectDefaultPr([closed, open])).toBe(open.url);
+  });
+
+  it("prefers CLOSED over MERGED", () => {
+    const closed = pr("https://github.com/a/b/pull/1", "CLOSED");
+    const merged = pr("https://github.com/a/b/pull/2", "MERGED");
+    expect(selectDefaultPr([merged, closed])).toBe(closed.url);
+    expect(selectDefaultPr([closed, merged])).toBe(closed.url);
+  });
+
+  it("ranks an unprobed PR after OPEN but ahead of CLOSED and MERGED", () => {
+    const open = pr("https://github.com/a/b/pull/1", "OPEN");
+    const unknown = pr("https://github.com/a/b/pull/2", null);
+    const closed = pr("https://github.com/a/b/pull/3", "CLOSED");
+    const merged = pr("https://github.com/a/b/pull/4", "MERGED");
+    expect(selectDefaultPr([merged, closed, unknown])).toBe(unknown.url);
+    expect(selectDefaultPr([unknown, open])).toBe(open.url);
+  });
+
+  it("returns the first PR when all states are equal", () => {
+    const a = pr("https://github.com/a/b/pull/1", "OPEN");
+    const b = pr("https://github.com/a/b/pull/2", "OPEN");
+    expect(selectDefaultPr([a, b])).toBe(a.url);
+  });
+
+  it("compares states case-insensitively", () => {
+    const open = pr("https://github.com/a/b/pull/1", "open");
+    const merged = pr("https://github.com/a/b/pull/2", "merged");
+    expect(selectDefaultPr([merged, open])).toBe(open.url);
+  });
+});
+
+describe("session PR selection across sessions", () => {
+  const one = "https://github.com/example/one/pull/42";
+  const two = "https://github.com/example/two/pull/42";
+
+  /** A tracking payload whose selected PR is `selectedUrl`, listing `prs` in order. */
+  function trackingInfo(selectedUrl: string, prs: { url: string; state?: string | null }[]) {
+    return {
+      isLoading: false,
+      error: null,
+      isFetching: false,
+      data: {
+        ...state.info!.data!,
+        tracking_available: true,
+        selected_pr_url: selectedUrl,
+        prs: prs.map(({ url, state: prState }): PullRequestAssociation => ({
+          url,
+          host: "github.com",
+          repository: url.replace("https://github.com/", "").split("/pull/")[0],
+          number: 42,
+          title: `PR from ${url.split("/pull/")[0].split("/").pop()}`,
+          relationship: "created",
+          state: prState ?? null,
+        })),
+        pr: {
+          ...state.info!.data!.pr!,
+          url: selectedUrl,
+          state: prs.find((p) => p.url === selectedUrl)?.state ?? "OPEN",
+        },
+      },
+    };
+  }
+
+  it("remembers each session's PR when switching sessions and back", () => {
+    state.info = trackingInfo(one, [{ url: one, state: "OPEN" }]);
+    const { rerender } = renderPanel();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+
+    state.info = trackingInfo(two, [{ url: two, state: "MERGED" }]);
+    rerender(<PullRequestPanel conversationId="conv_2" />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_2", { poll: true, prUrl: two });
+
+    // conv_1 keeps its own PR rather than adopting conv_2's.
+    state.info = trackingInfo(one, [{ url: one, state: "OPEN" }]);
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+  });
+
+  it("selects the open PR even when the server's default is merged", () => {
+    state.info = trackingInfo(two, [
+      { url: two, state: "MERGED" },
+      { url: one, state: "OPEN" },
+    ]);
+    renderPanel();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+    expect(screen.getByRole("combobox", { name: "Session pull request" })).toHaveTextContent(
+      "example/one #42",
+    );
+  });
+
+  it("keeps an explicit selection when data refreshes", async () => {
+    const user = userEvent.setup();
+    state.info = trackingInfo(one, [
+      { url: one, state: "OPEN" },
+      { url: two, state: "MERGED" },
+    ]);
+    const { rerender } = renderPanel();
+
+    await user.click(screen.getByRole("combobox", { name: "Session pull request" }));
+    await user.click(screen.getByRole("option", { name: /example\/two #42/ }));
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+
+    state.info = trackingInfo(one, [
+      { url: one, state: "OPEN" },
+      { url: two, state: "MERGED" },
+    ]);
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
   });
 });

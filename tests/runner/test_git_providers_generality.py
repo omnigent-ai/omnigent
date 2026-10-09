@@ -129,6 +129,7 @@ class FakeGitLabFacet:
             "number": reference.number,
             "url": reference.url,
             "title": f" MR {reference.number} ",
+            "state": "OPEN",
         }
         return self._info(selected_pr_url=reference.url, pr=pr)
 
@@ -441,6 +442,26 @@ def test_legacy_resources_route_a_mixed_provider_session(
     assert [entry.url for entry in registry.list()] == [github_url]
 
 
+def test_facet_without_state_lookup_still_supplies_titles(
+    facet: FakeGitLabFacet, repo: str
+) -> None:
+    second = MR.replace("/7", "/8")
+    registry = SessionPrRegistry("titles-only")
+    registry.record(
+        [PullRequestRef.from_url(url) for url in [second, MR]],
+        relationship="created",
+        source="test",
+    )
+
+    info = pr_resource.pr_info(repo, session_id="titles-only", pr_url=MR)
+
+    assert "pr_title:8" in facet.calls
+    assert {entry["url"]: (entry["title"], entry["state"]) for entry in info["prs"]} == {
+        MR: ("MR 7", "OPEN"),
+        second: ("MR 8", None),
+    }
+
+
 @pytest.mark.parametrize("method", ["load_facet", "titles_available", "pr_title"])
 def test_optional_title_failure_keeps_selected_pr_and_healthy_titles(
     facet: FakeGitLabFacet, repo: str, monkeypatch: pytest.MonkeyPatch, method: str
@@ -466,7 +487,9 @@ def test_optional_title_failure_keeps_selected_pr_and_healthy_titles(
         },
     )
     monkeypatch.setattr(github, "titles_available", lambda _root: True)
-    monkeypatch.setattr(github, "pr_title", lambda *_args: ("Healthy GitHub title", False))
+    monkeypatch.setattr(
+        github, "pr_title_and_state", lambda *_args: ("Healthy GitHub title", "OPEN", False)
+    )
 
     def broken(*_args):
         raise RuntimeError("External forge unavailable")

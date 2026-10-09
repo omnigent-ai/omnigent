@@ -611,8 +611,28 @@ def test_file_access_failure_is_not_reported_as_deleted(root: str, api: Mock, mr
 def test_title_timeout_contract(root: str, api: Mock) -> None:
     api.object.side_effect = GitLabTimeoutError()
     assert module.PULL_REQUESTS.pr_title(root, ref(), time.monotonic()) == (None, True)
+    assert module.PULL_REQUESTS.pr_title_and_state(root, ref(), time.monotonic()) == (
+        None,
+        None,
+        True,
+    )
     api.object.side_effect = GitLabError("denied")
     assert module.PULL_REQUESTS.pr_title(root, ref(), time.monotonic()) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "gitlab_state,state",
+    [("opened", "OPEN"), ("merged", "MERGED"), ("closed", "CLOSED"), ("locked", "OPEN")],
+)
+def test_title_lookup_reads_the_normalized_state(
+    root: str, api: Mock, mr: dict, gitlab_state: str, state: str
+) -> None:
+    mr["state"] = gitlab_state
+    assert module.PULL_REQUESTS.pr_title_and_state(root, ref(), time.monotonic() + 8) == (
+        mr["title"],
+        state,
+        False,
+    )
 
 
 @pytest.mark.parametrize("expired", [True, False], ids=["deadline", "subprocess"])

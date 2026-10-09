@@ -778,11 +778,32 @@ def _pr_title_before(
     :returns: ``(title, timed_out)``; ``timed_out`` is true only when the
         deadline ended the lookup.
     """
+    data, timed_out = _pr_json_before(root, reference, "title", deadline)
+    return _pr_title(data), timed_out
+
+
+def _pr_title_and_state_before(
+    root: str, reference: PullRequestRef, deadline: float
+) -> tuple[str | None, str | None, bool]:
+    """Look up one PR's title and state in one ``gh`` call ending by ``deadline``.
+
+    :returns: ``(title, state, timed_out)``; ``state`` is upper-cased, or
+        ``None`` when the lookup failed.
+    """
+    data, timed_out = _pr_json_before(root, reference, "title,state", deadline)
+    state = data.get("state") if data else None
+    return _pr_title(data), (state.upper() or None) if isinstance(state, str) else None, timed_out
+
+
+def _pr_json_before(
+    root: str, reference: PullRequestRef, fields: str, deadline: float
+) -> tuple[dict[str, Any] | None, bool]:
+    """Read ``fields`` of one PR; the flag is true only when ``deadline`` ended the lookup."""
     token = _pr_title_deadline.set(deadline)
     timeout_token = _pr_title_timed_out.set(False)
     try:
-        data = _pr_json(root, reference, "title")
-        return _pr_title(data), data is None and _pr_title_timed_out.get()
+        data = _pr_json(root, reference, fields)
+        return data, data is None and _pr_title_timed_out.get()
     finally:
         _pr_title_timed_out.reset(timeout_token)
         _pr_title_deadline.reset(token)

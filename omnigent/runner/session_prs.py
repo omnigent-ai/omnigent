@@ -45,6 +45,17 @@ class PullRequestRef(BaseModel):
         )
 
 
+# Default-selection rank by PR state. An unprobed PR is usually new and still
+# open, so it ranks after OPEN but ahead of a known CLOSED or MERGED one.
+_PR_STATE_PRIORITY = {"OPEN": 0, "CLOSED": 2, "MERGED": 3}
+_UNKNOWN_STATE_PRIORITY = 1
+
+
+def pr_state_priority(state: str | None) -> int:
+    """Return a PR state's default-selection rank (lower is preferred)."""
+    return _PR_STATE_PRIORITY.get((state or "").upper(), _UNKNOWN_STATE_PRIORITY)
+
+
 class SessionPullRequest(PullRequestRef):
     relationship: Literal["created", "worked_on", "attached", "inferred"]
     source: str
@@ -53,6 +64,8 @@ class SessionPullRequest(PullRequestRef):
     title: str | None = None
     title_checked_at: float = 0
     title_lookup_timed_out: bool = False
+    # Cached PR state ("OPEN", "CLOSED", "MERGED"); None when not yet fetched.
+    state: str | None = None
 
 
 class _Associations(BaseModel):
@@ -102,7 +115,7 @@ class SessionPrRegistry:
         return state
 
     def list(self) -> list[SessionPullRequest]:
-        """Read a locked snapshot with explicit activity before inferred PRs.
+        """Read a locked snapshot, open PRs first, then explicit activity before inferred PRs.
 
         :raises ValueError: If the registry is corrupt or busy.
         """
@@ -113,6 +126,7 @@ class SessionPrRegistry:
                 return sorted(
                     self._read().prs,
                     key=lambda pr: (
+                        pr_state_priority(pr.state),
                         pr.relationship == "inferred",
                         pr.first_seen_at if pr.relationship == "inferred" else -pr.last_seen_at,
                     ),
@@ -187,6 +201,7 @@ class SessionPrRegistry:
                     title=previous.title if previous else None,
                     title_checked_at=previous.title_checked_at if previous else 0,
                     title_lookup_timed_out=previous.title_lookup_timed_out if previous else False,
+                    state=previous.state if previous else None,
                 )
             state.prs = list(entries.values())
             if observation_id:
@@ -199,26 +214,35 @@ class SessionPrRegistry:
         *,
         timestamp: float | None = None,
         timed_out_urls: Collection[str] = (),
+        states: Mapping[str, str | None] | None = None,
     ) -> None:
-        """Cache title lookups without reordering or recreating removed associations."""
-        if not titles:
+        """Cache title and state lookups without reordering or recreating removed associations.
+
+        :param states: PR states (``"OPEN"``, ``"MERGED"``, ``"CLOSED"``) by URL;
+            ``None`` values keep the cached state.
+        """
+        states = states or {}
+        if not titles and not states:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with FileLock(str(self.path) + ".lock", timeout=1):
-            state = self._read()
+            registry = self._read()
             now = time.time() if timestamp is None else timestamp
             changed = False
-            for entry in state.prs:
-                if entry.url not in titles or entry.title_checked_at > now:
-                    continue
-                title = titles[entry.url]
-                if title is not None:
-                    entry.title = title
-                entry.title_checked_at = now
-                entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
-                changed = True
+            for entry in registry.prs:
+                if entry.url in titles and entry.title_checked_at <= now:
+                    title = titles[entry.url]
+                    if title is not None:
+                        entry.title = title
+                    entry.title_checked_at = now
+                    entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
+                    changed = True
+                pr_state = states.get(entry.url)
+                if pr_state is not None and entry.state != pr_state:
+                    entry.state = pr_state
+                    changed = True
             if changed:
-                self._write(state)
+                self._write(registry)
 
     def remove(self, url: str) -> None:
         """Remember removal so subsequent hook replay cannot attach the PR again."""

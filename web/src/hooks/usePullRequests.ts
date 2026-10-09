@@ -142,6 +142,8 @@ export interface PullRequestAssociation {
   number: number;
   title?: string | null;
   relationship: "created" | "worked_on" | "attached" | "inferred";
+  /** "OPEN" | "CLOSED" | "MERGED" once probed; null/undefined when not yet fetched. */
+  state?: string | null;
   /** Git provider id; absent from hosts that predate providers (GitHub). */
   provider?: string;
   provider_display?: GitProviderDisplay;

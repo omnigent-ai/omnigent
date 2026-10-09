@@ -15,9 +15,11 @@ in `omnigent/runner/git_providers/__init__.py`; the GitHub implementation is in
 `omnigent.runner.pr_resource` owns selection, association persistence, branch
 inference, title caching, and routing. A facet implements workspace and linked
 request lookup, access checks, titles, changed files, diffs, preferences, and
-tool-output recognition. Calls can run concurrently in worker threads. Keep
-panel-only dependencies inside the methods that use them: the tool observer
-loads facets without opening the panel.
+tool-output recognition. A facet can also implement the optional
+`PullRequestStateLookup.pr_title_and_state`, which reads a title and state in
+one call so the panel lists and selects open requests first. Calls can run
+concurrently in worker threads. Keep panel-only dependencies inside the methods
+that use them: the tool observer loads facets without opening the panel.
 
 Declare supported controls through `ProviderCapabilities`: account switching,
 base remote selection, line counts, and diffs for linked requests outside the

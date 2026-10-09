@@ -86,6 +86,14 @@ class GitHubPullRequests:
 
         return github_resource._pr_title_before(root, reference, deadline)
 
+    def pr_title_and_state(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[str | None, str | None, bool]:
+        """Look up one PR's title and state before ``deadline``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_title_and_state_before(root, reference, deadline)
+
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         """Raise unless ``gh`` on the host can read the PR."""
         from omnigent.runner import github_resource
