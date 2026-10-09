@@ -168,13 +168,20 @@ def test_cursor_pane_gone_distinguishes_dead_live_and_unknown(
     assert cnb.cursor_pane_gone(tmp_path) is True  # no tmux target advertised
 
 
-def test_probe_session_reports_failed_probe_as_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "error",
+    [cnb.subprocess.TimeoutExpired(cmd="tmux", timeout=1), OSError("tmux: cannot spawn")],
+    ids=["timeout", "spawn-error"],
+)
+def test_probe_session_reports_failed_probe_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
     """A ``has-session`` timeout or spawn error is ``None``, not a dead pane."""
 
-    def _timeout(*_a: object, **_k: object) -> None:
-        raise cnb.subprocess.TimeoutExpired(cmd="tmux", timeout=1)
+    def _fail(*_a: object, **_k: object) -> None:
+        raise error
 
-    monkeypatch.setattr(cnb.subprocess, "run", _timeout)
+    monkeypatch.setattr(cnb.subprocess, "run", _fail)
     assert cnb._probe_session("s", "t") is None
     assert cnb._session_alive("s", "t") is False
 
@@ -984,7 +991,12 @@ async def test_send_cursor_keys_attributes_dead_pane_without_error_record(
     assert await cnp._send_cursor_keys(tmp_path, "conv_gone", "y") is False
 
     assert not _keystroke_error_records(caplog)
-    assert any("cursor pane is gone" in record.getMessage() for record in caplog.records)
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "cursor pane is gone" in record.getMessage()
+    ]
+    assert warnings and "error connecting to tmux.sock" in warnings[0]
 
 
 async def test_send_cursor_keys_still_errors_when_live_pane_send_fails(
@@ -1019,35 +1031,22 @@ async def test_send_cursor_keys_reports_spawn_failure_as_undelivered(
     assert not _keystroke_error_records(caplog)
 
 
-async def test_send_cursor_keys_keeps_tmux_error_in_dead_pane_warning(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The dead-pane warning keeps tmux's own error, so a hung probe stays diagnosable."""
-    caplog.set_level(logging.DEBUG)
-
-    def _boom(_bridge: Path, _key: str) -> None:
-        raise RuntimeError("tmux command timed out after 5s")
-
-    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
-    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: True)
-
-    assert await cnp._send_cursor_keys(tmp_path, "conv_hung", "y") is False
-    warnings = [
-        record.getMessage()
-        for record in caplog.records
-        if record.levelno == logging.WARNING and "cursor pane is gone" in record.getMessage()
-    ]
-    assert warnings and "timed out after 5s" in warnings[0]
-
-
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("tmux command timed out after 5s"), OSError("tmux: cannot spawn")],
+    ids=["send-timeout", "spawn-error"],
+)
 async def test_send_cursor_keys_keeps_error_when_probe_is_indeterminate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
 ) -> None:
     """A failed send with an unprobeable pane keeps the ERROR: death is not confirmed."""
     caplog.set_level(logging.DEBUG)
 
     def _boom(_bridge: Path, _key: str) -> None:
-        raise RuntimeError("tmux command timed out after 5s")
+        raise error
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
     monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: None)
