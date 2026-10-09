@@ -141,7 +141,9 @@ def _create_body(**overrides: object) -> dict[str, object]:
 
 async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
-    resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(max_cost_usd=2.5), headers=_headers()
+    )
     assert resp.status_code == 200, resp.text
     created = resp.json()
     assert created["name"] == "nightly triage"
@@ -149,6 +151,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert created["max_cost_usd"] == 2.5
     assert "base_branch" not in created
     # execution_target is now surfaced (defaults to connected_host); base_branch
     # stays an internal legacy column.
@@ -163,6 +166,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+    assert got.json()["max_cost_usd"] == 2.5
 
 
 async def test_create_no_workspace_task_persists_null_host_and_workspace(
