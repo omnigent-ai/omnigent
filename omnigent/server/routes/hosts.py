@@ -72,7 +72,7 @@ from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
 )
-from omnigent.server.schemas import SessionGitOptions
+from omnigent.server.schemas import HostList, HostSummary, SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -671,17 +671,18 @@ def create_hosts_router(
     router = APIRouter()
 
     @router.get("/hosts")
-    async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
+    async def list_hosts(request: Request) -> HostList:
         """List all hosts owned by the authenticated user.
 
         Returns both online and offline hosts, with live runner
         information for online hosts.
 
         :param request: The incoming request (for auth).
-        :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
-            ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+        :returns: A :class:`HostList`; each :class:`HostSummary` carries
+            ``host_id``, ``name``, ``owner``, ``status``, ``sandbox_provider``,
+            ``configured_harnesses``, ``gateway_inference`` and
+            ``interactive_shells`` (the last two ``None`` when no connected
+            host has reported them to this replica).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -695,7 +696,7 @@ def create_hosts_router(
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
         now = now_epoch()
-        result: list[dict[str, Any]] = []
+        result: list[HostSummary] = []
         for host in hosts:
             # Status comes from the DB, not host_registry. The registry
             # is per-replica; if a host is connected to replica B and
@@ -707,27 +708,27 @@ def create_hosts_router(
             # recently: a crashed host never runs set_offline and would
             # otherwise show as online forever in the picker.
             result.append(
-                {
-                    "host_id": host.host_id,
-                    "name": host.name,
-                    "owner": host.user_id,
-                    "status": "online" if host_is_live(host, now=now) else "offline",
+                HostSummary(
+                    host_id=host.host_id,
+                    name=host.name,
+                    owner=host.user_id,
+                    status="online" if host_is_live(host, now=now) else "offline",
                     # Non-None marks a server-managed sandbox host (e.g.
                     # "modal"). Clients use it to hide sandbox-backed
                     # hosts from manual host pickers — they are launch
                     # targets the server creates on demand, not
                     # user-connectable machines.
-                    "sandbox_provider": host.sandbox_provider,
-                    "configured_harnesses": host.configured_harnesses,
+                    sandbox_provider=host.sandbox_provider,
+                    configured_harnesses=host.configured_harnesses,
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
                     # gateway-backed".
-                    "gateway_inference": host_registry.gateway_inference(host.host_id),
-                    "interactive_shells": host_registry.interactive_shells(host.host_id),
-                }
+                    gateway_inference=host_registry.gateway_inference(host.host_id),
+                    interactive_shells=host_registry.interactive_shells(host.host_id),
+                )
             )
-        return {"hosts": result}
+        return HostList(hosts=result)
 
     @router.get("/hosts/{host_id}")
     async def get_host(request: Request, host_id: str) -> dict[str, Any]:
