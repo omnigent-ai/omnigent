@@ -207,7 +207,7 @@ class _SilentHttpsEndpoint:
 
 def _read(path: Path) -> str:
     """Return *path*'s text, or empty when it does not exist yet."""
-    return path.read_text(errors="replace") if path.exists() else ""
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
 
 @pytest.mark.timeout(240)
