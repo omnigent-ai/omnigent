@@ -82,6 +82,7 @@ import time
 import traceback
 from pathlib import Path
 
+assert len(sys.argv) == 13, f"driver expects 12 arguments, got {len(sys.argv) - 1}"
 BASE_URL, SESSION_ID, WORKSPACE, RESULT_PATH, GATED_COMMAND = sys.argv[1:6]
 POLL_FAILED_SIGNATURE = sys.argv[12]
 POLL_INTERVAL_S, SETTLE_S, WARMUP_S, FAULT_HOLD_S, SURFACE_WAIT_S, DEGRADED_WAIT_S = (
@@ -152,9 +153,8 @@ async def main():
     chats_root = Path.home() / ".cursor" / "chats"
     chats_root.mkdir(parents=True)
     launch_ms = int(time.time() * 1000)
-    # A STALE chat (created long before the discovery floor) keeps the loop in
-    # the discovery phase every pass — the phase the observed traceback fired
-    # in — while making _scan_hash_dir iterate the exact md5(workspace) dir.
+    # A chat older than the discovery floor keeps every poll scanning the
+    # md5(workspace) chats dir instead of binding a store.
     write_chat(chats_root, "stale-chat", launch_ms - 3_600_000, "true")
 
     supervisor = asyncio.create_task(
@@ -174,7 +174,8 @@ async def main():
 
     # ── genuine transient fd exhaustion ────────────────────────────────
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+    low = 64 if hard == resource.RLIM_INFINITY else min(64, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (low, hard))
     hoard = []
     hoard_errno = None
     selfcheck_errno = None
@@ -340,6 +341,12 @@ def test_transient_fd_exhaustion_does_not_emit_poll_failed_errors(
                     f"(hoard_errno={result['hoard_errno']}, "
                     f"selfcheck_errno={result['selfcheck_errno']}); "
                     "infrastructure problem, not a verdict on the bug"
+                )
+
+            if result["warmup_errors"]:
+                pytest.fail(
+                    f"{result['warmup_errors']} ERROR record(s) before the fault window: "
+                    f"{result['error_msgs']}; infrastructure problem, not a verdict on the bug"
                 )
 
             # The supervisor itself must have met the shortage inside the window;
