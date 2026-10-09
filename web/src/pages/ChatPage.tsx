@@ -1121,10 +1121,12 @@ export function ChatPage() {
               ? initialPrompt.prompt
               : null
           }
-          // The prompt now lives in the landing composer; mark this id's
-          // cached source consumed so a browser-back can't re-dispatch it.
+          // The prompt now lives in the landing composer; retire both views of
+          // the cached source (the per-id ref and the live state) so a
+          // browser-back into this id cannot re-dispatch it.
           onStrandedPromptRetired={() => {
             consumedInitialPromptRef.current = { conversationId: urlConvId, prompt: null };
+            setInitialPrompt(null);
           }}
         />
       );

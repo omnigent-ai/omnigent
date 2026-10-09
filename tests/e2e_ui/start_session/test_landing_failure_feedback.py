@@ -307,7 +307,9 @@ async def _drive_prompt_journey(base_url: str, browser_name: str, output: Path) 
                     f"the create itself must succeed for this journey; saw {created}"
                 )
                 await expect(page.get_by_text(PROMPT)).to_have_count(0)
+                # Wait for any late echo of the prompt, then re-assert none landed.
                 await page.wait_for_timeout(3_000)
+                await expect(page.get_by_text(PROMPT)).to_have_count(0)
 
                 await page.get_by_role("button", name="Start a new chat").click()
                 await expect(composer).to_be_visible(timeout=15_000)
