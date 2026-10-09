@@ -2578,9 +2578,8 @@ async def test_events_interrupt_on_opencode_native_aborts_the_native_turn(
     assert int_resp.status_code == 204, (
         f"opencode-native interrupt must return 204; got {int_resp.status_code}: {int_resp.text}"
     )
-    # The native abort ran against OpenCode's own session id, routed by the
-    # persisted server URL/auth. An empty list means the handler regressed to
-    # the in-process cancel, which cannot reach the serve process.
+    # An empty list means the interrupt fell through to the in-process cancel,
+    # which cannot reach OpenCode's serve process.
     assert abort_calls == ["ses_opencode"], (
         f"opencode-native interrupt must abort the native session; got {abort_calls!r}."
     )

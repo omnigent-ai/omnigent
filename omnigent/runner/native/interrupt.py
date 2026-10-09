@@ -19,11 +19,12 @@ two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 ``POST /session/{id}/abort``) keep dedicated methods; claude stop is likewise
 special-cased and codex/pi alias stop to their interrupt handler.
 
-Coverage note: opencode-native now dispatches :meth:`interrupt` to OpenCode's
-native ``POST /session/{id}/abort`` so a turn pending on the model is aborted;
-its :meth:`stop` still returns ``None`` and falls through to the in-process
-cancel. antigravity-native has no handler on either path and still falls
-through; wiring its native ``interrupt_turn`` is a deferred follow-up.
+Coverage note: opencode-native dispatches :meth:`interrupt` to OpenCode's native
+``POST /session/{id}/abort`` so a turn pending on the model is aborted; when no
+bridge state is readable yet (serve still starting) it returns ``None`` and falls
+through to the in-process cancel. Its :meth:`stop` returns ``None`` and falls
+through. antigravity-native has no handler on either path and falls through;
+wiring its native ``interrupt_turn`` is a deferred follow-up.
 """
 
 from __future__ import annotations
@@ -852,7 +853,7 @@ class NativeInterruptRunner:
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
-    async def _opencode_interrupt(self, conv_id: str) -> Response:
+    async def _opencode_interrupt(self, conv_id: str) -> Response | None:
         from omnigent.harnesses.opencode_native.app_server import client_for_state
         from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
@@ -862,21 +863,27 @@ class NativeInterruptRunner:
 
         state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
         if state is None:
-            # No bridge state means no opencode serve/turn to abort. Return 204
-            # (not None) so the caller does not fall through to the in-process
-            # cancel, which cannot reach OpenCode's own serve process.
+            # No readable bridge state: the serve/session is still starting (state
+            # is cleared until it is created), or the state file is half-written.
+            # Fall through so the in-process cancel stops the startup turn, or
+            # no-ops when nothing is running; serve is not addressable here anyway.
             self._logger.info(
-                "OpenCode-native interrupt skipped for %s: no bridge state.", conv_id
+                "OpenCode-native interrupt: no bridge state for %s; falling through.", conv_id
             )
-            return Response(status_code=204)
+            return None
         client = client_for_state(
             base_url=state.server_base_url,
             auth_secret=state.auth_secret,
             directory=state.workspace,
         )
+        # Record the pending interrupt before aborting: the abort emits an idle
+        # edge over SSE and opencode turns are not forwarder-confirmed, so an idle
+        # that raced ahead of this record would settle the turn as completed.
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         try:
             aborted = await client.abort(state.opencode_session_id)
         except (OpenCodeClientError, httpx.HTTPError) as exc:
+            self.clear_pending_interrupt(conv_id)
             self._logger.warning(
                 "OpenCode-native abort failed for session=%s opencode_session=%s",
                 conv_id,
@@ -896,9 +903,13 @@ class NativeInterruptRunner:
             with contextlib.suppress(Exception):
                 await client.aclose()
         if not aborted:
-            # The server reports no active work, so the turn already ended and
-            # its own terminal edge owns the idle transition; nothing to wake.
-            self._logger.info("OpenCode-native interrupt found no active turn for %s.", conv_id)
-            return Response(status_code=204)
-        self._defer_parent_wake_after_native_interrupt(conv_id)
+            # No active work server-side: the turn already ended, or the interrupt
+            # raced ahead of prompt admission. Fall through so the in-process
+            # cancel still covers a turn pending before admission.
+            self.clear_pending_interrupt(conv_id)
+            self._logger.info(
+                "OpenCode-native interrupt found no active turn for %s; falling through.",
+                conv_id,
+            )
+            return None
         return Response(status_code=204)

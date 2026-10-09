@@ -137,8 +137,8 @@ def test_native_cancel_capability_follows_stop_registry() -> None:
 async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
     """Harnesses without an interrupt/stop handler return None (caller falls through).
 
-    opencode-native is intentionally excluded: it now has an interrupt handler
-    (``test_opencode_interrupt_*``). Its stop still falls through, asserted by
+    opencode-native is intentionally excluded: it has an interrupt handler
+    (``test_opencode_interrupt_*``). Its stop falls through, asserted by
     ``test_opencode_has_no_stop_handler``.
     """
     runner, _ = _make_runner()
@@ -147,17 +147,32 @@ async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_opencode_interrupt_is_handled_not_dropped() -> None:
-    """opencode-native must dispatch an interrupt handler rather than return None.
+async def test_opencode_interrupt_is_handled_not_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn OpenCode's serve process owns is aborted, not dropped.
 
-    Returning None drops the interrupt to the in-process cancel, which cannot
-    abort a turn OpenCode's serve process already owns, so the session hangs.
+    With live bridge state the interrupt must reach OpenCode's own ``/abort``
+    and return a response, instead of falling through to the in-process cancel
+    that cannot reach the serve process, which would leave the session hung.
     """
+    state = SimpleNamespace(
+        server_base_url="http://127.0.0.1:9999/",
+        opencode_session_id="ses_oc",
+        auth_secret="secret",
+        workspace="/ws",
+    )
+    client = _FakeOpenCodeClient(abort_result=True)
+    _patch_opencode_bridge(monkeypatch, state=state, client=client)
+
     runner, _ = _make_runner()
-    assert await runner.interrupt("opencode-native", "conv_oc") is not None, (
+    resp = await runner.interrupt("opencode-native", "conv_oc")
+
+    assert resp is not None, (
         "opencode-native interrupt fell through to the no-op in-process cancel; "
         "the pending native turn is never aborted and the session hangs"
     )
+    assert client.abort_calls == ["ses_oc"]
 
 
 class _FakeOpenCodeClient:
@@ -239,11 +254,20 @@ async def test_opencode_interrupt_aborts_native_turn(
 
 
 @pytest.mark.asyncio
-async def test_opencode_interrupt_no_bridge_state_returns_204() -> None:
-    """With no live bridge state there is no native turn to abort: 204, no defer."""
-    runner, _ = _make_runner()  # no opencode bridge dir exists for this id
-    resp = await runner.interrupt("opencode-native", "conv_missing")
-    assert isinstance(resp, Response) and resp.status_code == 204
+async def test_opencode_interrupt_falls_through_without_bridge_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No readable bridge state (serve still starting) falls through to in-process cancel.
+
+    Returning None lets the caller run the in-process cancel, which stops the
+    startup turn in the window before bridge state is written; a handled 204
+    here would silently drop that interrupt.
+    """
+    import omnigent.harnesses.opencode_native.bridge as oc_bridge
+
+    monkeypatch.setattr(oc_bridge, "read_bridge_state", lambda bridge_dir: None)
+    runner, _ = _make_runner()
+    assert await runner.interrupt("opencode-native", "conv_missing") is None
     assert runner.take_pending_interrupt("conv_missing")[0] is False
 
 
@@ -278,13 +302,14 @@ async def test_opencode_interrupt_abort_failure_returns_503(
 
 
 @pytest.mark.asyncio
-async def test_opencode_interrupt_no_active_turn_returns_204_without_defer(
+async def test_opencode_interrupt_falls_through_when_no_active_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the server reports no active work, the turn already ended: 204, no defer.
+    """An unsuccessful abort falls through: the turn ended, or raced prompt admission.
 
-    The turn's own terminal edge owns the idle transition, so no grace-timer
-    cancel is armed that could later clobber a newer dispatch.
+    ``abort`` reporting no active work is ambiguous, so fall through to the
+    in-process cancel (which covers a turn still pending before admission) and
+    drop the pre-registered interrupt so no grace-timer cancel is left armed.
     """
     state = SimpleNamespace(
         server_base_url="http://127.0.0.1:9999/",
@@ -296,11 +321,56 @@ async def test_opencode_interrupt_no_active_turn_returns_204_without_defer(
     _patch_opencode_bridge(monkeypatch, state=state, client=client)
 
     runner, run_captured = _make_runner()
+    assert await runner.interrupt("opencode-native", "conv_oc") is None
+    assert client.abort_calls == ["ses_oc"]
+    assert run_captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_oc")[0] is False
+
+
+@pytest.mark.asyncio
+async def test_opencode_interrupt_registers_pending_before_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pending interrupt is recorded before the abort so a racing idle cancels.
+
+    OpenCode's abort emits an idle edge over SSE and opencode turns are not
+    forwarder-confirmed, so an idle that arrives while the abort is in flight
+    must find the pending interrupt and settle the dispatch as cancelled.
+    """
+    state = SimpleNamespace(
+        server_base_url="http://127.0.0.1:9999/",
+        opencode_session_id="ses_oc",
+        auth_secret="secret",
+        workspace="/ws",
+    )
+    seen: dict[str, Any] = {}
+
+    class _RacingAbortClient:
+        def __init__(self) -> None:
+            self.abort_calls: list[str] = []
+            self.closed = False
+
+        async def abort(self, session_id: str) -> bool:
+            self.abort_calls.append(session_id)
+            # The abort->idle SSE edge races in mid-abort: the idle handler
+            # resolves the pending interrupt for the dispatch now registered.
+            seen["resolved"] = runner.resolve_pending_interrupt("conv_oc", "work-1")
+            return True
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    client = _RacingAbortClient()
+    _patch_opencode_bridge(monkeypatch, state=state, client=client)
+
+    runner, run_captured = _make_runner()
+    run_captured["current_work_id"] = "work-1"
     resp = await runner.interrupt("opencode-native", "conv_oc")
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert client.abort_calls == ["ses_oc"]
-    assert run_captured["wakes"] == []
+    # The racing idle found the pending interrupt and bound it to the dispatch.
+    assert seen["resolved"] == (True, "work-1")
     assert runner.take_pending_interrupt("conv_oc")[0] is False
 
 
