@@ -2452,6 +2452,53 @@ async def test_launch_binds_page_up_scrollback_entry_point(
 
 
 @pytest.mark.asyncio
+async def test_launch_keeps_mouse_selection_until_dismissed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Managed terminals keep a copy-mode mouse selection after the button is released.
+
+    ``mouse on`` routes a plain drag on a non-tracking pane through tmux copy
+    mode, whose default release binding cancels the selection it just made.
+    The managed server must copy without clearing on release and let a click
+    dismiss the selection — leaving copy mode at the live bottom, keeping the
+    scrolled position in history — in both copy-mode key tables.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    for table in ("copy-mode", "copy-mode-vi"):
+        assert contains_subsequence(
+            cmd,
+            [
+                "bind-key",
+                "-T",
+                table,
+                "MouseDragEnd1Pane",
+                "send-keys",
+                "-X",
+                "copy-pipe-no-clear",
+            ],
+        )
+        assert contains_subsequence(
+            cmd,
+            [
+                "bind-key",
+                "-T",
+                table,
+                "MouseDown1Pane",
+                "if-shell",
+                "-F",
+                "#{scroll_position}",
+                "send-keys -X clear-selection",
+                "send-keys -X cancel",
+            ],
+        )
+
+
+@pytest.mark.asyncio
 async def test_launch_enables_csi_u_extended_keys_quietly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

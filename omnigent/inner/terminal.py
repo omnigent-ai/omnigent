@@ -90,6 +90,8 @@ _REAP_KILL_TIMEOUT_S = 10.0
 # Literal tmux empty option value. Passing this as an argv value clears
 # status segments and window formats; it is not an application sentinel.
 _TMUX_EMPTY_OPTION_VALUE = ""
+# tmux selects one of these copy-mode key tables from ``mode-keys``.
+_TMUX_COPY_MODE_KEY_TABLES = ("copy-mode", "copy-mode-vi")
 
 
 def _tmux_command_sequence(commands: list[list[str]]) -> list[str]:
@@ -136,6 +138,7 @@ def _tmux_managed_option_commands(
         *_tmux_input_option_commands(scrollback),
         *_tmux_lockdown_commands(),
         *_tmux_scrollback_key_commands(),
+        *_tmux_mouse_selection_commands(),
         *_tmux_status_option_commands(),
     ]
     if keep_alive_after_exit:
@@ -192,8 +195,9 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
     it is on the alternate screen or tracking the mouse, and only scrolls tmux
     history for the inline CLIs that ignore it. The cost is that click-drag
     selection on such a pane goes through tmux copy mode (which exports to the
-    attached terminal via ``set-clipboard``) rather than the terminal's own
-    selection, so native selection uses its Shift/Option-drag override.
+    attached terminal via ``set-clipboard``; see
+    :func:`_tmux_mouse_selection_commands`) rather than the terminal's own
+    selection, which stays available through its Shift/Option-drag override.
     ``focus-events on`` lets interactive programs observe pane
     focus changes. ``extended-keys`` with CSI-u formatting
     lets programs inside tmux receive Kitty Keyboard Protocol keys such
@@ -247,6 +251,46 @@ def _tmux_scrollback_key_commands() -> list[list[str]]:
             "copy-mode -eu",
         ],
     ]
+
+
+def _tmux_mouse_selection_commands() -> list[list[str]]:
+    """
+    Build copy-mode bindings that keep a mouse selection until the user dismisses it.
+
+    With ``mouse on`` a plain click-drag on a pane that ignores the mouse is a
+    tmux copy-mode selection, and tmux's default ``MouseDragEnd1Pane`` binding
+    (``copy-pipe-and-cancel``) leaves copy mode on release, so the highlight
+    vanishes and nothing stays selected. ``copy-pipe-no-clear`` still copies on
+    release (exported through ``set-clipboard``) but keeps the selection shown.
+    A click dismisses it: at the live bottom it leaves copy mode so keys reach
+    the program again; while scrolled into history it only clears the selection
+    so the user keeps their place. Until then keys follow tmux copy mode
+    (``Escape``, ``q`` and ``Enter`` leave it), as they already do after a wheel
+    scroll. Double and triple clicks keep tmux's brief copy-and-cancel so an
+    accidental click cannot strand the pane in copy mode. Both key tables are
+    bound because ``mode-keys`` follows the server's ``EDITOR``/``VISUAL``.
+
+    :returns: Tmux commands binding mouse selection keys in both copy-mode tables.
+    """
+    commands: list[list[str]] = []
+    for table in _TMUX_COPY_MODE_KEY_TABLES:
+        commands.append(
+            ["bind-key", "-T", table, "MouseDragEnd1Pane", "send-keys", "-X", "copy-pipe-no-clear"]
+        )
+        commands.append(
+            [
+                "bind-key",
+                "-T",
+                table,
+                "MouseDown1Pane",
+                "if-shell",
+                "-F",
+                "#{scroll_position}",
+                "send-keys -X clear-selection",
+                "send-keys -X cancel",
+            ]
+        )
+    return commands
 
 
 def _tmux_lockdown_commands() -> list[list[str]]:
