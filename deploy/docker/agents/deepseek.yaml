@@ -1,0 +1,6 @@
+name: deepseek
+prompt: You are a helpful, concise assistant.
+executor:
+  harness: openai-agents
+  model: deepseek.v3.2
+  auth: {type: provider, name: bedrock-oss}
