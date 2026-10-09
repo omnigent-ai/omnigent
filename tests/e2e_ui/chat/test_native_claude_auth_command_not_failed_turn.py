@@ -1,7 +1,8 @@
 """E2E: web ``/login``/``/logout`` on a Claude Code session are a notice, not a failed turn.
 
-The intercepted command must complete the turn, keep the session out of ``failed``,
-show the omni-setup guidance on a neutral notice, and still show it after a reload.
+The intercepted command must complete the turn, keep the session out of ``failed``
+(and out of ``running`` in the session list), show the omni-setup guidance on a
+neutral notice, and still show it after a reload.
 """
 
 from __future__ import annotations
@@ -52,6 +53,17 @@ def _session_status(base_url: str, session_id: str) -> str:
     response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     response.raise_for_status()
     return str(response.json()["status"])
+
+
+def _list_status(base_url: str, session_id: str) -> str:
+    """The status the sidebar shows; an idle session with a queued message reads as running."""
+    response = httpx.get(
+        f"{base_url}/v1/sessions",
+        params={"limit": 1000, "kind": "any", "visibility": "all"},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    return str(next(s["status"] for s in response.json()["data"] if s["id"] == session_id))
 
 
 def _wait_for_turn_outcome(page: Page, base_url: str, session_id: str) -> str:
@@ -116,6 +128,9 @@ def test_auth_slash_command_is_not_a_failed_turn(
         )
     assert status != "failed", f"{command} flipped the session to status {status!r}"
     _expect_notice(page)
+    # The answered command no longer waits on the runner, so the sidebar reads idle too.
+    list_status = _list_status(base_url, session_id)
+    assert list_status == "idle", f"{command} left the session listed as {list_status!r}"
 
     # The notice is persisted, so a reload still shows the answer to the command.
     page.reload()

@@ -125,6 +125,7 @@ def test_malformed_error_item_is_dropped() -> None:
                 "type": "error",
                 "source": "harness",
                 "code": "claude_native_auth_command",
+                "level": "info",
                 # message missing: ErrorData requires non-empty text.
             }
         )

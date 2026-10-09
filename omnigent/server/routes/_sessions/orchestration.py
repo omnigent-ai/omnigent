@@ -3235,28 +3235,33 @@ async def _settle_undelivered_native_input(
     session_id: str,
     response_id: str | None,
     input_stable_id: str | None,
+    *,
+    outcome: str = "reported_undelivered",
 ) -> None:
     """
-    Commit a failed native turn's own queued web message as a user item.
+    Commit a native turn's own queued web message as a user item.
 
     Only native-terminal sessions queue web messages: the transcript forwarder
-    normally mirrors each one back and drains its entry. When the runner
-    reports the turn failed and names the message it carried
-    (``input_stable_id``), an entry still queued under that id is a message the
-    harness never received. Left in the queue it lingers for the TTL and the
-    next mirrored message drains it instead of its own, so the transcript shows
-    the reply above a still-queued bubble and the failed message vanishes on
-    reload. Settlement is by identity, never by queue order: a turn that fails
-    after its message was mirrored (entry already drained) settles nothing, so
-    a later message still buffered in the runner keeps its own entry.
+    normally mirrors each one back and drains its entry. When the runner names
+    the message a turn carried (``input_stable_id``) on a failure the harness
+    never received, or on a notice that answers the message in the harness's
+    place, an entry still queued under that id will never be mirrored. Left in
+    the queue it lingers for the TTL, keeps the idle session listed as running,
+    and the next mirrored message drains it instead of its own, so the
+    transcript shows the reply above a still-queued bubble and the message
+    vanishes on reload. Settlement is by identity, never by queue order: a turn
+    that fails after its message was mirrored (entry already drained) settles
+    nothing, so a later message still buffered in the runner keeps its own entry.
 
     :param conversation_store: Store to append to; ``None`` skips persistence.
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    :param response_id: The failed turn's response id, so the message groups
-        with the error item persisted right after it; ``None`` mints one.
-    :param input_stable_id: The web stable id the runner stamped on the failed
-        turn, passed only when the harness reported the failure as undelivered;
-        ``None`` settles nothing.
+    :param response_id: The turn's response id, so the message groups with the
+        error or notice item persisted right after it; ``None`` mints one.
+    :param input_stable_id: The web stable id the runner stamped on the turn,
+        passed only when the harness reported the failure as undelivered or
+        answered with a notice; ``None`` settles nothing.
+    :param outcome: Why the entry settled, for the ``native_input_settled`` log
+        event: ``"reported_undelivered"`` or ``"answered_by_notice"``.
     """
     if conversation_store is None or input_stable_id is None:
         return
@@ -3289,7 +3294,7 @@ async def _settle_undelivered_native_input(
             "native_input_settled",
             session_id=session_id,
             attributes=pending_inputs.delivery_attributes(drained),
-            outcome="reported_undelivered",
+            outcome=outcome,
             item_id=persisted[0].id,
             response_id=persisted[0].response_id,
             match_method="input_stable_id",
@@ -8493,6 +8498,22 @@ async def _relay_runner_stream_once(
                         response_id=_persist_rid,
                     )
                     if conv_item is not None:
+                        if conv_item.type == "error":
+                            # A notice answers a web message the harness never
+                            # received, so no mirror will drain its queued entry:
+                            # commit that message ahead of the notice.
+                            _notice_input_stable_id = event.get("input_stable_id")
+                            await _settle_undelivered_native_input(
+                                conversation_store,
+                                session_id,
+                                _persist_rid,
+                                (
+                                    _notice_input_stable_id
+                                    if isinstance(_notice_input_stable_id, str)
+                                    else None
+                                ),
+                                outcome="answered_by_notice",
+                            )
                         await _relay_persist(
                             conversation_store,
                             session_id,

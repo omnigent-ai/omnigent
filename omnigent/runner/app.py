@@ -432,6 +432,14 @@ _CLAUDE_VOLUNTARY_EXIT_MARKER = "Resume this session with:"
 _RUNNER_DISPATCHED_FIELD = "omnigent_runner_dispatched"
 
 
+def _is_turn_notice_event(event: Mapping[str, object]) -> bool:
+    """Whether *event* completes a harness notice: an info-level ``error`` output item."""
+    if event.get("type") != "response.output_item.done":
+        return False
+    item = event.get("item")
+    return isinstance(item, dict) and item.get("type") == "error" and item.get("level") == "info"
+
+
 def _encode_sse_event(event: Mapping[str, object]) -> bytes:
     """Re-encode an SSE event as a single ``data:`` frame."""
     import json as _json
@@ -5019,8 +5027,8 @@ def create_runner_app(
         _model_override = msg_body.get("model_override")
         if isinstance(_model_override, str) and _model_override:
             harness_body["model_override"] = _model_override
-        # The web's stable id for this message: stamped on the turn's failure
-        # so the server can settle exactly this queued entry, not the oldest.
+        # The web's stable id for this message: stamped on the turn's failure, or
+        # on a notice answering it, so the server settles exactly this queued entry.
         _stable_id = msg_body.get("stable_id")
         if isinstance(_stable_id, str) and _stable_id:
             harness_body["input_stable_id"] = _stable_id
@@ -6058,7 +6066,12 @@ def create_runner_app(
                             if event is None:
                                 yield raw_sse_bytes
                                 continue
-                            if event.get("type") == "response.failed":
+                            # A failed turn, or a notice that answers the message in the
+                            # harness's place, names the web message it carried; neither
+                            # ever mirrors that message back to drain its queued entry.
+                            if event.get("type") == "response.failed" or _is_turn_notice_event(
+                                event
+                            ):
                                 _input_stable_id = body.get("input_stable_id")
                                 if isinstance(_input_stable_id, str):
                                     event["input_stable_id"] = _input_stable_id
