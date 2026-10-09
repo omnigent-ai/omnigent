@@ -1295,8 +1295,9 @@ def _parse_optional_int(value: str | None) -> int | None:
         return None
 
 
-# The Claude CLI also anchors its per-uid runtime dir at this fixed root,
-# independent of $TMPDIR; on macOS that is the spelling it opens.
+# Reported Claude CLI builds opened /tmp/claude-<uid> regardless of $TMPDIR (the
+# denied path in the macOS launch failure); current builds use $CLAUDE_CODE_TMPDIR
+# or os.tmpdir(), so both spellings are granted.
 _CLAUDE_CLI_TMP_ROOT = pathlib.Path("/tmp")
 
 

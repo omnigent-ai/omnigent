@@ -25,25 +25,12 @@ from omnigent.inner.sandbox import (
     resolve_sandbox,
     with_additional_write_roots,
 )
-from tests.inner.sandbox.conftest import _repo_root_for_pythonpath
-
-_BWRAP = shutil.which("bwrap")
+from tests.inner.sandbox.conftest import _bwrap_functional, _repo_root_for_pythonpath
 
 pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux") or _BWRAP is None,
+    not sys.platform.startswith("linux") or shutil.which("bwrap") is None,
     reason="linux_bwrap requires Linux + bwrap on PATH",
 )
-
-
-def _bwrap_functional() -> bool:
-    """Whether bwrap can create a namespace here (a seccomp-confined shell cannot)."""
-    try:
-        proc = subprocess.run(
-            [_BWRAP, "--ro-bind", "/", "/", "/bin/true"], capture_output=True, timeout=30
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
 
 
 def test_claude_cli_tmp_runtime_dir_writable_under_bwrap(
