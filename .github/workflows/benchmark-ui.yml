@@ -1,0 +1,158 @@
+name: Benchmark (UI)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "19 8 * * *"
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: "Optional baseline ref; use the current ref for an A/A noise check"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: benchmark-ui-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  # Job-level filtering keeps this usable as a required check for all PRs.
+  detect:
+    name: Detect UI benchmark inputs
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.changes.outputs.ui }}
+    steps:
+      - id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${PR:-}" ]; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pattern='^(web/|dev/benchmarks/|tests/benchmarks/|\.github/actions/setup-(pnpm|uv)/|\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)'
+          if printf '%s\n' "$files" | grep -qE "$pattern"; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  benchmark:
+    name: UI performance regression check
+    needs: detect
+    if: needs.detect.outputs.ui == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve baseline
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # First parent of the test merge is the exact base it was built on.
+            parents="$(git cat-file -p HEAD | awk '/^parent /{print $2}')"
+            if [ "$(printf '%s\n' "$parents" | grep -c .)" -eq 2 ]; then
+              BASELINE_REF="$(printf '%s\n' "$parents" | head -1)"
+            else
+              BASELINE_REF="$EVENT_BASE_SHA"
+            fi
+          fi
+          echo "ref=$BASELINE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Check out baseline UI
+        if: steps.base.outputs.ref != ''
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.base.outputs.ref }}
+          path: ui-baseline
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Install benchmark dependencies
+        run: |
+          uv sync --locked --group test
+          uv run --no-sync playwright install --with-deps chromium
+
+      - name: Build candidate UI
+        run: |
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build --outDir "$RUNNER_TEMP/ui-candidate"
+
+      - name: Build baseline UI
+        if: steps.base.outputs.ref != ''
+        working-directory: ui-baseline
+        run: |
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build --outDir "$RUNNER_TEMP/ui-baseline"
+
+      # One browser, one active page at a time, alternating base/candidate order.
+      # Both bundles use the candidate's OSS server and the same fixture/driver.
+      - name: Benchmark production UI
+        env:
+          BASELINE_REF: ${{ steps.base.outputs.ref }}
+        run: |
+          args=()
+          if [ -n "$BASELINE_REF" ]; then
+            args+=(--baseline-dist "$RUNNER_TEMP/ui-baseline"
+                   --baseline-revision "$(git -C ui-baseline rev-parse HEAD)")
+          fi
+          uv run --no-sync dev/benchmarks/ui/run.py \
+            --web-dist "$RUNNER_TEMP/ui-candidate" \
+            --revision "$(git rev-parse HEAD)" \
+            --output-dir artifacts/ui-benchmark \
+            "${args[@]}"
+
+      - name: Publish benchmark summary
+        if: always()
+        run: |
+          if [ -f artifacts/ui-benchmark/summary.md ]; then
+            cat artifacts/ui-benchmark/summary.md >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f artifacts/ui-benchmark/error.txt ]; then
+            cat artifacts/ui-benchmark/error.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload UI benchmark results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-results-ui-${{ github.run_id }}
+          path: artifacts/ui-benchmark/
+          retention-days: 30
+          if-no-files-found: warn
