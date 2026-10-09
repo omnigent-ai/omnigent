@@ -14,6 +14,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
+from omnigent.host.service import (
+    LAUNCHD_LABEL,
+    SYSTEMD_UNIT,
+    launchd_plist_path,
+    systemd_unit_path,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
@@ -484,36 +490,44 @@ def observed_external_configs(*, deep: bool) -> list[ExternalConfigEntry]:
     return entries
 
 
+def _known_launch_agent_units() -> tuple[tuple[str, Path, str], ...]:
+    """``(kind, path, label)`` of every unit ``omnigent host service enable`` installs."""
+    return (
+        ("launchd", launchd_plist_path(), LAUNCHD_LABEL),
+        ("systemd_user", systemd_unit_path(), SYSTEMD_UNIT),
+    )
+
+
 def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
+    """Back-fill only the units Omnigent itself installs.
+
+    Uninstall unloads and deletes every ledger entry, so matching by name
+    substring would destroy third-party units that merely contain "omnigent".
+    """
     if not deep:
         return []
-    entries: list[LaunchAgentEntry] = []
-    launchd_dir = Path.home() / "Library" / "LaunchAgents"
-    if launchd_dir.is_dir():
-        for path in sorted(launchd_dir.glob("*omnigent*.plist")):
-            entries.append(
-                LaunchAgentEntry(
-                    kind="launchd",
-                    path=str(path),
-                    label=path.stem,
-                    source="observed",
-                    confidence="high",
-                )
-            )
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    systemd_dir = config_home / "systemd" / "user"
-    if systemd_dir.is_dir():
-        for path in sorted(systemd_dir.glob("*omnigent*.service")):
-            entries.append(
-                LaunchAgentEntry(
-                    kind="systemd_user",
-                    path=str(path),
-                    label=path.name,
-                    source="observed",
-                    confidence="high",
-                )
-            )
-    return entries
+    return [
+        LaunchAgentEntry(
+            kind=kind, path=str(path), label=label, source="observed", confidence="high"
+        )
+        for kind, path, label in _known_launch_agent_units()
+        if path.is_file()
+    ]
+
+
+def _drop_unknown_observed_launch_agents(ledger: InstallLedger) -> None:
+    """Keep only Omnigent's own units among observed launch agents.
+
+    Ledgers written before exact matching may list third-party units observed
+    by filename substring. Matching by label (not path) keeps Omnigent's entry
+    even if HOME or XDG_CONFIG_HOME changed since the ledger was written.
+    """
+    known = {(kind, label) for kind, _path, label in _known_launch_agent_units()}
+    ledger.entries.launch_agents = [
+        entry
+        for entry in ledger.entries.launch_agents
+        if entry.source != "observed" or (entry.kind, entry.label) in known
+    ]
 
 
 def new_ledger(*, source: str, strategy: str, deep: bool) -> InstallLedger:
@@ -593,9 +607,11 @@ def backfill_install_ledger(*, deep: bool, apply: bool = True) -> InstallLedger 
 def resolve_uninstall_ledger() -> InstallLedger | None:
     real = load_ledger(ledger_path())
     if real and real.ledger_source == "installer":
+        _drop_unknown_observed_launch_agents(real)
         return real
     backfill = load_ledger(backfill_ledger_path())
     if backfill:
+        _drop_unknown_observed_launch_agents(backfill)
         return backfill
     return backfill_install_ledger(deep=True, apply=True)
 

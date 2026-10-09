@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from omnigent import install_ledger
+from omnigent.host.service import LAUNCHD_LABEL, SYSTEMD_UNIT
 
 
 def test_install_ledger_round_trip_and_mode(tmp_path: Path, monkeypatch) -> None:
@@ -175,16 +178,25 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     state = home / ".omnigent"
     cursor_dir = workspace / ".cursor"
     launch_dir = home / "Library" / "LaunchAgents"
+    systemd_dir = home / ".config" / "systemd" / "user"
     state.mkdir(parents=True)
     cursor_dir.mkdir(parents=True)
     launch_dir.mkdir(parents=True)
+    systemd_dir.mkdir(parents=True)
     (state / "installation_id").write_text("install-123\n")
     cursor_config = cursor_dir / "mcp.json"
     cursor_config.write_text('{"mcpServers": {"omnigent": {"command": "python"}}}\n')
-    launch_agent = launch_dir / "ai.omnigent.local.plist"
+    launch_agent = launch_dir / f"{LAUNCHD_LABEL}.plist"
     launch_agent.write_text("plist\n")
+    systemd_unit = systemd_dir / SYSTEMD_UNIT
+    systemd_unit.write_text("[Unit]\n")
+    third_party_plist = launch_dir / "com.example.omnigent-handoff.plist"
+    third_party_plist.write_text("plist\n")
+    third_party_unit = systemd_dir / "com.example.omnigent-handoff.service"
+    third_party_unit.write_text("[Unit]\n")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.chdir(workspace)
 
     ledger = install_ledger.backfill_install_ledger(deep=True, apply=False)
@@ -192,9 +204,62 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     assert ledger is not None
     assert ledger.entries.injected_external_config[0].path == str(cursor_config)
     assert ledger.entries.injected_external_config[0].marker == "mcpServers.omnigent"
-    assert ledger.entries.launch_agents[0].path == str(launch_agent)
+    assert [entry.path for entry in ledger.entries.launch_agents] == [
+        str(launch_agent),
+        str(systemd_unit),
+    ]
     assert cursor_config.exists()
     assert launch_agent.exists()
+
+
+@pytest.mark.parametrize("source", ["installer", "backfill"])
+def test_resolve_uninstall_ledger_drops_stale_third_party_launch_agents(
+    tmp_path: Path, monkeypatch, source: str
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    launch_dir = home / "Library" / "LaunchAgents"
+    # Observed under a HOME that differs from the current one, as after a home move.
+    previous_launch_dir = tmp_path / "previous-home" / "Library" / "LaunchAgents"
+    own = install_ledger.LaunchAgentEntry(
+        kind="launchd",
+        path=str(previous_launch_dir / f"{LAUNCHD_LABEL}.plist"),
+        label=LAUNCHD_LABEL,
+        source="observed",
+    )
+    stale = install_ledger.LaunchAgentEntry(
+        kind="launchd",
+        path=str(launch_dir / "com.example.omnigent-handoff.plist"),
+        label="com.example.omnigent-handoff",
+        source="observed",
+    )
+    recorded = install_ledger.LaunchAgentEntry(
+        kind="systemd_user",
+        path=str(home / ".config" / "systemd" / "user" / SYSTEMD_UNIT),
+        label=SYSTEMD_UNIT,
+        source="recorded",
+        confidence="certain",
+    )
+    ledger = install_ledger.new_ledger(source=source, strategy="deep-backfill", deep=False)
+    ledger.entries.launch_agents = [own, stale, recorded]
+    path = (
+        install_ledger.ledger_path()
+        if source == "installer"
+        else install_ledger.backfill_ledger_path()
+    )
+    install_ledger.write_ledger(ledger, path=path)
+    stored = path.read_bytes()
+
+    resolved = install_ledger.resolve_uninstall_ledger()
+
+    assert resolved is not None
+    assert resolved.ledger_source == source
+    assert resolved.entries.launch_agents == [own, recorded]
+    assert path.read_bytes() == stored
 
 
 def test_record_and_remove_launch_agent_preserves_other_entries(
