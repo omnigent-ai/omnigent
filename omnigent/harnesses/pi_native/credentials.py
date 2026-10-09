@@ -10,7 +10,7 @@ This module closes that gap. It resolves the provider configured for the Pi
 surface (``~/.omnigent/config.yaml``) and writes a per-session ``models.json``
 into a *managed* Pi config dir (selected via ``PI_CODING_AGENT_DIR``), so the
 runner-owned ``pi`` process authenticates exactly like the configured harness —
-mirroring how codex-native routes through the Databricks AI Gateway.
+mirroring how codex-native routes through the Databricks Unity Gateway.
 
 The managed config dir is per-session (like codex-native's managed
 ``CODEX_HOME``), so this never mutates the user's global ``~/.pi/agent``.
@@ -115,19 +115,19 @@ _SURFACE_PROVIDER_IDS: dict[DatabricksPiSurface, str] = {
 }
 
 _PI_MANAGED_PROVIDER_IDS = frozenset({_PI_PROVIDER_ID, *_SURFACE_PROVIDER_IDS.values()})
-# Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
+# Databricks Unity Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
 # workspace bearer token, so we set ``authHeader`` (Authorization: Bearer).
 _DATABRICKS_ANTHROPIC_GATEWAY_PATH = "/ai-gateway/anthropic"
 
-# The Databricks AI Gateway exposes one surface per protocol under the same
+# The Databricks Unity Gateway exposes one surface per protocol under the same
 # workspace origin: Codex/OpenAI-Responses at ``/codex/v1`` and Anthropic
 # Messages at ``/anthropic``. ``isaac configure codex`` writes the Codex
 # base_url; pi-native rewrites it to the Anthropic surface Pi speaks natively.
 _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
 
-# Aliases for the canonical Databricks AI Gateway predicate and its constants,
+# Aliases for the canonical Databricks Unity Gateway predicate and its constants,
 # which live in :mod:`omnigent.databricks_ai_gateway` so every surface that must
 # recognize the gateway agrees.
 _DATABRICKS_TRUSTED_HOST_SUFFIXES = DATABRICKS_TRUSTED_HOST_SUFFIXES
@@ -192,7 +192,7 @@ def _databricks_workspace_url_for_gateway(
     *,
     profile: str | None = None,
 ) -> str | None:
-    """Resolve the workspace API origin behind a Databricks AI Gateway URL.
+    """Resolve the workspace API origin behind a Databricks Unity Gateway URL.
 
     Workspace-hosted gateways already expose the workspace hostname. Dedicated
     ``ai-gateway`` subdomains require the configured Databricks profile because
@@ -775,7 +775,7 @@ def _databricks_openai_provider(
 
     ``api_type`` selects the wire protocol:
 
-    * ``"openai-responses"`` — AI Gateway codex surface
+    * ``"openai-responses"`` — Unity Gateway codex surface
       (``/ai-gateway/codex/v1``). Required for newer GPT models (gpt-5.5,
       gpt-5.6-*) that reject function tool calls via ``/chat/completions``.
     * ``"openai-completions"`` — workspace serving-endpoints surface. Works
@@ -894,7 +894,7 @@ def _fetch_pi_model_lists(
     returns ``system.ai.*`` model ids with their supported API types:
 
     * ``openai/v1/responses`` in supported_api_types → ``openai-responses``
-      provider at the AI Gateway codex surface.
+      provider at the Unity Gateway codex surface.
     * Chat-capable models without Responses API support → ``openai-completions``
       provider at the serving-endpoints surface.
     * Claude models → ``anthropic-messages`` provider.
@@ -981,14 +981,14 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
     Shared core of :func:`_cli_config_pi_provider` and
     :func:`cli_config_pi_provider_capable`: validates that *entry* is a codex
     ``cli-config`` whose pinned ``[model_providers.X]`` table in
-    ``~/.codex/config.toml`` is a genuine Databricks AI Gateway carrying a
+    ``~/.codex/config.toml`` is a genuine Databricks Unity Gateway carrying a
     bearer-token command. Returns the resolved
     :class:`~omnigent.onboarding.ambient.CodexConfigTransport` when so, else
     ``None`` (logging the reason at INFO).
 
     :param entry: The provider entry (expected ``kind="cli-config"``).
     :returns: The codex transport when *entry* is a pi-consumable Databricks
-        AI Gateway, else ``None``.
+        Unity Gateway, else ``None``.
     """
     # Only codex cli-config providers are model_provider-shaped today; a
     # claude analog would be a different mechanism entirely.
@@ -1028,7 +1028,7 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
             entry.model_provider,
         )
         return None
-    # Identify the Databricks AI Gateway robustly (not by workspace id): parse
+    # Identify the Databricks Unity Gateway robustly (not by workspace id): parse
     # the codex base_url and validate its *hostname* against a trusted
     # Databricks domain suffix allowlist plus the ``ai-gateway`` DNS label — a
     # substring scan over the whole base_url would forward the workspace bearer
@@ -1036,7 +1036,7 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
     if not _is_databricks_ai_gateway_url(transport.base_url):
         _LOGGER.info(
             "pi-native: cli-config provider %r (model_provider %r, base_url %r) is not a "
-            "recognized Databricks AI Gateway; Pi will use its own login.",
+            "recognized Databricks Unity Gateway; Pi will use its own login.",
             entry.name,
             entry.model_provider,
             transport.base_url,
@@ -1076,7 +1076,7 @@ def cli_config_pi_provider_capable(entry: ProviderEntry) -> bool:
 
     A codex ``cli-config`` provider IS reusable by Pi exactly when
     :func:`_cli_config_pi_provider` would resolve — i.e. its pinned
-    ``[model_providers.X]`` table is a genuine Databricks AI Gateway with a
+    ``[model_providers.X]`` table is a genuine Databricks Unity Gateway with a
     bearer-token command. This is the capability predicate the selection layer
     (:mod:`omnigent.onboarding.provider_config`) consults to decide whether a
     cli-config provider may serve / default the ``pi`` surface, keeping the
@@ -1100,11 +1100,11 @@ def _databricks_gateway_pi_provider(
     configured_context_window: int | None = None,
     configured_max_output_tokens: int | None = None,
 ) -> PiProviderConfig:
-    """Build a multi-surface Pi config from a Databricks AI Gateway base URL.
+    """Build a multi-surface Pi config from a Databricks Unity Gateway base URL.
 
     Shared by the cli-config path (a codex ``config.toml`` gateway table) and
     the inline key/gateway path (an ``~/.omnigent`` provider whose family
-    ``base_url`` is a Databricks AI Gateway). Both front one workspace origin
+    ``base_url`` is a Databricks Unity Gateway). Both front one workspace origin
     serving Claude on the Anthropic surface plus GPT / Gemini / OSS on the
     Responses / MLflow / serving-endpoints surfaces. Enumerating the workspace's
     Unity Catalog model services lets Pi surface every family the gateway
@@ -1312,7 +1312,7 @@ _WORKSPACE_GATEWAY_SURFACE_PATHS: dict[str, DatabricksPiSurface] = {
 
 
 def _databricks_workspace_gateway_surface(base_url: str) -> DatabricksPiSurface | None:
-    """Return the surface a workspace-hosted Databricks AI Gateway URL names.
+    """Return the surface a workspace-hosted Databricks Unity Gateway URL names.
 
     Only a workspace-hosted URL is classified: its hostname is the workspace, so
     the inventory behind it can be listed with the same credential. A dedicated
@@ -1603,7 +1603,7 @@ def _inline_family_pi_provider(
         if model is not None and not preserve_model_ids:
             resolved_model = normalize_model_for_provider(resolved_model, entry.kind)
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
-        # Anthropic API but rejected by the Databricks AI Gateway, and in a Pi
+        # Anthropic API but rejected by the Databricks Unity Gateway, and in a Pi
         # ``enabledModels`` ref the "[" would route the pattern through Pi's
         # glob matcher instead of its exact reference match.
         if not preserve_model_ids:
@@ -1611,7 +1611,7 @@ def _inline_family_pi_provider(
         tier_ids = _family_tier_ids(family)
         # A session override must not turn a default-only setup into a shortlist.
         curated_models = len(tier_ids) > 1
-        # A workspace-hosted Databricks AI Gateway fronts Claude, GPT and Gemini
+        # A workspace-hosted Databricks Unity Gateway fronts Claude, GPT and Gemini
         # together; list the workspace so Pi offers every family, not just this
         # one. Inference bindings pin exact ids and a multi-model tier map is a
         # deliberate shortlist, so both keep the single-family config below.
@@ -1776,7 +1776,7 @@ def resolve_pi_native_provider(
         # default exactly like the rest of the codebase — an explicit pi default
         # wins, else the anthropic (Pi's native surface) then openai family
         # default, skipping kinds that can't drive pi. Crucially this now lets a
-        # cli-config Databricks AI Gateway through (it is pi-consumable via
+        # cli-config Databricks Unity Gateway through (it is pi-consumable via
         # ``_cli_config_pi_provider``), so an unrelated anthropic-family default
         # no longer shadows it.
         entry = default_provider_for_harness(config, PI_SURFACE)
@@ -1819,7 +1819,7 @@ def resolve_pi_native_provider(
             resolved = _databricks_pi_provider(entry, model=model)
         elif entry.kind == CLI_CONFIG_KIND:
             # A Codex cli-config provider whose [model_providers.X] table is the
-            # Databricks AI Gateway IS reusable by Pi (the gateway exposes an
+            # Databricks Unity Gateway IS reusable by Pi (the gateway exposes an
             # Anthropic surface Pi speaks). Translate it rather than dropping to
             # Pi's own login — the bug this module fixes.
             resolved = _cli_config_pi_provider(entry, model=model)

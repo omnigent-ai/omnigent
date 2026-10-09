@@ -40,6 +40,14 @@ be able to write resources without a separate Omnigent account.
   (silent), session expiry while open (silent), an expired or revoked sign-in
   (back to the connect screen with the reason), and sign-out. Accounts, header,
   older servers, and Databricks hosts keep their previous sign-in.
+- `ios-oidc-browser-sign-in`: the iOS app signs in to an OIDC server in Apple's
+  sign-in sheet and never shows the identity provider inside its web view.
+  States: Connect with no session (sheet), Connect with a still-valid session
+  (no sheet), cancel mid sign-in, a refused sign-in (disallowed domain; relaunch
+  then shows the connect screen, prefilled), relaunch or a deep link (silent, or the sheet directly when nothing can renew), session
+  expiry while open (silent), an expired or revoked sign-in ("Sign in again?"
+  with the reason), and sign-out. Accounts, header, older OIDC servers (ticket
+  sign-in), and Databricks hosts keep their previous sign-in.
 
 ## How to get to it (user POV)
 
@@ -58,6 +66,12 @@ server; relaunching the app, New Window, deep links, and switching servers on a
 signed-in server; the app's sign-out in Settings, **Server → Sign Out of Server**
 in the native menu, and **Sign out of <server>** in the sidebar server picker (Databricks and OIDC servers; the next Connect opens
 the browser, which is how a user switches accounts).
+
+**iOS:** Connect on the connect screen to an OIDC server; a server picked in the
+native server menu or the sidebar server picker; relaunching the app, deep links,
+and notification taps on a signed-in server; **Sign In** in the "Sign in again?"
+prompt; and sign-out from the app's settings, **Sign Out** in the native server
+menu, and **Sign out of <server>** in the sidebar server picker.
 
 **Embedded API:** construct `create_app(auth_provider=...)` with the embedding
 application's provider and stores, then use its authenticated REST client to
@@ -107,6 +121,13 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `web/electron/test/oidc-auth.test.js`, `oidc-credentials.test.js`, and the
   "OIDC system-browser sign-in wiring" suite in `main.test.js`; server flow:
   `tests/server/integration/test_oidc_native_login.py`.
+- **`ios-oidc-browser-sign-in` (iOS app, own environment):** drive the iOS app
+  in the simulator per `web/ios/README.md` ("OIDC sign-in", Manual verification)
+  against an OIDC server whose manifest lists the app's redirect. The
+  verification instance is header mode, so it can't show this. Component tests:
+  `web/ios/OmnigentTests/OidcWebSessionTests.swift`, `OidcCredentialsTests.swift`,
+  and `ServerManifestTests.swift`; server flow:
+  `tests/server/integration/test_oidc_native_login.py`.
 - **Desktop sign-out (Server menu and sidebar picker):** connect the desktop to an
   OIDC server or a Databricks workspace, choose **Server → Sign Out of Server**,
   and confirm every window on it shows "You're signed out of …" and the next
@@ -138,6 +159,8 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   establish every resource endpoint or a real host-registration flow.
 - Sign-in can open a browser even with `--no-open`; use `--non-interactive` in
   scripted runs.
+- The iOS app also needs the server to list `ai.omnigent.ios:/oauth/callback`
+  in its manifest; an OIDC server without it keeps the ticket sign-in in Safari.
 - The desktop decides OIDC from the server's manifest, so a server reached
   through a subpath proxy (manifest not at the origin root) keeps the in-window
   sign-in. Reproduce with the reporter's exact server URL.

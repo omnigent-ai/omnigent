@@ -191,7 +191,7 @@ def credit_records(results: list[HarvestResult]) -> list[dict]:
 
 
 def render_draft_notes(results: list[HarvestResult], repo: str) -> str:
-    """Without curated highlights, credit every PR in compact contributor groups."""
+    """Without curated highlights, keep community thanks and a full changelog link."""
     return compose_notes("", credit_records(results), repo)
 
 

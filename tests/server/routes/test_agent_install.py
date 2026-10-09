@@ -178,6 +178,20 @@ async def test_reinstalling_the_same_files_is_a_no_op(client, retar: bool) -> No
     assert installed[0][1] == 1
 
 
+async def test_reinstalling_the_same_files_restores_a_lost_bundle(
+    client, agent_store, artifact_store
+) -> None:
+    """A row can outlive its blob (pruned artifacts, a DB restored without its
+    store); reinstalling the same files puts the blob back."""
+    first = (await _install(client, ALICE, "orion", "same")).json()
+    location = agent_store.get(first["id"]).bundle_location
+    artifact_store.delete(location)
+
+    again = (await _install(client, ALICE, "orion", "same")).json()
+    assert (again["id"], again["version"]) == (first["id"], first["version"])
+    assert artifact_store.exists(location)
+
+
 async def test_same_name_for_another_user_is_a_separate_agent(client, agent_store) -> None:
     alice = (await _install(client, ALICE, "orion", "alice")).json()
     bob = (await _install(client, BOB, "orion", "bob")).json()
@@ -552,6 +566,33 @@ async def test_a_run_after_an_mcp_edit_starts_on_the_uploaded_files(
     listed = await c.get(f"/v1/sessions/{later[0]['session_id']}/agent/mcp-servers", headers=ALICE)
     assert listed.status_code == 200, listed.text
     assert listed.json()["data"] == []
+
+
+async def test_a_run_restores_its_agent_bundle_when_the_blob_is_gone(
+    multi_user_client: httpx.AsyncClient, db_uri: str, tmp_path: Path
+) -> None:
+    """A row can outlive its blob (pruned artifacts, a DB restored without its
+    store). The next run of the same files binds that row and puts the blob
+    back, so its session still loads the agent."""
+    from omnigent.server.routes import sessions as session_routes
+    from tests.server.helpers import policy_tool_call_request
+
+    c = multi_user_client
+    bundle = build_agent_bundle("codex")
+    first = await _upload(c, ALICE, bundle)
+    location = SqlAlchemyAgentStore(db_uri).get(first["agent_id"]).bundle_location
+    LocalArtifactStore(str(tmp_path / "artifacts")).delete(location)
+    # As on a fresh server: nothing cached to fall back on.
+    session_routes.get_agent_cache().evict(first["agent_id"])
+
+    rerun = await _upload(c, ALICE, _retarred(bundle, 1))
+    assert rerun["agent_id"] == first["agent_id"]
+    resp = await c.post(
+        f"/v1/sessions/{rerun['session_id']}/policies/evaluate",
+        json=policy_tool_call_request(),
+        headers=ALICE,
+    )
+    assert resp.status_code == 200, resp.text
 
 
 async def test_sub_agent_uploads_keep_a_row_each(multi_user_client: httpx.AsyncClient) -> None:

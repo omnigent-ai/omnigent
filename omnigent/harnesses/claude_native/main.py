@@ -228,7 +228,7 @@ _CLAUDE_ALIAS_RESOLUTION_CONCURRENCY = 12
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _CLAUDE_CODE_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
-# request headers. The Databricks AI gateway only serves Claude requests
+# request headers. The Databricks Unity Gateway only serves Claude requests
 # in coding-agent mode when this header is present.
 _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 # Claude Code's agent view (the session list opened by `claude agents`, the
@@ -455,16 +455,15 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
 
 
 def _ambient_env_is_non_anthropic_gateway() -> bool:
-    """Whether the ambient process env routes through a non-Anthropic gateway.
+    """Whether managed settings or the process env route through a gateway.
 
     Used as the ``claude_config is None`` counterpart to
     :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
     set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
     fingerprint must treat the env as a non-canonical endpoint.
     """
-    from urllib.parse import urlparse
-
-    base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    managed_base_url, _ = managed_claude_gateway_signal()
+    base_url = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
     if not base_url:
         return False
     host = (urlparse(base_url).hostname or "").lower()
@@ -512,6 +511,8 @@ def claude_catalog_serves_model(
 
     if catalog_contains(rows, model):
         return True
+    if claude_config is None and _ambient_env_is_non_anthropic_gateway():
+        return False
     if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
         return False
     if not model.lower().startswith("claude-"):
@@ -1313,7 +1314,10 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, _ = resolve_claude_launch("claude", [])
-    ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
+    ambient_gateway = None
+    if claude_config is None:
+        managed_base_url, _ = managed_claude_gateway_signal()
+        ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
     return fingerprint_of(
         "claude-native",
         "control-picker-v4",
@@ -3562,7 +3566,7 @@ def resolve_native_claude_config(
         if broker_config is not None:
             log_info_once(
                 _logger,
-                "native-claude routing: managed connect host — Databricks AI gateway via the "
+                "native-claude routing: managed connect host — Databricks Unity Gateway via the "
                 "credential broker (host-only [omnigent] profile + broker sidecar).",
             )
             return broker_config
@@ -6494,6 +6498,7 @@ def _claude_terminal_request(
     args = augment_claude_args(
         claude_args,
         bridge_dir=bridge_dir,
+        workspace=Path.cwd(),
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,

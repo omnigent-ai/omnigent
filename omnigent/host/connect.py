@@ -538,6 +538,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Discovery and invocation must read the same harness config directories.
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
+        # Forge CLI config selectors must agree across CLI, daemon, and runner.
+        # Forward paths only; bearer-token environment variables remain excluded.
+        "GLAB_CONFIG_DIR",
+        "GH_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]
@@ -3607,9 +3613,11 @@ class HostProcess:
         """Serve a workspace-mutating op from the host (runner-offline fallback).
 
         Mirrors :meth:`_handle_fs_request` but for the small set of writes the
-        host can serve — currently the GitHub account/base preference, which
-        touches the host's ``~/.omnigent/config.yaml`` and runs ``gh``/``git`` in
-        the workspace. Called inside a worker thread by the dispatcher.
+        host can serve — currently the pull request panel's account/base
+        preference and PR attach/remove, which touch the host's
+        ``~/.omnigent/config.yaml`` and the session's PR registry and run the git
+        provider's CLI and ``git`` in the workspace. Called inside a worker
+        thread by the dispatcher.
 
         :param frame: The write frame (op + workspace + params).
         :returns: A result frame with the refreshed payload, or an error frame.
@@ -3661,17 +3669,17 @@ class HostProcess:
         op: str,
         params: dict[str, object],
     ) -> dict[str, object]:
-        """Route a write op to its handler. Writes call ``github_resource``
+        """Route a write op to its handler. Writes call ``pr_resource``
         directly (not the read-only ``WorkspaceReader``).
 
         :raises ValueError: On an unknown op.
         """
         from typing import cast
 
-        from omnigent.runner import github_resource
+        from omnigent.runner import pr_resource
 
         if op == "github_set_preference":
-            return github_resource.set_github_preference(
+            return pr_resource.set_pr_preference(
                 workspace,
                 account=cast("str | None", params.get("account")),
                 remote=cast("str | None", params.get("remote")),
@@ -3679,7 +3687,7 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
             )
         if op == "github_prs_update":
-            return github_resource.update_session_pr(
+            return pr_resource.update_session_pr(
                 workspace,
                 str(params["session_id"]),
                 str(params["url"]),
@@ -3920,7 +3928,11 @@ class HostProcess:
         while True:
             await asyncio.sleep(_LIFECYCLE_POLL_INTERVAL_S)
             if await asyncio.to_thread(lock.still_owner):
-                confirmed = True
+                if not confirmed:
+                    confirmed = True
+                    # Marks when the startup-grace latch above opens: any
+                    # record mutation from this point on retires the daemon.
+                    _logger.debug("Host daemon confirmed registry ownership of %s.", lock.target)
                 continue
             if not confirmed:
                 continue
@@ -3952,18 +3964,27 @@ class HostProcess:
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
 
+    @property
+    def lifecycle_lost(self) -> bool:
+        """Whether this daemon lost ownership of its registry record."""
+        return self._lifecycle_lost.is_set()
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
         Connects to the server, sends hello, and enters the
         receive loop. Reconnects with exponential backoff on
-        disconnect. Ctrl-C / SIGTERM exit cleanly.
+        disconnect. Ctrl-C exits cleanly; SIGTERM/SIGHUP are logged and end
+        the process (see :mod:`omnigent.host.crash_reporting`).
 
         :returns: None. Runs until the process is terminated.
         :raises HostConnectError: On a permanent failure — auth /
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
+        from omnigent.host.crash_reporting import host_asyncio_exception_handler
+
+        asyncio.get_running_loop().set_exception_handler(host_asyncio_exception_handler)
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
@@ -4993,6 +5014,72 @@ def run_host_process(
         "host",
         log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
     )
+    from omnigent.host import crash_reporting
+
+    crash_reporting.install_host_crash_hooks()
+    crash_reporting.set_host_exit_context(daemon_target=daemon_target)
+    # Installed before any startup work, so a stop signal during e.g. the git
+    # credential setup is still reported and drained.
+    restore_signal_handlers = crash_reporting.install_host_signal_handlers()
+    # Report here rather than relying on sys.excepthook: the foreground CLI
+    # catches crashes itself, so the hook never sees them.
+    try:
+        lifecycle_lost = _serve_host_until_exit(
+            server_url,
+            config_path,
+            host_log_path=host_log_path,
+            daemon_target=daemon_target,
+            lifecycle_lock=lifecycle_lock,
+            interactive_shells=interactive_shells,
+        )
+    except BaseException as exc:
+        # A stop signal already being handled owns the exit: never returns then.
+        crash_reporting.await_signal_exit()
+        if isinstance(exc, KeyboardInterrupt):
+            crash_reporting.report_host_exit("interrupted")
+        elif isinstance(exc, SystemExit):
+            code = 0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1
+            crash_reporting.report_host_exit("clean" if code == 0 else "exit", exit_code=code)
+        else:
+            crash_reporting.report_host_exit(
+                "uncaught", exit_code=1, exc_info=(type(exc), exc, exc.__traceback__)
+            )
+        _finish_host_exit(restore_signal_handlers)
+        raise
+    crash_reporting.await_signal_exit()
+    crash_reporting.report_host_exit("lifecycle_lost" if lifecycle_lost else "clean", exit_code=0)
+    _finish_host_exit(restore_signal_handlers)
+
+
+def _finish_host_exit(restore_signal_handlers: Callable[[], None]) -> None:
+    """Drain the reported exit while still protected, then hand signals back.
+
+    A stop signal during the drain waits for it and then dies by the signal;
+    one after the handlers are restored takes its default action, with the
+    exit row already delivered.
+    """
+    from omnigent.host import crash_reporting
+
+    crash_reporting.drain_debug_sink()
+    restore_signal_handlers()
+    crash_reporting.await_signal_exit()
+
+
+def _serve_host_until_exit(
+    server_url: str,
+    config_path: Path | None,
+    *,
+    host_log_path: Path,
+    daemon_target: str | None,
+    lifecycle_lock: DaemonLifecycleLock | None,
+    interactive_shells: list[str] | None,
+) -> bool:
+    """Run the host until it exits; see :func:`run_host_process`.
+
+    :returns: Whether the daemon exited because it lost its registry record.
+    """
+    from omnigent.host import crash_reporting
+
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -5007,12 +5094,17 @@ def run_host_process(
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:
+        crash_reporting.report_host_exit(
+            "identity_error", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
+        )
         print(
             f"\n✗ Could not start host.\n{exc}",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from None
+    crash_reporting.set_host_exit_context(host_id=identity.host_id)
+    crash_reporting.log_host_started()
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
@@ -5058,7 +5150,7 @@ def run_host_process(
 
     # Executor-agnostic Databricks setup: when the owner has linked a workspace,
     # materialize their per-user token as a ``~/.databrickscfg`` profile so the
-    # agent's model serving + MCP route through their Databricks AI Gateway.
+    # agent's model serving + MCP route through their Databricks Unity Gateway.
     # Best-effort; a no-op when Databricks isn't connected/configured.
     from omnigent.host.databricks_credential import configure_host_databricks
 
@@ -5081,9 +5173,13 @@ def run_host_process(
         # instead of the old behavior of reconnecting silently forever.
         # The dedicated code (not a bare 1) tells a supervisor this can never
         # succeed, so it stops retrying instead of looping on a bad credential.
+        crash_reporting.report_host_exit(
+            "fatal_connect", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
+        )
         print(
             f"\n✗ Could not connect to {display_server_url(server_url)}.\n{exc}",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    return host.lifecycle_lost

@@ -933,13 +933,16 @@ class HostFsWriteFrame:
 
     The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
     this carries the small set of writes the host can serve when the session's
-    runner is offline — currently the GitHub account/base preference
-    (``op="github_set_preference"``). The host runs the mutation against
+    runner is offline — currently the pull request panel's account/base
+    preference (``op="github_set_preference"``) and PR attach/remove
+    (``op="github_prs_update"``), for every git provider; the op names are
+    stable wire ids. The host runs the mutation against
     ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
     would, so the result transport and correlation are shared.
 
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
-    :param op: Write op name — currently ``"github_set_preference"``.
+    :param op: Write op name — ``"github_set_preference"`` or
+        ``"github_prs_update"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -2774,12 +2777,15 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
     for skill in raw_skills:
         if not isinstance(skill, dict):
             raise ValueError("frame field must be a list of skill summaries: 'skills'")
-        skills.append(
-            {
-                "name": _required_str(skill, "name"),
-                "description": _required_str(skill, "description"),
-            }
-        )
+        summary = {
+            "name": _required_str(skill, "name"),
+            "description": _required_str(skill, "description"),
+        }
+        # Absent from older hosts; the menu falls back to ``name``.
+        display_name = _optional_nullable_str(skill, "display_name")
+        if display_name is not None:
+            summary["display_name"] = display_name
+        skills.append(summary)
     return HostSkillsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
