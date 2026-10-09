@@ -257,7 +257,7 @@ def test_codex_native_parent_woken_by_independent_child(
 
         wake_seen = False
         continuation_seen = False
-        wake_deadline = time.monotonic() + 120
+        wake_deadline = min(deadline, time.monotonic() + 120)
         while time.monotonic() < wake_deadline:
             blob = _items_blob(client, parent_id)
             wake_seen = wake_seen or (_WAKE_NOTICE_SIGNATURE in blob)

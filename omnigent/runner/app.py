@@ -189,6 +189,7 @@ from omnigent.runner.subagent_work import (
     _truncate_child_preview,
     get_subagent_work,
     is_codex_native_subagent_wrapper,
+    latest_wake_eligible_subagent_work,
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
@@ -4428,13 +4429,9 @@ def create_runner_app(
         _stranded_wake_parents.discard(parent_session_id)
         if drained:
             return
-        entries = list_subagent_work(parent_session_id)
-        if not entries:
+        latest = latest_wake_eligible_subagent_work(list_subagent_work(parent_session_id))
+        if latest is None:
             return
-        latest = max(
-            entries,
-            key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
-        )
         _schedule_subagent_wake(latest, is_rewake=True)
 
     async def _retry_stranded_wakes_soon() -> None:
@@ -4453,15 +4450,9 @@ def create_runner_app(
                 inbox = _session_inboxes.get(parent_id)
                 if inbox is None or inbox.empty():
                     continue
-                entries = list_subagent_work(parent_id)
-                if not entries:
+                latest = latest_wake_eligible_subagent_work(list_subagent_work(parent_id))
+                if latest is None:
                     continue
-                latest = max(
-                    entries,
-                    key=lambda entry: (
-                        entry.completed_at if entry.completed_at is not None else 0.0
-                    ),
-                )
                 _logger.info(
                     "Re-attempting stranded sub-agent wake for parent=%s after reconnect",
                     parent_id,

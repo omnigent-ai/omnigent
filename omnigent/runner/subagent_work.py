@@ -432,6 +432,32 @@ def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
     return agent is not None and wrapper_label == agent.subagent_wrapper_label
 
 
+def latest_wake_eligible_subagent_work(
+    entries: list[_SubagentWorkEntry],
+) -> _SubagentWorkEntry | None:
+    """
+    The most recently completed entry that still owes the parent an inbox wake.
+
+    Stranded-wake recovery nudges an idle parent to drain its inbox, so it must
+    skip codex-native sub-agents: a suppressed thread completing after an
+    independent child would otherwise shadow the child's stranded wake, which
+    the ownership guard then drops.
+
+    :param entries: Candidate work entries for one parent.
+    :returns: The latest wake-eligible entry, or ``None`` when every entry is a
+        codex-native sub-agent.
+    """
+    eligible = [
+        entry for entry in entries if not is_codex_native_subagent_wrapper(entry.wrapper_label)
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
+    )
+
+
 def wrapper_label_from_labels(labels: object) -> str | None:
     """
     Return a child's ``omnigent.wrapper`` label from its session labels.

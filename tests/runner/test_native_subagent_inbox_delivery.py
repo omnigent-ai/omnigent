@@ -1194,3 +1194,54 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
     assert late.delivered and not late.delivered_now
     assert inbox.empty()
     assert child["runner_id"] == "other-live-runner"
+
+
+def _wake_candidate(
+    child_session_id: str,
+    *,
+    wrapper_label: str | None,
+    completed_at: float | None,
+) -> subagent_work._SubagentWorkEntry:
+    return subagent_work._SubagentWorkEntry(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=child_session_id,
+        work_id=f"subagent_{child_session_id}",
+        agent="reviewer",
+        title="review",
+        wrapper_label=wrapper_label,
+        completed_at=completed_at,
+    )
+
+
+def test_stranded_wake_rescue_skips_a_later_codex_owned_thread() -> None:
+    """A suppressed thread finishing last must not shadow an independent child's wake.
+
+    The stranded-wake rescue picks one entry per parent to re-send. Selecting the
+    absolute latest would choose a Codex-owned thread that completed after an
+    independent child, and the ownership guard would then drop the wake the child
+    is still owed.
+    """
+    independent = _wake_candidate(
+        "conv_worker", wrapper_label="codex-native-ui", completed_at=100.0
+    )
+    codex_owned = _wake_candidate(
+        "conv_side", wrapper_label="codex-native-ui-subagent", completed_at=200.0
+    )
+
+    picked = subagent_work.latest_wake_eligible_subagent_work([independent, codex_owned])
+
+    assert picked is independent
+
+
+def test_stranded_wake_rescue_has_nothing_for_a_codex_only_parent() -> None:
+    """A parent whose only entries are Codex-owned threads owes no inbox wake."""
+    entries = [
+        _wake_candidate(
+            "conv_thread_a", wrapper_label="codex-native-ui-subagent", completed_at=100.0
+        ),
+        _wake_candidate(
+            "conv_thread_b", wrapper_label="codex-native-ui-subagent", completed_at=200.0
+        ),
+    ]
+
+    assert subagent_work.latest_wake_eligible_subagent_work(entries) is None
