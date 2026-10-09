@@ -39,9 +39,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+          PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           REPO: ${{ github.repository }}
         run: |
-          if [ -z "${PR:-}" ]; then
+          # The files API truncates successful responses at 3,000 entries.
+          if [ -z "${PR:-}" ] || [ "${PR_CHANGED_FILES:-0}" -ge 3000 ]; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -49,7 +51,7 @@ jobs:
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pattern='^(web/|omnigent/(server|stores)/|dev/benchmarks/|tests/benchmarks/|\.github/actions/setup-(pnpm|uv)/|(\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)$)'
+          pattern='^(web/|omnigent/(server|stores)/|dev/benchmarks/|tests/(benchmarks|browser_ui)/|\.github/actions/setup-(pnpm|uv)/|(\.github/workflows/benchmark-ui\.yml|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock|\.python-version)$)'
           if grep -qE "$pattern" <<< "$files"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
           else
@@ -94,6 +96,7 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+          restore-keys: ${{ runner.os }}-playwright-
 
       - name: Install benchmark dependencies
         run: |

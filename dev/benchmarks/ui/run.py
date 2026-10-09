@@ -140,7 +140,10 @@ async def measure_typing(page: Page, cdp: CDPSession, count: int) -> dict[str, A
             * sum(after[key] - before[key] for key in ("RecalcStyleDuration", "LayoutDuration"))
         )
         script_ms.append(1000 * (after["ScriptDuration"] - before["ScriptDuration"]))
-        if any(not math.isfinite(value) or value < 0 for value in (frame_ms[-1], render_ms[-1])):
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (frame_ms[-1], render_ms[-1], script_ms[-1])
+        ):
             raise RuntimeError("Chromium returned an invalid timing sample")
     await expect(composer).to_have_value(expected)
     return {

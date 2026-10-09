@@ -118,8 +118,11 @@ def test_one_slow_run_does_not_fail_the_ui_budget() -> None:
     [
         ([150, 150, 150], [150, 150, 150], "ok"),  # Unchanged on a slow machine.
         ([20, 20, 20], [22, 22, 22], "ok"),  # Small relative increase.
+        ([10, 10, 10], [20, 20, 20], "ok"),  # Exactly the relative threshold.
         ([2, 2, 2], [7, 7, 7], "ok"),  # At the absolute noise floor.
         ([2, 2, 2], [10, 10, 10], "advisory"),  # Still within the rendering budget.
+        ([5, 5, 5], [16, 16, 16], "advisory"),  # Exactly the rendering budget.
+        ([5, 5, 5], [16.01, 16.01, 16.01], "regression"),  # Just over the budget.
         ([5, 5, 5], [5, 5, 200], "ok"),  # One isolated slow run.
         ([5, 5, 100], [5, 100, 100], "advisory"),  # Medians differ; only one pair regresses.
         ([5, 5, 5], [150, 150, 150], "regression"),  # Whole-document restyle.
@@ -155,12 +158,18 @@ def test_absolute_noise_floor_applies_even_above_budget() -> None:
     assert warnings
 
 
-def test_standalone_runs_still_enforce_budgets() -> None:
+@pytest.mark.parametrize(("metric", "budget"), [("style_layout", 16), ("key_to_frame", 100)])
+@pytest.mark.parametrize("extra_ms", [0, 0.01])
+def test_standalone_runs_still_enforce_budgets(metric: str, budget: int, extra_ms: float) -> None:
     report = _report()
-    for run in report["journeys"]["browser_style_layout"]["runs"]:
-        run["p95_ms"] = 17
+    for run in report["journeys"][f"browser_{metric}"]["runs"]:
+        run["p95_ms"] = budget + extra_ms
     failures, warnings, rows = assess_reports({"candidate": report}, _args())
-    assert failures == ["browser_style_layout: P95 17.00 ms exceeds 16.00 ms"]
+    assert failures == (
+        [f"browser_{metric}: P95 {budget + extra_ms:.2f} ms exceeds {budget:.2f} ms"]
+        if extra_ms
+        else []
+    )
     assert warnings == rows == []
 
 
