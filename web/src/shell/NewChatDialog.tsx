@@ -2111,14 +2111,10 @@ export function resetLandingDraft(): void {
 
 /**
  * Restore a first message stranded by a failed session load to the next
- * landing visit: the create succeeded (so the draft was already cleared)
- * but the session never became viewable, leaving the typed text with no
- * composer to surface it. Only the text and attachments come back: an
- * existing draft keeps its picker selections (host, workspace, agent, …),
- * and a draft the user has already typed into is never overwritten.
- *
- * @returns Whether the message was written, so the caller keeps the
- *   stranded source intact when the restore is refused.
+ * landing visit. Only the text and attachments return: an existing draft
+ * keeps its picker selections, and a draft the user has typed into is never
+ * overwritten. Returns whether the message was written, so a refused restore
+ * leaves the stranded source intact.
  */
 export function restoreLandingDraftMessage(message: string, files: File[]): boolean {
   if (message.trim() === "" && files.length === 0) return false;
@@ -2127,6 +2123,9 @@ export function restoreLandingDraftMessage(message: string, files: File[]): bool
     writeLandingDraft({ ...landingDraft, message, files });
     return true;
   }
+  // A plain landing visit's defaults: the shared mode constants match the
+  // screen's initializers, and the nullish slots fall through to its
+  // last-used agent/harness seeding, so a restored visit matches a fresh one.
   writeLandingDraft({
     project: "",
     message,

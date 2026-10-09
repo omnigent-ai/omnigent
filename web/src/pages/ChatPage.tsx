@@ -1978,12 +1978,12 @@ export function ConversationLoadError({
       (strandedPrompt !== null
         ? { text: strandedPrompt.text, files: strandedPrompt.files ?? [] }
         : null);
-    // Retire the source only once the landing draft accepted the text, so a
-    // browser-back can't auto-send a second copy; a newer draft refuses and
-    // keeps the stranded copy. Retiring the ChatPage cache uses the callback.
+    // Retire every live source once the landing composer accepts the text, so a
+    // browser-back can't auto-send a copy: clear the failed-send draft that fed
+    // it, and retire any cached initial prompt, which re-dispatches otherwise.
     if (stranded !== null && restoreLandingDraftMessage(stranded.text, stranded.files)) {
       if (failedDraft !== null) clearFailedSendDraft(conversationId);
-      else onStrandedPromptRetired();
+      if (strandedPrompt !== null) onStrandedPromptRetired();
     }
     navigate("/");
   };

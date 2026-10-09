@@ -82,14 +82,27 @@ describe("ConversationLoadError stranded-prompt handoff", () => {
     expect(mocks.clearFailedSendDraft).not.toHaveBeenCalled();
   });
 
-  it("clears the failed-send draft instead of the cache when a failed send exists", () => {
+  it("clears the failed-send draft and retires any stranded cache when a failed send exists", () => {
     const file = new File(["x"], "shot.png", { type: "image/png" });
     mocks.peekFailedSendDraft.mockReturnValue({ text: "half-typed", files: [file] });
     mocks.restoreLandingDraftMessage.mockReturnValue(true);
 
-    // strandedPrompt is present too, but a settled failed send outranks the
-    // consumed-but-never-dispatched initial prompt.
+    // A settled failed send supplies the restored text, but the still-cached
+    // initial prompt must also be retired or a browser-back re-dispatches it.
     renderError({ text: "initial", skill: null, files: [] });
+    clickStartNewChat();
+
+    expect(mocks.restoreLandingDraftMessage).toHaveBeenCalledWith("half-typed", [file]);
+    expect(mocks.clearFailedSendDraft).toHaveBeenCalledWith("conv_abc");
+    expect(onStrandedPromptRetired).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears only the failed-send draft when there is no cached initial prompt", () => {
+    const file = new File(["x"], "shot.png", { type: "image/png" });
+    mocks.peekFailedSendDraft.mockReturnValue({ text: "half-typed", files: [file] });
+    mocks.restoreLandingDraftMessage.mockReturnValue(true);
+
+    renderError(null);
     clickStartNewChat();
 
     expect(mocks.restoreLandingDraftMessage).toHaveBeenCalledWith("half-typed", [file]);
