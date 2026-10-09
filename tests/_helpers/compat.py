@@ -379,10 +379,8 @@ def resolve_server_version(base_url: str) -> str:
     return reconcile_server_version(_fetch_reported_version(base_url), override, source=base_url)
 
 
-# Runner/host identity (and any zygote vars) inherited when the suite itself
-# runs inside a managed runner. Left in a daemon's env they send its spawned
-# runner down the zygote-fork path and hang it, so daemon-spawning fixtures
-# strip them to start a clean runner.
+# Runner/host identity stripped from a spawned daemon's env (see
+# strip_leaked_runner_env for why leaving it in hangs the daemon's runner).
 _LEAKED_RUNNER_ENV = (
     "OMNIGENT_RUNNER_ID",
     "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
