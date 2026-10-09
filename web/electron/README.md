@@ -140,7 +140,10 @@ tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
 and cancellation lead to the shell's connect/retry screen—not embedded workspace
 SSO. Failed connections stay blocked through the selector handoff so a late login
 redirect cannot replace it. Connect reuses stored credentials and opens the
-system browser only when they can't sign in. To use another account, choose
+system browser only when they can't sign in. Credentials are stored per
+workspace, so an account URL that names its workspace (`?o=<workspace id>`)
+reuses the credentials of the workspace it reached last time; without `?o=` it
+runs the account sign-in and workspace picker. To use another account, choose
 **Server → Sign Out of Server** (or **Sign out of <workspace>** in the server
 picker at the bottom of the sidebar, on servers whose web app includes it): it
 forgets the stored OAuth token, clears DBAUTH, and returns every window on that
@@ -151,7 +154,10 @@ links use stored credentials without opening a browser automatically.
 When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
 access list refusing this network, or HTTP 5xx/429), the window keeps its page
 under a **Reconnecting to Databricks…** overlay and retries every 5s for a minute,
-then every 10s for another. Cancel, or running out of retries, returns to the
+then every 10s for another. After that, an unreachable or IP-blocked workspace
+keeps retrying every minute until it answers; HTTP 5xx/429 stops there. Attempts
+wait while the Mac is offline without counting, and waking or unlocking the Mac
+starts the 5s retries over. Cancel, or running out of retries, returns to the
 setup page with the reason.
 
 For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:

@@ -233,6 +233,8 @@ function loadNavigationHarness({
   const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
+  const powerMonitor = new EventEmitter();
+  const connectivity = { online: true };
   const webContents = {
     id: 1,
     send: (channel, data) => calls.progress.push({ channel, data }),
@@ -383,6 +385,8 @@ function loadNavigationHarness({
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
+    net: { isOnline: () => connectivity.online },
+    powerMonitor,
     screen: {},
     session: { defaultSession },
     shell: {},
@@ -582,7 +586,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -632,6 +636,8 @@ function loadNavigationHarness({
     browserIpcDeps: () => browserIpcDeps,
     permissionPromptCalls,
     electron,
+    powerMonitor,
+    connectivity,
     ipc,
     webRequest,
     webContents,
@@ -647,6 +653,8 @@ function loadNavigationHarness({
     },
     win,
     cleanup: () => {
+      // Network failures retry until they succeed; a closed window would stop them.
+      api.cancelReconnect(win);
       api.disposeAuth();
       api.windows.clear();
       fs.rmSync(userData, { recursive: true, force: true });
@@ -1111,6 +1119,37 @@ describe("Databricks auth mode wiring", () => {
     );
   });
 
+  it("signs in through the browser from an account URL whose workspace rejected its session", async (t) => {
+    const accountPick = "https://spog.cloud.databricks.com/?o=123";
+    let rejected = false;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin, { storedOrigin = origin } = {}) => {
+        if (rejected) return storedOrigin;
+        rejected = true;
+        throw Object.assign(new Error("rejected"), { errorCode: "SESSION_REJECTED" });
+      },
+    });
+    t.after(h.cleanup);
+    const workspaceOrigin = new URL(workspace).origin;
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ server_labels: { [workspaceOrigin]: accountPick } }),
+    );
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace), /rejected/);
+    const connect = () => h.api.loadServerUrl(h.win, accountPick, undefined, { interactive: true });
+    await connect();
+    await connect();
+    assert.deepEqual(
+      h.calls.auth.slice(1).map((call) => [call[2].storedOrigin, call[2].useStoredCredentials]),
+      [
+        [workspaceOrigin, false],
+        [workspaceOrigin, true],
+      ],
+    );
+  });
+
   it("signs a workspace out from the server picker, in every window on it", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
     t.after(h.cleanup);
@@ -1397,7 +1436,7 @@ describe("Databricks auth mode wiring", () => {
   ]) {
     it(`shows "${hint}" over the page while retrying, then "${final}"`, async (t) => {
       const finals = [];
-      // [40]: retrying, then Cancel; []: retries ran out.
+      // [40]: retrying, then Cancel; []: the fast retries ran out.
       for (const retries of [[40], []]) {
         const h = loadNavigationHarness({
           serverUrl: workspace,
@@ -1415,7 +1454,8 @@ describe("Databricks auth mode wiring", () => {
         } else h.emit("did-fail-load", -105, "ERR", `${workspace}/c/1`, true);
         // oxlint-disable-next-line no-await-in-loop
         await wait();
-        if (retries.length) {
+        // Network failures keep retrying past the fast retries; only Cancel stops them.
+        if (retries.length || failure !== serverError) {
           // The page stays underneath the overlay.
           assert.equal(h.overlay.hint, hint);
           assert.deepEqual(h.calls.loadFile, []);
@@ -3013,7 +3053,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     return h;
   }
 
-  it("retries every 5s for a minute, then every 10s for another, counting attempts", (t) => {
+  it("retries every 5s for a minute, every 10s for another, then every minute", (t) => {
     const h = loadNavigationHarness();
     t.after(h.cleanup);
     // Attempts, not elapsed time: timers keep running through sleep.
@@ -3021,6 +3061,8 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
       [...h.api.reconnectDelaysMs()],
       [...Array(12).fill(5_000), ...Array(6).fill(10_000)],
     );
+    // Only network failures use the minute-long retries.
+    assert.equal(h.api.reconnectSlowDelayMs(), 60_000);
   });
 
   const setupEvent = (h) => ({
@@ -3092,7 +3134,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadFile, []);
   });
 
-  it("reopens the mounted page after Connect while offline, once retries ran out", async (t) => {
+  it("reopens the mounted page after a Cancel, then Connect while offline", async (t) => {
     let online = false;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => {
@@ -3113,7 +3155,9 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     h.api.registerIpc();
     failLoad(h);
     await wait(1);
-    // Retries ran out: the setup form keeps the mounted URL for the next Connect.
+    h.overlay.cancel();
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    // The setup form keeps the mounted URL for the next Connect.
     assert.equal(h.overlay.hint, null);
     assert.equal(setupParams(h).url, workspace);
     h.api.setReconnectDelaysMs([20]);
@@ -3127,6 +3171,45 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadURL, [[workspace]]);
     assert.equal(h.overlay.hint, null);
   });
+
+  it("waits while offline without using up retries", async (t) => {
+    const h = browserHarness(t, [20], {
+      ensureSession: async () => {
+        throw Object.assign(new Error("HTTP 503"), { status: 503 });
+      },
+    });
+    h.connectivity.online = false;
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await wait(100);
+    // Several checks passed while offline; none spent the one retry.
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.overlay.hint, "Databricks isn't responding.");
+    h.connectivity.online = true;
+    await until(() => h.calls.auth.length === 2, "the retry once online");
+    // That was the one retry, so the server error now shows the setup page.
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    assert.equal(h.overlay.hint, null);
+  });
+
+  for (const event of ["resume", "unlock-screen"]) {
+    it(`starts the fast retries over on ${event}`, async (t) => {
+      const h = browserHarness(t, [20], {
+        ensureSession: async () => {
+          throw new TypeError("fetch failed");
+        },
+      });
+      h.api.setReconnectSlowDelayMs(60_000);
+      await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+      await until(() => h.calls.auth.length === 2, "the fast retry");
+      // The next retry is a minute away.
+      await wait(60);
+      assert.equal(h.calls.auth.length, 2);
+      h.powerMonitor.emit(event);
+      await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
+      assert.equal(h.overlay.hint, "Check your network connection.");
+      assert.deepEqual(h.calls.loadFile, []);
+    });
+  }
 
   it("returns a failed deep link to its conversation", async (t) => {
     let first = true;
@@ -3254,13 +3337,11 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       },
       () => {},
     );
-  for (const [trigger, drop, vpnReturns] of [
-    ["the session cookie is removed", (_h, network) => network.removeCookie(), true],
-    ["the workspace redirects to login", loginRedirect, true],
-    ["the session cookie is removed", (_h, network) => network.removeCookie(), false],
+  for (const [trigger, drop] of [
+    ["the session cookie is removed", (_h, network) => network.removeCookie()],
+    ["the workspace redirects to login", loginRedirect],
   ]) {
-    const outcome = vpnReturns ? "reconnects by itself when the VPN returns" : "gives up";
-    it(`${outcome} after ${trigger} off the VPN`, async (t) => {
+    it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
       const { h, network } = await connected(t, [30, 30, 30]);
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       network.verdict = "blocked";
@@ -3272,27 +3353,40 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       assert.deepEqual(h.calls.loadFile, []);
       // Connect, the blocked renewal, then one blocked background retry.
       await until(() => network.sessionCreates === 3, "a blocked retry");
-      if (vpnReturns) {
-        network.verdict = "allow";
-        await until(() => h.calls.loadURL.length === 2, "the reconnect");
-        // Back on the page the user was on; setup never showed.
-        assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
-        assert.equal(h.api.windows.get(h.win).origin, origin);
-        assert.equal(h.overlay.hint, null);
-        assert.deepEqual(h.calls.loadFile, []);
-      } else {
-        await until(() => h.calls.loadFile.length === 1, "the final setup page");
-        assert.deepEqual(shown(h), { error: `${blocked}, then click Connect.`, url: workspace });
-        assert.equal(h.overlay.hint, null);
-      }
+      network.verdict = "allow";
+      await until(() => h.calls.loadURL.length === 2, "the reconnect");
+      // Back on the page the user was on; setup never showed.
+      assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
+      assert.equal(h.overlay.hint, null);
+      assert.deepEqual(h.calls.loadFile, []);
       const settled = network.sessionCreates;
       await wait(100);
       assert.equal(network.sessionCreates, settled);
-      assert.equal(h.calls.loadURL.length, vpnReturns ? 2 : 1);
+      assert.equal(h.calls.loadURL.length, 2);
       assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
       assert.equal(network.browserSignIns, 0);
     });
   }
+
+  it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    h.api.setReconnectSlowDelayMs(20);
+    h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    // Connect, the blocked renewal, the one fast retry, then slower ones past it.
+    await until(() => network.sessionCreates >= 6, "retries past the fast schedule");
+    assert.equal(h.overlay.hint, `${blocked}.`);
+    assert.deepEqual(h.calls.loadFile, []);
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+    assert.equal(h.overlay.hint, null);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(network.browserSignIns, 0);
+  });
 
   it("keeps retrying when Connect is clicked off the VPN, then reconnects", async (t) => {
     const { h, network } = await connected(t, [30, 30, 30]);
@@ -3329,6 +3423,62 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       h.calls.auth.map((call) => call[2].interactive),
       [false, false, true, false, false],
     );
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  // The organization-provided server: an account URL naming the workspace sign-in lands on.
+  const accountPick = "https://spog.cloud.databricks.com/?o=123";
+  async function accountPickHarness(t) {
+    const network = createWorkspaceNetwork(origin, {
+      oauth: {
+        // Tokens are stored per workspace, never under the account origin.
+        getValidStoredToken: async (tokenOrigin) => {
+          if (tokenOrigin === origin) return "token";
+          throw Object.assign(new Error("no stored token"), { errorCode: "NO_STORED_TOKEN" });
+        },
+      },
+    });
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      network,
+    });
+    t.after(h.cleanup);
+    // An earlier Connect to the pick landed on this workspace.
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_labels: { [origin]: accountPick } }));
+    h.api.registerIpc();
+    const connect = () =>
+      h.ipc.get("omnigent:set-server-url")(
+        { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+        accountPick,
+        { requestId: "connect" },
+      );
+    return { h, network, connect };
+  }
+
+  it("connects an account URL to the workspace it reached before, without the browser", async (t) => {
+    const { h, network, connect } = await accountPickHarness(t);
+    assert.equal((await connect()).reconnecting, undefined);
+    assert.equal(network.browserSignIns, 0);
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+    // Relaunch restores the workspace, where the sign-in is stored.
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).server_url, workspace);
+  });
+
+  it("reconnects an account URL's workspace once the VPN is back", async (t) => {
+    const { h, network, connect } = await accountPickHarness(t);
+    h.api.setReconnectDelaysMs([20]);
+    h.api.setReconnectSlowDelayMs(20);
+    network.verdict = "blocked";
+    assert.equal((await connect()).reconnecting, true);
+    assert.equal(h.overlay.hint, `${blocked}.`);
+    await until(() => network.sessionCreates === 2, "a blocked retry");
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 1, "the reconnect");
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.equal(h.overlay.hint, null);
     assert.equal(network.browserSignIns, 0);
   });
 
