@@ -1,33 +1,7 @@
-"""A harness-spawn failure aborts the turn AND surfaces its spawn reason.
-
-When the runner cannot spawn the harness subprocess for a turn,
-``HarnessProcessManager.get_client`` raises ``HarnessSpawnError``; the runner's
-turn-dispatch path (``omnigent/runner/app.py`` ``_stream_message_to_harness`` ->
-``_run_turn_bg_setup_and_stream``) turns that into a ``503`` body
-``{"error": "harness_spawn_failed", "detail": ...}``, and
-``_publish_turn_status(..., "failed", error={"code": "runner_error", ...})``
-surfaces the aborted turn to the web SPA as a failed turn.
-
-The guarded behavior is twofold:
-
-1. The turn must not hang or vanish — the SPA shows the failed-turn error pill
-   with the ``runner_error`` headline.
-2. The pill's expanded detail must carry the *actual spawn-failure reason*
-   (``HarnessSpawnError`` messages are curated to be client-safe), not only the
-   opaque "see the runner log" pointer. Redacting the reason leaves users and
-   telemetry with no attributable cause for the aborted turn.
-
-To drive the spawn failure deterministically under the mock-LLM e2e harness,
-the session is bound to the ``open-responses`` harness. ``open-responses`` is a
-valid harness *name* (it passes spec validation) but is **not** registered in
-``omnigent.runtime.harnesses._HARNESS_MODULES``, so the runner's
-``_resolve_module_path`` raises ``HarnessSpawnError`` inside ``get_client`` at
-turn time — the same mock-incompatibility documented in
-``tests/e2e/omnigent/test_repl_overview_terminal_visibility.py``.
+"""A runner spawn failure reaches the chat error pill with its client-safe cause.
 
 The failed-turn signal reaches the SPA over the ``session.status`` SSE event,
-not as a persisted ``/items`` error record, so the assertions read the rendered
-pill.
+not as a persisted ``/items`` record, so the assertions read the rendered pill.
 
 Run::
 
@@ -36,15 +10,14 @@ Run::
 
 from __future__ import annotations
 
-import io
-import json
-import tarfile
 import uuid
 from collections.abc import Iterator
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import _create_bundled_session
 
 # ``open-responses`` passes spec validation (spec_version 1, strict parser via
 # the ``config.yaml`` arcname) but is unregistered in ``_HARNESS_MODULES``, so the
@@ -72,18 +45,6 @@ _SPAWN_FAILED_CODE = "harness_spawn_failed"
 _SPAWN_FAILURE_CAUSE = "unknown harness"
 
 
-def _bundle(name: str) -> bytes:
-    """Gzip-tar the inline agent YAML under ``config.yaml`` for multipart upload."""
-    yaml_text = _AGENT_YAML.format(name=name)
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("config.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
-
-
 @pytest.fixture
 def spawn_fail_session(live_server: str, runner_id: str) -> Iterator[tuple[str, str]]:
     """A runner-bound session whose harness fails to spawn at turn time.
@@ -93,24 +54,11 @@ def spawn_fail_session(live_server: str, runner_id: str) -> Iterator[tuple[str, 
     :returns: ``(base_url, session_id)``.
     """
     name = f"spawn_fail_{uuid.uuid4().hex[:8]}"
-    create = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _bundle(name), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
-    httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    ).raise_for_status()
+    session_id = _create_bundled_session(live_server, runner_id, _AGENT_YAML.format(name=name))
     try:
         yield (live_server, session_id)
     finally:
-        with httpx.Client(timeout=10.0) as client:
-            client.delete(f"{live_server}/v1/sessions/{session_id}")
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
 
 
 @pytest.mark.timeout(180)

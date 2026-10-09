@@ -10,7 +10,8 @@ must do the same instead of publishing the fixed string
 ``"harness returned error response"`` and logging nothing: otherwise relay
 subscribers cannot distinguish a spawn failure from any other
 non-streaming outcome, and the HTTP response and the relay disagree about
-the same failure.
+the same failure. Both must also name the spawn cause (a curated
+``HarnessSpawnError`` message), not only the runner-log pointer.
 
 Journey driven (real runner app, real started ``HarnessProcessManager``):
 POST a user message to ``/v1/sessions/{conv}/events?stream=true`` naming a
@@ -169,7 +170,8 @@ async def test_stream_spawn_failure_relays_error_detail(
     cannot spawn. The HTTP caller gets the diagnosed
     ``503 harness_spawn_failed``; the relay subscriber and the runner's
     ERROR log must learn the same diagnosis instead of the fixed
-    ``"harness returned error response"`` string.
+    ``"harness returned error response"`` string. The detail the user sees
+    and the relayed status must both name which harness could not spawn.
     """
     app = _build_app(spawn_failing_manager)
     conv = f"conv_spawn_detail_{uuid.uuid4().hex[:8]}"
@@ -178,12 +180,15 @@ async def test_stream_spawn_failure_relays_error_detail(
         with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
             response = await _post_spawn_failing_turn(http, conv, stream=True)
 
-        # Journey sanity: the direct HTTP caller receives the diagnosed
-        # spawn failure (this side has always been correct).
+        # The direct HTTP caller receives the diagnosed spawn failure; its
+        # client-safe detail names the cause with the log pointer appended.
         assert response.status_code == 503
         body = response.json()
         assert body["error"] == "harness_spawn_failed"
-        assert body["detail"]
+        assert f"unknown harness {_UNSPAWNABLE_HARNESS!r}" in body["detail"], (
+            f"spawn cause redacted out of the client detail: {body['detail']!r}"
+        )
+        assert "see the runner log for details" in body["detail"]
 
         failed = await _failed_relay_event(app.state.session_event_queues, conv)
 
@@ -200,6 +205,9 @@ async def test_stream_spawn_failure_relays_error_detail(
     # carries the harness_spawn_failed code and the client-safe detail.
     assert "harness_spawn_failed" in relayed_error
     assert "see the runner log for details" in relayed_error
+    assert f"unknown harness {_UNSPAWNABLE_HARNESS!r}" in relayed_error, (
+        f"spawn cause redacted out of the relayed failure: {relayed_error!r}"
+    )
 
     # The dispatch outcome must be diagnosable from the runner log too: at
     # least one ERROR record names the decoded harness error, not only the
@@ -209,45 +217,6 @@ async def test_stream_spawn_failure_relays_error_detail(
     ]
     assert any("harness_spawn_failed" in line for line in error_lines), (
         f"no ERROR log line carries the decoded harness error body: {error_lines!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_spawn_failure_detail_preserves_client_safe_reason(
-    spawn_failing_manager: HarnessProcessManager,
-) -> None:
-    """The spawn-failure detail must carry the spawn cause, not only a log pointer.
-
-    ``HarnessSpawnError`` messages are curated to be client-safe (they name
-    the harness, exit code, or timeout — never paths or hosts), so the 503
-    ``harness_spawn_failed`` body and the relayed ``session.status: failed``
-    event must preserve the reason. Redacting it to the fixed
-    "Request failed on the runner" string leaves telemetry and the surfaced
-    turn failure with no attributable cause at all.
-    """
-    app = _build_app(spawn_failing_manager)
-    conv = f"conv_spawn_reason_{uuid.uuid4().hex[:8]}"
-
-    async with _runner_client(app) as http:
-        response = await _post_spawn_failing_turn(http, conv, stream=True)
-        assert response.status_code == 503
-        body = response.json()
-        assert body["error"] == "harness_spawn_failed"
-        # The cause (the real unknown-harness message) is preserved verbatim,
-        # with the log pointer still appended for the full traceback.
-        assert f"unknown harness {_UNSPAWNABLE_HARNESS!r}" in body["detail"], (
-            f"spawn cause redacted out of the client detail: {body['detail']!r}"
-        )
-        assert "see the runner log for details" in body["detail"]
-
-        failed = await _failed_relay_event(app.state.session_event_queues, conv)
-
-    # The relay subscriber (and therefore the SPA's failed-turn pill and the
-    # runner's turn-status telemetry) learns the same preserved reason.
-    assert failed is not None, "no session.status: failed event reached the relay"
-    relayed_message = str((failed.get("error") or {}).get("message", ""))
-    assert f"unknown harness {_UNSPAWNABLE_HARNESS!r}" in relayed_message, (
-        f"spawn cause redacted out of the relayed failure: {relayed_message!r}"
     )
 
 
