@@ -20,11 +20,14 @@ from unittest.mock import Mock
 import pytest
 
 from tests.e2e_ui import conftest as fixtures
+from tests.e2e import _harness_probes
 
 
-@pytest.mark.parametrize("harness", ["claude", "codex"])
+@pytest.mark.parametrize("harness", ["claude", "codex", "pi"])
 @pytest.mark.parametrize("owned", [False, True])
 def test_mock_session_uses_owned_config(monkeypatch, tmp_path, harness, owned):
+    monkeypatch.setattr(_harness_probes, "cli_unavailable_reason", lambda _: None)
+    monkeypatch.setattr(fixtures.shutil, "which", lambda _: "/test/tmux")
     monkeypatch.setenv("LLM_API_KEY", "synthetic-proxy-placeholder")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     config = tmp_path / "config.yaml"
@@ -46,7 +49,8 @@ def test_mock_session_uses_owned_config(monkeypatch, tmp_path, harness, owned):
         if owned:
             assert config.read_text() == "original"
         else:
-            assert f"mock-{harness}:" in config.read_text()
+            provider = "claude" if harness == "pi" else harness
+            assert f"mock-{provider}:" in config.read_text()
             assert "http://model" in config.read_text()
     finally:
         journey.close()
@@ -72,4 +76,4 @@ def test_partial_environment_fails_before_spawn(monkeypatch, tmp_path, present):
     spawn.assert_not_called()
 """
     )
-    pytester.runpytest_subprocess("-q").assert_outcomes(passed=10)
+    pytester.runpytest_subprocess("-q").assert_outcomes(passed=12)

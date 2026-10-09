@@ -3435,3 +3435,56 @@ def native_cursor_approval_session(
             except subprocess.TimeoutExpired:
                 respawned.kill()
                 respawned.wait(timeout=5)
+
+
+def _create_native_pi_session(base_url: str, runner_id: str) -> str:
+    """Launch the same terminal-first Pi wrapper as `omnigent pi`."""
+    created = create_native_session(
+        httpx, base_url, harness="pi", metadata={"workspace": str(_REPO_ROOT)}
+    )
+    session_id = str(created["session_id"])
+    try:
+        _bind_session_runner(base_url, session_id, runner_id)
+    except BaseException:
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10)
+        raise
+    return session_id
+
+
+@pytest.fixture
+def native_pi_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """Real Pi CLI and extension, with only model responses scripted locally.
+
+    The prepared environment already supplies an Anthropic mock provider.
+    Standalone runs use the same provider config as the Claude mock fixture.
+    """
+    from tests.e2e._harness_probes import cli_unavailable_reason
+
+    if reason := cli_unavailable_reason("pi"):
+        pytest.skip(reason)
+    if shutil.which("tmux") is None:
+        pytest.skip("Pi recording needs tmux on PATH")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    try:
+        with _temp_omnigent_mock_config(
+            mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+        ):
+            session_id = _create_native_pi_session(live_server, str(_server_state["runner_id"]))
+            try:
+                yield live_server, session_id
+            finally:
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10)
+    finally:
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
