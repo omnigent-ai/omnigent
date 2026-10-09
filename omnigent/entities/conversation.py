@@ -267,11 +267,12 @@ class Conversation:
     # None = never reported); ``pending_elicitation_count`` is the
     # outstanding approval-prompt count (None = never written);
     # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
-    # seconds, None = no live stamp) — carried on the row so a session list
-    # can judge runner liveness without a second connectivity query.
+    # seconds, None = no live stamp), carried on the row so a session list can
+    # judge liveness; ``runner_last_connected`` outlives graceful disconnects.
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    runner_last_connected: int | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.

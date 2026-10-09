@@ -7045,6 +7045,117 @@ def test_clear_runner_liveness_without_not_after_still_clears_unconditionally(
     assert connectivity[conv.id].runner_last_seen is None
 
 
+def test_clear_runner_liveness_preserves_the_connect_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A graceful clear drops ``runner_last_seen`` but keeps the connect stamp.
+
+    The cross-replica disconnect check reads ``runner_last_connected``; a
+    sibling's reconnect blip clears ``runner_last_seen`` and must not erase the
+    only evidence the runner is live elsewhere.
+    """
+    conv = conversation_store.create_conversation(title="preserve-connect-stamp")
+    assert conversation_store.set_runner_id(conv.id, "runner_preserve_connect")
+
+    conversation_store.touch_runner_liveness(["runner_preserve_connect"], now=1_000_000)
+    assert conversation_store.get_runner_liveness(conv.id) == (
+        "runner_preserve_connect",
+        1_000_000,
+        1_000_000,
+    )
+
+    conversation_store.clear_runner_liveness("runner_preserve_connect")
+
+    assert conversation_store.get_runner_liveness(conv.id) == (
+        "runner_preserve_connect",
+        None,
+        1_000_000,
+    )
+
+
+def test_rebind_to_a_different_runner_resets_liveness_stamps(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Rebinding a session to a new runner must not inherit the old liveness.
+
+    ``runner_last_connected`` outlives a graceful disconnect, so if a rebind
+    kept the previous runner's connect stamp the cross-replica check would read
+    the new, not-yet-connected binding as live elsewhere until the TTL expired
+    and suppress legitimate offline marking. Both ``replace_runner_id`` branches
+    (blind and compare-and-set) must reset the stamps on a real runner change.
+    """
+    conv = conversation_store.create_conversation(title="rebind-clears-liveness")
+    assert conversation_store.set_runner_id(conv.id, "runner_old")
+    conversation_store.touch_runner_liveness(["runner_old"], now=2_000_000)
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_old", 2_000_000, 2_000_000)
+
+    conversation_store.replace_runner_id(conv.id, "runner_new")
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_new", None, None)
+
+    conversation_store.touch_runner_liveness(["runner_new"], now=3_000_000)
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_new", 3_000_000, 3_000_000)
+    conversation_store.replace_runner_id(conv.id, "runner_third", expected_runner_id="runner_new")
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_third", None, None)
+
+
+def test_replace_runner_id_with_the_same_runner_preserves_liveness(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A no-op rebind to the already-bound runner keeps its live stamps.
+
+    Internal callers re-assert the current binding; that must not look like a
+    disconnect by wiping a still-connected runner's liveness.
+    """
+    conv = conversation_store.create_conversation(title="rebind-noop-preserves")
+    assert conversation_store.set_runner_id(conv.id, "runner_same")
+    conversation_store.touch_runner_liveness(["runner_same"], now=4_000_000)
+
+    conversation_store.replace_runner_id(conv.id, "runner_same")
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_same", 4_000_000, 4_000_000)
+
+    conversation_store.replace_runner_id(conv.id, "runner_same", expected_runner_id="runner_same")
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_same", 4_000_000, 4_000_000)
+
+
+def test_unbinding_a_runner_resets_liveness_stamps(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Both unbind paths drop liveness so an unbound session is never live elsewhere."""
+    conv = conversation_store.create_conversation(title="unbind-clears-liveness")
+    assert conversation_store.set_runner_id(conv.id, "runner_clear")
+    conversation_store.touch_runner_liveness(["runner_clear"], now=5_000_000)
+    conversation_store.clear_runner_id(conv.id)
+    assert conversation_store.get_runner_liveness(conv.id) == (None, None, None)
+
+    conv2 = conversation_store.create_conversation(title="unbind-host-clears-liveness")
+    assert conversation_store.set_runner_id(conv2.id, "runner_clear_host")
+    conversation_store.touch_runner_liveness(["runner_clear_host"], now=6_000_000)
+    conversation_store.clear_host_binding(conv2.id)
+    assert conversation_store.get_runner_liveness(conv2.id) == (None, None, None)
+
+
+def test_set_runner_id_resets_stale_liveness_stamps(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A first binding must not inherit stamps an older writer left on the row.
+
+    Before unbinding reset liveness, ``clear_runner_id`` left both stamps in
+    place, so an unbound row can still carry them when a new runner is pinned.
+    """
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    conv = conversation_store.create_conversation(title="bind-clears-stale-liveness")
+    with conversation_store._session_immediate("test_seed_stale_liveness") as session:
+        meta = session.get(SqlConversationMetadata, (current_workspace_id(), conv.id))
+        assert meta is not None
+        meta.runner_last_seen = 7_000_000
+        meta.runner_last_connected = 7_000_000
+    assert conversation_store.get_runner_liveness(conv.id) == (None, 7_000_000, 7_000_000)
+
+    assert conversation_store.set_runner_id(conv.id, "runner_first")
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_first", None, None)
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

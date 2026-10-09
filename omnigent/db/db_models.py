@@ -748,6 +748,10 @@ class SqlConversationMetadata(OmnigentBase):
     # Epoch seconds the bound runner's tunnel was last seen alive;
     # runner_online is derived from freshness (like host_is_live).
     runner_last_seen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Epoch seconds the bound runner's tunnel was last connected. Stamped with
+    # runner_last_seen but never cleared on a graceful disconnect, so a mid-turn
+    # disconnect check survives a sibling's transient reconnect blip.
+    runner_last_connected: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Last relay-observed turn status (enum_codecs.SESSION_LIVE_STATUS);
     # NULL means no relay has ever reported on this session.
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
