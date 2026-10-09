@@ -117,7 +117,7 @@ def spawn_fail_session(live_server: str, runner_id: str) -> Iterator[tuple[str, 
 
 @pytest.mark.timeout(180)
 def test_spawn_failure_aborts_turn_and_preserves_reason(
-    page: Page,
+    request: pytest.FixtureRequest,
     spawn_fail_session: tuple[str, str],
 ) -> None:
     """Send a turn whose harness cannot spawn; the pill names the spawn cause.
@@ -130,6 +130,8 @@ def test_spawn_failure_aborts_turn_and_preserves_reason(
     """
     base_url, session_id = spawn_fail_session
 
+    # Open the page only after the session exists so a recording starts at the journey.
+    page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
