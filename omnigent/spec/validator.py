@@ -274,11 +274,11 @@ def _validate_skills(spec: AgentSpec, result: ValidationResult) -> None:
     seen_names: set[str] = set()
     for i, skill in enumerate(spec.skills):
         prefix = f"skills[{i}]"
-        # Name format
+        # Name format (the directory name; the frontmatter label is free-form)
         if not _SKILL_NAME_PATTERN.match(skill.name):
             result.add(
                 f"{prefix}.name",
-                f"must match [a-z0-9-]+, got {skill.name!r}",
+                f"skill directory name must match [a-z0-9-]+, got {skill.name!r}",
             )
         # Name length
         if len(skill.name) > _SKILL_NAME_MAX_LEN:

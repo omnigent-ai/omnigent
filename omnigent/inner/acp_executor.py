@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
@@ -380,6 +381,61 @@ def _unattended_auth_method_id(initialize_result: _AcpJsonObject) -> str | None:
     return None
 
 
+def _resolve_cwd(cwd: str | None, *, session_id: str | None = None) -> str:
+    """Resolve and validate the working directory for the ACP agent subprocess.
+
+    Called from :meth:`AcpExecutor.__init__` (where *cwd* may be ``None``) and
+    from :meth:`AcpExecutor._start_process` (where *cwd* is always a string, to
+    re-validate before every spawn and respawn). Raises a clear
+    :class:`RuntimeError` so the failure goes through the normal startup-error
+    path and surfaces with the harness-log suffix.
+
+    On Linux, reads ``/proc/self/cwd`` to recover a deleted inherited path
+    (shown as ``<path> (deleted)``).
+
+    :param cwd: Caller-supplied directory, or ``None`` to inherit from the process.
+    :param session_id: Session id for the structured WARNING, when available.
+    :returns: The resolved working directory path.
+    :raises RuntimeError: When the directory is missing or the process cwd was deleted.
+    """
+    if cwd is not None:
+        if not os.path.isdir(cwd):
+            logger.warning(
+                "acp executor cwd does not exist: %s",
+                cwd,
+                extra=debug_event(
+                    "acp_executor_cwd_missing",
+                    session_id=session_id,
+                    cwd=cwd,
+                    reason="not_a_directory",
+                ),
+            )
+            raise RuntimeError(f"ACP executor working directory does not exist: {cwd!r}")
+        return cwd
+
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        deleted_path: str | None = None
+        with contextlib.suppress(OSError):
+            deleted_path = os.readlink("/proc/self/cwd").removesuffix(" (deleted)")
+        path_detail = f" ({deleted_path})" if deleted_path else ""
+        logger.warning(
+            "acp executor inherited working directory was deleted%s",
+            path_detail,
+            extra=debug_event(
+                "acp_executor_cwd_missing",
+                session_id=session_id,
+                cwd=deleted_path,
+                reason="inherited_cwd_deleted",
+            ),
+        )
+        raise RuntimeError(
+            f"Runner working directory was deleted{path_detail}; "
+            "restart the runner in a valid directory or pass an explicit cwd"
+        ) from None
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -406,7 +462,7 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
-        self._cwd = cwd or os.getcwd()
+        self._cwd = _resolve_cwd(cwd)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
@@ -502,6 +558,14 @@ class AcpExecutor(Executor):
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
         response or tool-output line can't hit the default 64 KiB per-line cap.
         """
+        # Re-validate cwd before every spawn and respawn: the workspace may have
+        # been deleted after __init__, and this error flows through
+        # _startup_error_message so the UI also shows the harness-log path.
+        _resolve_cwd(self._cwd, session_id=self._session_id)
+        # If the cwd is relative the spawn resolves it against the process cwd;
+        # fail early with a clear message if that directory was also deleted.
+        if not os.path.isabs(self._cwd):
+            _resolve_cwd(None, session_id=self._session_id)
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
