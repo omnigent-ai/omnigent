@@ -8498,15 +8498,18 @@ async def _relay_runner_stream_once(
                         response_id=_persist_rid,
                     )
                     if conv_item is not None:
-                        if conv_item.type == "error":
+                        if (
+                            isinstance(conv_item.data, ErrorData)
+                            and conv_item.data.level == "info"
+                        ):
                             # A notice answers a web message the harness never
                             # received, so no mirror will drain its queued entry:
-                            # commit that message ahead of the notice.
+                            # commit that message ahead of the notice, under its id.
                             _notice_input_stable_id = event.get("input_stable_id")
                             await _settle_undelivered_native_input(
                                 conversation_store,
                                 session_id,
-                                _persist_rid,
+                                conv_item.response_id,
                                 (
                                     _notice_input_stable_id
                                     if isinstance(_notice_input_stable_id, str)

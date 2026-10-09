@@ -295,6 +295,9 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Servers before 0.18.0 drop info-level ``error`` output items on persist, so a
+# harness notice would vanish on reload; the harness answers as a failed turn.
+_DURABLE_NOTICE_MIN_SERVER_VERSION = "0.18.0"
 # Published statuses that mean a session's terminal is still working a turn.
 # ``waiting`` is parked on user input, so it keeps the runner alive too.
 _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
@@ -327,6 +330,31 @@ def _invalid_effort_response(effort: object) -> JSONResponse | None:
     )
 
 
+def _server_release_at_least(server_version: str, minimum: str, feature: str) -> bool:
+    """
+    Whether *server_version*'s PEP 440 release tuple is at least *minimum*'s.
+
+    :param server_version: The server's reported version, e.g. ``"0.2.0"`` or
+        ``"0.3.0.dev0"`` (a dev build counts as its release).
+    :param minimum: The first release with the capability, e.g. ``"0.3.0"``.
+    :param feature: Capability name for the warning on a malformed version.
+    :returns: ``True`` iff the release tuple is ``>=``; ``False`` for versions
+        that are not PEP 440 (the capability is treated as unknown).
+    """
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(server_version).release >= Version(minimum).release
+    except InvalidVersion:
+        _logger.warning(
+            "server version %r is not PEP 440; treating %s support as unknown",
+            server_version,
+            feature,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return False
+
+
 def _version_supports_waiting_status(server_version: str) -> bool:
     """
     Whether *server_version* can serialize ``session.status: "waiting"``.
@@ -336,19 +364,26 @@ def _version_supports_waiting_status(server_version: str) -> bool:
     :returns: ``True`` iff the server's PEP 440 release tuple is ``>= 0.3.0``
         (the release that added "waiting" to the session-status model).
     """
-    from packaging.version import InvalidVersion, Version
+    return _server_release_at_least(
+        server_version, _WAITING_STATUS_MIN_SERVER_VERSION, "waiting status"
+    )
 
-    try:
-        return (
-            Version(server_version).release >= Version(_WAITING_STATUS_MIN_SERVER_VERSION).release
-        )
-    except InvalidVersion:
-        _logger.warning(
-            "server version %r is not PEP 440; treating waiting status support as unknown",
-            server_version,
-            extra={"session_id": runner_primary_session_id()},
-        )
-        return False
+
+def _version_supports_durable_notices(server_version: str | None) -> bool:
+    """
+    Whether the server keeps a harness notice across reloads.
+
+    A notice rides the stream as an info-level ``error`` output item; servers
+    before 0.18.0 drop that item on persist, so the harness answers those (and
+    an unknown version) with a failed turn, which every server persists.
+
+    :param server_version: The server's reported version, or ``None`` when the
+        probe has not succeeded yet.
+    :returns: ``True`` iff the version is known and its release is ``>= 0.18.0``.
+    """
+    return server_version is not None and _server_release_at_least(
+        server_version, _DURABLE_NOTICE_MIN_SERVER_VERSION, "durable notice"
+    )
 
 
 async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
@@ -433,11 +468,21 @@ _RUNNER_DISPATCHED_FIELD = "omnigent_runner_dispatched"
 
 
 def _is_turn_notice_event(event: Mapping[str, object]) -> bool:
-    """Whether *event* completes a harness notice: an info-level ``error`` output item."""
+    """Whether *event* completes a harness notice answering the turn's input.
+
+    The executor adapter emits such a notice as a harness-sourced, info-level
+    ``error`` output item. Side notices (sign-in completed, thread reset) are
+    posted as external conversation items and never ride the stream.
+    """
     if event.get("type") != "response.output_item.done":
         return False
     item = event.get("item")
-    return isinstance(item, dict) and item.get("type") == "error" and item.get("level") == "info"
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "error"
+        and item.get("source") == "harness"
+        and item.get("level") == "info"
+    )
 
 
 def _encode_sse_event(event: Mapping[str, object]) -> bytes:
@@ -5039,6 +5084,11 @@ def create_runner_app(
                 extra={"session_id": conv},
             )
         harness_body.update(input_attributes(msg_body))
+        # Lets the adapter answer a TurnNotice as a notice item only when this
+        # server persists one; see _version_supports_durable_notices.
+        harness_body["durable_notices"] = _version_supports_durable_notices(
+            await _get_server_version(server_client)
+        )
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union

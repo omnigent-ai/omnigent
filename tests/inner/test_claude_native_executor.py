@@ -268,8 +268,6 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
         )
     ]
 
-    # A notice + a clean completion — not an ExecutorError (which would
-    # surface as a failed turn with a destructive error pill).
     assert len(events) == 2
     assert isinstance(events[0], TurnNotice)
     assert "omni setup" in events[0].message

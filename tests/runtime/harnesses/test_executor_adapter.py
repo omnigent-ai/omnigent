@@ -522,7 +522,9 @@ async def test_turn_notice_emits_info_error_item_and_completes(
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
     async with client.stream(
-        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+        "POST",
+        f"/v1/sessions/{conv_id}/events",
+        json={**_start_turn_body(), "durable_notices": True},
     ) as response:
         async for event in _stream_iter(response):
             events.append(event)
@@ -546,6 +548,47 @@ async def test_turn_notice_emits_info_error_item_and_completes(
     assert item["source"] == "harness"
     assert item["code"] == "mock_notice"
     assert "omni setup" in item["message"]
+
+
+async def test_turn_notice_is_a_failed_turn_for_servers_without_durable_notices(
+    use_notice: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """Without ``durable_notices`` a TurnNotice becomes the legacy failed turn.
+
+    A server older than 0.18.0 drops info-level error output items on persist,
+    so the guidance would vanish on reload. The adapter then answers with the
+    ``response.failed`` shape every server keeps, naming the message as never
+    delivered so the queued web input settles too.
+    """
+    from omnigent.server.routes._sessions.helpers import _error_item_from_sse
+
+    conv_id = "conv_notice_legacy"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    assert "response.completed" not in [e.event for e in events]
+    assert not [
+        e
+        for e in events
+        if e.event == "response.output_item.done"
+        and isinstance(e.data.get("item"), dict)
+        and e.data["item"].get("type") == "error"
+    ]
+    error = events[-1].data["response"]["error"]
+    assert error["code"] == "mock_notice"
+    assert "omni setup" in error["message"]
+    assert error["undelivered"] is True
+    # The failed turn is what every server persists across reloads.
+    persisted = _error_item_from_sse(events[-1].data, response_id="resp_legacy")
+    assert persisted is not None and persisted.type == "error"
+    assert "omni setup" in persisted.data.message
 
 
 async def test_provider_auth_required_survives_adapter_and_sse_envelope(

@@ -7342,18 +7342,24 @@ _NOTICE_ITEM_DONE: dict[str, Any] = {
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn_announced", [True, False], ids=["in_progress_first", "no_in_progress"]
+)
 async def test_relay_settles_queued_native_message_answered_by_notice(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    turn_announced: bool,
 ) -> None:
     """A notice that answers a web message commits that message ahead of itself.
 
     An intercepted ``/login`` never reaches the harness, so no transcript
     mirror drains its queued entry even though the turn completes. The notice
     names the message it answers; the relay persists it as the user message
-    under the turn's id, publishes the consumed event that swaps the optimistic
-    bubble, and leaves nothing queued, so the session list reads idle instead
-    of promoting the idle session to running until the entry expires.
+    under the notice's turn id, publishes the consumed event that swaps the
+    optimistic bubble, and leaves nothing queued, so the session list reads
+    idle instead of promoting the idle session to running until the entry
+    expires. The two items share one id even when the notice arrives before
+    the turn announced its own.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
@@ -7378,25 +7384,17 @@ async def test_relay_settles_queued_native_message_answered_by_notice(
         real_publish(session_id, event)
 
     monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
-    client = _ScriptedStreamingRunnerClient(
-        [
-            _sse_frame(
-                {
-                    "type": "response.in_progress",
-                    "response": {"id": "resp_notice", "model": "claude"},
-                }
-            ),
-            _sse_frame({**_NOTICE_ITEM_DONE, "input_stable_id": stable_id}),
-            _sse_frame(
-                {
-                    "type": "response.completed",
-                    "response": {"id": "resp_notice", "model": "claude"},
-                }
-            ),
-            _sse_frame({"type": "session.status", "status": "idle", "response_id": "resp_notice"}),
-            "data: [DONE]\n\n",
-        ]
-    )
+    turn = {"id": "resp_notice", "model": "claude"}
+    frames: list[str | Callable[[], None]] = []
+    if turn_announced:
+        frames.append(_sse_frame({"type": "response.in_progress", "response": turn}))
+    frames += [
+        _sse_frame({**_NOTICE_ITEM_DONE, "input_stable_id": stable_id}),
+        _sse_frame({"type": "response.completed", "response": turn}),
+        _sse_frame({"type": "session.status", "status": "idle", "response_id": "resp_notice"}),
+        "data: [DONE]\n\n",
+    ]
+    client = _ScriptedStreamingRunnerClient(frames)
     try:
         # The queued command keeps the idle session listed as running until settled.
         assert _list_status_with_starting("idle", sid) == "running"
@@ -7409,8 +7407,10 @@ async def test_relay_settles_queued_native_message_answered_by_notice(
         assert message.data.user_authored is True
         assert "".join(b["text"] for b in message.data.content) == "/login"
         assert message.created_by == "alice@example.com"
-        # Both items share the turn's id so they group in one bubble.
-        assert message.response_id == notice.response_id == "resp_notice"
+        # Both items share one turn id so they group in one bubble.
+        assert message.response_id == notice.response_id
+        if turn_announced:
+            assert message.response_id == "resp_notice"
         assert notice.data.level == "info"
         assert notice.data.code == "claude_native_auth_command"
         assert pending_inputs.snapshot_for(sid) == []
@@ -7425,7 +7425,7 @@ async def test_relay_settles_queued_native_message_answered_by_notice(
         ]
         assert record.attributes["outcome"] == "answered_by_notice"
         assert record.attributes["input_stable_id"] == stable_id
-        assert record.attributes["response_id"] == "resp_notice"
+        assert record.attributes["response_id"] == message.response_id
     finally:
         pending_inputs.reset_for_tests()
 

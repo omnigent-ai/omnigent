@@ -13188,12 +13188,18 @@ _SSE_NOTICE_ITEM_DONE = (
     '"source":"harness","code":"claude_native_auth_command","level":"info",'
     '"message":"Run omni setup on the host to sign in again."}}\n\n'
 )
+_SSE_SIDE_NOTICE_ITEM_DONE = (
+    "event: response.output_item.done\ndata: "
+    '{"type":"response.output_item.done","item":{"id":"err_side","type":"error",'
+    '"source":"execution","code":"pi_native_effort_ignored","level":"info",'
+    '"message":"Reasoning effort is not supported by this model."}}\n\n'
+)
 
 
 @pytest.mark.asyncio
 async def test_notice_item_event_names_the_web_message_it_answers() -> None:
     """
-    A notice item carries the web message's stable id; the completion does not.
+    A harness notice item carries the web message's stable id; other items do not.
 
     A harness that answers a web message with guidance instead of running it
     never mirrors that message back, so the server settles its queued entry by
@@ -13215,7 +13221,12 @@ async def test_notice_item_event_names_the_web_message_it_answers() -> None:
             HarnessProcessManager,
             _FakeProcessManager(
                 _FakeHarnessClient(
-                    [_SSE_RESPONSE_CREATED, _SSE_NOTICE_ITEM_DONE, _SSE_RESPONSE_COMPLETED]
+                    [
+                        _SSE_RESPONSE_CREATED,
+                        _SSE_NOTICE_ITEM_DONE,
+                        _SSE_SIDE_NOTICE_ITEM_DONE,
+                        _SSE_RESPONSE_COMPLETED,
+                    ]
                 )
             ),
         ),
@@ -13243,9 +13254,66 @@ async def test_notice_item_event_names_the_web_message_it_answers() -> None:
             if any(e.get("type") == "response.completed" for e in published):
                 break
             await asyncio.sleep(0.02)
-    notices = [e for e in published if e.get("type") == "response.output_item.done"]
-    assert notices, "the notice item was not published"
-    assert notices[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    items = [e for e in published if e.get("type") == "response.output_item.done"]
+    assert [e["item"]["code"] for e in items] == [
+        "claude_native_auth_command",
+        "pi_native_effort_ignored",
+    ]
+    assert items[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    # An info item that is not a harness notice does not answer the message.
+    assert "input_stable_id" not in items[1]
     completed = [e for e in published if e.get("type") == "response.completed"]
     assert completed, "response.completed was not published"
     assert "input_stable_id" not in completed[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_version", "durable"),
+    [("0.17.0", False), ("0.18.0.dev0", True), (None, False)],
+    ids=["old-server", "current-server", "unknown-server"],
+)
+async def test_turn_tells_the_harness_whether_the_server_keeps_notices(
+    monkeypatch: pytest.MonkeyPatch, server_version: str | None, durable: bool
+) -> None:
+    """
+    The forwarded turn says whether a notice item survives on this server.
+
+    Servers before 0.18.0 drop info-level error output items on persist, so
+    the adapter must answer a notice as a failed turn for them; the runner
+    decides from the cached server version and sends the verdict in-band.
+    """
+    import omnigent.runner.app as app_module
+
+    monkeypatch.setattr(app_module, "_server_version", server_version)
+    conv = f"conv_durable_notices_{durable}_{server_version}"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="durable-notice-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    harness = _RecordingHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED])
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(harness)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_durable",
+                "model": "x",
+                "content": [{"role": "user", "content": "/login"}],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+    assert harness.posted_bodies, "the turn was not forwarded to the harness"
+    assert harness.posted_bodies[-1]["durable_notices"] is durable

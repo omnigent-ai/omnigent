@@ -20,6 +20,7 @@ _TERMINAL_VIEW = '[data-testid="terminal-view"]'
 _FAILED_TURN_PILL = '[data-testid="error-pill"][data-level="error"]'
 _NOTICE_PILL = '[data-testid="error-pill"][data-level="info"]'
 _GUIDANCE = "omni setup on the host"
+_GUIDANCE_BODY = "do nothing from the web chat"
 
 _TERMINAL_READY_TIMEOUT_MS = 180_000
 _TURN_SETTLE_TIMEOUT_S = 90.0
@@ -63,7 +64,9 @@ def _list_status(base_url: str, session_id: str) -> str:
         timeout=10.0,
     )
     response.raise_for_status()
-    return str(next(s["status"] for s in response.json()["data"] if s["id"] == session_id))
+    status = next((s["status"] for s in response.json()["data"] if s["id"] == session_id), None)
+    assert status is not None, f"session {session_id!r} is missing from the session list"
+    return str(status)
 
 
 def _wait_for_turn_outcome(page: Page, base_url: str, session_id: str) -> str:
@@ -88,10 +91,14 @@ def _wait_for_turn_outcome(page: Page, base_url: str, session_id: str) -> str:
 
 
 def _expect_notice(page: Page) -> None:
-    """The guidance is readable on a neutral notice pill; no failed-turn pill exists."""
+    """The guidance headline and body are readable on a neutral notice; no failed-turn pill."""
     notice = page.locator(_NOTICE_PILL).first
     expect(notice).to_be_visible(timeout=30_000)
     expect(notice.get_by_text(_GUIDANCE).first).to_be_visible()
+    notice.get_by_test_id("error-headline").click()
+    body = notice.get_by_test_id("error-message-content")
+    expect(body).to_be_visible(timeout=10_000)
+    expect(body.get_by_text(_GUIDANCE_BODY)).to_be_visible()
     expect(page.locator(_FAILED_TURN_PILL)).to_have_count(0)
 
 

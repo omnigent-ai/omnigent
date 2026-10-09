@@ -351,6 +351,12 @@ class ExecutorAdapter(HarnessApp):
                     system_prompt=system_prompt,
                     config=config,
                 ):
+                    if isinstance(event, TurnNotice) and not request.durable_notices:
+                        # The server would drop the notice item on reload; answer
+                        # as the failed turn every server persists instead.
+                        event = ExecutorError(
+                            message=event.message, code=event.code, undelivered=True
+                        )
                     if ctx.cancelled.is_set():
                         log_input_event(
                             _logger,
@@ -1107,7 +1113,8 @@ class ExecutorAdapter(HarnessApp):
             if event.usage is not None:
                 ctx.provider_usage = event.usage
         elif isinstance(event, TurnNotice):
-            # Persist guidance as an info notice without failing the turn.
+            # Persist guidance as an info notice without failing the turn. The
+            # runner treats this stream-borne harness notice as answering the input.
             ctx.emit(
                 OutputItemDoneEvent(
                     type="response.output_item.done",
