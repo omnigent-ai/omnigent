@@ -2664,7 +2664,9 @@ def augment_claude_args(
     # Claude Code renders a predicted next prompt dimmed inside the input box
     # after each turn. The bridge reads that box as text, so the suggestion
     # looks like an unsent draft and a bare Enter would submit it.
-    if "--prompt-suggestions" not in args:
+    if not any(
+        arg == "--prompt-suggestions" or arg.startswith("--prompt-suggestions=") for arg in args
+    ):
         args.extend(["--prompt-suggestions", "false"])
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])

@@ -484,3 +484,146 @@ async def test_running_edge_keeps_a_result_the_orchestrator_has_not_received(
     assert kept.status == "completed" and not kept.delivered
     assert kept.output == "round one: found the bug"
     assert kept.work_id == work_id
+
+
+class _HeldSleep:
+    """Stand-in for ``_wake_retry_sleep`` that parks until the test releases it."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.calls: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        await self.release.wait()
+
+
+async def _let_settle_run() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_spurious_running_edge_is_settled_when_the_file_reads_idle_again(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-arm with no ``Stop`` behind it goes back to the drained state.
+
+    The poller is re-armed by the hook's idle, so a ``busy`` left over from the
+    turn that just ended can publish ``running`` once more. When the file then
+    reads ``idle`` and no terminal report arrives within the grace window, the
+    dispatch must not stay live: the orchestrator would read ``waiting`` forever
+    and the trailing-idle dedup for the drained turn would be lost.
+    """
+    monkeypatch.setattr(runner_app, "_server_version", "0.16.0")
+    held = _HeldSleep()
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", held)
+    server = _ChildSnapshotServerClient()
+    app, inbox, work_id = _dispatch_worker(server)
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        await _deliver_and_drain_round_one(client, inbox, server)
+        app.state.native_pane_status[PARENT_SESSION_ID] = "idle"
+        _parent_status_events()
+
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        await asyncio.sleep(0)
+        assert _parent_status_events() == ["waiting"]
+        live = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert live is not None and live.rearmed and live.status == "running"
+
+        # Claude's file reads idle again and no Stop follows.
+        publish_pane_status(CHILD_SESSION_ID, "idle", None)
+        await _let_settle_run()
+        assert held.calls == [runner_app._SUBAGENT_REARM_SETTLE_GRACE_S]
+        assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is live, (
+            "the re-arm must survive until the grace window elapses"
+        )
+        held.release.set()
+        await _let_settle_run()
+
+        assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
+        assert CHILD_SESSION_ID in subagent_work._drained_delivered_subagent_children
+        assert subagent_work._drained_subagent_work_ids[CHILD_SESSION_ID] == work_id
+        assert _parent_status_events() == ["idle"], (
+            "the orchestrator must stop reading waiting on a turn that never happened"
+        )
+
+        # The drained turn's trailing idle stays a no-op.
+        r = await _post_status(client, status="idle", output="round one: found the bug")
+        assert r.status_code == 204
+        assert inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_turn_end_within_the_grace_window_keeps_the_rearmed_result(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude writes ``idle`` before its ``Stop`` lands; the result is still delivered.
+
+    At the end of a real self-resumed turn the file flips to idle moments before
+    the forwarder's turn-end edge reaches the runner, so the grace window must
+    leave the re-armed entry in place for that report.
+    """
+    held = _HeldSleep()
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", held)
+    server = _ChildSnapshotServerClient()
+    app, inbox, work_id = _dispatch_worker(server)
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        await _deliver_and_drain_round_one(client, inbox, server)
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        publish_pane_status(CHILD_SESSION_ID, "idle", None)
+        await _let_settle_run()
+
+        r2_idle = await _post_status(
+            client, status="idle", output="round two: should I open the PR?"
+        )
+        assert r2_idle.status_code == 204
+        second = _drain_queue(inbox)
+        _assert_fresh_result(second, work_id=work_id)
+
+        held.release.set()
+        await _let_settle_run()
+        settled = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert settled is not None and settled.status == "completed" and settled.delivered
+        assert not settled.rearmed
+        assert CHILD_SESSION_ID not in subagent_work._drained_delivered_subagent_children
+
+
+@pytest.mark.asyncio
+async def test_spurious_running_edge_restores_a_delivered_result_the_parent_has_not_read(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round one was delivered but not drained when a stale ``busy`` re-armed the child.
+
+    Settling puts the delivered entry back, so the orchestrator's later drain
+    still finds the dispatch it is receipting and a duplicate report of round
+    one is still answered as already delivered.
+    """
+    held = _HeldSleep()
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", held)
+    server = _ChildSnapshotServerClient()
+    app, inbox, work_id = _dispatch_worker(server)
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        r1 = await _post_status(client, status="idle", output="round one: found the bug")
+        assert r1.status_code == 204
+        delivered = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert delivered is not None and delivered.delivered
+
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is not delivered
+        publish_pane_status(CHILD_SESSION_ID, "idle", None)
+        await _let_settle_run()
+        held.release.set()
+        await _let_settle_run()
+
+        assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is delivered
+        assert delivered.work_id == work_id and delivered.status == "completed"
+        r_dup = await _post_status(client, status="idle", output="round one: found the bug")
+        assert r_dup.status_code == 204
+        assert inbox.qsize() == 1, "the duplicate report must not deliver round one twice"

@@ -193,6 +193,7 @@ from omnigent.runner.subagent_work import (
     mark_subagent_work_started,
     mark_subagent_work_terminal,
     note_subagent_child_activity,
+    settle_spurious_subagent_rearm,
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
@@ -404,6 +405,10 @@ _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # final long round covers a server that is reachable but slow to become ready;
 # rounds cost nothing once no parent is stranded (the loop exits early).
 _STRANDED_WAKE_RETRY_DELAYS_S = (2.0, 5.0, 10.0, 30.0)
+# How long a child re-armed by its own ``running`` edge may read ``idle`` again
+# before that re-arm is treated as a stale status-file read rather than a turn.
+# The forwarder's ``Stop`` for a real turn lands well within this window.
+_SUBAGENT_REARM_SETTLE_GRACE_S = 30.0
 
 # Cadence for ``session.heartbeat`` keepalive events on the runner's
 # ``GET /v1/sessions/{id}/stream`` endpoint. Between turns the event
@@ -1619,6 +1624,10 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
+    # Parent -> the status this runner published for it because a re-armed child
+    # was running, so a settled spurious re-arm can take that status back.
+    _rearm_parent_status: dict[str, str] = {}
+
     def _note_subagent_child_activity(child_id: str) -> None:
         """Re-arm a finished dispatch on new child activity and show an idle parent waiting."""
         entry = note_subagent_child_activity(child_id)
@@ -1626,10 +1635,49 @@ def create_runner_app(
             return
         parent_id = entry.parent_session_id
         # A parent mid-turn derives ``waiting`` at its own turn end; a native
-        # parent's status is owned by its terminal (``_publish_turn_status`` skips it).
-        if parent_id in _active_turns or _native_pane_status.get(parent_id) != "idle":
+        # parent's status is owned by its terminal (``_publish_turn_status`` skips
+        # it). No status published in this process means no turn in flight here.
+        if parent_id in _active_turns or _native_pane_status.get(parent_id) not in (None, "idle"):
             return
+        before = _native_pane_status.get(parent_id)
         _publish_turn_status(parent_id, "waiting")
+        after = _native_pane_status.get(parent_id)
+        if after is not None and after != before:
+            _rearm_parent_status[parent_id] = after
+
+    def _settle_subagent_rearm_later(child_id: str) -> None:
+        """Undo a re-arm the file's own ``idle`` contradicts and no ``Stop`` confirms in time."""
+        entry = get_subagent_work(child_id)
+        if entry is None or not entry.rearmed or entry.status != "running":
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _settle() -> None:
+            await _subagent_work._wake_retry_sleep(_SUBAGENT_REARM_SETTLE_GRACE_S)
+            if get_subagent_work(child_id) is not entry:
+                return
+            reverted = settle_spurious_subagent_rearm(child_id)
+            if reverted is None:
+                return
+            parent_id = reverted.parent_session_id
+            published = _rearm_parent_status.pop(parent_id, None)
+            if (
+                published is not None
+                and _native_pane_status.get(parent_id) == published
+                and parent_id not in _active_turns
+                and not any(
+                    e.status in ("launching", "running", "waiting")
+                    for e in list_subagent_work(parent_id)
+                )
+            ):
+                _publish_turn_status(parent_id, "idle")
+
+        task = loop.create_task(_settle(), name=f"subagent-rearm-settle:{child_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     def _publish_session_status(
         session_id: str,
@@ -1643,6 +1691,8 @@ def create_runner_app(
             # The poller and pane watcher publish a claude-native child's
             # ``running`` here, never on ``/events``.
             _note_subagent_child_activity(session_id)
+        elif status == "idle":
+            _settle_subagent_rearm_later(session_id)
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)

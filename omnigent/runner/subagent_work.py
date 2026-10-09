@@ -136,6 +136,12 @@ class _SubagentWorkEntry:
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
         terminal edge from the child afterwards must replace it.
+    :param rearmed: Whether this live entry was opened by the child's own
+        ``running`` edge after its last result was delivered or drained
+        (see :func:`note_subagent_child_activity`), with no terminal report
+        yet confirming a real turn.
+    :param rearmed_from: The delivered entry that re-arm replaced, so a
+        spurious re-arm can restore it; ``None`` when it replaced a drain.
     """
 
     parent_session_id: str
@@ -152,6 +158,8 @@ class _SubagentWorkEntry:
     delivered: bool = False
     cancellation_confirmed: bool = False
     launch_timed_out: bool = False
+    rearmed: bool = False
+    rearmed_from: _SubagentWorkEntry | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -418,6 +426,7 @@ def note_subagent_child_activity(child_session_id: str) -> _SubagentWorkEntry | 
             created_by=entry.created_by,
             work_id=entry.work_id,
         )
+        fresh.rearmed_from = entry
     else:
         if not forget_drained_subagent_delivery(child_session_id):
             return None
@@ -429,7 +438,36 @@ def note_subagent_child_activity(child_session_id: str) -> _SubagentWorkEntry | 
             # snapshot recovery to deliver the result.
             return None
     fresh.status = "running"
+    fresh.rearmed = True
     return fresh
+
+
+def settle_spurious_subagent_rearm(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Undo a re-arm that no terminal report confirmed.
+
+    The status-file poller re-reads Claude's file after every forwarded turn
+    end, so a ``busy`` left over from the turn that just ended can publish a
+    ``running`` edge for a turn that never happens. Once the file reads
+    ``idle`` again with no ``Stop`` behind it, the dispatch goes back to its
+    finished state: the delivered entry it replaced, or the drain memory, so
+    the parent is not counted as waiting on it and a later duplicate report
+    of the old result is still absorbed.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The reverted live entry, or ``None`` when the child has no
+        unsettled re-arm.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None or not entry.rearmed or entry.status != "running":
+        return None
+    if entry.rearmed_from is not None:
+        _subagent_work_by_child[child_session_id] = entry.rearmed_from
+    else:
+        unregister_subagent_work(child_session_id, work_id=entry.work_id)
+        _drained_delivered_subagent_children.add(child_session_id)
+        _drained_subagent_work_ids[child_session_id] = entry.work_id
+    return entry
 
 
 def unregister_subagent_work(
@@ -809,6 +847,9 @@ def mark_subagent_work_terminal(
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
+    # A terminal report confirms the turn a re-arm anticipated.
+    entry.rearmed = False
+    entry.rearmed_from = None
     return _deliver_subagent_completion(entry)
 
 

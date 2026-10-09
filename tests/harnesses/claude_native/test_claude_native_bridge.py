@@ -12561,3 +12561,9 @@ def test_augment_claude_args_disables_prompt_suggestions_unless_requested(tmp_pa
     )
     assert explicit.count("--prompt-suggestions") == 1
     assert explicit[explicit.index("--prompt-suggestions") + 1] == "true"
+
+    joined = augment_claude_args(
+        ("--prompt-suggestions=true",), bridge_dir=tmp_path, python_executable="/venv/bin/python"
+    )
+    assert joined.count("--prompt-suggestions=true") == 1
+    assert "--prompt-suggestions" not in joined

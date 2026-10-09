@@ -550,6 +550,7 @@ async def test_self_resumed_child_result_is_delivered_after_a_drain() -> None:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work.unregister_child_session(child_id)
         subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._drained_subagent_work_ids.pop(child_id, None)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
