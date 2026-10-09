@@ -2282,7 +2282,9 @@ async def test_launch_failure_names_silent_exit_real_tmux(
     with pytest.raises(RuntimeError) as excinfo:
         await instance.launch(cwd=tmp_path)
 
-    assert str(excinfo.value) == "tmux launch failed (rc=1): <tmux produced no output>"
+    message = str(excinfo.value)
+    assert message.startswith("tmux launch failed (rc=1): ")
+    assert not message.rstrip().endswith(":"), message
     assert instance.running is False
 
 

@@ -181,7 +181,9 @@ def test_pi_terminal_ensure_failure_keeps_tmux_diagnostic(tmp_path: Path) -> Non
             "Runner log never recorded 'Pi terminal ensure failed for session='. "
             f"Log tail:\n{log_text[-2500:]}"
         )
-        failure_lines = [line for line in log_text.splitlines() if "tmux launch failed" in line]
+        failure_lines = [
+            line for line in log_text.splitlines() if "tmux launch failed (rc=1):" in line
+        ]
         assert failure_lines, (
             f"Runner log never recorded the tmux launch failure. Log tail:\n{log_text[-2500:]}"
         )
