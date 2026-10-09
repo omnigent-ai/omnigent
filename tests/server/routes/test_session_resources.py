@@ -7436,6 +7436,113 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
 
 
 @pytest.mark.asyncio
+async def test_setup_failure_failed_event_settles_input_without_a_response_id() -> None:
+    """A runner setup failure settles its input and foils the later false missing-report.
+
+    A codex-native turn that fails during runner setup (e.g. the bridge
+    labels lookup) never emitted ``response.in_progress``, so its
+    ``response.failed`` carries no response id — only ``input_stable_id``
+    and ``error.undelivered``. The relay must still settle exactly that
+    queued entry (minting a response id for it), persist no error item from
+    the id-less event (the ``session.status: failed`` edge owns the one
+    card), and leave the queue clean so the next message's own mirror
+    matches without skipping a stale entry into a false
+    ``native_prompt_not_recorded``.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_content = [{"type": "input_text", "text": "set up the worktree"}]
+    next_content = [{"type": "input_text", "text": "then run the tests"}]
+    first_pending = pending_inputs.record(
+        sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
+    )
+    next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    assert first_pending != next_pending
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": first_stable_id,
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "runner_error",
+                            "message": "turn setup failed: Host credential service "
+                            "could not supply workspace credentials",
+                            "undelivered": True,
+                        },
+                    },
+                    "error": {
+                        "code": "runner_error",
+                        "message": "turn setup failed: Host credential service "
+                        "could not supply workspace credentials",
+                        "undelivered": True,
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {
+                        "code": "runner_error",
+                        "message": "turn setup failed: Host credential service "
+                        "could not supply workspace credentials",
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        # The failed turn's own message settled; the id-less response.failed
+        # persisted no error item, and the next entry stayed queued.
+        assert [item.type for item in store.appended_items] == ["message"]
+        settled = store.appended_items[0]
+        assert settled.data.content == first_content
+        assert settled.created_by == "alice@example.com"
+        assert settled.response_id
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            next_pending
+        ]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": next_content},
+                    "response_id": "resp_next",
+                    "source_id": "codex:next-input:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+        # The mirror matched its own entry: no stale entry was skipped into a
+        # false missing-from-transcript error.
+        assert [item.type for item in store.appended_items] == ["message", "message"]
+        assert store.appended_items[-1].data.content == next_content
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_relay_leaves_the_queue_alone_when_the_harness_may_have_the_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
