@@ -1130,9 +1130,11 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
 
     - The **Pod phase** is ``Failed`` (the Job controller gave up after
       exhausting ``backoffLimit``), OR
-    - The host container is in ``CrashLoopBackOff`` (the kubelet is still
-      retrying, but the container is crash-looping and unlikely to self-heal
-      during the launch window).
+    - Any container — an init container (Pod still ``Pending``, e.g. the
+      workspace-prep clone failing) or the host container (Pod ``Running``) —
+      is in ``CrashLoopBackOff`` (the kubelet is still retrying, but the
+      container is crash-looping and unlikely to self-heal during the launch
+      window).
 
     :param pod: A ``V1Pod`` read from the API.
     :returns: The failed container name + summary, or ``None``.
@@ -1162,16 +1164,28 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
                 )
         return _CONTAINER_NAME, "entered terminal phase 'Failed'"
 
-    # Host container in CrashLoopBackOff while the Pod is still Running —
-    # the kubelet is retrying but the host is crash-looping.
-    for cs in getattr(status, "container_statuses", None) or []:
-        waiting = getattr(getattr(cs, "state", None), "waiting", None)
-        if waiting is not None:
-            wr = getattr(waiting, "reason", None)
-            if wr == "CrashLoopBackOff":
+    # A container in CrashLoopBackOff won't self-heal during the launch window.
+    # Init containers crash-loop with the Pod still Pending; the host container
+    # with the Pod Running.
+    for kind, default_name, statuses in (
+        (
+            "init container",
+            _INIT_CONTAINER_NAME,
+            getattr(status, "init_container_statuses", None) or [],
+        ),
+        (
+            "host container",
+            _CONTAINER_NAME,
+            getattr(status, "container_statuses", None) or [],
+        ),
+    ):
+        for cs in statuses:
+            waiting = getattr(getattr(cs, "state", None), "waiting", None)
+            if getattr(waiting, "reason", None) == "CrashLoopBackOff":
                 restart_count = getattr(cs, "restart_count", "?")
-                return getattr(cs, "name", _CONTAINER_NAME), (
-                    f"host container is crash-looping "
+                name = getattr(cs, "name", None) or default_name
+                return name, (
+                    f"{kind} '{name}' is crash-looping "
                     f"(restarts: {restart_count}, CrashLoopBackOff)"
                 )
 
@@ -1778,9 +1792,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 time.sleep(_POD_READY_POLL_S)
                 continue
 
-            # Check for terminal failure BEFORE accepting Running — a
-            # crash-looping host container stays in phase Running under
-            # OnFailure, so phase alone is not proof of liveness.
+            # Check for terminal failure BEFORE accepting Running — under
+            # OnFailure a crash-looping container leaves the phase at Running
+            # (host) or Pending (init), so phase alone is not proof of liveness.
             failure = _terminal_failure(pod)
             if failure is not None:
                 container, summary = failure
