@@ -2369,6 +2369,295 @@ async def test_runner_failed_status_carries_setup_error_message(
     assert error["code"]
 
 
+async def _drain_turn_events(
+    queues: dict[str, Any],
+    conv: str,
+    *,
+    until_status: str,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    """Collect every event a runner published for a session.
+
+    Like :func:`_drain_published_statuses` but keeps all event types, so a
+    test can assert on ``response.failed`` events published alongside the
+    terminal ``session.status``.
+
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
+    :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param until_status: Stop once this ``session.status`` value is observed.
+    :param timeout: Hard cap in seconds.
+    :returns: Ordered event dicts published for *conv*.
+    """
+    events: list[dict[str, Any]] = []
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        queue = queues.get(conv)
+        drained = False
+        while queue is not None and not queue.empty():
+            event = queue.get_nowait()
+            drained = True
+            if isinstance(event, dict):
+                events.append(event)
+        if any(
+            event.get("type") == "session.status" and event.get("status") == until_status
+            for event in events
+        ):
+            return events
+        if not drained:
+            # Let the background turn task make progress before re-polling.
+            await asyncio.sleep(0.02)
+    return events
+
+
+async def _run_codex_native_turn_with_raising_labels(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    conv: str,
+    raised_message: str,
+    *,
+    stable_id: str | None,
+) -> list[dict[str, Any]]:
+    """Drive a codex-native background turn whose labels lookup raises.
+
+    The bridge labels lookup is where a runner-spawn credential failure
+    surfaces, before the message reaches the harness.
+
+    :param monkeypatch: Pytest fixture used to isolate the bridge directory
+        and replace the labels lookup.
+    :param tmp_path: Pytest temp dir receiving the isolated bridge files.
+    :param conv: Session/conversation identifier.
+    :param raised_message: Message the labels lookup raises with.
+    :param stable_id: Web stable id to put on the posted message, if any.
+    :returns: Ordered events the runner published for *conv*.
+    """
+    # Keep the codex-native pre-turn bridge writes out of the real
+    # ``~/.omnigent/codex-native`` tree (the documented isolation point).
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
+
+    async def _raising_labels(**kwargs: object) -> dict[str, str]:
+        """
+        Stand in for the bridge labels lookup and fail on credentials.
+
+        :param kwargs: The lookup's keyword arguments (unused).
+        :returns: Never returns.
+        :raises RuntimeError: Always — mirrors a credential-service failure.
+        """
+        del kwargs
+        raise RuntimeError(raised_message)
+
+    monkeypatch.setattr("omnigent.runner.app._session_labels_for_runner_spawn", _raising_labels)
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return a codex-native spec so the turn takes the labels-lookup arm.
+
+        :param agent_id: Agent id requested by the runner (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal codex-native spec.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="codex-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    body: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_codex",
+        "model": "x",
+        "content": [{"role": "user", "content": "hi"}],
+    }
+    if stable_id is not None:
+        body["stable_id"] = stable_id
+    async with _runner_test_client(app) as http:
+        response = await http.post(f"/v1/sessions/{conv}/events", json=body)
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        return await _drain_turn_events(
+            app.state.session_event_queues, conv, until_status="failed", timeout=2.0
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_bg_setup_failure_marks_message_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A setup failure before the handoff reports the web input undelivered.
+
+    When turn setup raises before the message reaches the harness (e.g. the
+    bridge labels lookup fails on missing workspace credentials), nothing
+    ever mirrors the queued web input back, so the runner publishes an
+    undelivered ``response.failed`` naming the input's stable id; the server
+    settles exactly that queued entry instead of a later mirror reporting it
+    missing from the native transcript.
+
+    :param monkeypatch: Pytest fixture, used to fail the labels lookup.
+    :param tmp_path: Pytest temp dir receiving the isolated bridge files.
+    """
+    raised_message = "Host credential service could not supply workspace credentials"
+    events = await _run_codex_native_turn_with_raising_labels(
+        monkeypatch,
+        tmp_path,
+        "conv_setup_failure_undelivered",
+        raised_message,
+        stable_id="st-undelivered-1",
+    )
+
+    failed_events = [e for e in events if e.get("type") == "response.failed"]
+    assert len(failed_events) == 1
+    failed = failed_events[0]
+    assert failed.get("input_stable_id") == "st-undelivered-1"
+    error = failed.get("error")
+    assert isinstance(error, dict)
+    assert error.get("undelivered") is True
+    assert raised_message in str(error.get("message"))
+    response = failed.get("response")
+    assert isinstance(response, dict)
+    response_error = response.get("error")
+    assert isinstance(response_error, dict)
+    assert response_error.get("undelivered") is True
+    # The terminal status edge still publishes, naming the same failure so
+    # the web folds both into one card.
+    status_events = [
+        e for e in events if e.get("type") == "session.status" and e.get("status") == "failed"
+    ]
+    assert len(status_events) == 1
+    status_error = status_events[0].get("error")
+    assert isinstance(status_error, dict)
+    assert status_error.get("code") == error.get("code")
+    assert status_error.get("message") == error.get("message")
+
+
+class _StreamRaisingProcessManager(_FakeProcessManager):
+    """Process manager stub whose client lookup raises an uncaught error.
+
+    ``_stream_message_to_harness`` converts a ``RuntimeError`` from
+    ``get_client`` into a 503 error response, so this stub raises a
+    ``ValueError`` to exercise a failure that escapes the streaming call.
+    """
+
+    async def get_client(
+        self,
+        conversation_id: str,
+        harness_name: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> _FakeHarnessClient:
+        """
+        Raise past the ``RuntimeError`` arm that becomes a 503.
+
+        :param conversation_id: Omnigent conversation id.
+        :param harness_name: Harness name requested by the runner.
+        :param env: Optional spawn environment.
+        :returns: Never returns.
+        :raises ValueError: Always.
+        """
+        del conversation_id, harness_name, env
+        raise ValueError("stream setup exploded")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_bg_stream_failure_is_not_marked_undelivered() -> None:
+    """A failure after the handoff must not settle the input as undelivered.
+
+    Once the turn reaches ``_stream_message_to_harness`` the harness may have
+    received the message, so a failure there must NOT publish an undelivered
+    ``response.failed`` — the harness's own mirror can still arrive and the
+    queued entry must stay put for it.
+    """
+    conv = "conv_stream_failure_not_undelivered"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Pin the turn to the test harness so dispatch reaches the spawn.
+
+        :param agent_id: Agent id requested by the runner (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal spec naming the test harness.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="stream-raising-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _StreamRaisingProcessManager()),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_stream_raise",
+                "model": "x",
+                "stable_id": "st-maybe-delivered-1",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        events = await _drain_turn_events(
+            app.state.session_event_queues, conv, until_status="failed", timeout=2.0
+        )
+
+    assert [e for e in events if e.get("type") == "response.failed"] == []
+    status_events = [
+        e for e in events if e.get("type") == "session.status" and e.get("status") == "failed"
+    ]
+    assert len(status_events) == 1
+    status_error = status_events[0].get("error")
+    assert isinstance(status_error, dict)
+    assert "stream setup exploded" in str(status_error.get("message"))
+
+
+@pytest.mark.asyncio
+async def test_run_turn_bg_setup_failure_without_stable_id_publishes_no_extra_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A setup failure for a message with no stable id settles nothing.
+
+    Only a web-originated message carries a stable id; without one there is
+    no queued input to settle, so the runner publishes no extra
+    ``response.failed`` — just the terminal status edge as before.
+
+    :param monkeypatch: Pytest fixture, used to fail the labels lookup.
+    :param tmp_path: Pytest temp dir receiving the isolated bridge files.
+    """
+    events = await _run_codex_native_turn_with_raising_labels(
+        monkeypatch,
+        tmp_path,
+        "conv_setup_failure_no_stable_id",
+        "Host credential service could not supply workspace credentials",
+        stable_id=None,
+    )
+
+    assert [e for e in events if e.get("type") == "response.failed"] == []
+    status_events = [
+        e for e in events if e.get("type") == "session.status" and e.get("status") == "failed"
+    ]
+    assert len(status_events) == 1
+
+
 # ── Harness-stream failure → terminal session.status ────
 
 
