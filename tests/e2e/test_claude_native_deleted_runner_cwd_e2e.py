@@ -6,14 +6,12 @@ hooks, MCP relay, and workspace file read all run normally.
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import secrets
 import shutil
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -29,6 +27,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
 )
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.test_host_claude_native_e2e import _poll_for_assistant_marker
 from tests.e2e.test_host_claude_native_fork_e2e import _send_user_message
 from tests.server.integration.mock_llm_server import (
@@ -241,22 +240,15 @@ os_env:
   sandbox:
     type: none
 """
-            bundle = io.BytesIO()
-            with tarfile.open(fileobj=bundle, mode="w:gz") as archive:
-                info = tarfile.TarInfo("deleted-runner-cwd.yaml")
-                info.size = len(spec)
-                archive.addfile(info, io.BytesIO(spec))
-            response = client.post(
+            bundle_bytes = bundle_files({"deleted-runner-cwd.yaml": spec})
+            response = post_session_bundle(
+                client.post,
                 "/v1/sessions",
-                data={
-                    "metadata": json.dumps(
-                        {
-                            "workspace": str(workspace),
-                            "labels": {"omnigent.wrapper": "claude-code-native-ui"},
-                        }
-                    )
+                bundle_bytes,
+                metadata={
+                    "workspace": str(workspace),
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
                 },
-                files={"bundle": ("agent.tar.gz", bundle.getvalue(), "application/gzip")},
             )
             response.raise_for_status()
             session_id = response.json()["session_id"]

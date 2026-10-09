@@ -38,7 +38,6 @@ Usage::
 from __future__ import annotations
 
 import io
-import json as _json
 import sys
 import tarfile
 import threading
@@ -51,6 +50,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -245,11 +245,8 @@ def test_mcp_elicitation_delivers_user_selected_answer_not_schema_default(
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
-    resp = http_client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    resp = post_session_bundle(
+        http_client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code not in (200, 201, 409):
         pytest.fail(f"Agent registration failed: {resp.status_code} {resp.text[:500]}")

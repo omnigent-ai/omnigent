@@ -65,7 +65,10 @@ def _open_right_rail(page: Page) -> None:
     expect(toggle).to_be_visible(timeout=20_000)
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
-    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail).to_be_visible()
+    # The sliding rail can move the shell's close button under a pending click.
+    rail.evaluate("el => Promise.all(el.getAnimations().map(animation => animation.finished))")
 
 
 def _terminal_id(session_id: str) -> str:

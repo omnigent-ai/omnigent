@@ -408,6 +408,58 @@ describe("authenticatedFetch", () => {
       expect(response.status).toBe(200);
     });
 
+    it.each([200, 400, 500, 503])(
+      "only drops the shared parent host key after a successful fallback (HTTP %s)",
+      async (fallbackStatus) => {
+        vi.doUnmock("./sessionHost");
+        const { setSessionHost, setSessionParent } = await import("./sessionHost");
+        setSessionHost("parent", "host_parent");
+        setSessionParent("child", "parent");
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+        }));
+        const { authenticatedFetch } = await import("./identity");
+        fetchMock
+          .mockResolvedValueOnce(
+            new Response(JSON.stringify({ error: { code: "wrong_replica" } }), { status: 400 }),
+          )
+          .mockResolvedValueOnce(
+            new Response(
+              JSON.stringify(
+                fallbackStatus === 200
+                  ? { queued: true }
+                  : { error: { code: "runner_unavailable" } },
+              ),
+              { status: fallbackStatus },
+            ),
+          )
+          .mockResolvedValue(mockJsonResponse({ queued: true }));
+
+        const response = await authenticatedFetch("/v1/sessions/child/events", {
+          method: "POST",
+          body: JSON.stringify({ type: "message", data: { content: "side question" } }),
+        });
+        expect(response.status).toBe(fallbackStatus);
+        await authenticatedFetch("/v1/sessions/child/events", {
+          method: "POST",
+          body: JSON.stringify({ type: "retry_session" }),
+        });
+        await authenticatedFetch("/v1/sessions/parent/events", {
+          method: "POST",
+          body: JSON.stringify({ type: "message", data: { content: "main question" } }),
+        });
+
+        const subsequentKey = fallbackStatus === 200 ? null : "host_parent";
+        expect(
+          fetchMock.mock.calls.map(([, init]) =>
+            new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+          ),
+        ).toEqual(["host_parent", null, subsequentKey, subsequentKey]);
+      },
+    );
+
     it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
       // The import reads the CHOSEN host's transcripts over that host's tunnel,
       // so it must route to the replica keyed by the body host_id — never the

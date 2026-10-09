@@ -757,7 +757,7 @@ describe("NewChatLandingScreen project prefill", () => {
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
     await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
     expect(workspaceTrigger).toHaveTextContent("gamma");
-    expect(worktreeTrigger).toHaveTextContent("feature/x");
+    expect(worktreeTrigger).toHaveTextContent("feature-x");
     expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
     const body = await submitAndReadBody();
     // Bound straight to the worktree dir; the worktree's branch rides along and
@@ -1121,7 +1121,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     localStorage.removeItem(ALWAYS_WORKTREE_KEY);
     renderLanding();
 
-    await waitFor(() => expect(branchLabel()).toBe("Choose"));
+    await waitFor(() => expect(branchLabel()).toBe("None"));
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
