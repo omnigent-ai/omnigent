@@ -8,8 +8,8 @@ login`` CLI command.
 
 Native apps sign in through the system browser with an RFC 8252
 redirect: a loopback (the desktop shell) or an allowlisted private-use
-scheme (the iOS app's ``ai.omnigent.ios:/oauth/callback``, see
-:data:`NATIVE_APP_REDIRECT_URIS`). ``/auth/login`` accepts that
+scheme (the iOS and Android apps, see :data:`NATIVE_APP_REDIRECT_URIS`).
+``/auth/login`` accepts that
 ``native_redirect_uri`` plus a PKCE ``code_challenge``, the callback
 redirects the browser to it with a one-time code, and the app exchanges
 the code and its verifier at ``/auth/native-token``. The code only
@@ -72,7 +72,9 @@ _NATIVE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 # RFC 8252 §7.1 private-use-scheme redirects of first-party apps, matched
 # exactly. The well-known manifest lists them so an app can tell whether
 # this server accepts its redirect before opening the browser.
-NATIVE_APP_REDIRECT_URIS: frozenset[str] = frozenset({"ai.omnigent.ios:/oauth/callback"})
+NATIVE_APP_REDIRECT_URIS: frozenset[str] = frozenset(
+    {"ai.omnigent.android:/oauth/callback", "ai.omnigent.ios:/oauth/callback"}
+)
 _NATIVE_PARAMS = ("native_redirect_uri", "native_state", "code_challenge", "code_challenge_method")
 # RFC 7636: an S256 challenge is a 43-char base64url SHA-256 digest, and a
 # verifier is 43-128 unreserved characters.

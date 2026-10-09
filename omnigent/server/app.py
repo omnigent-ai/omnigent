@@ -2872,11 +2872,12 @@ def create_app(
            (``/auth/login`` native parameters + ``POST /auth/native-token``).
            ``session_cookie`` names the session cookie for ``oidc`` and
            ``accounts`` and is ``null`` otherwise. ``native_redirect_uris``
-           lists the private-use-scheme redirects (e.g. the iOS app's
-           ``ai.omnigent.ios:/oauth/callback``) the native sign-in accepts
-           besides loopback, sorted, for ``oidc``; ``null`` otherwise. The
-           iOS app gates on its URI being listed, because servers that only
-           support loopback answer the custom scheme with 400. A missing
+           lists the private-use-scheme redirects (the iOS and Android apps'
+           ``ai.omnigent.ios:/oauth/callback`` and
+           ``ai.omnigent.android:/oauth/callback``) the native sign-in accepts
+           besides loopback, sorted, for ``oidc``; ``null`` otherwise. Each
+           app gates on its own URI being listed, because servers that don't
+           accept it answer that redirect with 400. A missing
            ``auth`` (older servers) means "sign in as before".
         6. ``server_name`` (str | null) is the operator's display name for
            this deployment (``branding.server_name``), for clients that list
