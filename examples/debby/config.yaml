@@ -12,11 +12,9 @@
 # Usage:
 #   omnigent run examples/debby
 #
-# Debby's two heads run on the claude-sdk and codex-native harnesses, so
-# configure both a Claude and an OpenAI provider first (e.g. `omnigent setup`,
-# or export ANTHROPIC_API_KEY and OPENAI_API_KEY). The codex-native head also
-# needs the Codex CLI installed (and, on Linux, `bwrap` for the terminal
-# sandbox).
+# Debby's heads run on claude-sdk and codex-native: configure a Claude and an
+# OpenAI provider (`omnigent setup`, or export ANTHROPIC_API_KEY and
+# OPENAI_API_KEY). The codex-native head also needs the Codex CLI installed.
 
 spec_version: 1
 name: debby

@@ -6,11 +6,20 @@ description: >-
 
 # Native Codex harness (like Polly's codex worker), no model pinned. The GPT
 # head uses the configured OpenAI provider, or the credential broker on a
-# managed Databricks host, without the SDK codex harness's os_env sandbox.
+# managed Databricks host, without the SDK codex harness's signer-gated start.
 executor:
   type: omnigent
   config:
     harness: codex-native
+
+# Keep the native Codex terminal unsandboxed, like Polly's codex worker: without
+# an os_env block it would default to the platform sandbox (bwrap on Linux), so
+# sandbox: none runs it in the caller's working directory.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
 
 # Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
 # identically: the catastrophic set (force-push, ``rm -rf /``, hard-reset to a

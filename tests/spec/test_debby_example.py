@@ -1,16 +1,13 @@
 """Regression guard for the Debby example's GPT head.
 
-Debby's "GPT" sub-agent must run on the ``codex-native`` harness, not the SDK
-``codex`` harness or ``openai-agents``. Routed to a Databricks provider, the
-SDK ``codex`` harness only starts inside an active ``os_env`` sandbox — the
-reported signer-backed startup failure. ``openai-agents`` treats an unpinned
-model as a Databricks model (``is_databricks_model = model is None`` in
-``omnigent/inner/openai_agents_sdk_executor.py``) and, with no
-``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` set, silently falls back to ambient
-Databricks credentials, routing the "GPT" head through the Databricks gateway
-instead of OpenAI. ``codex-native`` is GPT-only and needs no ``os_env``
-sandbox; on a managed host it reaches Databricks only through the deliberate
-credential broker, not that silent fallback.
+Debby's "GPT" sub-agent must run on the ``codex-native`` harness with an
+explicit unsandboxed ``os_env`` (``sandbox.type: none``), like Polly's codex
+worker. The SDK ``codex`` harness, routed to a Databricks provider, fails the
+signer-backed ``os_env`` sandbox gate (the reported bug); ``openai-agents``
+with no pinned model silently routes the head to ambient Databricks
+credentials instead of OpenAI. The explicit ``os_env`` is also required:
+without it the native Codex terminal defaults to the platform sandbox
+(``bwrap`` on Linux) and cannot start on hosts without Bubblewrap.
 
 This is a non-live parse-only check so it runs in the default suite (the
 dir-shaped example's own e2e coverage lives under ``tests/e2e``, which is
@@ -30,12 +27,12 @@ _PACKAGED_DEBBY_DIR = _REPO_ROOT / "omnigent" / "resources" / "examples" / "debb
 
 
 def test_debby_gpt_head_uses_codex_not_openai_agents() -> None:
-    """The GPT head runs on the ``codex-native`` harness.
+    """The GPT head runs on ``codex-native`` with an unsandboxed ``os_env``.
 
     Flipping to the SDK ``codex`` harness reintroduces the reported
-    signer-backed startup failure on a Databricks host; flipping to
-    ``openai-agents`` with no pinned model silently routes the head through
-    ambient Databricks credentials. codex-native avoids both.
+    signer-backed startup failure; ``openai-agents`` with no pinned model
+    silently routes to ambient Databricks credentials; dropping the explicit
+    ``os_env`` makes the native terminal require ``bwrap`` on Linux.
     """
     spec = parse(_DEBBY_DIR)
     by_name = {sub.name: sub for sub in spec.sub_agents}
@@ -48,6 +45,19 @@ def test_debby_gpt_head_uses_codex_not_openai_agents() -> None:
         f"{gpt.executor.harness_kind!r}. The SDK 'codex' harness needs an "
         f"os_env sandbox on a Databricks host, and 'openai-agents' with no "
         f"pinned model silently routes to ambient Databricks credentials."
+    )
+
+    # The native Codex terminal inherits this os_env's sandbox. Without an
+    # explicit sandbox: none it defaults to the platform sandbox (bwrap on
+    # Linux), so the head must keep the unsandboxed caller-process environment.
+    assert gpt.os_env is not None and gpt.os_env.sandbox is not None, (
+        "Debby's GPT head must declare an os_env with a sandbox so the native "
+        "Codex terminal does not default to the platform sandbox."
+    )
+    assert gpt.os_env.sandbox.type == "none", (
+        f"Debby's GPT head must keep sandbox.type: none; got "
+        f"{gpt.os_env.sandbox.type!r}. Any other type requires bwrap/user "
+        f"namespaces for the native terminal on Linux hosts."
     )
 
     # Belt-and-suspenders: the GPT head must not pin a Databricks model or
