@@ -241,6 +241,45 @@ async def test_close_expected_closes_its_own_instance(tmp_path: Path) -> None:
     assert reg.get("conv_close_expected_own", "claude", "main") is None
 
 
+def test_native_panes_returns_the_registered_instance(tmp_path: Path) -> None:
+    """
+    ``native_panes`` snapshots the exact instance holding each native key.
+
+    The idle pane reaper acts on this snapshot later, possibly after a slow
+    close has freed the key for a replacement. Without the instance in the
+    snapshot the reaper can only close (and tear down codex resources) by
+    key/session id, which removes whatever holds the key at teardown time —
+    including a live successor. The instance is the ownership handle that
+    makes the reap a compare-and-close.
+    """
+    reg = TerminalRegistry()
+    codex = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "codex.sock",
+        private_dir=tmp_path / "codex",
+        running=True,
+    )
+    other = TerminalInstance(
+        name="bash",
+        session_key="main",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+    reg._by_conversation["conv_native_panes"] = {
+        ("codex", "main"): codex,
+        ("bash", "main"): other,
+    }
+
+    panes = reg.native_panes()
+
+    assert len(panes) == 1
+    conv_id, name, socket_path, instance = panes[0]
+    assert (conv_id, name, socket_path) == ("conv_native_panes", "codex", codex.socket_path)
+    assert instance is codex, "the snapshot must carry the exact registered instance"
+
+
 @pytest.mark.asyncio
 async def test_launch_replaces_stale_running_entry(
     tmp_path: Path,
