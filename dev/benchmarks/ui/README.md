@@ -41,6 +41,9 @@ uv run --no-sync dev/benchmarks/ui/run.py \
   --output-dir artifacts/ui-benchmark
 ```
 
+`--baseline-revision` is required with `--baseline-dist` so reports identify
+the baseline build without assuming it matches the driver's revision.
+
 Both bundles use the candidate's backend, fixture, and Playwright version.
 Only one page is measured at a time; the order alternates base/candidate,
 candidate/base, base/candidate across the three runs. Use the **same bundle**

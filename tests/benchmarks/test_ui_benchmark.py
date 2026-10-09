@@ -213,16 +213,51 @@ def test_ui_cli_rejects_invalid_counts_and_budgets(
     assert option in capsys.readouterr().err.partition("error:")[2]
 
 
-def test_ui_cli_requires_both_bundles(tmp_path: Path) -> None:
+def test_ui_cli_requires_both_bundles(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     (tmp_path / "index.html").write_text("<html></html>")
     with pytest.raises(SystemExit, match="2"):
-        parse_args(["--web-dist", str(tmp_path), "--baseline-dist", str(tmp_path / "missing")])
+        parse_args(
+            [
+                "--web-dist",
+                str(tmp_path),
+                "--baseline-dist",
+                str(tmp_path / "missing"),
+                "--baseline-revision",
+                "base-sha",
+            ]
+        )
+    assert "No built SPA" in capsys.readouterr().err.partition("error:")[2]
 
 
-def test_paired_comparisons_require_repeated_runs(tmp_path: Path) -> None:
+def test_ui_cli_requires_baseline_revision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "index.html").write_text("<html></html>")
+    args = ["--web-dist", str(tmp_path), "--baseline-dist", str(tmp_path)]
+    with pytest.raises(SystemExit, match="2"):
+        parse_args(args)
+    assert "requires --baseline-revision" in capsys.readouterr().err.partition("error:")[2]
+    assert parse_args([*args, "--baseline-revision", "base-sha"]).baseline_revision == "base-sha"
+
+
+def test_paired_comparisons_require_repeated_runs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     (tmp_path / "index.html").write_text("<html></html>")
     with pytest.raises(SystemExit, match="2"):
-        parse_args(["--web-dist", str(tmp_path), "--baseline-dist", str(tmp_path), "--runs", "1"])
+        parse_args(
+            [
+                "--web-dist",
+                str(tmp_path),
+                "--baseline-dist",
+                str(tmp_path),
+                "--baseline-revision",
+                "base-sha",
+                "--runs",
+                "1",
+            ]
+        )
+    assert "at least three --runs" in capsys.readouterr().err.partition("error:")[2]
 
 
 @pytest.mark.parametrize("regression", [False, True])

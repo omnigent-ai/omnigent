@@ -227,7 +227,7 @@ async def measure_scenario(
             session_open=[open_ms],
             dom_elements=elements,
             dom_elements_after=elements_after,
-            page_errors=errors,
+            page_errors=list(errors),
         )
         if errors:
             raise RuntimeError(f"Browser errors: {errors}")
@@ -509,6 +509,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.cpu_throttle < 1:
         parser.error("--cpu-throttle must be at least 1")
+    if args.baseline_dist and not args.baseline_revision:
+        parser.error("--baseline-dist requires --baseline-revision for report provenance")
     if args.baseline_dist and args.runs < 3:
         parser.error("--baseline-dist requires at least three --runs")
     for name in ("web_dist", "baseline_dist"):
