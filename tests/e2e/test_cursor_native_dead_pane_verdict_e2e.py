@@ -24,6 +24,7 @@ from omnigent.harnesses.cursor_native.bridge import (
     write_tmux_target,
 )
 from omnigent.harnesses.cursor_native.permissions import _send_cursor_keys
+from omnigent.inner.terminal import tmux_reports_target_gone
 
 pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
@@ -35,14 +36,22 @@ _ERROR_SIGNATURE = "failed to send cursor keystroke"
 _SESSION_ID = "1080588264878826"
 # What _run_one_approval sends for a Reject verdict: the decline key then Enter.
 _DECLINE_SEQUENCE = ("Escape", "Enter")
+# Bound the teardown call so a hung tmux surfaces instead of blocking cleanup.
+_TMUX_TEARDOWN_TIMEOUT_S = 10.0
 
 
 def _kill_tmux_pane(socket_path: Path) -> None:
-    subprocess.run(
+    proc = subprocess.run(
         ["tmux", "-S", str(socket_path), "kill-server"],
         check=False,
         capture_output=True,
+        text=True,
+        timeout=_TMUX_TEARDOWN_TIMEOUT_S,
     )
+    # Only drop the socket once the server is confirmed gone; unlinking after an
+    # operational failure would strand a still-live server behind a missing socket.
+    if proc.returncode != 0 and not tmux_reports_target_gone(proc.stderr.strip()):
+        raise RuntimeError(f"tmux kill-server failed: {proc.stderr.strip()!r}")
     socket_path.unlink(missing_ok=True)
 
 
