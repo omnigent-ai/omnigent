@@ -2,7 +2,7 @@
 End-to-end guard: a crash-looping workspace-prep init container must fail the
 managed Kubernetes launch fast, with the init container's log tail attached.
 
-User journey (operator + user), from the bug report:
+Journey (operator + user):
 
 1. An operator configures ``sandbox.provider: kubernetes`` on the server,
    pointing at a cluster whose sandbox namespace cannot reach the clone host
@@ -14,167 +14,45 @@ User journey (operator + user), from the bug report:
 3. ``git clone`` in the ``workspace-prep`` init container fails immediately
    and the kubelet restarts it: the Pod sits in phase ``Pending`` with the
    init container in ``CrashLoopBackOff`` — it will never come up.
-4. The user watches the session's sandbox launch progress. Expected: the
-   launch fails fast, names the crash-looping container, and carries a tail
-   of its log (the clone error). Observed (bug): the launch polls the full
-   ``pod_ready_timeout_s`` (90s by default) and the failure carries only Pod
-   events, never the log tail.
+4. The user watches the session's sandbox launch progress: it must fail
+   within seconds, name the crash-looping container, and carry a tail of its
+   log (the clone error) instead of polling out ``pod_ready_timeout_s`` with
+   Pod events only.
 
 The apiserver is unreachable from the test environment, so a stub
 ``kubernetes`` package on the server subprocess's PYTHONPATH stands in for
-the cluster, replaying exactly what a real apiserver reports for this state
-(``init_container_statuses[0].state.waiting.reason == "CrashLoopBackOff"``,
-Pod ``Pending``, kubelet ``BackOff`` events, the clone error in the init
-container's log). Everything else is real: the server process, its config
-parsing, the managed-session HTTP journey, the launcher's start wait, and
-the failure-message builder.
+the cluster (see ``tests/e2e/_k8s_crashloop_stub_sdk``). Everything else is
+real: the server process, its config parsing, the managed-session HTTP
+journey, the launcher's start wait, and the failure-message builder.
 """
 
 from __future__ import annotations
 
-import os
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import httpx
 import pytest
-import yaml
 
-from tests.e2e._k8s_crashloop_stub_sdk import CLONE_ERROR_LINE as _CLONE_ERROR_LINE
-from tests.e2e._k8s_crashloop_stub_sdk import STUB_FILES as _STUB_FILES
+from tests._helpers.live_server import find_free_port
+from tests.e2e._k8s_crashloop_server import spawn_server, terminate, wait_for_health
+from tests.e2e._k8s_crashloop_stub_sdk import CLONE_ERROR_LINE
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-
-_HEALTH_TIMEOUT_S = 180.0
 _POLL_INTERVAL_S = 0.5
 
 # The repository workspace the user asks for — the clone the init container
 # fails on.
 _REPO_URL = "https://github.com/omnigent-ai/omnigent"
 
-# Pod-ready budget for the fail-fast test: generous enough that a fail-fast
-# well under it is unambiguous, small enough that the buggy
-# poll-to-the-deadline path doesn't stall CI for the default 90s.
-_FAILFAST_POD_READY_TIMEOUT_S = 45
+# Pod-ready budget: generous enough that a fail-fast well under it is
+# unambiguous, small enough that the buggy poll-to-the-deadline path doesn't
+# stall CI for the default 90s.
+_POD_READY_TIMEOUT_S = 45
 
-# A crash-loop detected at the first poll after the stub enters
-# CrashLoopBackOff (~3s in) fails the launch within seconds; the buggy path
-# cannot fail before the 45s deadline. 25s splits the two with wide margins.
+# The stub parks workspace-prep in CrashLoopBackOff ~3s after the Job is
+# submitted, so a fail-fast start wait surfaces the failure within seconds;
+# the buggy path cannot fail before the 45s deadline. 25s splits the two.
 _FAILFAST_MAX_S = 25.0
-
-# Pod-ready budget for the log-tail test: the message-content assertion is
-# deadline-independent, so keep the buggy run short.
-_LOG_TAIL_POD_READY_TIMEOUT_S = 10
-
-
-def _find_free_port() -> int:
-    """Bind port 0 and return the assigned free port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _write_stub_sdk(tmp_path: Path) -> Path:
-    """Materialize the stub ``kubernetes`` package; return its sys.path root."""
-    root = tmp_path / "k8s_stub"
-    for rel, source in _STUB_FILES.items():
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source)
-    return root
-
-
-def _write_server_config(tmp_path: Path, port: int, pod_ready_timeout_s: int) -> Path:
-    """Write a server config enabling the kubernetes sandbox provider."""
-    config_path = tmp_path / "server-config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "sandbox": {
-                    "server_url": f"http://127.0.0.1:{port}",
-                    "provider": "kubernetes",
-                    "kubernetes": {
-                        "image": "ghcr.io/omnigent-ai/omnigent-host:e2e",
-                        "namespace": "omnigent-sandboxes",
-                        "in_cluster": False,
-                        "kubeconfig": str(tmp_path / "kubeconfig"),
-                        "pod_ready_timeout_s": pod_ready_timeout_s,
-                    },
-                }
-            }
-        )
-    )
-    (tmp_path / "kubeconfig").write_text("")
-    return config_path
-
-
-def _spawn_server(
-    tmp_path: Path, config_path: Path, port: int
-) -> tuple[subprocess.Popen[bytes], Path]:
-    """Start a real ``omnigent server`` subprocess wired to the stub SDK."""
-    stub_root = _write_stub_sdk(tmp_path)
-    pythonpath = os.pathsep.join(
-        [
-            str(stub_root),
-            str(_REPO_ROOT),
-            str(_REPO_ROOT / "sdks" / "python-client"),
-            str(_REPO_ROOT / "sdks" / "ui"),
-            os.environ.get("PYTHONPATH", ""),
-        ]
-    )
-    env = {
-        **os.environ,
-        "PYTHONPATH": pythonpath,
-        "OPENAI_API_KEY": "unused-no-turn-runs",
-        "OMNIGENT_BUILTIN_AGENT_DIRS": str(
-            _REPO_ROOT / "tests" / "resources" / "agents" / "sdk-chat-builtin.yaml"
-        ),
-    }
-    log_path = tmp_path / "server.log"
-    # The child owns its own copy of the log fd; closing ours after spawn is safe.
-    with open(log_path, "w") as log_handle:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{tmp_path / 'e2e.db'}",
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-                "--config",
-                str(config_path),
-            ],
-            env=env,
-            cwd=str(_REPO_ROOT),
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-        )
-    return proc, log_path
-
-
-def _wait_for_health(proc: subprocess.Popen[bytes], base_url: str, log_path: Path) -> None:
-    """Wait for /health, failing with the server log if the process dies."""
-    deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            pytest.fail(
-                f"server exited (code {proc.returncode}) before serving /health:\n"
-                f"{log_path.read_text()[-2000:]}"
-            )
-        try:
-            if httpx.get(f"{base_url}/health", timeout=2.0).status_code == 200:
-                return
-        except httpx.HTTPError:
-            pass  # not listening yet; keep polling until the deadline
-        time.sleep(_POLL_INTERVAL_S)
-    pytest.fail(f"server did not become healthy:\n{log_path.read_text()[-2000:]}")
 
 
 def _create_managed_repo_session(base_url: str) -> str:
@@ -224,67 +102,36 @@ def _await_failed_launch(
     )
 
 
-def test_init_crashloop_fails_fast_before_pod_ready_deadline(tmp_path: Path) -> None:
-    """A crash-looping init container must fail the launch fast, not at the deadline.
-
-    The stub cluster parks ``workspace-prep`` in ``CrashLoopBackOff`` ~3s
-    after the Job is submitted; the kubelet will never bring the Pod up. The
-    start wait is expected to detect that terminal state and fail within
-    seconds. The bug: ``_terminal_failure`` never reads
-    ``init_container_statuses`` outside phase ``Failed``, so the launch
-    burns the whole ``pod_ready_timeout_s`` (90s by default) before failing.
-    """
-    port = _find_free_port()
-    config_path = _write_server_config(tmp_path, port, _FAILFAST_POD_READY_TIMEOUT_S)
-    proc, log_path = _spawn_server(tmp_path, config_path, port)
+def test_init_crashloop_fails_fast_with_init_log_tail(tmp_path: Path) -> None:
+    """An init crash loop fails the launch before the pod-ready deadline, and
+    the failure names the init container and carries its log tail."""
+    port = find_free_port()
+    proc, log_path = spawn_server(tmp_path, port, _POD_READY_TIMEOUT_S)
     try:
         base_url = f"http://127.0.0.1:{port}"
-        _wait_for_health(proc, base_url, log_path)
+        wait_for_health(proc, base_url, log_path)
         session_id = _create_managed_repo_session(base_url)
         elapsed, error = _await_failed_launch(
-            base_url, session_id, _FAILFAST_POD_READY_TIMEOUT_S + 45.0, log_path
+            base_url, session_id, _POD_READY_TIMEOUT_S + 45.0, log_path
         )
     finally:
-        proc.kill()
-        proc.wait(timeout=30)
+        terminate(proc)
 
-    assert elapsed < _FAILFAST_MAX_S, (
-        f"launch failure took {elapsed:.1f}s — the crash-looping workspace-prep "
-        f"init container was not fail-fast detected and the start wait polled to "
-        f"its {_FAILFAST_POD_READY_TIMEOUT_S}s pod-ready deadline (90s in a "
-        f"default deployment); error: {error[:500]}"
-    )
-
-
-def test_init_crashloop_failure_carries_init_container_log_tail(tmp_path: Path) -> None:
-    """The launch failure must carry the init container's log tail.
-
-    The module docstring promises the launch error carries "a tail of the
-    failed container's log (e.g. the ``git clone`` error from the init
-    container)", and the stub cluster serves exactly that log. The bug: the
-    crash-loop is never attributed to the init container, the poll times
-    out, and the timeout diagnostics attach Pod events but never fetch the
-    container log — leaving the user without the actual clone error.
-    """
-    port = _find_free_port()
-    config_path = _write_server_config(tmp_path, port, _LOG_TAIL_POD_READY_TIMEOUT_S)
-    proc, log_path = _spawn_server(tmp_path, config_path, port)
-    try:
-        base_url = f"http://127.0.0.1:{port}"
-        _wait_for_health(proc, base_url, log_path)
-        session_id = _create_managed_repo_session(base_url)
-        _, error = _await_failed_launch(
-            base_url, session_id, _LOG_TAIL_POD_READY_TIMEOUT_S + 45.0, log_path
+    problems: list[str] = []
+    if elapsed >= _FAILFAST_MAX_S:
+        problems.append(
+            f"launch failure took {elapsed:.1f}s — the crash-looping workspace-prep "
+            f"init container was not fail-fast detected and the start wait polled to "
+            f"its {_POD_READY_TIMEOUT_S}s pod-ready deadline (90s in a default "
+            f"deployment)"
         )
-    finally:
-        proc.kill()
-        proc.wait(timeout=30)
-
-    assert "workspace-prep" in error, (
-        f"launch failure does not name the failed init container: {error[:800]}"
-    )
-    assert _CLONE_ERROR_LINE in error, (
-        "launch failure dropped the workspace-prep log tail — the user never "
-        "sees the git clone error the init container printed (the apiserver "
-        f"served it via read_namespaced_pod_log); error: {error[:800]}"
-    )
+    if "workspace-prep" not in error:
+        problems.append(f"launch failure does not name the failed init container: {error[:800]}")
+    if CLONE_ERROR_LINE not in error:
+        problems.append(
+            "launch failure dropped the workspace-prep log tail — the user never "
+            "sees the git clone error the init container printed (the apiserver "
+            f"served it via read_namespaced_pod_log); error: {error[:800]}"
+        )
+    if problems:
+        pytest.fail("\n".join(problems))

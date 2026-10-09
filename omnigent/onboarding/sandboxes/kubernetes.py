@@ -1164,10 +1164,9 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
                 )
         return _CONTAINER_NAME, "entered terminal phase 'Failed'"
 
-    # A container in CrashLoopBackOff — the kubelet is still retrying, but it
-    # won't self-heal during the launch window. An init container crash-loops
-    # with the Pod still Pending (e.g. the workspace-prep clone failing); the
-    # host container with the Pod Running.
+    # A container in CrashLoopBackOff won't self-heal during the launch window.
+    # Init containers crash-loop with the Pod still Pending; the host container
+    # with the Pod Running.
     for kind, default_name, statuses in (
         (
             "init container",
@@ -1793,10 +1792,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 time.sleep(_POD_READY_POLL_S)
                 continue
 
-            # Check for terminal failure BEFORE accepting Running — a
-            # crash-looping container leaves the phase at Running (host) or
-            # Pending (init) under OnFailure, so phase alone is not proof of
-            # liveness.
+            # Check for terminal failure BEFORE accepting Running — under
+            # OnFailure a crash-looping container leaves the phase at Running
+            # (host) or Pending (init), so phase alone is not proof of liveness.
             failure = _terminal_failure(pod)
             if failure is not None:
                 container, summary = failure
