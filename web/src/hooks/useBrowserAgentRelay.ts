@@ -11,12 +11,69 @@
 import { useEffect } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+
+// Keep the post-claim lookup budget well below the server's 30s browser-action wait.
+const SOURCE_HOST_LOOKUP_TIMEOUT_MS = 2000;
+
+async function resolveSourceHostId(
+  queryClient: QueryClient,
+  sessionId: string,
+): Promise<string | null> {
+  const features = await getDesktopFeatures();
+  if (features?.databricksInternalFeatures !== true) return null;
+
+  // Cached parent links can be partial, so fetch each hop to find the nearest own host.
+  const visited = new Set<string>();
+  let id: string | null = sessionId;
+  while (id !== null && !visited.has(id)) {
+    visited.add(id);
+    const hopId: string = id;
+    // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
+    const source: Session = await queryClient.fetchQuery({
+      queryKey: ["session", hopId],
+      queryFn: () => getSessionSlim(hopId),
+      staleTime: Infinity,
+      retry: false,
+    });
+    setSessionHost(source.id, source.hostId);
+    setSessionParent(source.id, source.parentSessionId);
+    if (source.hostId) return source.hostId;
+    id = source.parentSessionId;
+  }
+  return null;
+}
+
+async function lookupSourceHostId(
+  queryClient: QueryClient,
+  sessionId: string,
+): Promise<string | null> {
+  const timeoutError = new Error("source host lookup timed out");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    // A race also bounds fetchQuery when it joins an existing in-flight request.
+    return await Promise.race([
+      resolveSourceHostId(queryClient, sessionId),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(timeoutError), SOURCE_HOST_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (error) {
+    if (error === timeoutError) {
+      console.warn("[browser-relay] source host lookup timed out");
+    } else {
+      console.warn("[browser-relay] source host lookup failed", error);
+    }
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -372,31 +429,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       if (!claimToken) return;
       let sourceHostId: string | null = null;
       if (evt.action === "navigate") {
-        try {
-          // Parent hints cannot establish which ancestor has the nearest own host binding.
-          const visited = new Set<string>();
-          let id: string | null = sourceConversationId;
-          while (id !== null && !visited.has(id)) {
-            visited.add(id);
-            const hopId: string = id;
-            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
-            const source: Session = await queryClient.fetchQuery({
-              queryKey: ["session", hopId],
-              queryFn: () => getSessionSlim(hopId),
-              staleTime: Infinity,
-              retry: false,
-            });
-            setSessionHost(source.id, source.hostId);
-            setSessionParent(source.id, source.parentSessionId);
-            if (source.hostId) {
-              sourceHostId = source.hostId;
-              break;
-            }
-            id = source.parentSessionId;
-          }
-        } catch {
-          // Unknown provenance stays denied for localhost; public browsing still works.
-        }
+        sourceHostId = await lookupSourceHostId(queryClient, sourceConversationId);
       }
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }

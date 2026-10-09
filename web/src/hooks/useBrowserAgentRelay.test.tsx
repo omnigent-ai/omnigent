@@ -4,9 +4,11 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // supportsBrowser gates the whole relay; force it true so the hook registers.
+const getDesktopFeatures = vi.fn();
 vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: () => true,
   supportsBrowser: () => true,
+  getDesktopFeatures: (...args: unknown[]) => getDesktopFeatures(...args),
 }));
 
 // The relay POSTs claim + result through authenticatedFetch; mock it so we can
@@ -111,6 +113,7 @@ function postedResult(): Record<string, unknown> {
 
 beforeEach(() => {
   authenticatedFetch.mockReset();
+  getDesktopFeatures.mockReset().mockResolvedValue({ databricksInternalFeatures: true });
   getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
     id,
     hostId: null,
@@ -123,6 +126,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
@@ -285,6 +290,150 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     // Every dispatch test wins the claim, then a benign result POST.
     authenticatedFetch.mockResolvedValue(WON);
   });
+  it.each([{ databricksInternalFeatures: false }, null, {}])(
+    "skips source metadata when desktop internal features are disabled (%j)",
+    async (features) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const bridge = installBridge();
+      getDesktopFeatures.mockResolvedValue(features);
+      getSessionSlim.mockResolvedValue({ id: CONV, hostId: "arca-host", parentSessionId: null });
+
+      await runAction(actionEvent("navigate", { url: "https://example.com" }));
+
+      expect(getSessionSlim).not.toHaveBeenCalled();
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        CONV,
+        "https://example.com",
+        undefined,
+        { force: true, agent: true },
+      );
+      expect(warn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("clears the lookup deadline timer after successful source-host resolution", async () => {
+    vi.useFakeTimers();
+    const bridge = installBridge();
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } });
+    getSessionSlim.mockResolvedValue({ id: CONV, hostId: "arca-host", parentSessionId: null });
+    renderRelay(CONV, client);
+    emitBrowserActionRequest(actionEvent("navigate", { url: "https://example.com" }), CONV);
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(postedResult().result).toHaveProperty("ok", true);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledExactlyOnceWith(
+      CONV,
+      "https://example.com",
+      undefined,
+      { force: true, agent: true, sourceHostId: "arca-host" },
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("dispatches without provenance when the desktop feature check rejects", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bridge = installBridge();
+    const error = new Error("feature IPC failed");
+    getDesktopFeatures.mockRejectedValue(error);
+
+    await runAction(actionEvent("navigate", { url: "https://example.com" }));
+
+    expect(getSessionSlim).not.toHaveBeenCalled();
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      CONV,
+      "https://example.com",
+      undefined,
+      { force: true, agent: true },
+    );
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "[browser-relay] source host lookup failed",
+      error,
+    );
+  });
+
+  it.each(["feature check", "session fetch", "joined session fetch"])(
+    "dispatches and posts the result after a stalled %s reaches the deadline",
+    async (stall) => {
+      vi.useFakeTimers();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const bridge = installBridge();
+      const client = new QueryClient();
+      if (stall === "feature check") {
+        getDesktopFeatures.mockImplementation(() => new Promise(() => {}));
+      } else {
+        getSessionSlim.mockImplementation(() => new Promise(() => {}));
+        if (stall === "joined session fetch") {
+          void client.fetchQuery({
+            queryKey: ["session", CONV],
+            queryFn: () => getSessionSlim(CONV),
+          });
+        }
+      }
+      renderRelay(CONV, client);
+      emitBrowserActionRequest(actionEvent("navigate", { url: "https://example.com" }), CONV);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledExactlyOnceWith(
+        CONV,
+        "https://example.com",
+        undefined,
+        { force: true, agent: true },
+      );
+      expect(postedResult()).toEqual({
+        claim_token: "tok_1",
+        result: { ok: true, data: { final_url: "https://example.com" } },
+      });
+      expect(warn).toHaveBeenCalledExactlyOnceWith("[browser-relay] source host lookup timed out");
+      expect(getSessionSlim).toHaveBeenCalledTimes(stall === "feature check" ? 0 : 1);
+    },
+  );
+
+  it("shares one deadline across the feature check and ancestry, ignoring a late host", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bridge = installBridge();
+    let resolveFeatures!: (features: { databricksInternalFeatures: boolean }) => void;
+    let resolveParent!: (source: unknown) => void;
+    getDesktopFeatures.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFeatures = resolve;
+        }),
+    );
+    getSessionSlim.mockImplementation((id: string) =>
+      id === CONV
+        ? Promise.resolve({ id, hostId: null, parentSessionId: "parent" })
+        : new Promise((resolve) => {
+            resolveParent = resolve;
+          }),
+    );
+    renderRelay();
+    emitBrowserActionRequest(actionEvent("navigate", { url: "https://example.com" }), CONV);
+    await vi.advanceTimersByTimeAsync(1000);
+    resolveFeatures({ databricksInternalFeatures: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual([CONV, "parent"]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(postedResult().result).toHaveProperty("ok", true);
+
+    resolveParent({ id: "parent", hostId: "arca-host", parentSessionId: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledExactlyOnceWith(
+      CONV,
+      "https://example.com",
+      undefined,
+      { force: true, agent: true },
+    );
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("[browser-relay] source host lookup timed out");
+  });
+
   it("derives inherited provenance from the source session, never model args or visible host", async () => {
     const bridge = installBridge();
     setSessionHost(CONV, "local-host");
