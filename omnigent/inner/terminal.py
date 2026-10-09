@@ -396,7 +396,8 @@ class _TmuxCommandFailedError(_TmuxCommandError):
     """tmux failed without confirming whether the target is alive."""
 
 
-def _tmux_reports_target_gone(detail: str) -> bool:
+def tmux_reports_target_gone(detail: str) -> bool:
+    """Return whether tmux stderr ``detail`` confirms the server or target is gone."""
     lowered = detail.lower()
     return lowered.startswith(_TMUX_TARGET_GONE_STDERR_MARKERS) or (
         lowered.startswith("error connecting to ")
@@ -409,7 +410,7 @@ def _tmux_command_failed_error(
 ) -> _TmuxCommandError:
     detail = stderr.decode(errors="replace").strip()
     error_type = (
-        _TmuxTargetGoneError if _tmux_reports_target_gone(detail) else _TmuxCommandFailedError
+        _TmuxTargetGoneError if tmux_reports_target_gone(detail) else _TmuxCommandFailedError
     )
     return error_type(cmd, returncode=returncode, stderr=stderr)
 
@@ -854,7 +855,7 @@ def reap_orphaned_terminals() -> int:
                 continue
             if result.returncode != 0 and socket_path.exists():
                 detail = result.stderr.decode(errors="replace").strip()
-                if not _tmux_reports_target_gone(detail):
+                if not tmux_reports_target_gone(detail):
                     # Keep the control socket until cleanup is confirmed.
                     logger.warning(
                         "tmux orphan cleanup failed (rc=%s) for %s; preserving its "
@@ -2465,7 +2466,7 @@ class TerminalInstance:
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
                 detail = stderr.decode(errors="replace").strip() or "<no stderr>"
-                if not _tmux_reports_target_gone(detail):
+                if not tmux_reports_target_gone(detail):
                     logger.warning(
                         "tmux liveness probe failed without confirming death "
                         "for terminal %s:%s; preserving optimistic running "

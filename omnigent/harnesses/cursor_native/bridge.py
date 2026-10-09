@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import click
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.terminal import tmux_reports_target_gone
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -649,23 +650,16 @@ class CursorPaneGoneError(RuntimeError):
     """Raised when tmux confirms the advertised Cursor pane is gone (expected teardown)."""
 
 
-# Markers in ``tmux has-session`` output that confirm the target session/pane is
-# genuinely absent (expected teardown). A nonzero exit for any other reason (e.g.
-# "Permission denied") does not confirm absence and must not be read as teardown.
-_PANE_ABSENT_MARKERS = (
-    "no server running",  # the tmux server for this socket is not running
-    "no such file or directory",  # the socket path does not exist
-    "can't find session",  # the server is up but this target session is gone
-)
-
-
 def _probe_session(socket_path: str, tmux_target: str) -> bool | None:
     """Return whether the pane exists, or ``None`` when the probe is inconclusive.
 
     ``True``/``False`` are returned only for a definitive ``tmux has-session``
-    answer (exit 0, or a nonzero exit whose output confirms the session is gone).
-    A probe that could not run, or failed for another operational reason, returns
-    ``None`` so callers keep treating a delivery failure as a genuine error.
+    answer (exit 0, or a nonzero exit whose stderr confirms the session is gone).
+    A probe that could not run, or failed for another operational reason (a
+    permission error, or a loader failure that keeps the tmux client from
+    starting), returns ``None`` so callers keep treating a delivery failure as a
+    genuine error. Classification reuses :func:`tmux_reports_target_gone` so a
+    bare ``No such file or directory`` substring is not mistaken for teardown.
     """
     try:
         proc = subprocess.run(
@@ -679,8 +673,7 @@ def _probe_session(socket_path: str, tmux_target: str) -> bool | None:
         return None
     if proc.returncode == 0:
         return True
-    output = f"{proc.stderr}\n{proc.stdout}".lower()
-    if any(marker in output for marker in _PANE_ABSENT_MARKERS):
+    if tmux_reports_target_gone(proc.stderr.strip()):
         return False
     return None
 

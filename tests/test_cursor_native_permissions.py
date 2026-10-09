@@ -255,6 +255,14 @@ def test_send_cursor_pane_keys_operational_probe_failure_stays_an_error(
         (1, "error connecting to sock (No such file or directory)", False),
         (1, "can't find session: main", False),
         (1, "error connecting to sock (Permission denied)", None),
+        # A dynamic-loader failure keeps the tmux client from starting; its
+        # trailing "No such file or directory" must not be read as teardown.
+        (
+            1,
+            "error while loading shared libraries: libtinfo.so.6: "
+            "cannot open shared object file: No such file or directory",
+            None,
+        ),
         (1, "", None),
     ],
 )
@@ -1052,8 +1060,11 @@ async def test_send_cursor_keys_dead_pane_drops_verdict_without_error(
     with caplog.at_level(logging.INFO, logger=cnp.__name__):
         assert await cnp._send_cursor_keys(tmp_path, "conv_gone", "Escape", "Enter") is False
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
-    # The drop is still observable, just as an expected teardown consequence.
-    assert any("cursor pane gone" in record.getMessage() for record in caplog.records)
+    # The drop is still observable, as an expected teardown consequence logged at INFO.
+    assert any(
+        record.levelno == logging.INFO and "cursor pane gone" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────

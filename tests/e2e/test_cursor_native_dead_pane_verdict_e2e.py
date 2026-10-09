@@ -4,14 +4,15 @@ not log the tracked operational-error signature.
 The harness answers a web card by sending tmux keystrokes into the runner-owned
 cursor-agent pane. Once that pane exits its socket is gone, so the keystroke can
 only be dropped — expected teardown that belongs below ERROR. This drives the
-real bridge + permissions path against a real tmux pane advertised then torn down
-mid-flight, asserting the Reject sequence (Escape, Enter) is reported undelivered
-without the signature.
+real bridge + permissions path against a real tmux pane that is torn down before
+the Reject sequence (Escape, Enter) is delivered, asserting the sequence is
+reported undelivered without the signature.
 """
 
 import logging
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -46,22 +47,24 @@ def _kill_tmux_pane(socket_path: Path) -> None:
 
 
 @pytest.fixture
-def cursor_bridge_with_live_pane(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[Path, Path]]:
+def cursor_bridge_with_live_pane() -> Iterator[tuple[Path, Path]]:
     """A cursor-native bridge dir advertising a real, live tmux pane."""
-    socket_path = tmp_path_factory.mktemp("cursor-terminal") / "tmux.sock"
-    bridge_dir = tmp_path_factory.mktemp("cursor-native-bridge")
-    subprocess.run(
-        ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "cursor", "sleep 600"],
-        check=True,
-        capture_output=True,
-    )
-    write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="cursor")
-    try:
-        yield bridge_dir, socket_path
-    finally:
-        _kill_tmux_pane(socket_path)
+    # A short /tmp path keeps the socket under the macOS Unix-socket length limit.
+    with tempfile.TemporaryDirectory(prefix="og-cursor-", dir="/tmp") as directory:
+        root = Path(directory)
+        socket_path = root / "tmux.sock"
+        bridge_dir = root / "bridge"
+        bridge_dir.mkdir()
+        subprocess.run(
+            ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "cursor", "sleep 600"],
+            check=True,
+            capture_output=True,
+        )
+        write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="cursor")
+        try:
+            yield bridge_dir, socket_path
+        finally:
+            _kill_tmux_pane(socket_path)
 
 
 async def test_cursor_decline_verdict_to_dead_pane_is_not_an_error_signature(
