@@ -15,11 +15,13 @@ import logging
 
 import pytest
 from prompt_toolkit.document import Document
+from rich.errors import MarkupError
 
 from omnigent.repl._repl import (
     _SLASH_COMMAND_ALIASES,
     COMMANDS,
     WELCOME_HINTS,
+    _attach_failure_notice,
     _build_call_id_to_name_lookup,
     _build_call_id_to_tool_metadata_lookup,
     _build_model_readout_lines,
@@ -382,6 +384,35 @@ def test_render_history_item_function_call_includes_args_summary() -> None:
         f"Args summary missing from function_call render. Got: {plain!r}. "
         f"If absent, args were dropped — resumed conversations show every "
         f"Read as anonymous ``⏵ Read`` with no file context."
+    )
+
+
+def test_render_history_item_function_call_with_markup_in_args_does_not_crash() -> None:
+    """Replayed tool-call args such as ``echo '[/dim]'`` render verbatim on the
+    ``⏵`` line instead of raising ``MarkupError`` and aborting ``--resume``."""
+    host = _CapturingHost()
+    item = {
+        "type": "function_call",
+        "call_id": "c1",
+        "name": "Bash",
+        "arguments": json.dumps({"command": "echo '[/dim]'"}),
+    }
+    _render_history_item(item, host)
+    plain = host.render_plain()
+    assert "Bash(echo '[/dim]')" in plain, (
+        f"markup in tool-call args must render as literal text, neither consumed "
+        f"as a closing tag nor shown with escape backslashes. Got: {plain!r}."
+    )
+
+
+def test_attach_failure_notice_renders_markup_in_error_text_literally() -> None:
+    """An exception whose message quotes Rich markup renders in the notice rather
+    than raising a second ``MarkupError`` from the handler that keeps the REPL alive."""
+    exc = MarkupError("closing tag '[/dim]' at position 48 doesn't match any open tag")
+    notice = _attach_failure_notice("Failed to resume", "6ad83003d41543f795fd2b3c52cb38d2", exc)
+    assert notice.plain == (
+        "  Failed to resume 6ad83003d41543f7…: "
+        "closing tag '[/dim]' at position 48 doesn't match any open tag"
     )
 
 

@@ -3164,6 +3164,12 @@ def _render_failed_status_error(
     return err_items
 
 
+def _attach_failure_notice(action: str, conversation_id: str, exc: BaseException) -> Text:
+    """Red notice for a failed ``--resume`` / ``/open`` attach; ``exc`` is escaped so
+    a message quoting Rich markup (e.g. ``[/dim]``) displays instead of raising."""
+    return Text.from_markup(f"  [bold red]{action} {conversation_id[:16]}…: {escape(str(exc))}[/]")
+
+
 async def run_repl(
     client: OmnigentClient,
     agent_name: str,
@@ -4479,9 +4485,7 @@ async def run_repl(
                 interactive=interactive,
             )
         except Exception as exc:  # noqa: BLE001 — REPL boundary: render the failure, stay alive
-            host.output(
-                Text.from_markup(f"  [bold red]Failed to open {target_id[:16]}…: {exc}[/]")
-            )
+            host.output(_attach_failure_notice("Failed to open", target_id, exc))
             return
         await _attach_to_conversation(
             target_id,
@@ -4659,9 +4663,7 @@ async def run_repl(
             except Exception as exc:  # noqa: BLE001 — REPL boundary: never crash on resume failure; render and proceed
                 _log.exception("Failed to resume conversation %s", resume_conversation_id)
                 host.output(
-                    Text.from_markup(
-                        f"  [bold red]Failed to resume {resume_conversation_id[:16]}…: {exc}[/]"
-                    )
+                    _attach_failure_notice("Failed to resume", resume_conversation_id, exc)
                 )
         # Hold a reference to the auto-send task for the lifetime of
         # ``host.run`` — ``asyncio.create_task`` only weakly roots its
