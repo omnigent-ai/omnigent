@@ -301,6 +301,66 @@ async def test_write_file(
     assert (workspace / "new.txt").read_text() == "new content"
 
 
+# Bytes that are not valid UTF-8 (a PNG signature, a NUL and 0xff), carried as latin-1.
+_BINARY_BYTES = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_name", "content", "expected_bytes"),
+    [
+        pytest.param("blob.png", _BINARY_BYTES.decode("latin-1"), _BINARY_BYTES, id="binary"),
+        pytest.param("cafe.txt", "café", "café".encode("latin-1"), id="non-ascii-text"),
+    ],
+)
+async def test_write_file_honours_requested_encoding(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    file_name: str,
+    content: str,
+    expected_bytes: bytes,
+) -> None:
+    """PUT with ``encoding: latin-1`` writes the latin-1 bytes instead of failing as UTF-8."""
+    resp = await client.put(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{file_name}",
+        json={"content": content, "encoding": "latin-1"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["created"] is True
+    assert body["bytes_written"] == len(expected_bytes)
+    assert (workspace / file_name).read_bytes() == expected_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("encoding", "content"),
+    [
+        pytest.param("not-a-codec", "hello", id="unknown-codec"),
+        pytest.param("base64", "hello", id="non-text-codec"),
+        pytest.param("ascii", "café", id="unencodable-content"),
+    ],
+)
+async def test_write_file_rejects_unusable_encoding(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    encoding: str,
+    content: str,
+) -> None:
+    """An ``encoding`` that cannot produce bytes gives a 400 naming it; nothing is written."""
+    resp = await client.put(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/odd.txt",
+        json={"content": content, "encoding": encoding},
+    )
+    assert resp.status_code == 400, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "invalid_input"
+    assert encoding in error["message"]
+    assert not (workspace / "odd.txt").exists()
+
+
 @pytest.mark.asyncio
 async def test_edit_file(
     client: httpx.AsyncClient,

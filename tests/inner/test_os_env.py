@@ -15,6 +15,7 @@ import pytest
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
+    _handle_helper_request,
     _project_root,
     _read_impl,
     _shell_impl,
@@ -515,3 +516,43 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+def test_write_bytes_lands_verbatim_through_helper(tmp_path: Path) -> None:
+    """``write`` with ``bytes`` stores them unchanged, even when not valid UTF-8."""
+    payload = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    try:
+        result = asyncio.run(os_env.write("blob.bin", payload))
+    finally:
+        os_env.close()
+
+    assert result["created"] is True
+    assert result["bytes_written"] == len(payload)
+    assert (tmp_path / "blob.bin").read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    ("request_extra", "expected_error"),
+    [
+        pytest.param({"content": "%%%", "encoding": "base64"}, "base64", id="malformed-base64"),
+        pytest.param({"content": "abc", "encoding": "hex"}, "encoding", id="unknown-encoding"),
+    ],
+)
+def test_helper_write_rejects_bad_content_encoding(
+    tmp_path: Path, request_extra: dict[str, str], expected_error: str
+) -> None:
+    """The helper refuses a write it cannot decode and leaves the existing file untouched."""
+    target = tmp_path / "blob.bin"
+    target.write_bytes(b"keep me")
+    result = _handle_helper_request(
+        request={"op": "write", "path": "blob.bin", **request_extra},
+        cwd=tmp_path,
+        shell_path="/bin/sh",
+        sandbox=_inactive_policy(),
+    )
+    assert expected_error in result["error"]
+    assert target.read_bytes() == b"keep me"

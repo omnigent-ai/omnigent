@@ -326,7 +326,7 @@ class OSEnvironment(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def write(self, path: str, content: str) -> OpResult:
+    async def write(self, path: str, content: str | bytes) -> OpResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -922,15 +922,13 @@ class CallerProcessOSEnvironment(OSEnvironment):
         )
         return cast(OpResult, result)
 
-    async def write(self, path: str, content: str) -> OpResult:
-        result = await run_sync_on_thread(
-            self._helper.request,
-            {
-                "op": "write",
-                "path": path,
-                "content": content,
-            },
-        )
+    async def write(self, path: str, content: str | bytes) -> OpResult:
+        request: OpRequest = {"op": "write", "path": path, "content": content}
+        if isinstance(content, bytes):
+            # The helper IPC is JSON text, so raw bytes travel base64-encoded.
+            request["content"] = base64.b64encode(content).decode("ascii")
+            request["encoding"] = "base64"
+        result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
 
     async def edit(
@@ -1089,14 +1087,24 @@ def _handle_helper_request(
         except PermissionError as exc:
             return {"error": str(exc)}
         # ``content`` is optional — JSON ``null`` or missing maps to an
-        # empty-file write. Non-string values are rejected.
+        # empty-file write. Non-string values are rejected. ``encoding:
+        # "base64"`` marks raw bytes, which the JSON channel cannot carry.
         raw_content = request.get("content")
+        content_encoding = request.get("encoding")
+        content: str | bytes
         if raw_content is None:
             content = ""
-        elif isinstance(raw_content, str):
-            content = raw_content
-        else:
+        elif not isinstance(raw_content, str):
             return {"error": "content must be a string"}
+        elif content_encoding is None:
+            content = raw_content
+        elif content_encoding == "base64":
+            try:
+                content = base64.b64decode(raw_content, validate=True)
+            except ValueError as exc:
+                return {"error": f"content is not valid base64: {exc}"}
+        else:
+            return {"error": "encoding must be 'base64' when present"}
         return _write_impl(path, content)
 
     if op == "edit":
@@ -1432,13 +1440,18 @@ def _read_impl(
     }
 
 
-def _write_impl(path: Path, content: str) -> OpResult:
+def _write_impl(path: Path, content: str | bytes) -> OpResult:
     path.parent.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
-    path.write_text(content, encoding="utf-8")
+    if isinstance(content, str):
+        path.write_text(content, encoding="utf-8")
+        bytes_written = len(content.encode("utf-8"))
+    else:
+        path.write_bytes(content)
+        bytes_written = len(content)
     return {
         "path": str(path),
-        "bytes_written": len(content.encode("utf-8")),
+        "bytes_written": bytes_written,
         "created": not existed,
     }
 

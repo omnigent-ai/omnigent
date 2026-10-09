@@ -1195,18 +1195,17 @@ print(json.dumps({'r': results, 't': truncated}))
         the OSEnvironment.write() always creates parents.
 
         :param path: Relative file path.
-        :param content: Bytes to write.
+        :param content: Bytes to write verbatim.
         :param create_parents: Accepted for API compat; OSEnvironment
             always creates parents.
         :returns: Write result with change tracking.
         """
         target, direct = self._write_route(path)
-        content_str = content.decode("utf-8")
 
         if direct is not None:
-            result = await _run_impl_direct(_write_impl, direct, content_str)
+            result = await _run_impl_direct(_write_impl, direct, content)
         else:
-            result = await _run_os_env_async(self._os_env.write, target, content_str)
+            result = await _run_os_env_async(self._os_env.write, target, content)
         if "error" in result:
             raise FilesystemPathNotFound(result.get("error", f"Write failed for {path!r}"))
 
