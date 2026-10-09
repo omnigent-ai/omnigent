@@ -110,8 +110,9 @@ The native `antigravity-native` harness (aliases `agy-native`,
 `native-antigravity`) launches the signed-in `agy` CLI instead and passes a
 session or dispatch `model` straight to `agy --model`, so it accepts any id the
 CLI's `agy models` catalog lists — Gemini as well as the Claude / GPT ids the
-account's separate quota offers. Only `databricks-` gateway ids are rejected
-for it; neither antigravity harness has a gateway path.
+account's separate quota offers. For `sys_session_send` dispatch overrides,
+Omnigent rejects only `databricks-` gateway ids for it; neither antigravity
+harness has a gateway path.
 
 ### Pi context files
 
