@@ -331,8 +331,7 @@ function markSessionsArchiving(ids: Iterable<string>): Map<string, ArchiveTombst
   for (const id of ids) {
     const previous = archivingSessions.get(id);
     if (previous?.timer !== undefined) clearTimeout(previous.timer);
-    // A session is either archiving or unarchiving, never both: a re-archive
-    // supersedes an in-flight unarchive guard so the row can leave the list.
+    // The latest archive direction owns the row.
     unmarkSessionsUnarchiving([id]);
     const entry = {};
     archivingSessions.set(id, entry);
@@ -371,11 +370,8 @@ export function isSessionArchiving(id: string): boolean {
   return archivingSessions.has(id);
 }
 
-// The mirror of `archivingSessions` for the unarchive/undo direction. Archiving
-// holds a row's `archived` flag TRUE against a lagging server signal (a WS frame
-// or a search-index-lagged fetch) so it stays out of the sidebar; unarchiving
-// holds it FALSE for the same window so a just-restored row can't be re-hidden
-// by the archive's own late signals. That late re-hide is the flash Undo shows.
+// Mirror of `archivingSessions`: pins a restored row's `archived` flag FALSE
+// while the archive's own late signals (WS frames, index-lagged fetches) propagate.
 const unarchivingSessions = new Map<string, ArchiveTombstone>();
 
 function markSessionsUnarchiving(ids: Iterable<string>): Map<string, ArchiveTombstone> {
@@ -453,8 +449,7 @@ function applySessionTombstones(
       continue;
     }
     if (isSessionUnarchiving(conv.id)) {
-      // Undo/unarchive in flight: keep the row active even if a search-index
-      // read still reports it archived (mirrors the archiving coercion below).
+      // The optimistic restore wins over stale indexed state.
       if (conv.archived === true) {
         changed = true;
         data.push({ ...conv, archived: false });
@@ -1012,8 +1007,7 @@ async function paintConversationsArchived(
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
   ]);
-  // Arm the matching tombstone: archiving holds the row hidden, unarchiving
-  // holds it visible. Each mark supersedes the opposite one for these ids.
+  // Arm a tombstone in the latest archive direction.
   const marked = archived ? markSessionsArchiving(ids) : markSessionsUnarchiving(ids);
   const snapshot = snapshotArchiveLists(queryClient);
   for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
@@ -1037,8 +1031,7 @@ export function useArchiveConversation() {
     onError: (_err, { id, archived }, context) => {
       if (context?.marked !== undefined) {
         const marked = context.marked.get(id);
-        // A newer op of the same kind (archive/unarchive) replaced this row's
-        // mark, so leave its state alone rather than rolling back over it.
+        // Do not roll back over a newer operation.
         const live = (archived ? archivingSessions : unarchivingSessions).get(id);
         if (live !== undefined && live !== marked) return;
         if (archived) unmarkSessionsArchiving([id], context.marked);
@@ -1418,8 +1411,7 @@ export function useBulkArchiveConversations() {
       const failed = new Set(err instanceof BulkConversationMutationError ? err.failed : ids);
       const succeeded = ids.filter((id) => !failed.has(id));
       if (context.marked !== undefined) {
-        // Drop the guard for the ids that didn't move (they revert), keep it
-        // through the propagation window for the ids that did.
+        // Keep guards only for rows that moved.
         if (archived) {
           unmarkSessionsArchiving(failed, context.marked);
           expireSessionsArchiving(context.marked, succeeded);
@@ -1479,16 +1471,11 @@ export async function undoArchiveConversations(
 ): Promise<void> {
   if (conversations.length === 0) return;
   const ids = conversations.map((c) => c.id);
-  // Hold the unread dot off every restored row until this settles. The unarchive
-  // bumps each session's updated_at (a self-initiated write), which the WS push
-  // surfaces before the seen-anchor below lands, so the row would otherwise
-  // flash an unread badge on the way back in. Released in `finally`.
+  // The unarchive bumps updated_at before the seen anchors below land; hold the
+  // unread dot off until then.
   for (const id of ids) beginUnseenSuppression(id);
   // Un-hide any rows still in the list cache (flag flip). Rows a refetch already
-  // evicted aren't here to flip; the keep-alive below covers those. The paint
-  // also arms the unarchive tombstone (`marked`), which coerces a lagging
-  // archived=true signal (the just-issued archive's own WS frame, or a
-  // search-index refetch) back to false so the restored row can't flash out.
+  // evicted aren't here to flip; the keep-alive and tombstone cover those.
   const { marked } = await paintConversationsArchived(queryClient, ids, false);
   const restored = conversations.map((conv) => ({ ...conv, archived: false }));
   for (const conv of restored) markRecentlyCreated(conv);
@@ -1524,18 +1511,14 @@ export async function undoArchiveConversations(
       if (result.status === "fulfilled") markConversationSeen(ids[i], result.value.updated_at);
       else failed.push(ids[i]);
     }
-    // Hold the unarchive guard through the propagation window for the ids that
-    // restored (it expires itself after), so a lagging archived=true signal
-    // can't re-hide them in the meantime.
+    // Keep guards until stale archive signals have propagated.
     const failedSet = new Set(failed);
     expireSessionsUnarchiving(
       marked,
       ids.filter((id) => !failedSet.has(id)),
     );
     if (failed.length > 0) {
-      // The ids that stayed archived: drop the unarchive guard and the
-      // keep-alive so they stop being re-injected, and overlay archived=true so
-      // they leave the list again. The ids that DID unarchive stay visible.
+      // Failed rows lose their guard and optimistic keep-alive.
       unmarkSessionsUnarchiving(failed, marked);
       for (const id of failed) {
         unmarkRecentlyCreated(id);
@@ -1551,8 +1534,7 @@ export async function undoArchiveConversations(
       );
     }
   } finally {
-    // Restore settled: the seen-anchor for the ids that came back has landed
-    // (marked seen in the loop above), so the dot can read normally again.
+    // Seen anchors have landed; resume normal unread detection.
     for (const id of ids) endUnseenSuppression(id);
     void queryClient.invalidateQueries({ queryKey: ["projects"] });
     void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });

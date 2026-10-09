@@ -75,9 +75,7 @@ function applyItemsToCache(
   const itemsById = new Map<string, SessionListWireItem>();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
-    // An optimistic archive/unarchive in flight owns the row's archived flag:
-    // coerce a stale frame to match so a lagging server signal can't flip the
-    // row out from under the pending mutation (either direction flashes).
+    // The pending archive operation owns the flag while server signals lag.
     let coerced = item;
     if (isSessionArchiving(item.id)) coerced = { ...item, archived: true };
     else if (isSessionUnarchiving(item.id)) coerced = { ...item, archived: false };
