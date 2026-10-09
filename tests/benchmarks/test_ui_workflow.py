@@ -16,11 +16,10 @@ _WORKFLOW = yaml.safe_load((_ROOT / ".github/workflows/benchmark-ui.yml").read_t
 _DETECT = next(
     step["run"] for step in _WORKFLOW["jobs"]["detect"]["steps"] if step.get("id") == "changes"
 )
-pytestmark = pytest.mark.skipif(
-    not shutil.which("bash") or not shutil.which("jq"), reason="Needs bash and jq"
-)
+pytestmark = pytest.mark.skipif(not shutil.which("bash"), reason="Needs bash")
 
 
+@pytest.mark.skipif(not shutil.which("jq"), reason="Needs jq")
 @pytest.mark.parametrize(
     ("files", "api_failure", "expected"),
     [
@@ -88,6 +87,7 @@ def test_detect_ui_benchmark_changes(
     assert called_api
 
 
+@pytest.mark.skipif(not shutil.which("jq"), reason="Needs jq")
 @pytest.mark.parametrize(
     ("pr", "total_files", "expected", "uses_api"),
     [

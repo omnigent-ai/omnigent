@@ -29,6 +29,11 @@ from dev.benchmarks.ui.run import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_git_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(schema, "_git", lambda *args: "")
+
+
 def _args() -> argparse.Namespace:
     return argparse.Namespace(
         iterations=20,
@@ -274,7 +279,7 @@ def test_paired_comparisons_require_repeated_runs(
 
 @pytest.mark.parametrize(
     ("candidate_style_ms", "expected_status"),
-    [(2.0, "ok"), (10.0, "advisory"), (150.0, "regression")],
+    [(2.0, "ok"), (10.0, "advisory"), (150.0, "regression"), (2.0, "measurement-error")],
 )
 async def test_orchestration_alternates_bundles_and_propagates_verdict(
     tmp_path: Path,
@@ -283,11 +288,13 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
     expected_status: str,
 ) -> None:
     regression = expected_status == "regression"
+    measurement_error = expected_status == "measurement-error"
     args = _args()
     args.output_dir = tmp_path / "results"
     args.web_dist, args.baseline_dist = Path("candidate"), Path("baseline")
     args.revision, args.baseline_revision = "candidate-sha", "baseline-sha"
     browser = SimpleNamespace(version="test-chromium", close=AsyncMock())
+    closed_environments = []
 
     @contextlib.asynccontextmanager
     async def playwright_context():
@@ -295,13 +302,18 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
 
     @contextlib.asynccontextmanager
     async def environment(dist):
-        yield SimpleNamespace(dist=dist)
+        try:
+            yield SimpleNamespace(dist=dist)
+        finally:
+            closed_environments.append(dist.name)
 
     calls = []
     sample = _report()["samples"]["browser"][0]
 
     async def scenario(_browser, env, _session_id, mode, _args, _evidence):
         calls.append((env.dist.name, mode))
+        if measurement_error and len(calls) == 4:
+            raise RuntimeError("synthetic measurement failure")
         result = copy.deepcopy(sample)
         if env.dist == args.web_dist:
             result["style_layout"] = [candidate_style_ms] * args.iterations
@@ -311,12 +323,34 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
     monkeypatch.setattr(ui_run, "UIEnvironment", environment)
     monkeypatch.setattr(ui_run, "seed_conversation", AsyncMock(return_value="session"))
     monkeypatch.setattr(ui_run, "measure_scenario", scenario)
-    assert await ui_run.run_benchmark(args) is not regression
-    assert calls == [
+    if measurement_error:
+        with pytest.raises(RuntimeError, match="synthetic measurement failure"):
+            await ui_run.run_benchmark(args)
+    else:
+        assert await ui_run.run_benchmark(args) is not regression
+    expected_calls = [
         (variant, mode)
         for variant in ("baseline", "candidate", "candidate", "baseline", "baseline", "candidate")
         for mode in ("browser", "mac_css")
     ]
+    assert calls == (expected_calls[:4] if measurement_error else expected_calls)
+    browser.close.assert_awaited_once()
+    assert sorted(closed_environments) == ["baseline", "candidate"]
+    for variant in ("candidate", "baseline"):
+        report = json.loads((args.output_dir / f"{variant}.json").read_text())
+        assert report["git_sha"] == f"{variant}-sha"
+        if measurement_error:
+            assert {mode: len(samples) for mode, samples in report["samples"].items()} == {
+                "browser": 1,
+                "mac_css": 1 if variant == "baseline" else 0,
+            }
+        else:
+            assert not measurement_failures(report, args)
+    if measurement_error:
+        assert not (args.output_dir / "comparison.json").exists()
+        assert not (args.output_dir / "summary.md").exists()
+        return
+
     comparison = json.loads((args.output_dir / "comparison.json").read_text())
     assert comparison["passed"] is not regression
     assert bool(comparison["failures"]) is regression
@@ -328,11 +362,6 @@ async def test_orchestration_alternates_bundles_and_propagates_verdict(
     if expected_status == "advisory":
         assert "| ⚠️ advisory |" in summary
         assert "**PASS** — no blocking regressions detected." in summary
-    for variant in ("candidate", "baseline"):
-        report = json.loads((args.output_dir / f"{variant}.json").read_text())
-        assert report["git_sha"] == f"{variant}-sha"
-        assert not measurement_failures(report, args)
-    browser.close.assert_awaited_once()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal handling")
