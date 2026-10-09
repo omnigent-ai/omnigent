@@ -50,17 +50,17 @@ def test_compare_flags_a_run_median_regression() -> None:
 
 
 @pytest.mark.parametrize(
-    ("candidate_p50", "candidate_p95", "passed"),
+    ("baseline_p95", "candidate_p50", "candidate_p95", "passed"),
     [
-        (0.3, 0.5, True),  # large percentages, negligible absolute work
-        (8.0, 8.0, False),  # meaningful increase in median work
-        (0.3, 20.0, False),  # only tail latency regressed
+        (0.2, 0.3, 0.5, True),  # large percentages, negligible absolute work
+        (10.0, 8.0, 10.0, False),  # only median work regressed
+        (0.2, 0.3, 20.0, False),  # only tail latency regressed
     ],
 )
 def test_compare_can_require_an_absolute_increase(
-    candidate_p50: float, candidate_p95: float, passed: bool
+    baseline_p95: float, candidate_p50: float, candidate_p95: float, passed: bool
 ) -> None:
-    baseline = {"journeys": {"render": _journey([0.1] * 3, [0.2] * 3, n=80)}}
+    baseline = {"journeys": {"render": _journey([0.1] * 3, [baseline_p95] * 3, n=80)}}
     candidate = {"journeys": {"render": _journey([candidate_p50] * 3, [candidate_p95] * 3, n=80)}}
 
     actual, rows = compare_reports(baseline, candidate, threshold=1.0, min_regression_ms=5.0)

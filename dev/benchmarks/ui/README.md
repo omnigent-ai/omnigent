@@ -91,8 +91,8 @@ baseline.
 
 ## CI and artifacts
 
-[`benchmark-ui.yml`](../../../.github/workflows/benchmark-ui.yml) runs on UI
-PRs (including forks), nightly, and by manual dispatch. PRs compare the exact
+[`benchmark-ui.yml`](../../../.github/workflows/benchmark-ui.yml) runs on UI/server
+PRs ready for review (including forks), nightly, and by manual dispatch. PRs compare the exact
 base of the test merge against the candidate on **one runner**. Filtering is
 at the job level, so `UI performance regression check` can be made a required
 check without leaving unrelated PRs pending. Nightlies enforce absolute

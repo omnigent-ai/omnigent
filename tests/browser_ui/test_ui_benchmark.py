@@ -13,7 +13,11 @@ import pytest
 from playwright.async_api import Browser, BrowserContext, Route, async_playwright
 
 from dev.benchmarks.omnigent.environment import BenchEnvironment
-from dev.benchmarks.ui.run import measure_scenario
+from dev.benchmarks.ui.run import _MIN_ELEMENTS, _TRANSCRIPT_TURNS, measure_scenario
+from tests._helpers.async_thread import run_in_fresh_loop
+
+# Keep the synchronous suite's event loop alive even when this file runs alone.
+pytestmark = pytest.mark.usefixtures("playwright")
 
 
 @asynccontextmanager
@@ -40,12 +44,12 @@ _ENV = cast(BenchEnvironment, SimpleNamespace(base_url="http://ui-benchmark.inva
 _ARGS = argparse.Namespace(cpu_throttle=1, warmup=1, iterations=2)
 _BODY = (
     '<textarea aria-label="Message the agent"></textarea>'
-    "<p>Review complete 11.</p>" + "<span></span>" * 2600
+    f"<p>Review complete {_TRANSCRIPT_TURNS - 1}.</p>" + "<span></span>" * (_MIN_ELEMENTS + 100)
 )
 
 
 @pytest.mark.parametrize("failure", ["http-404", "network-error"])
-async def test_measure_scenario_rejects_failed_static_asset(
+def test_measure_scenario_rejects_failed_static_asset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     async def handler(route: Route) -> None:
@@ -63,14 +67,19 @@ async def test_measure_scenario_rejects_failed_static_asset(
                 f"<body>{_BODY}</body></html>",
             )
 
-    async with _routed_browser(monkeypatch, handler) as browser:
-        with pytest.raises(RuntimeError, match=r"Required asset \(stylesheet\)"):
-            await measure_scenario(browser, _ENV, "session", "browser", _ARGS, tmp_path / "asset")
+    async def drive() -> None:
+        async with _routed_browser(monkeypatch, handler) as browser:
+            with pytest.raises(RuntimeError, match=r"Required asset \(stylesheet\)"):
+                await measure_scenario(
+                    browser, _ENV, "session", "browser", _ARGS, tmp_path / "asset"
+                )
+
+    run_in_fresh_loop(drive())
     assert (tmp_path / "asset.failed.png").is_file()
 
 
 @pytest.mark.parametrize("mode", ["browser", "mac_css"])
-async def test_css_scope_is_active_before_spa_bootstrap(
+def test_css_scope_is_active_before_spa_bootstrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     expected = "true" if mode == "mac_css" else "false"
@@ -84,7 +93,10 @@ async def test_css_scope_is_active_before_spa_bootstrap(
         assert route.request.url.endswith("/c/session")
         await route.fulfill(content_type="text/html", body=html)
 
-    async with _routed_browser(monkeypatch, handler) as browser:
-        sample = await measure_scenario(browser, _ENV, "session", mode, _ARGS, tmp_path / mode)
-    assert sample["page_errors"] == []
-    assert len(sample["key_to_frame"]) == _ARGS.iterations
+    async def drive() -> None:
+        async with _routed_browser(monkeypatch, handler) as browser:
+            sample = await measure_scenario(browser, _ENV, "session", mode, _ARGS, tmp_path / mode)
+        assert sample["page_errors"] == []
+        assert len(sample["key_to_frame"]) == _ARGS.iterations
+
+    run_in_fresh_loop(drive())

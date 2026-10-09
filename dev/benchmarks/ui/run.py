@@ -404,6 +404,7 @@ async def run_benchmark(args: argparse.Namespace) -> bool:
     async with contextlib.AsyncExitStack() as stack:
         playwright = await stack.enter_async_context(async_playwright())
         browser = await playwright.chromium.launch()
+        browser_version = browser.version
         stack.push_async_callback(browser.close)
         for variant, (dist, _) in variants.items():
             env = await stack.enter_async_context(UIEnvironment(dist))
@@ -419,7 +420,7 @@ async def run_benchmark(args: argparse.Namespace) -> bool:
                     samples[variant][mode].append(sample)
                     # Keep partial measurements if a later scenario fails or is cancelled.
                     report = make_report(
-                        samples[variant], args, variants[variant][1], browser.version
+                        samples[variant], args, variants[variant][1], browser_version
                     )
                     reports[variant] = report
                     (args.output_dir / f"{variant}.json").write_text(
@@ -429,7 +430,7 @@ async def run_benchmark(args: argparse.Namespace) -> bool:
     summary = [
         "# OSS UI benchmark",
         "",
-        f"Chromium {browser.version}; CPU throttle {args.cpu_throttle}x.",
+        f"Chromium {browser_version}; CPU throttle {args.cpu_throttle}x.",
         "",
     ]
     for name, journey in reports["candidate"]["journeys"].items():

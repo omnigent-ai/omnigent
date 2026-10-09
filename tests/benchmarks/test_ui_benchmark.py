@@ -204,9 +204,13 @@ def test_session_open_regression_is_gated_with_one_sample_per_run() -> None:
         ("--max-key-to-frame-ms", "0"),
     ],
 )
-def test_ui_cli_rejects_invalid_counts_and_budgets(option: str, value: str) -> None:
+def test_ui_cli_rejects_invalid_counts_and_budgets(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], option: str, value: str
+) -> None:
+    (tmp_path / "index.html").write_text("<html></html>")
     with pytest.raises(SystemExit, match="2"):
-        parse_args([option, value])
+        parse_args(["--web-dist", str(tmp_path), option, value])
+    assert option in capsys.readouterr().err.partition("error:")[2]
 
 
 def test_ui_cli_requires_both_bundles(tmp_path: Path) -> None:

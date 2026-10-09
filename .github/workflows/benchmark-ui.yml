@@ -59,7 +59,7 @@ jobs:
   benchmark:
     name: UI performance regression check
     needs: detect
-    if: needs.detect.outputs.ui == 'true'
+    if: needs.detect.outputs.ui == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
