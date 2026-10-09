@@ -484,6 +484,9 @@ def register_agent_routes(
                 from omnigent.server.registry_gateway import registry_tools
                 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
 
+                data = json.loads(bytes(response.body))
+                if "error" in data:
+                    return response
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is not None and not conv.archived:
                     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
@@ -496,9 +499,8 @@ def register_agent_routes(
                             spec,
                             user_id,
                         )
-                        data = json.loads(bytes(response.body))
                         tools = data.get("result", {}).get("tools", [])
-                        return _mcp_ok_response(rpc_id, {"tools": tools + extra})
+                        return _mcp_ok_response(rpc_id, {**data["result"], "tools": tools + extra})
             return response
 
         if method == "tools/call":

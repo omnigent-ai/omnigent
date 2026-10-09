@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from mcp.types import Tool
 
@@ -76,6 +77,7 @@ async def test_shared_editor_uses_own_registry_identity(
 ):
     from mcp.types import CallToolResult, TextContent
 
+    from omnigent.server.routes import sessions as sessions_mod
     from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
     from tests.server.integration.test_session_agent_owner import _share_editor
 
@@ -105,6 +107,13 @@ async def test_shared_editor_uses_own_registry_identity(
     from omnigent.runtime import get_conversation_store
 
     get_conversation_store().set_labels(sid, {_TURN_ACTOR_LABEL: alice})
+    runner = AsyncMock()
+    runner.post.return_value = httpx.Response(
+        200,
+        json={"result": {"schemas": []}},
+        request=httpx.Request("POST", "http://runner.test"),
+    )
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", AsyncMock(return_value=runner))
     path = f"/v1/sessions/{sid}/mcp" if legacy else "/v1/mcp/tracker"
     headers = {"X-Forwarded-Email": bob, "X-Omnigent-Session-Id": sid}
     listed = await auth_client.post(
@@ -195,7 +204,6 @@ async def test_registry_selection_preserves_trusted_template_provenance(
 async def test_editor_turn_uses_editor_policy_and_runner_credential(
     auth_app, auth_client, monkeypatch, route, phase
 ):
-    import httpx
     from mcp.types import CallToolResult, TextContent
 
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -344,8 +352,9 @@ async def test_editor_turn_uses_editor_policy_and_runner_credential(
 
 
 @pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("source", ["template", "installed", "upload"])
 async def test_template_env_expansion_is_snapshotted_but_uploads_stay_literal(
-    auth_app, auth_client, tmp_path, monkeypatch, selected
+    auth_app, auth_client, tmp_path, monkeypatch, selected, source
 ):
     import json
 
@@ -380,11 +389,7 @@ async def test_template_env_expansion_is_snapshotted_but_uploads_stay_literal(
     (child_mcp / "existing.yaml").write_bytes((mcp / "existing.yaml").read_bytes())
     bundle = _tar_gz_dir(root)
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
-    artifacts.put("env-template/bundle", bundle)
     agents = get_agent_store()
-    template = agents.create(
-        "1234567890abcdef1234567890abcdef", "env-template", "env-template/bundle"
-    )
     auth_app.state.mcp_registry = McpRegistry(
         McpRegistryConfig(
             services=[
@@ -401,40 +406,56 @@ async def test_template_env_expansion_is_snapshotted_but_uploads_stay_literal(
     )
     headers = {"X-Forwarded-Email": "alice@example.test"}
     selection = ["tracker"] if selected else []
-    for trusted in (True, False):
-        if trusted:
-            response = await auth_client.post(
-                "/v1/sessions",
-                headers=headers,
-                json={"agent_id": template.id, "mcp_registry_services": selection},
-            )
-        else:
-            response = await auth_client.post(
-                "/v1/sessions",
-                headers=headers,
-                data={"metadata": json.dumps({"mcp_registry_services": selection})},
-                files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-            )
-        assert response.status_code == 201, response.text
-        sid = response.json().get("id") or response.json()["session_id"]
-        conv = get_conversation_store().get_conversation(sid)
-        spec = _load_agent_spec_for_session(conv, agents)
-        expected = (
-            "Bearer synthetic-template-token" if trusted else "Bearer ${MCP_TEMPLATE_TEST_TOKEN}"
+    if source == "template":
+        artifacts.put("env-template/bundle", bundle)
+        agent = agents.create(
+            "1234567890abcdef1234567890abcdef", "env-template", "env-template/bundle"
         )
+    elif source == "installed":
+        installed = await auth_client.post(
+            "/v1/agents",
+            headers=headers,
+            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        )
+        assert installed.status_code == 200, installed.text
+        agent = agents.get(installed.json()["id"])
+        assert agent.kind == "user" and agent.created_by == "alice@example.test"
+        assert agent.session_id is None and not agent.operator_authored
+    if source == "upload":
+        response = await auth_client.post(
+            "/v1/sessions",
+            headers=headers,
+            data={"metadata": json.dumps({"mcp_registry_services": selection})},
+            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        )
+    else:
+        response = await auth_client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"agent_id": agent.id, "mcp_registry_services": selection},
+        )
+    assert response.status_code == 201, response.text
+    sid = response.json().get("id") or response.json()["session_id"]
+    conv = get_conversation_store().get_conversation(sid)
+    spec = _load_agent_spec_for_session(conv, agents)
+    trusted = source == "template"
+    expected = (
+        "Bearer synthetic-template-token" if trusted else "Bearer ${MCP_TEMPLATE_TEST_TOKEN}"
+    )
+    assert (
+        next(c for c in spec.mcp_servers if c.name == "existing").headers["Authorization"]
+        == expected
+    )
+    assert spec.sub_agents[0].mcp_servers[0].headers["Authorization"] == expected
+    if selected or not trusted:
+        copied = artifacts.get(agents.get(conv.agent_id).bundle_location)
+        runner_spec = load(copied, dest=tmp_path / "runner", expand_env=False)
         assert (
-            next(c for c in spec.mcp_servers if c.name == "existing").headers["Authorization"]
+            next(c for c in runner_spec.mcp_servers if c.name == "existing").headers[
+                "Authorization"
+            ]
             == expected
         )
-        assert spec.sub_agents[0].mcp_servers[0].headers["Authorization"] == expected
-        if selected or not trusted:
-            copied = artifacts.get(agents.get(conv.agent_id).bundle_location)
-            runner_spec = load(copied, dest=tmp_path / f"runner-{trusted}", expand_env=False)
-            assert (
-                next(c for c in runner_spec.mcp_servers if c.name == "existing").headers[
-                    "Authorization"
-                ]
-                == expected
-            )
-            assert runner_spec.sub_agents[0].mcp_servers[0].headers["Authorization"] == expected
-    assert artifacts.get(template.bundle_location) == bundle
+        assert runner_spec.sub_agents[0].mcp_servers[0].headers["Authorization"] == expected
+    if source != "upload":
+        assert artifacts.get(agent.bundle_location) == bundle

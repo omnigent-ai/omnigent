@@ -26,6 +26,11 @@ and steers messages while the agent is busy.
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `managed-mcp-picker`: choose administrator-configured services before launch
+  on a host or sandbox. States: loading, empty, error, selected, unavailable.
+- `managed-mcp-sign-in`: selecting an unconnected service opens inline sign-in;
+  selection and launch wait for success. States: connected, pending, cancelled,
+  failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
@@ -89,6 +94,13 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
+- Open **MCPs** in the composer footer (the plug icon on mobile), then check or
+  uncheck services in **Tools for this session** before launching on a host or
+  sandbox. Unchecking a service keeps its account connected.
+- Check an unconnected OAuth service to open its sign-in popup. Complete sign-in
+  to select it; for Databricks, first enter the workspace URL and choose
+  **Connect workspace**. Bearer-token services require **Manage MCP accounts**
+  before selection. Use **Reconnect** if a selected service loses its connection.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -114,6 +126,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 
 Tests under `tests/browser_ui/` stub every backend call and need no instance:
 `uv run pytest <test> --browser-ui-skip-build --video=on --output="$VERIFY_EVIDENCE/composer"`.
+
+For managed MCP journeys, the server must have an administrator-configured
+registry enabled and a service visible to the current account; otherwise the
+picker is hidden or the catalog is empty. Host and sandbox runners must support
+managed MCP services. Use a fictional local OAuth provider for live sign-in
+checks and allow popups; the browser tests below stub the catalog and callbacks.
+Other connection providers alone do not enable the managed MCP picker.
 
 - **`pill-tooltip`, `pill-tooltip-suppressed`, in-session:**
   `tests/browser_ui/chat/test_composer_tooltips.py::test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open`
@@ -153,6 +172,26 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort
   pickers by hand: fork a Codex session, pick another effort in the dialog, and
   expect the new session's pill to show it. See [sessions](./sessions.md).
+- **`managed-mcp-picker`, new-session composer:**
+  `tests/e2e_ui/sessions/test_mcp_registry_connections.py::test_managed_mcp_selection_is_sent_with_launch`
+  covers host and sandbox launch on desktop and mobile. Selection persistence,
+  launch gating during sign-in, and an absent picker without registry enablement
+  are covered in `web/src/shell/NewChatDialog.flow.test.tsx`.
+- **`managed-mcp-sign-in`, new-session composer:**
+  `tests/e2e_ui/sessions/test_mcp_registry_connections.py::test_databricks_connects_from_launch_picker`
+  covers the workspace prompt and successful sign-in before a desktop host
+  launch. `web/src/components/McpRegistry.test.tsx` and
+  `web/src/lib/mcpRegistry.test.ts` cover selection after sign-in, cancellation,
+  retry, reconnect, and closed or blocked popups (`pnpm --dir web test`).
+  `tests/server/integration/test_mcp_gateway_http.py::test_real_http_oauth_refresh_through_gateway`
+  covers real OAuth, refresh, account reuse, and disconnect without a browser
+  or external credentials (`uv run --no-sync pytest tests/server/integration/test_mcp_gateway_http.py`).
+  Manually on desktop and mobile: select an unconnected OAuth service, confirm
+  launch is disabled while sign-in is pending, then approve in the popup and
+  expect it to close with the service checked and the selection count updated.
+  Repeat with popup cancellation: expect an error, an unchecked service, and a
+  usable retry. Launch on a host and a sandbox with the selected service and
+  confirm its tools are available on the first turn.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
 - **`attachments`:**
@@ -214,3 +253,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'
   catalogs need real CLIs or credentials.
+- The managed MCP picker uses only the administrator's registry; it does not
+  add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
+  connections. Bearer-token accounts must be connected in settings first.
+- Managed MCP browser tests stub launch and authentication. They prove composer
+  wiring; the HTTP integration test proves the real provider boundary.

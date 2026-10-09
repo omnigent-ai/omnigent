@@ -110,9 +110,9 @@ sequenceDiagram
 Launch waits while OAuth is pending. Existing accounts are reused. Bearer-token
 services must be connected in Settings first. JSON and multipart creation accept
 the selected IDs; a shared agent template is not modified. Operator-template
-environment fields are resolved into the session copy at launch; uploads stay
-unexpanded. Catalog responses use cursor pages of at most 100 services, with
-credential lookups limited to the current page. Unchecking removes
+environment fields are resolved into the session copy at launch; installed user
+agents and uploads stay unexpanded. Catalog responses use cursor pages of at most
+100 services, with credential lookups limited to the current page. Unchecking removes
 the session selection without disconnecting the account. Changes to an existing
 session require its runner to reload, as the UI indicates.
 

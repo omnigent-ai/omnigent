@@ -130,7 +130,8 @@ validation (422 for JSON, 400 for multipart); custom-server name collisions retu
 OAuth access or change the agent template. Existing narrower tool restrictions
 remain in force. Operator-template environment fields are resolved at launch
 using the existing bundle resolver, including nested agents, before storing the
-session copy. The source template stays unchanged. Uploaded bundles remain literal
+session copy. The source template stays unchanged. Only `operator_authored` agents
+are trusted templates. Installed user agents and uploaded bundles remain literal
 and never expand against the server environment.
 
 Existing sessions use the shared MCP declaration API:
@@ -228,6 +229,9 @@ The existing `/v1/sessions/{session}/mcp` route remains for built-in tools, cust
 HTTP/stdio declarations and older runners. Its registry compatibility path uses
 the same execution backend and policy handler. New runners use the general route
 for registry tools and request only non-registry tools from the legacy route.
+Legacy `tools/list` preserves runner errors instead of returning an incomplete
+tool list as success. Per-service discovery at `/v1/mcp/{service}` works
+independently of runner availability.
 No downstream deployment must migrate its existing custom MCP route to opt out.
 
 Unknown/unselected/disallowed services produce HTTP 403/404, and authentication

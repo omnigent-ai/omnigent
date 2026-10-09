@@ -6,6 +6,7 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from mcp.types import CallToolResult, TextContent, Tool
 
@@ -78,11 +79,13 @@ async def test_registry_tools_are_attached_discovered_and_executed_on_server(
     assert attached.status_code == 200, attached.text
     assert attached.json()["url"] is None
     listed = await client.post(
-        f"/v1/sessions/{session_id}/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        "/v1/mcp/tracker",
+        headers={"X-Omnigent-Session-Id": session_id},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     )
     assert listed.status_code == 200, listed.text
     assert "result" in listed.json(), listed.text
-    assert "tracker__read_ticket" in [t["name"] for t in listed.json()["result"]["tools"]]
+    assert "read_ticket" in [t["name"] for t in listed.json()["result"]["tools"]]
     called = await client.post(
         f"/v1/sessions/{session_id}/mcp",
         json={
@@ -148,6 +151,56 @@ def launch_registry(app):
         None,
     )
     return app.state.mcp_registry
+
+
+@pytest.mark.parametrize("outcome", ["success", "rpc_error", "transport_error"])
+async def test_legacy_discovery_preserves_runner_errors(
+    client, app, launch_registry, monkeypatch, outcome
+):
+    from omnigent.server.routes import sessions as sessions_mod
+
+    session = await create_test_session(client)
+    sid = session["id"]
+    attached = await client.post(
+        f"/v1/sessions/{sid}/agent/mcp-servers",
+        json={"name": "tracker", "transport": "registry"},
+    )
+    assert attached.status_code == 200, attached.text
+    backend = AsyncMock()
+    backend.list_tools.return_value = [Tool(name="read_ticket", inputSchema={"type": "object"})]
+    app.state.mcp_gateway_backend = backend
+    rpc_error = {"code": -32001, "message": "Runner discovery unavailable"}
+
+    def runner_response(request):
+        if outcome == "transport_error":
+            raise httpx.ConnectError("Runner unavailable", request=request)
+        if outcome == "rpc_error":
+            return httpx.Response(200, json={"error": rpc_error})
+        return httpx.Response(200, json={"result": {"schemas": [{"name": "local__read"}]}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_response), base_url="http://runner.test"
+    ) as runner:
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", AsyncMock(return_value=runner))
+        listed = await client.post(
+            f"/v1/sessions/{sid}/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+    assert listed.status_code == 200, listed.text
+    data = listed.json()
+    if outcome == "success":
+        assert [tool["name"] for tool in data["result"]["tools"]] == [
+            "local__read",
+            "tracker__read_ticket",
+        ]
+        backend.list_tools.assert_awaited_once()
+    else:
+        expected = (
+            rpc_error
+            if outcome == "rpc_error"
+            else {"code": -32000, "message": "Runner MCP execute failed."}
+        )
+        assert data == {"jsonrpc": "2.0", "id": 1, "error": expected}
+        backend.list_tools.assert_not_awaited()
 
 
 @pytest.mark.parametrize("upload", [False, True])
