@@ -627,6 +627,231 @@ def _hook_posts(posts: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
     return [(u, j) for u, j in posts if "hooks/cursor-permission-request" in u]
 
 
+@pytest.mark.parametrize("resolved_in_terminal", [False, True])
+@pytest.mark.parametrize("tool_name", ["Shell", "AskQuestion"])
+async def test_supervisor_cancels_obsolete_verdict_before_it_can_send_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resolved_in_terminal: bool,
+    tool_name: str,
+) -> None:
+    """Obsolete parked verdicts are cancelled before a late web verdict can type.
+
+    A terminal-answered prompt is released while its hook request is still parked
+    (so the server clears the card at once), then cancelled; a stopping supervisor
+    cancels and joins its parked tasks before its HTTP client closes.
+    """
+    pending = [
+        CursorPendingToolCall("call_cleanup", tool_name, {}),
+        CursorPendingToolCall("call_cleanup_2", tool_name, {}),
+    ]
+    posts, sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=pending, pane=_IDLE_PANE
+    )
+    cancelled = asyncio.Event()
+    late_verdict = asyncio.Event()
+    verdict_tasks: dict[str, asyncio.Task] = {}
+    released_while_parked: list[bool] = []
+
+    async def park(_client, *, session_id: str, payload: dict):
+        current = asyncio.current_task()
+        assert current is not None
+        verdict_tasks[payload["elicitation_id"]] = current
+        try:
+            await late_verdict.wait()
+            return {"action": "accept"}
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    release = cnp._post_external_elicitation_resolved
+
+    async def release_recording_task_state(client, session_id: str, elicitation_id: str):
+        released_while_parked.append(not verdict_tasks[elicitation_id].done())
+        await release(client, session_id, elicitation_id)
+
+    client_closed_after_tasks: list[bool] = []
+    fake_client = cnp.httpx.AsyncClient
+
+    class _ClosingClient(_FakeAsyncCM):
+        async def __aexit__(self, *exc: object) -> bool:
+            client_closed_after_tasks.append(all(task.done() for task in verdict_tasks.values()))
+            return await super().__aexit__(*exc)
+
+    monkeypatch.setattr(cnp, "_park_cursor_elicitation", park)
+    monkeypatch.setattr(cnp, "_post_external_elicitation_resolved", release_recording_task_state)
+    monkeypatch.setattr(
+        cnp.httpx, "AsyncClient", lambda **kwargs: _ClosingClient(fake_client(**kwargs)._client)
+    )
+    supervisor = _start_supervisor(
+        tmp_path, session_id="conv_cleanup", auto_accept_approvals=False
+    )
+    try:
+        assert await _wait_for(lambda: len(verdict_tasks) == 2, timeout_s=2.0)
+        if resolved_in_terminal:
+            pending.clear()
+            assert await _wait_for(
+                lambda: (
+                    sum(body.get("type") == "external_elicitation_resolved" for _, body in posts)
+                    == 2
+                )
+            )
+            assert released_while_parked == [True, True]
+            assert await _wait_for(
+                lambda: all(task.cancelled() for task in verdict_tasks.values())
+            )
+        else:
+            await _stop(supervisor)
+            assert client_closed_after_tasks == [True]
+        assert cancelled.is_set()
+        assert all(task.cancelled() for task in verdict_tasks.values())
+        late_verdict.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert sent == []
+    finally:
+        await _stop(supervisor)
+
+
+async def test_supervisor_observes_verdict_failure_without_restarting_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _install_supervisor_fakes(monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_IDLE_PANE)
+    failures: list[str] = []
+
+    async def fail(*_args, **_kwargs):
+        failures.append("failed")
+        raise ValueError("invalid verdict")
+
+    monkeypatch.setattr(cnp, "_park_cursor_elicitation", fail)
+    supervisor = _start_supervisor(
+        tmp_path, session_id="conv_failed_verdict", auto_accept_approvals=False
+    )
+    try:
+        assert await _wait_for(lambda: "cursor elicitation task failed" in caplog.text)
+        assert "invalid verdict" in caplog.text
+        # A few more polls, so a restarted task would show up in the count.
+        await asyncio.sleep(0.05)
+        assert not supervisor.done()
+        assert failures == ["failed"]
+    finally:
+        await _stop(supervisor)
+
+
+async def test_supervisor_cancels_obsolete_verdict_when_release_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A card release that raises still cancels the obsolete verdict task."""
+    pending = [_SHELL_CALL]
+    _, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=pending, pane=_IDLE_PANE
+    )
+    parked = asyncio.Event()
+    cancelled = asyncio.Event()
+    late_verdict = asyncio.Event()
+
+    async def park(*_args, **_kwargs):
+        parked.set()
+        try:
+            await late_verdict.wait()
+            return {"action": "accept"}
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def release_fails(*_args, **_kwargs):
+        raise RuntimeError("client is closing")
+
+    monkeypatch.setattr(cnp, "_park_cursor_elicitation", park)
+    monkeypatch.setattr(cnp, "_post_external_elicitation_resolved", release_fails)
+    supervisor = _start_supervisor(
+        tmp_path, session_id="conv_release_fails", auto_accept_approvals=False
+    )
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=2)
+        pending.clear()
+        assert await _wait_for(cancelled.is_set)
+        assert not supervisor.done()
+        late_verdict.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert keys_sent == []
+    finally:
+        await _stop(supervisor)
+
+
+@pytest.mark.parametrize("cancel_twice", [False, True])
+async def test_cancelled_verdict_task_finishes_its_key_sequence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cancel_twice: bool
+) -> None:
+    """A verdict task cancelled between keys still sends the rest of the sequence."""
+    sent: list[str] = []
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda _bridge, key: sent.append(key))
+    task = asyncio.create_task(
+        cnp._run_one_approval(
+            _QueueClient([httpx.Response(200, json={"action": "decline"})]),  # type: ignore[arg-type]
+            session_id="conv_cancel_mid_sequence",
+            bridge_dir=tmp_path,
+            prompt=CursorApprovalPrompt(
+                operation_type="shell",
+                message="Run this command?",
+                preview="rm -rf build",
+                accept_key="y",
+                decline_key="Escape",
+            ),
+            elicitation_id="elic_cancel_mid_sequence",
+        )
+    )
+    # The decline sequence pauses before its Enter, so the cancel lands between keys.
+    assert await _wait_for(lambda: sent == ["Escape"])
+    task.cancel()
+    if cancel_twice:
+        # A shutdown re-cancel while the task drains its delivery must not cut it short.
+        await asyncio.sleep(0)
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    # Escape alone leaves cursor at its reason prompt; the owed Enter went out
+    # before the task finished.
+    assert sent == ["Escape", "Enter"]
+
+
+async def test_cancelled_verdict_task_logs_a_failed_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A delivery that fails while its task is cancelled is logged, not lost."""
+    sent: list[str] = []
+
+    def send(_bridge: Path, key: str) -> None:
+        sent.append(key)
+        if key == "Enter":
+            raise ValueError("pane vanished")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", send)
+    task = asyncio.create_task(
+        cnp._run_one_approval(
+            _QueueClient([httpx.Response(200, json={"action": "decline"})]),  # type: ignore[arg-type]
+            session_id="conv_cancel_failed_delivery",
+            bridge_dir=tmp_path,
+            prompt=CursorApprovalPrompt(
+                operation_type="shell",
+                message="Run this command?",
+                preview="rm -rf build",
+                accept_key="y",
+                decline_key="Escape",
+            ),
+            elicitation_id="elic_cancel_failed_delivery",
+        )
+    )
+    assert await _wait_for(lambda: sent == ["Escape"])
+    await cnp._cancel_cursor_elicitation_tasks((task,))
+    assert task.cancelled()
+    assert sent == ["Escape", "Enter"]
+    assert "failed while cancelling" in caplog.text
+    assert "pane vanished" in caplog.text
+
+
 async def test_supervise_transcript_yolo_auto_accepts_without_card(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -906,17 +1131,29 @@ def test_pane_shows_accept_prompt(pane: str, expected: bool) -> None:
     assert cnp._pane_shows_accept_prompt(pane) is expected
 
 
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("cursor-native tmux target not advertised"), OSError(24, "Too many open files")],
+)
 async def test_send_cursor_keys_reports_undelivered_keystroke(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
 ) -> None:
-    """A tmux send that raises reports failure rather than a silent success."""
+    """A tmux send that raises reports failure and aborts the rest of the sequence."""
+    attempts: list[str] = []
 
-    def _boom(_bridge: Path, _key: str) -> None:
-        raise RuntimeError("cursor-native tmux target not advertised")
+    def _boom(_bridge: Path, key: str) -> None:
+        attempts.append(key)
+        raise error
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
-    assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "y") is False
+    assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "Escape", "Enter") is False
+    assert attempts == ["Escape"]
 
+
+async def test_send_cursor_keys_reports_delivered_keystroke(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A clean tmux send reports success."""
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
     assert await cnp._send_cursor_keys(tmp_path, "conv_live", "y") is True
 
