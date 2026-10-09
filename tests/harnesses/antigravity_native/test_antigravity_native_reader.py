@@ -3703,7 +3703,7 @@ def test_placeholder_recovery_adopts_typed_tui_cascade(
     """A typed-into, locally-owned root cascade replaces the stale placeholder."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     _own_conversation_db(bridge_dir, _CASCADE_ID)
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t: _PORT)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
     monkeypatch.setattr(
         reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
     )
@@ -3722,7 +3722,7 @@ def test_placeholder_recovery_requires_an_advertised_local_pane(
     pane, and a blind port scan on a multi-agy host could reach a foreign agy."""
     bridge_dir = _placeholder_bridge_dir(tmp_path, with_pane=False)
 
-    def _no_scan(_s: object, _t: object) -> int | None:
+    def _no_scan(_s: object, _t: object, **_kwargs: object) -> int | None:
         raise AssertionError("recovery must not resolve a port without a local pane")
 
     monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _no_scan)
@@ -3740,7 +3740,7 @@ def test_placeholder_recovery_refuses_a_foreign_cascade(
     adopting a foreign agy's cascade would durably cross-bind the session."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     # No conversation db is written: the scan answer came from a foreign agy.
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t: _PORT)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
     monkeypatch.setattr(
         reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
     )
@@ -3776,7 +3776,7 @@ def test_placeholder_recovery_keeps_waiting_without_a_typed_cascade(
     """With only never-typed cascades on the port there is nothing to adopt yet."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     _own_conversation_db(bridge_dir, _CASCADE_ID)
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t: _PORT)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
     body = {
         "trajectorySummaries": {
             _CASCADE_ID: _summary(last_modified_time="2026-06-23T17:50:32.565300Z"),
@@ -3797,7 +3797,7 @@ def test_placeholder_recovery_keeps_an_id_bound_during_the_scan(
     adoption write refuses to replace it and recovery reports nothing adopted."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     _own_conversation_db(bridge_dir, _CASCADE_ID)
-    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t: _PORT)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
 
     def _scan_while_cold_start_binds(_port: int) -> dict[str, Any]:
         (bridge_dir / "state.json").write_text(
@@ -3812,6 +3812,63 @@ def test_placeholder_recovery_keeps_an_id_bound_during_the_scan(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == _OTHER_CASCADE
+
+
+async def _no_sleep(_seconds: float) -> None:
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_discover_records_an_adoption_before_the_port_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The adopted cascade reaches ``on_adopted`` as soon as it is persisted, so a
+    reader restart before the port resolves cannot lose the --resume record."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    _own_conversation_db(bridge_dir, _CASCADE_ID)
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
+    monkeypatch.setattr(
+        reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
+    )
+    # No port ever confirms the cascade, so this discovery run cannot bind.
+    monkeypatch.setattr(reader, "_candidate_agy_rpc_ports", lambda: [_PORT])
+    monkeypatch.setattr(reader, "_conversation_matches", lambda _port, _cid: False)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    adopted: list[str] = []
+
+    async def _on_adopted(cascade_id: str) -> None:
+        adopted.append(cascade_id)
+
+    result = await reader._discover(
+        bridge_dir, poll_interval_s=0.0, stop=_stop_after(2), on_adopted=_on_adopted
+    )
+
+    assert result is None
+    assert adopted == [_CASCADE_ID]
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == _CASCADE_ID
+
+
+@pytest.mark.asyncio
+async def test_discover_reports_the_resolver_fallback_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the first recovery round asks the port resolver to warn about its
+    restricted-/proc fallback; later rounds keep it at debug level."""
+    bridge_dir = _placeholder_bridge_dir(tmp_path)
+    warn_flags: list[bool] = []
+
+    def _resolver(_s: object, _t: object, *, warn_fallback: bool = True) -> int | None:
+        warn_flags.append(warn_fallback)
+        return None
+
+    monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", _resolver)
+    monkeypatch.setattr(reader, "_PLACEHOLDER_RECOVERY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+
+    assert await reader._discover(bridge_dir, poll_interval_s=0.0, stop=_stop_after(2)) is None
+    assert warn_flags == [True, False, False]
 
 
 @pytest.mark.asyncio
@@ -3829,7 +3886,7 @@ async def test_supervise_reader_recovers_placeholder_and_mirrors(
     # so on such a build this test fails on the behavioral assertions below (the
     # placeholder is never replaced), not on patching a missing attribute.
     monkeypatch.setattr(
-        reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t: _PORT, raising=False
+        reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT, raising=False
     )
     monkeypatch.setattr(
         reader, "get_all_cascade_trajectories", lambda _p: _typed_body(_CASCADE_ID)
