@@ -1,6 +1,7 @@
 // Maximizing the main window on native Wayland must not kill the shell (Chromium
 // traps on the zero-height geometry a collapsed update overlay once produced).
-// Drives the real shell against a headless stub compositor enforcing xdg-shell.
+// Drives the real shell against a headless stub compositor enforcing xdg-shell
+// (needs pywayland >= 0.4.19 in OMNIGENT_PYTHON's environment; skips otherwise).
 
 "use strict";
 
@@ -45,29 +46,32 @@ async function pollUntil(fn, { timeout, interval = 200, label }) {
   /* oxlint-enable no-await-in-loop */
 }
 
-// A SIGTRAP kill finalizes Playwright's per-page video slightly after
-// electronApp.close() resolves, so wait for the raw clips to stop growing
-// before saveRecording renames them.
-async function waitForRawVideo(recordDir, timeout = 15_000) {
-  const totalSize = () =>
+// A SIGTRAP kill finalizes Playwright's per-page videos slightly after
+// electronApp.close() resolves, so wait until every page seen has a raw clip
+// and the clips stop growing before saveRecording renames them.
+async function waitForRawVideo(recordDir, expectedPages, timeout = 15_000) {
+  const rawClipSizes = () =>
     fs
       .readdirSync(recordDir)
       .filter((f) => (f.startsWith("page@") || f.startsWith("display@")) && f.endsWith(".webm"))
-      .reduce((sum, f) => sum + fs.statSync(path.join(recordDir, f)).size, 0);
+      .map((f) => fs.statSync(path.join(recordDir, f)).size);
   const deadline = Date.now() + timeout;
   let last = -1;
   /* oxlint-disable no-await-in-loop */
   while (Date.now() < deadline) {
-    const total = totalSize();
-    if (total > 0 && total === last) return;
+    const sizes = rawClipSizes();
+    const total = sizes.reduce((sum, size) => sum + size, 0);
+    if (sizes.length >= expectedPages && total > 0 && total === last) return;
     last = total;
     await sleep(400);
   }
   /* oxlint-enable no-await-in-loop */
 }
 
+// The stub compositor uses the server-side Resource.get_id() added in pywayland 0.4.19.
 function pywaylandAvailable() {
-  return spawnSync(PYTHON, ["-c", "import pywayland"], { stdio: "ignore" }).status === 0;
+  const probe = "from pywayland.protocol_core.resource import Resource; Resource.get_id";
+  return spawnSync(PYTHON, ["-c", probe], { stdio: "ignore" }).status === 0;
 }
 
 // The AF_UNIX socket path limit is 108 bytes, so the runtime dir must live
@@ -112,7 +116,10 @@ async function startCompositor() {
     for (const suffix of [".done", ".taken"]) {
       fs.rmSync(file + suffix, { force: true });
     }
-    fs.writeFileSync(file, JSON.stringify(selector));
+    // The compositor polls for `file`; rename a finished temp file into place so
+    // it never parses a partially written command.
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(selector));
+    fs.renameSync(`${file}.tmp`, file);
     const done = await pollUntil(
       () => (fs.existsSync(file + ".done") ? fs.readFileSync(file + ".done", "utf8") : null),
       { timeout: 10_000, label: `compositor ${name}` },
@@ -154,7 +161,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     return t.skip(`missing desktop deps: ${deps.missing.join(", ")}`);
   }
   if (!pywaylandAvailable()) {
-    return t.skip("pywayland (stub compositor) not importable");
+    return t.skip("pywayland >= 0.4.19 (stub compositor) not importable");
   }
 
   fs.mkdirSync(RECORD_DIR, { recursive: true });
@@ -165,12 +172,18 @@ test("desktop shell survives maximize on Wayland", async (t) => {
   let electronApp;
   let stopDisplayCapture = async () => {};
   let exitInfo = null;
-  const evidence = {};
+  const evidence = { timeline: {} };
+  const pagesSeen = new Set();
+  let launchedAt = Date.now();
+  const mark = (name) => {
+    evidence.timeline[name] = Date.now() - launchedAt;
+  };
 
   try {
     server = await spawnServer(tmpDir);
     compositor = await startCompositor();
 
+    launchedAt = Date.now();
     const launched = await launchDesktop({
       recordDir: RECORD_DIR,
       serverUrl: server.serverUrl,
@@ -185,6 +198,8 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     });
     electronApp = launched.electronApp;
     stopDisplayCapture = launched.stopDisplayCapture;
+    for (const page of electronApp.windows()) pagesSeen.add(page);
+    electronApp.on("window", (page) => pagesSeen.add(page));
 
     electronApp.process().on("exit", (code, signal) => {
       exitInfo = { code, signal };
@@ -202,6 +217,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       },
       { timeout: WINDOWS_TIMEOUT_MS, label: "main window and update overlay" },
     );
+    mark("windowsVisible");
 
     // firstWindow() is often the empty overlay page; the shell renders on the
     // page navigated to the server URL. Let it show the home screen so the
@@ -210,11 +226,13 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       () => electronApp.windows().find((p) => p.url().startsWith("http")) ?? null,
       { timeout: WINDOWS_TIMEOUT_MS, label: "main SPA page" },
     );
-    await mainPage
+    evidence.homeScreenVisible = await mainPage
       .getByText(SHELL_READY_TEXT)
       .first()
       .waitFor({ state: "visible", timeout: SHELL_TIMEOUT_MS })
-      .catch(() => {});
+      .then(() => true)
+      .catch(() => false);
+    mark("homeScreenChecked");
     await sleep(2000);
 
     evidence.windowsBefore = await describeWindows(electronApp);
@@ -222,6 +240,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     // Maximizing the largest non-child toplevel models a user maximizing the
     // main window (not the overlay); the shell then repositions the overlay.
     const maximize = await compositor.command("maximize");
+    mark("maximizeConfigured");
     evidence.maximizeAction = maximize;
     assert.equal(
       maximize.affected.length,
@@ -236,8 +255,23 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       label: "shell exit",
     }).catch(() => {});
 
+    if (exitInfo) mark("shellExited");
     evidence.exit = exitInfo;
-    evidence.windowsAfter = await describeWindows(electronApp).catch(() => null);
+    // A trapped main process stops answering before its exit is reported.
+    evidence.windowsAfter = await describeWindows(electronApp).catch((err) => {
+      evidence.windowsAfterError = String(err);
+      return null;
+    });
+    mark("windowsAfterChecked");
+    if (exitInfo === null) {
+      // Restoring the window resizes it again; the shell must survive that too.
+      evidence.unmaximizeAction = await compositor.command("unmaximize");
+      mark("unmaximizeConfigured");
+      await sleep(3000);
+      if (exitInfo) mark("shellExited");
+      evidence.exitAfterUnmaximize = exitInfo;
+      evidence.windowsAfterUnmaximize = await describeWindows(electronApp).catch(() => null);
+    }
     const geometry = compositor.events.filter((e) => e.event === "set_window_geometry");
     evidence.lastGeometry = geometry.slice(-3);
     evidence.invalidGeometry = compositor.events.filter(
@@ -247,7 +281,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     fs.writeFileSync(path.join(RECORD_DIR, "evidence.json"), JSON.stringify(evidence, null, 2));
 
     assert.equal(
-      exitInfo,
+      evidence.exit,
       null,
       `desktop shell died while maximizing on Wayland: ${JSON.stringify(evidence.exit)} ` +
         `(compositor geometry: ${JSON.stringify(evidence.lastGeometry)})`,
@@ -256,6 +290,15 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     assert.ok(
       after.some((w) => !w.overlay && w.maximized),
       "the main window should be maximized and alive after the resize",
+    );
+    assert.equal(
+      evidence.exitAfterUnmaximize,
+      null,
+      `desktop shell died while restoring the window: ${JSON.stringify(evidence.exitAfterUnmaximize)}`,
+    );
+    assert.ok(
+      (evidence.windowsAfterUnmaximize ?? []).some((w) => !w.overlay && !w.maximized),
+      "the main window should be restored and alive after un-maximizing",
     );
     assert.equal(
       evidence.invalidGeometry.length,
@@ -267,7 +310,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     await stopDisplayCapture().catch(() => {});
     if (compositor) await compositor.stop().catch(() => {});
     if (server) await server.close().catch(() => {});
-    await waitForRawVideo(RECORD_DIR).catch(() => {});
+    await waitForRawVideo(RECORD_DIR, pagesSeen.size).catch(() => {});
     saveRecording(RECORD_DIR, "wayland-maximize");
   }
 });
