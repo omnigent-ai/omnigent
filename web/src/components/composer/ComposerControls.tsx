@@ -40,7 +40,7 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
     <div
       ref={barRef}
       className={cn(
-        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-1.5 md:gap-2",
+        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
         COMPOSER_CONTENT_INSET_CLASS,
         COMPOSER_TRAY_INSET_CLASS,
         className,
@@ -56,8 +56,13 @@ export const ComposerWorkspaceTrigger = forwardRef<
     kind: "directory" | "worktree";
     label: string;
     icon?: ReactNode;
+    /** Hide the visible label; it stays the accessible name. */
+    iconOnly?: boolean;
   }
->(function ComposerWorkspaceTrigger({ kind, label, icon, className, ...props }, ref) {
+>(function ComposerWorkspaceTrigger(
+  { kind, label, icon, iconOnly = false, className, ...props },
+  ref,
+) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
   return (
     <button
@@ -72,12 +77,14 @@ export const ComposerWorkspaceTrigger = forwardRef<
       {...props}
     >
       {icon ?? <Icon className="size-3.5 shrink-0" />}
-      <span
-        data-workspace-collapse-label=""
-        className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
-      >
-        {label}
-      </span>
+      {!iconOnly && (
+        <span
+          data-workspace-collapse-label=""
+          className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+        >
+          {label}
+        </span>
+      )}
       <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
     </button>
   );
@@ -132,6 +139,7 @@ export function ComposerPermissionPicker({
   selectedValue,
   options,
   disabled = false,
+  iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
   onSelect,
@@ -143,6 +151,8 @@ export function ComposerPermissionPicker({
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hide the visible value; it stays in the accessible name. */
+  iconOnly?: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
@@ -165,11 +175,13 @@ export function ComposerPermissionPicker({
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span
-            className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
-          >
-            {value}
-          </span>
+          {!iconOnly && (
+            <span
+              className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+            >
+              {value}
+            </span>
+          )}
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>

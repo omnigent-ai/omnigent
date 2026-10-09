@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -284,48 +285,35 @@ async def test_sdk_override_on_native_spec_refuses_sys_os_tools(
     assert executed == []
 
 
+@pytest.mark.parametrize("os_env_option", ["fork", "start_in_scratch"])
 async def test_surface_probe_does_not_fork_the_working_tree(
     monkeypatch: pytest.MonkeyPatch,
+    os_env_option: str,
 ) -> None:
-    """The surface probe never pays for ``os_env.fork``.
-
-    ``fork`` copies the whole working tree when an OS environment is built, and
-    the copy has no bearing on which tool names exist. Closing the probe's
-    environment is asserted alongside it, so nothing outlives the check.
-    """
+    """Metadata probes never construct an environment, even for fork/scratch specs."""
     from omnigent.inner import os_env as os_env_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-    copied: list[Any] = []
-    closed: list[object] = []
-    monkeypatch.setattr(os_env_mod, "_copy_tree", lambda *a, **kw: copied.append(a))
-    _real_create = os_env_mod.create_os_environment
-
-    def _spy_create(spec_obj: Any) -> Any:
-        env = _real_create(spec_obj)
-        if env is not None:
-            _real_close = env.close
-
-            def _close() -> None:
-                closed.append(env)
-                _real_close()
-
-            object.__setattr__(env, "close", _close)
-        return env
-
-    monkeypatch.setattr(os_env_mod, "create_os_environment", _spy_create)
+    create_env = Mock(side_effect=AssertionError("metadata must not construct an OS environment"))
+    monkeypatch.setattr(os_env_mod, "create_os_environment", create_env)
     spec = AgentSpec(
         spec_version=1,
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=".",
             sandbox=OSEnvSandboxSpec(type="none"),
-            fork=True,
+            fork=os_env_option == "fork",
+            start_in_scratch=os_env_option == "start_in_scratch",
         ),
     )
 
     granted = tool_dispatch._granted_tool_names(spec)
+    schemas = tool_dispatch.build_native_relay_tool_schemas(spec)
+    request_schemas = tool_dispatch.ToolManager(spec, os_env_schema_only=True).get_tool_schemas()
 
-    assert "sys_os_shell" in granted
-    assert copied == []
-    assert len(closed) == 1
+    assert granted >= tool_dispatch._OS_ENV_TOOLS
+    assert {schema["name"] for schema in schemas} >= tool_dispatch._OS_ENV_TOOLS
+    assert {
+        schema["function"]["name"] for schema in request_schemas
+    } >= tool_dispatch._OS_ENV_TOOLS
+    create_env.assert_not_called()

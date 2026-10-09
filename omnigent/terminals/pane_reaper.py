@@ -16,7 +16,9 @@ disjunction of three signals (any one spares the pane):
     working autonomously *between* runner turns (native turns clear the runner's
     ``_active_turns`` right after the prompt is pasted, so this is the load-bearing
     signal for a long autonomous turn), OR
-  * a tmux client is attached (a human is watching the pane).
+  * a human recently drove an attached viewer — a keypress on a tmux client, or
+    any event on the web attach bridge. An idle attached viewer alone does not
+    count, else a tab left open overnight pins the pane (and its MCP fleet).
 
 A pane idle on all three for longer than the window is reaped, with a **second
 busy re-check immediately before teardown** to close the select→reap race. The
@@ -42,10 +44,11 @@ from typing import NamedTuple
 
 _logger = logging.getLogger(__name__)
 
-# A pane whose window emitted output this recently counts as busy. tmux's own
-# activity clock is evidence independent of the harness status pipeline, whose
-# silent stall must not get a live, producing terminal reaped. Two reaper scan
-# intervals, so any output between scans re-arms the idle clock.
+# A pane whose window emitted output, or whose viewer took human input, this
+# recently counts as busy. tmux's own clocks are evidence independent of the
+# harness status pipeline, whose silent stall must not get a live, producing
+# terminal reaped. Two reaper scan intervals, so activity between scans re-arms
+# the idle clock.
 PANE_OUTPUT_BUSY_WINDOW_S = 120.0
 
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in

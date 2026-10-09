@@ -1,4 +1,7 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useConversationRedirect } from "@/hooks/useConversationRedirect";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
@@ -27,15 +30,14 @@ import {
   FileTextIcon,
   Loader2Icon,
   MessagesSquareIcon,
-  TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
-import { useNavigate, useParams } from "@/lib/routing";
+import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -71,11 +73,12 @@ import {
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
-import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
+import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
+import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -89,12 +92,12 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
-  type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -108,11 +111,14 @@ import {
 } from "@/lib/nativeCodingAgents";
 import {
   isSideChatCommand,
+  newPendingSideChatId,
   SIDE_CHAT_COMMAND_PREFIX,
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
+import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -127,6 +133,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
   type ComposerDraft,
@@ -151,7 +158,6 @@ export {
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   SessionSharedContext,
-  UserMessageNavConnected,
   WORKING_MESSAGES,
   WorkingIndicator,
   bubbleKey,
@@ -176,6 +182,7 @@ export type { ConversationScroller } from "@/components/chat/chatBubbleParts";
 import {
   type ConversationScroller,
   SessionSharedContext,
+  computeIsTurnActive,
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
@@ -198,6 +205,9 @@ import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
+  matchSlashCommandInvocation,
+  skillDisplayNames,
+  skillMenuDescription,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -218,7 +228,6 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
-import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
@@ -329,59 +338,20 @@ export function isSubagentRoutingEligible(
 const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
 
 /**
- * Split a command or skill draft for the composer highlight overlay.
- * Returns null for prose and file paths such as `/etc/hosts`.
+ * Split a command or skill draft for the composer highlight overlay. The token
+ * is a known `commands` entry's full name (it may contain spaces or punctuation),
+ * else the first `/command`-shaped word. Null for prose and paths like `/etc/hosts`.
  */
 export function splitSlashCommand(
   value: string,
+  commands: Iterable<string> = [],
 ): { before: string; token: string; after: string } | null {
-  const m = SLASH_COMMAND_SPLIT_RE.exec(value);
-  if (!m) return null;
-  const [, before, token] = m;
+  const token =
+    matchSlashCommandInvocation(value, commands)?.command ??
+    SLASH_COMMAND_SPLIT_RE.exec(value)?.[2];
+  if (token === undefined) return null;
+  const before = /^\s*/.exec(value)?.[0] ?? "";
   return { before, token, after: value.slice(before.length + token.length) };
-}
-
-/**
- * Whether a submitted message should be queued rather than POSTed now.
- *
- * Queue when busy, or when this conversation already has a queued message even
- * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
- * later direct send could overtake a still-queued earlier one when status
- * flickers idle mid-queue (cursor-native). A new chat always sends.
- *
- * ``waiting`` is NOT busy for queueing: it means the turn already ended and the
- * agent loop is only parked on background work (background shells / sub-agents)
- * — the server's turn gate is already free, so a new message starts a fresh
- * turn immediately instead of stalling behind that background work. (The
- * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
- * reflect background activity, which is a separate concern from send gating.)
- *
- * ``alwaysSteer`` (a per-device preference) drops the busy gate entirely: a
- * follow-up sent mid-turn is POSTed now — steered into the running turn —
- * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
- * once this conversation has a queued message it must drain in order, or a
- * direct send could overtake a still-queued earlier one on an idle flicker.
- *
- * ``opensSideChat`` (a codex ``/side`` command) always POSTs now. A side chat is
- * forked onto its own thread and is non-interrupting by design — asking while
- * the agent works is the whole point — so it must not park in the queue behind
- * the parent's active turn. It shares no ordering with main-thread sends, so it
- * bypasses ``hasQueued`` too.
- */
-export function shouldQueueSend(
-  conversationId: string | null,
-  status: "idle" | "streaming",
-  sessionStatus: SessionStatus,
-  queuedMessages: QueuedMessage[],
-  alwaysSteer = false,
-  opensSideChat = false,
-): boolean {
-  if (conversationId === null) return false;
-  if (opensSideChat) return false;
-  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  if (alwaysSteer) return hasQueued;
-  const isBusy = status === "streaming" || sessionStatus === "running";
-  return isBusy || hasQueued;
 }
 
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
@@ -410,6 +380,8 @@ export function ChatPage() {
   // the session exists. `switchTo` still gets the raw `urlConvId`.
   const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
   const navigate = useNavigate();
+  const { pathname, search } = useLocation();
+  const rebasePath = useRebasePath();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
@@ -475,32 +447,22 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
-    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
-    // conversation is gone) has no forward path: landing is URL-keyed, so the
-    // page would sit on a permanently read-only phantom chat. Redirect to
-    // landing instead of binding a nonexistent session.
+    // A temporary route has no client session after a reload. Return to its
+    // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
-      navigate("/", { replace: true });
+      const canvas = isCanvasPathname(pathname, rebasePath("/canvas"));
+      navigate(
+        canvas
+          ? canvasLocation(new URLSearchParams(search).get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID)
+          : "/",
+        { replace: true },
+      );
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate]);
+  }, [urlConvId, navigate, pathname, search, rebasePath]);
 
-  // Server-driven redirect: when the active conversation is superseded
-  // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
-  // away), the store records the follow-to target in
-  // `redirectToConversationId`. Perform the router navigation here (the
-  // store can't), replacing history so Back doesn't return to the
-  // cleared session, then clear the flag so it fires exactly once. Skip
-  // when we're already on the target URL.
-  const redirectToConversationId = useChatStore((s) => s.redirectToConversationId);
-  useEffect(() => {
-    if (!redirectToConversationId) return;
-    if (redirectToConversationId !== urlConvId) {
-      navigate(`/c/${redirectToConversationId}`, { replace: true });
-    }
-    useChatStore.setState({ redirectToConversationId: null });
-  }, [redirectToConversationId, urlConvId, navigate]);
+  useConversationRedirect(urlConvId);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay
@@ -729,7 +691,7 @@ export function ChatPage() {
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
   const isWorking =
-    computeIsWorking(sessionStatus) || status === "streaming" || hasPendingInitialMessage;
+    computeIsTurnActive(sessionStatus, status === "streaming") || hasPendingInitialMessage;
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -932,11 +894,12 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const { reconnect, dialogOpen, setDialogOpen, localReconnect } = useSessionReconnect({
-    sessionId: urlConvId ?? null,
-    hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
-    isOwner: isOwnerLevel(permissionLevel),
-  });
+  const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
+    useSessionReconnect({
+      sessionId: urlConvId ?? null,
+      hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+      isOwner: isOwnerLevel(permissionLevel),
+    });
 
   const onSend = useCallback(
     (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
@@ -1143,6 +1106,7 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
+      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1206,6 +1170,7 @@ export function ChatPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         localReconnect={localReconnect}
+        arcaReconnect={arcaReconnect}
         conversationId={urlConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
@@ -1401,6 +1366,7 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
+  hostId: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1575,6 +1541,7 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
+  hostId,
   status,
   isWorking,
   showsWorking,
@@ -1863,6 +1830,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <Transcript
+            hostId={hostId}
             setConversationEl={setConversationEl}
             containerEl={containerEl}
             scroller={scroller}
@@ -2123,7 +2091,7 @@ interface ComposerProps {
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
-  skills: readonly { name: string; description: string }[],
+  skills: readonly SkillSummary[],
   showEffort: boolean,
   showModel: boolean,
   showCompact = true,
@@ -2144,7 +2112,7 @@ export function buildSlashCommandMap(
     m[name] = name === "/model" && supportsModelReset ? `${description} | default` : description;
   }
   for (const skill of skills) {
-    m[`${skillPrefix}${skill.name}`] = skill.description;
+    m[`${skillPrefix}${skill.name}`] = skillMenuDescription(skill);
   }
   return m;
 }
@@ -2408,8 +2376,6 @@ function ComposerImpl(
     editText,
     replaceText,
     appendQuote,
-    beginSideChatQuote,
-    sideChat,
     removeQuote,
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -2433,6 +2399,11 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // A restored failed-send draft whose fate is still unknown — flips to
+  // `delivered` when the send turns out to have reached the server, so the
+  // retraction effect below can empty the composer.
+  const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
+  const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
@@ -2678,6 +2649,12 @@ function ComposerImpl(
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 
+  // Ctrl+Shift+L focuses the composer input from anywhere in the session view.
+  // No-op on mobile, where programmatic focus would pop the software keyboard.
+  useFocusComposerHotkey(() => {
+    if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
+  });
+
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
   // callbacks so the hook never learns about sessions or focus.
@@ -2793,7 +2770,7 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
-  const skillPrefix = sessionHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
@@ -2821,6 +2798,7 @@ function ComposerImpl(
       supportsModelReset,
     ],
   );
+  const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
@@ -2838,7 +2816,7 @@ function ComposerImpl(
     draft.quotes.length === 0 &&
     files.length === 0 &&
     hasCommandPrefix &&
-    splitSlashCommand(value) !== null;
+    splitSlashCommand(value, slashCommandNames) !== null;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -2966,6 +2944,15 @@ function ComposerImpl(
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
+    // The send may have proven delivered since the render that scheduled this
+    // effect: its committed item landed under the send's stable id (see
+    // `retractDeliveredSendDraft`), so restoring now would prime a duplicate.
+    // Not so for a send the server refused: its item is persisted too, but the
+    // runner never took it, so the text must come back for a resend.
+    if (committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft)) {
+      useChatStore.setState({ failedSendDraft: null });
+      return;
+    }
     useChatStore.setState({
       failedSendDraft: null,
       pendingRetryStableId: failedSendDraft.stableId ?? null,
@@ -2976,13 +2963,58 @@ function ComposerImpl(
       useChatStore.setState({ pendingRetryStableId: null });
       return;
     }
+    pendingFailedSendRestore.current = failedSendDraft.stableId
+      ? { stableId: failedSendDraft.stableId, draft }
+      : null;
     replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0)
       attachmentsRef.current.replaceFiles(failedSendDraft.files);
+    // Remember what was restored: if the "failed" send proves delivered (its
+    // stable id shows up as a committed item), the retraction effect below
+    // empties the composer instead of priming a duplicate send.
+    if (failedSendDraft.stableId) {
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: failedSendDraft.conversationId,
+          stableId: failedSendDraft.stableId,
+          text: failedSendDraft.text,
+          files: failedSendDraft.files,
+          replyDraft: failedSendDraft.replyDraft,
+          serverRefused: failedSendDraft.serverRefused,
+          delivered: false,
+        },
+      });
+    }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
+  }, [failedSendDraft, conversationId, settledConversationId, replaceText, draft]);
+
+  // Retract a restored failed-send draft once its send proves delivered (its
+  // committed item arrived over the stream or a reconnect snapshot). Edits win:
+  // the text is cleared only while it is exactly what the restore put there.
+  useEffect(() => {
+    if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
+    if (restoredSendDraft.conversationId !== conversationId) return;
+    if (settledConversationId !== conversationId) return;
+    // Delivery can interrupt the queued text restore with a store render.
+    // Wait for the local draft update before deciding whether the user edited it.
+    const pending = pendingFailedSendRestore.current;
+    if (pending?.stableId === restoredSendDraft.stableId && pending.draft === draft) return;
+    pendingFailedSendRestore.current = null;
+    useChatStore.setState({ restoredSendDraft: null });
+    const expected = serializeReplyDraft(
+      restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
+    );
+    const filesUnedited =
+      filesRef.current.length === restoredSendDraft.files.length &&
+      filesRef.current.every((f) => restoredSendDraft.files.includes(f));
+    if (valueRef.current !== expected || !filesUnedited) return;
+    replaceText("");
+    attachmentsRef.current.replaceFiles([]);
+    dirtyRef.current = false;
+    if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
+  }, [restoredSendDraft, conversationId, settledConversationId, replaceText, draft]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -2991,14 +3023,55 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
-      case "/compact":
+      case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
+          return true;
+        }
+        if (
+          (sessionHarness === "codex-native" ||
+            sessionHarness === "claude-sdk" ||
+            sessionHarness === "pi-native") &&
+          arg
+        ) {
+          const harnessName = {
+            "codex-native": "Codex",
+            "pi-native": "Pi",
+            "claude-sdk": "Claude SDK",
+          }[sessionHarness];
+          setCommandError(`/compact does not accept arguments for ${harnessName}`);
+          return true;
+        }
+        const chat = useChatStore.getState();
+        if (
+          sessionHarness === "codex-native" &&
+          (chat.status === "streaming" || chat.sessionStatus === "running") &&
+          !shouldQueueSend(
+            chat.conversationId,
+            chat.status,
+            chat.sessionStatus,
+            chat.queuedMessages,
+            readAlwaysSteer(),
+          )
+        ) {
+          toast.error("Compact is disabled while a chat is in progress", { richColors: true });
           return true;
         }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        if (
+          sessionHarness === "claude-native" ||
+          sessionHarness === "claude-sdk" ||
+          sessionHarness === "codex-native" ||
+          sessionHarness === "pi-native"
+        ) {
+          // Use the message queue; the store dispatches SDK, Codex and Pi as controls.
+          const command = arg ? `/compact ${arg}` : "/compact";
+          appendEntry(command);
+          onSend(command);
+          return true;
+        }
         void useChatStore
           .getState()
           .compact()
@@ -3006,6 +3079,7 @@ function ComposerImpl(
             setCommandError(err instanceof Error ? err.message : "Compact failed");
           });
         return true;
+      }
       case "/effort": {
         if (!showEffort) return false;
         const valid = [...effortLevels, "default"];
@@ -3106,33 +3180,41 @@ function ComposerImpl(
     }
   };
 
-  /**
-   * Called when the user selects a suggestion from the menu (keyboard or
-   * click). Commands that need an argument (``SLASH_COMMANDS_WITH_ARGS``)
-   * fill in the text with a trailing space so the user can type the arg.
-   * All other commands execute immediately.
-   */
+  const completeMenuSelection = (cmd: string) => {
+    const completion = slashCompletion.complete(cmd);
+    setValue(completion.text);
+    dirtyRef.current = true;
+  };
+
+  // Skills insert at the caret; Enter/click executes standalone no-argument built-ins.
   const applyMenuSelection = (cmd: string) => {
-    if (slashCommandsWithArgs.has(cmd)) {
-      // Fill in "cmd " and let the user type the argument.
-      setValue(cmd + " ");
-      dirtyRef.current = true;
-      textareaRef.current?.focus();
+    if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
+      completeMenuSelection(cmd);
     } else {
       // Execute immediately — no argument needed.
-      setValue("");
+      // /compact clears its draft only after the busy guard accepts it.
+      if (cmd !== "/compact") setValue("");
       setCommandError(null);
       executeSlashCommand(cmd, "");
     }
   };
 
-  // Slash-completion menu mechanics (shared useSlashCompletion): the menu
-  // opens while the focused draft is a lone command token with no
-  // attachments, and owns Escape, arrows, and Tab/Enter completion while
-  // open. What a selection does (fill vs execute) stays in the adapter.
+  const skillCommands = useMemo(
+    () =>
+      Object.fromEntries(
+        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+      ),
+    [skills, skillPrefix],
+  );
+  const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
+
+  // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
+    skills: skillCommands,
+    labels: skillLabels,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobile,
@@ -3140,6 +3222,7 @@ function ComposerImpl(
     escapeClearsOnlyWithContent: true,
     allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
     onSelect: applyMenuSelection,
+    onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
   });
 
@@ -3184,20 +3267,13 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     startSideChat(selectedText) {
-      // Add the selection as a quote card (exactly like Reply) and mark the
-      // draft as opening a side chat. The user types their question below it;
-      // submit prefixes /side so it forks instead of replying inline.
-      if (disabled || isReadOnly || unreachable || composerLockedByBtw || !selectedText.trim()) {
+      // Open an empty side-chat rail tab right away with the selection quoted in
+      // its composer; the fork is created when the user sends from that tab.
+      const sourceId = useChatStore.getState().conversationId;
+      if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
         return;
       }
-      beginSideChatQuote(selectedText);
-      textareaRef.current = tailTextareaRef.current;
-      dirtyRef.current = true;
-      replyQuoteInsertedRef.current = true;
-      setCommandError(null);
-      dismissMention();
-      resetCursor();
-      recallingRef.current = false;
+      useChatStore.getState().openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
     },
   }));
 
@@ -3281,25 +3357,34 @@ function ComposerImpl(
       );
     };
 
-    // Slash command path: the first token must read as "/name" (the shared
-    // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
-    // match, while args after the name may carry paths or URLs, e.g.
-    // "/review-pr https://github.com/...").
-    // Commands don't mix with file attachments — require no files. Built-ins
-    // run locally; a known skill routes through ``onSendSlashCommand`` (a
-    // ``slash_command`` event) when that's wired — i.e. in-process sessions.
-    // Anything else (unknown command, or a skill on a native-terminal
-    // session where ``onSendSlashCommand`` is undefined) falls through to the
-    // plaintext send path below.
+    // Slash command path: text that reads as "/name ..." (not a file path) or
+    // invokes a known catalog skill by its full name, with no attachments.
+    // Built-ins run locally; anything unhandled falls through to plaintext.
+    const skill = onSendSlashCommand
+      ? matchSlashCommandInvocation(trimmed, slashCommandNames)
+      : null;
     if (
       draft.quotes.length === 0 &&
-      isSlashCommandText(trimmed) &&
+      (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
       mentionedItems.length === 0
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
+      const sendSkill = (match: { command: string; args: string }) => {
+        appendEntry(trimmed);
+        onSendSlashCommand?.(match.command.slice(1), match.args);
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+      };
+      // A multi-word catalog skill outranks a built-in that matches only its
+      // first word: "/Help Desk summarize" invokes the skill, not /help.
+      if (skill !== null && skill.command !== parts[0]) {
+        sendSkill(skill);
+        return;
+      }
       // Bare "/model" when the session has a switchable model (claude-native):
       // sent as plaintext it would open Claude's interactive selector inside the
       // vendor TUI, which the web UI can't render — the session just blocks. Open
@@ -3329,7 +3414,7 @@ function ComposerImpl(
         cmd in BUILTIN_SLASH_COMMANDS &&
         cmd in slashCommands
       ) {
-        executeSlashCommand(cmd, arg);
+        executeSlashCommand(cmd, cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg);
         return;
       }
       // /side opens a side chat. Codex forks in-process (falls through to the
@@ -3339,20 +3424,11 @@ function ComposerImpl(
         openGenericSideChat(trimmed.slice(cmd.length).trim());
         return;
       }
-      // Known skill on an in-process session: send a `slash_command` event
-      // (the REPL's wire shape) so the server resolves the skill and
-      // injects its instructions, instead of the agent seeing the literal
-      // "/name" text. `parts[0]` keeps the original case for the server's
-      // exact-name lookup. `onSendSlashCommand` is undefined for
-      // native-terminal sessions, so those fall through to the plaintext
-      // path below and the vendor TUI loads the skill itself.
-      if (onSendSlashCommand && parts[0] in slashCommands) {
-        const skillArgs = trimmed.slice(parts[0].length).trim();
-        appendEntry(trimmed);
-        onSendSlashCommand(parts[0].slice(1), skillArgs);
-        dirtyRef.current = true;
-        setValue("");
-        setCommandError(null);
+      // Known skill on an in-process session: send a `slash_command` event so
+      // the server resolves it. Native-terminal sessions have no
+      // `onSendSlashCommand`; their vendor TUI loads the skill from plaintext.
+      if (skill !== null) {
+        sendSkill(skill);
         return;
       }
     }
@@ -3379,18 +3455,7 @@ function ComposerImpl(
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
-      const serialized = serializeReplyDraft(outgoing);
-      if (sideChat && usesNativeSideChatFork(sessionHarness)) {
-        // Codex: the /side pipeline keys off the leading command and forks
-        // in-process. No main-chat bubble is kept, so no reply-draft snapshot.
-        onSend(SIDE_CHAT_COMMAND_PREFIX + serialized, sendFiles);
-      } else if (sideChat && supportsSideChat(sessionHarness)) {
-        // Generic: fork onto a managed side chat, seeding its composer with the
-        // quoted selection + question (no main-chat bubble either).
-        openGenericSideChat(serialized);
-      } else {
-        onSend(serialized, sendFiles, snapshotReplyDraft(outgoing));
-      }
+      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       onSend(mentionPreamble + trimmed, sendFiles);
     }
@@ -3526,6 +3591,7 @@ function ComposerImpl(
   };
 
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+    slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
@@ -3548,7 +3614,7 @@ function ComposerImpl(
   return (
     <form
       onSubmit={handleSubmit}
-      className="chat-composer-form relative px-4 pb-[max(20px,env(safe-area-inset-bottom))] md:px-6"
+      className="chat-composer-form relative px-6 pb-[max(20px,env(safe-area-inset-bottom))]"
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -3625,6 +3691,7 @@ function ComposerImpl(
             state={composerGit.githubState}
             prCount={composerGit.prCount}
             prNumber={composerGit.prNumber}
+            prNumberPrefix={composerGit.prNumberPrefix}
             onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
@@ -3655,6 +3722,7 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
+          onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
           onFocus: (e) => {
             setInputFocused(true);
             handleTextFocus(null, e.currentTarget);
@@ -3703,40 +3771,29 @@ function ComposerImpl(
         slots={{
           inputPrefix:
             draft.quotes.length > 0 ? (
-              <>
-                {sideChat ? (
-                  <div
-                    data-testid="composer-side-chat-hint"
-                    className="mb-1 flex items-center gap-1 text-xs font-medium text-brand-accent"
-                  >
-                    <MessagesSquareIcon className="size-3" />
-                    Ask in a side chat forked from this main conversation
-                  </div>
-                ) : null}
-                <ReplyDraftBlocks
-                  quotes={draft.quotes}
-                  activeTextId={activeTextId}
-                  keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                  disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
-                  onGrowth={onViewportShrinkPinScroll}
-                  onRemove={(id) => {
-                    removeQuote(id);
-                    resetCursor();
-                    recallingRef.current = false;
-                    textareaRef.current = tailTextareaRef.current;
-                    dirtyRef.current = true;
-                    dismissMention();
-                  }}
-                  inputFor={(quote) => ({
-                    onChange: (e) => handleTextChange(quote.id, e),
-                    onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
-                    onBlur: dismissMention,
-                    onKeyDown: handleKeyDown,
-                    onPaste,
-                    "data-has-draft": hasDraft ? "true" : undefined,
-                  })}
-                />
-              </>
+              <ReplyDraftBlocks
+                quotes={draft.quotes}
+                activeTextId={activeTextId}
+                keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
+                onGrowth={onViewportShrinkPinScroll}
+                onRemove={(id) => {
+                  removeQuote(id);
+                  resetCursor();
+                  recallingRef.current = false;
+                  textareaRef.current = tailTextareaRef.current;
+                  dirtyRef.current = true;
+                  dismissMention();
+                }}
+                inputFor={(quote) => ({
+                  onChange: (e) => handleTextChange(quote.id, e),
+                  onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
+                  onBlur: dismissMention,
+                  onKeyDown: handleKeyDown,
+                  onPaste,
+                  "data-has-draft": hasDraft ? "true" : undefined,
+                })}
+              />
             ) : undefined,
           beforeInput: (
             <>
@@ -3746,7 +3803,9 @@ function ComposerImpl(
                   query={slashCompletion.query}
                   activeIndex={slashCompletion.index}
                   onSelect={applyMenuSelection}
-                  commands={slashCommands}
+                  commands={slashCompletion.commands}
+                  builtinNames={slashCompletion.builtinNames}
+                  labels={slashCompletion.labels}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />
@@ -3812,7 +3871,7 @@ function ComposerImpl(
               className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
             >
               {(() => {
-                const split = splitSlashCommand(value);
+                const split = splitSlashCommand(value, slashCommandNames);
                 if (!split) return value;
                 return (
                   <>
@@ -4589,8 +4648,7 @@ function SessionHarnessPicker({
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
-  const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [configOpen, setConfigOpen] = useState(false);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
@@ -4655,27 +4713,21 @@ function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
       setMenuOpen(true);
-      setConfigMenu(showModels ? "model" : "effort");
+      setConfigOpen(true);
     }
-  }, [openNonce, disabled, configurable, showModels]);
+  }, [openNonce, disabled, configurable]);
   useEffect(() => {
     setMenuOpen(false);
-    setConfigMenu(null);
-    setError(null);
+    setConfigOpen(false);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
     if (disabled || busyRef.current || pendingModelChange !== null) return;
     busyRef.current = true;
     setBusy(true);
-    setError(null);
-    const sourceSessionId = useChatStore.getState().conversationId;
     try {
       await change();
-    } catch (failure) {
-      if (useChatStore.getState().conversationId === sourceSessionId)
-        setError(
-          failure instanceof Error ? failure.message : "Unable to update session configuration",
-        );
+    } catch {
+      // The store rolls back a refused change, so the pill shows what applied.
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -4715,7 +4767,7 @@ function SessionHarnessPicker({
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (selectedEffort !== null) await store.setEffort(null);
     });
-  const modelContent = (
+  const configContent = (
     <>
       {costRoutingEligible && showModels && (
         <>
@@ -4795,6 +4847,23 @@ function SessionHarnessPicker({
               }
             : undefined
         }
+        efforts={
+          showEffort && availableEfforts.length > 0
+            ? {
+                testId: "composer-agent-efforts",
+                header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
+                choices: availableEfforts.map((effort) => ({
+                  key: effort,
+                  label: formatStatusEffortLabel(effort) ?? effort,
+                  checked: !routingOn && effort === selectedEffort,
+                  disabled: routingOn || busy || pendingModelChange !== null,
+                  onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                  testId: `composer-agent-effort-${effort}`,
+                  data: { "data-effort-level": effort },
+                })),
+              }
+            : undefined
+        }
         extra={
           composerFusion !== undefined && fusionSelected && !routingOn
             ? buildFusionSections({
@@ -4809,136 +4878,56 @@ function SessionHarnessPicker({
       />
     </>
   );
-  const effortContent = (
-    <ComposerConfigSections
-      efforts={
-        showEffort && availableEfforts.length > 0
-          ? {
-              testId: "composer-agent-efforts",
-              header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
-              choices: availableEfforts.map((effort) => ({
-                key: effort,
-                label: formatStatusEffortLabel(effort) ?? effort,
-                checked: !routingOn && effort === selectedEffort,
-                disabled: routingOn || busy || pendingModelChange !== null,
-                onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
-                testId: `composer-agent-effort-${effort}`,
-                data: { "data-effort-level": effort },
-              })),
-            }
-          : undefined
-      }
-    />
-  );
   return (
-    <>
-      <HarnessPicker
-        open={menuOpen}
-        onOpenChange={(next) => {
-          if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigMenu(null);
-        }}
-        trigger={{
-          label: "Configure session",
-          model: label,
-          effort: effortLabel ?? undefined,
-          icon: <ComposerAgentIcon agent={iconAgent} />,
-          disabled: busy || !configurable,
-          "aria-disabled": disabled || busy || !configurable,
-          className: disabled ? "cursor-default opacity-50" : undefined,
-          testIdPrefix: "composer",
-          "data-testid": "composer-config-gear",
-          loading: modelLabelLoading && !routingOn,
-          pending:
-            (sessionModelSeeded || pendingModelChange !== null) &&
-            (modelPickerKind === "claude" || modelPickerKind === "codex"),
-        }}
-        tooltip={<ComposerConfigTooltipRows rows={summary} />}
-        tooltipTestId="composer-config-gear-tooltip"
-        testId="composer-agent-menu"
-      >
-        {isMobile && configMenu !== null ? (
-          <HarnessPickerConfigPage
-            backTestId="composer-agent-config-back"
-            testId={
-              configMenu === "model" ? "composer-agent-config-menu" : "composer-agent-effort-menu"
-            }
-            onBack={() => setConfigMenu(null)}
-          >
-            {configMenu === "model" ? modelContent : effortContent}
-          </HarnessPickerConfigPage>
-        ) : (
-          <>
-            <PickerSectionHeader>
-              {nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-            </PickerSectionHeader>
-            {showModels && (
-              <HarnessPickerConfigRow
-                label="Model"
-                value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
-                open={configMenu === "model"}
-                onOpenChange={(open) =>
-                  setConfigMenu((current) =>
-                    open ? "model" : current === "model" ? null : current,
-                  )
-                }
-                isMobile={isMobile}
-                disabled={busy || pendingModelChange !== null}
-                valueTestId="composer-agent-model-summary"
-                testId="composer-agent-edit"
-                configTestId="composer-agent-config-menu"
-              >
-                {modelContent}
-              </HarnessPickerConfigRow>
-            )}
-            {showEffort && availableEfforts.length > 0 && (
-              <HarnessPickerConfigRow
-                label={modelPickerKind === "pi" ? "Thinking level" : "Effort"}
-                value={routingOn ? "Automatic" : (effortLabel ?? "Default")}
-                open={configMenu === "effort"}
-                onOpenChange={(open) =>
-                  setConfigMenu((current) =>
-                    open ? "effort" : current === "effort" ? null : current,
-                  )
-                }
-                isMobile={isMobile}
-                disabled={routingOn || busy || pendingModelChange !== null}
-                testId="composer-agent-effort-select"
-                configTestId="composer-agent-effort-menu"
-              >
-                {effortContent}
-              </HarnessPickerConfigRow>
-            )}
-          </>
-        )}
-      </HarnessPicker>
-      {error && (
-        <TooltipProvider delayDuration={0}>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                aria-label={`Couldn't update configuration: ${error}`}
-                className="flex size-7 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/10"
-                data-testid="composer-config-error"
-              >
-                <TriangleAlertIcon className="size-4" aria-hidden="true" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side="top"
-              className="w-72 max-w-[calc(100vw-2rem)] flex-col items-start gap-1 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-menu"
-              data-testid="composer-config-error-tooltip"
-            >
-              <strong className="font-medium">Couldn’t update configuration</strong>
-              <span className="text-xs leading-5 text-muted-foreground">
-                {error} Try again, or reconnect the session if the problem continues.
-              </span>
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+    <HarnessPicker
+      open={menuOpen}
+      onOpenChange={(next) => {
+        if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
+        if (!next) setConfigOpen(false);
+      }}
+      trigger={{
+        label: "Configure session",
+        model: label,
+        effort: effortLabel ?? undefined,
+        icon: <ComposerAgentIcon agent={iconAgent} />,
+        disabled: busy || !configurable,
+        "aria-disabled": disabled || busy || !configurable,
+        className: disabled ? "cursor-default opacity-50" : undefined,
+        testIdPrefix: "composer",
+        "data-testid": "composer-config-gear",
+        loading: modelLabelLoading && !routingOn,
+        pending:
+          (sessionModelSeeded || pendingModelChange !== null) &&
+          (modelPickerKind === "claude" || modelPickerKind === "codex"),
+      }}
+      tooltip={<ComposerConfigTooltipRows rows={summary} />}
+      tooltipTestId="composer-config-gear-tooltip"
+      testId="composer-agent-menu"
+    >
+      {isMobile && configOpen ? (
+        <HarnessPickerConfigPage
+          backTestId="composer-agent-config-back"
+          testId="composer-agent-config-menu"
+          onBack={() => setConfigOpen(false)}
+        >
+          {configContent}
+        </HarnessPickerConfigPage>
+      ) : (
+        <HarnessPickerConfigRow
+          label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+          value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
+          open={configOpen}
+          onOpenChange={setConfigOpen}
+          isMobile={isMobile}
+          disabled={busy || pendingModelChange !== null}
+          valueTestId="composer-agent-model-summary"
+          testId="composer-agent-edit"
+          configTestId="composer-agent-config-menu"
+        >
+          {configContent}
+        </HarnessPickerConfigRow>
       )}
-    </>
+    </HarnessPicker>
   );
 }
 

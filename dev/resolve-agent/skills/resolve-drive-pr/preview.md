@@ -21,7 +21,7 @@ green — so the two paths label at different times:
 
   - **A PR you authored (author path)** is a branch on `omnigent-ai/omnigent`
     itself — a same-repo PR no outside contributor can push to, carrying code that
-    already came through your repro→fix→CI→Polly pipeline. There is no untrusted
+    already came through your reproduction and focused validation. There is no untrusted
     code to gate, so **label it immediately, the moment `gh pr create` returns** —
     right alongside opening the PR, *before* the interim handoff and Step 4's CI
     poll. Front-loading it matters: the deploy takes a few minutes and the session
@@ -32,13 +32,13 @@ green — so the two paths label at different times:
   - **A PR you're reviewing (review path)** may be a **fork** PR from an outside
     contributor. Here the label *is* the real trust boundary: it green-lights
     deploying fork code, so never apply it until the current head has passed CI and
-    a clean Polly review (4.2 + 4.3). And because an attacker can push a new commit
+    settled Polly and OCR reviews (4.2 + 4.3). An attacker can push a new commit
     *after* you label, the fork deploy is backstopped by a human-approved
     Environment that re-gates every commit — but that gate is a safety net, not a
     licence to label early.
 
 If you push (or the author pushes) a further commit after labelling, re-confirm
-CI + Polly on the new head before you rely on the preview. Never keep a preview
+CI + Polly + OCR on the new head before you rely on the preview. Never keep a preview
 you're relying on for a PR whose review is still red — on the author path, if CI
 later goes red, say so in the handoff rather than pointing a reviewer at a broken
 preview.

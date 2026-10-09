@@ -22,7 +22,6 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
-  customizeEnabled: true,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -30,7 +29,6 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { customize: mocks.customizeEnabled },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -64,7 +62,6 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
-  mocks.customizeEnabled = true;
 });
 afterEach(cleanup);
 
@@ -76,6 +73,11 @@ describe("settingsNavGroups", () => {
       label: "General",
       icon: SettingsIcon,
     });
+    expect(general?.items.slice(0, 3).map((item) => item.id)).toEqual([
+      "general",
+      "appearance",
+      "harnesses",
+    ]);
   });
 
   it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
@@ -112,6 +114,14 @@ describe("settingsNavGroups", () => {
     expect(ids(false)).not.toContain("updates");
     expect(ids(true)).toContain("cli");
     expect(ids(true)).toContain("updates");
+  });
+
+  it("places Desktop immediately after General", () => {
+    expect(settingsNavGroups(false, true).map((group) => group.title)).toEqual([
+      "General",
+      "Desktop",
+      "Archived",
+    ]);
   });
 
   it("includes the Admin group (Members / Policies / Sharing) for any admin, in accounts OR OIDC mode", () => {
@@ -398,38 +408,12 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/inbox").inSettings).toBe(false);
   });
 
-  it("parses the customize sub-section and defaults a bare/unknown one to the first", () => {
-    expect(routeHook("/settings/customize/harnesses")).toEqual({
+  it("parses the harness details segment of the harnesses section", () => {
+    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "harnesses" });
+    expect(routeHook("/settings/harnesses/claude-native")).toEqual({
       inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-    expect(routeHook("/settings/customize/skills")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "skills",
-    });
-    // Bare or unknown sub-section falls back to the first sub-section.
-    expect(routeHook("/settings/customize")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-    expect(routeHook("/settings/customize/nope")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-  });
-
-  it("falls back to General for a customize deep link when the feature is disabled", () => {
-    mocks.customizeEnabled = false;
-    // Disabled (the default deploy) → the section resolves to General instead
-    // of an empty customize page, and no subSection is set.
-    expect(routeHook("/settings/customize")).toEqual({ inSettings: true, section: "general" });
-    expect(routeHook("/settings/customize/skills")).toEqual({
-      inSettings: true,
-      section: "general",
+      section: "harnesses",
+      harness: "claude-native",
     });
   });
 

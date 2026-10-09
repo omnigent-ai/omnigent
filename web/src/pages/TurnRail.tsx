@@ -255,7 +255,7 @@ export function TurnRail({
       // of ticks sits mid-page rather than clustering at the top. The row is
       // wide enough for the ticks; the preview box overflows to the right.
       // Hidden on mobile (max-md:hidden): the rail is a hover minimap and
-      // touch has no hover, so mobile keeps the ↑↓ nav buttons instead.
+      // touch has no hover.
       className="pointer-events-none absolute left-0 top-1/2 z-40 flex w-6 -translate-y-1/2 items-center max-md:hidden"
       onMouseLeave={() => {
         interactingRef.current = false;

@@ -19,13 +19,13 @@ gh pr view <pr> --json mergeable,mergeStateStatus,baseRefName
   ```
   git fetch origin main
   git rebase origin/main        # resolve conflicts: edit, `git add`, `git rebase --continue`
-  # re-run the repro test + your targeted tests after resolving, then:
+  # re-run the selected permanent checks and relevant archived reproduction after resolving, then:
   git push --force-with-lease
   ```
 
   Resolve conflicts by **understanding both sides**, not by blindly taking one —
   the incoming `main` change may interact with the fix. After resolving, **re-run
-  the repro test and your targeted tests** (the merge may have silently broken the
+  the selected permanent checks and relevant archived reproduction** (the merge may have silently broken the
   fix), then force-push. On a **fork PR you can't push to**, a conflict is one more
   reason to **take over** into your own PR (Step 4 preamble): branch off latest
   `main`, replay their commits (`git cherry-pick` / `am`), resolve there, and
@@ -64,5 +64,6 @@ settles:
     someone else's red.
 
 Re-poll after each push (or, if you took over a fork PR, on your own PR's checks).
-Stay in this loop (within the round cap) until the checks you're responsible for
-are green.
+Every push here also requires fresh Polly and OCR reviews (4.3). Continue until
+the required checks pass, or record a concrete blocker and an incomplete handoff.
+An unrelated failing required check still prevents a ready-to-merge claim.

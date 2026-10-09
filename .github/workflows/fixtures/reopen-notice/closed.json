@@ -1,0 +1,17 @@
+{
+  "action": "closed",
+  "repository": {
+    "name": "omnigent",
+    "owner": { "login": "omnigent-ai" },
+    "default_branch": "main"
+  },
+  "number": 7,
+  "pull_request": {
+    "number": 7,
+    "state": "closed",
+    "merged": false,
+    "closed_at": "2026-10-02T12:00:00Z",
+    "user": { "login": "omni-resolve-agent[bot]", "type": "Bot" }
+  },
+  "sender": { "login": "maintainer1", "type": "User" }
+}

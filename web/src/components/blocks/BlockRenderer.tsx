@@ -778,9 +778,22 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse mode={isTextStreaming ? "streaming" : "static"}>
+          <FilePathAwareMessageResponse
+            className="chat-markdown"
+            mode={isTextStreaming ? "streaming" : "static"}
+          >
             {item.text}
           </FilePathAwareMessageResponse>
+          {item.previewInterrupted && item.itemId?.startsWith("live:") && (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="stream-interruption-notice"
+              className="mt-1 select-none text-xs text-muted-foreground"
+            >
+              Live output interrupted. Full response will appear when complete.
+            </div>
+          )}
         </div>
       );
     case "reasoning":

@@ -19,6 +19,9 @@ const {
   WORKSPACE_UI_PATH,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
+  MAX_SERVER_NAME_LENGTH,
+  parseManifestAuth,
+  sanitizeServerName,
 } = require("../src/url");
 
 describe("defaultSchemeFor", () => {
@@ -62,25 +65,52 @@ describe("normalizeUrl", () => {
   it("preserves an explicit scheme (even http to a remote host)", () => {
     assert.equal(normalizeUrl("http://localhost:6767"), "http://localhost:6767/");
     assert.equal(normalizeUrl("https://example.com"), "https://example.com/");
-    assert.equal(normalizeUrl("http://example.databricks.com"), "http://example.databricks.com/");
+    assert.equal(normalizeUrl("http://example.com"), "http://example.com/");
+  });
+
+  it("upgrades HTTP workspace URLs before discovery and origin pinning", () => {
+    assert.equal(
+      normalizeUrl("http://workspace.cloud.databricks.com/omnigent?o=123"),
+      "https://workspace.cloud.databricks.com/?o=123",
+    );
+    assert.equal(normalizeUrl("http://ws.azuredatabricks.net"), "https://ws.azuredatabricks.net/");
+    assert.equal(normalizeUrl("http://notdatabricks.com"), "http://notdatabricks.com/");
+  });
+
+  it("preserves custom-port HTTP workspaces across connection, restore, and warning", () => {
+    for (const port of [8080, 443]) {
+      const origin = `http://ws.databricks.com:${port}`;
+      const saved = `${origin}/omnigent?o=123`;
+      assert.equal(normalizeUrl(saved), `${origin}/?o=123`);
+      assert.equal(normalizeSavedServerUrl(saved), saved);
+      assert.equal(normalizeSavedServerUrl(`${origin}/api/2.0/omnigent?o=123`), saved);
+      assert.equal(isPlainHttpRemote(saved), true);
+    }
+  });
+
+  it("still upgrades an explicit default HTTP port", () => {
+    const input = "http://workspace.cloud.databricks.com:80/omnigent?o=123";
+    assert.equal(normalizeUrl(input), "https://workspace.cloud.databricks.com/?o=123");
+    assert.equal(
+      normalizeSavedServerUrl(input),
+      "https://workspace.cloud.databricks.com/omnigent?o=123",
+    );
+    assert.equal(isPlainHttpRemote(input), false);
   });
 
   it("preserves the Databricks organization while removing other URL state", () => {
     assert.equal(
       normalizeUrl(
-        "  https://isaac.databricks.com/omnigent/c/123?view=chat&o=1965859176160743#latest  ",
+        "  https://workspace.cloud.databricks.com/omnigent/c/123?view=chat&o=123#latest  ",
       ),
-      "https://isaac.databricks.com/?o=1965859176160743",
+      "https://workspace.cloud.databricks.com/?o=123",
     );
   });
 
   it("removes every query parameter for non-Databricks hosts", () => {
+    assert.equal(normalizeUrl("example.com/path?o=123&view=chat#latest"), "https://example.com/");
     assert.equal(
-      normalizeUrl("example.com/path?o=1965859176160743&view=chat#latest"),
-      "https://example.com/",
-    );
-    assert.equal(
-      normalizeUrl("https://my-app.aws.databricksapps.com/?o=1965859176160743"),
+      normalizeUrl("https://my-app.aws.databricksapps.com/?o=123"),
       "https://my-app.aws.databricksapps.com/",
     );
   });
@@ -110,13 +140,14 @@ describe("normalizeRecentServers", () => {
   it("shows root URLs, preserves organizations, and deduplicates", () => {
     assert.deepEqual(
       normalizeRecentServers([
-        "https://isaac.databricks.com/omnigent?o=1965859176160743",
-        "https://isaac.databricks.com/c/123?ignored=yes&o=1965859176160743",
+        "https://workspace.cloud.databricks.com/omnigent?o=123",
+        "http://workspace.cloud.databricks.com/omnigent?o=123",
+        "https://workspace.cloud.databricks.com/c/123?ignored=yes&o=123",
         "http://localhost:6767/conversation/123",
         "not a URL",
         null,
       ]),
-      ["https://isaac.databricks.com/?o=1965859176160743", "http://localhost:6767/"],
+      ["https://workspace.cloud.databricks.com/?o=123", "http://localhost:6767/"],
     );
   });
 
@@ -128,8 +159,8 @@ describe("normalizeRecentServers", () => {
 describe("serverDisplayLabel", () => {
   it("shows only the host and optional Databricks organization", () => {
     assert.equal(
-      serverDisplayLabel("https://isaac.databricks.com/omnigent?o=1965859176160743"),
-      "isaac.databricks.com/?o=1965859176160743",
+      serverDisplayLabel("https://workspace.cloud.databricks.com/omnigent?o=123"),
+      "workspace.cloud.databricks.com/?o=123",
     );
     assert.equal(serverDisplayLabel("http://localhost:6767/sessions"), "localhost:6767");
   });
@@ -177,7 +208,11 @@ describe("isPlainHttpRemote", () => {
   });
 
   it("warns for an explicit http:// to a remote host", () => {
-    assert.equal(isPlainHttpRemote("http://example.databricks.com"), true);
+    assert.equal(isPlainHttpRemote("http://example.com"), true);
+  });
+
+  it("does not warn for workspace URLs that connect over HTTPS", () => {
+    assert.equal(isPlainHttpRemote("http://workspace.cloud.databricks.com/omnigent?o=123"), false);
   });
 
   it("does not warn for loopback hosts", () => {
@@ -194,6 +229,16 @@ describe("isPlainHttpRemote", () => {
 });
 
 describe("normalizeSavedServerUrl", () => {
+  it("upgrades saved HTTP workspaces while preserving their paths and organization", () => {
+    for (const path of ["/", "/omnigent", "/omnigent/c/123"]) {
+      assert.equal(
+        normalizeSavedServerUrl(`http://workspace.cloud.databricks.com${path}?o=123#state`),
+        `https://workspace.cloud.databricks.com${path}?o=123#state`,
+      );
+    }
+    assert.equal(normalizeSavedServerUrl("http://localhost:6767/"), "http://localhost:6767/");
+  });
+
   it("maps the current Databricks API mount to the UI mount", () => {
     assert.equal(
       normalizeSavedServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent"),
@@ -561,6 +606,33 @@ describe("fetchServerManifest", () => {
     );
   });
 
+  it("reads the auth block and server name", async () => {
+    await withFetch(
+      async () =>
+        fakeJsonResponse({
+          manifest_version: 1,
+          auth: { mode: "oidc", session_cookie: "__Host-ap_session" },
+          server_name: "Acme Engineering",
+        }),
+      async () => {
+        const m = await fetchServerManifest("https://omni.example/");
+        assert.deepEqual(m.auth, { mode: "oidc", sessionCookie: "__Host-ap_session" });
+        assert.equal(m.serverName, "Acme Engineering");
+      },
+    );
+  });
+
+  it("leaves auth and server name null on an older server", async () => {
+    await withFetch(
+      async () => fakeJsonResponse({ manifest_version: 1 }),
+      async () => {
+        const m = await fetchServerManifest("https://omni.example/");
+        assert.equal(m.auth, null);
+        assert.equal(m.serverName, null);
+      },
+    );
+  });
+
   it("returns the baseline for an unparseable server URL", async () => {
     assert.deepEqual(await fetchServerManifest("not a url"), PRE_MANIFEST_BASELINE);
   });
@@ -578,5 +650,61 @@ describe("fetchServerManifest", () => {
         assert.equal(m.manifestVersion, 1);
       },
     );
+  });
+});
+
+describe("parseManifestAuth", () => {
+  it("accepts each known mode", () => {
+    for (const mode of ["oidc", "accounts", "header", "custom", "none"]) {
+      assert.equal(parseManifestAuth({ mode, session_cookie: null }, "https://a.test")?.mode, mode);
+    }
+  });
+
+  it("rejects unknown modes and non-objects", () => {
+    assert.equal(parseManifestAuth({ mode: "saml" }, "https://a.test"), null);
+    assert.equal(parseManifestAuth("oidc", "https://a.test"), null);
+    assert.equal(parseManifestAuth(null, "https://a.test"), null);
+  });
+
+  it("keeps only the real session cookie names", () => {
+    const auth = (cookie, url = "https://a.test") =>
+      parseManifestAuth({ mode: "oidc", session_cookie: cookie }, url).sessionCookie;
+    assert.equal(auth("__Host-ap_session"), "__Host-ap_session");
+    assert.equal(auth("ap_session", "http://localhost:8000"), "ap_session");
+    assert.equal(auth("session_id"), null);
+    assert.equal(auth(7), null);
+    // Chromium refuses a __Host- cookie on plain http.
+    assert.equal(auth("__Host-ap_session", "http://localhost:8000"), null);
+    assert.equal(auth("__Host-ap_session", "HTTPS://A.TEST"), "__Host-ap_session");
+    assert.equal(auth("__Host-ap_session", "not a url"), null);
+  });
+});
+
+describe("sanitizeServerName", () => {
+  it("trims and collapses whitespace", () => {
+    assert.equal(sanitizeServerName("  Acme \n  Engineering\t"), "Acme Engineering");
+  });
+
+  it("strips control, bidi, and zero-width characters", () => {
+    assert.equal(sanitizeServerName("Acme\u0000\u202eevil\u2066"), "Acmeevil");
+    assert.equal(sanitizeServerName("\u200fAc\u200bme\u061c\ufeff"), "Acme");
+  });
+
+  it("never cuts a character in half when capping", () => {
+    const flag = "\u{1F3F3}\u{FE0F}";
+    const name = sanitizeServerName("a".repeat(MAX_SERVER_NAME_LENGTH - 1) + flag + "tail");
+    assert.ok(name.endsWith(flag), JSON.stringify(name));
+  });
+
+  it("caps the length by characters", () => {
+    const name = sanitizeServerName("😀".repeat(MAX_SERVER_NAME_LENGTH + 10));
+    assert.equal(Array.from(name).length, MAX_SERVER_NAME_LENGTH);
+  });
+
+  it("returns null for blanks and non-strings", () => {
+    assert.equal(sanitizeServerName("   "), null);
+    assert.equal(sanitizeServerName("\u202e"), null);
+    assert.equal(sanitizeServerName(42), null);
+    assert.equal(sanitizeServerName(undefined), null);
   });
 });
