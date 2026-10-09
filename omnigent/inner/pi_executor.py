@@ -831,6 +831,10 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
+                # Claude 4+/5 reject ``thinking.type.enabled``; Pi 0.84.2+ sends
+                # ``thinking.type.adaptive`` only with this compat flag (same as
+                # the pi-native provider in ``harnesses/pi_native/credentials.py``).
+                "compat": {"forceAdaptiveThinking": True},
                 "models": provider_models["databricks-anthropic"],
             },
             # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
