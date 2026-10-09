@@ -1,4 +1,3 @@
-import { MenuIcon } from "lucide-react";
 import {
   createContext,
   lazy,
@@ -13,11 +12,11 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { MAIN_CANVAS_ID } from "./canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "./canvasNavigation";
 
@@ -64,7 +63,7 @@ export function CanvasWorkspace({
   conversationId?: string;
   minConversationWidth?: number;
   onCanvasWidthChange?: (width: number) => void;
-  onOpenSidebar?: () => void;
+  onOpenSidebar?: (peek?: boolean) => void;
   children: ReactNode;
 }) {
   const navigate = useNavigate();
@@ -161,20 +160,10 @@ export function CanvasWorkspace({
             } as CSSProperties
           }
         >
-          {/* Match the chat header's native safe-area offset for the mobile menu. */}
+          {/* Keep navigation available while the board is loading. */}
           {onOpenSidebar && (
-            <div className="chat-header pointer-events-none absolute inset-x-0 top-0 z-30 flex h-14 items-center px-2 md:hidden">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Open sidebar"
-                componentId="canvas.open_sidebar"
-                className="pointer-events-auto size-11 border-none text-muted-foreground hover:text-foreground"
-                onClick={onOpenSidebar}
-              >
-                <MenuIcon className="size-5" />
-              </Button>
+            <div className="chat-header pointer-events-none absolute inset-x-0 top-0 z-30 flex h-14 items-center px-2 md:h-12 md:px-4">
+              <SidebarOpenButton componentId="canvas.open_sidebar" onOpenSidebar={onOpenSidebar} />
             </div>
           )}
           <Suspense

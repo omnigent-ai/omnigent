@@ -52,15 +52,15 @@ the header menu), and each place is a separate entry point.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab.
-- `canvas-workspace`: desktop Canvas collapses navigation to an icon rail; clicking a
+- `canvas-workspace`: Canvas collapses the shared sidebar on entry; clicking a
   card opens its session beside the project board. Switching cards keeps
   drafts and board state; resize, focus, and close controls adjust the split.
 - `canvas-mobile`: the board and selected session use the standard top-left
   hamburger to open navigation. Back to canvas retains the selected project
   across deep links and reloads.
-- `canvas-navigation`: the desktop collapsed sidebar keeps its expand button at the
-  top; the remaining icons follow the expanded sidebar's order and available
-  destinations, including Usage when enabled.
+- `canvas-navigation`: Canvas uses the same collapsed-sidebar button and hover
+  preview as other pages, including the macOS titlebar controls. Opening it
+  reveals the shared destinations, including Usage when enabled.
 - `canvas-create`: the plus button on Main or a project opens the new-session
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and
@@ -93,7 +93,7 @@ you remove them.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
-cards. Choosing Canvas in either navigation state returns to the selected board.
+cards. Choosing Canvas in the sidebar returns to the selected board.
 Drag the divider to resize, or focus it and use Left/Right arrows to
 adjust the split and Home/End to reach its limits. Double-click the divider to
 restore the default split. Focus the session to use the full area; Escape
@@ -107,8 +107,9 @@ its replacement stays beside the same board.
 The plus button starts a new session in the selected canvas. After sending,
 the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
-the same board. The collapsed sidebar keeps its expand button first, followed by
-Search, Settings, and the same primary destinations as the expanded sidebar.
+the same board. Open sidebar appears on the board or, when the board is hidden,
+in the conversation header. On desktop, hovering previews the sidebar and clicking
+opens it. The macOS app uses its existing titlebar toggle, Search, and Settings.
 On macOS desktop, the board and its controls stay below the window title bar,
 including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
@@ -394,16 +395,18 @@ plain `uv run pytest`, which starts a private server for the test.
   hamburger with an ordinary session, opens navigation from both Canvas views,
   and returns to the selected project.
 - **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
-  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_rail_matches_expanded_navigation`.
-  The journey compares destinations and clicks Canvas with a project selected,
-  then reloads to confirm the selected project remains remembered.
-  macOS title-bar clearance, sidebar opening from the desktop rail or mobile
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_uses_standard_sidebar_navigation`.
+  The journey compares the toggle's icon, position, and size with an ordinary
+  session, previews and opens navigation, and checks that split and focused
+  conversations retain one toggle. It compares destinations and returns through
+  Canvas, then reloads to confirm the selected project remains remembered.
+  macOS title-bar clearance, sidebar opening from the titlebar toggle or mobile
   hamburger, and conversation focus/return at wide and narrow widths run in
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`.
   This Chromium journey emulates the macOS preload bridge and user agent; it
   verifies the app's layout around the title bar, not native traffic-light rendering.
-  `web/src/extensions/ExtensionPrimaryNavigation.test.tsx` verifies compact
-  extension links retain accessible labels and work when activated.
+  `web/src/shell/ChatHeader.test.tsx` checks the shared toggle's desktop/mobile
+  icons, peek cancellation, and hover/keyboard tooltip behavior.
 - **`canvas-create` (Main/project plus button, desktop/mobile):**
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_plus_creates_session_on_the_selected_board`.
   The composer uses a fixture host; session creation, binding to the isolated

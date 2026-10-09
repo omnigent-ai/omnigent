@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import * as Dialog from "radix-ui/dialog";
 import { MemoryRouter, useLocation, useMatch, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { CanvasWorkspace, useCanvasWorkspace } from "./CanvasWorkspace";
 
 let boardReady: Promise<void> | null = null;
@@ -118,11 +119,13 @@ describe("CanvasWorkspace", () => {
       finishLoading = resolve;
     });
     render(
-      <MemoryRouter>
-        <CanvasWorkspace active onOpenSidebar={onOpenSidebar}>
-          {null}
-        </CanvasWorkspace>
-      </MemoryRouter>,
+      <TooltipProvider>
+        <MemoryRouter>
+          <CanvasWorkspace active onOpenSidebar={onOpenSidebar}>
+            {null}
+          </CanvasWorkspace>
+        </MemoryRouter>
+      </TooltipProvider>,
     );
     expect(await screen.findByLabelText("Loading Canvas")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Open sidebar" }));
