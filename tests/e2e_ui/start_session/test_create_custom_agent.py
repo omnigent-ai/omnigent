@@ -21,6 +21,7 @@ from typing import Any
 from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Stubbed host the composer auto-selects.
@@ -133,6 +134,7 @@ async def _register_routes(
     await page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
     )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
 
 async def _seed_workspace(page) -> None:

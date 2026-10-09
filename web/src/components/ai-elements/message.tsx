@@ -771,7 +771,7 @@ export const MessageResponse = memo(
           key={themeMode}
           // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
           className={cn(
-            "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+            "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
             className,
           )}
           plugins={STREAMDOWN_PLUGINS}

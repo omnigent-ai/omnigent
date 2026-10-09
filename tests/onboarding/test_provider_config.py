@@ -163,7 +163,7 @@ _DATABRICKS_CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -187,7 +187,7 @@ def test_default_provider_for_pi_selects_cli_config_databricks_gateway(
     """For the unmapped ``pi`` harness, a cli-config Databricks gateway IS selected.
 
     A cli-config entry pins a provider table in ~/.codex/config.toml. PR #1251
-    made a Databricks AI Gateway cli-config pi-consumable (Pi speaks its
+    made a Databricks Unity Gateway cli-config pi-consumable (Pi speaks its
     Anthropic surface natively), and pi resolution now routes it (pi-native
     translates it; the gateway-harness pi path translates it too). So when the
     pinned ``[model_providers.X]`` resolves to a real Databricks gateway, the
@@ -687,7 +687,7 @@ def test_parse_cli_config_entry() -> None:
                     "kind": "cli-config",
                     "cli": "codex",
                     "model_provider": "Databricks",
-                    "display_name": "Databricks AI Gateway",
+                    "display_name": "Databricks Unity Gateway",
                     "default": True,
                 }
             }
@@ -696,9 +696,9 @@ def test_parse_cli_config_entry() -> None:
     assert entry.kind == "cli-config"
     assert entry.cli == "codex"
     assert entry.model_provider == "Databricks"
-    assert entry.display_name == "Databricks AI Gateway"
+    assert entry.display_name == "Databricks Unity Gateway"
     # A codex cli-config serves the openai surface AND is structurally
-    # pi-capable: a Databricks AI Gateway is reusable by Pi (its Anthropic
+    # pi-capable: a Databricks Unity Gateway is reusable by Pi (its Anthropic
     # surface), so it can claim the pi scope. (``default: true`` deliberately
     # never expands to pi — only an explicit ``pi`` does — so default_families
     # stays openai-only here.)
@@ -946,7 +946,7 @@ def test_load_providers_skips_unrecognized_cli_config_cli_without_raising() -> N
             "claude-databricks": {
                 "kind": "cli-config",
                 "cli": "claude",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
                 "default": True,
             },
             "openai": {

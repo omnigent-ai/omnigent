@@ -42,6 +42,73 @@ function makeIpcMain() {
   };
 }
 
+describe("browser IPC Arca context", () => {
+  it("adds a main-owned recovery hint only to a denied agent navigation", () => {
+    const ipcMain = makeIpcMain();
+    let allowed = false;
+    let hints = 0;
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: () => ({ ok: allowed, error: allowed ? undefined : "blocked" }),
+      }),
+      getAgentNavigationHintForEvent: () => {
+        hints++;
+        return "Reconnect to Arca";
+      },
+    });
+    const invoke = (agent) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "source", url: "http://localhost", opts: { agent } },
+      );
+    assert.equal(invoke(true).error, "blocked Reconnect to Arca");
+    assert.equal(invoke(false).error, "blocked");
+    allowed = true;
+    assert.equal(invoke(true).ok, true);
+    assert.equal(hints, 1);
+  });
+
+  it("pairs the renderer's source host with main's context and ignores caller exception flags", () => {
+    const ipcMain = makeIpcMain();
+    const calls = [];
+    const context = { serverTarget: "current", sourceHostId: "actual-host" };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: (...args) => {
+          calls.push(args);
+          return { ok: true };
+        },
+      }),
+      getAgentContextForEvent: (_event, host) => {
+        assert.equal(host, "actual-host");
+        return context;
+      },
+    });
+    ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost",
+        opts: {
+          force: true,
+          agent: true,
+          sourceHostId: "actual-host",
+          allowLocalhost: true,
+          isArca: true,
+          agentContext: { serverTarget: "forged" },
+        },
+      },
+    );
+    assert.deepEqual(calls[0][3], { force: true, agent: true, agentContext: context });
+  });
+});
+
 /** A stub webContents with a navigationHistory (Electron 42) and toggleable
  *  devtools + recorded navigation calls. */
 function makeWebContents({ canBack = false, canForward = false } = {}) {

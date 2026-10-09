@@ -17,6 +17,8 @@ from synthetic events.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from playwright.sync_api import Browser, Page, expect
 
@@ -31,11 +33,6 @@ _CLOSE_SETTLE_MS = 600
 # that the real 150ms bridge still holds it open until the pointer lands on the
 # panel and cancels the pending close.
 _GAP_DWELL_MS = 60
-
-# Time for the popover's open animation (``duration-150`` zoom/slide) to settle
-# so ``bounding_box`` reports stable, untransformed geometry. Spent while the
-# pointer still rests on the trigger, so the panel cannot close during it.
-_ANIM_SETTLE_MS = 250
 
 
 def _open_trigger(page: Page) -> Page:
@@ -76,17 +73,22 @@ def test_agent_info_opens_on_hover_and_bridges_to_panel(
         runner-bound session.
     """
     base_url, session_id = seeded_session
+    clock_start = datetime.now(UTC)
+    page.clock.install(time=clock_start)
     page.goto(f"{base_url}/c/{session_id}")
     _open_trigger(page)
 
     trigger = page.get_by_test_id("agent-info-trigger")
     panel = page.get_by_test_id("agent-info-panel")
 
+    page.clock.pause_at(clock_start + timedelta(hours=1))
     # Hover the icon (real mouse move) — the panel opens without a click.
     trigger.hover()
     expect(panel).to_be_visible()
     # Let the open animation settle so the boxes below are stable geometry.
-    page.wait_for_timeout(_ANIM_SETTLE_MS)
+    panel.evaluate(
+        "element => Promise.all(element.getAnimations().map(animation => animation.finished))"
+    )
 
     # The panel is anchored just below the icon (Radix side="bottom",
     # sideOffset=4), so there's a real vertical gap between them. Walk the
@@ -116,8 +118,9 @@ def test_agent_info_opens_on_hover_and_bridges_to_panel(
 
     # Step through the gap, dwelling in the empty middle.
     page.mouse.move(cross_x, gap_top + (gap_bottom - gap_top) * 0.5)
-    page.wait_for_timeout(_GAP_DWELL_MS)
+    page.clock.run_for(_GAP_DWELL_MS)
     # Still crossing empty space — the bridge must be holding the panel open.
+    expect(panel).to_have_attribute("data-state", "open")
     expect(panel).to_be_visible()
 
     # Land on the panel (just inside its top edge) and confirm it's still open,
@@ -125,7 +128,8 @@ def test_agent_info_opens_on_hover_and_bridges_to_panel(
     # pending close, so it must stay open.
     page.mouse.move(cross_x, panel_box["y"] + 5)
     expect(panel).to_be_visible()
-    page.wait_for_timeout(_CLOSE_SETTLE_MS)
+    page.clock.run_for(_CLOSE_SETTLE_MS)
+    expect(panel).to_have_attribute("data-state", "open")
     expect(panel).to_be_visible()
 
 
