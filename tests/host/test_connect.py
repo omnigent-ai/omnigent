@@ -118,6 +118,19 @@ def _isolated_model_catalog_store(
 
 
 @pytest.fixture(autouse=True)
+def _isolated_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Isolate provider config, the inference overlay, and ambient detection.
+
+    Exact model-option frame assertions must not depend on machine-global state.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path_factory.mktemp("config_home")))
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep these tests from forking a real runner zygote.
 
