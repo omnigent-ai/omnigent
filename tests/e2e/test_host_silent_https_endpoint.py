@@ -189,9 +189,11 @@ class _SilentHttpsEndpoint:
                 )
                 with self._lock:
                     self._accepted_upgrades += 1
-                # Give the client time to finish its handshake and enter its
-                # receive loop, then drop without ever sending a frame.
-                time.sleep(0.4)
+                # Stay silent and hold the connection open until the host
+                # gives up and disconnects, instead of racing a fixed sleep.
+                with contextlib.suppress(OSError, ssl.SSLError):
+                    while tls.recv(4096):
+                        pass
             else:
                 tls.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\n"
@@ -233,9 +235,6 @@ def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path)
     inject_dir.mkdir()
     (inject_dir / "sitecustomize.py").write_text(_SITECUSTOMIZE)
 
-    endpoint = _SilentHttpsEndpoint(str(cert_path), str(key_path))
-    server_url = f"https://{_FAKE_HOST}:{endpoint.port}"
-
     home = tmp_path / "home"
     config_home = tmp_path / "config"
     data_dir = tmp_path / "data"
@@ -274,23 +273,26 @@ def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path)
         }
     )
 
-    with open(console_log, "wb") as console_fh:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent",
-                "host",
-                "--server",
-                server_url,
-                "--non-interactive",
-            ],
-            env=env,
-            cwd=str(_REPO_ROOT),
-            stdout=console_fh,
-            stderr=subprocess.STDOUT,
-        )
+    endpoint = _SilentHttpsEndpoint(str(cert_path), str(key_path))
+    server_url = f"https://{_FAKE_HOST}:{endpoint.port}"
+    proc: subprocess.Popen[bytes] | None = None
     try:
+        with open(console_log, "wb") as console_fh:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "omnigent",
+                    "host",
+                    "--server",
+                    server_url,
+                    "--non-interactive",
+                ],
+                env=env,
+                cwd=str(_REPO_ROOT),
+                stdout=console_fh,
+                stderr=subprocess.STDOUT,
+            )
         # Journey gate: the escalation has fired once its operator notice is on
         # the console (or the host gave up).
         deadline = time.monotonic() + _ESCALATION_DEADLINE_S
@@ -334,7 +336,7 @@ def test_host_silent_https_endpoint_not_logged_as_omnigent_error(tmp_path: Path)
             f"no WARN-level escalation record in the host log\n{diagnostics}"
         )
     finally:
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             proc.send_signal(signal.SIGINT)
             try:
                 proc.wait(timeout=15)
