@@ -1399,6 +1399,10 @@ def create_runner_app(
     _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
+    # Wake-notice turn outcome: "armed" at dispatch, "output" after a text delta
+    # or tool call, "empty" only on an observed response.completed with nothing
+    # surfaced. Only "empty" earns a recovery wake (see _rewake_parent_if_inbox_stranded).
+    _wake_turn_outcome: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
     # still held a sub-agent result (typically: the server was down when the
     # child finished). The catch-up scan re-attempts these on tunnel reconnect.
@@ -3411,6 +3415,7 @@ def create_runner_app(
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
+        _wake_turn_outcome.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
@@ -4406,6 +4411,7 @@ def create_runner_app(
         _background_tasks.add(_wake_task)
 
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
+        wake_turn_outcome = _wake_turn_outcome.pop(parent_session_id, None)
         inbox = _session_inboxes.get(parent_session_id)
         drained = inbox is None or inbox.empty()
         if drained:
@@ -4414,15 +4420,22 @@ def create_runner_app(
             # later episode's matching notice is wrongly deduped.
             _last_rewake_notice.pop(parent_session_id, None)
             _stranded_wake_parents.discard(parent_session_id)
-        # A parent whose wake POST exhausted its retries has no pending flag,
-        # but its inbox still holds an undelivered result — rescue it too.
-        stranded_retry = parent_session_id in _stranded_wake_parents
-        if parent_session_id not in _subagent_wake_pending and not stranded_retry:
+            # Keep the wake-pending flag consistent with a drained inbox.
+            _subagent_wake_pending.discard(parent_session_id)
             return
+        # Recover only when delivery is known broken: the wake never started a
+        # turn (pending), its POST exhausted retries (stranded), or the turn
+        # observed an empty completion. Output or a native/interrupt end did not.
+        if (
+            wake_turn_outcome != "empty"
+            and parent_session_id not in _subagent_wake_pending
+            and parent_session_id not in _stranded_wake_parents
+        ):
+            return
+        # Clear both markers so _schedule_subagent_wake's double-wake guard
+        # lets the recovery wake through.
         _subagent_wake_pending.discard(parent_session_id)
         _stranded_wake_parents.discard(parent_session_id)
-        if drained:
-            return
         entries = list_subagent_work(parent_session_id)
         if not entries:
             return
@@ -4782,7 +4795,16 @@ def create_runner_app(
         msg_body: _JsonObject,
         conv: str,
     ) -> None:
-        _subagent_wake_pending.discard(conv)
+        if conv in _subagent_wake_pending:
+            _subagent_wake_pending.discard(conv)
+            # This turn delivers a sub-agent wake notice; track its outcome so
+            # only an observed empty completion (not a native/interrupt end)
+            # earns recovery.
+            _wake_turn_outcome[conv] = "armed"
+        elif _wake_turn_outcome.get(conv) != "empty":
+            # Preserve a recorded empty outcome across an intervening user turn;
+            # the stranded-inbox check re-validates the inbox before recovering.
+            _wake_turn_outcome.pop(conv, None)
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
@@ -5777,8 +5799,18 @@ def create_runner_app(
                                     delta = event.get("delta")
                                     if delta is not None:
                                         _text_acc.append(delta)
+                                    # Only the wake turn (armed) is tracked; a later
+                                    # turn's output must not reclassify a preserved
+                                    # empty outcome.
+                                    if delta and _wake_turn_outcome.get(conv_id) == "armed":
+                                        _wake_turn_outcome[conv_id] = "output"
                                 elif _evt_type == "response.completed":
                                     _stream_failed_error = None
+                                    # An observed completion with nothing
+                                    # surfaced is the only state that earns a
+                                    # recovery wake.
+                                    if _wake_turn_outcome.get(conv_id) == "armed":
+                                        _wake_turn_outcome[conv_id] = "empty"
                                     if _text_acc:
                                         _session_histories.setdefault(conv_id, []).append(
                                             {
@@ -5806,6 +5838,10 @@ def create_runner_app(
                                     _item = event.get("item")
                                     if isinstance(_item, dict):
                                         _it = _item.get("type")
+                                        if _it in ("function_call", "function_call_output") and (
+                                            _wake_turn_outcome.get(conv_id) == "armed"
+                                        ):
+                                            _wake_turn_outcome[conv_id] = "output"
                                         if _it == "function_call":
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
