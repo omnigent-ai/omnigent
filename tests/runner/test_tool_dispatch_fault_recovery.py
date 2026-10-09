@@ -1,4 +1,4 @@
-"""E2E regression: runner ``sys_os_shell`` dispatch under upstream/host faults.
+"""Runner ``sys_os_shell`` dispatch under upstream/host faults.
 
 An agent runs a shell command while a dependency misbehaves, in one of two
 ways that production logs record as tool-dispatch failures:
@@ -34,7 +34,7 @@ action and the observable is the tool-result string plus the ERROR log line.
 
 Run with::
 
-    .venv/bin/python -m pytest tests/e2e/test_runner_shell_dispatch_fault_recovery.py -v
+    .venv/bin/python -m pytest tests/runner/test_tool_dispatch_fault_recovery.py -v
 """
 
 from __future__ import annotations
@@ -59,6 +59,11 @@ _TOOL = "sys_os_shell"
 _SHELL_ARGS = json.dumps({"command": "echo hi"})
 _PROXY_ERROR_LOG = "tool sys_os_shell failed"
 _OS_ENV_ERROR_LOG = "runner OSEnvironment dispatch failed for sys_os_shell"
+
+
+def _is_helper_argv(args: object) -> bool:
+    """Only the OS-environment helper spawn takes the injected fork failure."""
+    return isinstance(args, (list, tuple)) and "omnigent.inner.os_env" in args and "helper" in args
 
 
 def _rpc_shell_success(request_body: bytes) -> httpx.Response:
@@ -113,9 +118,7 @@ async def test_shell_proxy_transient_500_recovers(
     **What breaks if wrong:** a single server blip during a shell tool call
     permanently fails the agent's command.
     """
-    # ``raising=False``: on a tree without the retry the constant is absent;
-    # the test must then fail on the behavior below, not on this setattr.
-    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
     session_id = "conv_proxy_transient_500"
     requests: list[dict[str, object]] = []
 
@@ -176,7 +179,7 @@ async def test_shell_proxy_persistent_500_surfaces_as_tool_error(
     **What breaks if wrong:** a persistent server-side failure is silently
     dropped, crashes the turn, or retries without bound.
     """
-    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
     session_id = "conv_proxy_persistent_500"
     attempts = 0
 
@@ -210,8 +213,7 @@ async def test_shell_proxy_persistent_500_surfaces_as_tool_error(
     assert f"'{_TOOL}'" in output
     assert f"session '{session_id}'" in output
     assert "500 Internal Server Error" in output
-    # Bounded retries: the initial post plus two retries, then give up.
-    assert attempts == 3
+    assert attempts == proxy_mcp_manager_mod._TRANSIENT_PROXY_MAX_RETRIES + 1
     # The runner logged the attributable dispatch failure.
     assert _PROXY_ERROR_LOG in caplog.text
 
@@ -234,16 +236,18 @@ async def test_shell_helper_transient_fork_failure_recovers(
     **What breaks if wrong:** momentary host fork pressure permanently fails
     the agent's shell command.
     """
-    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
     real_popen = subprocess.Popen
     spawn_attempts = 0
 
-    def _fork_blocked_once(*args: object, **kwargs: object) -> object:
+    def _fork_blocked_once(args: object, *popen_args: object, **popen_kwargs: object) -> object:
         nonlocal spawn_attempts
+        if not _is_helper_argv(args):
+            return real_popen(args, *popen_args, **popen_kwargs)  # type: ignore[arg-type]
         spawn_attempts += 1
         if spawn_attempts == 1:
             raise BlockingIOError(35, "Resource temporarily unavailable")
-        return real_popen(*args, **kwargs)  # type: ignore[arg-type]
+        return real_popen(args, *popen_args, **popen_kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked_once)
 
@@ -285,11 +289,14 @@ async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
     **What breaks if wrong:** persistent host resource exhaustion crashes the
     turn or is dropped instead of being surfaced as an attributable error.
     """
-    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
+    real_popen = subprocess.Popen
     spawn_attempts = 0
 
-    def _fork_blocked(*_args: object, **_kwargs: object) -> object:
+    def _fork_blocked(args: object, *popen_args: object, **popen_kwargs: object) -> object:
         nonlocal spawn_attempts
+        if not _is_helper_argv(args):
+            return real_popen(args, *popen_args, **popen_kwargs)  # type: ignore[arg-type]
         spawn_attempts += 1
         raise BlockingIOError(35, "Resource temporarily unavailable")
 
@@ -309,7 +316,6 @@ async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
     assert isinstance(payload, dict)
     assert "Resource temporarily unavailable" in payload["error"]
     assert "Errno 35" in payload["error"]
-    # Bounded spawn attempts: the initial spawn plus two retries, then give up.
-    assert spawn_attempts == 3
+    assert spawn_attempts == os_env_mod._SPAWN_TRANSIENT_ATTEMPTS
     # The runner logged the attributable dispatch failure.
     assert _OS_ENV_ERROR_LOG in caplog.text

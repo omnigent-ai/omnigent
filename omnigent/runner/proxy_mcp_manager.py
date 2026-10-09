@@ -49,9 +49,9 @@ _logger = logging.getLogger(__name__)
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
 
-# Bounded retry for transient HTTP failures from the MCP proxy endpoint
-# (server restart, LB blip, momentary overload). ``call_tool`` documents why
-# re-posting under the same operation id is safe for every proxied tool.
+# Bounded retry for brief HTTP failures from the MCP proxy (LB blip, momentary
+# overload); a lost connection takes the reconnect path instead. ``Retry-After``
+# is ignored on purpose: the budget targets sub-second blips, not rate limiting.
 _TRANSIENT_PROXY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _TRANSIENT_PROXY_MAX_RETRIES = 2
 _TRANSIENT_PROXY_BACKOFF_S = 0.5
@@ -319,15 +319,15 @@ class ProxyMcpManager:
         runner-side approval Future until the user accepts or declines, then
         retries once with the user's decision in ``inputResponses``.
 
-        **Transient proxy failures**: an HTTP status in
+        **Transient proxy failures**: a status in
         :data:`_TRANSIENT_PROXY_STATUSES` is re-posted a bounded number of
-        times with the same operation id and a fresh JSON-RPC id. On the
-        server a re-post repeats only TOOL_CALL/TOOL_RESULT policy evaluation
-        and its idempotent label writes -- the work the approval retry and the
-        reconnect reattach already repeat -- while the runner's execution
-        registry attaches the retried ``/mcp/execute`` to the step already
-        started instead of running the tool again. The one tool the server
-        executes itself, ``sys_advise_models``, is a read-only advisory.
+        times with the same operation id and a fresh JSON-RPC id, so the
+        runner's execution registry reattaches work it already started instead
+        of running it again. The server side of a re-post repeats only policy
+        evaluation and idempotent label writes, and its one self-executed tool,
+        ``sys_advise_models``, is read-only. An approved call whose approval
+        the server already consumed still fails with ``Elicitation not found
+        or already resolved`` on re-post, as it did before this retry.
 
         :param spec: Ignored — accepted for interface parity with
             :class:`RunnerMcpManager`.  ``None`` is acceptable for callers

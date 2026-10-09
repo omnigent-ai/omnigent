@@ -22,6 +22,7 @@ Run::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -40,7 +41,11 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.chat._shell_dispatch_faults import FORK_EAGAIN_MARKER, PROXY_500_MARKER
+from tests.e2e_ui.chat._shell_dispatch_faults import (
+    FAULT_LOG_ENV,
+    FORK_EAGAIN_MARKER,
+    PROXY_500_MARKER,
+)
 from tests.e2e_ui.conftest import (
     _create_bundled_session,
     _find_free_port,
@@ -86,6 +91,7 @@ class _FaultedStack:
     server_log: Path
     runner_stdout: Path
     runner_log: Path
+    fault_log: Path
 
 
 def _stop(proc: subprocess.Popen[bytes]) -> None:
@@ -158,6 +164,7 @@ def faulted_stack(
     server_log = stack_tmp / "server.log"
     runner_stdout = stack_tmp / "runner-stdout.log"
     runner_log = stack_tmp / "runner-process.log"
+    fault_log = stack_tmp / "faults.log"
 
     port = _find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -167,6 +174,7 @@ def faulted_stack(
     common_env = {
         **os.environ,
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        FAULT_LOG_ENV: str(fault_log),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         "ANTHROPIC_API_KEY": "",
@@ -218,7 +226,7 @@ def faulted_stack(
     logs = (server_log, runner_stdout, runner_log)
     try:
         _wait_until_online(base_url, runner_id, procs, logs)
-        yield _FaultedStack(base_url, runner_id, server_log, runner_stdout, runner_log)
+        yield _FaultedStack(base_url, runner_id, server_log, runner_stdout, runner_log, fault_log)
     finally:
         for proc in reversed(procs):
             _stop(proc)
@@ -234,14 +242,15 @@ def probe_session(faulted_stack: _FaultedStack) -> Iterator[tuple[str, str]]:
     session_id = _create_bundled_session(
         faulted_stack.base_url, faulted_stack.runner_id, yaml_text
     )
-    httpx.get(
-        f"{faulted_stack.base_url}/v1/sessions/{session_id}/resources/environments/default",
-        timeout=30.0,
-    ).raise_for_status()
     try:
+        httpx.get(
+            f"{faulted_stack.base_url}/v1/sessions/{session_id}/resources/environments/default",
+            timeout=30.0,
+        ).raise_for_status()
         yield session_id, model
     finally:
-        httpx.delete(f"{faulted_stack.base_url}/v1/sessions/{session_id}", timeout=10.0)
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{faulted_stack.base_url}/v1/sessions/{session_id}", timeout=10.0)
         shutil.rmtree(ws, ignore_errors=True)
 
 
@@ -318,6 +327,11 @@ def _assert_command_ran(
         observed = output.inner_text()
     # Hold the tool card on screen so a recording ends on the Output panel.
     page.wait_for_timeout(1_500)
+    fired = stack.fault_log.read_text(errors="replace") if stack.fault_log.exists() else ""
+    assert token in fired, (
+        f"the injected fault for {token!r} never fired, so this run did not exercise the "
+        f"retry path; fault log:\n{fired or '<empty>'}"
+    )
     if observed is None:
         return
     log_lines = [

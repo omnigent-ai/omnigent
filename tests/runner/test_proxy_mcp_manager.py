@@ -669,7 +669,7 @@ async def test_call_tool_transient_500_retries_and_succeeds(
     Failure means one server blip (restart, LB error, momentary overload)
     permanently fails the agent's tool call.
     """
-    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
     rpc_ok = _json_resp(
         {
             "jsonrpc": "2.0",
@@ -701,8 +701,11 @@ async def test_call_tool_persistent_500_raises_after_bounded_retries(
     Failure means either the error is swallowed or the proxy retries without
     bound against a persistently failing server.
     """
-    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
-    transport = _StubTransport([httpx.Response(500, text="Internal Server Error")] * 3)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
+    attempts = proxy_mcp_manager_mod._TRANSIENT_PROXY_MAX_RETRIES + 1
+    transport = _StubTransport(
+        [httpx.Response(500, text="Internal Server Error") for _ in range(attempts)]
+    )
     manager = _make_manager(transport)
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -712,8 +715,7 @@ async def test_call_tool_persistent_500_raises_after_bounded_retries(
     assert "github__search" in error_msg
     assert "conv_test" in error_msg
     assert "500" in error_msg
-    # Initial post plus two retries, then give up.
-    assert len(transport.calls) == 3
+    assert len(transport.calls) == attempts, "The initial post plus the configured retries"
 
 
 @pytest.mark.asyncio
@@ -725,7 +727,7 @@ async def test_call_tool_client_error_does_not_retry(
     Failure means deterministic request errors burn retries and delay the
     tool result for no benefit.
     """
-    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
     transport = _StubTransport([httpx.Response(404, text="not found")])
     manager = _make_manager(transport)
 
@@ -734,6 +736,76 @@ async def test_call_tool_client_error_does_not_retry(
 
     assert "404" in str(exc_info.value)
     assert len(transport.calls) == 1, "Client errors must not be retried"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_transient_500_after_forward_reattaches_retained_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 500 raised after the server forwarded the call must not rerun the tool.
+
+    The transport stands in for the server: every post forwards to the runner's
+    execution registry (as ``/mcp/execute`` does) before answering, and the
+    first answer is a 500. The re-post must attach to the retained step, so the
+    external work runs once and its result is what the caller receives.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
+    registry = McpExecutionRegistry()
+
+    class _FailAfterForwardTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(
+                    status_code=200,
+                    content={"result": {"output": "retained"}},
+                )
+
+            executed = await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": "github__deploy", "arguments": {}},
+                run=_retained_work,
+            )
+            assert executed.content == {"result": {"output": "retained"}}
+            if len(self.calls) == 1:
+                return httpx.Response(500, text="Internal Server Error")
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "retained"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _FailAfterForwardTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    try:
+        output = await manager.call_tool(None, "github__deploy", {})
+    finally:
+        await client.aclose()
+
+    assert output == "retained"
+    assert transport.external_invocations == 1, "The re-post must reattach, not rerun the tool"
+    assert len(transport.calls) == 2
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
 
 
 # ── dispatch timeout nesting ────────────────────────────────────────────────

@@ -643,9 +643,7 @@ class _HelperProcessClient:
                     )
                     break
                 except BlockingIOError:
-                    # Fork EAGAIN: the host is briefly out of process
-                    # capacity. Nothing spawned and the config pipe is
-                    # untouched, so retrying the spawn is side-effect free.
+                    # Fork EAGAIN; nothing spawned yet (see _SPAWN_TRANSIENT_ATTEMPTS).
                     if attempt == _SPAWN_TRANSIENT_ATTEMPTS:
                         raise
                     time.sleep(_SPAWN_TRANSIENT_BACKOFF_S * 2 ** (attempt - 1))

@@ -528,7 +528,7 @@ def test_helper_spawn_retries_transient_fork_failure(
     — the transient shape of host fork pressure. The helper never started,
     so the retry is side-effect free and the shell op must succeed.
     """
-    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
     real_popen = os_env_mod.subprocess.Popen
     attempts = 0
 
@@ -565,7 +565,7 @@ def test_helper_spawn_persistent_fork_failure_raises_after_bounded_attempts(
     structured tool error, so the spawn path must re-raise — not swallow —
     once the attempt budget is exhausted, and must not loop forever.
     """
-    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0, raising=False)
+    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
     attempts = 0
 
     def _fork_blocked(*_args: object, **_kwargs: object) -> object:
@@ -585,5 +585,4 @@ def test_helper_spawn_persistent_fork_failure_raises_after_bounded_attempts(
     finally:
         os_env.close()
 
-    # Initial spawn plus two retries, then give up.
-    assert attempts == 3
+    assert attempts == os_env_mod._SPAWN_TRANSIENT_ATTEMPTS, "Give up after the bounded attempts"

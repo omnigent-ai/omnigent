@@ -11,6 +11,9 @@ once per token; everything else passes through untouched.
 - ``install_runner_fault``: the first OS-environment helper spawn made for a
   command carrying :data:`FORK_EAGAIN_MARKER` raises ``BlockingIOError``
   (``EAGAIN``) from ``subprocess.Popen``, as a host out of process slots does.
+
+When :data:`FAULT_LOG_ENV` names a file, each fired fault appends
+``<kind> <token>`` to it so the test can assert the fault really happened.
 """
 
 from __future__ import annotations
@@ -25,6 +28,14 @@ from typing import Any
 
 PROXY_500_MARKER = "shellfault-proxy500-"
 FORK_EAGAIN_MARKER = "shellfault-forkeagain-"
+FAULT_LOG_ENV = "SHELL_DISPATCH_FAULT_LOG"
+
+
+def _record_fired(kind: str, token: str) -> None:
+    path = os.environ.get(FAULT_LOG_ENV)
+    if path:
+        with open(path, "a", encoding="utf-8") as log:
+            log.write(f"{kind} {token}\n")
 
 
 def _marker_token(text: object, marker: str) -> str | None:
@@ -80,6 +91,7 @@ class _McpProxy500Once:
         token = _marked_proxy_call(body)
         if token is not None and token not in self._fired:
             self._fired.add(token)
+            _record_fired("proxy500", token)
             await send(
                 {
                     "type": "http.response.start",
@@ -125,8 +137,10 @@ def install_runner_fault() -> None:
 
     class EagainOncePopen(real_popen):  # type: ignore[valid-type,misc]
         def __init__(self, args: Any, *popen_args: Any, **popen_kwargs: Any) -> None:
-            if getattr(armed, "token", None) is not None and _is_helper_argv(args):
+            token = getattr(armed, "token", None)
+            if token is not None and _is_helper_argv(args):
                 armed.token = None
+                _record_fired("forkeagain", token)
                 raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
             super().__init__(args, *popen_args, **popen_kwargs)
 
