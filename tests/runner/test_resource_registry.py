@@ -1174,7 +1174,7 @@ def test_resolve_environment_default_pins_none_sandbox_when_no_agent_spec(
     """
     monkeypatch.setattr(
         "omnigent.inner.sandbox.shutil.which",
-        lambda name: "/usr/bin/bwrap",
+        lambda name, *_, **__: "/usr/bin/bwrap",
     )
     monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path))
 
