@@ -3416,3 +3416,102 @@ async def test_serve_tunnel_graceful_shutdown_callback_fires_once_across_cutover
     assert graceful_calls == 1, (
         f"on_graceful_shutdown fired {graceful_calls} times; the once-latch did not hold"
     )
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_failed_replacement_keeps_superseded_connection_serving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected replacement handshake leaves the superseded connection serving.
+
+    The renewal watcher mints a token and signals a cutover, but the replacement
+    fails before it is accepted. The superseded connection must not be cancelled;
+    the loop retries with a fresh mint and a later replacement succeeds. Each
+    accepted generation still records exactly one connect and one disconnect.
+    """
+    shutdown_event = asyncio.Event()
+    old_cancelled = False
+    generations = 0
+    mint_calls = 0
+    connects = 0
+    disconnects = 0
+    seen_tokens: list[str | None] = []
+
+    def _factory() -> str:
+        nonlocal mint_calls
+        mint_calls += 1
+        return f"minted-{mint_calls}"
+
+    def _count_connected(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal connects
+        connects += 1
+
+    def _count_disconnected(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal disconnects
+        disconnects += 1
+
+    monkeypatch.setattr(serve_module, "_INITIAL_RECONNECT_DELAY_S", 0.001)
+    monkeypatch.setattr(serve_module, "touch_connect_marker", lambda: None)
+    monkeypatch.setattr(serve_module, "record_websocket_connected", _count_connected)
+    monkeypatch.setattr(serve_module, "record_websocket_disconnected", _count_disconnected)
+
+    async def _serve_once(
+        app: Any,
+        *,
+        auth_token: str | None = None,
+        on_connected: Any = None,
+        on_prepare_renewal: Any = None,
+        renewal_signal: asyncio.Future[str | None] | None = None,
+        on_graceful_shutdown: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        del app
+        nonlocal generations, old_cancelled
+        generations += 1
+        seen_tokens.append(auth_token)
+        if generations == 1:
+            if on_connected is not None:
+                on_connected()
+            assert on_prepare_renewal is not None
+            assert renewal_signal is not None
+            renewal_signal.set_result(await on_prepare_renewal())
+            try:
+                await shutdown_event.wait()
+            except asyncio.CancelledError:
+                old_cancelled = True
+                raise
+            if on_graceful_shutdown is not None:
+                on_graceful_shutdown()
+            return
+        if generations == 2:
+            # The replacement never reaches the server; the old socket still serves.
+            raise OSError("replacement handshake refused")
+        if on_connected is not None:
+            on_connected()
+        shutdown_event.set()
+        if on_graceful_shutdown is not None:
+            on_graceful_shutdown()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_failed_replacement",
+            runner_version="0.1.0",
+            auth_token="initial",
+            auth_token_factory=_factory,
+            shutdown_event=shutdown_event,
+            on_graceful_shutdown=lambda: None,
+        ),
+        timeout=5.0,
+    )
+    await asyncio.sleep(0)
+
+    assert not old_cancelled, "the superseded connection was cancelled by a failed replacement"
+    assert generations == 3, f"expected a retry after the failed replacement, got {generations}"
+    assert seen_tokens == ["minted-1", "minted-2", "minted-3"], seen_tokens
+    assert mint_calls == 3, "the retry after a failed replacement did not mint a fresh token"
+    assert connects == 2, f"expected one connect per accepted generation, got {connects}"
+    assert disconnects == 2, f"expected one disconnect per accepted generation, got {disconnects}"

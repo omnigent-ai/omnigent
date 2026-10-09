@@ -451,3 +451,42 @@ async def test_disconnect_during_failed_send_leaves_no_unretrieved_future_error(
     await asyncio.sleep(0)
     assert dispatcher._pending == {}
     assert not reported
+
+
+async def test_stale_ready_from_superseded_generation_does_not_enable_delivery() -> None:
+    """A superseded generation's late ``event.ready`` leaves the replacement negotiating.
+
+    Make-before-break can deliver the old socket's ready frame after the
+    replacement has already connected. It must not repoint delivery at the
+    closing socket; batches wait for the replacement's own ready frame.
+    """
+    dispatcher = RunnerEventDispatcher()
+    old_sent: list[EventBatchFrame] = []
+    live_sent: list[EventBatchFrame] = []
+
+    async def old_send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        old_sent.append(frame)
+
+    async def live_send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        live_sent.append(frame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, 1))
+
+    old_generation = dispatcher.connected(old_send)
+    live_generation = dispatcher.connected(live_send)
+    dispatcher.ready(old_send, old_generation)
+
+    submit = asyncio.create_task(dispatcher.submit("session-a", [_ITEM]))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not submit.done(), "a superseded generation's ready frame enabled delivery"
+    assert old_sent == [] and live_sent == []
+
+    dispatcher.ready(live_send, live_generation)
+    ack = await asyncio.wait_for(submit, timeout=2)
+    assert ack.applied == 1
+    assert old_sent == [], "the superseded socket must not carry batches"
+    assert len(live_sent) == 1
