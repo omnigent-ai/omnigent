@@ -2354,6 +2354,12 @@ def _extract_latest_user_content(
     return ""
 
 
+def _has_prior_history(messages: list[Message]) -> bool:
+    """Whether a fresh thread's first prompt replays earlier turns, not just the latest message."""
+    user_messages = [msg for msg in messages if msg.get("role") == "user"]
+    return len(messages) > 1 and len(user_messages) > 1
+
+
 def _build_initial_prompt(
     messages: list[Message],
 ) -> str | list[CodexParams]:
@@ -2366,8 +2372,7 @@ def _build_initial_prompt(
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
     """
-    user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    if len(messages) <= 1 or len(user_messages) <= 1:
+    if not _has_prior_history(messages):
         return _extract_latest_user_content(messages)
 
     has_attachments = any(
@@ -3741,6 +3746,11 @@ class _CodexAppServerSession:
             too_large = _input_too_large_error(exc.error)
             if too_large is None:
                 raise
+            if is_new_thread and _has_prior_history(prompt_messages):
+                # The fresh thread never received the replayed history; drop it so
+                # the next turn replays into a new thread instead of sending only
+                # the latest message.
+                self.thread_id = None
             yield too_large
             return
         if effort_via_turn_start:

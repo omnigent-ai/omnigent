@@ -182,6 +182,24 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+_INPUT_TOO_LARGE_REJECTION = {
+    "code": -32602,
+    "data": {
+        "input_error_code": "input_too_large",
+        "max_chars": 1_048_576,
+        "actual_chars": 1_449_987,
+    },
+    "message": "Input exceeds the maximum length of 1048576 characters.",
+}
+_TURN_KWARGS: dict[str, Any] = {
+    "tools": [],
+    "system_prompt": "",
+    "model": "gpt-5.4-mini",
+    "cwd": ".",
+    "sandbox": "workspace-write",
+}
+
+
 class TestCodexExecutor(unittest.TestCase):
     def test_databricks_codex_config_overrides(self):
         overrides = _databricks_codex_config_overrides(
@@ -489,16 +507,6 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_oversized_turn_input_fails_with_a_clear_reason(self):
-        rejection = {
-            "code": -32602,
-            "data": {
-                "input_error_code": "input_too_large",
-                "max_chars": 1_048_576,
-                "actual_chars": 1_449_987,
-            },
-            "message": "Input exceeds the maximum length of 1048576 characters.",
-        }
-
         async def _t():
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
@@ -511,18 +519,14 @@ class TestCodexExecutor(unittest.TestCase):
             session._request = AsyncMock(
                 side_effect=[
                     {"result": {"thread": {"id": "thread-1"}}},
-                    _CodexRequestError(rejection),
+                    _CodexRequestError(_INPUT_TOO_LARGE_REJECTION),
                 ]
             )
             events = [
                 event
                 async for event in session.run_turn(
                     messages=[{"role": "user", "content": "Summarize this log"}],
-                    tools=[],
-                    system_prompt="",
-                    model="gpt-5.4-mini",
-                    cwd=".",
-                    sandbox="workspace-write",
+                    **_TURN_KWARGS,
                 )
             ]
             methods = [call.args[0] for call in session._request.await_args_list]
@@ -541,6 +545,100 @@ class TestCodexExecutor(unittest.TestCase):
             for fragment in ("-32602", "input_error_code", "Codex executor error"):
                 self.assertNotIn(fragment, surfaced)
             self.assertIsNone(session.active_turn_id)
+            # No earlier history was lost, so the empty thread is kept for the retry.
+            self.assertEqual(session.thread_id, "thread-1")
+
+        _run(_t())
+
+    def test_rejected_history_replay_discards_the_fresh_thread(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    _CodexRequestError(_INPUT_TOO_LARGE_REJECTION),
+                    {"result": {"thread": {"id": "thread-2"}}},
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            history = [
+                {"role": "user", "content": "What does the log say?"},
+                {"role": "assistant", "content": "It reports heartbeat latency."},
+                {"role": "user", "content": "x" * 32},
+            ]
+            events = [event async for event in session.run_turn(messages=history, **_TURN_KWARGS)]
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertTrue(events[0].preserve_session)
+            self.assertIsNone(session.thread_id)
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-2"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            follow_up = [*history, {"role": "user", "content": "Summarize the first error."}]
+            _ = [event async for event in session.run_turn(messages=follow_up, **_TURN_KWARGS)]
+            await inject_task
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertEqual(methods, ["thread/start", "turn/start", "thread/start", "turn/start"])
+            replay = session._request.await_args_list[3].args[1]["input"][0]["text"]
+            self.assertIn("Conversation so far:", replay)
+            self.assertIn("It reports heartbeat latency.", replay)
+            self.assertEqual(session.thread_id, "thread-2")
+
+        _run(_t())
+
+    def test_rejected_oversized_input_keeps_an_established_thread(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(
+                side_effect=[
+                    _CodexRequestError(_INPUT_TOO_LARGE_REJECTION),
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            history = [
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": "earlier answer"},
+                {"role": "user", "content": "x" * 32},
+            ]
+            events = [event async for event in session.run_turn(messages=history, **_TURN_KWARGS)]
+            self.assertTrue(events[0].preserve_session)
+            self.assertEqual(session.thread_id, "thread-1")
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-2"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            follow_up = [*history, {"role": "user", "content": "shorter"}]
+            _ = [event async for event in session.run_turn(messages=follow_up, **_TURN_KWARGS)]
+            await inject_task
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertEqual(methods, ["turn/start", "turn/start"])
+            self.assertEqual(
+                session._request.await_args_list[1].args[1]["input"],
+                [{"type": "text", "text": "shorter"}],
+            )
 
         _run(_t())
 
