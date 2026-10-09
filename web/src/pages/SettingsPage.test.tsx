@@ -11,6 +11,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import * as host from "@/lib/host";
+import { createCustomThemeFromPalette, deriveCustomTheme } from "@/lib/customTheme";
+import { PALETTES } from "@/lib/themePalette";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -705,6 +707,66 @@ describe("SettingsPage", () => {
       /^rgba\(/,
     );
     expect(document.documentElement).toHaveAttribute("data-custom-translucent-sidebar");
+  });
+
+  it("creates a custom theme when the flat-background control is enabled", () => {
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "catppuccin" },
+    });
+    const toggle = screen.getByRole("switch", { name: "Flat background" });
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toBeChecked();
+    expect(screen.getByTestId("color-theme-select")).toHaveValue("custom");
+    expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
+      basePalette: "catppuccin",
+      flatBackground: true,
+    });
+    const style = document.documentElement.style;
+    for (const mode of ["light", "dark"]) {
+      expect(style.getPropertyValue(`--custom-${mode}-shell-background`)).toBe(
+        style.getPropertyValue(`--custom-${mode}-background`),
+      );
+    }
+  });
+
+  it("restores the flat-background choice and preserves colors when toggling it off", () => {
+    const palette = PALETTES.find((candidate) => candidate.id === "catppuccin")!;
+    const theme = {
+      ...createCustomThemeFromPalette(palette),
+      accent: "#2563eb",
+      darkAccent: "#7aa2f7",
+      tint: "#dbeafe",
+      darkTint: "#24283b",
+      contrast: 55,
+      translucentSidebar: true,
+      flatBackground: true,
+    };
+    localStorage.setItem("omnigent:ui-theme-palette", JSON.stringify("custom"));
+    localStorage.setItem("omnigent:custom-theme", JSON.stringify(theme));
+    renderPage("/settings/appearance");
+    const toggle = screen.getByRole("switch", { name: "Flat background" });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+
+    expect(toggle).not.toBeChecked();
+    expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toEqual({
+      ...theme,
+      flatBackground: false,
+    });
+    const style = document.documentElement.style;
+    for (const mode of ["light", "dark"] as const) {
+      expect(style.getPropertyValue(`--custom-${mode}-shell-background`)).toBe(
+        palette.tokens[mode].shellBackground,
+      );
+      expect(style.getPropertyValue(`--custom-${mode}-primary`)).toBe(
+        deriveCustomTheme(theme)[mode].primary,
+      );
+    }
   });
 
   it("moves the mode selection with arrow keys (radiogroup keyboard nav)", () => {
