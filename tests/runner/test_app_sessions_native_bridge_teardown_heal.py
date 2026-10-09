@@ -1,14 +1,10 @@
-"""Turn delivery must relaunch a live codex pane whose bridge was torn down.
+"""Turn delivery relaunches a live codex pane whose bridge files are gone.
 
-``_delete_native_bridge_dirs`` (session delete / resource cleanup) removes a
-session's native bridge dir, and the tmux pane can outlive that teardown. The
-turn-time self-heal (``_ensure_native_terminal_for_turn``) used to probe only
-pane liveness, so the surviving pane masked the missing bridge: the executor
-found neither ``state.json`` nor a recorded startup error and failed the turn
-with the generic "Codex native bridge state is missing" message. These tests
-pin the third detection layer: a live codex pane whose runner-written bridge
-files are all gone is closed and re-created before the turn is forwarded,
-while a live pane whose bridge is intact is left alone.
+``_delete_native_bridge_dirs`` (session delete / resource cleanup) can remove a
+session's bridge dir while its tmux pane survives. The turn-time self-heal
+(``_ensure_native_terminal_for_turn``) closes and re-creates such a pane before
+forwarding the turn, leaves a pane with an intact bridge alone, and never
+relaunches when the session's bridge identity is rotated or cannot be read.
 """
 
 from __future__ import annotations
@@ -82,6 +78,19 @@ def _plant_live_codex_pane(
     return closes
 
 
+class _UnlabeledServerClient(NullServerClient):
+    """Null server client whose labels endpoint answers with an empty mapping."""
+
+    class _LabelsResponse(NullServerClient._Response):
+        def json(self) -> dict[str, Any]:
+            return {"labels": {}}
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Serve ``{"labels": {}}`` for any GET."""
+        del url, kwargs
+        return self._LabelsResponse()
+
+
 def _build_codex_native_app(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -150,7 +159,7 @@ def _build_codex_native_app(
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=_UnlabeledServerClient(),  # type: ignore[arg-type]
         terminal_registry=registry,
     )
     return app, registry, harness_client
@@ -311,25 +320,25 @@ async def test_torn_down_check_does_not_flag_rotated_bridge_id(
 class _FailingLabelServerClient:
     """Server-client stub whose labels lookup times out, errors, or returns junk."""
 
-    def __init__(self, *, status_code: int | None, malformed: bool = False) -> None:
+    def __init__(self, *, status_code: int | None, body: Any = None) -> None:
         self._status_code = status_code
-        self._malformed = malformed
+        self._body = body
 
     async def get(self, url: str, **kwargs: Any) -> Any:
-        """Raise a timeout when no status is configured; otherwise serve it."""
+        """Raise a timeout when no status is configured; otherwise serve the body."""
         del url, kwargs
         if self._status_code is None:
             raise httpx.ReadTimeout("labels lookup timed out")
         code = self._status_code
-        malformed = self._malformed
+        body = self._body
 
         class _Response:
             status_code = code
 
-            def json(self) -> dict[str, Any]:
-                if malformed:
+            def json(self) -> Any:
+                if body is None:
                     raise ValueError("not JSON")
-                return {}
+                return body
 
         return _Response()
 
@@ -339,11 +348,20 @@ class _FailingLabelServerClient:
     "client",
     [
         _FailingLabelServerClient(status_code=None),
-        _FailingLabelServerClient(status_code=503),
-        _FailingLabelServerClient(status_code=200, malformed=True),
+        _FailingLabelServerClient(status_code=503, body={"labels": {}}),
+        _FailingLabelServerClient(status_code=200),
+        _FailingLabelServerClient(status_code=200, body={"labels": "rotated-bridge"}),
+        _FailingLabelServerClient(status_code=200, body={}),
         None,
     ],
-    ids=["timeout", "non_200", "malformed_body", "no_server_client"],
+    ids=[
+        "timeout",
+        "non_200",
+        "not_json",
+        "labels_not_mapping",
+        "labels_missing",
+        "no_server_client",
+    ],
 )
 async def test_torn_down_check_fails_closed_when_labels_are_unreadable(
     monkeypatch: pytest.MonkeyPatch,

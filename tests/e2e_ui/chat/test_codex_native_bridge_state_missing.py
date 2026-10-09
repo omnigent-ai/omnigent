@@ -1,14 +1,10 @@
 """E2E: a codex-native web turn survives its bridge dir being torn down.
 
 A runner teardown (``_delete_native_bridge_dirs``) can remove a session's
-native bridge dir while its tmux pane stays alive. The turn-time self-heal
-(``_ensure_native_terminal_for_turn``) probes only pane liveness, so a live
-pane masks the missing bridge: the next composer turn finds no ``state.json``
-or ``startup_error.json``, waits out the executor poll, and surfaces the error
-pill ``inner executor error: Codex native bridge state is missing``.
-
-Fails on a tree where a live pane masks a torn-down bridge; passes once turn
-delivery restores the bridge before executing.
+native bridge dir while its tmux pane stays alive. The next composer turn must
+still be delivered: the turn-time self-heal relaunches Codex and the reply
+renders instead of the error pill ``inner executor error: Codex native bridge
+state is missing``.
 """
 
 from __future__ import annotations
@@ -49,10 +45,9 @@ _TURN_DELIVERY_TIMEOUT_MS = 180_000
 
 _MISSING_STATE_MESSAGE = "Codex native bridge state is missing"
 
-# Runner-written bridge files; their absence is the production teardown
-# signature (the live CLI may resurrect the dir with codex-home content only).
-# Mirrors bridge_torn_down on purpose: importing it would make a tree without
-# the heal fail on the import instead of on the reported behavior.
+# Runner-written bridge files; all absent is the production teardown signature.
+# Mirrors bridge_torn_down on purpose: importing it would fail a tree without
+# the heal on the import instead of on the reported behavior.
 _BRIDGE_FILES = ("state.json", "startup_error.json", "bridge.json")
 
 

@@ -10261,10 +10261,10 @@ async def _lookup_session_labels(
         labels endpoint.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``.
-    :returns: String label mapping (empty when the response carries no labels
-        mapping), or ``None`` on a timeout, transport or auth error, non-200
-        status, or an unparseable body. Callers that must tell "no labels" from
-        "could not read labels" use this directly.
+    :returns: String label mapping, or ``None`` on a timeout, transport or
+        auth error, non-200 status, an unparseable body, or a ``labels`` value
+        that is not a mapping. Callers that must tell "no labels" from "could
+        not read labels" use this directly.
     """
     from omnigent.inner.databricks_executor import DatabricksAuthError
 
@@ -10301,7 +10301,7 @@ async def _lookup_session_labels(
         )
         return None
     try:
-        labels = resp.json().get("labels")
+        payload = resp.json()
     except ValueError:
         # A 200 with a non-JSON body (e.g. an empty response from the
         # Databricks Apps proxy when the server event loop is starved,
@@ -10315,8 +10315,9 @@ async def _lookup_session_labels(
             extra={"session_id": session_id},
         )
         return None
+    labels = payload.get("labels") if isinstance(payload, dict) else None
     if not isinstance(labels, dict):
-        return {}
+        return None
     return {str(key): str(value) for key, value in labels.items()}
 
 
