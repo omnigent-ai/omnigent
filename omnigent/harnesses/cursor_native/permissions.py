@@ -150,14 +150,15 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except CursorPaneGoneError:
+        except CursorPaneGoneError as exc:
             # The pane was torn down (session end / runner disconnect): the
             # verdict has nowhere to land. Expected teardown, not an error.
             _logger.info(
-                "cursor pane gone; dropped keystroke %r (of %r); session=%s",
+                "cursor pane gone; dropped keystroke %r (of %r); session=%s; cause=%s",
                 key,
                 keys,
                 session_id,
+                exc.__cause__,
             )
             return False
         except RuntimeError:

@@ -1053,18 +1053,24 @@ async def test_send_cursor_keys_dead_pane_drops_verdict_without_error(
 ) -> None:
     """A verdict to a torn-down pane reports failure with no ERROR record."""
 
+    tmux_detail = "tmux command failed (rc=1): socket gone"
+
     def _gone(_bridge: Path, _key: str) -> None:
-        raise cnb.CursorPaneGoneError("cursor pane no longer exists (TUI exited)")
+        cause = RuntimeError(tmux_detail)
+        raise cnb.CursorPaneGoneError("cursor pane no longer exists (TUI exited)") from cause
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", _gone)
     with caplog.at_level(logging.INFO, logger=cnp.__name__):
         assert await cnp._send_cursor_keys(tmp_path, "conv_gone", "Escape", "Enter") is False
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
-    # The drop is still observable, as an expected teardown consequence logged at INFO.
-    assert any(
-        record.levelno == logging.INFO and "cursor pane gone" in record.getMessage()
+    # The drop is still observable, as an expected teardown consequence logged at INFO,
+    # and that record keeps the originating tmux failure so the teardown stays diagnosable.
+    info_messages = [
+        record.getMessage()
         for record in caplog.records
-    )
+        if record.levelno == logging.INFO and "cursor pane gone" in record.getMessage()
+    ]
+    assert any(tmux_detail in message for message in info_messages)
 
 
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────
