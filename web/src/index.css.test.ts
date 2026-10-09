@@ -960,7 +960,7 @@ describe("index.css mobile settings title", () => {
 describe("index.css electron-mac window drag region", () => {
   const dragRule = cssBlocks
     .map(([block]) => block)
-    .find((block) => selectorOf(block) === "[data-electron-mac] .electron-drag-strip");
+    .find((block) => selectorOf(block) === "html[data-electron-mac] .electron-drag-strip");
   const controlsRule = cssBlocks
     .map(([block]) => block)
     .find(

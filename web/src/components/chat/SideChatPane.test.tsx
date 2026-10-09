@@ -465,3 +465,14 @@ describe("side chat sealed by the server", () => {
     );
   });
 });
+
+describe("side-chat composer auto-grow", () => {
+  it("applies auto-grow to the text input so it grows with its content", () => {
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input") as HTMLTextAreaElement;
+    // useAutoGrowTextarea sets style.height="auto" during its initial measure
+    // when scrollHeight is 0 (jsdom has no layout). A textarea that doesn't
+    // have auto-grow wired up keeps style.height="" (the browser default).
+    expect(input.style.height).toBe("auto");
+  });
+});

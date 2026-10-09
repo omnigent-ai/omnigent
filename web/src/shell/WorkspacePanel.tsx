@@ -28,7 +28,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 import { ALT_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 import { defaultWorkspaceTabs, readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
@@ -1135,7 +1134,7 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
-  return (
+  const rail = (
     <aside
       aria-label="Workspace"
       aria-hidden={!open}
@@ -1480,76 +1479,80 @@ function WorkspacePanelImpl({
           )}
         </div>
       </div>
-      {/* The rail is `hidden` on phones, so the drawer is portaled out of it. */}
-      {isMobile &&
-        createPortal(
-          <MobilePanelDrawer
-            open={mobileSideChatsOpen}
-            title="Side chats"
-            onClose={() => onMobileSideChatsOpenChange?.(false)}
-            testId="side-chats-panel-drawer"
-            // Keep live side-chat work mounted while the drawer is closed.
-            keepMounted
-          >
-            <div
-              role="tablist"
-              aria-label="Side chats"
-              className="flex shrink-0 items-center gap-1 overflow-x-auto border-border border-b px-2 py-1.5"
-            >
-              {sideChats.tabs.map((childId, index) => {
-                const active = sideChats.selected === childId;
-                const label = `Side chat ${index + 1}`;
-                return (
-                  <div
-                    key={childId}
-                    className={cn(
-                      "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
-                      active ? "bg-muted text-foreground" : "text-muted-foreground",
-                    )}
-                  >
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={active}
-                      onClick={() => sideChats.select(childId)}
-                    >
-                      {label}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Close ${label}`}
-                      className="flex size-6 items-center justify-center rounded"
-                      onClick={() => closeSideChat(childId)}
-                    >
-                      <XIcon className="size-3.5" />
-                    </button>
-                  </div>
-                );
-              })}
-              {onNewSideChat && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label="New side chat"
-                  onClick={onNewSideChat}
-                >
-                  <PlusIcon className="size-4" />
-                </Button>
-              )}
-            </div>
-            {selectedSideChatPane ?? (
-              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-                <MessagesSquareIcon className="size-6 text-muted-foreground" />
-                <p className="max-w-[36ch] text-sm text-muted-foreground">
-                  Tap + to ask a question without affecting the main conversation.
-                </p>
-              </div>
-            )}
-          </MobilePanelDrawer>,
-          document.body,
-        )}
     </aside>
+  );
+  return (
+    <>
+      {rail}
+      {/* The rail is `hidden` on phones, so the drawer renders beside it. A
+        portal to the body would escape the embed's scoped styles. */}
+      {isMobile && (
+        <MobilePanelDrawer
+          open={mobileSideChatsOpen}
+          title="Side chats"
+          onClose={() => onMobileSideChatsOpenChange?.(false)}
+          testId="side-chats-panel-drawer"
+          // Keep live side-chat work mounted while the drawer is closed.
+          keepMounted
+        >
+          <div
+            role="tablist"
+            aria-label="Side chats"
+            className="flex shrink-0 items-center gap-1 overflow-x-auto border-border border-b px-2 py-1.5"
+          >
+            {sideChats.tabs.map((childId, index) => {
+              const active = sideChats.selected === childId;
+              const label = `Side chat ${index + 1}`;
+              return (
+                <div
+                  key={childId}
+                  className={cn(
+                    "flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-ui font-medium",
+                    active ? "bg-muted text-foreground" : "text-muted-foreground",
+                  )}
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => sideChats.select(childId)}
+                  >
+                    {label}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Close ${label}`}
+                    className="flex size-6 items-center justify-center rounded"
+                    onClick={() => closeSideChat(childId)}
+                  >
+                    <XIcon className="size-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+            {onNewSideChat && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="New side chat"
+                onClick={onNewSideChat}
+              >
+                <PlusIcon className="size-4" />
+              </Button>
+            )}
+          </div>
+          {selectedSideChatPane ?? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+              <MessagesSquareIcon className="size-6 text-muted-foreground" />
+              <p className="max-w-[36ch] text-sm text-muted-foreground">
+                Tap + to ask a question without affecting the main conversation.
+              </p>
+            </div>
+          )}
+        </MobilePanelDrawer>
+      )}
+    </>
   );
 }
 

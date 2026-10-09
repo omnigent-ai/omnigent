@@ -1088,6 +1088,21 @@ describe("WorkspacePanel mobile side chats", () => {
     expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("renders the drawer inside the app subtree, beside the hidden rail", () => {
+    // The embed scopes its stylesheet to its own root, and native shells scope
+    // safe-area insets to the app shell, so a drawer portaled to the body
+    // would render unstyled there.
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    const { view } = renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(view.container).toContainElement(drawer);
+    expect(
+      screen.getByRole("complementary", { name: "Workspace", hidden: true }),
+    ).not.toContainElement(drawer);
+  });
+
   it("keeps the side chat mounted while the drawer is closed", () => {
     // Dismissing the drawer must not unmount the pane: a seeded `/side`
     // question still waiting on the child's agent binding has to go out, and

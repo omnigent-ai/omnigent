@@ -19,6 +19,7 @@ let queryClient: QueryClient;
 const row = (title: string, pin: string) => ({ title, labels: { [PINNED_LABEL_KEY]: pin } });
 
 beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
   writePin.mockReset().mockResolvedValue({});
   queryClient = new QueryClient();
   localStorage.clear();
@@ -26,9 +27,16 @@ beforeEach(() => {
   render(<Toaster />);
 });
 
-afterEach(() => {
-  toast.dismiss();
+afterEach(async () => {
+  // Finish Sonner's exit callbacks before the DOM environment is torn down.
+  await act(async () => {
+    toast.dismiss();
+    await vi.runOnlyPendingTimersAsync();
+  });
   cleanup();
+  queryClient.clear();
+  vi.clearAllTimers();
+  vi.useRealTimers();
 });
 
 describe("unpinWithUndo", () => {
