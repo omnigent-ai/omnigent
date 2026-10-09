@@ -339,7 +339,7 @@ struct OmnigentWebView: UIViewRepresentable {
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
-    UIGestureRecognizerDelegate
+    UIGestureRecognizerDelegate, WKDownloadDelegate
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
@@ -356,6 +356,8 @@ struct OmnigentWebView: UIViewRepresentable {
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
     private let oidcLoginManager = OidcLoginManager()
+    /// Temporary destinations owned by in-flight native WebKit downloads.
+    private var downloadDestinations: [ObjectIdentifier: URL] = [:]
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -592,6 +594,14 @@ struct OmnigentWebView: UIViewRepresentable {
       decidePolicyFor navigationAction: WKNavigationAction,
       decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
+      // A Blob-backed `<a download>` must become a native download. Allowing
+      // it as navigation replaces the SPA with WebKit's file preview; actions
+      // in that preview then move the pinned WebView off its server.
+      if navigationAction.shouldPerformDownload {
+        decisionHandler(.download)
+        return
+      }
+
       guard let url = navigationAction.request.url,
         let scheme = url.scheme?.lowercased()
       else {
@@ -656,6 +666,72 @@ struct OmnigentWebView: UIViewRepresentable {
 
       promptForExternalURL(url, scheme: scheme)
       decisionHandler(.cancel)
+    }
+
+    func webView(
+      _ webView: WKWebView,
+      decidePolicyFor navigationResponse: WKNavigationResponse,
+      decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+      decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
+    }
+
+    func webView(
+      _ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload
+    ) {
+      download.delegate = self
+    }
+
+    func webView(
+      _ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload
+    ) {
+      download.delegate = self
+    }
+
+    func download(
+      _ download: WKDownload, decideDestinationUsing response: URLResponse,
+      suggestedFilename: String, completionHandler: @escaping (URL?) -> Void
+    ) {
+      let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("omnigent-download-\(UUID().uuidString)", isDirectory: true)
+      do {
+        try FileManager.default.createDirectory(
+          at: directory, withIntermediateDirectories: true)
+        let filename = Self.safeDownloadFilename(suggestedFilename)
+        let destination = directory.appendingPathComponent(filename, isDirectory: false)
+        downloadDestinations[ObjectIdentifier(download)] = destination
+        completionHandler(destination)
+      } catch {
+        completionHandler(nil)
+      }
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+      guard let destination = downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
+      else { return }
+      guard let presenter = topViewController() else {
+        try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+        return
+      }
+      let share = UIActivityViewController(activityItems: [destination], applicationActivities: nil)
+      share.popoverPresentationController?.sourceView = presenter.view
+      share.popoverPresentationController?.sourceRect = CGRect(
+        x: presenter.view.bounds.midX, y: presenter.view.bounds.maxY, width: 0, height: 0)
+      share.completionWithItemsHandler = { _, _, _, _ in
+        try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+      }
+      presenter.present(share, animated: true)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+      guard let destination = downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
+      else { return }
+      try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+    }
+
+    static func safeDownloadFilename(_ suggestedFilename: String) -> String {
+      let filename = (suggestedFilename as NSString).lastPathComponent
+      return filename.isEmpty || filename == "." || filename == ".." ? "download" : filename
     }
 
     func webView(
