@@ -26,6 +26,7 @@ class Feature(StrEnum):
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     HARNESS_SETTINGS_UI = "harness_settings_ui"
     IMPORT_REVIEW = "import_review"
+    CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.IMPORT_REVIEW,
         description="Auto-opening import review modal for a newly connected host's context",
         owner="onboarding",
+        review_by_release="0.18.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
+        description="Manage reusable custom agents from Settings",
+        owner="web",
         review_by_release="0.18.0",
     ),
 )

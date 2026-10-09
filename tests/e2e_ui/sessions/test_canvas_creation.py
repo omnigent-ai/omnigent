@@ -1,4 +1,4 @@
-"""Canvas navigation stays consistent while creating sessions and expanding the rail."""
+"""Canvas uses the shared sidebar while browsing and creating sessions."""
 
 from __future__ import annotations
 
@@ -18,48 +18,74 @@ from tests.e2e_ui.sessions.test_canvas_workspace import canvas_project as canvas
 
 
 @pytest.mark.parametrize("usage", [False, True])
-def test_canvas_rail_matches_expanded_navigation(
+def test_canvas_uses_standard_sidebar_navigation(
     page: Page, canvas_project: tuple[str, str, str, str], usage: bool
 ) -> None:
-    base_url, _first, _second, project_id = canvas_project
+    base_url, first, _second, project_id = canvas_project
     page.set_viewport_size({"width": 1440, "height": 900})
     _stub_server_info(page, canvas=True, usage=usage)
+    page.goto(f"{base_url}/c/{first}")
+    primary = page.get_by_test_id("sidebar-primary-nav")
+    expect(primary).to_be_visible()
+    ordinary_destinations = primary.locator("a").all_text_contents()
+    page.get_by_role("button", name="Close sidebar", exact=True).click()
+    toggle = page.get_by_role("button", name="Open sidebar", exact=True)
+    expect(toggle).to_be_visible()
+    ordinary_icon = toggle.locator("svg").inner_html()
+    ordinary_bounds = toggle.bounding_box()
+    assert ordinary_bounds is not None
+
     page.goto(f"{base_url}/canvas")
     project = page.get_by_role("tab", name=re.compile("Canvas review"))
     project.click()
-    rail = page.get_by_role("navigation", name="Collapsed sidebar")
-    expect(rail).to_be_visible()
-    collapsed = rail.locator("button, a").evaluate_all(
-        "elements => elements.map(element => ({"
-        "label: element.getAttribute('aria-label') || element.textContent.trim(),"
-        "href: element.getAttribute('href'),"
-        "icon: element.querySelector('svg')?.innerHTML}))"
-    )
-    rail.get_by_role("button", name="Expand sidebar", exact=True).click()
-    primary = page.get_by_test_id("sidebar-primary-nav")
+    expect(toggle).to_have_count(1)
+    expect(toggle).to_be_visible()
+    expect(page.get_by_role("navigation", name="Collapsed sidebar")).to_have_count(0)
+    assert toggle.locator("svg").inner_html() == ordinary_icon
+    canvas_bounds = toggle.bounding_box()
+    assert canvas_bounds is not None
+    for key in ("x", "y", "width", "height"):
+        assert canvas_bounds[key] == pytest.approx(ordinary_bounds[key], abs=1)
+    heading_bounds = page.get_by_role("heading", name="Canvas", exact=True).bounding_box()
+    assert heading_bounds and heading_bounds["x"] > canvas_bounds["x"] + canvas_bounds["width"]
+
+    board = page.get_by_role("region", name="Canvas pane", exact=True)
+    board_bounds = board.bounding_box()
+    assert board_bounds is not None and board_bounds["x"] == 0
+    toggle.hover()
+    sidebar = page.locator("aside.conversations-sidebar")
+    expect(sidebar).to_have_class(re.compile(r"\bis-peek\b"))
     expect(primary).to_be_visible()
-    expanded = primary.locator("a").evaluate_all(
-        "elements => elements.map(element => ({"
-        "label: [...element.childNodes].filter(node => node.nodeType === Node.TEXT_NODE)"
-        ".map(node => node.textContent).join('').trim(),"
-        "href: element.getAttribute('href'),"
-        "icon: element.querySelector('svg')?.innerHTML}))"
-    )
-    header = (
-        page.get_by_test_id("sidebar-header-actions")
-        .locator("button, a")
-        .evaluate_all("elements => elements.map(element => element.getAttribute('aria-label'))")
-    )
-    header = ["Expand sidebar"] + [label for label in header if label != "Close sidebar"]
+    assert board.bounding_box() == board_bounds
+    page.mouse.move(1000, 800)
+    expect(sidebar).not_to_have_class(re.compile(r"\bis-peek\b"))
+    toggle.click()
+    expect(primary).to_be_visible()
+    assert primary.locator("a").all_text_contents() == ordinary_destinations
+    assert ("Usage" in ordinary_destinations) is usage
+    page.get_by_role("button", name="Close sidebar", exact=True).click()
+
+    card = page.locator(f'.react-flow__node[data-id="{first}"]').get_by_test_id("session-card")
+    card.click()
+    expect(toggle).to_have_count(1)
+    expect(board).to_be_visible()
+    page.get_by_role("button", name="Focus conversation", exact=True).click()
+    expect(board).not_to_be_visible()
+    expect(toggle).to_have_count(1)
+    toggle.click()
+    expect(primary).to_be_visible()
+    page.get_by_role("button", name="Close sidebar", exact=True).click()
+    page.get_by_role("button", name="Show canvas beside conversation", exact=True).click()
+    expect(board).to_be_visible()
+    expect(toggle).to_have_count(1)
+    toggle.click()
     primary.get_by_role("link", name="Canvas", exact=True).click()
     expect(page).to_have_url(re.compile(rf"/canvas\?canvas={project_id}$"))
     expect(project).to_have_attribute("aria-selected", "true")
     page.reload()
     expect(project).to_have_attribute("aria-selected", "true")
     expect(page).to_have_url(re.compile(rf"/canvas\?canvas={project_id}$"))
-    assert [item["label"] for item in collapsed] == header + [item["label"] for item in expanded]
-    assert collapsed[len(header) :] == expanded
-    assert ("Usage" in [item["label"] for item in expanded]) is usage
+    expect(toggle).to_be_visible()
 
 
 @pytest.mark.parametrize("project_canvas", [False, True], ids=["main", "project"])

@@ -398,6 +398,9 @@ describe("PullRequestPanel", () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
+    // index.css binds @pierre/diffs' font variables on this class; outside it the
+    // shadow stylesheet falls back to a fixed 13px that ignores the Interface font size.
+    for (const diff of diffs) expect(diff.closest(".github-diff-stack")).not.toBeNull();
   });
 
   it("jumps to a file's section when its sidebar row is clicked", async () => {

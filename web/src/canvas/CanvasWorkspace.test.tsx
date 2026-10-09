@@ -3,15 +3,24 @@ import userEvent from "@testing-library/user-event";
 import * as Dialog from "radix-ui/dialog";
 import { MemoryRouter, useLocation, useMatch, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { CanvasWorkspace, useCanvasWorkspace } from "./CanvasWorkspace";
 
+let boardReady: Promise<void> | null = null;
+
 vi.mock("@/pages/CanvasPage", () => ({
-  CanvasPage: ({ selectedSessionId }: { selectedSessionId: string | null }) => (
-    <div>
-      <input aria-label="Board state" defaultValue="Unchanged board" />
-      <span data-testid="selected-session">{selectedSessionId}</span>
-    </div>
-  ),
+  CanvasPage: ({ selectedSessionId }: { selectedSessionId: string | null }) => {
+    if (boardReady) {
+      // eslint-disable-next-line no-throw-literal -- Suspense waits for this promise.
+      throw boardReady;
+    }
+    return (
+      <div>
+        <input aria-label="Board state" defaultValue="Unchanged board" />
+        <span data-testid="selected-session">{selectedSessionId}</span>
+      </div>
+    );
+  },
 }));
 
 let containerWidth = 1200;
@@ -70,6 +79,7 @@ async function renderWorkspace(entry = "/canvas?canvas=project") {
 
 beforeEach(() => {
   localStorage.clear();
+  boardReady = null;
   containerWidth = 1200;
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(() => ({
     width: containerWidth,
@@ -101,6 +111,33 @@ afterEach(() => {
 });
 
 describe("CanvasWorkspace", () => {
+  it("keeps sidebar navigation usable while the board is loading", async () => {
+    const user = userEvent.setup();
+    const onOpenSidebar = vi.fn();
+    let finishLoading!: () => void;
+    boardReady = new Promise<void>((resolve) => {
+      finishLoading = resolve;
+    });
+    render(
+      <TooltipProvider>
+        <MemoryRouter>
+          <CanvasWorkspace active onOpenSidebar={onOpenSidebar}>
+            {null}
+          </CanvasWorkspace>
+        </MemoryRouter>
+      </TooltipProvider>,
+    );
+    expect(await screen.findByLabelText("Loading Canvas")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Open sidebar" }));
+    expect(onOpenSidebar).toHaveBeenCalledOnce();
+    await act(async () => {
+      boardReady = null;
+      finishLoading();
+    });
+    expect(await screen.findByLabelText("Board state")).toBeVisible();
+    expect(screen.queryByLabelText("Loading Canvas")).not.toBeInTheDocument();
+  });
+
   it("keeps the board mounted through selection, focus, and closing the session", async () => {
     const board = await renderWorkspace();
     fireEvent.change(board, { target: { value: "Preserved viewport and cards" } });

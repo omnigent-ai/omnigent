@@ -1060,9 +1060,9 @@ class SharePolicy(str, Enum):
     - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
       registered at all (default).
     - :attr:`NON_PUBLIC`: the agent may grant access to named users
-      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+      (emails), but NOT to ``__public__``.
     - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
-      (anonymous read of the full transcript).
+      (link access subject to server authentication and its public permission ceiling).
     """
 
     NONE = "none"
@@ -1566,7 +1566,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         session through the server API or CLI. One of
         :class:`SharePolicy`: ``none`` (default — tool not registered),
         ``non-public`` (grant named users only), or ``public`` (also
-        allow ``__public__`` anonymous read). **Defaults to
+        allow ``__public__`` link access). **Defaults to
         ``SharePolicy.NONE``.**
     """
 

@@ -2613,7 +2613,7 @@
             "type": "integer"
           },
           "user_id": {
-            "description": "The user to grant access to, e.g. `\"alice@example.com\"` or `\"__public__\"` for public read access.",
+            "description": "The user to grant access to, e.g. `\"alice@example.com\"` or `\"__public__\"` for public access subject to the server's public permission ceiling.",
             "title": "User Id",
             "type": "string"
           }
@@ -5197,6 +5197,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "agent_detail": {
+            "default": false,
+            "title": "Agent Detail",
+            "type": "boolean"
+          },
           "agent_install": {
             "default": false,
             "title": "Agent Install",
@@ -5265,6 +5270,15 @@
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
+          },
+          "public_sharing_max_level": {
+            "default": "read",
+            "enum": [
+              "read",
+              "edit"
+            ],
+            "title": "Public Sharing Max Level",
+            "type": "string"
           },
           "sandbox_provider": {
             "anyOf": [
@@ -8323,6 +8337,17 @@
             ],
             "title": "Public Sharing"
           },
+          "public_sharing_max_level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Public Sharing Max Level"
+          },
           "sharing_mode": {
             "anyOf": [
               {
@@ -9784,6 +9809,48 @@
           }
         },
         "summary": "Remove Agent",
+        "tags": [
+          "agents"
+        ]
+      },
+      "get": {
+        "description": "Return the list summary for a server agent or the caller's own user agent.\n\nMissing and inaccessible agents both return 404. Sharing a session\ndoes not grant access to its owner's agent through this route.\n\n**Returns:** The same redacted `AgentObject` used by the list routes.",
+        "operationId": "get_agent_v1_agents__agent_id__get",
+        "parameters": [
+          {
+            "description": "Agent to read.",
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent",
         "tags": [
           "agents"
         ]

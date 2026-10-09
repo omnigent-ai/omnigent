@@ -1934,8 +1934,15 @@ final class ThemeController: ObservableObject {
     self.source = source
     for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
       for window in scene.windows {
-        window.overrideUserInterfaceStyle = source.userInterfaceStyle
+        Self.apply(source, to: window)
       }
     }
+  }
+
+  static func apply(_ source: ThemeSource, to window: UIWindow) {
+    window.overrideUserInterfaceStyle = source.userInterfaceStyle
+    guard window.windowLevel == .normal else { return }
+    window.backgroundColor = DesignTokens.nativeBackground
+    window.rootViewController?.view.backgroundColor = DesignTokens.nativeBackground
   }
 }

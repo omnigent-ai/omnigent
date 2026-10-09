@@ -765,6 +765,13 @@ aside[aria-label="Workspace"][data-maximized] {
  * Mark <html> standalone, or .omnigent-app in the embed: its CSS build maps
  * html selectors to that scope root. */
 @media (min-width: 48rem) {
+  /* Reserve the board's shared sidebar toggle only while navigation is closed. */
+  .app-shell:not([data-sidebar-open]) .canvas-page-heading {
+    padding-left: 4rem;
+  }
+  html[data-electron-mac] .app-shell .canvas-page-heading {
+    padding-left: 1.5rem;
+  }
   /* md+: matches the sidebar's own desktop breakpoint.
    *
    * The sidebar starts at the window's top edge rather than below the lights, so
@@ -830,13 +837,10 @@ html[data-electron-mac] .electron-drag-strip {
   height: 3rem;
   -webkit-app-region: drag;
 }
-/* Canvas and its rail share the native title-bar clearance, including focus
+/* Canvas clears the native title bar, including focus
  * and compact conversation states where the board is hidden. */
 [data-electron-mac] .canvas-workspace {
   margin-top: 3rem;
-}
-[data-electron-mac] .canvas-sidebar-rail {
-  padding-top: 3.5rem;
 }
 /* Pin the cluster beside the lights independently of the sidebar. The top
  * inset centers 1.5rem buttons in the 3rem bar; visually reorder the toggle
@@ -1329,6 +1333,17 @@ html[data-electron-mac] .breadcrumb-folder {
   font-feature-settings:
     "liga" 0,
     "calt" 0;
+}
+
+/* @pierre/diffs renders the GitHub tab's diff in a shadow root that falls back
+ * to a fixed 13px/20px SF Mono, ignoring the Interface font size. Bind it to the
+ * panel's text-ui step with the same mono compensation as chat code above. */
+.github-diff-stack {
+  --diffs-font-size: calc(var(--text-ui) * 0.875);
+  --diffs-line-height: calc(var(--diffs-font-size) * var(--text-ui--line-height));
+  --diffs-font-family: var(--font-mono);
+  --diffs-header-font-family: var(--ui-font-family, var(--font-sans));
+  --diffs-font-features: "liga" 0, "calt" 0;
 }
 
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);

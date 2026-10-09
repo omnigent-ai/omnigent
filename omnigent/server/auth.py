@@ -772,6 +772,15 @@ class UnifiedAuthProvider(AuthProvider):
         return None
 
 
+def authentication_requires_identity(provider: AuthProvider | None) -> bool:
+    """Whether missing credentials are denied rather than mapped to the local user."""
+    return provider is not None and not (
+        isinstance(provider, UnifiedAuthProvider)
+        and provider._source == "header"
+        and provider._local_single_user
+    )
+
+
 def auth_mode(provider: AuthProvider | None) -> str:
     """Name the sign-in mode a client should expect from an app's provider.
 

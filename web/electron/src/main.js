@@ -5167,12 +5167,23 @@ if (!gotLock) {
         // Re-entering app.quit() while Electron is unwinding the prevented quit
         // can stop after before-quit, so resume on the next event-loop turn.
         setImmediate(() => {
-          if (updater.quitAndInstallIfPending()) {
-            clearQuitForceExitTimer();
+          if (!updater.installPending) {
+            app.quit();
+            return;
+          }
+          clearQuitForceExitTimer();
+          // A failed install (e.g. the user cancels the admin prompt) must not
+          // leave the torn-down app running.
+          autoUpdater.once("error", () => app.exit(0));
+          updater.quitAndInstallIfPending();
+          // Squirrel.Mac installs asynchronously and, for a bundle the user
+          // can't write (root-owned install), shows an admin password prompt
+          // from this process; a timed exit would kill that prompt. Elsewhere
+          // the installer is spawned synchronously, so the timer only covers
+          // an install() that silently declined.
+          if (process.platform !== "darwin") {
             const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
             if (typeof fallback.unref === "function") fallback.unref();
-          } else {
-            app.quit();
           }
         });
       });
