@@ -45,7 +45,7 @@ _MISDIAGNOSIS_HEADLINE = "Agent command not found"
 _MISDIAGNOSIS_REMEDIATION = "Install the harness"
 _HONEST_HEADLINE = "The agent's terminal exited unexpectedly"
 
-pytestmark = pytest.mark.skipif(
+_needs_tmux = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="the claude-native required terminal needs tmux",
 )
@@ -156,16 +156,20 @@ def _await_required_terminal_exit(
     deadline = time.monotonic() + timeout_s
     last: Any = None
     while time.monotonic() < deadline:
-        info = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-        if info.status_code == 200:
-            last = info.json().get("last_task_error")
-            if isinstance(last, dict) and last.get("code"):
-                return last
-        items = httpx.get(
-            f"{base_url}/v1/sessions/{session_id}/items",
-            params={"limit": 50, "order": "desc"},
-            timeout=10.0,
-        )
+        try:
+            info = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+            if info.status_code == 200:
+                last = info.json().get("last_task_error")
+                if isinstance(last, dict) and last.get("code"):
+                    return last
+            items = httpx.get(
+                f"{base_url}/v1/sessions/{session_id}/items",
+                params={"limit": 50, "order": "desc"},
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            time.sleep(1.0)
+            continue
         if items.status_code == 200:
             for item in items.json().get("data", []):
                 error = item.get("error") if isinstance(item.get("error"), dict) else item
@@ -189,15 +193,17 @@ def _reveal_failure_card(page: Page):
     expect(pill.get_by_test_id("error-message-content")).to_be_visible(timeout=15_000)
     diag_btn = pill.get_by_role("button", name="View diagnostics")
     if diag_btn.count() > 0:
-        with contextlib.suppress(Exception):
-            diag_btn.first.click()
-            output_tab = pill.get_by_role("tab", name="Last captured output")
-            if output_tab.count() > 0:
-                output_tab.first.click()
-            pill.get_by_test_id("error-diagnostics-content").first.scroll_into_view_if_needed()
+        diag_btn.first.click()
+        diagnostics = pill.get_by_test_id("error-diagnostics-content").first
+        expect(diagnostics).to_be_visible(timeout=15_000)
+        output_tab = pill.get_by_role("tab", name="Last captured output")
+        if output_tab.count() > 0:
+            output_tab.first.click()
+        diagnostics.scroll_into_view_if_needed()
     return pill
 
 
+@_needs_tmux
 @pytest.mark.timeout(300)
 def test_present_cli_crash_is_not_misdiagnosed_as_missing(
     request: pytest.FixtureRequest,
@@ -222,13 +228,12 @@ def test_present_cli_crash_is_not_misdiagnosed_as_missing(
     assert (scratch / _RAN_MARKER).exists(), "the stub CLI never ran to its exit"
     assert error.get("code") == "required_terminal_exited", error
 
-    # Read the card only after that failure is persisted, so this is its final text.
+    # The card's captured output must show the CLI ran; then hold the revealed
+    # card for the recording and snapshot its final text for the negative checks.
+    expect(pill).to_contain_text(_RESUME_MARKER, timeout=15_000)
+    expect(pill).to_contain_text(_STRAY_ARG_LINE, timeout=15_000)
     page.wait_for_timeout(3_000)
     card_text = pill.inner_text()
-    assert _RESUME_MARKER in card_text and _STRAY_ARG_LINE in card_text, (
-        f"The card's captured output lacks the pane lines proving the CLI ran.\n"
-        f"Card text:\n{card_text}"
-    )
 
     assert _MISDIAGNOSIS_HEADLINE not in card_text, (
         f"Misdiagnosis: the card reads {_MISDIAGNOSIS_HEADLINE!r} for a present Claude Code CLI "
