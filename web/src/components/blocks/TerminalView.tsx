@@ -730,13 +730,15 @@ export function TerminalView({
     };
   }, [state, disposeActiveSession, sessionId]);
 
+  // `isolate` scopes the status overlay's z-index to this surface so it
+  // can't paint over body-portaled UI such as the header's session menu.
   return (
     <div
       data-testid="terminal-view"
       data-state={state.kind}
       data-terminal-id={terminalId}
       data-terminal-theme={isDark ? "dark" : "light"}
-      className="relative flex min-h-0 flex-1 flex-col"
+      className="relative isolate flex min-h-0 flex-1 flex-col"
     >
       {visibleClipboardPrompt !== null && (
         <TerminalClipboardPrompt

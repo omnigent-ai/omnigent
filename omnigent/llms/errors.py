@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase, OmnigentError
@@ -52,6 +53,72 @@ def is_context_length_exceeded(exc: BaseException) -> bool:
         next_exc = current.__cause__ or current.__context__
         current = next_exc if isinstance(next_exc, BaseException) else None
     return False
+
+
+# Databricks front-door rejection of an oversized request body; sizes are
+# bytes, not tokens. The request/limit pair is matched directly as one adjacent
+# group (no nested ``.*?`` wildcards) to stay linear-time on hostile input.
+_CONTENT_LENGTH_PHRASE = re.compile(r"exceeds maximum allowed content length", re.IGNORECASE)
+_REQUEST_LIMIT_PAIR = re.compile(
+    r"RequestSize\(bytes\):\s*(\d+),\s*Limit\(bytes\):\s*(\d+)", re.IGNORECASE
+)
+
+# Rough bytes-per-token ratio for expressing a byte-cap rejection in the
+# token units the context-overflow plumbing carries.
+_APPROX_BYTES_PER_TOKEN = 4
+
+
+@dataclass(frozen=True)
+class RequestSizeOverflow:
+    """
+    A request rejected for exceeding a byte-size content-length cap.
+
+    :param request_bytes: Size of the rejected request, e.g. ``33967957``.
+    :param limit_bytes: The deployment's content-length cap, e.g.
+        ``33554432`` (the 32 MiB Databricks Apps front-door limit).
+    """
+
+    request_bytes: int
+    limit_bytes: int
+
+    @property
+    def approx_request_tokens(self) -> int:
+        """The request size expressed as an approximate token count."""
+        return max(self.request_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+
+    @property
+    def approx_limit_tokens(self) -> int:
+        """The byte cap expressed as an approximate token count."""
+        return max(self.limit_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+
+
+def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
+    """Parse a content-length cap rejection from an error *message*.
+
+    Recognizes the Databricks front-door shape above. The byte cap and the
+    model's token context window are independent limits; callers still map
+    this rejection to ``context_length_exceeded`` because compaction shrinks
+    the request body, making it recoverable rather than permanent.
+
+    :param message: Error text that may embed the rejection, e.g. a raw
+        response body or a harness-reported failure string.
+    :returns: The parsed sizes, or ``None`` when *message* does not match.
+    """
+    phrase = _CONTENT_LENGTH_PHRASE.search(message)
+    if phrase is None:
+        return None
+    pair = _REQUEST_LIMIT_PAIR.search(message, phrase.end())
+    if pair is None:
+        return None
+    try:
+        return RequestSizeOverflow(
+            request_bytes=int(pair.group(1)),
+            limit_bytes=int(pair.group(2)),
+        )
+    except ValueError:
+        # Python caps int(str) at 4300 digits; a malformed oversized field must
+        # not crash classification, so treat it as an unrecognized message.
+        return None
 
 
 def llm_error_category(code: str) -> ErrorCategory:

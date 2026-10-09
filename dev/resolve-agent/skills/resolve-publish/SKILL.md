@@ -31,7 +31,17 @@ an existing PR.
   publisher performs the GitHub writes; do not run the PR-facing
   CI/preview/review loop in the rest of Step 4.
 - **Direct publication (no publisher contract)** — perform all of Step 3, then
-  drive the published PR through Step 4.
+  drive the published PR through Step 4, except for the draft proposal below.
+
+**Unresolved design choice:** after completing the investigation and available
+validation in `resolve-investigate`, publish a direct author proposal with
+`gh pr create --draft`. Explain the choice, evidence, alternatives, and remaining
+checks in the body. Emit a `partially_fixed` handoff with the decision in
+`remaining_work`. Skip preview, readiness checks, and the Step 4 review loop that
+requires a ready PR; do not mark it ready merely to trigger automation. This is
+a reviewable proposal, not proof the bug is fixed. For workflow-owned publication,
+prepare the same body and incomplete handoff and obey the supplied publisher
+contract; do not assume it supports drafts. `skip_push` still means local only.
 
 In workflow-owned mode, `.omnigent/` is intentionally gitignored, so body
 transport does not rely on the file being committed. The workflow captures
@@ -41,12 +51,38 @@ finalizer. The finalizer validates and uses that restored file as the PR
 description; without it, the publisher can only construct a less readable
 fallback from machine-oriented handoff fields.
 
-### Get the GitHub write token (needed for every push / `gh` write)
+### Checked publication provided by CI
+
+When `.omnigent/pr-gate.json` exists, use the `pr.py` helper supplied in the
+`resolve-drive-pr` skill directory. This mode replaces the direct GitHub write
+and token-recovery recipes below. Keep Git pushes on the supplied credential;
+never decode another token or change credential configuration.
+
+| Action | Helper arguments |
+| --- | --- |
+| Open a PR after the required checks | `create --title TITLE --body-file FILE --base main` |
+| Update its description | `edit --number N --body-file FILE` |
+| Reply to findings | `comment --number N --body-file FILE` |
+| Submit a review without approval | `review --number N --head SHA --event COMMENT --body-file FILE` |
+| Mark a draft ready | `ready --number N` |
+
+Run the helper from the fix checkout. Use `review_cycle.py request` for review
+requests; CI routes it through the host. Follow CI's review budget and warning
+policy. Actions the helper does not support remain maintainer actions; never
+recover a broader credential, approve, or merge to work around that boundary.
+
+### Legacy direct publication: GitHub write token
+
+The following token setup applies only when CI has not supplied the checked
+publication helper and has explicitly authorized direct publication.
 
 Any write to GitHub — `git push`, `gh pr create`, `gh pr edit --add-reviewer`,
 `gh pr comment`, `gh pr close` — needs the resolve-agent App installation token
-(`omni-resolve-agent[bot]`, `contents`+`pull_requests` write on
-`omnigent-ai/omnigent`). **Your shell does not inherit it in a usable env var**:
+(`omni-resolve-agent[bot]`, Contents and Pull requests: write;
+Actions: read and write on `omnigent-ai/omnigent`). Actions access is needed to
+read review runs and completion artifacts and dispatch both review workflows.
+
+**Your shell does not inherit it in a usable env var**:
 you run inside the session's runner process (a different process, often a
 different machine when hosted on `--server`), so `$GH_TOKEN` in your shell is
 empty and a bare `git push` fails with a 403 / permission error. This is **not**
@@ -93,11 +129,19 @@ gh auth setup-git   # route git pushes through gh's credential helper with this 
 
 Once the set is genuinely green:
 
-1. **Commit** the fix and the tests on the working branch (the fix builds on the
-   repro branch, so the reproduction test and the fix land in one reviewable
-   diff). Follow the repo's commit conventions.
-   **Never commit workspace artifacts.** The commit must contain only the fix and
-   its reproduction test — nothing else. In particular, **never** stage or commit
+1. **Commit** the fix and selected permanent regression tests on the working
+   branch. Reused unchanged tests need no new commit. Follow the repo's commit
+   conventions. Before omitting an investigative test introduced for this task,
+   retain its original paths, command, tested revision, result, and source under
+   `.omnigent/repro-evidence/`, or cite the intact CI repro baseline/bundle.
+   Follow the [evidence retention rules in 2B.4](../resolve-author-fix/SKILL.md#2b4--select-permanent-regression-coverage):
+   identify the CI run/artifact/path or verified persistent local copy, and
+   distinguish pending workflow upload from confirmed storage. A worktree-local
+   path alone is not durable; preserve that worktree if retention is unresolved.
+   Put selected committed tests in `tests` and the selection/evidence location in
+   `test_audit`; no reproduction-only source is required in the PR. This does not
+   authorize deleting existing repository tests solely to reduce LOC.
+   **Never commit workspace artifacts.** In particular, **never** stage or commit
    the `recordings/` clips or any `.omnigent/` handoff files (e.g.
    `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride
    in the PR's Demo section / CI artifact bundle, not in the diff (see
@@ -131,9 +175,10 @@ Once the set is genuinely green:
    create` fails with a permission error. Recover the token first; do **not**
    conclude the token is "expired" or "read-only" from an empty env var — it is
    present on the machine, just not exported to your shell.
-4. **Open a ready-for-review PR** with `gh pr create` (not a draft — the repo's
-   automated review runs on ready PRs). Create `.omnigent/` if needed. If the
-   target repository provides `.github/pull_request_template.md`, copy it to
+4. **Open a ready-for-review PR** with `gh pr create`, unless the draft proposal
+   exception above applies. Automated review runs on ready PRs. Create
+   `.omnigent/` if needed. If the target repository provides
+   `.github/pull_request_template.md`, copy it to
    `.omnigent/pr-body.md` and edit that file. Otherwise create
    `.omnigent/pr-body.md` with concise **Related issue**, **Summary**, and **Test
    Plan** sections. Pass the finished file to `gh pr create --body-file
@@ -155,6 +200,9 @@ Once the set is genuinely green:
      paragraphs. Use complete sentences and plain language. Add a small diagram
      when a relationship or sequence is hard to follow in prose. Never include
      placeholder diagrams or empty sections.
+     State any intentional policy change, its historical rationale, and the
+     remaining decision from `resolve-investigate`; a passing test alone does
+     not justify the policy.
    - In **Test Plan**, group the proof into short, scannable bullets. Name the
      command or test, what failed before the fix, and what passes now. Do not
      paste `facets`, `test_transition`, other handoff fields, or a long comma-
@@ -218,11 +266,12 @@ Once the set is genuinely green:
    with `pr_url` set and `outcome` at its current best assessment, *before* you
    start Step 4. This is what lets the workflow post the PR link to the Linear
    ticket promptly, rather than waiting the ~hour Step 4 can take. Leave the
-   not-yet-known Step-4 fields empty (`ci_status`, `polly_review`,
-   `maintainer_review`) — you refill them in the final handoff. Emit it as a
-   normal intermediate message (json block last in *that* message), then carry on.
-   **Before this handoff, do the two outward actions a mid-turn drop would
-   otherwise strand:**
+   not-yet-known Step-4 fields empty (`ci_status`, `polly_review`, `ocr_review`,
+   `maintainer_review`, with `review_cycle: {}`) — refill them in the final
+   handoff. Emit it as a normal intermediate message (json block last in *that* message), then carry on.
+   For a draft proposal, emit the incomplete handoff and finish without the
+   outward actions below or Step 4. Otherwise, **before this handoff, do the two
+   outward actions a mid-turn drop would otherwise strand:**
    - **Label your PR `ui-preview`** (author path) — `gh pr edit <pr> --add-label
      ui-preview`. Your own PR is same-repo, already-pipelined code, so it needs no
      CI-green gate (see 4.1); label it now so the preview builds while you drive
@@ -232,5 +281,5 @@ Once the set is genuinely green:
      it open. Ensure the replacement body contains `Supersedes #<old>` on its own
      line, and set `reviewed_pr_url` so workflow reconciliation can preserve and
      inform the original PR until the replacement merges.
-6. You do **not** merge. Opening the PR is not the finish line — go to Step 4 and
-   drive it to a green, reviewed, ready-for-a-human state.
+6. You do **not** merge. For a ready PR, go to Step 4 and drive it to a green,
+   reviewed, ready-for-a-human state. Draft proposals use the exception above.

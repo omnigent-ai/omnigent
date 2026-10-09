@@ -30,6 +30,13 @@ backend — no real provider creds.
   isolated `userData` dir. `launchDesktop({ serverUrl })` pre-seeds a saved
   server so the app boots straight into the shell (skip connect); omit it to
   film the connect journey.
+- `desktop_oidc_browser_sign_in.e2e.js` — OIDC sign-in through the system
+  browser against an OIDC-mode server and `fixtures/fakeOidcIdp.js`. The
+  "system browser" is `fixtures/fakeSystemBrowser.cjs`, preloaded before
+  `main.js` (`launchDesktop({ preload })`), which replaces `shell.openExternal`
+  with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
+  connect, silent renewal, relaunch, and sign-out, and asserts the app window
+  never loads the IdP.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.
@@ -69,7 +76,11 @@ right interpreter with `OMNIGENT_PYTHON` when your `omnigent` lives in a venv:
 OMNIGENT_PYTHON=/path/to/.venv/bin/python node --test e2e/desktop_connect.e2e.js
 ```
 
-The recorded video lands in `e2e/recordings/<slug>/`. Playwright writes one raw
+The recorded video normally lands in `e2e/recordings/<slug>/`.
+The cookie-isolation test instead uses `OMNIGENT_DESKTOP_RECORD_DIR`, or prints
+the temporary directory where it retains recordings when that variable is unset.
+
+Playwright writes one raw
 `page@<hash>.webm` per page context — the main shell window, plus any OAuth
 popup or in-window IdP view, which record separately. Call
 `saveRecording(recordDir, "<name>")` after `electronApp.close()` (as the
