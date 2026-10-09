@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 import click
@@ -12,10 +13,19 @@ import pytest
 
 from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
 from omnigent.onboarding.sandboxes.cwsandbox import (
+    AUTH_STRATEGY_ENV_VAR,
+    EGRESS_HOSTS_ENV_VAR,
     HOST_IMAGE_ENV_VAR,
+    PLACEMENT_MODE_ENV_VAR,
+    RUNNER_IDS_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     CWSandboxLauncher,
 )
+
+try:
+    import cwsandbox as real_sdk
+except ImportError:
+    real_sdk = None
 
 # ── Fake cwsandbox SDK ──────────────────────────────────────
 #
@@ -33,11 +43,25 @@ class _SandboxNotFoundError(_CWSandboxError):
     pass
 
 
+class _FakeAuthStrategy(StrEnum):
+    WANDB = "wandb"
+    COREWEAVE_API_KEY = "coreweave_api_key"
+
+
+class _FakePlacementMode(StrEnum):
+    UNSPECIFIED = "unspecified"
+    SERVERLESS = "serverless"
+    CKS = "cks"
+
+
+@dataclass
+class _FakeEgressRule:
+    dns_name: str
+
+
 @dataclass
 class _FakeNetworkOptions:
-    egress_mode: str | None = None
-    ingress_mode: str | None = None
-    exposed_ports: tuple[int, ...] | None = None
+    egress: list[_FakeEgressRule] = field(default_factory=list)
 
 
 @dataclass
@@ -90,6 +114,7 @@ class _State:
     stopped: list[str] = field(default_factory=list)
     exec_result: _FakeResult = field(default_factory=_FakeResult)
     from_id_missing: bool = False
+    from_id_auth: object = None
     # Each exec() call's command (list argv), in order.
     exec_commands: list[list] = field(default_factory=list)
     # Processes handed back by successive exec() calls, in order.
@@ -113,7 +138,8 @@ class _FakeSandbox:
         return cls()
 
     @classmethod
-    def from_id(cls, sandbox_id: str) -> _FakeOp:
+    def from_id(cls, sandbox_id: str, *, auth=None) -> _FakeOp:
+        cls._state.from_id_auth = auth
         if cls._state.from_id_missing:
             raise _SandboxNotFoundError(sandbox_id)
         return _FakeOp(cls(sandbox_id))
@@ -143,6 +169,9 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _State:
 
     mod = types.ModuleType("cwsandbox")
     mod.Sandbox = _FakeSandbox  # type: ignore[attr-defined]
+    mod.EgressRule = _FakeEgressRule
+    mod.PlacementMode = _FakePlacementMode
+    mod.AuthStrategy = _FakeAuthStrategy
     mod.NetworkOptions = _FakeNetworkOptions  # type: ignore[attr-defined]
     exc = types.ModuleType("cwsandbox.exceptions")
     exc.CWSandboxError = _CWSandboxError  # type: ignore[attr-defined]
@@ -150,23 +179,31 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _State:
 
     monkeypatch.setitem(sys.modules, "cwsandbox", mod)
     monkeypatch.setitem(sys.modules, "cwsandbox.exceptions", exc)
+    monkeypatch.setenv("WANDB_API_KEY", "wandb-test-key")
     monkeypatch.setenv("CWSANDBOX_API_KEY", "cw-test-key")
+    monkeypatch.delenv(AUTH_STRATEGY_ENV_VAR, raising=False)
+    monkeypatch.delenv(EGRESS_HOSTS_ENV_VAR, raising=False)
+    monkeypatch.delenv(PLACEMENT_MODE_ENV_VAR, raising=False)
+    monkeypatch.delenv(RUNNER_IDS_ENV_VAR, raising=False)
     monkeypatch.delenv(HOST_IMAGE_ENV_VAR, raising=False)
     monkeypatch.delenv(SANDBOX_ENV_PASSTHROUGH_ENV_VAR, raising=False)
     return state
 
 
 def test_prepare_requires_api_key(sdk: _State, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CWSANDBOX_API_KEY")
-    with pytest.raises(click.ClickException, match="CWSANDBOX_API_KEY"):
+    monkeypatch.delenv("WANDB_API_KEY")
+    with pytest.raises(click.ClickException, match="WANDB_API_KEY"):
         CWSandboxLauncher().prepare()
 
 
-def test_provision_requests_host_image_and_egress(sdk: _State) -> None:
+def test_provision_uses_serverless_and_network_defaults(sdk: _State) -> None:
     assert CWSandboxLauncher().provision("managed-x") == "sb-1"
+    assert sdk.run_kwargs["auth"] == _FakeAuthStrategy.WANDB
     assert sdk.run_command == ("sleep", "infinity")
     assert sdk.run_kwargs["container_image"] == DEFAULT_HOST_IMAGE
-    assert sdk.run_kwargs["network"].egress_mode == "internet"
+    assert sdk.run_kwargs["network"] is None
+    assert sdk.run_kwargs["placement_mode"] == "serverless"
+    assert sdk.run_kwargs["runner_ids"] is None
     assert sdk.run_kwargs["tags"] == ["omnigent", "managed-x"]
 
 
@@ -260,3 +297,90 @@ def test_exec_foreground_kills_remote_on_interrupt(sdk: _State) -> None:
     kill = sdk.exec_commands[1][-1]
     assert 'case "$pid" in' in kill and 'kill "$pid"' in kill
     assert "rm -rf /tmp/oa-foreground-" in kill
+
+
+def _use_real_network_types(monkeypatch):
+    if real_sdk is None:
+        pytest.skip("Install the cwsandbox extra to validate SDK network types")
+    monkeypatch.setattr(sys.modules["cwsandbox"], "NetworkOptions", real_sdk.NetworkOptions)
+    monkeypatch.setattr(sys.modules["cwsandbox"], "EgressRule", real_sdk.EgressRule)
+
+
+def test_provision_grants_https_hosts_with_real_sdk(sdk: _State, monkeypatch: pytest.MonkeyPatch):
+    _use_real_network_types(monkeypatch)
+    monkeypatch.setenv(EGRESS_HOSTS_ENV_VAR, " server.example.com,api.openai.com,, ")
+    CWSandboxLauncher().provision("x")
+    network = sdk.run_kwargs["network"]
+    assert isinstance(network, real_sdk.NetworkOptions)
+    assert [rule.dns_name for rule in network.egress] == ["server.example.com", "api.openai.com"]
+
+
+def test_invalid_egress_host_fails_before_provision(sdk: _State, monkeypatch: pytest.MonkeyPatch):
+    _use_real_network_types(monkeypatch)
+    monkeypatch.setenv(EGRESS_HOSTS_ENV_VAR, "https://server.example.com/path")
+    with pytest.raises(click.ClickException, match=EGRESS_HOSTS_ENV_VAR):
+        CWSandboxLauncher().provision("x")
+    assert not sdk.run_kwargs
+
+
+@pytest.mark.parametrize("mode", ["cks", " CKS "])
+def test_provision_selects_cks_runner(sdk: _State, monkeypatch: pytest.MonkeyPatch, mode):
+    monkeypatch.setenv(PLACEMENT_MODE_ENV_VAR, mode)
+    monkeypatch.setenv(RUNNER_IDS_ENV_VAR, " runner-a,runner-b, ")
+    CWSandboxLauncher().provision("x")
+    assert sdk.run_kwargs["placement_mode"] == "cks"
+    assert sdk.run_kwargs["runner_ids"] == ["runner-a", "runner-b"]
+
+
+@pytest.mark.parametrize("mode", ["invalid", "unspecified"])
+def test_invalid_placement_fails_before_provision(sdk: _State, monkeypatch, mode):
+    monkeypatch.setenv(PLACEMENT_MODE_ENV_VAR, mode)
+    with pytest.raises(click.ClickException, match=PLACEMENT_MODE_ENV_VAR):
+        CWSandboxLauncher().provision("x")
+    assert not sdk.run_kwargs
+
+
+def test_serverless_rejects_runner_pin(sdk: _State, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(RUNNER_IDS_ENV_VAR, "runner-a")
+    with pytest.raises(click.ClickException, match=r"requires.*=cks"):
+        CWSandboxLauncher().provision("x")
+    assert not sdk.run_kwargs
+
+
+def test_cks_creation_failure_suggests_checking_runner_ids(
+    sdk: _State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(PLACEMENT_MODE_ENV_VAR, "CKS")
+    monkeypatch.setenv(RUNNER_IDS_ENV_VAR, "missing-runner")
+
+    def fail(*args, **kwargs):
+        raise _CWSandboxError("no eligible runner; retry shortly")
+
+    monkeypatch.setattr(_FakeSandbox, "run", fail)
+    with pytest.raises(click.ClickException, match="CKS runner IDs exist and are ready"):
+        CWSandboxLauncher().provision("test")
+
+
+@pytest.mark.parametrize("strategy", ["wandb", "coreweave_api_key"])
+def test_auth_strategy_used_for_create_and_attach(sdk, monkeypatch, strategy):
+    monkeypatch.setenv(AUTH_STRATEGY_ENV_VAR, strategy)
+    launcher = CWSandboxLauncher()
+    launcher.prepare()
+    launcher.provision("auth-test")
+    assert sdk.run_kwargs["auth"] == strategy
+    CWSandboxLauncher().attach("sb-existing")
+    assert sdk.from_id_auth == strategy
+
+
+def test_coreweave_auth_requires_its_own_key(sdk, monkeypatch):
+    monkeypatch.setenv(AUTH_STRATEGY_ENV_VAR, "coreweave_api_key")
+    monkeypatch.delenv("CWSANDBOX_API_KEY")
+    with pytest.raises(click.ClickException, match="CWSANDBOX_API_KEY"):
+        CWSandboxLauncher().prepare()
+
+
+def test_invalid_auth_fails_before_provision(sdk, monkeypatch):
+    monkeypatch.setenv(AUTH_STRATEGY_ENV_VAR, "invalid")
+    with pytest.raises(click.ClickException, match=AUTH_STRATEGY_ENV_VAR):
+        CWSandboxLauncher().provision("bad-auth")
+    assert not sdk.run_kwargs

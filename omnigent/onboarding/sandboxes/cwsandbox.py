@@ -16,12 +16,13 @@ with a server-minted launch token instead.
 
 Notes that shape this launcher:
 
-- Egress defaults to none on CW Sandbox, so :meth:`provision` requests
-  ``egress_mode="internet"`` — a managed host must dial the server out.
+- Placement defaults to serverless, with optional CKS runner selection.
+- Egress follows the placement's defaults unless a hostname allowlist replaces
+  them with HTTPS access to only the listed destinations.
 - Lifetime is a single hard cap (``max_lifetime_seconds``); there is no
   idle auto-stop. The managed token TTL is set above the cap.
-- Credentials and base URL come from the SDK's own env vars
-  (``CWSANDBOX_API_KEY`` / ``CWSANDBOX_BASE_URL``), 12-factor.
+- Authentication defaults to explicit W&B auth using ``WANDB_API_KEY``.
+  CoreWeave API-key auth is an explicit option for existing customers and CKS.
 """
 
 from __future__ import annotations
@@ -48,12 +49,16 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-    from cwsandbox import Sandbox
+    from cwsandbox import AuthStrategy, Sandbox
     from cwsandbox._types import Process
 
+AUTH_STRATEGY_ENV_VAR = "OMNIGENT_CWSANDBOX_AUTH_STRATEGY"
 HOST_IMAGE_ENV_VAR = "OMNIGENT_CWSANDBOX_HOST_IMAGE"
 SANDBOX_ENV_PASSTHROUGH_ENV_VAR = "OMNIGENT_CWSANDBOX_SANDBOX_ENV"
 MAX_LIFETIME_ENV_VAR = "OMNIGENT_CWSANDBOX_MAX_LIFETIME_S"
+EGRESS_HOSTS_ENV_VAR = "OMNIGENT_CWSANDBOX_EGRESS_HOSTS"
+PLACEMENT_MODE_ENV_VAR = "OMNIGENT_CWSANDBOX_PLACEMENT_MODE"
+RUNNER_IDS_ENV_VAR = "OMNIGENT_CWSANDBOX_RUNNER_IDS"
 
 _DEFAULT_MAX_LIFETIME_S = 24 * 60 * 60
 _SANDBOX_RESOURCES = {"cpu": "2", "memory": "4Gi"}
@@ -86,7 +91,21 @@ def _ensure_sdk() -> None:
         raise click.ClickException(
             "The cwsandbox SDK is required for the 'cwsandbox' sandbox provider. "
             "Install it with `pip install 'omnigent[cwsandbox]'`, then set "
-            "CWSANDBOX_API_KEY (and optionally CWSANDBOX_BASE_URL)."
+            "WANDB_API_KEY (and optionally CWSANDBOX_BASE_URL)."
+        ) from exc
+
+
+def resolve_auth_strategy() -> AuthStrategy:
+    """Select credentials explicitly so another account's key cannot take precedence."""
+    _ensure_sdk()
+    from cwsandbox import AuthStrategy
+
+    value = os.environ.get(AUTH_STRATEGY_ENV_VAR, AuthStrategy.WANDB).strip().lower()
+    try:
+        return AuthStrategy(value)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{AUTH_STRATEGY_ENV_VAR} must be 'wandb' or 'coreweave_api_key'"
         ) from exc
 
 
@@ -163,7 +182,7 @@ class CWSandboxLauncher(SandboxLauncher):
         handle = self._sandboxes.get(sandbox_id)
         if handle is None:
             try:
-                handle = Sandbox.from_id(sandbox_id).result()
+                handle = Sandbox.from_id(sandbox_id, auth=resolve_auth_strategy()).result()
             except SandboxNotFoundError as exc:
                 raise click.ClickException(
                     f"CW Sandbox '{sandbox_id}' not found — it may have been stopped "
@@ -196,38 +215,71 @@ class CWSandboxLauncher(SandboxLauncher):
 
     def prepare(self) -> None:
         """Preflight: the SDK must be installed and an API key available."""
-        _ensure_sdk()
-        if not os.environ.get("CWSANDBOX_API_KEY"):
-            raise click.ClickException(
-                "No CW Sandbox credentials found — set CWSANDBOX_API_KEY to a "
-                "CoreWeave Sandbox API key."
-            )
+        auth = resolve_auth_strategy()
+        from cwsandbox import AuthStrategy
+
+        key_name = "WANDB_API_KEY" if auth == AuthStrategy.WANDB else "CWSANDBOX_API_KEY"
+        if not os.environ.get(key_name):
+            raise click.ClickException(f"No sandbox credentials found — set {key_name}.")
 
     def provision(self, name: str) -> str:
         """Create a sandbox from the host image and wait until it is running."""
         _ensure_sdk()
-        from cwsandbox import NetworkOptions, Sandbox
+        from cwsandbox import EgressRule, NetworkOptions, PlacementMode, Sandbox
         from cwsandbox.exceptions import CWSandboxError
 
         image = self._image_ref or os.environ.get(HOST_IMAGE_ENV_VAR) or DEFAULT_HOST_IMAGE
         max_lifetime = resolve_max_lifetime_s()
         env_vars = self._resolve_sandbox_env()
+        try:
+            placement = PlacementMode(
+                os.environ.get(PLACEMENT_MODE_ENV_VAR, "serverless").strip().lower()
+            )
+            if placement == PlacementMode.UNSPECIFIED:
+                raise ValueError("placement must be explicit")
+        except ValueError as exc:
+            raise click.ClickException(
+                f"{PLACEMENT_MODE_ENV_VAR} must be 'serverless' or 'cks'"
+            ) from exc
+        runner_ids = [
+            runner.strip()
+            for runner in os.environ.get(RUNNER_IDS_ENV_VAR, "").split(",")
+            if runner.strip()
+        ]
+        if runner_ids and placement != PlacementMode.CKS:
+            raise click.ClickException(
+                f"{RUNNER_IDS_ENV_VAR} requires {PLACEMENT_MODE_ENV_VAR}=cks"
+            )
+        hosts = [
+            host.strip()
+            for host in os.environ.get(EGRESS_HOSTS_ENV_VAR, "").split(",")
+            if host.strip()
+        ]
+        try:
+            network = NetworkOptions(egress=[EgressRule(dns_name=host) for host in hosts])
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid {EGRESS_HOSTS_ENV_VAR}: {exc}") from exc
         click.echo(f"▸ Creating CW Sandbox '{name}' from {image}")
         try:
             sandbox = Sandbox.run(
                 "sleep",
                 "infinity",
+                auth=resolve_auth_strategy(),
                 container_image=image,
                 max_lifetime_seconds=max_lifetime,
                 resources=dict(_SANDBOX_RESOURCES),
-                # Egress defaults to none; a managed host must dial the server out.
-                network=NetworkOptions(egress_mode="internet"),
+                placement_mode=placement,
+                runner_ids=runner_ids or None,
+                network=network if hosts else None,
                 environment_variables=env_vars or None,
                 tags=["omnigent", name],
             )
             sandbox.wait()
         except CWSandboxError as exc:
-            raise click.ClickException(f"CW Sandbox creation failed: {exc}") from exc
+            detail = f"CW Sandbox creation failed: {exc}"
+            if runner_ids:
+                detail += "\nCheck that the configured CKS runner IDs exist and are ready."
+            raise click.ClickException(detail) from exc
         raw_sandbox_id = sandbox.sandbox_id
         if not raw_sandbox_id:
             raise click.ClickException("CW Sandbox creation returned no sandbox id")
@@ -331,7 +383,10 @@ class CWSandboxLauncher(SandboxLauncher):
         from cwsandbox.exceptions import CWSandboxError, SandboxNotFoundError
 
         try:
-            handle = self._sandboxes.get(sandbox_id) or Sandbox.from_id(sandbox_id).result()
+            handle = (
+                self._sandboxes.get(sandbox_id)
+                or Sandbox.from_id(sandbox_id, auth=resolve_auth_strategy()).result()
+            )
             handle.stop().result()
         except SandboxNotFoundError:
             pass  # Already gone — the desired end state holds.
