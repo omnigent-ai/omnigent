@@ -348,8 +348,6 @@ class ExecutorError(ExecutorEvent):
         call started has already reported its prompt size, and
         discarding it freezes the context-occupancy meter at the
         previous turn's value exactly when the session is in trouble.
-    :param exception: Original SDK error for semantic classification through
-        the adapter's explicit cause chain; None for non-exception failures.
     :param preserve_session: The executor is idle and safe to reuse after this
         failure. Set only when no prompt or tool work remains in progress.
         Defaults to ``False`` so failed turns receive normal teardown.
@@ -365,17 +363,20 @@ class ExecutorError(ExecutorEvent):
         prompt that never rendered), so the message never reached the
         transcript and its sender's queued copy is the only record of it.
         ``False`` (default) once the harness may have accepted it.
+    :param exception: Original SDK error for semantic classification through
+        the adapter's explicit cause chain; None for non-exception failures.
+        Appended last so positional construction keeps its meaning.
     """
 
     message: str
     retryable: bool = False
     usage: ExecutorUsage | None = None
-    exception: BaseException | None = None
     preserve_session: bool = False
     code: str | None = None
     title: str | None = None
     remediation: str | None = None
     undelivered: bool = False
+    exception: BaseException | None = None
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:

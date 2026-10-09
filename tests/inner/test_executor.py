@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.executor import (
+    ExecutorError,
     MockExecutor,
     TextChunk,
     ToolCallRequest,
@@ -150,3 +151,10 @@ class TestSplitTransientTail(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExecutorError(unittest.TestCase):
+    def test_positional_arguments_keep_their_meaning(self):
+        error = ExecutorError("boom", False, None, True)
+        self.assertTrue(error.preserve_session)
+        self.assertIsNone(error.exception)
