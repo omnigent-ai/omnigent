@@ -49,6 +49,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.native_session import create_native_session
 from tests.e2e_ui.conftest import (
     _REPO_ROOT,
     _TEST_AGENT_YAML,
@@ -395,44 +396,13 @@ def _create_kiro_native_session(base_url: str, runner_id: str, workspace: Path) 
     session workspace to a scratch directory so the kiro workspace MCP config
     is not written into the repo checkout.
     """
-    import io
-    import tarfile
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        KIRO_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="kiro",
+        metadata={"workspace": str(workspace)},
     )
-    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        spec_path = _materialize_kiro_agent_spec(Path(tmp), model=None)
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("kiro-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    metadata = {
-        "labels": {
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: KIRO_NATIVE_WRAPPER_VALUE,
-        },
-        "workspace": str(workspace),
-    }
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("kiro-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 

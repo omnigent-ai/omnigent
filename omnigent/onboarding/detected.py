@@ -169,7 +169,7 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
             # matching the interactive wizard / non-interactive onboarding /
             # ``provider_selection._read_credentials_from_env``). Without
             # this, an env key pointed at an OpenAI-compatible gateway (e.g.
-            # the Databricks AI gateway) is synthesized against
+            # the Databricks Unity Gateway) is synthesized against
             # ``api.openai.com`` and every request 401s — the credential is a
             # gateway token, not an OpenAI key. Scoped to the openai family's
             # canonical vendor (not a third-party endpoint, handled above).
