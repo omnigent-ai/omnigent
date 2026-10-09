@@ -3446,7 +3446,7 @@ def test_remote_headers_refreshes_expired_stored_token(
 def test_remote_headers_refused_refresh_skips_ambient_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A refused renewal must not fall through to ambient ~/.databrickscfg credentials."""
+    """A refused renewal must not fall through to ambient Databricks config credentials."""
     _store_expired_login(tmp_path, monkeypatch, refresh_status=400)
 
     def _no_ambient(_profile: object) -> object:
