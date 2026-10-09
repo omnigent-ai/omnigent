@@ -181,8 +181,10 @@ def test_downgrade_commits_each_page_and_resumes(db_uri: str) -> None:
         assert plans and plans[0].startswith("SEARCH conversation_items USING")
         assert "SCAN conversation_items" not in plans[0]
     elif dialect == "mysql":
-        # A key-only SELECT reports "Covering index range scan"; a full scan would not say "range".
-        assert plans and "range scan on conversation_items using primary" in plans[0].lower(), plans
+        # Key-only pages come back as a covering index range scan on MySQL.
+        assert plans and "range scan on conversation_items using primary" in plans[0].lower(), (
+            plans
+        )
     texts = _stored_search_texts(engine)
     assert texts[:batch] == ["kept text"] + [""] * (batch - 1)
     assert texts[batch:] == [None] * 3
