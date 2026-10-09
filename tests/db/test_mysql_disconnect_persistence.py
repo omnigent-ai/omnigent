@@ -1,5 +1,5 @@
-"""End-to-end regression: a transient mid-transaction MySQL disconnect silently
-drops a session-persistence write.
+"""Regression against a real MySQL server: a transient mid-transaction disconnect
+silently drops a session-persistence write.
 
 The bug lives in :func:`omnigent.db.utils.run_write_transaction`, which replays
 only CockroachDB serialization failures (40001) and MySQL deadlock victims
@@ -267,11 +267,10 @@ def _reap_orphaned_transaction(
                     "WHERE trx_state = 'RUNNING' AND trx_query IS NULL"
                 )
                 for (thread_id,) in cur.fetchall():
-                    try:
+                    # The orphan may vanish on its own between SELECT and KILL.
+                    with contextlib.suppress(Exception):
                         cur.execute(f"KILL {int(thread_id)}")
                         killed = True
-                    except Exception:
-                        pass
         finally:
             conn.close()
 

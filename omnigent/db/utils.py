@@ -1029,7 +1029,12 @@ def _is_serialization_failure(exc: DBAPIError) -> bool:
     )
 
 
-def _is_transient_disconnect(exc: DBAPIError) -> bool:
+# Backends that commit each statement on their own. A callback interrupted
+# there may already be partially applied, so replaying it could double-apply.
+_AUTOCOMMIT_DIALECTS = frozenset({"cloudflare_d1"})
+
+
+def _is_transient_disconnect(exc: DBAPIError, dialect: str) -> bool:
     """Return whether a statement died because its connection was lost.
 
     ``connection_invalidated`` is set when the dialect recognized the error as
@@ -1038,8 +1043,13 @@ def _is_transient_disconnect(exc: DBAPIError) -> bool:
     discarded and a replay runs on a fresh one. Errors raised outside a
     statement (``statement is None``, e.g. a failed COMMIT) are excluded: a
     disconnected commit may have landed, so replaying it could double-apply.
+    Autocommit dialects are excluded for the same reason.
     """
-    return exc.connection_invalidated and exc.statement is not None
+    return (
+        exc.connection_invalidated
+        and exc.statement is not None
+        and dialect not in _AUTOCOMMIT_DIALECTS
+    )
 
 
 def run_write_transaction(
@@ -1055,14 +1065,16 @@ def run_write_transaction(
 
     Three kinds of failure are replayed with bounded, jittered backoff:
     CockroachDB serialization failures (SQLSTATE 40001), MySQL deadlock
-    victims (error 1213), and statement-phase connection losses on any
-    dialect (the dialect invalidated the connection, e.g. MySQL "server has
-    gone away", so the replay runs on a fresh one).
+    victims (error 1213), and statement-phase connection losses on
+    transactional dialects (the dialect invalidated the connection, e.g. MySQL
+    "server has gone away", so the replay runs on a fresh one).
 
-    The callback must contain database work only. Callers must perform cache
-    invalidation and external side effects after this function returns. The
-    supplied maker remains responsible for query naming, commit, rollback,
-    SQLite write isolation, and session cleanup on every attempt.
+    The callback must contain database work only and must not commit on its
+    own: a replay assumes the failed attempt left nothing behind, which holds
+    only while the maker performs the single commit at exit. Callers must
+    perform cache invalidation and external side effects after this function
+    returns. The supplied maker remains responsible for query naming, commit,
+    rollback, SQLite write isolation, and session cleanup on every attempt.
     """
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
@@ -1074,7 +1086,7 @@ def run_write_transaction(
             with session_maker(operation_name) as session:
                 return callback(session)
         except DBAPIError as exc:
-            if _is_transient_disconnect(exc):
+            if _is_transient_disconnect(exc, dialect):
                 retry_reason = "connection loss"
             elif is_cockroachdb(dialect) and _is_serialization_failure(exc):
                 retry_reason = "serialization failure"
