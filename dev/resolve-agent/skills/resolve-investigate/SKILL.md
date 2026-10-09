@@ -22,6 +22,13 @@ matches the checkout. Record concise findings in the existing `root_cause`,
    Explain why the selected cause accounts for the reported configuration and
    symptom. If no credible alternative emerges, say so briefly; do not invent
    one or implement a plausible generic fix without evidence.
+   Exercise the reported configuration through the implementation being
+   diagnosed. Controlled external services, clocks, and credentials are useful
+   substitutes; replacing the suspected component with canned results assumes
+   the cause instead of testing it. For example, a fake token factory proves how
+   its caller handles those tokens, not how the configured credential provider
+   behaves. Record which parts actually ran and which were substituted. A
+   fail-before/pass-after test of that substitute does not confirm the incident.
 3. **Find the design intent.** Read nearby tests and documentation, targeted
    `git log -S`/`git blame`, and relevant commit/PR discussion. Cite the source
    and revision; distinguish documented rationale from inference and note
@@ -51,6 +58,13 @@ reviews; do not create a replacement just to resolve a policy disagreement.
 For workflow-owned publication, prepare the proposal body and incomplete handoff
 under the supplied publisher contract; never bypass it or invent a draft flag.
 For `skip_push`, leave the proposal in the local commit and handoff.
+
+Apply the same distinction to an unverified cause. If a proposed fix is supported
+only by a substitute configuration or canned failure, describe it as a hypothesis,
+use `partially_fixed`, and name the missing discriminator in `remaining_work`.
+When a reliable reproduction cannot be established, use the existing
+`needs_more_info` outcome. Passing tests that assume the cause do not justify
+`fixed`.
 
 Concrete blockers still apply: missing required inputs or credentials, unsafe
 evidence, an unrecoverable verification environment, conflicting authoritative

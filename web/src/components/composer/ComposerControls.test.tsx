@@ -27,8 +27,10 @@ describe("shared composer controls", () => {
     expect(screen.getByRole("button", { name: "main" })).toBeInTheDocument();
     expect(screen.getByTestId("workspace-bar")).toHaveClass(
       "items-center",
-      "py-1.5",
-      "h-[37px]",
+      "py-0.5",
+      "h-7",
+      "md:h-[37px]",
+      "md:py-1.5",
       "gap-0.5",
       "md:gap-2",
     );

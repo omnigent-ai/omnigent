@@ -12,6 +12,7 @@
 
 import type React from "react";
 import { useMemo } from "react";
+import { GitPullRequestIcon } from "lucide-react";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -67,7 +68,7 @@ interface WorkspaceFileOpener {
  * it in the FileViewer plus the openability verdict. Shared by the
  * inline-code and link renderers so both judge a path the same way.
  */
-function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
+function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFileOpener {
   const openFile = useFileViewer();
   const isChangedPath = useIsChangedPath();
   const conversationId = useFileViewerConversationId();
@@ -92,12 +93,11 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   // Only relative paths can be in the changed-files list (it speaks
   // workspace-relative); an outside-workspace absolute is never a change.
   const isChanged = !!linkPath && !linkPath.startsWith("/") && isChangedPath(linkPath);
-  // Only hit the filesystem for path-shaped spans that aren't already known
-  // changes; passing null disables the query (keeps hook order stable).
+  // Explicit links also verify basenames; inline code keeps its path heuristic.
   const { exists, settled } = useWorkspaceFileExists(
     conversationId,
     openFile && linkPath && !isChanged ? linkPath : null,
-    resolution?.trusted ?? false,
+    explicitLink || (resolution?.trusted ?? false),
   );
 
   if (!openFile || !linkPath || !(isChanged || exists)) {
@@ -178,7 +178,7 @@ function WorkspacePathInlineCode({
         // link only adds the underline affordance on top of Streamdown's
         // styling and any caller-provided attributes survive.
         className={cn(
-          "font-mono text-ui underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
+          "font-mono text-ui text-link underline decoration-dotted underline-offset-2 transition-colors cursor-pointer",
           className,
         )}
         onClick={openWorkspaceFile}
@@ -211,7 +211,19 @@ function WorkspacePathInlineCode({
 // slot replaces its link component wholesale, so both must be reproduced here:
 // index.css keys the pointer cursor and the table-cell `overflow-wrap` rule
 // (which stops a link-only table column collapsing to ~2ch) on the attribute.
-const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-primary underline";
+const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-link underline";
+
+function githubPullRequest(href: string | undefined): string | null {
+  if (!href) return null;
+  try {
+    const url = new URL(href);
+    if (url.protocol !== "https:" || url.hostname !== "github.com") return null;
+    const match = url.pathname.match(/^\/[^/]+\/([^/]+)\/pull\/(\d+)\/?$/);
+    return match ? `${match[1]}#${match[2]}` : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Follows an external chat link (`target="_blank"`) on a plain click, with a
@@ -251,6 +263,23 @@ function followLinkWithPopupFallback(
   link.click();
 }
 
+function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
+  const words = typeof children === "string" ? children.match(/^(\S+)([\s\S]*)$/) : null;
+  const prefix = (
+    <>
+      <GitPullRequestIcon aria-hidden="true" className="inline-block size-[1em] align-[-0.125em]" />
+      {"\u00a0"}
+      {words?.[1]}
+    </>
+  );
+  return (
+    <>
+      {words ? <span className="whitespace-nowrap">{prefix}</span> : prefix}
+      {words ? words[2] : children}
+    </>
+  );
+}
+
 /**
  * Anchor renderer for markdown links. A link to a workspace file, its href
  * parked on a fragment by `markWorkspaceFileLinks` and the real path moved to
@@ -271,7 +300,7 @@ function WorkspaceFileLink({
 }: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
   const marked = (props as Record<string, unknown>)[WORKSPACE_FILE_LINK_ATTR];
   const path = typeof marked === "string" ? marked : "";
-  const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path);
+  const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
 
@@ -284,11 +313,12 @@ function WorkspaceFileLink({
     // Streamdown renders external links with target="_blank"; those need the
     // popup fallback so a click still works where new tabs can't open.
     const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
+    const pullRequest = githubPullRequest(rebased);
     return (
       <a
         href={rebased}
         className={cn(STREAMDOWN_LINK_CLASS, className)}
-        title={title}
+        title={title ?? (pullRequest ? rebased : undefined)}
         data-streamdown="link"
         {...props}
         onClick={
@@ -300,7 +330,11 @@ function WorkspaceFileLink({
               }
         }
       >
-        {children}
+        {pullRequest ? (
+          <PullRequestLinkLabel>{children === href ? pullRequest : children}</PullRequestLinkLabel>
+        ) : (
+          children
+        )}
       </a>
     );
   }
