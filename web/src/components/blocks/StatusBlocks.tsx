@@ -76,7 +76,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
   runner_unavailable: "The session's runner isn't connected to the server.",
-  runner_failed_to_start: "The session's runner process exited on the host.",
+  runner_failed_to_start: "The session's runner failed to start on the host.",
   connection_error:
     "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",

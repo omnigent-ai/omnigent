@@ -25,7 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _LAUNCH_LINE = re.compile(r"Launched runner (\S+) for workspace .*?\(pid=(\d+)\)")
 _RUNNER_EXIT_TEXT = re.compile(r"runner process exited")
 # The error code determines the banner headline.
-_EXPECTED_HEADLINE = "The session's runner process exited on the host."
+_EXPECTED_HEADLINE = "The session's runner failed to start on the host."
 
 
 def _launches(log_path: Path) -> list[tuple[str, int]]:

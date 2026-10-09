@@ -1814,6 +1814,46 @@ def test_runner_exit_error_redacts_the_stated_reason(tmp_path: Path) -> None:
     assert "cause: uncaught RuntimeError: mint failed for" in error
 
 
+def test_runner_exit_error_redacts_the_whole_reason_before_bounding_it(tmp_path: Path) -> None:
+    """A credential straddling the cause's length bound is masked in full: the
+    reason is redacted before it is cut, so no fragment of the value survives in
+    the stated cause or the tail."""
+    log = tmp_path / "runner-x.log"
+    value = ' password="label SYNTHETIC-PASSWORD'
+    reason = "x" * (512 - len(value)) + value + '"'
+    log.write_text(
+        "CRIT  09-10 17:15:27.891 runner._entry                    _log_uncaught      | "
+        f"runner exiting: {reason}\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert "SYNTHETIC-PASSWORD" not in error
+    cause = error.splitlines()[1]
+    assert cause.startswith("cause: xxx")
+    assert len(cause) <= len("cause: ") + 512
+
+
+def test_runner_exit_error_ignores_an_exit_phrase_outside_a_log_record(tmp_path: Path) -> None:
+    """Only the runner logger's own record names the cause; the same phrase printed
+    bare or echoed to stderr is not promoted, so the traceback's last line wins."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "runner exiting: printed by a wrapper\n"
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 31, in <module>\n'
+        "    import websockets\n"
+        "ModuleNotFoundError: No module named 'websockets'\n"
+        "error: runner exiting: echoed to stderr\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: ModuleNotFoundError: No module named 'websockets'"
+
+
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

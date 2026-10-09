@@ -242,9 +242,9 @@ describe("ErrorBanner", () => {
       <ErrorBanner message={RUNNER_EXIT_ERROR} source="execution" code="runner_failed_to_start" />,
     );
     expect(screen.getByTestId("error-headline")).toHaveTextContent(
-      "The session's runner process exited on the host.",
+      "The session's runner failed to start on the host.",
     );
-    fireEvent.click(screen.getByRole("button", { name: /runner process exited on the host/i }));
+    fireEvent.click(screen.getByRole("button", { name: /runner failed to start on the host/i }));
     const message = screen.getByTestId("error-message-content");
     expect(message).toHaveTextContent("runner process exited with code 1");
     expect(message).toHaveTextContent(
@@ -313,6 +313,7 @@ describe("ErrorBanner", () => {
       "client_update_required",
       "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
     ],
+    ["runner_failed_to_start", "The session's runner failed to start on the host."],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();

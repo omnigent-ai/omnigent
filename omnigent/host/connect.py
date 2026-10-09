@@ -287,15 +287,20 @@ _LOG_TAIL_MAX_LINES = 15
 # a traceback that appears twice, well outside the shown tail.
 _EXIT_REASON_SCAN_BYTES = 64 * 1024
 
-# The runner records why it is stopping (see ``runner._entry``) as its last words.
-_RUNNER_EXIT_REASON_MARKER = "runner exiting: "
+# The runner logs why it is stopping (see ``runner._entry``). Only a formatted
+# log record counts, so a bare "runner exiting:" printed by something else in
+# the process cannot pose as the cause.
+_RUNNER_EXIT_REASON_LINE = re.compile(
+    r"^[A-Z]{4,8}\s+\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} .*? \| runner exiting: (?P<reason>\S.*)$"
+)
 
 # Final line of a Python traceback, e.g. ``OSError: [Errno 28] No space left on device``.
 _TRACEBACK_FINAL_LINE = re.compile(
     r"^(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|Exit|Interrupt): \S.*$"
 )
 
-# Bound on the stated cause; the shown tail still carries the rest.
+# Bound on the stated cause, applied after redaction so the cut cannot split a
+# credential; the shown tail still carries the rest.
 _EXIT_REASON_MAX_CHARS = 512
 
 # Poll cadence for the per-runner exit watcher. 0.5s matches the client's
@@ -381,17 +386,16 @@ def _redact_log_tail(tail: str) -> str:
 
 
 def _runner_exit_reason(scanned: str, shown_tail: list[str]) -> str | None:
-    """Return the runner's own ``runner exiting: <reason>`` line from *scanned*, else
-    the final ``SomeError: ...`` line of a traceback in *shown_tail*, else ``None``."""
+    """Return the runner's own ``runner exiting: <reason>`` record from *scanned*, else
+    the final ``SomeError: ...`` line of a traceback in *shown_tail*, else ``None``.
+    The result is unredacted and unbounded; the caller does both, in that order."""
     for line in reversed(scanned.splitlines()):
-        marker_at = line.find(_RUNNER_EXIT_REASON_MARKER)
-        if marker_at != -1:
-            reason = line[marker_at + len(_RUNNER_EXIT_REASON_MARKER) :].strip()
-            if reason:
-                return reason[:_EXIT_REASON_MAX_CHARS]
+        match = _RUNNER_EXIT_REASON_LINE.match(line.rstrip())
+        if match is not None:
+            return match.group("reason").strip()
     for line in reversed(shown_tail):
         if _TRACEBACK_FINAL_LINE.match(line.strip()):
-            return line.strip()[:_EXIT_REASON_MAX_CHARS]
+            return line.strip()
     return None
 
 
@@ -407,11 +411,12 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     if not scanned.strip():
         return message
     lines = scanned.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
-    tail = "\n".join(lines)[-_LOG_TAIL_MAX_BYTES:]
     reason = _runner_exit_reason(scanned, lines)
     if reason is not None:
-        message += f"\ncause: {_redact_log_tail(reason)}"
-    message += "\n--- runner log tail ---\n" + _redact_log_tail(tail)
+        message += f"\ncause: {_redact_log_tail(reason)[:_EXIT_REASON_MAX_CHARS]}"
+    # Redact whole lines before bounding so the cut cannot leave half a credential.
+    tail = _redact_log_tail("\n".join(lines))[-_LOG_TAIL_MAX_BYTES:]
+    message += "\n--- runner log tail ---\n" + tail
     return message
 
 
