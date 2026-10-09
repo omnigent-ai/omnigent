@@ -10,6 +10,10 @@ from pathlib import Path
 
 import pytest
 
+# Keep pytest's timeout above the 900 s subprocess timeout so a hung vitest run
+# fails with its captured output instead of pytest killing the worker first.
+pytestmark = pytest.mark.timeout(960)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WEB_DIR = _REPO_ROOT / "web"
 _VITEST = _WEB_DIR / "node_modules" / ".bin" / "vitest"
@@ -72,27 +76,27 @@ _USER_AGENT_SENSITIVE_FILES = ("src/shell/NewChatDialog.test.tsx",)
 
 
 def _run_vitest(files: tuple[str, ...], preload: Path) -> tuple[int, str]:
-    """Run the web suite's vitest as ``pnpm test`` does, loading ``preload`` first.
-
-    Returns the exit code and the ANSI-stripped combined output.
-    """
+    """Run vitest as ``pnpm test`` does, with ``preload`` required first."""
     if not _VITEST.exists():
         pytest.skip("web toolchain not installed (run pnpm install first)")
     if shutil.which("node") is None:
         pytest.skip("node is not on PATH")
     env = os.environ.copy()
-    # An ambient NODE_OPTIONS or VITEST must not mask the environment each guard builds.
-    env.pop("NODE_OPTIONS", None)
+    # Replace ambient NODE_OPTIONS and VITEST so each guard controls the environment it builds.
     env.pop("VITEST", None)
     env["NODE_OPTIONS"] = f'--require "{preload}"'
-    result = subprocess.run(
-        [str(_VITEST), "run", *files],
-        cwd=_WEB_DIR,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    try:
+        result = subprocess.run(
+            [str(_VITEST), "run", *files],
+            cwd=_WEB_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = _ANSI.sub("", f"{exc.stdout or ''}\n{exc.stderr or ''}")
+        pytest.fail(f"vitest did not finish within {exc.timeout}s:\n{_tail(output)}")
     return result.returncode, _ANSI.sub("", f"{result.stdout}\n{result.stderr}")
 
 
