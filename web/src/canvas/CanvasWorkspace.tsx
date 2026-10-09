@@ -134,7 +134,7 @@ export function CanvasWorkspace({
     drag.current = null;
   };
 
-  if (!active) return children;
+  if (!active) return <div className="relative flex min-h-0 min-w-0 flex-1">{children}</div>;
   return (
     <CanvasWorkspaceContext.Provider value={controls}>
       <div
@@ -197,13 +197,10 @@ export function CanvasWorkspace({
             onKeyDown={(event) => {
               if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
               event.preventDefault();
-              resize(
-                event.key === "Home"
-                  ? MIN_CANVAS_WIDTH
-                  : event.key === "End"
-                    ? maximum
-                    : canvasWidth + (event.key === "ArrowLeft" ? -24 : 24),
-              );
+              let next = canvasWidth + (event.key === "ArrowLeft" ? -24 : 24);
+              if (event.key === "Home") next = MIN_CANVAS_WIDTH;
+              else if (event.key === "End") next = maximum;
+              resize(next);
               saveRatio();
             }}
           >

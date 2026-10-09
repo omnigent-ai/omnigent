@@ -2,9 +2,12 @@ import { MAIN_CANVAS_ID } from "./canvasLayout";
 
 export const CANVAS_QUERY_PARAM = "canvas";
 
-/** Matches Canvas in standalone and embedded routes; extensions are checked by the caller. */
-export function isCanvasPathname(pathname: string): boolean {
-  return /\/canvas(?:\/c\/[^/]+)?\/?$/.test(pathname);
+/** Match only the Canvas root and session routes under the current mount path. */
+export function isCanvasPathname(pathname: string, canvasPath = "/canvas"): boolean {
+  return (
+    pathname.startsWith(canvasPath) &&
+    /^(?:\/c\/[^/]+)?\/?$/.test(pathname.slice(canvasPath.length))
+  );
 }
 
 export function canvasLocation(canvasId: string, sessionId?: string) {

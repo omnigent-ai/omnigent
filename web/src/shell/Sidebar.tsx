@@ -94,7 +94,7 @@ import {
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -434,11 +434,13 @@ function useActiveNavItem(): {
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
+  const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
-  const isCanvasPage = !isExtensionRoute && isCanvasPathname(location.pathname);
+  const isCanvasPage =
+    !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =

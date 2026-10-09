@@ -1,4 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import * as Dialog from "radix-ui/dialog";
 import { MemoryRouter, useLocation, useMatch, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CanvasWorkspace, useCanvasWorkspace } from "./CanvasWorkspace";
@@ -25,6 +27,14 @@ function Conversation() {
       <button type="button" onClick={canvas.closeConversation}>
         {canvas.compact ? "Back to canvas" : "Close session"}
       </button>
+      <Dialog.Root>
+        <Dialog.Trigger>Open conversation dialog</Dialog.Trigger>
+        <Dialog.Portal>
+          <Dialog.Content aria-describedby={undefined}>
+            <Dialog.Title>Conversation options</Dialog.Title>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </>
   );
 }
@@ -120,6 +130,19 @@ describe("CanvasWorkspace", () => {
     expect(localStorage.getItem("omnigent:canvas-split-ratio")).not.toBeNull();
     fireEvent.keyDown(divider, { key: "Home" });
     expect(divider.getAttribute("aria-valuenow")).toBe(divider.getAttribute("aria-valuemin"));
+  });
+
+  it("lets a nested dialog consume Escape before restoring the canvas", async () => {
+    const user = userEvent.setup();
+    await renderWorkspace("/canvas/c/first?canvas=project");
+    await user.click(screen.getByRole("button", { name: "Focus session" }));
+    await user.click(screen.getByRole("button", { name: "Open conversation dialog" }));
+    expect(screen.getByRole("dialog")).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Canvas pane")).toHaveClass("hidden");
+    await user.keyboard("{Escape}");
+    expect(screen.getByLabelText("Canvas pane")).not.toHaveClass("hidden");
   });
 
   it("switches to a single pane on narrow screens and returns to the same board", async () => {

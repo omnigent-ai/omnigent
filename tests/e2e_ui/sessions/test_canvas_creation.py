@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import uuid
 from urllib.parse import urlparse
@@ -122,12 +123,21 @@ def test_canvas_plus_creates_session_on_the_selected_board(
         body = {
             key: payload[key] for key in ("agent_id", "project_id", "labels") if key in payload
         }
-        response = httpx.post(f"{base_url}/v1/sessions", json=body, timeout=30)
-        response.raise_for_status()
-        created = response.json()
-        created_ids.append(created["id"])
-        bind_session_runner(httpx.patch, base_url, created["id"], source["runner_id"], timeout=10)
-        route.fulfill(status=response.status_code, json=created)
+        try:
+            assert payload.get("agent_id") == agent_id, (
+                "Canvas creation must use the fixture agent"
+            )
+            response = httpx.post(f"{base_url}/v1/sessions", json=body, timeout=30)
+            response.raise_for_status()
+            created = response.json()
+            created_ids.append(created["id"])
+            bind_session_runner(
+                httpx.patch, base_url, created["id"], source["runner_id"], timeout=10
+            )
+            route.fulfill(status=response.status_code, json=created)
+        except (httpx.HTTPError, AssertionError):
+            route.abort()
+            raise
 
     page.route(re.compile(r"/v1/sessions(?:\?.*)?$"), create_on_fixture_runner)
     prompt = f"Create from Canvas {uuid.uuid4().hex[:8]}"
@@ -137,6 +147,10 @@ def test_canvas_plus_creates_session_on_the_selected_board(
     try:
         page.goto(f"{base_url}/canvas{query}")
         page.get_by_test_id("canvas-new-session").click()
+        # Other tests can leave discoverable native agents on the shared server.
+        page.get_by_test_id("new-chat-landing-agent-select").click()
+        page.get_by_test_id("new-chat-landing-custom-agents").click()
+        page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
         page.get_by_test_id("new-chat-landing-input").fill(prompt)
         page.get_by_test_id("new-chat-landing-submit").click()
         expect(page).to_have_url(
@@ -170,4 +184,5 @@ def test_canvas_plus_creates_session_on_the_selected_board(
         assert urlparse(page.url).path.startswith("/canvas")
     finally:
         for created_id in created_ids:
-            httpx.delete(f"{base_url}/v1/sessions/{created_id}", timeout=10).raise_for_status()
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/sessions/{created_id}", timeout=10).raise_for_status()

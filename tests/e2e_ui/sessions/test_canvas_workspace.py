@@ -97,14 +97,20 @@ def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
     divider = page.get_by_role("separator", name="Resize canvas and conversation")
     before = float(divider.get_attribute("aria-valuenow") or "0")
     divider.press("ArrowLeft")
-    assert float(divider.get_attribute("aria-valuenow") or "0") < before
+    page.wait_for_function(
+        "([divider, before]) => Number(divider.getAttribute('aria-valuenow')) < before",
+        arg=[divider.element_handle(), before],
+    )
     handle = divider.bounding_box()
     assert handle is not None
     page.mouse.move(handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2)
     page.mouse.down()
     page.mouse.move(handle["x"] - 70, handle["y"] + handle["height"] / 2, steps=8)
     page.mouse.up()
-    assert float(divider.get_attribute("aria-valuenow") or "0") < before - 60
+    page.wait_for_function(
+        "([divider, before]) => Number(divider.getAttribute('aria-valuenow')) < before - 60",
+        arg=[divider.element_handle(), before],
+    )
     page.get_by_role("button", name="Focus conversation", exact=True).click()
     expect(page.get_by_role("region", name="Canvas pane", exact=True)).not_to_be_visible()
     page.get_by_role("button", name="Show canvas beside conversation", exact=True).click()

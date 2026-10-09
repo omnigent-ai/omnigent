@@ -351,6 +351,10 @@ plain `uv run pytest`, which starts a private server for the test.
   Grouping, feature gating, drag persistence, and live updates also run in
   `tests/e2e_ui/sessions/test_canvas_page.py`, with selection churn in
   `tests/e2e_ui/sessions/test_canvas_selected_highlight_persists.py::test_clicked_card_keeps_selected_highlight_across_live_updates`.
+  Unit tests in `web/src/canvas/canvasNavigation.test.ts` distinguish Canvas
+  from similarly named routes under standalone and embedded mount paths.
+  `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested
+  dialog with Escape preserves conversation focus.
 - **`canvas-mobile` (deep link, back button, and reload):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
 - **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
