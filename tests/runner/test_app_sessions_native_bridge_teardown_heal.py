@@ -27,7 +27,7 @@ from omnigent.harnesses.codex_native.bridge import (
     prepare_bridge_dir,
     write_mcp_bridge_config,
 )
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner import create_runner_app
 from omnigent.runner.native.orchestration import _codex_bridge_torn_down_for_live_pane
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -38,34 +38,36 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
 class _LabelServerClient:
     """Server-client stub for the session labels endpoint, counting calls.
 
     ``labels`` is served as ``{"labels": labels}``; ``body`` replaces the whole
-    payload instead. With neither, ``json()`` raises like a non-JSON body. A
-    ``status_code`` of ``None`` raises a timeout instead of answering.
+    payload instead. With neither, ``json()`` raises like a non-JSON body. An
+    ``error`` is raised instead of answering.
     """
 
     def __init__(
         self,
         labels: dict[str, str] | None = None,
         *,
-        status_code: int | None = 200,
+        status_code: int = 200,
         body: Any = None,
+        error: Exception | None = None,
     ) -> None:
         self._payload = {"labels": labels} if labels is not None else body
         self._status_code = status_code
+        self._error = error
         self.calls = 0
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         """Answer the labels lookup as configured."""
         del url, kwargs
         self.calls += 1
-        if self._status_code is None:
-            raise httpx.ReadTimeout("labels lookup timed out")
+        if self._error is not None:
+            raise self._error
         code, payload = self._status_code, self._payload
 
         class _Response:
@@ -104,24 +106,12 @@ def _plant_live_codex_pane(
     :param tmp_path: Temp dir for the instance's private paths.
     :returns: A list that receives one entry per ``close()`` call.
     """
-    live = TerminalInstance(
-        name="codex",
-        session_key="main",
-        socket_path=tmp_path / "live" / "tmux.sock",
-        private_dir=tmp_path / "live_private",
-    )
-    live.running = True
-    (tmp_path / "live_private").mkdir(exist_ok=True)
-
-    async def _alive() -> bool:
-        return True
-
+    live = make_test_terminal_instance("codex", "main", tmp_path, running=True)
     closes: list[bool] = []
 
     async def _close() -> None:
         closes.append(True)
 
-    live.is_alive = _alive  # type: ignore[method-assign]
     live.close = _close  # type: ignore[method-assign]
     with registry._lock:
         registry._by_conversation[conv_id] = {("codex", "main"): live}
@@ -156,23 +146,11 @@ def _build_codex_native_app(
             name="codex",
         )
 
+    # The real _launch_codex adapter resolves this name at call time.
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal",
         _stub_auto_create,
     )
-    monkeypatch.setattr(
-        "omnigent.runner.native._auto_create_codex_terminal",
-        _stub_auto_create,
-    )
-
-    async def _stub_launch_codex(ctx: Any) -> SessionResourceView:
-        return await _stub_auto_create(ctx.session_id, ctx.resource_registry, ctx.publish_event)
-
-    monkeypatch.setattr(
-        "omnigent.runner.native.orchestration._launch_codex",
-        _stub_launch_codex,
-    )
-    monkeypatch.setattr("omnigent.runner.native._launch_codex", _stub_launch_codex)
     # A native turn also nudges the tool relay, which waits 30s for a bridge
     # server-info file no fake harness ever writes.
     monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda *_a, **_kw: None)
@@ -336,17 +314,23 @@ async def test_torn_down_check_does_not_flag_rotated_bridge_id(
 @pytest.mark.parametrize(
     "client",
     [
-        _LabelServerClient(status_code=None),
+        _LabelServerClient(error=httpx.ReadTimeout("labels lookup timed out")),
+        _LabelServerClient(error=httpx.ConnectError("connection refused")),
+        _LabelServerClient(error=DatabricksAuthError("not signed in")),
         _LabelServerClient({}, status_code=503),
         _LabelServerClient(),
+        _LabelServerClient(body=[]),
         _LabelServerClient(body={"labels": "rotated-bridge"}),
         _LabelServerClient(body={}),
         None,
     ],
     ids=[
         "timeout",
+        "transport_error",
+        "auth_error",
         "non_200",
         "not_json",
+        "payload_not_object",
         "labels_not_mapping",
         "labels_missing",
         "no_server_client",

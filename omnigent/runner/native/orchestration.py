@@ -9346,9 +9346,10 @@ async def _codex_bridge_torn_down_for_live_pane(
     (:func:`~omnigent.harnesses.codex_native.bridge.bridge_torn_down`) only when
     the session labels confirm an unrotated bridge. A rotated label or an
     inconclusive lookup leaves the pane untouched: the relaunch seeds only the
-    session-id dir, and closing a live pane on a guess is worse than letting
-    one more turn fail. The stat check runs first, so a healthy turn never
-    pays the label lookup.
+    session-id dir, and closing a live pane on a guess is worse than a failed
+    turn. Turn setup then re-seeds ``bridge.json``, so a session skipped once
+    is not retried until its pane dies. The stat check runs first, so a
+    healthy turn never pays the label lookup.
 
     :param server_client: Omnigent server client used to resolve a rotated
         bridge-id label. ``None`` cannot rule out a rotated label, so the pane
