@@ -41,6 +41,57 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
+class _LabelServerClient:
+    """Server-client stub for the session labels endpoint, counting calls.
+
+    ``labels`` is served as ``{"labels": labels}``; ``body`` replaces the whole
+    payload instead. With neither, ``json()`` raises like a non-JSON body. A
+    ``status_code`` of ``None`` raises a timeout instead of answering.
+    """
+
+    def __init__(
+        self,
+        labels: dict[str, str] | None = None,
+        *,
+        status_code: int | None = 200,
+        body: Any = None,
+    ) -> None:
+        self._payload = {"labels": labels} if labels is not None else body
+        self._status_code = status_code
+        self.calls = 0
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Answer the labels lookup as configured."""
+        del url, kwargs
+        self.calls += 1
+        if self._status_code is None:
+            raise httpx.ReadTimeout("labels lookup timed out")
+        code, payload = self._status_code, self._payload
+
+        class _Response:
+            status_code = code
+
+            def json(self) -> Any:
+                if payload is None:
+                    raise ValueError("not JSON")
+                return payload
+
+        return _Response()
+
+
+class _UnlabeledServerClient(NullServerClient):
+    """Null server client whose labels endpoint answers with an empty mapping."""
+
+    class _LabelsResponse(NullServerClient._Response):
+        def json(self) -> dict[str, Any]:
+            return {"labels": {}}
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Serve ``{"labels": {}}`` for any GET."""
+        del url, kwargs
+        return self._LabelsResponse()
+
+
 def _plant_live_codex_pane(
     registry: TerminalRegistry,
     conv_id: str,
@@ -76,19 +127,6 @@ def _plant_live_codex_pane(
         registry._by_conversation[conv_id] = {("codex", "main"): live}
         registry._instance_locks[(conv_id, "codex", "main")] = threading.Lock()
     return closes
-
-
-class _UnlabeledServerClient(NullServerClient):
-    """Null server client whose labels endpoint answers with an empty mapping."""
-
-    class _LabelsResponse(NullServerClient._Response):
-        def json(self) -> dict[str, Any]:
-            return {"labels": {}}
-
-    async def get(self, url: str, **kwargs: Any) -> Any:
-        """Serve ``{"labels": {}}`` for any GET."""
-        del url, kwargs
-        return self._LabelsResponse()
 
 
 def _build_codex_native_app(
@@ -261,29 +299,6 @@ def test_bridge_torn_down_requires_every_bridge_file_gone(tmp_path: Path) -> Non
         marker.unlink()
 
 
-class _LabelServerClient:
-    """Server-client stub serving one labels payload, counting calls."""
-
-    def __init__(self, labels: dict[str, str]) -> None:
-        self._labels = labels
-        self.calls = 0
-
-    async def get(self, url: str, **kwargs: Any) -> Any:
-        """Serve the labels endpoint payload for any GET."""
-        del url, kwargs
-        self.calls += 1
-
-        labels = self._labels
-
-        class _Response:
-            status_code = 200
-
-            def json(self) -> dict[str, Any]:
-                return {"labels": labels}
-
-        return _Response()
-
-
 @pytest.mark.asyncio
 async def test_torn_down_check_does_not_flag_rotated_bridge_id(
     monkeypatch: pytest.MonkeyPatch,
@@ -317,41 +332,15 @@ async def test_torn_down_check_does_not_flag_rotated_bridge_id(
     ), "an intact rotated dir is not a teardown the session-id heal handles"
 
 
-class _FailingLabelServerClient:
-    """Server-client stub whose labels lookup times out, errors, or returns junk."""
-
-    def __init__(self, *, status_code: int | None, body: Any = None) -> None:
-        self._status_code = status_code
-        self._body = body
-
-    async def get(self, url: str, **kwargs: Any) -> Any:
-        """Raise a timeout when no status is configured; otherwise serve the body."""
-        del url, kwargs
-        if self._status_code is None:
-            raise httpx.ReadTimeout("labels lookup timed out")
-        code = self._status_code
-        body = self._body
-
-        class _Response:
-            status_code = code
-
-            def json(self) -> Any:
-                if body is None:
-                    raise ValueError("not JSON")
-                return body
-
-        return _Response()
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "client",
     [
-        _FailingLabelServerClient(status_code=None),
-        _FailingLabelServerClient(status_code=503, body={"labels": {}}),
-        _FailingLabelServerClient(status_code=200),
-        _FailingLabelServerClient(status_code=200, body={"labels": "rotated-bridge"}),
-        _FailingLabelServerClient(status_code=200, body={}),
+        _LabelServerClient(status_code=None),
+        _LabelServerClient({}, status_code=503),
+        _LabelServerClient(),
+        _LabelServerClient(body={"labels": "rotated-bridge"}),
+        _LabelServerClient(body={}),
         None,
     ],
     ids=[

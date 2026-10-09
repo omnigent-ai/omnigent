@@ -9342,14 +9342,13 @@ async def _codex_bridge_torn_down_for_live_pane(
     """
     Return whether a codex session's bridge was torn out from under a live pane.
 
-    :func:`_delete_native_bridge_dirs` removes the bridge dir while the tmux
-    pane can outlive it; the next turn then finds no bridge state and fails
-    with the generic "bridge state is missing". The teardown signature is every
-    runner-written bridge file being gone
-    (:func:`~omnigent.harnesses.codex_native.bridge.bridge_torn_down`), which a
-    cold boot (launch-seeded ``bridge.json``) or a recorded startup failure
-    never matches. The session-id dir is checked first with a stat-only fast
-    path; the label lookup runs only when that dir is torn down.
+    Flags the session-id bridge dir missing every runner-written file
+    (:func:`~omnigent.harnesses.codex_native.bridge.bridge_torn_down`) only when
+    the session labels confirm an unrotated bridge. A rotated label or an
+    inconclusive lookup leaves the pane untouched: the relaunch seeds only the
+    session-id dir, and closing a live pane on a guess is worse than letting
+    one more turn fail. The stat check runs first, so a healthy turn never
+    pays the label lookup.
 
     :param server_client: Omnigent server client used to resolve a rotated
         bridge-id label. ``None`` cannot rule out a rotated label, so the pane
@@ -9357,8 +9356,6 @@ async def _codex_bridge_torn_down_for_live_pane(
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :returns: ``True`` only for a non-forked session whose session-id bridge
         dir was torn down (the case the session-id relaunch can restore).
-        ``False`` when the label lookup is inconclusive: closing a live pane
-        on a guess is worse than leaving one more turn to fail.
     """
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,

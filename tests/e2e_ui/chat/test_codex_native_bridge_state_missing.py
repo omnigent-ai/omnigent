@@ -46,8 +46,7 @@ _TURN_DELIVERY_TIMEOUT_MS = 180_000
 _MISSING_STATE_MESSAGE = "Codex native bridge state is missing"
 
 # Runner-written bridge files; all absent is the production teardown signature.
-# Mirrors bridge_torn_down on purpose: importing it would fail a tree without
-# the heal on the import instead of on the reported behavior.
+# Kept local so the base revision fails on behavior, not on an import.
 _BRIDGE_FILES = ("state.json", "startup_error.json", "bridge.json")
 
 
