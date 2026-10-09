@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -114,8 +115,19 @@ def _wait_for_runner_log(data_dir: Path, needle: str, timeout_s: float) -> str:
 
 def _stop_local_stack(omnigent: Path, env: dict[str, str]) -> None:
     for args in (["server", "stop"], ["stop"]):
-        with contextlib.suppress(Exception):
-            subprocess.run([str(omnigent), *args], env=env, capture_output=True, timeout=60)
+        try:
+            result = subprocess.run(
+                [str(omnigent), *args], env=env, capture_output=True, text=True, timeout=60
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            warnings.warn(f"teardown `omnigent {' '.join(args)}` failed: {exc}", stacklevel=2)
+            continue
+        if result.returncode != 0:
+            warnings.warn(
+                f"teardown `omnigent {' '.join(args)}` exited {result.returncode}: "
+                f"{result.stderr.strip()[-300:]}",
+                stacklevel=2,
+            )
 
 
 @pytest.mark.skipif(
@@ -162,7 +174,9 @@ def test_pi_terminal_ensure_failure_keeps_tmux_diagnostic(tmp_path: Path) -> Non
             f"CLI output tail:\n{cli_output[-2500:]}"
         )
 
-        log_text = _wait_for_runner_log(data_dir, "tmux launch failed", _LOG_SETTLE_TIMEOUT_S)
+        log_text = _wait_for_runner_log(
+            data_dir, "Pi terminal ensure failed for session=", _LOG_SETTLE_TIMEOUT_S
+        )
         assert "Pi terminal ensure failed for session=" in log_text, (
             "Runner log never recorded 'Pi terminal ensure failed for session='. "
             f"Log tail:\n{log_text[-2500:]}"
