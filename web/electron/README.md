@@ -741,6 +741,20 @@ pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
 
+When passing electron-builder flags through pnpm (for example in CI), put them
+**directly after the script name**, without an extra `--`:
+
+```bash
+pnpm run build:win --publish never
+pnpm run build:linux --publish never
+```
+
+`pnpm run build:win -- --publish never` forwards the literal `--` to
+electron-builder instead of setting its publish mode. In CI this may trigger
+implicit publishing; on Windows it can also fail argument parsing. The dev
+scripts use double quotes around `Omnigent Dev` so their product-name override
+works on Windows as well as macOS and Linux.
+
 Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
 name; output lands in `electron/dist-dev/` (the DMG is named
 `Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
