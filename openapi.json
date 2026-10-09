@@ -48,6 +48,119 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentDetailObject": {
+        "description": "Agent summary with caller ownership for management actions.",
+        "properties": {
+          "builtin": {
+            "default": false,
+            "title": "Builtin",
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "mcp_servers": {
+            "items": {
+              "$ref": "#/components/schemas/MCPServerSummary"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          },
+          "mcp_servers_editable": {
+            "default": false,
+            "title": "Mcp Servers Editable",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "default": "agent",
+            "title": "Object",
+            "type": "string"
+          },
+          "policies": {
+            "items": {
+              "$ref": "#/components/schemas/PolicySummary"
+            },
+            "title": "Policies",
+            "type": "array"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "terminals": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Terminals",
+            "type": "array"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "user_owned": {
+            "title": "User Owned",
+            "type": "boolean"
+          },
+          "version": {
+            "default": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "user_owned"
+        ],
+        "title": "AgentDetailObject",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -9814,7 +9927,7 @@
         ]
       },
       "get": {
-        "description": "Return the list summary for a server agent or the caller's own user agent.\n\nMissing and inaccessible agents both return 404. Sharing a session\ndoes not grant access to its owner's agent through this route.\n\n**Returns:** The same redacted `AgentObject` used by the list routes.",
+        "description": "Return the list summary for a server agent or the caller's own user agent.\n\nMissing and inaccessible agents both return 404. Sharing a session\ndoes not grant access to its owner's agent through this route.\n\n**Returns:** The redacted summary plus whether the caller owns the agent.",
         "operationId": "get_agent_v1_agents__agent_id__get",
         "parameters": [
           {
@@ -9833,7 +9946,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AgentObject"
+                  "$ref": "#/components/schemas/AgentDetailObject"
                 }
               }
             },

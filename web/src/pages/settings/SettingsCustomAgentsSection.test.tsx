@@ -7,11 +7,16 @@ import { authenticatedFetch } from "@/lib/identity";
 import { buildAgentBundle } from "@/lib/agentBundle";
 import type { ManagedAgent } from "@/hooks/useCustomAgents";
 
-const flags = vi.hoisted(() => ({ feature: true, install: true }));
+const flags = vi.hoisted(() => ({
+  feature: true,
+  install: true,
+  detail: true as boolean | undefined,
+}));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     features: { custom_agents_settings_ui: flags.feature },
     agent_install: flags.install,
+    agent_detail: flags.detail,
   }),
 }));
 vi.mock("@/lib/agentLabels", () => ({
@@ -68,6 +73,7 @@ function mount(path = "/settings/custom-agents") {
 beforeEach(() => {
   flags.feature = true;
   flags.install = true;
+  flags.detail = true;
   failSave = false;
   failDelete = false;
   inUse = false;
@@ -94,6 +100,14 @@ beforeEach(() => {
       users = users.filter((a) => a.id !== url.pathname.split("/").at(-1));
       return response({ deleted: true });
     }
+    if (url.pathname.startsWith("/v1/agents/")) {
+      const id = decodeURIComponent(url.pathname.slice("/v1/agents/".length));
+      const owned = users.find((a) => a.id === id);
+      const found = owned ?? [polly, agent("operator-agent")].find((a) => a.id === id);
+      return found
+        ? response({ ...found, user_owned: !!owned })
+        : response({ error: { message: "Not found", code: "not_found" } }, 404);
+    }
     return response(
       page(
         url.searchParams.get("scope") === "user"
@@ -117,20 +131,112 @@ describe("Custom agents settings", () => {
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
 
-  it("continues through an empty page when opening a bookmarked agent", async () => {
+  it("opens a bookmark with one detail request and no list scans", async () => {
+    mount("/settings/custom-agents/a1");
+    expect(await screen.findByRole("heading", { name: "research" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Delete agent" })).toBeVisible();
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/agents/a1", expect.anything());
+  });
+
+  it("keeps an operator-added server agent read-only on a cold link", async () => {
+    mount("/settings/custom-agents/operator-agent");
+    expect(await screen.findByRole("heading", { name: "operator-agent" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Delete agent" })).toBeNull();
+    expect(screen.getByText("Server-provided agents are read-only.")).toBeVisible();
+  });
+
+  it("disables deletion when an older detail response omits ownership", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(response(agent("a1")));
+    mount("/settings/custom-agents/a1");
+    expect(await screen.findByRole("heading", { name: "a1" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Delete agent" })).toBeNull();
+    expect(screen.getByText(/Update the server to enable agent deletion/)).toBeVisible();
+  });
+
+  it("shows loading while the detail request is pending", async () => {
+    let resolve!: (value: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValue(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    mount("/settings/custom-agents/a1");
+    expect(screen.getByText("Loading agent…")).toBeVisible();
+    resolve(response({ ...agent("a1"), user_owned: true }));
+    expect(await screen.findByRole("heading", { name: "a1" })).toBeVisible();
+  });
+
+  it("reports a missing bookmark without fetching lists or retrying 404", async () => {
+    mount("/settings/custom-agents/missing");
+    expect(
+      await screen.findByText(
+        "Agent not found. It may have been removed or belong to another user.",
+      ),
+    ).toBeVisible();
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: /Load more/ })).toBeNull();
+  });
+
+  it("retries a failed detail request without fetching lists", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      response({ error: { message: "Unavailable" } }, 500),
+    );
+    mount("/settings/custom-agents/a1");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load this agent");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("heading", { name: "research" })).toBeVisible();
+    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
+      "/v1/agents/a1",
+      "/v1/agents/a1",
+    ]);
+  });
+
+  it.each([405, 501])(
+    "shows an update notice if the advertised endpoint returns %s",
+    async (status) => {
+      vi.mocked(authenticatedFetch).mockResolvedValue(
+        response({ detail: "Not implemented" }, status),
+      );
+      mount("/settings/custom-agents/a1");
+      expect(await screen.findByRole("alert")).toHaveTextContent("Update the server and reload");
+      expect(screen.queryByRole("button", { name: "Delete agent" })).toBeNull();
+      expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("opens an agent whose ID needs URL encoding", async () => {
+    users = [agent("agent/space %2F?#é", "encoded-agent")];
+    mount();
+    fireEvent.click(await screen.findByRole("link", { name: "encoded-agent" }));
+    expect(await screen.findByRole("heading", { name: "encoded-agent" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Delete agent" })).toBeVisible();
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      `/v1/agents/${encodeURIComponent(users[0].id)}`,
+      expect.anything(),
+    );
+  });
+
+  it("updates search results when the term or loaded pages change", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = new URL(String(input), "http://localhost");
       if (url.searchParams.get("scope") !== "user") return response(page([polly]));
       return response(
-        url.searchParams.has("after") ? page([agent("later")]) : page([], true, "skipped-copy"),
+        url.searchParams.has("after")
+          ? page([agent("later", "research-later")])
+          : page(users, true, "a2"),
       );
     });
-    mount("/settings/custom-agents/later");
-    expect(await screen.findByRole("heading", { name: "later" })).toBeVisible();
-    expect(authenticatedFetch).toHaveBeenCalledWith(
-      expect.stringContaining("after=skipped-copy"),
-      expect.anything(),
-    );
+    mount();
+    expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: " RESEARCH " } });
+    expect(screen.queryByRole("link", { name: /Polly description/ })).toBeNull();
+    expect(screen.getAllByRole("link", { name: "research" })).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Load more agents" }));
+    expect(await screen.findByRole("link", { name: "research-later" })).toBeVisible();
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "polly" } });
+    expect(screen.getByRole("link", { name: /Polly description/ })).toBeVisible();
+    expect(screen.queryByRole("link", { name: "research-later" })).toBeNull();
   });
 
   it("retains form input after failure and saves a bundle without creating a session", async () => {
@@ -182,6 +288,22 @@ describe("Custom agents settings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove anyway" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(1);
+  });
+
+  it.each([undefined, false])("disables every entry point when agent_detail=%s", (detail) => {
+    flags.detail = detail;
+    for (const path of [
+      "/settings/custom-agents",
+      "/settings/custom-agents/new",
+      "/settings/custom-agents/a1",
+    ]) {
+      const view = mount(path);
+      expect(screen.getByRole("alert")).toHaveTextContent("Update the server and reload");
+      expect(screen.queryByRole("searchbox")).toBeNull();
+      expect(screen.queryByRole("button", { name: /Save agent|Delete agent/ })).toBeNull();
+      expect(authenticatedFetch).not.toHaveBeenCalled();
+      view.unmount();
+    }
   });
 
   it.each([

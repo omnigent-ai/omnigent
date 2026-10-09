@@ -225,7 +225,8 @@ clients treat its absence on older servers as unsupported.
 On a store without user-agent support, `scope=user`, `POST`, and `DELETE` return 404.
 
 **`GET /v1/agents/{id}`** (single-agent summary)
-- Returns the same redacted agent object as the list routes, using a direct lookup by ID.
+- Returns the same redacted agent summary as the list routes, plus `user_owned`
+  indicating whether the caller owns the agent, using a direct lookup by ID.
 - Allows server agents and the caller's own user agents in the current workspace.
   Unlike discovery, this also permits reading an owned legacy fork/switch copy by its ID.
   Session sharing does not grant access through this route.

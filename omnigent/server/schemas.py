@@ -306,6 +306,12 @@ class AgentObject(BaseModel):
     builtin: bool = False
 
 
+class AgentDetailObject(AgentObject):
+    """Agent summary with caller ownership for management actions."""
+
+    user_owned: bool
+
+
 # ── Session Policies ───────────────────────────────────────────
 
 

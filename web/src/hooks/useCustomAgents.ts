@@ -1,4 +1,4 @@
-import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Agent } from "./useAgents";
 import { authenticatedFetch } from "@/lib/identity";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
@@ -12,6 +12,10 @@ export interface ManagedAgent extends Agent {
   updated_at: number | null;
   builtin: boolean;
   skills: { name: string; description: string }[];
+}
+
+interface ManagedAgentDetail extends ManagedAgent {
+  user_owned?: boolean;
 }
 
 interface AgentPage {
@@ -35,6 +39,20 @@ export function useCustomAgents(scope: "server" | "user", enabled: boolean) {
     },
     getNextPageParam: (page) => (page.has_more ? page.last_id : undefined),
     enabled,
+  });
+}
+
+export function useCustomAgent(id: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ["settings-agents", "detail", id],
+    queryFn: async ({ signal }): Promise<ManagedAgentDetail | null> => {
+      const res = await authenticatedFetch(`/v1/agents/${encodeURIComponent(id!)}`, { signal });
+      if (res.status === 404) return null;
+      if (!res.ok) throw await apiErrorFromResponse(res);
+      return res.json();
+    },
+    enabled: enabled && id !== undefined,
+    retry: false,
   });
 }
 
