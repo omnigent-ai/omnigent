@@ -519,11 +519,8 @@ def test_shell_command_does_not_see_omnigent_project_root(
     assert str(_project_root()) not in out
 
 
-# ---------------------------------------------------------------------------
-# Helper-spawn failures: a helper that cannot start (e.g. fork EAGAIN when the
-# host is out of process capacity) must surface a structured error dict from
-# request(), never raise the bare OS errno to the caller.
-# ---------------------------------------------------------------------------
+# Helper-spawn failures (e.g. fork EAGAIN) must surface a structured error
+# dict from request(), never raise the bare OS errno to the caller.
 
 
 _RAW_FORK_EAGAIN = str(BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN)))
@@ -564,7 +561,7 @@ def test_helper_spawn_failure_surfaces_structured_error(
     finally:
         client.close()
 
-    assert spawn_attempts >= 1
+    assert spawn_attempts == 1
     assert result == {"error": f"os_env helper failed to start: {_RAW_FORK_EAGAIN}"}
 
 
@@ -635,3 +632,61 @@ def test_helper_respawn_failure_after_io_error_surfaces_structured_error(
 
     assert spawn_attempts == 2
     assert result == {"error": f"os_env helper failed to start: {_RAW_FORK_EAGAIN}"}
+
+
+class _FakeContainment:
+    """Containment handle stand-in that records ``close()``."""
+
+    closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeEgressHandle:
+    """Egress proxy handle stand-in that records ``stop()``."""
+
+    stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_helper_spawn_failure_releases_partial_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused respawn releases the state left by an earlier helper.
+
+    The client still holds an exited process, a scratch dir, a containment
+    handle and an egress proxy when the respawn hits fork ``EAGAIN``. All of
+    it must be released by ``request()`` itself, before ``close()`` runs.
+
+    :param tmp_path: Helper workspace and scratch directory root.
+    :param monkeypatch: Patches ``subprocess.Popen`` to raise fork-``EAGAIN``.
+    """
+
+    def _fork_eagain(*args: object, **kwargs: object) -> object:
+        raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+
+    monkeypatch.setattr("omnigent.inner.os_env.subprocess.Popen", _fork_eagain)
+    client = _helper_client(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    containment = _FakeContainment()
+    egress = _FakeEgressHandle()
+    client._proc = _BrokenPipeProc()
+    client._tmpdir = scratch
+    client._sandbox_handle = containment
+    client._egress_handle = egress
+    client._egress_auth_token = "token"
+    client._egress_relay_port = 4242
+
+    result = client.request({"op": "read", "path": "README.md", "offset": 1})
+
+    assert result == {"error": f"os_env helper failed to start: {_RAW_FORK_EAGAIN}"}
+    assert client._proc is None
+    assert client._tmpdir is None and not scratch.exists()
+    assert client._sandbox_handle is None and containment.closed
+    assert client._egress_handle is None and egress.stopped
+    assert client._egress_auth_token is None and client._egress_relay_port is None
+    client.close()
