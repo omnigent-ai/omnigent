@@ -24,13 +24,12 @@ Facet B (pre-launch picker, surface ``web``):
     union — every model of every provider present in ``auth.json`` — again
     ignoring ``enabledModels``.
 
-Both assertions are written against the FIXED behavior (an ``enabledModels``
-curation, when set, scopes what the pickers offer; the multi-vendor
-openrouter catalog must not clobber the list), so this module is RED on the
-buggy build and turns GREEN once the pickers honor pi's own curation. It
-runs against the mock LLM (no real credentials — auth entries are fakes and
-no turn is driven), but launching the real Pi terminal needs ``pi`` /
-``tmux`` / ``node`` on PATH; the module skips cleanly when any is absent.
+Both assertions require that an ``enabledModels`` curation, when set, scopes
+what the pickers offer and that the multi-vendor openrouter catalog does not
+clobber the list. The module runs against the mock LLM (no real credentials —
+auth entries are fakes and no turn is driven), but launching the real Pi
+terminal needs ``pi`` / ``tmux`` / ``node`` on PATH; it skips cleanly when any
+is absent.
 
     .venv/bin/python -m pytest tests/e2e/test_pi_native_picker_enabled_models.py -v
 """

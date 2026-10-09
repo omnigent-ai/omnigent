@@ -24,9 +24,7 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.chat.test_harness_render_smoke import _patch_session_as_harness
 from tests.e2e_ui.chat.test_model_flows_contract import _install_stream_controller
 
-# Pi's own curation (settings.json enabledModels) scopes the session to this
-# one model; the fixed extension pushes exactly this scope instead of the
-# union of every logged-in provider's full catalog.
+# Pi's enabledModels curation scopes the session's pushed catalog to this one model.
 _ENABLED_MODEL = "anthropic/claude-sonnet-4-5"
 
 _CURATED_OPTIONS = [
@@ -73,7 +71,7 @@ def test_pi_native_session_picker_offers_only_the_curated_scope(
     models_menu = page.get_by_test_id("composer-agent-models")
     expect(models_menu).to_be_visible(timeout=10_000)
 
-    # The fix, made observable: the picker offers exactly the curated scope.
+    # The picker must offer exactly the curated scope.
     enabled_row = models_menu.locator(f'[data-model-id="{_ENABLED_MODEL}"]')
     expect(enabled_row).to_be_visible(timeout=10_000)
     rows = models_menu.locator("[data-model-id]")

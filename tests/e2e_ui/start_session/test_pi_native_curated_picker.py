@@ -37,9 +37,7 @@ from tests.e2e_ui.start_session.test_start_session import (
     _run_in_fresh_loop,
 )
 
-# Pi's own curation (settings.json enabledModels) scopes the picker to this
-# one model; the fixed server returns exactly this instead of the union of
-# every logged-in provider's full catalog.
+# Pi's enabledModels curation scopes the pre-launch picker to this one model.
 _ENABLED_MODEL = "anthropic/claude-sonnet-4-5"
 
 
@@ -101,9 +99,7 @@ async def _drive_curated_pi_picker(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            # The fixed edge: the multi-login unmanaged host answers with Pi's
-            # own enabledModels curation (see the server-side guards in
-            # tests/e2e/test_pi_native_picker_enabled_models.py).
+            # Model-options edge: the host answers with Pi's enabledModels-curated scope.
             curated = _curated_pi_model_options()
 
             async def handle_pi_model_options(route: Route) -> None:
@@ -139,9 +135,8 @@ async def _drive_curated_pi_picker(base_url: str, session_id: str) -> None:
             models_menu = page.get_by_test_id("new-chat-landing-agent-models")
             await expect(models_menu).to_be_visible()
 
-            # The fix, made observable: the picker offers exactly the curated
-            # scope -- the enabled model is immediately visible, and none of
-            # the multi-vendor OpenRouter catalog floods the list.
+            # Assert the menu contains only the curated catalog: the enabled
+            # model is visible and no OpenRouter rows leak in.
             enabled_row = page.get_by_test_id(f"new-chat-landing-agent-model-{_ENABLED_MODEL}")
             await expect(enabled_row).to_be_visible(timeout=10_000)
             # The menu leads with its own "Harness default" row, then the

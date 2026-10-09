@@ -241,8 +241,8 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
                 for host in resp.json().get("hosts", []):
                     if host["host_id"] == host_id and host["status"] == "online":
                         return
-        except httpx.ConnectError:
-            pass  # the server is still starting; keep polling
+        except httpx.TransportError:
+            pass  # the server is still starting (connect/read); keep polling
         time.sleep(0.25)
     raise AssertionError(f"host {host_id!r} did not appear online within {timeout}s")
 
@@ -250,10 +250,19 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
 class _MultiProviderPiHost:
     """A spawned host daemon whose Pi is logged into several providers."""
 
-    def __init__(self, host_id: str, home: Path, base_url: str) -> None:
+    def __init__(
+        self,
+        host_id: str,
+        home: Path,
+        base_url: str,
+        proc: subprocess.Popen[bytes],
+        daemon_log: Path,
+    ) -> None:
         self.host_id = host_id
         self.home = home
         self.base_url = base_url
+        self.proc = proc
+        self.daemon_log = daemon_log
 
 
 @pytest.fixture(scope="module")
@@ -303,7 +312,13 @@ def multi_provider_pi_host(
     try:
         with _client(live_server) as client:
             _wait_for_host_online(client, host_id, timeout=45.0)
-        yield _MultiProviderPiHost(host_id=host_id, home=home, base_url=live_server)
+        yield _MultiProviderPiHost(
+            host_id=host_id,
+            home=home,
+            base_url=live_server,
+            proc=proc,
+            daemon_log=daemon_log,
+        )
     finally:
         proc.send_signal(signal.SIGTERM)
         try:
@@ -366,9 +381,15 @@ def _launch_pi_session_with_pushed_catalog(host: _MultiProviderPiHost) -> str:
         )
         assert create.status_code in (200, 201), f"session create failed: {create.text}"
         session_id = str(create.json()["session_id"])
-        deadline = time.monotonic() + 150.0
+        timeout_s = 150.0
+        deadline = time.monotonic() + timeout_s
         options: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
+            if host.proc.poll() is not None:
+                raise AssertionError(
+                    f"host daemon exited (rc={host.proc.returncode}) before the "
+                    f"picker populated; log tail:\n{host.daemon_log.read_text()[-2000:]}"
+                )
             resp = client.get(f"/v1/sessions/{session_id}", timeout=10.0)
             if resp.status_code == 200:
                 options = resp.json().get("model_options") or []
@@ -381,8 +402,9 @@ def _launch_pi_session_with_pushed_catalog(host: _MultiProviderPiHost) -> str:
             with contextlib.suppress(httpx.HTTPError):
                 client.delete(f"/v1/sessions/{session_id}", timeout=10.0)
             raise AssertionError(
-                f"pi-native session {session_id!r} never pushed a model catalog; "
-                "the in-session Model picker stayed empty"
+                f"pi-native session {session_id!r} never pushed a model catalog "
+                f"within {timeout_s:.0f}s; daemon log tail:\n"
+                f"{host.daemon_log.read_text()[-2000:]}"
             )
     return session_id
 

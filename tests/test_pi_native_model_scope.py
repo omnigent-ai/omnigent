@@ -58,6 +58,18 @@ def test_glob_matches_qualified_or_bare_id() -> None:
     assert scope_models(["*sonnet*"], _CATALOG) == [_SONNET]
 
 
+def test_single_char_wildcard_matches_one_segment_char() -> None:
+    """``?`` matches exactly one non-slash character (minimatch parity)."""
+    assert scope_models(["openai/gpt-5.?"], _CATALOG) == [_GPT]
+    assert scope_models(["anthropic/claude-sonnet-4-?"], _CATALOG) == [_SONNET]
+
+
+def test_character_class_matches_a_listed_character() -> None:
+    """A character class selects a model when a listed character matches."""
+    assert scope_models(["anthropic/claude-[s]onnet-4-5"], _CATALOG) == [_SONNET]
+    assert scope_models(["openai/gpt-[0-9].2"], _CATALOG) == [_GPT]
+
+
 def test_provider_glob_selects_provider_models() -> None:
     """``anthropic/*`` selects the provider's (single-segment) models."""
     assert scope_models(["anthropic/*"], _CATALOG) == [_SONNET, _OPUS, _DATED_OPUS]
