@@ -466,8 +466,9 @@ export function AppShell() {
   // state stays false — leaving it true would let rail-gated side effects fire
   // on non-session routes like the home page.
   const [rightPanelOpen, setRightPanelOpen] = useState(() =>
-    conversationId && !canvasMode
-      ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
+    conversationId
+      ? (readSessionWorkspaceState(conversationId).open ??
+        (canvasMode ? false : readDefaultWorkspacePanelOpen()))
       : false,
   );
   const workspaceTabListRef = useRef<HTMLDivElement>(null);
@@ -1250,7 +1251,8 @@ export function AppShell() {
     const hasWorkspaceUrlSignal =
       showAgents || urlFile !== null || (commentParam !== null && commentParam !== "");
     setRightPanelOpenImmediately(
-      (!canvasMode && (persisted.open ?? readDefaultWorkspacePanelOpen())) || hasWorkspaceUrlSignal,
+      (persisted.open ?? (canvasMode ? false : readDefaultWorkspacePanelOpen())) ||
+        hasWorkspaceUrlSignal,
     );
 
     stateConvRef.current = conversationId;

@@ -97,8 +97,10 @@ adjust the split and Home/End to reach its limits. Double-click the divider to
 restore the default split. Focus the session to use the full area; Escape
 restores the board. Close the session to return to the board. Opening, closing,
 or maximizing Workspace keeps the canvas visible. Session focus is independent: Show canvas
-restores the board without closing Workspace. On narrow screens, Back to canvas returns to
-the selected project. A Canvas session link opens the same layout directly.
+restores the board without closing Workspace. Each card remembers whether Workspace is open.
+On narrow screens, Back to canvas returns to the selected project. A Canvas session link
+opens the same layout directly. If a session is replaced, for example after `/clear`,
+its replacement stays beside the same board.
 The plus button starts a new session in the selected canvas. After sending,
 the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. The collapsed sidebar keeps its expand button first, followed by
@@ -365,7 +367,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/pages/CanvasPage.test.tsx` checks viewport
   translation across successive resizes, hiding, and restoring the pane,
   refitting untouched boards after card changes, and preserving queued viewports
-  during rapid project switches.
+  during rapid project switches and resizes. `web/src/shell/AppShell.test.tsx`
+  verifies Workspace's saved open/closed choice across card changes.
+  `web/src/hooks/useConversationRedirect.test.tsx` delivers session replacement
+  events and checks the same board, query parameters, and replaced history under
+  standalone and embedded routes.
 - **`canvas-session-health` (card selection and direct session links):** component
   tests in `web/src/hooks/useActiveConversationId.test.tsx` cover standalone and
   embedded session routes, switching cards, and returning to the board.

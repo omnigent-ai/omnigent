@@ -162,7 +162,7 @@ function RoutedCanvas({ controlSelection }: { controlSelection: boolean }) {
   );
 }
 
-function pageTree(initialEntry = "/canvas", controlSelection = false) {
+function pageTree(initialEntry = "/canvas", controlSelection = true) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={queryClient}>
@@ -627,13 +627,7 @@ describe("CanvasPage", () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
     const { rerender } = renderPage();
 
-    // React Flow reports a card click as a select change.
-    const onNodesChange = flowProps.current?.onNodesChange as (
-      changes: { id: string; type: "select"; selected: boolean }[],
-    ) => void;
-    act(() => {
-      onNodesChange([{ id: "conv_keep", type: "select", selected: true }]);
-    });
+    fireEvent.click(screen.getByTestId("flow-node-conv_keep"));
     expect(screen.getByTestId("flow-node-conv_keep")).toHaveAttribute("data-selected", "true");
 
     // A refresh publishes a fresh array with identical data (the 30s poll,
@@ -659,12 +653,7 @@ describe("CanvasPage", () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
     renderPage();
 
-    const onNodesChange = flowProps.current?.onNodesChange as (
-      changes: { id: string; type: "select"; selected: boolean }[],
-    ) => void;
-    act(() => {
-      onNodesChange([{ id: "conv_keep", type: "select", selected: true }]);
-    });
+    fireEvent.click(screen.getByTestId("flow-node-conv_keep"));
     expect(screen.getByTestId("flow-node-conv_keep")).toHaveAttribute("data-selected", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
