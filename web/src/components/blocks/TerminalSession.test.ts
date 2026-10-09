@@ -8,6 +8,7 @@
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TERMINAL_PALETTES } from "@/lib/terminalPalettes";
 import {
   SHIFT_ENTER_CSI_U,
   TerminalSession,
@@ -284,6 +285,19 @@ describe("terminalTheme", () => {
     expect(theme.background).toBe("#131517");
     expect(theme.foreground).toBe("#e4e4e7");
     expect(theme.brightBlack).toBe("#71717a");
+  });
+
+  it("renders the requested variant of a color theme's palette", () => {
+    expect(terminalTheme(true, TERMINAL_PALETTES.catppuccin)).toMatchObject({
+      background: "#1e1e2e",
+      foreground: "#cdd6f4",
+      red: "#f38ba8",
+    });
+    expect(terminalTheme(false, TERMINAL_PALETTES.catppuccin)).toMatchObject({
+      background: "#eff1f5",
+      foreground: "#4c4f69",
+      red: "#d20f39",
+    });
   });
 });
 
@@ -786,7 +800,7 @@ describe("TerminalSession", () => {
       const frames = [...socket.sent];
       for (const isDark of [!startsDark, startsDark, !startsDark]) {
         session.setTheme(isDark);
-        expect(term.options.theme?.extendedAnsi?.[239]).toBe(isDark ? "#2f3132" : "#f4f4f4");
+        expect(term.options.theme?.extendedAnsi?.[239]).toBe(isDark ? "#2f3133" : "#f4f4f4");
         expect(term.buffer.active.getLine(0)?.getCell(0)?.isBgPalette()).toBe(true);
         expect(term.buffer.active.getLine(0)?.getCell(0)?.getBgColor()).toBe(255);
         expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe("history");
@@ -856,8 +870,8 @@ describe("TerminalSession", () => {
     const frames = [...socket.sent];
     const expectedColors: Record<number, { light: string; dark: string }> = {
       253: { light: "#fafafa", dark: "#1f2123" },
-      254: { light: "#e0e0e0", dark: "#464849" },
-      255: { light: "#f4f4f4", dark: "#2f3132" },
+      254: { light: "#e0e0e0", dark: "#46484a" },
+      255: { light: "#f4f4f4", dark: "#2f3133" },
     };
     for (const isDark of [fixture.startsDark, !fixture.startsDark, fixture.startsDark]) {
       session.setTheme(isDark);
@@ -1148,6 +1162,18 @@ describe("TerminalSession", () => {
     session.setTheme(true);
     expect(socket).toBe(before);
     expect(socket.closed).toBe(false);
+    session.dispose();
+  });
+
+  it("setTheme swaps the color-theme palette live and keeps it across mode flips", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    session.setTheme(true, TERMINAL_PALETTES.gruvbox);
+    expect(term.options.theme).toMatchObject(TERMINAL_PALETTES.gruvbox.dark);
+    session.setTheme(false);
+    expect(term.options.theme).toMatchObject(TERMINAL_PALETTES.gruvbox.light);
+    expect(socket.closed).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(1);
     session.dispose();
   });
 
