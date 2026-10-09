@@ -7,6 +7,8 @@ import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
+const pdfRendering = vi.hoisted(() => ({ error: null as Error | null, mounts: 0 }));
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
@@ -26,11 +28,20 @@ vi.mock("./MonacoCodeEditor", () => ({
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
 // jsdom) never load; its testid presence is the signal that a file was routed
 // to the PDF surface.
-vi.mock("./PdfViewer", () => ({
-  PdfViewer: ({ comments }: { comments: Comment[] }) => (
-    <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
-  ),
-}));
+vi.mock("./PdfViewer", async () => {
+  const { useEffect } = await import("react");
+  return {
+    PdfViewer: ({ comments }: { comments: Comment[] }) => {
+      useEffect(() => {
+        pdfRendering.mounts += 1;
+      }, []);
+      if (pdfRendering.error) throw pdfRendering.error;
+      return (
+        <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+      );
+    },
+  };
+});
 // Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
 // (which has no WebGL); its presence in the DOM is the signal that a model file
 // was routed to the 3D preview instead of the binary-rejection placeholder.
@@ -73,13 +84,16 @@ function makeImageQuery(contentType: string, truncated = false): ReturnType<type
 // parses it, so any base64 payload with the application/pdf content type is enough
 // to exercise routing.
 const PDF_BASE64 = "JVBERi0xLjQK";
+// Different header bytes ("%PDF-1.7"), standing in for a rewritten file.
+const UPDATED_PDF_BASE64 = "JVBERi0xLjcK";
 
 function makePdfQuery(
   contentType: string | null = "application/pdf",
   truncated = false,
+  content = PDF_BASE64,
 ): ReturnType<typeof useFileContent> {
   return {
-    data: { content: PDF_BASE64, encoding: "base64", content_type: contentType, truncated },
+    data: { content, encoding: "base64", content_type: contentType, truncated },
     isLoading: false,
     isError: false,
     isSuccess: true,
@@ -873,6 +887,104 @@ describe("CodeViewer image rendering", () => {
 });
 
 describe("CodeViewer PDF routing", () => {
+  function pdfProps(): CodeViewerProps {
+    return {
+      conversationId: "conv_1",
+      path: "report.pdf",
+      fileQuery: makePdfQuery(),
+      comments: [],
+      activeSelection: null,
+      onSetActiveSelection: () => {},
+      panelOpen: true,
+      searchOpen: false,
+      setSearchOpen: () => {},
+      searchInputRef: noopRef,
+      viewMode: "source",
+    };
+  }
+
+  // Renders a PDF whose viewer throws, waits for the in-pane alert, then stops
+  // the stub from throwing so the caller can check how the failure clears.
+  async function renderFailedPdf(props: CodeViewerProps) {
+    const error = new Error("PDF renderer failed");
+    pdfRendering.error = error;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const suppressExpectedError = (event: ErrorEvent) => {
+      if (event.error === error) event.preventDefault();
+    };
+    window.addEventListener("error", suppressExpectedError);
+    const teardown = () => {
+      pdfRendering.error = null;
+      window.removeEventListener("error", suppressExpectedError);
+      log.mockRestore();
+    };
+    const view = render(<CodeViewer {...props} />);
+    try {
+      expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
+    } catch (failure) {
+      teardown();
+      throw failure;
+    }
+    pdfRendering.error = null;
+    return { ...view, teardown };
+  }
+
+  it.each<[string, (props: CodeViewerProps) => CodeViewerProps]>([
+    ["another file opens", (props) => ({ ...props, path: "healthy.pdf" })],
+    [
+      "another conversation shows the same path",
+      (props) => ({ ...props, conversationId: "conv_2" }),
+    ],
+    [
+      "new content arrives for the same file",
+      (props) => ({
+        ...props,
+        fileQuery: makePdfQuery("application/pdf", false, UPDATED_PDF_BASE64),
+      }),
+    ],
+  ])("recovers from a PDF render failure when %s", async (_case, next) => {
+    const props = pdfProps();
+    const { rerender, teardown } = await renderFailedPdf(props);
+    try {
+      rerender(<CodeViewer {...next(props)} />);
+      expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      teardown();
+    }
+  });
+
+  it("keeps a PDF render failure when the same file re-renders unchanged", async () => {
+    const props = pdfProps();
+    const { rerender, teardown } = await renderFailedPdf(props);
+    try {
+      rerender(<CodeViewer {...props} />);
+      expect(screen.getByRole("alert")).toHaveTextContent("Unable to render PDF.");
+      expect(screen.queryByTestId("pdf-viewer-stub")).not.toBeInTheDocument();
+    } finally {
+      teardown();
+    }
+  });
+
+  it("remounts a healthy PDF viewer only when the file changes, not when its content updates", async () => {
+    const props = pdfProps();
+    pdfRendering.mounts = 0;
+    const { rerender } = render(<CodeViewer {...props} />);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+    expect(pdfRendering.mounts).toBe(1);
+
+    const updated = makePdfQuery("application/pdf", false, UPDATED_PDF_BASE64);
+    rerender(<CodeViewer {...props} fileQuery={updated} />);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+    expect(pdfRendering.mounts).toBe(1);
+
+    // Each file starts with a fresh viewer (and 100% zoom) because the boundary
+    // is keyed by conversation and path.
+    rerender(<CodeViewer {...props} fileQuery={updated} path="other.pdf" />);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+    expect(pdfRendering.mounts).toBe(2);
+  });
+
   function renderPdf(
     contentType: string | null = "application/pdf",
     path = "report.pdf",
