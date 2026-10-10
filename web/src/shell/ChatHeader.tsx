@@ -568,10 +568,9 @@ export function ChatHeader({
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
         "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center gap-1 px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        // Desktop: a three-column grid centers the breadcrumb on the pane at any
-        // sidebar width. Both side columns start at the measured --chat-header-side
-        // (so an empty toggle slot still mirrors the action cluster) and share the
-        // leftover equally; the breadcrumb truncates before reaching either side.
+        // Desktop: a three-column grid centers the breadcrumb on the pane. Both
+        // side columns start at the measured --chat-header-side, so an empty toggle
+        // slot still mirrors the action cluster; the breadcrumb truncates first.
         "md:grid md:grid-cols-[minmax(var(--chat-header-side,0px),1fr)_auto_minmax(var(--chat-header-side,0px),1fr)] md:gap-6",
         settingsMode && "settings-mobile-header",
       )}

@@ -114,13 +114,8 @@ def test_long_header_title_truncates_centered_inside_the_chat_pane(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A title wider than the header's free middle truncates in place.
-
-    With the sidebar widened, the header's left slot is empty while the right
-    holds the action cluster. The breadcrumb must still center on the pane and
-    stay inside it, clear of both the sidebar and the action cluster, rather
-    than growing past its column.
-    """
+    """A long title truncates centered in the pane, clear of the sidebar and the
+    header actions, even though only the header's right side holds controls."""
     base_url, session_id = seeded_session
     _set_title(base_url, session_id, _LONG_TITLE)
 
