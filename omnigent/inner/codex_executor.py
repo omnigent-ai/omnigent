@@ -2356,8 +2356,7 @@ def _extract_latest_user_content(
 
 def _has_prior_history(messages: list[Message]) -> bool:
     """Whether a fresh thread's first prompt replays earlier turns, not just the latest message."""
-    user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    return len(messages) > 1 and len(user_messages) > 1
+    return sum(1 for msg in messages if msg.get("role") == "user") > 1
 
 
 def _build_initial_prompt(

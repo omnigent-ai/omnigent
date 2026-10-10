@@ -34,6 +34,10 @@ _TARGET_INPUT_CHARS = 1_450_000
 _LOG_LINE = "2026-09-09T14:12:42.117Z INFO worker-7 heartbeat ok latency_ms=12\n"
 _GENERIC_HOST_HEADLINE = "Something went wrong setting up the turn on the host."
 _EXPECTED_HEADLINE = "Message is too large for Codex"
+_EXPECTED_REMEDIATION = "Shorten the message or split large pasted content across turns."
+_COUNTS_REFERENCE = re.compile(
+    r"input is (\d{1,3}(?:,\d{3})+) characters; Codex accepts at most 1,048,576"
+)
 _RAW_RPC_FRAGMENTS = ("-32602", "input_error_code", "Codex executor error:")
 _INPUT_LIMIT_REFERENCE = re.compile(r"1,?048,?576|too large|input_too_large", re.IGNORECASE)
 _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
@@ -179,6 +183,14 @@ def test_codex_oversized_message_fails_with_clear_reason(
         )
         assert any(_EXPECTED_HEADLINE in headline for headline in headlines), (
             f"the pill is not headlined with the input-limit reason: {surfaced!r}"
+        )
+        # The expanded body must carry Codex's count, the limit and the next step.
+        counts = [match for match in map(_COUNTS_REFERENCE.search, bodies) if match]
+        assert counts and int(counts[0].group(1).replace(",", "")) > _CODEX_MAX_INPUT_CHARS, (
+            f"expanded error details omit the character counts: {bodies!r}"
+        )
+        assert any(_EXPECTED_REMEDIATION in body for body in bodies), (
+            f"expanded error details omit the next step: {bodies!r}"
         )
         for fragment in _RAW_RPC_FRAGMENTS:
             assert all(fragment not in text for text in surfaced), (
