@@ -3024,6 +3024,12 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     // The menu is open (the escape hatch renders), but no Arca entry.
     await screen.findByTestId("new-chat-landing-connect-host");
     expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+    // An old shell that reports no flag falls back to the bare command, not the placeholder.
+    fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+    expect(screen.queryByTestId("connect-host-pending")).toBeNull();
+    expect(screen.getByTestId("connect-host-command").textContent).toBe(
+      `omni host --server '${window.location.origin}'`,
+    );
   });
 
   it("offers reconnect after relaunch while preserving the remembered online host row", async () => {

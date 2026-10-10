@@ -1146,6 +1146,17 @@ describe("ForkSessionDialog", () => {
         );
         expect(screen.queryByTestId("connect-host-pending")).not.toBeInTheDocument();
       });
+
+      it("spells the collapsible connect-another-host command with isaac omni too", async () => {
+        renderDialog(CODING);
+
+        fireEvent.click(screen.getByTestId("fork-session-connect-host-toggle"));
+        await waitFor(() =>
+          expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+            /^isaac omni host --server '/,
+          ),
+        );
+      });
     });
 
     it("greys submit when the selected host goes offline on a later refetch", () => {
