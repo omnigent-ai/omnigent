@@ -209,7 +209,8 @@ def _framed(obj: dict) -> bytes:
     """
     prefix = b"\n \x16\xa0\x815\x13b\xc6mt2\x90{ noise \xff\x00"  # incl. a stray "{"
     suffix = b"*\x8e\x02\x08\xff\x01 trailing \x00\xfe"
-    return prefix + _json.dumps(obj).encode("utf-8") + suffix
+    # Like cursor-agent (JavaScript): non-ASCII text is raw UTF-8, not \uXXXX escapes.
+    return prefix + _json.dumps(obj, ensure_ascii=False).encode("utf-8") + suffix
 
 
 def _pending_tool_call_obj(tool_call_id: str, tool_name: str, args: dict) -> dict:
@@ -230,19 +231,26 @@ def _tool_result_obj(tool_call_id: str) -> dict:
     }
 
 
-def test_iter_embedded_json_recovers_from_enclosing_garbage() -> None:
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        pytest.param(b'{"k": ', b" trailing-bad}", id="invalid-json"),
+        pytest.param(b'{"k": \xff\xfe ', b" }", id="invalid-utf8"),
+    ],
+)
+def test_iter_embedded_json_recovers_from_enclosing_garbage(prefix: bytes, suffix: bytes) -> None:
     """A stray opener whose braces balance AROUND the real object must not hide it.
 
     Large cursor checkpoint frames contain binary that can form a ``{ … }`` span
-    enclosing a real message object while itself being invalid JSON. The scanner
-    must keep going (advance by one) and still extract the inner object — not
-    jump past the whole failed span (which dropped genuinely-pending tool calls,
-    e.g. MCP, in big frames).
+    enclosing a real message object while itself being invalid JSON (or not even
+    valid UTF-8). The scanner must keep going (advance by one) and still extract
+    the inner object — not jump past the whole failed span (which dropped
+    genuinely-pending tool calls, e.g. MCP, in big frames).
     """
     inner = _json.dumps(_pending_tool_call_obj("call_mcp\nfc", "omnigent-list_comments", {"x": 1}))
-    # Leading "{"k": … <inner> … bad}" balances at the trailing brace but fails
-    # to parse; the genuine object is nested inside it.
-    raw = b'{"k": ' + inner.encode("utf-8") + b" trailing-bad}"
+    # The enclosing span balances at its trailing brace but fails to parse; the
+    # genuine object is nested inside it.
+    raw = prefix + inner.encode("utf-8") + suffix
     objs = cnp._iter_embedded_json_objects(raw)
     names = [
         p.get("toolName")
@@ -272,6 +280,29 @@ def test_read_pending_detects_framed_gated_tool_call(tmp_path: Path) -> None:
     assert calls[0] == CursorPendingToolCall(
         tool_call_id="call_abc\nfc_1", tool_name="Delete", args={"path": "/x/hello.txt"}
     )
+
+
+def test_read_pending_preserves_non_ascii_tool_call_text(tmp_path: Path) -> None:
+    """Raw UTF-8 in a framed pending call's args (accents, quotes, CJK, emoji) survives intact."""
+    prompt = "Which café style — “classic” or ‘modern’? 日本語 \U0001f389"
+    args: dict = {
+        "title": "Pick a style",
+        "questions": [
+            {
+                "id": "style",
+                "prompt": prompt,
+                "options": [{"id": "a", "label": "Crème brûlée"}],
+            }
+        ],
+    }
+    store = tmp_path / "store.db"
+    _write_store(store, [_framed(_pending_tool_call_obj("call_utf8\nfc_9", "AskQuestion", args))])
+
+    calls = read_cursor_pending_tool_calls(store)
+
+    assert calls == [
+        CursorPendingToolCall(tool_call_id="call_utf8\nfc_9", tool_name="AskQuestion", args=args)
+    ]
 
 
 def test_read_pending_suppresses_resolved_call(tmp_path: Path) -> None:
