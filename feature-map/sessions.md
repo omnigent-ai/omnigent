@@ -31,6 +31,10 @@ the header menu), and each place is a separate entry point.
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
+- `project-preview`: an expanded project shows sessions updated in the last
+  three days, and at least its three newest. Open, selected, running, and
+  awaiting-approval sessions stay visible. Show more and Show less reveal or
+  hide the rest.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
@@ -80,6 +84,10 @@ that slot.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (archive, unarchive, delete).
+
+**Project preview:** expand a project folder in the desktop sidebar or mobile
+sidebar drawer. Choose Show more to reveal older sessions and page through the
+rest; choose Show less to return to the preview.
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, rename, archive or unarchive, and delete. Clicking the title also
@@ -195,6 +203,11 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
+- **`project-preview`, desktop sidebar and mobile drawer:**
+  `tests/e2e_ui/sessions/test_project_session_preview.py::test_project_session_preview`
+  runs both layouts. It shows six fresh sessions, then moves the browser clock
+  four days ahead to check the three-session preview, Show more, Show less, and
+  unchanged project membership.
 - **`pin-undo`, sidebar row:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_undo_unpin_restores_pinned_slot`.
   The row menu (mobile) and header menu Unpin have web unit coverage only:
@@ -464,6 +477,9 @@ plain `uv run pytest`, which starts a private server for the test.
   not open a session. Workspace must not hide the canvas or change session
   focus; both panels resize to leave room for the conversation controls.
 
+- The project preview judges age by the browser's clock against each
+  session's last update. New sessions are always recent, so prove hiding by
+  moving the browser clock forward rather than by creating more sessions.
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header
