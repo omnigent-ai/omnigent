@@ -34,6 +34,15 @@ class Omnigent < Formula
   # relocate them -- hence the Rust toolchain and the RUSTFLAGS below.
   depends_on "pkgconf" => :build
   depends_on "rust" => :build
+  # Apple Silicon only. homebrew-core stopped publishing `sequoia` bottles for
+  # rust, cryptography, libyaml, pydantic, rpds-py and tmux, so an Intel install
+  # would have to build all of those from source first; test-bot skipped the
+  # formula there outright and every release since 0.6.0 shipped arm-only bottles.
+  # Fail fast with a clear message instead of pouring arm64 wheels onto an Intel
+  # Mac. Keep in sync with DEFAULT_PLATFORMS in generate_formula.py.
+  # Placement is what FormulaAudit/DependencyOrder wants: after `=> :build`, before
+  # the named runtime deps.
+  depends_on arch: :arm64
   # certifi, cryptography, pydantic (which bundles pydantic-core), and rpds-py
   # are provided by Homebrew formulae rather than built as virtualenv resources.
   # The compiled ones would otherwise need a Rust/C build, and their transitive
