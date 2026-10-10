@@ -192,6 +192,8 @@ from omnigent.runner.subagent_work import (
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    note_subagent_child_activity,
+    settle_spurious_subagent_rearm,
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
@@ -403,6 +405,10 @@ _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # final long round covers a server that is reachable but slow to become ready;
 # rounds cost nothing once no parent is stranded (the loop exits early).
 _STRANDED_WAKE_RETRY_DELAYS_S = (2.0, 5.0, 10.0, 30.0)
+# How long a child re-armed by its own ``running`` edge may read ``idle`` again
+# before that re-arm is treated as a stale status-file read rather than a turn.
+# The forwarder's ``Stop`` for a real turn lands well within this window.
+_SUBAGENT_REARM_SETTLE_GRACE_S = 30.0
 
 # Cadence for ``session.heartbeat`` keepalive events on the runner's
 # ``GET /v1/sessions/{id}/stream`` endpoint. Between turns the event
@@ -1229,6 +1235,7 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
+    app.state.session_harness_overrides = _session_harness_overrides
     # session_id → revision of the agent bundle its caches were built from
     _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
@@ -1618,6 +1625,80 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
+    # Child -> pending settle of a provisional re-arm (see _settle_subagent_rearm_later).
+    _rearm_settle_tasks: dict[str, asyncio.Task[None]] = {}
+    app.state.rearm_settle_tasks = _rearm_settle_tasks
+
+    def _cancel_subagent_rearm_settle(child_id: str) -> None:
+        task = _rearm_settle_tasks.pop(child_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _note_subagent_child_activity(child_id: str) -> None:
+        """Re-arm a finished dispatch on new child activity and show an idle SDK parent waiting."""
+        # New activity invalidates a settle scheduled for an earlier idle read.
+        _cancel_subagent_rearm_settle(child_id)
+        entry = note_subagent_child_activity(child_id)
+        if entry is None:
+            return
+        parent_id = entry.parent_session_id
+        # A parent mid-turn derives ``waiting`` at its own turn end; a native
+        # parent's status is owned by its terminal (``_publish_turn_status`` skips
+        # it). No status published in this process means no turn in flight here.
+        if parent_id in _active_turns or _native_pane_status.get(parent_id) not in (None, "idle"):
+            return
+        _publish_turn_status(parent_id, "waiting")
+
+    def _settle_subagent_rearm_later(child_id: str) -> None:
+        """Undo a re-arm the file's own ``idle`` contradicts and no ``Stop`` confirms in time."""
+        entry = get_subagent_work(child_id)
+        if entry is None or not entry.rearmed or entry.status != "running":
+            return
+        pending = _rearm_settle_tasks.get(child_id)
+        if pending is not None and not pending.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _logger.warning(
+                "Sub-agent re-arm settle skipped off-loop for %s; the dispatch may stay live",
+                child_id,
+                extra={"session_id": child_id},
+            )
+            return
+
+        async def _settle() -> None:
+            await _subagent_work._wake_retry_sleep(_SUBAGENT_REARM_SETTLE_GRACE_S)
+            if get_subagent_work(child_id) is not entry:
+                return
+            reverted = settle_spurious_subagent_rearm(child_id)
+            if reverted is None:
+                return
+            parent_id = reverted.parent_session_id
+            # The parent reads waiting only because of re-armed children; once the
+            # last of them settles with no turn of its own in flight, it is idle.
+            if (
+                parent_id not in _active_turns
+                and parent_id not in _live_response_id
+                and _native_pane_status.get(parent_id) == _effective_waiting_status()
+                and not any(
+                    e.status in ("launching", "running", "waiting")
+                    for e in list_subagent_work(parent_id)
+                )
+            ):
+                _publish_turn_status(parent_id, "idle")
+
+        task = loop.create_task(_settle(), name=f"subagent-rearm-settle:{child_id}")
+        _rearm_settle_tasks[child_id] = task
+        _background_tasks.add(task)
+
+        def _drop_settle(done: asyncio.Task[None]) -> None:
+            _background_tasks.discard(done)
+            if _rearm_settle_tasks.get(child_id) is done:
+                _rearm_settle_tasks.pop(child_id, None)
+
+        task.add_done_callback(_drop_settle)
+
     def _publish_session_status(
         session_id: str,
         status: str,
@@ -1626,6 +1707,17 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if status in ("running", "waiting", "idle") and (
+            _session_harness_name(session_id) == "claude-native"
+        ):
+            # Claude's status-file poller publishes a claude-native child's
+            # ``running`` here, never on ``/events``, and only its stale ``busy``
+            # needs settling. Other harnesses' pane repaints also arrive here and
+            # neither mark nor end a turn.
+            if status == "idle":
+                _settle_subagent_rearm_later(session_id)
+            else:
+                _note_subagent_child_activity(session_id)
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -3501,6 +3593,12 @@ def create_runner_app(
         agent = native_coding_agent_for_harness(_session_harness_name(conv_id))
         return agent is not None and agent.key in _TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS
 
+    def _effective_waiting_status() -> str:
+        """``waiting`` when the server renders it; an older server is shown ``running``."""
+        if _server_version is not None and _version_supports_waiting_status(_server_version):
+            return "waiting"
+        return "running"
+
     def _publish_turn_status(
         conv_id: str,
         status: str,
@@ -3509,10 +3607,8 @@ def create_runner_app(
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
     ) -> None:
-        if status == "waiting" and not (
-            _server_version is not None and _version_supports_waiting_status(_server_version)
-        ):
-            status = "running"
+        if status == "waiting":
+            status = _effective_waiting_status()
         harness = _session_harness_name(conv_id)
         if status != "failed" and harness in {
             "claude-native",
@@ -6543,6 +6639,10 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+            if status in ("running", "waiting"):
+                # New activity from a child whose result was already delivered
+                # or drained is a turn Claude Code started on its own.
+                _note_subagent_child_activity(conversation_id)
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
             interrupt_pending = False
             interrupt_work_id: str | None = None
