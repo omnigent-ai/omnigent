@@ -31,6 +31,9 @@ def main() -> None:
     :raises SystemExit: If neither / both of ``--server`` and ``--local``
         are provided.
     """
+    # Captured before anything mutates it: runner launches treat later changes
+    # to this process's environment as host-owned overrides of the manifest.
+    launch_env = dict(os.environ)
     parser = argparse.ArgumentParser(
         description="Background host daemon",
     )
@@ -107,6 +110,8 @@ def main() -> None:
             server_url=server_url,
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
+            runner_env_target=daemon_target,
+            launch_env=launch_env,
         )
     finally:
         lifecycle_lock.release()

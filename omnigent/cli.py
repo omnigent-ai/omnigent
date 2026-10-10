@@ -72,12 +72,18 @@ from omnigent.host.daemon_lifecycle import (
     daemon_registry_dir as _daemon_registry_dir_for,
 )
 from omnigent.host.daemon_lifecycle import (
+    delete_runner_env_manifest as _delete_runner_env_manifest_impl,
+)
+from omnigent.host.daemon_lifecycle import (
     normalize_daemon_target as _normalize_daemon_target_impl,
 )
 from omnigent.host.daemon_lifecycle import (
     record_flock_is_held as _record_flock_is_held,
 )
 from omnigent.host.daemon_lifecycle import write_daemon_record as _write_daemon_record_impl
+from omnigent.host.daemon_lifecycle import (
+    write_runner_env_manifest as _write_runner_env_manifest_impl,
+)
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     LocalServerStartupError,
@@ -2876,6 +2882,7 @@ def _delete_daemon_record(record: _HostDaemonRecord) -> None:
     """
     with contextlib.suppress(OSError):
         _daemon_record_path(record.target).unlink()
+    _delete_runner_env_manifest_impl(record.target, base_dir=_HOST_PID_PATH.parent)
     legacy = _read_host_pid_file()
     if legacy is not None and legacy[1] == record.target:
         with contextlib.suppress(OSError):
@@ -3064,10 +3071,14 @@ class _DaemonReuseDecision:
         Distinct from a transparent tunnel-health heal — only a config
         change forces the caller to ask the user to re-run, because the
         server was restarted into a different auth posture mid-command.
+    :param background: ``True`` when the reused daemon was spawned detached by
+        this CLI. Such a daemon launches runners from its target's runner-env
+        manifest, so the caller republishes its own environment for it.
     """
 
     reuse: bool
     config_changed: bool
+    background: bool = False
 
 
 def _daemon_owner_is_live(record: _HostDaemonRecord) -> bool:
@@ -3136,7 +3147,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         # concern; its own reconnect loop covers transient tunnel drops). Keep
         # the original PID-liveness reuse so a live daemon for the URL is
         # reused as-is.
-        return _DaemonReuseDecision(reuse=True, config_changed=False)
+        return _DaemonReuseDecision(reuse=True, config_changed=False, background=background)
 
     if not background:
         # Foreground host / legacy host.pid: keep prior behavior — a
@@ -3157,7 +3168,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     if age_s >= _DAEMON_REUSE_MIN_AGE_S and not _daemon_tunnel_recovers(existing):
         _terminate_host_unit(existing, reason="host tunnel is offline")
         return _DaemonReuseDecision(reuse=False, config_changed=False)
-    return _DaemonReuseDecision(reuse=True, config_changed=False)
+    return _DaemonReuseDecision(reuse=True, config_changed=False, background=True)
 
 
 def _local_daemon_serves_target(target: str, server_url: str | None) -> bool:
@@ -3536,6 +3547,10 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
 
     decision = _reuse_existing_daemon_record(target)
     if decision.reuse:
+        if decision.background:
+            # The reused daemon keeps serving; hand it this invocation's
+            # environment for the runners it launches next.
+            _publish_runner_env_manifest(target, _build_host_daemon_env(server_url=server_url))
         _record_host_state("reused")
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
@@ -3549,6 +3564,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     args = [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *mode_args]
     config_sig = server_config_signature(include_features=not server_url)
     daemon_env = _build_host_daemon_env(server_url=server_url)
+    _publish_runner_env_manifest(target, daemon_env)
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
     expected_host_id = _load_existing_host_id()
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
@@ -3605,7 +3621,10 @@ def _build_host_daemon_env(
     but unrelated shell secrets are not inherited merely because the daemon
     runs on the user's machine. Runners launched by the daemon still pass
     through :func:`omnigent.host.connect._build_runner_env`, so these
-    local-server credentials do not leak into runner subprocesses.
+    local-server credentials do not leak into runner subprocesses. Variables
+    the host owner names in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` are copied in
+    both modes: the daemon-to-runner passthrough can only forward what reached
+    the daemon.
 
     :param server_url: Omnigent server URL for remote mode, e.g.
         ``"https://example.databricksapps.com"``, or a falsey value
@@ -3615,6 +3634,7 @@ def _build_host_daemon_env(
     from omnigent.host.connect import (
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
+        runner_env_passthrough_names,
     )
     from omnigent.host.identity import (
         HOST_ID_ENV_VAR,
@@ -3629,6 +3649,7 @@ def _build_host_daemon_env(
             HOST_TOKEN_ENV_VAR,
         }
     )
+    passthrough_names = runner_env_passthrough_names(os.environ)
 
     if not server_url:
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
@@ -3639,6 +3660,7 @@ def _build_host_daemon_env(
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in passthrough_names
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3653,6 +3675,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in passthrough_names
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later
@@ -3667,6 +3690,23 @@ def _build_host_daemon_env(
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
     return env
+
+
+# Local-server-only settings never reach runners; keep them out of the on-disk
+# manifest (the database URI may embed a password).
+_RUNNER_ENV_MANIFEST_EXCLUDED: frozenset[str] = frozenset({"OMNIGENT_DATABASE_URI"})
+
+
+def _publish_runner_env_manifest(target: str, daemon_env: Mapping[str, str]) -> None:
+    """Publish this invocation's sanitized env for *target*'s daemon.
+    A failed write keeps the previous manifest and is only logged."""
+    env = {k: v for k, v in daemon_env.items() if k not in _RUNNER_ENV_MANIFEST_EXCLUDED}
+    try:
+        _write_runner_env_manifest_impl(target, env, base_dir=_HOST_PID_PATH.parent)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Could not publish the runner environment for host daemon %r", target, exc_info=True
+        )
 
 
 def _read_host_pid_file() -> tuple[int, str] | None:

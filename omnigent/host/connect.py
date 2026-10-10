@@ -57,7 +57,7 @@ from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
-from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+from omnigent.host.daemon_lifecycle import DaemonLifecycleLock, read_runner_env_manifest
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
@@ -786,6 +786,16 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
 # their runners need; everything unnamed stays behind the allowlist.
 RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
 
+
+def runner_env_passthrough_names(env: Mapping[str, str]) -> frozenset[str]:
+    """Return the names listed in *env*'s :data:`RUNNER_ENV_PASSTHROUGH_ENV_VAR`."""
+    return frozenset(
+        name.strip()
+        for name in env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
+        if name.strip()
+    )
+
+
 # HTTP statuses on the WebSocket upgrade that are worth retrying. Everything
 # else in the 4xx range is a permanent client error (auth, authorization,
 # wrong/old server) where reconnecting can never succeed — those fail loud.
@@ -878,11 +888,7 @@ def _build_runner_env(
         host janitor. ``None`` preserves the standalone runner default.
     :returns: The runner subprocess environment.
     """
-    extra_names = {
-        name.strip()
-        for name in base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
-        if name.strip()
-    }
+    extra_names = runner_env_passthrough_names(base_env)
     # Forward env vars that the providers config references via
     # ``api_key_ref: env:VAR`` or ``api_key: $VAR``. Without this, a user
     # who configures a gateway provider with a custom env var (e.g.
@@ -1144,6 +1150,8 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        runner_env_target: str | None = None,
+        launch_env: Mapping[str, str] | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1154,8 +1162,18 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param runner_env_target: Registry target whose runner-env manifest
+            (published by each CLI invocation that ensures the daemon) supplies
+            the base environment for runner launches. ``None`` launches runners
+            from this process's own environment.
+        :param launch_env: This process's environment as it was launched,
+            before host initialization changed it. Variables that differ from
+            it at launch time are host-owned and override the manifest.
+            Defaults to the environment at construction.
         """
         self._identity = identity
+        self._runner_env_target = runner_env_target
+        self._launch_env = dict(launch_env if launch_env is not None else os.environ)
         self._server_url = server_url.rstrip("/")
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
@@ -1325,6 +1343,18 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+
+    def _runner_launch_base_env(self) -> Mapping[str, str]:
+        """Return the env runner launches are filtered from: the latest published
+        manifest with host-set variables on top for background daemons, else
+        ``os.environ``."""
+        if self._runner_env_target is None:
+            return os.environ
+        manifest = read_runner_env_manifest(self._runner_env_target)
+        if manifest is None:
+            return os.environ
+        host_owned = {k: v for k, v in os.environ.items() if self._launch_env.get(k) != v}
+        return {**manifest, **host_owned}
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -1903,8 +1933,9 @@ class HostProcess:
             self._current_auth_token,
             initialize=False,
         )
+        base_env = await asyncio.to_thread(self._runner_launch_base_env)
         env = _build_runner_env(
-            os.environ,
+            base_env,
             server_url=self._server_url,
             runner_id=runner_id,
             binding_token=frame.binding_token,
@@ -4982,6 +5013,8 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
+    runner_env_target: str | None = None,
+    launch_env: Mapping[str, str] | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -5001,6 +5034,12 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :param runner_env_target: Registry target whose runner-env manifest feeds
+        runner launches (see :class:`HostProcess`). Background daemons pass
+        their own target; a foreground host leaves it ``None`` and launches
+        runners from its own environment.
+    :param launch_env: The daemon's environment at process start, captured
+        before host initialization mutates it (see :class:`HostProcess`).
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -5160,6 +5199,8 @@ def _serve_host_until_exit(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        runner_env_target=runner_env_target,
+        launch_env=launch_env,
     )
     try:
         asyncio.run(host.run())

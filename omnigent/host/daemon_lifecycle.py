@@ -23,6 +23,9 @@ import hashlib
 import json
 import logging
 import os
+import stat
+import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -38,6 +41,7 @@ _logger = logging.getLogger(__name__)
 
 _LOCAL_DAEMON_MARKER = "local"
 DAEMON_CONFIG_SIG_ENV_VAR = "OMNIGENT_HOST_DAEMON_CONFIG_SIG"
+RUNNER_ENV_MANIFEST_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -137,6 +141,91 @@ def write_daemon_record(
     path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
     if update_legacy_pidfile:
         (root / "host.pid").write_text(f"{record.pid}\n{record.target}\n")
+
+
+def runner_env_manifest_path(target: str, *, base_dir: Path | None = None) -> Path:
+    """Return the runner-env manifest path for *target*: the latest CLI invocation's
+    sanitized env, kept under ``daemons/runner-env/`` so ``daemons/*.json`` scans
+    never read it as a daemon record."""
+    return daemon_registry_dir(base_dir) / "runner-env" / f"{_target_digest(target)}.json"
+
+
+def write_runner_env_manifest(
+    target: str, env: Mapping[str, str], *, base_dir: Path | None = None
+) -> Path:
+    """Atomically write *env* as *target*'s owner-only (0600) manifest; return its path."""
+    path = runner_env_manifest_path(target, base_dir=base_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        {"version": RUNNER_ENV_MANIFEST_VERSION, "env": dict(env)}, sort_keys=True
+    )
+    fd, temp_name = tempfile.mkstemp(prefix=".env-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+        os.replace(temp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_name)
+        raise
+    return path
+
+
+def _owned_private_file(info: os.stat_result) -> bool:
+    """Return whether *info* describes a regular file only this user can write."""
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    if not hasattr(os, "getuid"):
+        return True
+    return info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+
+def read_runner_env_manifest(
+    target: str, *, base_dir: Path | None = None
+) -> dict[str, str] | None:
+    """Return *target*'s manifest env, or ``None`` when absent or untrusted (symlink,
+    foreign-owned or group/other-accessible file, malformed JSON). Never logs values;
+    the result feeds every runner launch."""
+    path = runner_env_manifest_path(target, base_dir=base_dir)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    except OSError:
+        _logger.warning("ignoring unreadable runner env manifest %s", path, exc_info=True)
+        return None
+    try:
+        if not _owned_private_file(os.fstat(fd)):
+            _logger.warning(
+                "ignoring runner env manifest %s: not a private file owned by this user", path
+            )
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        _logger.warning("ignoring unreadable runner env manifest %s", path, exc_info=True)
+        return None
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    env = payload.get("env") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != RUNNER_ENV_MANIFEST_VERSION
+        or not isinstance(env, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+    ):
+        _logger.warning("ignoring malformed runner env manifest %s", path)
+        return None
+    return dict(env)
+
+
+def delete_runner_env_manifest(target: str, *, base_dir: Path | None = None) -> None:
+    """Remove the runner-env manifest for *target*, if any."""
+    with contextlib.suppress(OSError):
+        runner_env_manifest_path(target, base_dir=base_dir).unlink(missing_ok=True)
 
 
 def record_flock_is_held(record_path: Path) -> bool | None:
