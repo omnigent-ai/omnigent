@@ -1767,20 +1767,24 @@ def register_core_routes(
         if not accessible:
             return []
 
-        def _load_sessions(ids: list[str]) -> list[Conversation]:
+        def _load_sessions(ids: list[str]) -> list[tuple[str, Conversation]]:
             """Bulk-load the accessible conversations that are sessions
             (non-null ``agent_id``) in one batched store call, preserving
-            the caller's id order for deterministic output."""
+            the caller's id order for deterministic output. Each row is
+            paired with the watched spelling that found it: entity ids read
+            back bare hex, while ``perms_by_conv`` is keyed by the watched
+            spelling, so grants must be looked up by the latter."""
             by_id = conversation_store.get_conversations(ids)
             return [
-                conv
+                (cid, conv)
                 for cid in ids
                 if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
             ]
 
-        convs = await asyncio.to_thread(_load_sessions, accessible)
-        if not convs:
+        watched_convs = await asyncio.to_thread(_load_sessions, accessible)
+        if not watched_convs:
             return []
+        convs = [conv for _, conv in watched_convs]
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
         conv_ids = [c.id for c in convs]
         agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
@@ -1796,7 +1800,7 @@ def register_core_routes(
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
-                grants=perms_by_conv.get(conv.id, []),
+                grants=perms_by_conv.get(watched_id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
@@ -1804,7 +1808,7 @@ def register_core_routes(
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
             )
-            for conv in convs
+            for watched_id, conv in watched_convs
         ]
         await _apply_liveness_to_items(items, liveness_lookup)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
@@ -2104,9 +2108,13 @@ def register_core_routes(
                 # A client disconnect is the normal terminal condition; any
                 # other exception is a real bug worth surfacing in logs.
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                    # exc_info: a bare repr names the exception but not the
+                    # frame that raised it, which is the only thing that makes
+                    # a crash here actionable.
                     _logger.warning(
                         "session-updates stream task crashed: %r",
                         exc,
+                        exc_info=exc,
                         extra=debug_event("session_updates", phase="error"),
                     )
         finally:
