@@ -178,14 +178,19 @@ readiness; name pending publication/review steps in `remaining_work`.
   review mode, record the reviewed PR head. Keep recovered before-clips and
   captions unchanged. Each after-clip's caption lists the actions shown, ending
   with the corrected behavior. A missing before-clip is not a reason to skip
-  the after-clip. Use `[]` only for internal/API-only results with no visible
-  user interaction, or when recording is blocked as described above.
+  the after-clip, and a blocked after-clip is not a reason to drop a recovered
+  before-clip. Use `[]` only for internal/API-only results with no visible
+  user interaction, or when recording is blocked as described above and no
+  before-clip was recovered.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 
   - For internal/API-only results, say there is no visible user interaction
     and put the written before/after evidence in the PR Demo section.
   - For a recording failure, name the missing tool or the environment problem.
+    When the restored Repro bundle carried a recording driver or capture method
+    for that surface, also name the Repro driver path or command you ran and its
+    observed result; a different lane's failure does not stand in for it.
     Text-only CLI output is not a reason to skip recording.
   - Do not substitute a video of test output or a made-up demonstration.
     Missing or rejected footage must not block the fix or PR.

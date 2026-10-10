@@ -41,8 +41,11 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    through **and** produce the after; when it carries none, still produce the
    after and note the missing before. Only omit the after clip when it is
    genuinely unobtainable (recorder tooling missing, or the fixture can't come
-   online after the SPA build **and** the leaked runner env is stripped) — say so
-   explicitly in your review comment and in `evidence`, naming the blocker. An
+   online after the SPA build **and** the leaked runner env is stripped **and**
+   the capture method the Repro bundle retained for that surface, if any, was
+   run and failed too) — say so explicitly in your review comment and in
+   `evidence`, naming the blocker and the Repro driver you ran. The inherited
+   before clip stays declared even then. An
    `online: false` seen while `OMNIGENT_RUNNER_ID` is still set is your own
    un-stripped env, not a blocker: re-run with the `env -u` prefix from
    `dev/recording-lanes.md` first. A missing upstream before-clip is never that

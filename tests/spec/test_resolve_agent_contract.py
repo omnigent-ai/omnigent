@@ -301,7 +301,42 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
 
     assert "name the specific blocker in `recording_unavailable_reason`" in normalized
     assert "Text-only CLI output is not a reason to skip recording" in normalized
+    assert "run that driver and setup first" in normalized
+    assert "The inherited before clip stays declared even then" in normalized
+    assert "no before-clip was recovered" in normalized
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
+
+    # Pin the final-review.md gate at its own source; the aggregate checks above
+    # could survive if only this entry point's Repro-attempt requirement vanished.
+    final_review_gate = " ".join(
+        (_RESOLVE_AGENT / "skills" / "resolve-drive-pr" / "final-review.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    assert (
+        "established after running any capture method the Repro bundle retained "
+        "for that surface" in final_review_gate
+    )
+    assert "keeping the inherited before-clip declared" in final_review_gate
+
+    # Pin the failure-evidence and inherited-clip requirements at each skill's own
+    # source, so a regression in resolve-author-fix or resolve-handoff is caught
+    # individually instead of being masked by the other skill.
+    author_fix = " ".join(
+        (_RESOLVE_AGENT / "skills" / "resolve-author-fix" / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    assert "name the Repro driver path or command you ran and its observed result" in author_fix
+    assert "re-declare the recovered clip in `recordings` with its caption unchanged" in author_fix
+
+    handoff = " ".join(
+        (_RESOLVE_AGENT / "skills" / "resolve-handoff" / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    assert "name the Repro driver path or command you ran and its observed result" in handoff
+    assert "a blocked after-clip is not a reason to drop a recovered before-clip" in handoff
 
 
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:

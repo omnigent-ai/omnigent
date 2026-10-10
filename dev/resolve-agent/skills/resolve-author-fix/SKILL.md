@@ -181,7 +181,10 @@ If any live facet can't be made to pass with a real fix, say so honestly rather
 than shipping a hollow green.
 
 **Record the result after the fix.** Use the recovered reproduction test and
-journey to prepare the recording, even if the earlier run left no video.
+journey to prepare the recording, even if the earlier run left no video. When
+the restored Repro bundle carries a recording driver or its handoff describes
+how the surface was filmed, run that driver and setup first; it is the proven
+route to the state you need to show.
 See [`dev/recording-lanes.md`](../../../recording-lanes.md) for setup and recording
 steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 
@@ -196,16 +199,25 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
   `kind: "after"`, and include it in the PR Demo section and handoff.
 - Keep any recovered before-clip unchanged. A missing before-clip is not a
   reason to skip the after-clip; note the missing before-clip in your evidence.
+  A skipped after-clip is not a reason to drop the before-clip either:
+  re-declare the recovered clip in `recordings` with its caption unchanged.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the before/after result
   in your evidence and the PR Demo section.
 - If recording is blocked by missing tools or an environment that cannot run
-  the journey, set `recordings: []` and name the specific blocker in
-  `recording_unavailable_reason`. Do not block the fix or PR because footage is
-  missing or rejected; explain the gap and continue. Only report clips you
-  actually produced.
+  the journey, leave the after-clip out of `recordings` (a recovered
+  before-clip stays declared) and name the specific blocker in
+  `recording_unavailable_reason`. Claim that environment only after the Repro
+  bundle's capture method for that surface, if it carries one, has been run;
+  name the Repro driver path or command you ran and its observed result. Do not
+  block the fix or PR because footage is missing or rejected; explain the gap
+  and continue. Only report clips you actually produced.
 
 Build the SPA before starting the recorder. If you are inside a server-spawned
 runner (`OMNIGENT_RUNNER_ID` is set), strip the inherited runner/host variables
 as described in `dev/recording-lanes.md`. If the recorder reports `online: false`,
-retry with those variables removed before reporting an environment blocker.
+retry with those variables removed before reporting an environment blocker. A
+fixture lane that still reads `No host bound` or `online: false` after that retry
+says nothing about the Repro bundle's own host-binding recipe (for example
+`omnigent host --server <url>` bound to the session); run that recipe before
+reporting that no host can bind.

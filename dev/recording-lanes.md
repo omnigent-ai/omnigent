@@ -17,8 +17,9 @@ which clip `kind` it produces and where it goes; this file is the how.
 
 The recording driver may be an existing test or a temporary journey script,
 separate from the selected regression coverage. Retain its source and command
-as evidence for before/after replay. Recording does not require committing the
-driver as a permanent test.
+as evidence for before/after replay: resolve-agent runs that retained driver
+and setup before declaring the surface unfilmable. Recording does not require
+committing the driver as a permanent test.
 
 ## When to record
 
@@ -51,9 +52,23 @@ the `cli` section below for setup steps.
 Recording is **best-effort**:
 
 - If a required tool is missing or the product cannot reach the state you need
-  to show, set `recordings: []` for that facet. Name the specific blocker in
-  `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
-  that cannot start.
+  to show, set `recordings: []` for that facet, but only when no inherited clip
+  exists for it. Name the specific blocker in `recording_unavailable_reason`,
+  such as missing `vhs` or `ttyd`, or a server that cannot start.
+- **Run the Repro bundle's capture method before claiming a blocker.** On a
+  resolve run, when the restored Repro bundle carries a recording driver, or its
+  handoff describes how the same surface was filmed (for example a real host
+  started with `omnigent host --server <url>`, bound to the session with
+  `POST /v1/hosts/{host_id}/runners`, and the SPA driven against it), run that
+  driver and setup with the recorder on before you conclude the product cannot
+  reach the state. A failure in a different lane — the `tests/e2e_ui/` fixture's
+  own spawned runner reading `No host bound` or `online: false` — is evidence
+  about that lane only, not proof that no host can bind here. If the Repro
+  method also fails, `recording_unavailable_reason` names the Repro driver path
+  or command you ran and its observed result.
+- A skipped `after` clip does not remove the inherited `before` clip: keep it
+  declared in `recordings` with its caption unchanged, and reserve
+  `recordings: []` for a facet with no inherited clip either.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
@@ -121,14 +136,19 @@ concluding anything; do **not** file it as an environmental blocker or a "runner
 not coming online" env problem. Once the SPA is built, the env is stripped, and the
 spawned runner still doesn't reach `online: true` within the fixture's timeout,
 capture the tail of the fixture's `runner.log`, treat that lane as genuinely
-unreachable here, keep `recordings: []` for it, and say plainly **"recorder's test
-server did not come online in time"** with the `runner.log` tail — noting whether
+unreachable here, keep `recordings: []` for it only when no inherited clip
+exists, and say plainly **"recorder's test server did not come online in
+time"** with the `runner.log` tail — noting whether
 the log was empty (the leaked-env/zygote hang) or showed a later failure, so the
 cause is named from what you observed rather than guessed.
 
 ## `web` facets
 
-Run the selected Playwright journey driver with recording on.
+Run the selected Playwright journey driver with recording on. On a resolve run,
+start with the driver and setup the restored Repro bundle retained for this
+surface (see *If recording is blocked*); the `tests/e2e_ui/` fixture's spawned
+runner is one way to reach a bound host, not the only one. The `terminal` lane
+below records the same way, so this applies to native-harness panes too.
 
 **Record via `OMNIGENT_E2E_RECORD_DIR`, not `--video on`.** `--video on` only
 instruments pytest-playwright's own `page` fixture. Many e2e_ui tests (e.g. the

@@ -26,6 +26,13 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Name the specific blocker in `recording_unavailable_reason`" in lanes
     assert "Text-only CLI output is not a reason to skip recording" in lanes
     assert "A missing recording from an earlier run is not a reason either" in lanes
+    assert "Run the Repro bundle's capture method before claiming a blocker" in lanes
+    assert "names the Repro driver path or command you ran and its observed result" in lanes
+    assert "A skipped `after` clip does not remove the inherited `before` clip" in lanes
+    # The older empty-list instructions must defer to an inherited before-clip,
+    # or an agent could still drop a recovered clip when the capture lane fails.
+    assert "for that facet, but only when no inherited clip exists for it" in lanes
+    assert "keep `recordings: []` for it only when no inherited clip exists" in lanes
     assert "Do not block the verdict, fix, or PR" in lanes
 
 
