@@ -9,10 +9,14 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from omnigent.harnesses.kiro_native.bridge import acp_record_path, send_kiro_permission_verdict
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _logger = logging.getLogger(__name__)
 
@@ -186,6 +190,51 @@ def _read_new_permission_events(
     return events, new_offset
 
 
+class _VerdictDeliveryProbe:
+    """Tail Kiro's recorder for one parked request while its verdict is delivered.
+
+    Each check parses only the recorder bytes appended since the previous one.
+    """
+
+    def __init__(
+        self,
+        record_file: Path,
+        offset: int,
+        request_id: str,
+        other_requests_queued: Callable[[], bool],
+    ) -> None:
+        self._record_file = record_file
+        self._offset = offset
+        self._request_id = request_id
+        self._other_requests_queued = other_requests_queued
+        self._recorded = False
+        self._other_request_seen = False
+
+    def _advance(self) -> None:
+        events, self._offset = _read_new_permission_events(self._record_file, self._offset)
+        for event in events:
+            if event.kind == "response" and event.request_id == self._request_id:
+                self._recorded = True
+            elif event.kind == "request" and event.request_id != self._request_id:
+                self._other_request_seen = True
+
+    def verdict_recorded(self) -> bool:
+        """Whether Kiro recorded this request's response; stays set once seen."""
+        if not self._recorded:
+            self._advance()
+        return self._recorded
+
+    def resend_allowed(self) -> bool:
+        """Whether no other permission request is known to be outstanding.
+
+        Another request queued in the mirror, or appended to the recorder since
+        delivery began, could consume a resent key; once seen it stays unsafe.
+        """
+        if not self._other_request_seen:
+            self._advance()
+        return not self._other_request_seen and not self._other_requests_queued()
+
+
 async def supervise_kiro_permission_mirror(
     *,
     base_url: str,
@@ -253,6 +302,7 @@ async def supervise_kiro_permission_mirror(
                             bridge_dir=bridge_dir,
                             permission=permission,
                             elicitation_id=elicitation_id,
+                            other_requests_queued=lambda: bool(queued),
                         ),
                         name=f"kiro-permission-{request_id}",
                     )
@@ -276,8 +326,23 @@ async def _run_one_permission(
     bridge_dir: Path,
     permission: KiroPermissionRequest,
     elicitation_id: str,
+    other_requests_queued: Callable[[], bool],
 ) -> None:
-    """Park one Kiro permission request on the server and deliver the verdict."""
+    """Park one Kiro permission request on the server and deliver the verdict.
+
+    ``other_requests_queued`` reports whether the mirror holds further requests
+    behind this one; while it does, a dropped verdict key is never resent.
+    """
+    record_file = acp_record_path(bridge_dir)
+    try:
+        start_offset = record_file.stat().st_size
+    except FileNotFoundError:
+        start_offset = 0
+    except OSError:
+        _logger.exception(
+            "failed to stat kiro ACP recorder %s; scanning its full history", record_file
+        )
+        start_offset = 0
     payload = {
         "elicitation_id": elicitation_id,
         "agent": "Kiro",
@@ -312,11 +377,16 @@ async def _run_one_permission(
     if action not in {"accept", "decline", "cancel"}:
         return
     try:
+        probe = _VerdictDeliveryProbe(
+            record_file, start_offset, permission.request_id, other_requests_queued
+        )
         await asyncio.to_thread(
             send_kiro_permission_verdict,
             bridge_dir,
             action=action,
             expected_title=permission.title,
+            verdict_recorded=probe.verdict_recorded,
+            resend_allowed=probe.resend_allowed,
         )
     except RuntimeError:
         _logger.exception(

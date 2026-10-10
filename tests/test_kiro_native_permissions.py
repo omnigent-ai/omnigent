@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -187,8 +188,17 @@ async def test_run_one_permission_posts_then_delivers_verdict(
 ) -> None:
     delivered: list[tuple[Path, str]] = []
 
-    def _fake_send(bridge_dir: Path, *, action: str, expected_title: str | None = None) -> None:
+    def _fake_send(
+        bridge_dir: Path,
+        *,
+        action: str,
+        expected_title: str | None = None,
+        verdict_recorded: Callable[[], bool] | None = None,
+        resend_allowed: Callable[[], bool] | None = None,
+    ) -> None:
         assert expected_title == "Running: pwd"
+        assert callable(verdict_recorded)
+        assert callable(resend_allowed)
         delivered.append((bridge_dir, action))
 
     monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
@@ -202,6 +212,7 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         bridge_dir=tmp_path,
         permission=req,
         elicitation_id="elic_1",
+        other_requests_queued=lambda: False,
     )
 
     url, body = client.posts[0]
@@ -218,6 +229,102 @@ async def test_run_one_permission_posts_then_delivers_verdict(
         assert delivered == []
     else:
         assert delivered == [(tmp_path, expected_action)]
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_reports_recorded_verdict_for_this_request_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The delivery probe flips only on this request's recorder response, then stays set."""
+    record_file = acp_record_path(tmp_path)
+    record_file.write_bytes(_record_bytes(_permission_msg("req-1")))
+    seen: list[bool] = []
+
+    def _fake_send(
+        bridge_dir: Path,
+        *,
+        action: str,
+        expected_title: str | None = None,
+        verdict_recorded: Callable[[], bool] | None = None,
+        resend_allowed: Callable[[], bool] | None = None,
+    ) -> None:
+        assert verdict_recorded is not None
+        seen.append(verdict_recorded())
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_result_msg("req-2")))
+        seen.append(verdict_recorded())
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_result_msg("req-1")))
+        seen.append(verdict_recorded())
+        seen.append(verdict_recorded())
+
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"})])
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        other_requests_queued=lambda: False,
+    )
+
+    assert seen == [False, False, True, True]
+
+
+@pytest.mark.asyncio
+async def test_run_one_permission_allows_resend_only_while_no_other_request_is_outstanding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resend gate tracks the mirror's queue and requests appended to the recorder."""
+    record_file = acp_record_path(tmp_path)
+    record_file.write_bytes(_record_bytes(_permission_msg("req-1")))
+    mirror_queue = {"other": False}
+    seen: list[bool] = []
+
+    def _fake_send(
+        bridge_dir: Path,
+        *,
+        action: str,
+        expected_title: str | None = None,
+        verdict_recorded: Callable[[], bool] | None = None,
+        resend_allowed: Callable[[], bool] | None = None,
+    ) -> None:
+        assert resend_allowed is not None
+        seen.append(resend_allowed())
+        mirror_queue["other"] = True
+        seen.append(resend_allowed())
+        mirror_queue["other"] = False
+        seen.append(resend_allowed())
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_msg("req-2")))
+        seen.append(resend_allowed())
+        with record_file.open("ab") as handle:
+            handle.write(_record_bytes(_permission_result_msg("req-2")))
+        seen.append(resend_allowed())
+
+    monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
+    req = parse_permission_request(_permission_msg("req-1"))
+    assert req is not None
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"})])
+
+    await knp._run_one_permission(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        bridge_dir=tmp_path,
+        permission=req,
+        elicitation_id="elic_1",
+        other_requests_queued=lambda: mirror_queue["other"],
+    )
+
+    # Safe at first; blocked while the mirror holds a queued request; blocked for
+    # good once another request reaches the recorder, even after it resolves.
+    assert seen == [True, False, True, False, False]
 
 
 @pytest.mark.asyncio
@@ -386,10 +493,18 @@ async def test_supervise_mirror_queues_requests_while_one_is_pending(
     started = {request_id: asyncio.Event() for request_id in request_ids}
     release = {request_id: asyncio.Event() for request_id in request_ids}
     run_one_calls: list[str] = []
+    queue_signals: dict[str, Callable[[], bool]] = {}
 
-    async def _fake_run_one(_client: object, *, permission: object, **_kw: object) -> None:
+    async def _fake_run_one(
+        _client: object,
+        *,
+        permission: object,
+        other_requests_queued: Callable[[], bool],
+        **_kw: object,
+    ) -> None:
         request_id = permission.request_id  # type: ignore[attr-defined]
         run_one_calls.append(request_id)
+        queue_signals[request_id] = other_requests_queued
         started[request_id].set()
         await release[request_id].wait()
 
@@ -412,6 +527,8 @@ async def test_supervise_mirror_queues_requests_while_one_is_pending(
             handle.write(b"".join(_record_bytes(_permission_msg(rid)) for rid in request_ids))
         await asyncio.wait_for(started["req-1"].wait(), 2.0)
         assert run_one_calls == ["req-1"]
+        # Two requests wait behind the active one, so a dropped key may not be resent.
+        assert queue_signals["req-1"]() is True
 
         release["req-1"].set()
         await asyncio.wait_for(started["req-2"].wait(), 2.0)
@@ -420,6 +537,7 @@ async def test_supervise_mirror_queues_requests_while_one_is_pending(
         release["req-2"].set()
         await asyncio.wait_for(started["req-3"].wait(), 2.0)
         assert run_one_calls == ["req-1", "req-2", "req-3"]
+        assert queue_signals["req-3"]() is False
     finally:
         for event in release.values():
             event.set()
