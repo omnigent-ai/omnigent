@@ -41,7 +41,9 @@ def _drop_routes(page: Page) -> Iterator[None]:
     """Unroute before the page closes so a teardown replay cannot error the
     next test's setup (mirrors the fixture in ``test_files_panel_header``)."""
     yield
-    page.unroute_all(behavior="ignoreErrors")
+    # A recording run closes the page when the test body ends.
+    if not page.is_closed():
+        page.unroute_all(behavior="ignoreErrors")
 
 
 def test_outside_browse_expand_and_open_survive_a_slash_merging_proxy(
