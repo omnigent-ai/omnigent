@@ -8,13 +8,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
+import yaml
 from click.testing import CliRunner
 
 from omnigent.cli import _CLICK_SUBCOMMANDS, cli
+from omnigent.host import identity as _host_identity
 from omnigent.session_import.models import SessionImportNotFoundError
 
 _BASE = "http://localhost:6767"
+
+# The autouse _no_ambient_host fixture swaps this resolver for a None stub each
+# test; capture the real one at import time so a test can restore it and exercise
+# actual data-dir-vs-global identity selection.
+_REAL_LOAD_HOST_IDENTITY_IF_PRESENT = _host_identity.load_host_identity_if_present
 
 
 def _write_claude_transcript(
@@ -148,6 +156,57 @@ def test_import_command_binds_local_host_when_configured(tmp_path: Path) -> None
     assert json.loads(route.calls.last.request.content)["host_id"] == (
         "a1b2c3d4e5f67890abcdef1234567890"
     )
+
+
+@respx.mock
+def test_import_command_binds_data_dir_host_over_global(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host identity is data-dir scoped: with a data dir set, the import binds to
+    that dir's host id, not the user-level config's."""
+    global_home = tmp_path / "global"
+    data_dir = tmp_path / "data"
+    global_home.mkdir()
+    data_dir.mkdir()
+    global_id = "11112222333344445555666677778888"
+    data_id = "99998888777766665555444433332222"
+    (global_home / "config.yaml").write_text(
+        yaml.safe_dump({"host": {"host_id": global_id, "name": "global-box"}})
+    )
+    (data_dir / "config.yaml").write_text(
+        yaml.safe_dump({"host": {"host_id": data_id, "name": "data-box"}})
+    )
+
+    session_id = "a1b2c3d4-1234-5678-9abc-def01234567c"
+    _write_claude_transcript(tmp_path, session_id, text="scoped host")
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_scoped", "status": "imported", "item_count": 1},
+        )
+    )
+
+    # Restore the real resolver (the autouse fixture stubs it to None) so the
+    # data-dir-vs-global selection actually runs.
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        _REAL_LOAD_HOST_IDENTITY_IF_PRESENT,
+    )
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "claude", "--session", session_id],
+            env={
+                "HOME": str(tmp_path),
+                "OMNIGENT_CONFIG_HOME": str(global_home),
+                "OMNIGENT_DATA_DIR": str(data_dir),
+                "OMNIGENT_HOST_ID": None,
+                "OMNIGENT_HOST_NAME": None,
+            },
+        )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content)["host_id"] == data_id
 
 
 @respx.mock

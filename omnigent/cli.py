@@ -72,6 +72,9 @@ from omnigent.host.daemon_lifecycle import (
     daemon_registry_dir as _daemon_registry_dir_for,
 )
 from omnigent.host.daemon_lifecycle import (
+    loopback_server_port as _loopback_server_port,
+)
+from omnigent.host.daemon_lifecycle import (
     normalize_daemon_target as _normalize_daemon_target_impl,
 )
 from omnigent.host.daemon_lifecycle import (
@@ -82,6 +85,7 @@ from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     LocalServerStartupError,
     _pid_alive,
+    _read_local_server_sig,
     consume_failed_server_log_tail,
     ensure_local_omnigent_server,
     local_server_status,
@@ -2553,10 +2557,9 @@ def _runner_loopback_host(host: str) -> str:
 _HOST_PID_PATH = data_dir() / "host.pid"
 
 
-# host.pid records the daemon PID + the "target" it serves: a normalized
-# server URL for remote/explicit targets, or the literal marker ``"local"``
-# for a daemon that owns a local Omnigent server. Daemon reuse is keyed on this
-# target (real URLs never collide with the marker).
+# host.pid records the daemon PID and the "target" it serves: a normalized URL
+# for remote targets, or the marker ``"local"`` for this data dir's own instance.
+# Reuse keys on this target, so loopback spellings collapse to one local daemon.
 _LOCAL_DAEMON_MARKER = "local"
 
 # ``--server`` values that mean "run against a local server" rather than naming a
@@ -2695,13 +2698,19 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     """
     Normalize a daemon target key.
 
+    A plain-http loopback URL naming the port of this data dir's live
+    tracked server (``local_server.pid``) collapses to ``"local"``: it
+    addresses the data dir's own instance, so every spelling shares one record.
+
     :param server_url: Requested Omnigent server URL, e.g.
         ``"https://example.databricksapps.com/"``. ``None`` or empty
         string selects local mode.
-    :returns: ``"local"`` for local mode, otherwise the URL without a
-        trailing slash.
+    :returns: ``"local"`` for local mode or a loopback spelling of the live
+        tracked local server, otherwise the canonical URL.
     """
-    return _normalize_daemon_target_impl(server_url)
+    return _normalize_daemon_target_impl(
+        server_url, base_dir=_HOST_PID_PATH.parent, pid_alive=_pid_alive
+    )
 
 
 def _daemon_host_status_probe(
@@ -2833,6 +2842,7 @@ def _record_from_json(raw: _HostJsonObject) -> _HostDaemonRecord | None:
             else None
         ),
         config_sig=config_sig if isinstance(config_sig, str) and config_sig else None,
+        adopted=raw.get("adopted") is True,
     )
 
 
@@ -2941,6 +2951,11 @@ def _find_daemon_record(target: str) -> _HostDaemonRecord | None:
             return record
     for record in records:
         if _normalize_daemon_target(record.target) == target:
+            return record
+    # A local daemon stays addressable by its server's loopback URL after the
+    # server pidfile is gone (a foreground server exited under a live daemon).
+    for record in records:
+        if record.resolved_server_url and _same_local_server(record.resolved_server_url, target):
             return record
     return None
 
@@ -3091,7 +3106,9 @@ def _daemon_owner_is_live(record: _HostDaemonRecord) -> bool:
     return _pid_is_recorded_daemon(record)
 
 
-def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
+def _reuse_existing_daemon_record(
+    target: str, *, adopt_server: bool = False
+) -> _DaemonReuseDecision:
     """
     Decide whether an existing daemon for *target* can be reused.
 
@@ -3115,6 +3132,9 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     one whose config we can't verify.
 
     :param target: Normalized daemon target, e.g. ``"local"``.
+    :param adopt_server: The invocation named the running local server by an
+        explicit loopback URL, so it connects to that server as-is and config
+        drift is not its call.
     :returns: A :class:`_DaemonReuseDecision`.
     """
     existing = _find_daemon_record(target)
@@ -3144,9 +3164,14 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         # process or guess at an unstamped config).
         return _DaemonReuseDecision(reuse=True, config_changed=False)
 
-    # Config drift → the running server has the wrong auth source.
+    # Config drift → the running server has the wrong auth source. An adopted
+    # daemon with no verified server signature cannot vouch for the server, so
+    # an owning invocation re-validates it through the server lifecycle path.
     desired_sig = server_config_signature()
-    if existing.config_sig is not None and existing.config_sig != desired_sig:
+    if not adopt_server and existing.adopted and existing.config_sig is None:
+        _terminate_host_unit(existing, reason="adopted server config is unverified")
+        return _DaemonReuseDecision(reuse=False, config_changed=True)
+    if not adopt_server and existing.config_sig is not None and existing.config_sig != desired_sig:
         _terminate_host_unit(existing, reason="config changed (auth)")
         return _DaemonReuseDecision(reuse=False, config_changed=True)
 
@@ -3167,7 +3192,8 @@ def _local_daemon_serves_target(target: str, server_url: str | None) -> bool:
     :param target: Normalized daemon target, e.g.
         ``"http://127.0.0.1:8123"``.
     :param server_url: Requested server URL, or ``None`` for local mode.
-    :returns: ``True`` if the live local daemon already serves *target*.
+    :returns: ``True`` if the live local daemon already serves *target*,
+        under any loopback spelling of its port.
     """
     if not server_url:
         return False
@@ -3175,7 +3201,29 @@ def _local_daemon_serves_target(target: str, server_url: str | None) -> bool:
     if local_record is None or not _pid_alive(local_record.pid):
         return False
     local_url = local_server_url_if_healthy()
-    return local_url is not None and local_url.rstrip("/") == target
+    if local_url is None:
+        return False
+    return local_url.rstrip("/") == target or _same_local_server(local_url, server_url)
+
+
+def _same_local_server(local_url: str, requested_url: str) -> bool:
+    """Whether *requested_url* names the listener behind the local daemon's *local_url*.
+
+    Loopback spellings are compared by port, but only within one scheme: an
+    ``https`` request is a different endpoint from the plain-http local server.
+    """
+    from urllib.parse import urlsplit
+
+    if local_url.rstrip("/") == requested_url.rstrip("/"):
+        return True
+    try:
+        same_scheme = urlsplit(local_url).scheme.lower() == urlsplit(requested_url).scheme.lower()
+    except ValueError:
+        return False
+    if not same_scheme:
+        return False
+    local_port = _loopback_server_port(local_url)
+    return local_port is not None and local_port == _loopback_server_port(requested_url)
 
 
 def _spawn_host_daemon_process(
@@ -3395,7 +3443,8 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
             local_record is not None
             and local_record.pid != record.pid
             and _daemon_owner_is_live(local_record)
-            and local_record.resolved_server_url == record.server_url.rstrip("/")
+            and local_record.resolved_server_url is not None
+            and _same_local_server(local_record.resolved_server_url, record.server_url)
         ):
             return local_record
         if (
@@ -3520,6 +3569,12 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     """
     ensure_started_at = time.monotonic()
     target = _normalize_daemon_target(server_url)
+    # A loopback spelling of the live tracked server addresses this data dir's
+    # own instance: run the single local-mode daemon, but have it adopt the
+    # running server as-is rather than restart it on config drift.
+    adopt_server = target == _LOCAL_DAEMON_MARKER and bool(server_url)
+    if adopt_server:
+        server_url = None
     existing_before = _find_daemon_record(target)
     process_was_running = existing_before is not None and _daemon_owner_is_live(existing_before)
 
@@ -3534,7 +3589,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
             },
         )
 
-    decision = _reuse_existing_daemon_record(target)
+    decision = _reuse_existing_daemon_record(target, adopt_server=adopt_server)
     if decision.reuse:
         _record_host_state("reused")
         return False
@@ -3544,10 +3599,17 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
+    if adopt_server:
+        mode_args.append("--adopt-server")
     # Match runner/zygote startup: keep workspace code out of runtime imports
     # without changing the caller's working directory or agent workspace.
     args = [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *mode_args]
-    config_sig = server_config_signature(include_features=not server_url)
+    # An adopting daemon serves whatever config the running server has, so its
+    # record carries that signature, or none when the server has no sidecar.
+    if adopt_server:
+        config_sig = _read_local_server_sig() or ""
+    else:
+        config_sig = server_config_signature(include_features=not server_url)
     daemon_env = _build_host_daemon_env(server_url=server_url)
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
     expected_host_id = _load_existing_host_id()
@@ -3576,7 +3638,8 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         raise click.ClickException(
             f"Host daemon for {target!r} registered as {actual_host_id!r}, but this "
             f"invocation requested {expected_host_id!r}. The spawned daemon was stopped. "
-            "Check OMNIGENT_HOST_ID, OMNIGENT_HOST_NAME, and OMNIGENT_CONFIG_HOME. "
+            "Check OMNIGENT_HOST_ID, OMNIGENT_HOST_NAME, OMNIGENT_DATA_DIR (the identity lives in "
+            "that data dir's config.yaml when set), and OMNIGENT_CONFIG_HOME. "
             f"See {spawned.log_path}."
         )
     if claimed.pid != spawned.pid:
@@ -6656,12 +6719,11 @@ def import_session_command(
     base_url = base_url.rstrip("/")
 
     # If this machine is itself a host, bind the imported session to it so it
-    # resumes where the transcript came from. Read-only: never mints an identity
-    # on a machine that isn't already a host. Read from the effective config
-    # path so an OMNIGENT_CONFIG_HOME override is honored.
+    # resumes where the transcript came from. Resolve identity exactly as the
+    # daemon (data-dir scoped), read-only so a non-host never mints one.
     from omnigent.host.identity import load_host_identity_if_present
 
-    host_identity = load_host_identity_if_present(_effective_global_config_path())
+    host_identity = load_host_identity_if_present()
 
     def _import_one(target: tuple[ImportSource, str]) -> _SessionImportResult:
         # Each target carries its own harness so an "all" batch can span them.

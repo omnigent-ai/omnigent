@@ -10,6 +10,9 @@ Two modes:
 - ``--local``: this daemon owns a local Omnigent server — start (or reuse) a
   persistent background ``omnigent server`` on loopback and connect to
   it. The CLI discovers the resulting URL via the local-server pidfile.
+  With ``--adopt-server`` the daemon was requested through an explicit
+  loopback URL of that server, so it reuses the running server as-is
+  instead of restarting it on config drift.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import argparse
 import logging
 import os
 import time
+from dataclasses import replace
 
 
 def main() -> None:
@@ -44,6 +48,11 @@ def main() -> None:
         action="store_true",
         help="Start (or reuse) a local Omnigent server and connect to it.",
     )
+    parser.add_argument(
+        "--adopt-server",
+        action="store_true",
+        help="With --local: reuse the running local server as-is, never restart it.",
+    )
     args = parser.parse_args()
 
     from omnigent.process_logging import configure_process_logging
@@ -57,6 +66,8 @@ def main() -> None:
     if args.local == bool(args.server):
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
+    if args.adopt_server and not args.local:
+        parser.error("--adopt-server requires --local")
 
     from omnigent.host.daemon_lifecycle import (
         DAEMON_CONFIG_SIG_ENV_VAR,
@@ -89,15 +100,21 @@ def main() -> None:
             log_path=str(log_path),
             started_at=int(time.time()),
             host_id=identity.host_id,
-            config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
+            config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR) or None,
+            adopted=args.adopt_server,
         )
         write_daemon_record(record, update_legacy_pidfile=True)
 
         if args.local:
             # The daemon owns the local server: start/reuse it, then connect.
+            # Publishing the served URL keeps this record addressable by that
+            # URL once the server pidfile is gone.
             from omnigent.host.local_server import ensure_local_omnigent_server
 
-            server_url = ensure_local_omnigent_server().url
+            server_url = ensure_local_omnigent_server(
+                replace_on_config_drift=not args.adopt_server
+            ).url
+            write_daemon_record(replace(record, resolved_server_url=server_url))
         else:
             server_url = args.server
 

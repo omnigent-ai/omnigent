@@ -136,6 +136,9 @@ def test_host_daemon_idle_cpu_with_expensive_path(
         {
             **os.environ,
             "HOME": str(tmp_path),
+            # Host identity is data-dir-scoped; point the daemon's data dir at
+            # the dir carrying the pre-seeded config.yaml (isolated per test).
+            "OMNIGENT_DATA_DIR": str(omni_dir),
             "PATH": inflated_path,
             PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
         }

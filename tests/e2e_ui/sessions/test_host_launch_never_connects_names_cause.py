@@ -89,6 +89,9 @@ def _spawn_host_daemon(tmp_path: Path, base_url: str) -> tuple[subprocess.Popen[
     env = {
         **os.environ,
         "HOME": str(tmp_path),
+        # Host identity is data-dir-scoped; point the daemon's data dir at the
+        # dir carrying the pre-seeded config.yaml so it adopts this host id.
+        "OMNIGENT_DATA_DIR": str(omni_dir),
         "OMNIGENT_RUNNER_ZYGOTE": "0",
         "PYTHONPATH": os.pathsep.join([str(_REPO_ROOT), os.environ.get("PYTHONPATH", "")]).rstrip(
             os.pathsep

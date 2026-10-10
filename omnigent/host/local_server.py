@@ -584,7 +584,7 @@ class LocalServerStartup:
     log_path: Path | None = None
 
 
-def ensure_local_omnigent_server() -> LocalServerStartup:
+def ensure_local_omnigent_server(*, replace_on_config_drift: bool = True) -> LocalServerStartup:
     """Ensure a persistent background local Omnigent server is running.
 
     Reuses a healthy server recorded in the pidfile; otherwise spawns a
@@ -598,6 +598,11 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
     on demand by the connect daemon and authenticate as token-bound
     loopback runners, matching the deployed server posture.
 
+    :param replace_on_config_drift: Stop and respawn a healthy server whose
+        recorded config signature differs from this invocation's. ``False``
+        adopts the running server as-is: a daemon requested through an
+        explicit loopback URL must not restart a server it was only asked
+        to connect to.
     :returns: A :class:`LocalServerStartup` carrying the server URL and
         whether this call spawned it (``spawned=True``) or reused an
         already-running one (``spawned=False``). A config-drift respawn
@@ -611,7 +616,7 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
     desired_base_path = _resolve_effective_base_path()
     reused = local_server_url_if_healthy()
     if reused is not None:
-        if _read_local_server_sig() == desired_sig:
+        if not replace_on_config_drift or _read_local_server_sig() == desired_sig:
             return LocalServerStartup(
                 url=reused, spawned=False, log_path=_read_local_server_log_path()
             )
@@ -620,6 +625,10 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
         # mode, cookie secret, etc. are baked at boot). Stop it and spawn
         # a fresh one below so the invocation's intent takes effect.
         stop_local_omnigent_server()
+    if not replace_on_config_drift:
+        raise LocalServerStartupError(
+            "The local server this daemon was asked to adopt is no longer running."
+        )
 
     # Prefer the stable :6767 so the daemon-spawned server lands on the
     # same URL as a manual `omnigent server` (and reuse via the pidfile

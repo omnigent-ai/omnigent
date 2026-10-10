@@ -150,6 +150,56 @@ def test_ensure_local_omnigent_server_reuses_without_spawning(
     assert result.spawned is False
 
 
+def test_ensure_local_omnigent_server_adopts_drifted_server_when_not_replacing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without ``replace_on_config_drift`` a healthy server is reused despite drift.
+
+    A daemon requested through an explicit loopback URL only connects to the
+    server the user named; it must neither stop nor respawn it when this
+    shell's config signature differs from the running server's.
+    """
+    monkeypatch.setattr(
+        local_server, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123"
+    )
+    sig_file = tmp_path / "local_server.sig"
+    sig_file.write_text("sig-of-the-running-server\n")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
+    monkeypatch.setattr(
+        local_server, "_LOCAL_SERVER_LOG_REF_PATH", tmp_path / "local_server.logpath"
+    )
+    monkeypatch.setattr(local_server, "server_config_signature", lambda **_kw: "sig-of-this-shell")
+    stopped: list[bool] = []
+    monkeypatch.setattr(local_server, "stop_local_omnigent_server", lambda: stopped.append(True))
+
+    def _must_not_popen(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("respawned a server the daemon was only asked to connect to")
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _must_not_popen)
+
+    result = local_server.ensure_local_omnigent_server(replace_on_config_drift=False)
+
+    assert result.url == "http://127.0.0.1:8123"
+    assert result.spawned is False
+    assert stopped == []
+
+
+def test_ensure_local_omnigent_server_adopt_fails_loud_without_a_running_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopt mode never spawns: if the named server is gone, the daemon fails loud."""
+    monkeypatch.setattr(local_server, "local_server_url_if_healthy", lambda: None)
+
+    def _must_not_popen(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("spawned a fresh server instead of adopting the named one")
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _must_not_popen)
+
+    with pytest.raises(local_server.LocalServerStartupError, match="no longer running"):
+        local_server.ensure_local_omnigent_server(replace_on_config_drift=False)
+
+
 def test_ensure_local_omnigent_server_respawns_on_config_drift(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
