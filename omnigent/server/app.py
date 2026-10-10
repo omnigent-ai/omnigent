@@ -1685,6 +1685,10 @@ def create_app(
         # warmup blocks deleted here.
 
         _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        if sandbox_config is not None:
+            from omnigent.server.managed_hosts import warn_unknown_agent_images
+
+            warn_unknown_agent_images(sandbox_config, agent_store)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
