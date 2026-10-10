@@ -5823,3 +5823,36 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
         assert session._certificate_failure is None
 
     _run(_t())
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_populate_codex_home_preserves_relative_agent_config(
+    tmp_path: Path, present: bool
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[agents.reviewer]\nconfig_file = "agents/reviewer.toml"\n'
+    )
+    if present:
+        (source / "agents").mkdir()
+        (source / "agents/reviewer.toml").write_text('model_reasoning_effort = "high"\n')
+    target = tmp_path / "private"
+    target.mkdir()
+    _populate_codex_home_config(target, source)
+
+    config = tomllib.loads((target / "config.toml").read_text())
+    agent_path = target / config["agents"]["reviewer"]["config_file"]
+    if present:
+        assert (target / "agents").is_symlink()
+        assert agent_path.read_text() == 'model_reasoning_effort = "high"\n'
+        assert agent_path.samefile(source / "agents/reviewer.toml")
+        (source / "agents/reviewer.toml").write_text('model_reasoning_effort = "low"\n')
+        assert agent_path.read_text() == 'model_reasoning_effort = "low"\n'
+    else:
+        assert not (target / "agents").exists()
+        assert not (target / "agents").is_symlink()
