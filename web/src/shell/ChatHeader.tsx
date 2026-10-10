@@ -211,7 +211,7 @@ interface ChatHeaderProps {
 
 const PENDING_ACTION_TITLE = "Available when the session starts";
 // Breadcrumb width the desktop header keeps before it stops centering the title.
-const MIN_BREADCRUMB_PX = 120;
+export const MIN_BREADCRUMB_PX = 120;
 
 function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
   if (isMobile) {
@@ -366,10 +366,11 @@ export function ChatHeader({
   const actionsRef = useRef<HTMLDivElement>(null);
   const [sideColumns, setSideColumns] = useState({ left: 0, right: 0 });
   useLayoutEffect(() => {
+    if (isMobile) return;
     const header = headerRef.current;
     const left = leftSlotRef.current;
     const right = actionsRef.current;
-    if (!header || !left || !right || typeof ResizeObserver === "undefined") return;
+    if (!header || !left || !right) return;
     const measure = () => {
       const style = getComputedStyle(header);
       const inner =
@@ -392,12 +393,13 @@ export function ChatHeader({
       );
     };
     measure();
+    if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(measure);
     observer.observe(header);
     observer.observe(left);
     observer.observe(right);
     return () => observer.disconnect();
-  }, []);
+  }, [isMobile]);
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
   // ride in the header's single kebab rather than a second trigger of their
@@ -592,9 +594,7 @@ export function ChatHeader({
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
         "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center gap-1 px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        // Desktop: a three-column grid centers the breadcrumb on the pane. Each side
-        // column starts at its measured reservation (sideColumns), so an empty toggle
-        // slot mirrors the action cluster; the breadcrumb truncates first.
+        // Desktop grid uses the measured side-column reservations (sideColumns).
         "md:grid md:grid-cols-[minmax(var(--chat-header-left,0px),1fr)_auto_minmax(var(--chat-header-right,0px),1fr)] md:gap-6",
         settingsMode && "settings-mobile-header",
       )}

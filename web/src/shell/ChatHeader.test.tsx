@@ -9,7 +9,7 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
-import { ChatHeader } from "./ChatHeader";
+import { ChatHeader, MIN_BREADCRUMB_PX } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -248,9 +248,24 @@ describe("ChatHeader — workspace pane alignment", () => {
     expect(cluster).toContainElement(screen.getByRole("button", { name: "Share session" }));
   });
 
+  // Desktop header metrics the measurement reads back from computed styles
+  // (md:px-4 and md:gap-6), so the narrow case models the production boundary.
+  const HEADER_PADDING_PX = 16;
+  const COLUMN_GAP_PX = 24;
+
   // Renders with an empty toggle slot and a 138px action cluster inside a header
-  // whose content box is `headerWidth` wide; returns the side-column variables.
+  // `headerWidth` px wide (padding included); returns the side-column variables.
   function renderSideColumns(headerWidth: number) {
+    const computed = window.getComputedStyle.bind(window);
+    const styles = vi.spyOn(window, "getComputedStyle").mockImplementation((element) =>
+      element.tagName === "HEADER"
+        ? ({
+            paddingLeft: `${HEADER_PADDING_PX}px`,
+            paddingRight: `${HEADER_PADDING_PX}px`,
+            columnGap: `${COLUMN_GAP_PX}px`,
+          } as CSSStyleDeclaration)
+        : computed(element),
+    );
     const rect = vi
       .spyOn(HTMLElement.prototype, "getBoundingClientRect")
       .mockImplementation(function (this: HTMLElement) {
@@ -276,6 +291,7 @@ describe("ChatHeader — workspace pane alignment", () => {
         style.getPropertyValue("--chat-header-right"),
       ];
     } finally {
+      styles.mockRestore();
       rect.mockRestore();
       clientWidth.mockRestore();
     }
@@ -286,9 +302,10 @@ describe("ChatHeader — workspace pane alignment", () => {
   });
 
   it("shrinks the empty side's reservation before a narrow header overflows", () => {
-    // 300px minus the 120px breadcrumb minimum leaves 90px per side; the
-    // populated side keeps its own 138px.
-    expect(renderSideColumns(300)).toEqual(["90px", "138px"]);
+    // The populated side keeps its own 138px; the empty side gets what is left
+    // per side once padding, both column gaps and the breadcrumb minimum are out.
+    const emptySide = (300 - 2 * HEADER_PADDING_PX - 2 * COLUMN_GAP_PX - MIN_BREADCRUMB_PX) / 2;
+    expect(renderSideColumns(300)).toEqual([`${emptySide}px`, "138px"]);
   });
 });
 

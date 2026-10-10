@@ -143,6 +143,7 @@ def test_long_header_title_truncates_centered_inside_the_chat_pane(
 
     page: Page = request.getfixturevalue("page")
     _open_titled_session(page, base_url, session_id, _LONG_TITLE)
+    _close_workspace_panel(page)
     _drag_sidebar_edge_to(page, _SIDEBAR_TARGET_PX)
 
     sidebar_box = page.locator(_CONVERSATIONS).bounding_box()
