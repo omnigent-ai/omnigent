@@ -49,8 +49,11 @@ _CONNECTING_RE = re.compile(r"server\(s\) still connecting after \d+s:\s*(.+?)\s
 _AGY_MCP_SCAN_TIMEOUT = 75.0
 
 
-def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> set[str]:
-    """Launch agy against *gemini_dir*; return the servers its log reports still connecting."""
+def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> tuple[set[str], str]:
+    """Launch agy against *gemini_dir*; return the servers its log reports still connecting.
+
+    Also returns the MCP-related log lines scanned, for diagnosing a changed log format.
+    """
     assert _AGY_BIN is not None
     child = pexpect.spawn(
         _AGY_BIN,
@@ -64,6 +67,7 @@ def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> set[str]:
     )
     log_dir = gemini_dir / "antigravity-cli" / "log"
     servers: set[str] = set()
+    mcp_lines: list[str] = []
     try:
         deadline = time.monotonic() + _AGY_MCP_SCAN_TIMEOUT
         while time.monotonic() < deadline:
@@ -73,8 +77,11 @@ def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> set[str]:
                 pass  # no new TUI output this second; the log scan below still runs
             except pexpect.EOF:
                 break
+            mcp_lines = []
             for log_path in sorted(log_dir.glob("*.log")) if log_dir.is_dir() else []:
                 for line in log_path.read_text(errors="replace").splitlines():
+                    if "mcp" in line.lower():
+                        mcp_lines.append(line)
                     match = _CONNECTING_RE.search(line)
                     if match:
                         servers |= {name.strip() for name in match.group(1).split(",")}
@@ -82,10 +89,10 @@ def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> set[str]:
                 break
     finally:
         # The hanging stand-ins share agy's process group; kill it so none outlive the test.
-        with contextlib.suppress(ProcessLookupError):
+        with contextlib.suppress(OSError):
             os.killpg(child.pid, signal.SIGKILL)
         child.close(force=True)
-    return servers
+    return servers, "\n".join(mcp_lines[-20:])
 
 
 def test_dispatched_agy_worker_inherits_user_mcp_servers(
@@ -118,15 +125,16 @@ def test_dispatched_agy_worker_inherits_user_mcp_servers(
     dispatched_ws = tmp_path / "dispatched-ws"
     dispatched_ws.mkdir()
 
-    interactive = _agy_loaded_mcp_servers(real_gemini, cwd=interactive_ws)
+    interactive, interactive_log = _agy_loaded_mcp_servers(real_gemini, cwd=interactive_ws)
     assert {"graft", "graphify"} <= interactive, (
         "interactive agy did not load the fixture MCP servers \u2014 fixture invalid "
-        f"(loaded {sorted(interactive)})"
+        f"(loaded {sorted(interactive)}); MCP log lines:\n{interactive_log}"
     )
 
-    dispatched = _agy_loaded_mcp_servers(iso_gemini, cwd=dispatched_ws)
+    dispatched, dispatched_log = _agy_loaded_mcp_servers(iso_gemini, cwd=dispatched_ws)
     assert {"graft", "graphify"} <= dispatched, (
         "dispatched agy worker lost the user's MCP servers: interactive agy loaded "
         f"{sorted(interactive)} but the isolated --gemini_dir worker loaded "
-        f"{sorted(dispatched)} (isolated config has {sorted(iso_servers)})"
+        f"{sorted(dispatched)} (isolated config has {sorted(iso_servers)}); "
+        f"MCP log lines:\n{dispatched_log}"
     )

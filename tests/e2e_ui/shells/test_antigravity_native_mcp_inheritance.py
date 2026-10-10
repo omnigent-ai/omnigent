@@ -1,7 +1,7 @@
 """Browser journey: an antigravity-native worker keeps the user's own MCP servers.
 
-Runs the real agy in a runner-owned session against a local mock Gemini that
-answers each turn with the user's MCP tool names agy offered it::
+Runs the real agy in a runner-owned session against the local mock Gemini,
+which answers each turn with the user's MCP tool names agy offered it::
 
     OMNIGENT_E2E_ANTIGRAVITY=mock uv run --no-sync pytest \\
         tests/e2e_ui/shells/test_antigravity_native_mcp_inheritance.py -v --ui-skip-build
@@ -17,9 +17,6 @@ import json
 import os
 import re
 import subprocess
-import threading
-from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -30,8 +27,12 @@ from omnigent.harnesses.antigravity_native.bridge import (
     agy_home_dir,
     read_tmux_info,
 )
+from tests.e2e_ui.shells import test_antigravity_tmux_recovery as _tmux_recovery
 from tests.e2e_ui.shells.test_antigravity_tmux_recovery import _antigravity_stack, _wait_until
 from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIALS
+
+# pytest discovers fixtures by module attribute; share the mock model fixture here.
+antigravity_model = _tmux_recovery.antigravity_model
 
 pytestmark = [
     pytest.mark.skipif(
@@ -66,6 +67,21 @@ done
 """
 
 
+class _ToolListingReply:
+    """Mock-model strategy: answer with the user's MCP tool names agy offered in the request."""
+
+    def __init__(self) -> None:
+        self.requests: list[bytes] = []
+
+    def __call__(self, body: bytes) -> str:
+        self.requests.append(body)
+        offered = sorted(set(_USER_TOOL_RE.findall(body.decode("utf-8", "replace"))))
+        return _REPLY_PREFIX + (", ".join(offered) or "none")
+
+
+_TOOL_LISTING = _ToolListingReply()
+
+
 def _agy_mcp_list(home: Path) -> str:
     """``agy mcp list`` output for ``<home>/.gemini/config/mcp_config.json``."""
     result = subprocess.run(
@@ -90,66 +106,7 @@ def _mcp_connected(mcp_dir: Path, server: str) -> bool:
 
 
 @pytest.fixture
-def tool_listing_model(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, built_spa: None
-) -> Iterator[list[bytes]]:
-    """Isolate HOME and serve a mock Gemini whose reply names the user's MCP tools agy offered."""
-    requests_seen: list[bytes] = []
-
-    class GeminiHandler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: object) -> None:
-            pass
-
-        def do_POST(self) -> None:
-            streaming = ":streamGenerateContent" in self.path
-            if not streaming and ":generateContent" not in self.path:
-                self.send_error(404)
-                return
-            raw = self.rfile.read(int(self.headers["Content-Length"]))
-            requests_seen.append(raw)
-            offered = sorted(set(_USER_TOOL_RE.findall(raw.decode("utf-8", "replace"))))
-            reply = _REPLY_PREFIX + (", ".join(offered) or "none")
-            response = {
-                "candidates": [
-                    {
-                        "content": {"role": "model", "parts": [{"text": reply}]},
-                        "finishReason": "STOP",
-                        "index": 0,
-                    }
-                ],
-                "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
-            }
-            payload = json.dumps(response)
-            body = (f"data: {payload}\n\n" if streaming else payload).encode()
-            self.send_response(200)
-            self.send_header(
-                "Content-Type", "text/event-stream" if streaming else "application/json"
-            )
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    home = tmp_path / "model-home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(
-        "omnigent.harnesses.antigravity_native.bridge._BRIDGE_ROOT",
-        home / ".omnigent" / "antigravity-native",
-    )
-    monkeypatch.setenv("GEMINI_API_KEY", "mock-gemini-key")
-    with ThreadingHTTPServer(("127.0.0.1", 0), GeminiHandler) as server:
-        monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", f"http://127.0.0.1:{server.server_port}/")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield requests_seen
-        finally:
-            server.shutdown()
-            thread.join(timeout=5)
-
-
-@pytest.fixture
-def user_home(tool_listing_model: list[bytes], tmp_path: Path) -> Path:
+def user_home(antigravity_model: list[str] | None, tmp_path: Path) -> Path:
     """Register the user's own stdio MCP servers with ``agy mcp add`` in the journey HOME."""
     home = Path(os.environ["HOME"])
     for name in _USER_SERVERS:
@@ -184,8 +141,9 @@ def _retain_evidence(files: dict[str, str | bytes]) -> None:
             target.write_text(content, encoding="utf-8")
 
 
+@pytest.mark.parametrize("antigravity_model", [_TOOL_LISTING], ids=["tool-listing"], indirect=True)
 def test_dispatched_agy_worker_keeps_user_mcp_servers(
-    browser: Browser, tmp_path: Path, user_home: Path, tool_listing_model: list[bytes]
+    browser: Browser, tmp_path: Path, user_home: Path, antigravity_model: list[str] | None
 ) -> None:
     user_config = user_home / ".gemini" / "config" / "mcp_config.json"
     user_config_before = user_config.read_bytes()
@@ -256,7 +214,7 @@ def test_dispatched_agy_worker_keeps_user_mcp_servers(
             {
                 "worker-agy-mcp-list.txt": worker_list,
                 "assistant-reply.txt": reply_text,
-                **{f"model-request-{i}.json": raw for i, raw in enumerate(tool_listing_model)},
+                **{f"model-request-{i}.json": raw for i, raw in enumerate(_TOOL_LISTING.requests)},
             }
         )
         _retain_evidence(evidence)

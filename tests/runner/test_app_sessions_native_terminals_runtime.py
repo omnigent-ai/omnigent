@@ -3311,6 +3311,11 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
 
     session_id = "1fd85439049bbfc88cbf04221bad5079"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    real_home = tmp_path / "real-home"
+    user_mcp = real_home / ".gemini" / "config" / "mcp_config.json"
+    user_mcp.parent.mkdir(parents=True)
+    user_mcp.write_text('{"mcpServers":{"graft":{"command":"graft"}}}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
@@ -3409,6 +3414,9 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     ]
     assert str(bridge_dir) in server["args"]
     assert "sys_session_create" in server["enabledTools"]
+    # The user's own MCP servers ride along with the relay; their file is untouched.
+    assert payload["mcpServers"]["graft"] == {"command": "graft"}
+    assert user_mcp.read_text(encoding="utf-8") == '{"mcpServers":{"graft":{"command":"graft"}}}'
     # The bridge token the shared relay needs was written into the bridge dir.
     assert (bridge_dir / "bridge.json").is_file()
 

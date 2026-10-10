@@ -1572,15 +1572,33 @@ def test_write_mcp_config_tolerates_malformed_user_config(
     with caplog.at_level(logging.WARNING, logger=_mod.__name__):
         path = write_mcp_config(bridge_dir, python_executable="python-test")
 
-    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
-    assert set(servers) == {"omnigent"}
-    assert servers["omnigent"]["command"] == "python-test"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
     warnings = [
         record.getMessage()
         for record in caplog.records
         if record.name == _mod.__name__ and record.levelno == logging.WARNING
     ]
     assert len(warnings) == 1 and "seeding only the Omnigent relay" in warnings[0]
+
+
+@pytest.mark.posix_only
+def test_write_mcp_config_restricts_isolated_config_to_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inherited server env blocks can hold tokens, so only the owner may read the file."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(
+        fake_home,
+        json.dumps({"mcpServers": {"graft": {"command": "graft", "env": {"GRAFT_TOKEN": "s"}}}}),
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_write_mcp_config_without_user_config_seeds_only_the_relay(

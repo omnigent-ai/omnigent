@@ -547,13 +547,15 @@ def write_mcp_config(
     )
     payload["mcpServers"] = servers
     tmp = path.with_suffix(path.suffix + ".tmp")
+    # Inherited server definitions may carry credentials in their env blocks.
+    tmp.touch(mode=0o600)
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
 
 
 def _load_user_mcp_config(real_home: Path) -> dict[str, object]:
-    """Load the user's real agy MCP config, dropping a malformed file or ``mcpServers`` map."""
+    """Load the user's real agy MCP config; a missing or malformed file yields ``{}``."""
     path = real_home / ".gemini" / _MCP_CONFIG_DIR / _MCP_CONFIG_FILE
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -566,17 +568,13 @@ def _load_user_mcp_config(real_home: Path) -> dict[str, object]:
             exc_info=True,
         )
         return {}
-    if not isinstance(loaded, dict):
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("mcpServers", {}), dict):
         _logger.warning(
-            "agy MCP config at %s is not a JSON object; seeding only the Omnigent relay", path
-        )
-        return {}
-    if "mcpServers" in loaded and not isinstance(loaded["mcpServers"], dict):
-        _logger.warning(
-            "agy MCP config at %s has a non-object mcpServers; seeding only the Omnigent relay",
+            "agy MCP config at %s is not a JSON object with an mcpServers object; "
+            "seeding only the Omnigent relay",
             path,
         )
-        loaded["mcpServers"] = {}
+        return {}
     return loaded
 
 
