@@ -16,6 +16,7 @@ import contextlib
 import subprocess
 import sys
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -36,6 +37,10 @@ _PROBE = "steady-state-recovery-probe"
 # Per-call MCP read timeout (seconds). Bounds any pending request left
 # doomed by the mid-session transport crash.
 _MCP_TIMEOUT_S = 8
+
+# How long a call that met the outage may take to settle when the server
+# config carries no read timeout at all (the inline ``tools:`` form).
+_SETTLE_BOUND_S = 20
 
 
 @pytest.fixture()
@@ -141,5 +146,55 @@ async def test_mcp_reconnects_after_steady_state_auth_expiry(
             "steady-state auth failure cleared; the call after recovery "
             f"should reconnect and return the answer. got: {recovered!r}"
         )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_call_meeting_401_settles_and_recovers_without_read_timeout(
+    expiring_auth_http_mcp: tuple[MCPServerConfig, str],
+) -> None:
+    """Without a per-call read timeout, the call that meets the 401 must
+    still settle promptly and the next call after recovery must answer.
+
+    Inline ``tools:`` MCP servers are parsed with ``timeout=None``. The SDK
+    does not wake a request whose transport died on the lifecycle task, so
+    a session with no read timeout would otherwise leave that request
+    pending forever while it holds the connection's call lock.
+    """
+    config, base_url = expiring_auth_http_mcp
+    conn = McpServerConnection(replace(config, timeout=None))
+    try:
+        await conn.connect()
+        warm = await conn.call_tool("ask", {"question": "warm"})
+        assert warm == "answer: warm", f"unexpected warm result: {warm!r}"
+
+        async with httpx.AsyncClient() as client:
+            armed = await client.get(f"{base_url}/arm", timeout=10)
+            assert armed.status_code == 200, f"arm failed: {armed.status_code}"
+
+        try:
+            await asyncio.wait_for(
+                conn.call_tool("ask", {"question": "during-outage"}), timeout=_SETTLE_BOUND_S
+            )
+        except TimeoutError:
+            pytest.fail(
+                f"the call that met the 401 was still pending after {_SETTLE_BOUND_S}s; "
+                "it holds the connection's call lock, so no later call can run"
+            )
+        except Exception:  # the outage surfaces varied types
+            pass
+        else:
+            pytest.fail("the call that met the 401 unexpectedly succeeded")
+        assert not conn._call_lock.locked(), "the failed call still holds the call lock"
+
+        async with httpx.AsyncClient() as client:
+            reset = await client.get(f"{base_url}/reset", timeout=10)
+            assert reset.status_code == 200, f"reset failed: {reset.status_code}"
+
+        recovered = await asyncio.wait_for(
+            conn.call_tool("ask", {"question": _PROBE}), timeout=_SETTLE_BOUND_S
+        )
+        assert recovered == f"answer: {_PROBE}", f"unexpected recovered result: {recovered!r}"
     finally:
         await conn.close()

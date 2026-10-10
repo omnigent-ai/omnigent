@@ -717,6 +717,7 @@ class McpServerConnection:
                 raise ConnectionError(
                     f"MCP server {self.config.name!r} session died before the call was sent"
                 )
+            lifecycle = self._lifecycle_task
             if used_session is not None:
                 used_session[0] = session
             self._active_session_id = session_id
@@ -728,7 +729,9 @@ class McpServerConnection:
             self._call_serial += 1
             self._transport_error = None
             try:
-                result = await session.call_tool(name=name, arguments=arguments)
+                result = await self._await_on_live_session(
+                    session.call_tool(name=name, arguments=arguments), lifecycle
+                )
             finally:
                 self._active_session_id = None
 
@@ -755,6 +758,48 @@ class McpServerConnection:
                 source="managed_mcp",
             )
         return _format_call_result(result)
+
+    async def _await_on_live_session(
+        self,
+        request: Awaitable[_T],
+        lifecycle: asyncio.Task[None] | None,
+    ) -> _T:
+        """
+        Await an SDK request, failing fast if the session dies first.
+
+        A steady-state transport failure tears the SDK's task group
+        down on the lifecycle task, but a request already waiting for
+        its response on another task is not reliably woken. Without a
+        read timeout it would wait forever while holding
+        ``_call_lock``, wedging every later call on this connection.
+        Racing the request against the lifecycle task turns that into
+        a ``ConnectionError`` the reconnect-retry loop handles.
+
+        :param request: The in-flight SDK request.
+        :param lifecycle: The lifecycle task owning the session the
+            request was sent on, or ``None`` to await it plainly.
+        :returns: The request's result.
+        :raises ConnectionError: If the lifecycle task exits before
+            the request completes.
+        """
+        pending = asyncio.ensure_future(request)
+        if lifecycle is None:
+            return await pending
+        # Retrieve a late failure so the loop does not log it as unhandled.
+        pending.add_done_callback(lambda t: t.cancelled() or t.exception())
+        waiters: list[asyncio.Future[Any]] = [pending, lifecycle]
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            pending.cancel()
+            raise
+        if pending.done():
+            return pending.result()
+        pending.cancel()
+        await asyncio.wait([pending])
+        raise ConnectionError(
+            f"MCP server {self.config.name!r} session died while a tool call was in flight"
+        )
 
     async def call_tool_with_elicitation(
         self,
@@ -1623,6 +1668,10 @@ def _is_connection_error(exc: BaseException) -> bool:
     :param exc: The exception to classify.
     :returns: ``True`` if the error is connection-related.
     """
+    # The SDK's streamable-HTTP transport raises from a task group, so a
+    # failed connect or reconnect arrives wrapped in an exception group.
+    if isinstance(exc, BaseExceptionGroup):  # noqa: F821 — 3.11+ builtin, ruff targets py310
+        return any(_is_connection_error(sub) for sub in exc.exceptions)
     if isinstance(exc, _CONNECTION_ERROR_TYPES):
         return True
     if isinstance(exc, McpError):

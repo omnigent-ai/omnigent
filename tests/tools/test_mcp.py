@@ -534,6 +534,52 @@ async def test_call_tool_reconnects_when_session_dies_while_waiting_for_call_loc
 
 
 @pytest.mark.asyncio()
+async def test_call_tool_in_flight_when_lifecycle_exits_fails_over_to_reconnect() -> None:
+    """
+    A call already waiting on the SDK when the lifecycle task exits
+    fails fast and reconnects instead of waiting forever.
+
+    The SDK does not reliably wake a request whose transport died on
+    the lifecycle task, and a session without a read timeout would
+    then hold ``_call_lock`` for good, wedging every later call.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        in_flight = asyncio.Event()
+
+        async def _call_tool(**_: object) -> MagicMock:
+            if not in_flight.is_set():
+                in_flight.set()
+                # The response to this first request never arrives.
+                await asyncio.Event().wait()
+            return ok_result
+
+        mock_session.call_tool = AsyncMock(side_effect=_call_tool)
+
+        with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+            call = asyncio.create_task(conn.call_tool("test_tool", {"query": "hi"}))
+            await asyncio.wait_for(in_flight.wait(), timeout=5)
+            # End the lifecycle task the way a steady-state transport
+            # failure does: it clears the session on its way out.
+            assert conn._close_event is not None
+            conn._close_event.set()
+            result = await asyncio.wait_for(call, timeout=5)
+
+        assert result == "recovered"
+        assert mock_session.call_tool.await_count == 2
+        assert not conn._call_lock.locked()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
 async def test_call_tool_marks_dead_the_session_the_attempt_ran_against() -> None:
     """
     The dead-session token names the session used under the lock.
@@ -1302,6 +1348,16 @@ def _request_timeout_error() -> McpError:
             message="Timed out while waiting for response to ClientRequest. Waited 8.0 seconds.",
         )
     )
+
+
+def test_is_connection_error_unwraps_exception_group() -> None:
+    """
+    A connect failure raised from the SDK's transport task group is
+    still classified as a connection error.
+    """
+    grouped = ExceptionGroup("transport", [httpx.ConnectError("still refusing")])  # noqa: F821
+    assert _is_connection_error(grouped) is True
+    assert _is_connection_error(ExceptionGroup("tool", [ValueError("bad args")])) is False  # noqa: F821
 
 
 def test_dead_session_timeout_detected_when_session_dead() -> None:
