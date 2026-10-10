@@ -54,6 +54,11 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
+import {
+  clearApprovalInFlight,
+  clearAskUserQuestionDraft,
+  markApprovalInFlight,
+} from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
@@ -3004,27 +3009,34 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ...(content === undefined ? {} : { content }),
       ...(meta === undefined ? {} : { _meta: meta }),
     };
-    write((s) => ({
-      blocks: s.blocks.map((b) =>
-        b.type === "elicitation" && b.elicitationId === elicitationId
-          ? { ...b, status: "responded", response: responseValue }
-          : b,
-      ),
-    }));
-    // Human-in-the-loop decision: accept = granted, decline = rejected, cancel =
-    // dismissed without deciding. Fires on the user's action (live only).
-    emitInteractionPhase({
-      interactionId: elicitationId,
-      interactionKind: "approval",
-      phase: "complete",
-      status: action === "accept" ? "success" : action === "decline" ? "failure" : "cancelled",
-    });
+    // Mark the resolution unconfirmed before the flip remounts the card, so the
+    // remounted "responded" card does not mistake the optimistic state for a
+    // server-confirmed answer and clear the draft. The finally always clears it.
+    markApprovalInFlight(elicitationId);
     try {
+      write((s) => ({
+        blocks: s.blocks.map((b) =>
+          b.type === "elicitation" && b.elicitationId === elicitationId
+            ? { ...b, status: "responded", response: responseValue }
+            : b,
+        ),
+      }));
+      // Human-in-the-loop decision: accept = granted, decline = rejected, cancel =
+      // dismissed without deciding. Fires on the user's action (live only).
+      emitInteractionPhase({
+        interactionId: elicitationId,
+        interactionKind: "approval",
+        phase: "complete",
+        status: action === "accept" ? "success" : action === "decline" ? "failure" : "cancelled",
+      });
       await approveElicitation(targetSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      // The answer is committed only once the resolve POST succeeds; clearing
+      // the draft any earlier would drop it on the rollback path below.
+      clearAskUserQuestionDraft(elicitationId);
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
@@ -3041,6 +3053,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             : b,
         ),
       }));
+    } finally {
+      clearApprovalInFlight(elicitationId);
     }
   },
 

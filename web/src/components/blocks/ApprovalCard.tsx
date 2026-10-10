@@ -32,7 +32,7 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
-import { useContext } from "react";
+import { useContext, useEffect, useMemo } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -52,6 +52,7 @@ import {
   exitPlanModePlan,
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
+import { clearAskUserQuestionDraft, isApprovalInFlight } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
@@ -285,12 +286,14 @@ export function ApprovalCard({
     submit(elicitationId, "decline", trimmed ? { feedback: trimmed } : undefined);
   };
 
-  // Mode detection. Prefer the server-stamped structured payload
-  // (full, non-truncated); fall back to parsing the content_preview
-  // JSON for backwards compatibility with elicitations published
-  // before the structured field was added.
-  const askPayload: AskUserQuestionPayload | null =
-    castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview);
+  // Mode detection: prefer the server-stamped structured payload, else parse
+  // content_preview for older elicitations. Memoized so the form's draft
+  // mirror sees one stable ``questions`` reference per card.
+  const askPayload: AskUserQuestionPayload | null = useMemo(
+    () =>
+      castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview),
+    [askUserQuestion, contentPreview],
+  );
   // ExitPlanMode plan review: the server stamps the full tool_input
   // as `exit_plan_mode`; a usable plan card needs the `plan` markdown
   // string. Anything else falls back to the binary card.
@@ -298,6 +301,19 @@ export function ApprovalCard({
   const isExitPlanMode = planMarkdown !== null;
   const optionLabels = askPayload === null ? extractOptionLabels(requestedSchema) : [];
   const isAskUserQuestion = askPayload !== null;
+  // Retire a leftover draft once the server commits a verdict, including a
+  // resolve while mounted. Skip an optimistic in-flight flip (it can roll back)
+  // and an auto_resolved card (a re-park can revive it to pending).
+  useEffect(() => {
+    if (
+      isAskUserQuestion &&
+      status === "responded" &&
+      response?.action !== "auto_resolved" &&
+      !isApprovalInFlight(elicitationId)
+    ) {
+      clearAskUserQuestionDraft(elicitationId);
+    }
+  }, [isAskUserQuestion, elicitationId, status, response]);
   const isMultiChoice = optionLabels.length > 0;
   // Any other schema that names fields: a free-form string, several
   // properties, an enum under a name other than ``answer``. These used to
@@ -673,6 +689,8 @@ export function ApprovalCard({
           </>
         ) : isAskUserQuestion ? (
           <AskUserQuestionForm
+            key={elicitationId}
+            elicitationId={elicitationId}
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}

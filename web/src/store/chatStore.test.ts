@@ -32,6 +32,12 @@ import type {
 } from "@/lib/blocks";
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import {
+  clearAskUserQuestionDrafts,
+  getAskUserQuestionDraft,
+  isApprovalInFlight,
+  setAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
@@ -9382,6 +9388,10 @@ function elicitationBlock(id: string): ElicitationBlock {
 }
 
 describe("chatStore — submitApproval", () => {
+  afterEach(() => {
+    clearAskUserQuestionDrafts();
+  });
+
   it("posts the verdict to the elicitation resolve URL and optimistically marks responded", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
@@ -9404,6 +9414,145 @@ describe("chatStore — submitApproval", () => {
       expect(block.status).toBe("responded");
       expect(block.response).toEqual({ action: "accept" });
     }
+  });
+
+  it("clears the AskUserQuestion draft once the resolve POST succeeds", async () => {
+    clearAskUserQuestionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_draft_ok")],
+    });
+    setAskUserQuestionDraft("elic_draft_ok", {
+      currentIndex: 0,
+      selections: { Q: "A" },
+      customSelected: {},
+      customInputs: {},
+    });
+
+    await useChatStore.getState().submitApproval("elic_draft_ok", "accept", { Q: "A" });
+
+    // Dropped only now that the answer is committed server-side.
+    expect(getAskUserQuestionDraft("elic_draft_ok")).toBeUndefined();
+  });
+
+  it("clears the AskUserQuestion draft when a Cancel (decline) resolve POST succeeds", async () => {
+    // Cancel routes through submitApproval with action "decline"; it clears the
+    // draft on the same POST-success path as accept rather than leaving it behind.
+    clearAskUserQuestionDrafts();
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_draft_cancel")],
+    });
+    setAskUserQuestionDraft("elic_draft_cancel", {
+      currentIndex: 0,
+      selections: { Q: "A" },
+      customSelected: {},
+      customInputs: {},
+    });
+
+    await useChatStore.getState().submitApproval("elic_draft_cancel", "decline");
+
+    expect(getAskUserQuestionDraft("elic_draft_cancel")).toBeUndefined();
+  });
+
+  it("keeps the AskUserQuestion draft when the resolve POST fails and rolls back", async () => {
+    clearAskUserQuestionDrafts();
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.match(/\/v1\/sessions\/[^/]+\/elicitations\/[^/]+\/resolve$/)) {
+        return mockResponse(
+          { error: { code: "boom", message: "resolve failed" } },
+          { ok: false, status: 500 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_draft_fail")],
+    });
+    setAskUserQuestionDraft("elic_draft_fail", {
+      currentIndex: 0,
+      selections: { Q: "A" },
+      customSelected: {},
+      customInputs: {},
+    });
+
+    await useChatStore.getState().submitApproval("elic_draft_fail", "accept", { Q: "A" });
+
+    // The POST failed: the card rolls back to pending and the draft survives
+    // so the restored form keeps the user's answers.
+    const block = useChatStore.getState().blocks[0];
+    expect(block?.type).toBe("elicitation");
+    if (block?.type === "elicitation") expect(block.status).toBe("pending");
+    expect(getAskUserQuestionDraft("elic_draft_fail")).toBeDefined();
+  });
+
+  it("marks an approval in flight only until the resolve POST settles", async () => {
+    // ApprovalCard reads this to tell an optimistic (unconfirmed) resolution
+    // apart from a server-confirmed one, so the card keeps the draft across the
+    // float→inline remount instead of clearing it on the optimistic flip.
+    let releaseResolve: (() => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.match(/\/v1\/sessions\/[^/]+\/elicitations\/[^/]+\/resolve$/)) {
+        return new Promise((resolve) => {
+          releaseResolve = () => resolve(mockResponse({ queued: true }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_inflight")],
+    });
+
+    expect(isApprovalInFlight("elic_inflight")).toBe(false);
+    const pending = useChatStore.getState().submitApproval("elic_inflight", "accept");
+    // The optimistic flip ran synchronously; the POST is still open.
+    expect(isApprovalInFlight("elic_inflight")).toBe(true);
+
+    await vi.waitFor(() => expect(releaseResolve).not.toBeNull());
+    releaseResolve!();
+    await pending;
+    // Cleared once the POST settles, whether it succeeds or rolls back.
+    expect(isApprovalInFlight("elic_inflight")).toBe(false);
+  });
+
+  it("clears the in-flight mark once the resolve POST rejects and rolls back", async () => {
+    let releaseResolve: (() => void) | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.match(/\/v1\/sessions\/[^/]+\/elicitations\/[^/]+\/resolve$/)) {
+        return new Promise((resolve) => {
+          releaseResolve = () =>
+            resolve(
+              mockResponse(
+                { error: { code: "boom", message: "resolve failed" } },
+                { ok: false, status: 500 },
+              ),
+            );
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_inflight_fail")],
+    });
+
+    const pending = useChatStore.getState().submitApproval("elic_inflight_fail", "accept");
+    // The optimistic flip ran synchronously; the POST is still open.
+    expect(isApprovalInFlight("elic_inflight_fail")).toBe(true);
+
+    await vi.waitFor(() => expect(releaseResolve).not.toBeNull());
+    releaseResolve!();
+    await pending;
+    // The finally clears the mark even though the POST failed and rolled back.
+    expect(isApprovalInFlight("elic_inflight_fail")).toBe(false);
+    const block = useChatStore.getState().blocks[0];
+    expect(block?.type).toBe("elicitation");
+    if (block?.type === "elicitation") expect(block.status).toBe("pending");
   });
 
   it("preserves Codex MCP persistence metadata in the resolve payload", async () => {

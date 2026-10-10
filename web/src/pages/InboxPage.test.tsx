@@ -15,7 +15,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // component that just exposes an Accept button wired to its `onSubmit`, which
 // lets us drive the approve/rollback path without the real card's internals.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
@@ -24,6 +24,12 @@ import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
+import {
+  clearAskUserQuestionDrafts,
+  getAskUserQuestionDraft,
+  isApprovalInFlight,
+  setAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 import {
   isExplicitlyUnread,
   resetReadStateForTests,
@@ -154,6 +160,7 @@ afterEach(() => {
   vi.clearAllMocks();
   resetReadStateForTests();
   localStorage.clear();
+  clearAskUserQuestionDrafts();
 });
 
 /** A finished session whose latest turn the viewer hasn't opened yet. */
@@ -338,6 +345,102 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending"),
     );
+  });
+
+  it("clears an AskUserQuestion draft once the Inbox resolve POST succeeds", async () => {
+    // WHY: answering from the Inbox retires the saved draft only on a
+    // confirmed resolve, matching the chat store's POST-success cleanup.
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    setAskUserQuestionDraft("eli_1", {
+      currentIndex: 0,
+      selections: { Q: "A" },
+      customSelected: {},
+      customInputs: {},
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+    await waitFor(() => expect(getAskUserQuestionDraft("eli_1")).toBeUndefined());
+  });
+
+  it("keeps an AskUserQuestion draft when the Inbox resolve POST rejects", async () => {
+    // WHY: the rollback must leave the draft so the restored card can retry
+    // with the same answers.
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("nope"));
+    setAskUserQuestionDraft("eli_1", {
+      currentIndex: 0,
+      selections: { Q: "A" },
+      customSelected: {},
+      customInputs: {},
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending"),
+    );
+    expect(getAskUserQuestionDraft("eli_1")).toBeDefined();
+  });
+
+  it("marks the elicitation in flight only until the Inbox resolve POST settles", async () => {
+    // WHY: the shared in-flight guard must cover the Inbox optimistic flip too,
+    // so a restored transcript card keeps its draft until this POST confirms.
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    let releaseApprove: (() => void) | null = null;
+    vi.mocked(sessionsApi.approve).mockReturnValue(
+      new Promise<Awaited<ReturnType<typeof sessionsApi.approve>>>((resolve) => {
+        releaseApprove = () => resolve({} as Awaited<ReturnType<typeof sessionsApi.approve>>);
+      }),
+    );
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+    // The optimistic flip registered the id; the POST is still open.
+    await waitFor(() => expect(isApprovalInFlight("eli_1")).toBe(true));
+    expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded");
+
+    await act(async () => {
+      releaseApprove?.();
+    });
+    await waitFor(() => expect(isApprovalInFlight("eli_1")).toBe(false));
+  });
+
+  it("clears the in-flight mark when the Inbox resolve POST rejects", async () => {
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    let rejectApprove: (() => void) | null = null;
+    vi.mocked(sessionsApi.approve).mockReturnValue(
+      new Promise<Awaited<ReturnType<typeof sessionsApi.approve>>>((_resolve, reject) => {
+        rejectApprove = () => reject(new Error("nope"));
+      }),
+    );
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+    await waitFor(() => expect(isApprovalInFlight("eli_1")).toBe(true));
+
+    await act(async () => {
+      rejectApprove?.();
+    });
+    // The finally-equivalent clear runs on the rejection path too.
+    await waitFor(() => expect(isApprovalInFlight("eli_1")).toBe(false));
+    expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending");
   });
 
   it("clears a stale verdict when a snapshot refresh still shows the elicitation as pending", async () => {

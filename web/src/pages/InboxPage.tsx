@@ -81,6 +81,11 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
+import {
+  clearApprovalInFlight,
+  clearAskUserQuestionDraft,
+  markApprovalInFlight,
+} from "@/lib/askUserQuestionDrafts";
 import { latestOutputPreview } from "@/lib/lastAssistantText";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
@@ -289,6 +294,9 @@ export function InboxPage() {
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
     return (elicitationId, action, content, meta) => {
+      // Mark unconfirmed before the optimistic flip so a restored transcript card
+      // keeps its draft until this POST settles, matching the chat store.
+      markApprovalInFlight(elicitationId);
       setResponded((prev) => ({
         ...prev,
         [elicitationId]: {
@@ -301,19 +309,26 @@ export function InboxPage() {
         action,
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
-      }).then(
-        () => {
-          void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-        },
-        () => {
-          // Roll back to pending so the buttons reappear and the user
-          // can retry — same recovery the chat store uses.
-          setResponded((prev) => {
-            const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
-            return pendingVerdicts;
-          });
-        },
-      );
+      })
+        .then(
+          () => {
+            // Only a confirmed resolve retires the draft; the rollback below
+            // keeps it so the restored card can retry with the same answers.
+            clearAskUserQuestionDraft(elicitationId);
+            void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          },
+          () => {
+            // Roll back to pending so the buttons reappear and the user
+            // can retry — same recovery the chat store uses.
+            setResponded((prev) => {
+              const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
+              return pendingVerdicts;
+            });
+          },
+        )
+        .finally(() => {
+          clearApprovalInFlight(elicitationId);
+        });
     };
   };
 

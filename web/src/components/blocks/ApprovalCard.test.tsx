@@ -1,15 +1,29 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  clearApprovalInFlight,
+  clearAskUserQuestionDrafts,
+  getAskUserQuestionDraft,
+  markApprovalInFlight,
+} from "@/lib/askUserQuestionDrafts";
+import type { ElicitationBlock } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
-import { useChatStore } from "@/store/chatStore";
+import { bindConversationForTest, useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
 afterEach(() => {
   cleanup();
+  clearAskUserQuestionDrafts();
 });
+
+// The genuine store action, captured before any test swaps in a spy. Most cards
+// here only check what submitApproval is called with and stub it, which leaves
+// the stub on the shared store; the optimistic-submit test needs the real one.
+const realSubmitApproval = useChatStore.getState().submitApproval;
 
 describe("ApprovalCard — binary approve/reject", () => {
   it("renders Approve and Reject buttons when requestedSchema has no enum", () => {
@@ -1030,6 +1044,342 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByText("First?")).toBeDefined();
   });
 
+  it("keeps a partially entered answer when the card is unmounted and mounted again", () => {
+    // Leaving the session (Inbox, another session) unmounts the card while
+    // the question stays pending; the draft must come back with it.
+    const card = (
+      <ApprovalCard
+        elicitationId="elic_draft"
+        message="Claude wants to call AskUserQuestion"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              question: "First?",
+              header: "",
+              options: [
+                { label: "A", description: "" },
+                { label: "B", description: "" },
+              ],
+              multiSelect: false,
+            },
+            {
+              question: "Second?",
+              header: "",
+              options: [{ label: "C", description: "" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />
+    );
+    const { unmount } = render(card);
+    fireEvent.click(screen.getByLabelText("A"));
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "draft text" },
+    });
+    expect(
+      (screen.getByTestId("ask-user-question-custom-input") as HTMLTextAreaElement).value,
+    ).toBe("draft text");
+    unmount();
+
+    render(card);
+    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 2 of 2:");
+    expect(
+      (screen.getByTestId("ask-user-question-custom-input") as HTMLTextAreaElement).value,
+    ).toBe("draft text");
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    expect((screen.getByLabelText("A") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("keeps the draft when a submit rolls back to pending", () => {
+    // The store flips the card to "responded" the instant the user submits,
+    // then rolls back to "pending" if the resolve POST fails. The draft must
+    // survive that round trip so the restored form keeps the typed answers.
+    const props = {
+      elicitationId: "elic_draft_rollback",
+      message: "Claude wants to call AskUserQuestion",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+      askUserQuestion: {
+        questions: [{ question: "Only?", header: "", options: [{ label: "A", description: "" }] }],
+      },
+    } as const;
+    const { rerender } = render(<ApprovalCard {...props} status="pending" response={null} />);
+    fireEvent.click(screen.getByLabelText("A"));
+
+    // Optimistic flip while the resolve POST is in flight: the form unmounts but
+    // the draft stays put because the resolution is not yet server-confirmed.
+    markApprovalInFlight("elic_draft_rollback");
+    rerender(
+      <ApprovalCard
+        {...props}
+        status="responded"
+        response={{ action: "accept", content: { "Only?": "A" } }}
+      />,
+    );
+    expect(sessionStorage.getItem("omnigent.askUserQuestionDrafts")).toContain(
+      "elic_draft_rollback",
+    );
+
+    // Rollback: the POST failed, the mark clears, and the form returns with the
+    // user's selection intact.
+    clearApprovalInFlight("elic_draft_rollback");
+    rerender(<ApprovalCard {...props} status="pending" response={null} />);
+    expect((screen.getByLabelText("A") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("drops a leftover draft when the card mounts already answered", () => {
+    // Answered in another tab or the Inbox while this card was away: it mounts
+    // responded with no form to fill, so the stale draft is cleared on mount.
+    const props = {
+      elicitationId: "elic_draft_resolved",
+      message: "Claude wants to call AskUserQuestion",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+      askUserQuestion: {
+        questions: [{ question: "Only?", header: "", options: [{ label: "A", description: "" }] }],
+      },
+    } as const;
+    const { unmount } = render(<ApprovalCard {...props} status="pending" response={null} />);
+    fireEvent.click(screen.getByLabelText("A"));
+    expect(sessionStorage.getItem("omnigent.askUserQuestionDrafts")).toContain(
+      "elic_draft_resolved",
+    );
+    unmount();
+
+    render(
+      <ApprovalCard
+        {...props}
+        status="responded"
+        response={{ action: "accept", content: { "Only?": "A" } }}
+      />,
+    );
+    expect(sessionStorage.getItem("omnigent.askUserQuestionDrafts")).toBeNull();
+  });
+
+  it("drops the draft when a mounted card resolves pending→responded off-screen", async () => {
+    // The question is answered elsewhere (Inbox, another tab) while this card
+    // stays mounted: no in-flight mark, so the committed flip clears the draft.
+    const props = {
+      elicitationId: "elic_draft_external",
+      message: "Claude wants to call AskUserQuestion",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+      askUserQuestion: {
+        questions: [{ question: "Only?", header: "", options: [{ label: "A", description: "" }] }],
+      },
+    } as const;
+    const { rerender } = render(<ApprovalCard {...props} status="pending" response={null} />);
+    fireEvent.click(screen.getByLabelText("A"));
+    expect(getAskUserQuestionDraft("elic_draft_external")).toBeDefined();
+
+    rerender(
+      <ApprovalCard
+        {...props}
+        status="responded"
+        response={{ action: "accept", content: { "Only?": "A" } }}
+      />,
+    );
+    await waitFor(() => expect(getAskUserQuestionDraft("elic_draft_external")).toBeUndefined());
+  });
+
+  it("keeps the draft across an auto_resolved flip that a re-park revives", () => {
+    // A severed harness wait flips the card to auto_resolved ("Resolved
+    // elsewhere") before the retry re-parks it as pending. The draft must
+    // survive that round trip so the revived form keeps the typed answer.
+    const props = {
+      elicitationId: "elic_draft_autoresolved",
+      message: "Claude wants to call AskUserQuestion",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+      askUserQuestion: {
+        questions: [{ question: "Only?", header: "", options: [{ label: "A", description: "" }] }],
+      },
+    } as const;
+    const { rerender } = render(
+      <TooltipProvider>
+        <ApprovalCard {...props} status="pending" response={null} />
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByLabelText("A"));
+    expect(getAskUserQuestionDraft("elic_draft_autoresolved")).toBeDefined();
+
+    // auto_resolved is not a committed verdict, so the draft stays even with no
+    // in-flight mark; a re-park can still revive the card as pending.
+    rerender(
+      <TooltipProvider>
+        <ApprovalCard {...props} status="responded" response={{ action: "auto_resolved" }} />
+      </TooltipProvider>,
+    );
+    expect(getAskUserQuestionDraft("elic_draft_autoresolved")).toBeDefined();
+
+    rerender(
+      <TooltipProvider>
+        <ApprovalCard {...props} status="pending" response={null} />
+      </TooltipProvider>,
+    );
+    expect((screen.getByLabelText("A") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("drops a restored selection whose option is no longer offered", () => {
+    // The draft kept a selected label, but the card remounts after the server
+    // re-published the question without that option. The gone label must not
+    // preselect, leaving the form at its empty default.
+    const base = {
+      elicitationId: "elic_draft_staleoption",
+      message: "Claude wants to call AskUserQuestion",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+    } as const;
+    const { unmount } = render(
+      <ApprovalCard
+        {...base}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              question: "Pick?",
+              header: "",
+              options: [
+                { label: "A", description: "" },
+                { label: "B", description: "" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("A"));
+    unmount();
+
+    render(
+      <ApprovalCard
+        {...base}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              question: "Pick?",
+              header: "",
+              options: [
+                { label: "B", description: "" },
+                { label: "C", description: "" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+    expect(screen.queryByLabelText("A")).toBeNull();
+    expect((screen.getByLabelText("B") as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByLabelText("C") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("clamps a restored carousel index past the shortened question list", () => {
+    // The draft remembered a later slide; the remounted question now has fewer
+    // slides, so the restored index clamps into range instead of a blank card.
+    const base = {
+      elicitationId: "elic_draft_clamp",
+      message: "Claude wants to call AskUserQuestion",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "",
+      requestedSchema: {},
+    } as const;
+    const { unmount } = render(
+      <ApprovalCard
+        {...base}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            { question: "First?", header: "", options: [{ label: "A", description: "" }] },
+            { question: "Second?", header: "", options: [{ label: "B", description: "" }] },
+            { question: "Third?", header: "", options: [{ label: "C", description: "" }] },
+          ],
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 3 of 3:");
+    unmount();
+
+    render(
+      <ApprovalCard
+        {...base}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            { question: "First?", header: "", options: [{ label: "A", description: "" }] },
+            { question: "Second?", header: "", options: [{ label: "B", description: "" }] },
+          ],
+        }}
+      />,
+    );
+    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 2 of 2:");
+  });
+
+  it("restores a secret answer on remount without writing it to sessionStorage", () => {
+    const card = (
+      <ApprovalCard
+        elicitationId="elic_draft_secret"
+        message="Codex needs input"
+        phase="codex_request_user_input"
+        policyName="codex_native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              question: "API token?",
+              header: "",
+              options: [{ label: "Skip", description: "" }],
+              multiSelect: false,
+              isSecret: true,
+            },
+          ],
+        }}
+      />
+    );
+    const { unmount } = render(card);
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "hunter2" },
+    });
+    expect(sessionStorage.getItem("omnigent.askUserQuestionDrafts")).toContain("elic_draft_secret");
+    expect(sessionStorage.getItem("omnigent.askUserQuestionDrafts")).not.toContain("hunter2");
+    unmount();
+
+    render(card);
+    expect(
+      (screen.getByTestId("ask-user-question-custom-input") as HTMLTextAreaElement).value,
+    ).toBe("hunter2");
+  });
+
   it("hides Submit until the carousel is on the final question", () => {
     // Submit is the only path to commit the form, so it only
     // makes sense on the last slide — earlier slides expose Next.
@@ -1245,6 +1595,162 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     // ("wants to call AskUserQuestion") would read as if the prompt
     // were still outstanding.
     expect(screen.queryByText(/wants to call/)).toBeNull();
+  });
+});
+
+describe("ApprovalCard — transcript float→inline remount under optimistic submit", () => {
+  beforeEach(() => {
+    useChatStore.setState({ submitApproval: realSubmitApproval } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    // Drop the bound entry so a sibling test's state seed can't inherit this
+    // conversation as the active one through the shared registry.
+    conversationRegistry.clear();
+  });
+
+  const QUESTION_PROPS = {
+    elicitationId: "elic_transcript",
+    message: "Claude wants to call AskUserQuestion",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+    askUserQuestion: {
+      questions: [
+        {
+          question: "First?",
+          header: "",
+          options: [
+            { label: "A", description: "" },
+            { label: "B", description: "" },
+          ],
+          multiSelect: false,
+        },
+        {
+          question: "Second?",
+          header: "",
+          options: [{ label: "C", description: "" }],
+          multiSelect: false,
+        },
+      ],
+    },
+  } as const;
+
+  function pendingBlock(): ElicitationBlock {
+    return {
+      type: "elicitation",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+      elicitationId: "elic_transcript",
+      message: QUESTION_PROPS.message,
+      phase: QUESTION_PROPS.phase,
+      policyName: QUESTION_PROPS.policyName,
+      contentPreview: "",
+      requestedSchema: {},
+      status: "pending",
+      response: null,
+    };
+  }
+
+  // Mirror the transcript: a pending card floats in its own subtree while a
+  // responded one renders inline, so flipping status remounts the card as a
+  // fresh instance — the condition the draft cleanup must survive, not a rerender.
+  function TranscriptLike() {
+    const block = useChatStore((s) => s.blocks[0]);
+    if (!block || block.type !== "elicitation") return null;
+    const pending = block.status === "pending";
+    const card = (
+      <ApprovalCard {...QUESTION_PROPS} status={block.status} response={block.response} />
+    );
+    return (
+      <>
+        <div data-testid="inline-stream">{pending ? null : card}</div>
+        <div data-testid="pending-float">{pending ? card : null}</div>
+      </>
+    );
+  }
+
+  function okResponse(): Response {
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "application/json" }),
+      json: async () => ({ queued: true }),
+      text: async () => "{}",
+    } as unknown as Response;
+  }
+
+  function errorResponse(): Response {
+    return {
+      ok: false,
+      status: 500,
+      statusText: "Server Error",
+      headers: new Headers({ "content-type": "application/json" }),
+      json: async () => ({ error: { code: "boom", message: "resolve failed" } }),
+      text: async () => JSON.stringify({ error: { code: "boom", message: "resolve failed" } }),
+    } as unknown as Response;
+  }
+
+  it("keeps the draft when a failed submit remounts the card float→inline and back", async () => {
+    clearAskUserQuestionDrafts();
+    // Hold the resolve POST open so the optimistically mounted responded card
+    // is observable before the verdict lands, then fail it on demand.
+    let failResolve: (() => void) | null = null;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (/\/elicitations\/[^/]+\/resolve$/.test(String(input))) {
+        return new Promise<Response>((resolve) => {
+          failResolve = () => resolve(errorResponse());
+        });
+      }
+      return Promise.resolve(okResponse());
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Bind an active entry so the optimistic flip, which writes through the
+    // conversation entry, reaches the root store the view subscribes to; a bare
+    // state seed can leave no entry when a prior test set this id, dropping the flip.
+    bindConversationForTest("conv_transcript", { blocks: [pendingBlock()] });
+    render(<TranscriptLike />);
+
+    // Answer question 1 by option and question 2 by free text.
+    fireEvent.click(screen.getByLabelText("A"));
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "draft text" },
+    });
+
+    // Submit through the real store path; the POST stays in flight.
+    let submitPromise: Promise<void> = Promise.resolve();
+    await act(async () => {
+      submitPromise = useChatStore
+        .getState()
+        .submitApproval("elic_transcript", "accept", { "First?": "A", "Second?": "draft text" });
+    });
+
+    // The card has remounted inline as responded, yet the draft is retained
+    // because the resolution is still in flight (not server-confirmed).
+    expect(screen.queryByTestId("ask-user-question-custom-input")).toBeNull();
+    expect(getAskUserQuestionDraft("elic_transcript")).toBeDefined();
+
+    // The POST fails: the card rolls back to pending in the float, and the
+    // restored form still carries the option and the typed text.
+    await act(async () => {
+      failResolve?.();
+      await submitPromise;
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("ask-user-question-custom-input")).toBeDefined();
+    });
+    expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 2 of 2:");
+    expect(
+      (screen.getByTestId("ask-user-question-custom-input") as HTMLTextAreaElement).value,
+    ).toBe("draft text");
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    expect((screen.getByLabelText("A") as HTMLInputElement).checked).toBe(true);
   });
 });
 
