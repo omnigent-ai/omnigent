@@ -930,12 +930,17 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  * server is the authority — this only gates the submit button so an
  * obviously unusable value gets inline feedback instead of a 422.
  *
+ * The host may not carry an ``@``: that is embedded ``user:token@host``
+ * userinfo, which the server refuses so a token never reaches a session
+ * label or a sandbox Pod spec. Refusing it here keeps it out of the
+ * request as well.
+ *
  * @param url Value the user typed in the repository input.
  * @returns true when ``url.trim()`` matches one of the two forms.
  */
 export function isValidSandboxRepoUrl(url: string): boolean {
   const t = url.trim();
-  return /^https:\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
+  return /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
 }
 
 /**
