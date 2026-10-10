@@ -387,6 +387,19 @@ def get_runner_id() -> str | None:
     return _globals._runner_id
 
 
+def set_remote_routing_available(available: bool) -> None:
+    """Record whether the attached server can route, for a runner process.
+
+    The routing backends live in the server process, so a runner has none of
+    its own; without this it reads routing as unavailable and hides
+    ``sys_advise_models`` even from sessions whose server routes. Runners set
+    it from the session-init envelope.
+
+    :param available: What the server reported.
+    """
+    _globals._caps.remote_routing_available = available
+
+
 def set_harness_process_manager(manager: HarnessProcessManager | None) -> None:
     """
     Set the AP-wide :class:`HarnessProcessManager` singleton.
