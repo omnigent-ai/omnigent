@@ -420,6 +420,84 @@ overrides this auto-selection.
 > `403` even though the host connects. Framework-level; applies to every sandbox
 > provider (Modal / Daytona / Islo / Kubernetes / …).
 
+### Browser sessions
+
+In `accounts` and `oidc` modes the web UI (and the mobile / desktop apps that
+wrap it) stays signed in while it is in use, and signs out after an idle limit
+measured from the user's last interaction: a click or tap, a key press, a
+mouse wheel, a touch, or switching back to the window or tab. Nothing the page
+does on its own counts: its polling, stream reconnects, automatic scrolling
+and focus changes keep it connected, but only up to the idle limit after the
+last interaction, so an unattended tab signs out on schedule. API requests
+from the web UI report how long the user has been idle (the
+`X-Omnigent-Activity-Age` header); once half of the cookie's lifetime has
+passed, the server re-issues it to expire the idle limit after that last
+interaction. Loading, reloading or restoring a page is not an interaction:
+until the user interacts, or while the recorded interaction lies in the future
+because the clock was set back, requests carry no idle time and cannot renew
+the session. A closed tab sends nothing, so it is signed out no later than the
+idle limit after its last interaction, and possibly sooner. Requests without
+the header (the CLI, scripts) never extend a browser session. Only a new login
+resets the absolute limit, so a browser signs in again at most once per max
+lifetime.
+
+Idle time is measured per browser, not per tab: every tab of a browser shares
+one session cookie, and the tabs share the time of the last interaction
+through the browser's local storage, so activity in any tab keeps the session
+alive for all of them. The idle limit applies from the last interaction in
+whichever tab was used most recently, once every tab is idle. Where local
+storage is unavailable (some private-browsing modes and embedded webviews),
+each tab counts only its own interactions.
+
+| Variable (accounts / OIDC) | Default | Meaning |
+|---|---|---|
+| `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` / `OMNIGENT_OIDC_SESSION_TTL_HOURS` | `8` | Idle limit: the session ends this long after the user's last interaction, even with the tab open. |
+| `OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS` / `OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS` | `720` (30 days) | Hard cap from login, however active the user is. Must be at least the idle limit. Set it equal to the idle limit to turn sliding renewal off. |
+
+The idle time is reported by the browser, so code already running with the
+user's cookie could fake it, just as it could keep a session alive by making
+requests. The idle limit protects an unattended screen, not a compromised
+device; the max lifetime bounds every session regardless.
+
+Renewal relies on the server's database to record sign-outs, and every deploy
+here (and `omnigent server`) has one. A custom embedding that calls
+`create_app` without a `permission_store` has no shared place to record them,
+so it turns renewal off and logs a warning at startup. Its session cookies keep
+the fixed expiry set at login, as before renewal existed.
+
+Signing out ends the session and every renewed cookie descended from it. The
+logout is recorded in the server's database until the session's max lifetime,
+so it holds on every replica sharing that database and survives restarts:
+every replica rejects the cookie on its next request. Sign-out ends only the
+browser cookie. A CLI holding the same token as a Bearer (the OIDC
+`omnigent login` browser flow hands one token to both) keeps it until it
+expires on its own.
+
+Cookies issued before an upgrade to this behavior are not renewed. They expire
+on schedule, and the next login issues one that renews. CLI and host tokens
+(`omnigent login`) renew through their refresh grants instead. In OIDC mode the
+IdP is only consulted at login, so the max lifetime is also how long an active
+browser keeps access after a user is removed at the IdP. Lower it to match your
+deprovisioning policy.
+
+If the database write fails, sign-out fails as a whole: the server answers
+`503`, keeps the session cookie, and leaves the session valid everywhere, so the
+user is told they are still signed in and can try again once the database
+recovers. The web UI shows the error on the Settings page; in OIDC mode the
+error page offers a "Try again" link and skips the IdP end-session hop. The
+server logs each failure.
+
+**Rolling back.** Sign-outs are recorded in the `browser_session_revocations`
+table, which the database migration creates. Downgrading that migration drops
+the table, and an older server ignores it, so a rollback while renewed cookies
+are still valid can re-admit sessions that were signed out. When rolling back,
+rotate the session cookie secret (`OMNIGENT_ACCOUNTS_COOKIE_SECRET` or
+`OMNIGENT_OIDC_COOKIE_SECRET`) as part of the rollback, which signs every
+browser out, or wait to roll back until the max lifetime has passed since the
+last sign-out that must keep holding. Rotating the secret also invalidates CLI
+and host tokens and refresh grants signed with it, so those need
+`omnigent login` again.
+
 ### Browser origin allowlist
 
 Independent of the auth mode above, the server also checks the browser

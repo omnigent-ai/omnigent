@@ -4043,6 +4043,12 @@ def create_app(
 
             device_grant_store = DeviceGrantStore(permission_store.storage_location)
             auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            from omnigent.server.browser_session_store import BrowserSessionRevocationStore
+
+            # Logout must end a browser session on every replica and across restarts.
+            auth_provider.set_session_revocation_store(
+                BrowserSessionRevocationStore(permission_store.storage_location)
+            )
 
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
@@ -4267,6 +4273,22 @@ def create_app(
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
+    if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+        "accounts",
+        "oidc",
+    ):
+        if auth_provider.renews_browser_sessions:
+            from omnigent.server.auth import SessionRenewalMiddleware
+
+            # Slide the browser session cookie forward for active users.
+            app.add_middleware(SessionRenewalMiddleware, auth_provider=auth_provider)
+        else:
+            _logger.warning(
+                "Browser session renewal is disabled: no permission store, so there is "
+                "no shared database to record logouts in. Session cookies keep their "
+                "fixed expiry (%s auth mode).",
+                auth_provider._source,
+            )
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     app.add_middleware(PublicSharingPolicyMiddleware, max_level=app.state.public_sharing_max_level)
     if resolved_base_path:
