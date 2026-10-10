@@ -4806,6 +4806,7 @@ async def _auto_create_codex_terminal(
         codex_session_meta_model_provider,
         fresh_codex_launch_catalog,
         is_unreadable_thread_error,
+        native_codex_launch_pins_model_provider,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
     )
@@ -5371,6 +5372,11 @@ async def _auto_create_codex_terminal(
                 launch_config.external_session_id,
                 terminal_launch_args=launch_config.terminal_launch_args,
                 cwd=Path(workspace),
+                model_provider=(
+                    _session_meta_provider
+                    if native_codex_launch_pins_model_provider(_codex_launch)
+                    else None
+                ),
                 retain_client=codex_remote_resume_omits_permission_args(
                     app_server.codex_cli_version
                 ),

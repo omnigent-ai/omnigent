@@ -1296,6 +1296,11 @@ async def _prepare_codex_terminal(
                     thread_id,
                     terminal_launch_args=codex_args,
                     cwd=Path.cwd(),
+                    model_provider=(
+                        codex_session_meta_model_provider(_codex_launch)
+                        if native_codex_launch_pins_model_provider(_codex_launch)
+                        else None
+                    ),
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
