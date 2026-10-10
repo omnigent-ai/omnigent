@@ -1,5 +1,10 @@
 # Omnigent on Kubernetes
 
+To try multiple server replicas, see the [NGINX example](multi_replica/README.md).
+It explains how browser requests reach the server connected to each host and
+includes a local test that replaces the server pods during an active session.
+The manifests below deploy a single server replica.
+
 Deploy Omnigent to any Kubernetes cluster using Kustomize. The manifests pull
 the prebuilt image and set up a persistent volume and health checks. They also
 include an Ingress so you can serve the app over HTTPS at a public web address,
