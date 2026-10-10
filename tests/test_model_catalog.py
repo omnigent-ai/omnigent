@@ -1948,6 +1948,33 @@ def test_openai_compatible_listing_hits_the_versioned_base() -> None:
     ]
 
 
+def test_openai_compatible_listing_forwards_extra_params_and_headers() -> None:
+    """Optional query params and headers ride along; the bearer token still wins."""
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(200, json={"data": [{"id": "claude-*"}]})
+
+    provider = ResolvedModelProvider(
+        kind="gateway", family="anthropic", base_url="http://litellm.local", api_key="tok"
+    )
+
+    listing = model_catalog._fetch_openai_compatible_listing(
+        provider,
+        transport=httpx.MockTransport(_handler),
+        params={"return_wildcard_routes": "true"},
+        headers={"x-litellm-api-key": "sk-extra", "authorization": "Bearer other"},
+    )
+
+    assert [str(request.url) for request in requests_seen] == [
+        "http://litellm.local/v1/models?return_wildcard_routes=true"
+    ]
+    assert requests_seen[0].headers["x-litellm-api-key"] == "sk-extra"
+    assert requests_seen[0].headers.get_list("authorization") == ["Bearer tok"]
+    assert [m.id for m in listing.models] == ["claude-*"]
+
+
 def test_openai_compatible_listing_mints_bearer_via_auth_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
