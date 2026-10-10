@@ -624,7 +624,8 @@ class LLMRoutingClient:
             self.last_error = "routing judge returned no model"
             return None
 
-        # Clamp hallucinated models to the cheapest available.
+        # The judge picked a model outside the servable catalog; clamp it to the
+        # cheapest servable one and rewrite the rationale to name the applied model.
         if model not in flat:
             if flat:
                 _logger.info(
@@ -633,6 +634,7 @@ class LLMRoutingClient:
                     flat[0],
                 )
                 model = flat[0]
+                rationale = f"The selected model is not available in this session; using {model}."
             else:
                 self.last_error = "no candidate models were available"
                 return None
