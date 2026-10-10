@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import PurePath
 from typing import Any, Final, Literal, cast
 
+import cachetools
 import httpx
 from fastapi import (
     HTTPException,
@@ -234,6 +235,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
+    _session_status_edge_seq,
     _session_terminal_pending_cache,
     build_policy_engine,
     get_agent_cache,
@@ -4926,6 +4928,11 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    # Every authoritative edge invalidates any runner probe mid-flight, so bump
+    # the epoch even on a repeat of the same value: a fresh native ``running``
+    # for a new turn reuses the ``running`` string, and the probe must still be
+    # able to tell its ``idle`` answer went stale rather than overwrite it.
+    _session_status_edge_seq[session_id] = _session_status_edge_seq.get(session_id, 0) + 1
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,
@@ -5085,6 +5092,80 @@ def reconcile_orphaned_running_status(
         scheduled_run_outcome="failed",
     )
     return True
+
+
+# Strong refs so the loop can't collect these fire-and-forget probe tasks
+# before they finish.
+# custom-lint: disable-next=workspace-scoped-cache -- set of unique Task objects, not tenant-keyed
+_live_runner_reconcile_tasks: set[asyncio.Task[None]] = set()
+
+# A session confirmed running (or unreachable) is re-probed only after this
+# cooldown, so a hot list poll does not re-probe it every time; the value is the
+# probed runner, so a session rebound to a different one re-probes at once.
+_LIVE_RUNNER_PROBE_COOLDOWN_S: Final[float] = 30.0
+_live_runner_probe_cooldown: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(
+        maxsize=math.inf, ttl=_LIVE_RUNNER_PROBE_COOLDOWN_S, timer=lambda: time.monotonic()
+    )
+)
+
+
+def spawn_live_runner_idle_reconcile(
+    session_id: str,
+    runner_id: str,
+    runner_router: RunnerRouter,
+) -> None:
+    """
+    Schedule a cooldown-limited runner probe for a suspected lost terminal status.
+
+    The confirmed-gone backstop (``reconcile_orphaned_running_status``) leaves a
+    fresh-runner row running so a real in-flight turn is never falsely idled,
+    but a terminal ``idle`` edge can be lost while the runner stays alive (a
+    dropped relay frame, replica lag), stranding the row ``running`` with no
+    turn behind it. ``GET /v1/sessions`` is a hot poll, so this fires the
+    shared, backed-off runner status probe in the background; the probe
+    rewrites the cached and persisted status from the runner's answer, settling
+    a lost-edge row to idle or confirming a still-running turn for the next
+    poll. The task is held in a module set until it finishes so the loop cannot
+    collect it early.
+
+    :param session_id: Session/conversation identifier to reconcile.
+    :param runner_id: The runner bound on the list row, keying the per-session
+        cooldown so a busy session is not re-probed on every poll while a
+        session rebound to another runner is re-probed at once.
+    :param runner_router: Router used to reach the pinned runner.
+    """
+    if _live_runner_probe_cooldown.get(session_id) == runner_id:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _live_runner_probe_cooldown[session_id] = runner_id
+
+    async def _run() -> None:
+        try:
+            routed = await asyncio.to_thread(
+                runner_router.client_for_existing_conversation, session_id
+            )
+            if routed is None:
+                return
+            from omnigent.server.routes._sessions.orchestration import (
+                _probe_runner_live_status,
+            )
+
+            await _probe_runner_live_status(routed.client, session_id, routed.runner_id)
+        except OmnigentError:
+            # Runner offline, or pinned to another replica — can't confirm here.
+            return
+        except Exception:  # noqa: BLE001
+            # A fire-and-forget probe failure must not surface only as an
+            # unretrieved task exception at GC.
+            _logger.exception("live-runner idle reconcile failed for %s", session_id)
+
+    task = loop.create_task(_run())
+    _live_runner_reconcile_tasks.add(task)
+    task.add_done_callback(_live_runner_reconcile_tasks.discard)
 
 
 def _truncate_label(value: str) -> str:

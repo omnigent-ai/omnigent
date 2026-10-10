@@ -158,6 +158,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_permission_mode_forward,
     _RunnerForwardResult,
     _same_provider_family,
+    _session_active_response_cache,
     _session_status_cache,
     _set_read_state,
     _surface_model_change_forward_failure,
@@ -166,6 +167,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
     reconcile_orphaned_running_status,
+    spawn_live_runner_idle_reconcile,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -1676,6 +1678,28 @@ def register_core_routes(
             for conv in page.data
             if conv.agent_id is not None
         ]
+        # Fire-and-forget re-probe for a lost terminal-idle edge: a row still
+        # relay-cached running/waiting with no tracked response id, a fresh
+        # runner, owned by the caller (see spawn_live_runner_idle_reconcile).
+        if runner_router is not None:
+            for conv in page.data:
+                if (
+                    conv.agent_id is not None
+                    and conv.runner_id is not None
+                    and _session_status_cache.get(conv.id) in ("running", "waiting")
+                    and _session_active_response_cache.get(conv.id) is None
+                    and runner_seen_is_fresh(conv.runner_last_seen)
+                    and (
+                        permission_store is None
+                        or _permission_level_from_grants(
+                            user_id,
+                            perms_by_conv.get(conv.id, []),
+                            user_is_admin,
+                        )
+                        == LEVEL_OWNER
+                    )
+                ):
+                    spawn_live_runner_idle_reconcile(conv.id, conv.runner_id, runner_router)
         # Apart from the bounded orphan-suspect probe above, the list does not
         # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the

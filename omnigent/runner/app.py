@@ -3227,7 +3227,14 @@ def create_runner_app(
                     "detail": (f"No session '{session_id}' on this runner."),
                 },
             )
-        has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
+        # Native-pane turns stream through their own terminal, outside
+        # _active_turns and the process manager, so a server status probe
+        # settling a stuck row reads a false idle unless we count them here.
+        has_turn = (
+            session_id in _active_turns
+            or process_manager.has_active_turn(session_id)
+            or _native_turn_in_flight(session_id)
+        )
         status = "running" if has_turn else "idle"
         # A failed setup has no active turn; retain its failure in server status probes.
         if not has_turn and _native_pane_status.get(session_id) == "failed":
@@ -3279,6 +3286,10 @@ def create_runner_app(
                 "reasoning_effort": None,
                 "items": [],
                 "permission_level": None,
+                # ``status`` counts native-pane turns; the server only lets an
+                # ``idle`` settle a live row when this is present, so an older
+                # runner's bare ``idle`` cannot false-settle a native turn.
+                "counts_native_turns": True,
             },
         )
 
