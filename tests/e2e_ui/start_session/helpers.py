@@ -21,6 +21,8 @@ async def wait_until(predicate: Callable[[], object], *, timeout_s: float = 15.0
         if predicate():
             return
         await asyncio.sleep(0.05)
+    if predicate():
+        return
     raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 

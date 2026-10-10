@@ -145,7 +145,8 @@ async def _drive_journey(base_url: str, codex_id: str, claude_id: str, evidence_
             await expect(submit).to_be_enabled()
             await page.screenshot(path=evidence_dir / "codex-sandbox-start.png")
             await submit.click()
-            await wait_until(lambda: len(creates) == 1)
+            await wait_until(lambda: len(creates) >= 1)
+            assert len(creates) == 1, creates
             body = creates[0]
             assert body["agent_id"] == codex_id, body
             assert body["host_type"] == "managed", body
