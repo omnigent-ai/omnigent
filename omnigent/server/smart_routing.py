@@ -27,6 +27,7 @@ from omnigent.models.model_fallbacks import (
     SMART_ROUTING_FAMILY_FALLBACKS,
     SMART_ROUTING_GPT_LADDER,
     SMART_ROUTING_PI_EXCLUDED,
+    SMART_ROUTING_PI_EXCLUDED_GENERATIONS,
     SMART_ROUTING_PI_LADDER,
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
@@ -1121,6 +1122,12 @@ _ROUTER_HARNESS_BY_FAMILY: dict[str, str] = {"claude": "claude", "gpt": "codex"}
 # live gateway; tests/e2e/routing/ exercises the exclusions.
 _HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {"pi": SMART_ROUTING_PI_EXCLUDED}
 
+# Whole model generations a harness cannot run, as bare-id prefixes. The list
+# above names single probed arms; one entry here bars every arm of a generation.
+_HARNESS_EXCLUDED_GENERATIONS: dict[str, tuple[str, ...]] = {
+    "pi": SMART_ROUTING_PI_EXCLUDED_GENERATIONS
+}
+
 
 def _configured_prefixes(prefixes: Sequence[str] | None) -> Sequence[str]:
     """Resolve which catalog prefixes to compare ids with.
@@ -1310,10 +1317,26 @@ def harness_bars_model(
 ) -> bool:
     """Report whether *harness*'s gateway rejects *model*.
 
-    See :data:`_HARNESS_EXCLUDED_MODELS`.
+    See :data:`_HARNESS_EXCLUDED_MODELS` and :data:`_HARNESS_EXCLUDED_GENERATIONS`.
     """
-    barred = {_bare_id(m, prefixes) for m in _HARNESS_EXCLUDED_MODELS.get(harness or "", ())}
-    return _bare_id(model, prefixes) in barred
+    key = harness or ""
+    bare = _bare_id(model, prefixes)
+    if bare in {_bare_id(m, prefixes) for m in _HARNESS_EXCLUDED_MODELS.get(key, ())}:
+        return True
+    return any(
+        bare == generation or bare.startswith(f"{generation}-")
+        for generation in _HARNESS_EXCLUDED_GENERATIONS.get(key, ())
+    )
+
+
+def _barred_candidates(
+    harness: str | None,
+    candidates: Sequence[str],
+    *,
+    prefixes: Sequence[str] | None = None,
+) -> list[str]:
+    """Return the *candidates* *harness* bars, for :func:`substitute_model`'s ``barred``."""
+    return [m for m in candidates if harness_bars_model(harness, m, prefixes=prefixes)]
 
 
 def _redirect_incompatible_pick(
@@ -1497,7 +1520,7 @@ class TaskV1RouteOptionSource:
             router_id,
             pool,
             prefixes=self._model_prefixes,
-            barred=_HARNESS_EXCLUDED_MODELS.get(harness, ()),
+            barred=_barred_candidates(harness, pool, prefixes=self._model_prefixes),
             aliases=self._aliases,
         )
         if local is None:
@@ -2211,11 +2234,12 @@ async def route_session_harness(
     if chosen_harness is None and result.harness in harness_models:
         # Every offered harness bars the pick, and the family the caller allowed
         # is not negotiable — swap the model instead of the harness.
+        pool = harness_models[result.harness]
         substitute = substitute_model(
             raw_model or chosen_model,
-            harness_models[result.harness],
+            pool,
             prefixes=prefixes,
-            barred=_HARNESS_EXCLUDED_MODELS.get(result.harness, ()),
+            barred=_barred_candidates(result.harness, pool, prefixes=prefixes),
         )
         if substitute is not None:
             raw_model = raw_model or chosen_model
@@ -2350,7 +2374,7 @@ async def route_turn(
     # A turn cannot change the harness, so a model its gateway bars is not a
     # candidate at all. The seam still injects whatever arms the router's menu
     # requires, so dropping these rows never makes that menu partial.
-    if _HARNESS_EXCLUDED_MODELS.get(harness or ""):
+    if harness in _HARNESS_EXCLUDED_MODELS or harness in _HARNESS_EXCLUDED_GENERATIONS:
         available = {
             name: runnable
             for name, models in available.items()
@@ -2397,7 +2421,7 @@ async def route_turn(
             raw_model or model,
             candidates,
             prefixes=prefixes,
-            barred=_HARNESS_EXCLUDED_MODELS.get(harness or "", ()),
+            barred=_barred_candidates(harness, candidates, prefixes=prefixes),
         )
         if substitute is None:
             _logger.info(

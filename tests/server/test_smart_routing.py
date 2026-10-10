@@ -104,6 +104,21 @@ def _models_for(harness: str | None) -> list[str] | None:
     return list(models) if models is not None else None
 
 
+def _catalog_response_client(workers: dict[str, list[dict[str, Any]]]) -> MagicMock:
+    """Runner client whose ``/models`` response lists *workers*' model entries by worker name."""
+    response = MagicMock()
+    response.json.return_value = {
+        "workers": {
+            worker: {"source": "catalog", "verified": True, "models": entries, "note": ""}
+            for worker, entries in workers.items()
+        }
+    }
+    response.raise_for_status = MagicMock()
+    client = MagicMock()
+    client.get = AsyncMock(return_value=response)
+    return client
+
+
 def _catalog_client() -> MagicMock:
     workers = {
         "claude_code": _TEST_MODELS["claude-sdk"],
@@ -111,8 +126,7 @@ def _catalog_client() -> MagicMock:
         "pi": _TEST_MODELS["pi"],
         "self": _TEST_MODELS["claude-sdk"],
     }
-    response = MagicMock()
-    catalog_workers: dict[str, dict[str, Any]] = {}
+    catalog_workers: dict[str, list[dict[str, Any]]] = {}
     for worker, models in workers.items():
         entries: list[dict[str, Any]] = []
         for model in models:
@@ -126,17 +140,8 @@ def _catalog_client() -> MagicMock:
                         wire_apis=["openai-chat", "openai-responses"],
                     )
             entries.append(entry)
-        catalog_workers[worker] = {
-            "source": "catalog",
-            "verified": True,
-            "models": entries,
-            "note": "",
-        }
-    response.json.return_value = {"workers": catalog_workers}
-    response.raise_for_status = MagicMock()
-    client = MagicMock()
-    client.get = AsyncMock(return_value=response)
-    return client
+        catalog_workers[worker] = entries
+    return _catalog_response_client(catalog_workers)
 
 
 # ── test catalog fixtures ───────────────────────────────────────────
@@ -738,6 +743,111 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
         )
     # Still routes — fell back to the static infer_models table.
     assert model == "databricks-claude-haiku-4-5"
+
+
+_GEMINI_3X = "system.ai.gemini-3-5-flash"
+
+
+def _workers_catalog_client(workers: dict[str, list[str]]) -> MagicMock:
+    """Runner catalog listing *workers*' model ids, keyed by worker name."""
+    return _catalog_response_client(
+        {worker: [{"id": model} for model in models] for worker, models in workers.items()}
+    )
+
+
+def _gemini_catalog_client() -> MagicMock:
+    """Runner catalog whose own row serves a Gemini-3.x id and a claude id."""
+    return _workers_catalog_client({"self": [_GEMINI_3X, "databricks-claude-opus-4-8"]})
+
+
+@pytest.mark.asyncio
+async def test_route_turn_bars_gemini_3x_from_claude_sdk() -> None:
+    """claude-sdk's family filter already drops Gemini-3.x from the candidates."""
+    client = FakeRoutingClient(
+        RoutingResult(model="databricks-claude-opus-4-8", rationale="guard", harness="claude-sdk")
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
+        model, _v = await route_turn(
+            "claude-sdk",
+            "edit the config file",
+            session_id="conv_gemini",
+            runner_client=_gemini_catalog_client(),
+        )
+    assert _GEMINI_3X not in client.offered[0].get("claude-sdk", [])
+    assert model != _GEMINI_3X
+
+
+@pytest.mark.asyncio
+async def test_route_turn_bars_gemini_3x_from_pi() -> None:
+    """pi cannot carry Gemini-3.x past its first tool call, so no Gemini-3.x arm is offered."""
+    client = FakeRoutingClient(
+        RoutingResult(model=_GEMINI_3X, rationale="cheap+fast", harness="pi")
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
+        model, _v = await route_turn(
+            "pi",
+            "edit the config file",
+            session_id="conv_gemini",
+            runner_client=_gemini_catalog_client(),
+        )
+    assert _GEMINI_3X not in client.offered[0].get("pi", [])
+    assert model != _GEMINI_3X
+
+
+@pytest.mark.parametrize(
+    ("harness", "model", "barred"),
+    [
+        ("pi", "system.ai.gemini-3-5-flash", True),
+        ("pi", "databricks-gemini-3-pro", True),
+        ("pi", "gemini-3.8-flash", True),
+        ("pi", "databricks-llama-4-maverick", False),
+        ("claude-sdk", "system.ai.gemini-3-5-flash", False),
+        ("codex", "system.ai.gemini-3-5-flash", False),
+    ],
+)
+def test_pi_bars_every_gemini_3x_spelling(harness: str, model: str, barred: bool) -> None:
+    """One generation entry bars every Gemini-3.x spelling under pi, and only under pi."""
+    assert harness_bars_model(harness, model, prefixes=["databricks-", "system.ai."]) is barred
+
+
+@pytest.mark.asyncio
+async def test_route_turn_bars_gemini_3x_from_the_callers_catalog() -> None:
+    """The pre-session vocabulary path prunes Gemini-3.x for pi before the router sees it."""
+    client = FakeRoutingClient(RoutingResult(model=_GEMINI_3X, rationale="cheap", harness="pi"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
+        model, verdict = await route_turn(
+            "pi", "edit the config file", catalog=[_GEMINI_3X, "databricks-claude-opus-4-8"]
+        )
+    assert client.offered == [{"pi": ["databricks-claude-opus-4-8"]}]
+    # The router still named Gemini and nothing substitutes for it, so the turn keeps its model.
+    assert (model, verdict) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_declines_a_gemini_3x_pick_on_pi() -> None:
+    """An auto session's Gemini-3.x pick is declined: pi bars it and no other harness serves it."""
+    client = FakeRoutingClient(RoutingResult(model=_GEMINI_3X, rationale="cheap", harness="pi"))
+    runner = _workers_catalog_client(
+        {
+            "pi": [_GEMINI_3X, "databricks-claude-sonnet-5"],
+            "claude_code": ["databricks-claude-sonnet-5"],
+        }
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
+        harness, model, verdict, error = await route_session_harness(
+            "edit the config file", session_id="conv_gemini", runner_client=runner
+        )
+    assert (harness, model, verdict) == (None, None, None)
+    assert error is not None and _GEMINI_3X in error
+
+
+def test_route_option_source_declines_a_gemini_3x_pick_on_pi() -> None:
+    """The external router's Gemini-3.x pick never resolves onto pi."""
+    from omnigent.server.smart_routing import RoutePick
+
+    source = TaskV1RouteOptionSource(model_prefixes=["databricks-", "system.ai."])
+    catalog = {"pi": [_GEMINI_3X, "databricks-claude-sonnet-5"]}
+    assert source.resolve_selection(RoutePick(model="gemini-3-5-flash"), ["pi"], catalog) is None
 
 
 # ── ExternalRoutingClient ─────────────────────────────────────────────

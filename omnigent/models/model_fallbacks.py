@@ -195,6 +195,11 @@ SMART_ROUTING_FAMILY_FALLBACKS = _SMART_ROUTING_FALLBACKS["family_fallbacks"].mo
 #: Models pi's own gateway rejects, so the router may not pick them under pi.
 SMART_ROUTING_PI_EXCLUDED = _SMART_ROUTING_FALLBACKS["pi_excluded"].model_ids
 
+#: Model generations pi cannot carry past its first tool call, as bare-id
+#: prefixes. Gemini-3.x demands a ``thought_signature`` on function-call history
+#: that pi's chat-completions path never echoes, so the gateway 400s the turn.
+SMART_ROUTING_PI_EXCLUDED_GENERATIONS: tuple[str, ...] = ("gemini-3",)
+
 #: The codex catalog entry a gateway-only arm is cloned from.
 CODEX_CATALOG_CLONE_SOURCE_SLUG = _SMART_ROUTING_FALLBACKS["codex_catalog_clone_source"].model_ids[
     0
