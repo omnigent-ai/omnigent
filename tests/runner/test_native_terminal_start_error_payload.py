@@ -89,6 +89,68 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
     assert "agent no longer exists" not in payload["message"]
 
 
+def test_mixed_version_import_failure_guides_host_restart() -> None:
+    """A stale in-tree import failure must guide a host restart, not the log.
+
+    After an in-place upgrade the running host imports an upgraded module whose
+    new symbol its in-memory copy lacks; the launch path must guide a restart.
+    """
+    frames_path = (
+        "/opt/pipx/venvs/omnigent/lib/python3.12/site-packages/"
+        "omnigent/runner/transports/ws_tunnel/frames.py"
+    )
+    exc = ImportError(
+        "cannot import name 'EventAckFrame' from "
+        "'omnigent.runner.transports.ws_tunnel.frames' "
+        f"({frames_path})",
+        name="omnigent.runner.transports.ws_tunnel.frames",
+        path=frames_path,
+    )
+    exc.name_from = "EventAckFrame"
+
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    message = payload["message"].lower()
+    assert "restart" in message and "host" in message, payload["message"]
+    # Never leak the on-disk install path through the client-facing message.
+    assert frames_path not in payload["message"]
+
+
+def _third_party_cannot_import_name() -> ImportError:
+    exc = ImportError(
+        "cannot import name 'Timeout' from 'httpx'",
+        name="httpx",
+    )
+    exc.name_from = "Timeout"
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # A "cannot import name" failure outside the omnigent tree is a plain
+        # dependency problem, not a stale host: it must keep the generic log
+        # pointer and must not claim a host restart will help.
+        _third_party_cannot_import_name(),
+        # A missing in-tree module (no ``name_from``) is not the symbol-skew
+        # signature the stale-host guard is scoped to.
+        ModuleNotFoundError(
+            "No module named 'omnigent.runner.transports.ws_tunnel.frames'",
+            name="omnigent.runner.transports.ws_tunnel.frames",
+        ),
+    ],
+)
+def test_unrelated_import_failure_keeps_generic_startup_code(exc: ImportError) -> None:
+    """Only the in-tree symbol-skew signature gets the host-restart guidance."""
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    message = payload["message"].lower()
+    assert "see the runner log" in message
+    assert "restart the host" not in message
+
+
 @pytest.mark.parametrize(
     ("exc", "category"),
     [

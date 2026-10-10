@@ -49,6 +49,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -7605,6 +7606,19 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
     return class_name
 
 
+def _is_stale_host_import_error(exc: BaseException) -> bool:
+    """Return whether *exc* is a mixed-version in-tree lazy-import failure.
+
+    An in-place upgrade leaves a running host's in-memory ``omnigent`` modules
+    older than the on-disk copies, so a lazy import raises ``cannot import name``
+    with ``name_from`` set — the in-process twin of ``_refuse_if_upgraded``.
+    """
+    if not isinstance(exc, ImportError) or getattr(exc, "name_from", None) is None:
+        return False
+    name = exc.name
+    return isinstance(name, str) and (name == "omnigent" or name.startswith("omnigent."))
+
+
 def _native_terminal_start_error_payload(
     exc: BaseException, runtime_name: str, *, session_id: str
 ) -> dict[str, str]:
@@ -7708,6 +7722,16 @@ def _native_terminal_start_error_payload(
             "Claude Code is Windows-native, but Omnigent is running under WSL. "
             "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
             "binary wins PATH resolution, then retry."
+        )
+    elif _is_stale_host_import_error(exc):
+        # Guide the user to a host restart, and never echo the exception text
+        # in the client message: it carries the on-disk install path.
+        cli = cli_invocation()
+        message = (
+            f"Native {runtime_name} terminal failed to start because this host "
+            "is still running an older Omnigent build than the one now on disk "
+            "(an in-place upgrade left it mixed-version). Restart the host to "
+            f"load the upgraded code: `{cli} host disable && {cli} host enable`."
         )
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
