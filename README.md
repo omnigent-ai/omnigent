@@ -485,8 +485,19 @@ omnigent host  https://your-host    # new sessions can now run on this machine
 ```
 
 > [!TIP]
-> On your own network you don't need a deploy. Open your machine's LAN
-> address on your phone (e.g. `http://192.168.x.x:6767`).
+> On your own network you don't need a deploy — but by default
+> `omnigent server` listens only on loopback (`127.0.0.1`), so a phone on
+> the same Wi-Fi is refused. Bind every interface instead:
+>
+> ```bash
+> omnigent server --host 0.0.0.0
+> ```
+>
+> A non-loopback bind turns on accounts (login) mode. Open the server URL
+> in a browser and create the admin account right away — until it exists,
+> anyone who can reach the server can claim it. Then open your machine's
+> LAN address on your phone (e.g. `http://192.168.x.x:6767`) and sign in.
+> This is plain HTTP, so only do it on a network you trust.
 
 ### 5. Collaborate with your team
 
