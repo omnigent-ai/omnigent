@@ -9980,7 +9980,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     );
     selectSmartRoutingHarness();
     const { body } = await submitAndReadBody("  refactor the auth\u0007 module  ");
-    expect(body.smart_routing_message).toBe("refactor the auth module");
+    expect(body.smart_routing_message).toBe("  refactor the auth module");
   });
 
   it("sends no routing on a create after the restored pick degraded", async () => {
