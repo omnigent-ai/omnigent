@@ -45,7 +45,7 @@ import os
 import re
 import shutil
 import sys
-import tempfile
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -300,10 +300,12 @@ class HermesExecutor(Executor):
             return
         from omnigent.harnesses.hermes_native.bridge import (
             bridge_dir_for_session_id,
+            hermes_profile_home,
             write_policy_hook_config,
         )
 
-        self._hermes_home = Path(tempfile.mkdtemp(prefix="hermes_home_"))
+        # A profile of the user's Hermes install, not a bare tempdir: see hermes_profile_home.
+        self._hermes_home = hermes_profile_home(f"exec-{uuid.uuid4().hex[:12]}")
         write_policy_hook_config(
             bridge_dir_for_session_id(conv_id),
             server_url,
