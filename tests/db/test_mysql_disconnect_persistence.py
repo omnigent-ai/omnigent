@@ -268,16 +268,19 @@ def _reap_orphaned_transaction(
 
     A failover, restart, or ``wait_timeout`` kill terminates the dead session
     and releases its row locks. Severing only the TCP path leaves the orphaned
-    transaction holding the ``conversations`` row lock. Record every client
-    thread alive before the drop -- the store's pooled connection is among them
-    from the first append on -- then, once the disconnect has fired, kill the
-    transaction still ``RUNNING`` but idle (its client was severed) on one of
-    those threads. The replay reconnects only after the drop on a new thread,
-    so it is never in the pre-drop set and cannot be the target. The reaper's
-    own connection is excluded, and it connects straight to the server,
-    bypassing the relay.
+    transaction holding the ``conversations`` row lock. While the write is in
+    flight (before the drop), record the thread id of the oldest ``RUNNING``
+    transaction -- the orphan-to-be -- and kill that exact thread once the
+    disconnect has fired. The replay reconnects on a new thread, so it is never
+    that target. The cold fallback, used only when the orphan was never seen in
+    flight (the reaper's first poll landed after the drop), kills the oldest
+    transaction that is still ``RUNNING`` but idle and began no later than the
+    drop: the replay is always newer, and while it is blocked on the orphan's
+    lock it is not idle, so it is never selected. The reaper's own connection is
+    excluded, and it connects straight to the server, bypassing the relay.
     """
-    pre_drop_threads: set[int] = set()
+    orphan_thread_id: int | None = None
+    drop_time: Any = None
     conn: Any = None
     try:
         while not stop.is_set():
@@ -302,28 +305,41 @@ def _reap_orphaned_transaction(
                 with conn.cursor() as cur:
                     if not dropped:
                         cur.execute(
-                            "SELECT id FROM information_schema.processlist "
-                            "WHERE id <> CONNECTION_ID()"
-                        )
-                        pre_drop_threads.update(int(row[0]) for row in cur.fetchall())
-                    else:
-                        cur.execute(
                             "SELECT trx_mysql_thread_id "
                             "FROM information_schema.innodb_trx "
-                            "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
+                            "WHERE trx_state = 'RUNNING' "
                             "AND trx_mysql_thread_id <> CONNECTION_ID() "
-                            "ORDER BY trx_started ASC"
+                            "ORDER BY trx_started ASC LIMIT 1"
                         )
-                        for (thread_id,) in cur.fetchall():
-                            if int(thread_id) in pre_drop_threads:
-                                # The orphan may vanish on its own before the KILL.
-                                with contextlib.suppress(Exception):
-                                    cur.execute(f"KILL {int(thread_id)}")
-                                return
+                        row = cur.fetchone()
+                        if row is not None:
+                            orphan_thread_id = int(row[0])
+                    else:
+                        if drop_time is None:
+                            cur.execute("SELECT NOW(6)")
+                            drop_time = cur.fetchone()[0]
+                        target = orphan_thread_id
+                        if target is None:
+                            cur.execute(
+                                "SELECT trx_mysql_thread_id "
+                                "FROM information_schema.innodb_trx "
+                                "WHERE trx_state = 'RUNNING' AND trx_query IS NULL "
+                                "AND trx_started <= %s "
+                                "AND trx_mysql_thread_id <> CONNECTION_ID() "
+                                "ORDER BY trx_started ASC LIMIT 1",
+                                (drop_time,),
+                            )
+                            row = cur.fetchone()
+                            target = int(row[0]) if row is not None else None
+                        if target is not None:
+                            # The orphan may vanish on its own before the KILL.
+                            with contextlib.suppress(Exception):
+                                cur.execute(f"KILL {target}")
+                            return
             except Exception:
                 conn = None
                 continue
-            if stop.wait(0.01 if not dropped else 0.02):
+            if stop.wait(0.01 if not dropped else 0.05):
                 return
     finally:
         if conn is not None:
