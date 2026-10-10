@@ -8006,6 +8006,13 @@ async def _relay_runner_stream(
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            # Default the interruption to a runner disconnect; only a session
+            # whose tunnel is still registered overrides it on the failure path.
+            disconnect_error = ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            )
+            failure_origin = "runner_disconnected_mid_turn"
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
@@ -8013,9 +8020,9 @@ async def _relay_runner_stream(
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
             else:
-                # Resolve the cause only on the failure path: a still-registered
-                # tunnel (including a runner that re-registered within the grace)
-                # means ``session_stream_lost``, which recovers like a disconnect.
+                # A still-registered tunnel (including a runner that re-registered
+                # within the grace) means only this session's stream dropped, which
+                # recovers like a disconnect; the probe runs only on this path.
                 wait = _runner_tunnel_waiter(runner_client)
                 if wait is not None and await wait(0.0):
                     disconnect_error = ErrorDetail(
@@ -8023,12 +8030,6 @@ async def _relay_runner_stream(
                         message="The live session connection was lost.",
                     )
                     failure_origin = "session_stream_lost_mid_turn"
-                else:
-                    disconnect_error = ErrorDetail(
-                        code="runner_disconnected",
-                        message="Runner disconnected unexpectedly.",
-                    )
-                    failure_origin = "runner_disconnected_mid_turn"
                 if await _runner_disconnect_requires_failure(
                     session_id,
                     conversation_store,
