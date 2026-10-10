@@ -17,7 +17,13 @@
 
 import type * as IdentityModule from "@/lib/identity";
 
-import { type InfiniteData, QueryClient } from "@tanstack/react-query";
+import {
+  CancelledError,
+  type InfiniteData,
+  onlineManager,
+  QueryClient,
+  QueryObserver,
+} from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -1104,6 +1110,201 @@ describe("chatStore — lazy subtree usage", () => {
 });
 
 describe("chatStore — switchTo", () => {
+  describe("replaced session snapshots", () => {
+    const id = "conv_replaced_snapshot";
+
+    async function holdSnapshots() {
+      seedSession(id, [assistantMessage("resp_done", "Preserved history")]);
+      const queryKey = ["session", id];
+      client.setQueryData(queryKey, await getSessionSlim(id));
+      const observer = new QueryObserver(client, {
+        queryKey,
+        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        staleTime: Infinity,
+        retry: false,
+      });
+      const unsubscribe = observer.subscribe(() => {});
+      let status = "running";
+      const responses: ((response?: Response) => void)[] = [];
+      onTestFinished(() => {
+        responses.forEach((resolve) => resolve());
+        unsubscribe();
+        client.clear();
+      });
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const response = defaultFetchHandler(input, init);
+        if (
+          (init?.method ?? "GET") !== "GET" ||
+          String(input).split("?")[0] !== `/v1/sessions/${id}`
+        )
+          return response;
+        // Held responses retain the status captured here.
+        const snapshot = { ...(await response.json()), status };
+        return new Promise<Response>((resolve) => {
+          responses.push((override) => resolve(override ?? mockResponse(snapshot)));
+        });
+      });
+      return {
+        queryKey,
+        observer,
+        responses,
+        finishLoading: async (loading: Promise<void>) => {
+          responses.forEach((resolve) => resolve());
+          await loading;
+          const state = useChatStore.getState();
+          expect(state.conversationLoadError).toBeNull();
+          expect(state.loadingConversation).toBe(false);
+          expect(state.blocks).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ type: "text_done", fullText: "Preserved history" }),
+            ]),
+          );
+          expect(state.sessionStatus).toBe("idle");
+          expect(client.getQueryData(queryKey)).toMatchObject({ status: "idle" });
+        },
+        emit: (next: "running" | "idle") => {
+          status = next;
+          handleSessionEvent(
+            {
+              type: "session_status",
+              conversationId: id,
+              status: next,
+              responseId: "resp_live",
+            },
+            id,
+          );
+        },
+      };
+    }
+
+    it.each([
+      { owner: "chat", statuses: ["idle", "idle"] as const },
+      { owner: "chat", statuses: ["running", "idle"] as const },
+      { owner: "observer", statuses: ["idle"] as const },
+    ])(
+      "loads fresh history after $owner query replacement ($statuses)",
+      async ({ owner, statuses }) => {
+        const held = await holdSnapshots();
+        if (owner === "observer") void held.observer.refetch();
+        const loading = useChatStore.getState().switchTo(id);
+        await vi.waitFor(() => expect(held.responses).toHaveLength(1));
+        for (const [index, status] of statuses.entries()) {
+          held.emit(status);
+          // oxlint-disable-next-line no-await-in-loop -- each event replaces the preceding request
+          await vi.waitFor(() => expect(held.responses).toHaveLength(index + 2));
+        }
+        await held.finishLoading(loading);
+      },
+    );
+
+    it("applies an effort pick after its session lookup is replaced", async () => {
+      seedSession(id);
+      sessionLabels.set(id, { "omnigent.wrapper": "codex-native-ui" });
+      await useChatStore.getState().switchTo(id);
+      const held = await holdSnapshots();
+      void client.invalidateQueries({ queryKey: held.queryKey, exact: true });
+      await vi.waitFor(() => expect(held.responses).toHaveLength(1));
+      const picking = useChatStore
+        .getState()
+        .setEffort("high")
+        .catch((error) => error);
+      held.emit("running");
+      await vi.waitFor(() => expect(held.responses.length).toBeGreaterThanOrEqual(2));
+      held.emit("idle");
+      await vi.waitFor(() => expect(held.responses.length).toBeGreaterThanOrEqual(3));
+      held.responses.forEach((resolve) => resolve());
+
+      expect(await picking).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/v1/sessions/${id}`,
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({ reasoning_effort: "high" }),
+        }),
+      );
+      expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+    });
+
+    it("loads fresh history when replacements pause offline", async () => {
+      const held = await holdSnapshots();
+      const loading = useChatStore.getState().switchTo(id);
+      await vi.waitFor(() => expect(held.responses).toHaveLength(1));
+      client.mount();
+      onlineManager.setOnline(false);
+      onTestFinished(() => {
+        onlineManager.setOnline(true);
+        client.unmount();
+      });
+      const query = client.getQueryCache().find({ queryKey: held.queryKey, exact: true })!;
+      for (const status of ["running", "idle"] as const) {
+        const previous = query.promise;
+        held.emit(status);
+        // oxlint-disable-next-line no-await-in-loop -- each event replaces the preceding request
+        await vi.waitFor(() => {
+          expect(query.promise).not.toBe(previous);
+          expect(query.state.fetchStatus).toBe("paused");
+        });
+      }
+      onlineManager.setOnline(true);
+      await vi.waitFor(() => expect(held.responses).toHaveLength(2));
+      await held.finishLoading(loading);
+    });
+
+    it("does not recreate a removed query", async () => {
+      const held = await holdSnapshots();
+      const loading = useChatStore.getState().switchTo(id);
+      await vi.waitFor(() => expect(held.responses).toHaveLength(1));
+      client.removeQueries({ queryKey: held.queryKey, exact: true });
+      held.responses.forEach((resolve) => resolve());
+      await loading;
+      // Removal must terminate this load rather than recreate the query.
+      expect(useChatStore.getState().conversationLoadError).toBeInstanceOf(CancelledError);
+      expect(client.getQueryState(held.queryKey)).toBeUndefined();
+      expect(held.responses).toHaveLength(1);
+    });
+
+    it("does not follow another fetch after non-silent cancellation", async () => {
+      const held = await holdSnapshots();
+      const fetchQuery = vi.spyOn(client, "fetchQuery");
+      onTestFinished(() => fetchQuery.mockRestore());
+      void held.observer.refetch();
+      const loading = useChatStore.getState().switchTo(id);
+      await vi.waitFor(() => {
+        expect(held.responses).toHaveLength(1);
+        expect(fetchQuery).toHaveBeenCalledWith(
+          expect.objectContaining({ queryKey: held.queryKey }),
+        );
+      });
+      const cancellation = client.cancelQueries({ queryKey: held.queryKey, exact: true });
+      // Start another fetch before cancellation reaches the joining loader.
+      const replacement = held.observer.refetch();
+      await cancellation;
+      await vi.waitFor(() => expect(held.responses).toHaveLength(2));
+      held.responses.forEach((resolve) => resolve());
+      await Promise.all([loading, replacement]);
+      const state = useChatStore.getState();
+      expect(state.conversationLoadError).toBeInstanceOf(CancelledError);
+      expect((state.conversationLoadError as CancelledError).silent).toBeFalsy();
+      expect(state.loadingConversation).toBe(false);
+      expect(client.getQueryState(held.queryKey)).toBeDefined();
+      expect(held.responses).toHaveLength(2);
+    });
+
+    it("reports a real error from the replacement without retrying it", async () => {
+      const held = await holdSnapshots();
+      const loading = useChatStore.getState().switchTo(id);
+      await vi.waitFor(() => expect(held.responses).toHaveLength(1));
+      held.emit("running");
+      await vi.waitFor(() => expect(held.responses).toHaveLength(2));
+      held.emit("idle");
+      await vi.waitFor(() => expect(held.responses).toHaveLength(3));
+      held.responses.at(-1)!(mockResponse({}, { ok: false, status: 500 }));
+      await loading;
+      expect(useChatStore.getState().conversationLoadError).toMatchObject({ status: 500 });
+      expect(held.responses).toHaveLength(3);
+    });
+  });
+
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
     const items: ConversationItem[] = [
       userMessage("resp_1", "hello"),
@@ -6247,15 +6448,43 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(spy).toHaveBeenCalledWith({ queryKey: ["session", "conv_root"] });
     });
 
+    it("refreshes a background session once per new turn without changing the visible turn", async () => {
+      await useChatStore.getState().switchTo("conv_background");
+      await useChatStore.getState().switchTo("conv_visible");
+      const visibleResponse = {
+        responseId: "resp_visible",
+        state: "streaming" as const,
+        error: null,
+      };
+      useChatStore.setState({ activeResponse: visibleResponse });
+      const spy = vi.spyOn(client, "invalidateQueries");
+      for (const responseId of ["resp_background_1", "resp_background_1", "resp_background_2"]) {
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: "conv_background",
+            status: "running",
+            responseId,
+          },
+          "conv_background",
+        );
+      }
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy).toHaveBeenCalledWith({ queryKey: ["session", "conv_background"], exact: true });
+      expect(
+        conversationRegistry.peek("conv_background")?.getState().activeResponse?.responseId,
+      ).toBe("resp_background_2");
+      expect(useChatStore.getState().activeResponse).toEqual(visibleResponse);
+      expect(useChatStore.getState().conversationId).toBe("conv_visible");
+    });
+
     it("running with a NEW responseId refetches the snapshot once (turn start)", () => {
       // The runner persists turn-scoped labels (the cost advisor's
       // cost_control.plan verdict) BEFORE the harness runs; this refetch is
       // what lets the routing-verdict tooltip render mid-turn instead of
       // only after the idle/failed turn-end invalidation.
       //
-      // Bind conv_ts: the once-per-turn latch compares against
-      // `activeResponse.responseId`, which only advances when the status patch
-      // applies — i.e. for the conversation on screen.
+      // Bind conv_ts so its status patch advances the turn-start latch.
       useChatStore.setState({ conversationId: "conv_ts" });
       const spy = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({

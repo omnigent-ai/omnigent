@@ -96,6 +96,7 @@ import {
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { fetchSessionSnapshot } from "@/hooks/useSession";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -3103,7 +3104,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       const pick = trackLiveSettingPick(conversationId, "reasoningEffort", previous);
       try {
-        const session = await queryClient.fetchQuery({
+        const session = await fetchSessionSnapshot(queryClient, {
           queryKey: ["session", conversationId],
           queryFn: () => getSessionSlim(conversationId),
           staleTime: Infinity,
@@ -4014,7 +4015,7 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
   if (queryClient === null) return;
   let session: Session;
   try {
-    session = await queryClient.fetchQuery({
+    session = await fetchSessionSnapshot(queryClient, {
       queryKey: ["session", id],
       queryFn: () => getSessionSlim(id),
       staleTime: 0,
@@ -4207,7 +4208,7 @@ async function refreshSessionBinding(id: string): Promise<void> {
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
   let session: Session;
   try {
-    session = await queryClient.fetchQuery({
+    session = await fetchSessionSnapshot(queryClient, {
       queryKey: ["session", id],
       queryFn: () => getSessionSlim(id),
       staleTime: 0,
@@ -4332,7 +4333,7 @@ async function bindStream(
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
     const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
+      fetchSessionSnapshot(queryClient, {
         queryKey: ["session", id],
         queryFn: () => getSessionSlim(id, { refreshState: true }),
         staleTime: 0,
@@ -5182,7 +5183,7 @@ async function reconcileOnReconnect(
   let page: SessionItemsPage;
   try {
     [session, page] = await Promise.all([
-      queryClient.fetchQuery({
+      fetchSessionSnapshot(queryClient, {
         queryKey: ["session", id],
         queryFn: () => getSessionSlim(id),
         staleTime: 0,
@@ -6814,7 +6815,7 @@ async function refetchRunnerBackedSessionState(
   let session: Session;
   try {
     if (queryClient !== null) {
-      session = await queryClient.fetchQuery({
+      session = await fetchSessionSnapshot(queryClient, {
         queryKey: ["session", conversationId],
         queryFn: () => getSessionSlim(conversationId, { refreshState: options.refreshState }),
         staleTime: 0,
@@ -7256,7 +7257,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     case "session_status": {
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
-      const prevResponseId = useChatStore.getState().activeResponse?.responseId;
+      const prevResponseId = setterForState(event.conversationId)?.activeResponse?.responseId;
       // The status patch is conversation-scoped; the cache/query side effects
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).

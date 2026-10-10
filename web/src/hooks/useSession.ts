@@ -11,7 +11,13 @@
 // Reading it from the single-fetch snapshot instead means the rail
 // gets the user's actual level for any conversation they navigate to.
 
-import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  CancelledError,
+  type FetchQueryOptions,
+  type QueryClient,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { SessionHostResolveOptions } from "@/lib/identity";
 import {
   getSessionHost,
@@ -78,6 +84,36 @@ export function useSession(conversationId: string | null | undefined): UseSessio
   };
 }
 
+/** Join replacement snapshots when invalidation silently cancels an awaited refetch. */
+export async function fetchSessionSnapshot(
+  client: QueryClient,
+  options: FetchQueryOptions<Session>,
+): Promise<Session> {
+  let result = client.fetchQuery(options);
+  const cache = client.getQueryCache();
+  const query = cache.find<Session>({ queryKey: options.queryKey, exact: true });
+  let pending = query?.promise;
+  for (;;) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- each iteration joins the replacement fetch
+      return await result;
+    } catch (error) {
+      const replacement = query?.promise;
+      if (
+        !(error instanceof CancelledError) ||
+        !error.silent ||
+        !replacement ||
+        replacement === pending ||
+        cache.find({ queryKey: options.queryKey, exact: true }) !== query
+      ) {
+        throw error;
+      }
+      pending = replacement;
+      result = replacement;
+    }
+  }
+}
+
 /**
  * Resolve the top-level root of a session's spawn tree by walking the
  * ``parentSessionId`` chain upward.
@@ -85,7 +121,7 @@ export function useSession(conversationId: string | null | undefined): UseSessio
  * Drives the Agents rail: the rail renders the whole tree from the
  * top-level session, so when the user is viewing a grandchild the root
  * is two-plus hops up, not just ``parentSessionId``. Each hop reuses
- * the shared ``["session", id]`` snapshot cache (via ``fetchQuery``),
+ * the shared ``["session", id]`` snapshot cache via ``fetchSessionSnapshot``,
  * so walking a tree the user navigated through usually costs zero
  * network requests. A session's parent link is immutable, so the
  * resolved root is cached forever (``staleTime: Infinity``).
@@ -116,7 +152,7 @@ export function useRootSessionId(
         // Each hop's request URL is the previous hop's parentSessionId,
         // so the chain is inherently serial.
         // oxlint-disable-next-line no-await-in-loop
-        const session = await queryClient.fetchQuery({
+        const session = await fetchSessionSnapshot(queryClient, {
           queryKey: ["session", hopId],
           queryFn: () => getSessionSlim(hopId),
           staleTime: Infinity,
@@ -207,11 +243,11 @@ export async function prefetchSessionHostChain(
       // An in-flight snapshot may predate provisioning. Let it settle before
       // starting the fresh read, without cancelling other snapshot consumers.
       // oxlint-disable-next-line no-await-in-loop
-      await queryClient.fetchQuery(queryOptions).catch(() => undefined);
+      await fetchSessionSnapshot(queryClient, queryOptions).catch(() => undefined);
     }
     // Each hop's id comes from the previous snapshot, so the chain is serial.
     // oxlint-disable-next-line no-await-in-loop
-    const session: Session = await queryClient.fetchQuery(queryOptions);
+    const session: Session = await fetchSessionSnapshot(queryClient, queryOptions);
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
     setSessionHost(session.id, session.hostId);
