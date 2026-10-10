@@ -3482,6 +3482,7 @@ export function NewChatLandingScreen() {
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
+    (sandboxSelected && info === "loading") ||
     (!sandboxSelected &&
       selectedHostId !== null &&
       (selectedNativeHarness === "claude-native"
