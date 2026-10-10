@@ -600,6 +600,15 @@ class BwrapSandboxBackend(SandboxBackend):
             seen_reexpose.add(key)
             bwrap_args.extend(reexpose[i : i + 3])
 
+        # Re-expose explicit policy grants the mask hid. The same
+        # last-mount-wins ordering that lets the mask beat the broad
+        # binds above also voids an explicit read/write grant living at
+        # or under a masked dotpath (e.g. write_paths
+        # ["~/.omnigent/codex-native"] with cwd=$HOME). Scoped to
+        # exactly the granted paths; dotfiles inside a re-exposed grant
+        # are re-masked. See :func:`_grant_reexpose_after_mask`.
+        bwrap_args.extend(_grant_reexpose_after_mask(policy, mask_args, cwd_resolved, argv))
+
         # AF_UNIX control-socket masks. A denied socket
         # (e.g. the managed tmux control socket) lives inside a bound
         # write root — the instance ``private_dir`` — so the helper can
@@ -1091,6 +1100,189 @@ def _interpreter_reexpose_after_mask(
     return out
 
 
+def _devnull_mask_files(mask_args: Sequence[str]) -> list[Path]:
+    """
+    Extract the file destinations masked with ``--bind-try /dev/null``.
+
+    Complements :func:`_tmpfs_mask_dirs`: together they name every path
+    the dotfile masker hid, which the grant re-expose pass needs to
+    decide whether an explicit grant was voided.
+
+    :param mask_args: The bwrap args produced by
+        :func:`_dotfile_and_symlink_mask_args`.
+    :returns: The ``/dev/null`` overlay destination paths, in emit order.
+    """
+    files: list[Path] = []
+    i = 0
+    while i < len(mask_args):
+        token = mask_args[i]
+        if token == "--bind-try" and i + 2 < len(mask_args) and mask_args[i + 1] == "/dev/null":
+            files.append(Path(mask_args[i + 2]))
+            i += 3
+        elif token == "--tmpfs":
+            i += 2
+        else:
+            i += 1
+    return files
+
+
+def _grant_reexpose_after_mask(
+    policy: SandboxPolicy,
+    mask_args: Sequence[str],
+    cwd: Path,
+    argv: Sequence[str],
+) -> list[str]:
+    """
+    Re-expose explicit policy grants ON TOP of dotfile masks.
+
+    The grant binds precede the dotfile mask so the mask wins over the
+    broad cwd / ``read_paths`` binds (deny-wins), but bwrap's
+    last-mount-wins layering then also voids any explicit
+    ``write_paths`` / ``write_files`` / ``read_paths`` grant living at
+    or under a masked path: ``--tmpfs ~/.omnigent`` emitted after the
+    grant's ``--bind-try ~/.omnigent/codex-native`` leaves the granted
+    subtree an empty tmpfs, and a ``/dev/null`` overlay on a granted
+    ``~/.claude.json`` blanks the very file the spec granted.
+
+    Mirroring :func:`_interpreter_reexpose_after_mask`, re-emit exactly
+    the hidden granted paths after the mask so they win right back. The
+    masked dotdir itself is never re-bound, so grant siblings (e.g.
+    ``~/.omnigent/chat.db``) stay hidden.
+
+    Replayed grants and replayed masks are emitted sorted by path depth
+    (shallowest first), so under bwrap's last-mount-wins layering the
+    most specific mount decides each path: a grant inside a mask stays
+    visible, a mask inside a grant stays hidden, a deeper grant inside
+    that mask stays visible, and overlapping read/write grants keep the
+    main bind pass's write-over-read precedence. A mask sorts before an
+    equal-path grant, so an explicitly granted dotpath beats its own
+    walker mask. Two deny levers still beat a grant:
+
+    - an operator-declared ``mask_paths`` entry at or above the grant
+      is never lifted: the grant under it is not re-exposed and the
+      mask itself is replayed unconditionally (explicit deny outranks
+      explicit allow), and
+    - dotfile hygiene INSIDE a re-exposed grant directory: the masked
+      ancestor made the cwd walk prune (and the extra-roots walk drop)
+      before reaching the grant, so the grant subtree is scanned here
+      and its masks are emitted after the re-expose bind — the same
+      masking the grant gets when no dotdir mask covers it. A deeper
+      explicit grant wins back over such a re-mask by being re-bound
+      after it, never by dropping the re-mask, so the granted path's
+      ungranted siblings stay hidden.
+
+    :param policy: Resolved sandbox policy carrying the grant lists.
+    :param mask_args: The mask args produced by
+        :func:`_dotfile_and_symlink_mask_args`.
+    :param cwd: Resolved helper cwd (anchors the symlink-escape safe
+        set for the grant-subtree scan).
+    :param argv: Helper argv (widens the safe set exactly like the main
+        mask scan).
+    :returns: Extra bwrap args; empty when no grant was masked.
+    """
+    masked_dirs = _tmpfs_mask_dirs(mask_args)
+    masked_files = _devnull_mask_files(mask_args)
+    if not masked_dirs and not masked_files:
+        return []
+
+    grants: list[tuple[str, Path, bool]] = [
+        *(("--bind-try", root, True) for root in policy.write_roots),
+        *(("--bind-try", fpath, False) for fpath in policy.write_files),
+        *(("--ro-bind-try", root, True) for root in (policy.read_roots or [])),
+    ]
+    operator_masks = policy.mask_paths or []
+
+    def _covered(path: Path, covers: Sequence[Path]) -> bool:
+        return any(_is_within(path, c, resolve=False) for c in covers)
+
+    # (depth, tie, tokens) layers, emitted depth-sorted so the deepest
+    # mount lands last and wins. Masks tie-sort before grants so an
+    # equal-path grant is emitted after its mask.
+    layers: list[tuple[int, int, list[str]]] = []
+    seen: set[str] = set()
+    reexposed_dirs: list[Path] = []
+    for flag, path, is_dir in grants:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not _covered(path, masked_dirs) and not _covered(path, masked_files):
+            continue
+        if _covered(path, operator_masks):
+            continue
+        layers.append((len(path.parts), 1, [flag, str(path), str(path)]))
+        if is_dir:
+            reexposed_dirs.append(path)
+
+    seen_masks: set[str] = set()
+
+    def _add_mask(tokens: list[str], dest: Path) -> None:
+        """Queue a mask that must win back over a re-exposed grant."""
+        # Only masks strictly inside a re-exposed grant were shadowed by
+        # the re-expose bind; anything else is already in effect.
+        if not any(
+            _is_within(dest, g, resolve=False) and not _is_within(g, dest, resolve=False)
+            for g in reexposed_dirs
+        ):
+            return
+        key = str(dest)
+        if key in seen_masks:
+            return
+        seen_masks.add(key)
+        layers.append((len(dest.parts), 0, tokens))
+
+    if reexposed_dirs:
+        # Original mask entries (walker hits and operator mask_paths)
+        # that a re-expose bind shadowed. Replayed unconditionally: a
+        # deeper explicit grant is re-bound after its covering mask via
+        # the depth sort, so ungranted content under the mask stays
+        # hidden and operator masks stay unconditional denies.
+        i = 0
+        while i < len(mask_args):
+            if mask_args[i] == "--tmpfs":
+                _add_mask(list(mask_args[i : i + 2]), Path(mask_args[i + 1]))
+                i += 2
+            elif mask_args[i] == "--bind-try":
+                _add_mask(list(mask_args[i : i + 3]), Path(mask_args[i + 2]))
+                i += 3
+            else:
+                i += 1
+
+        # Fresh dotfile scan of each re-exposed grant subtree, which the
+        # pruned cwd walk and the under-cwd root drop never reached.
+        safe_roots = _bwrap_safe_roots(cwd, policy, argv=argv)
+        allow_hidden = policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else []
+        skip_roots = policy.mask_scan_skip_roots or []
+        for root in reexposed_dirs:
+            if _covered(root, skip_roots):
+                continue
+            try:
+                entries = scan_cwd_mask_entries(
+                    root,
+                    allow_hidden=allow_hidden,
+                    safe_roots=safe_roots,
+                    max_entries=policy.cwd_hidden_scan_max_entries,
+                    overflow=policy.cwd_hidden_scan_overflow,
+                    recursive=policy.cwd_hidden_scan_recursive,
+                    logger_name=__name__,
+                    scope_label="re-exposed grant",
+                )
+            except OSError as err:
+                raise OSError(
+                    f"dotfile mask scan overflowed while walking the re-exposed "
+                    f"grant root {root}. Narrow the grant or tune the scan "
+                    f"limits. {err}"
+                ) from err
+            for entry in entries:
+                _add_mask(_mask_entry_args([entry]), entry.path)
+
+    layers.sort(key=lambda layer: (layer[0], layer[1]))
+    out: list[str] = []
+    for _, _, tokens in layers:
+        out.extend(tokens)
+    return out
+
+
 def _is_within(path: Path, root: Path, *, resolve: bool = True) -> bool:
     """
     Return whether *path* is *root* or a descendant of *root*.
@@ -1335,6 +1527,18 @@ def _dotfile_and_symlink_mask_args(
         seen_mask_paths.add(key)
         kind: MaskKind = "dir" if mask_path.is_dir() else "file"
         entries.append(MaskedEntry(path=mask_path, kind=kind))
+    return _mask_entry_args(entries)
+
+
+def _mask_entry_args(entries: Sequence[MaskedEntry]) -> list[str]:
+    """
+    Map masked entries to bwrap mount triples (the emit half of
+    :func:`_dotfile_and_symlink_mask_args`).
+
+    :param entries: Scan results to hide inside the namespace.
+    :returns: Flat bwrap argv tokens — ``--tmpfs <dir>`` for
+        directories, ``--bind-try /dev/null <file>`` for the rest.
+    """
     args: list[str] = []
     for entry in entries:
         # Re-stat just before emitting: a mask overlays onto an EXISTING
