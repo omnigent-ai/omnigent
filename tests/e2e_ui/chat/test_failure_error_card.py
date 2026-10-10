@@ -224,30 +224,47 @@ def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
     expect(surviving).to_contain_text("The agent's terminal exited unexpectedly")
 
 
+@pytest.mark.parametrize(
+    ("code", "message", "headline"),
+    [
+        (
+            "required_terminal_exited",
+            "Required terminal exited unexpectedly; the runtime is no longer available.",
+            "The agent's terminal exited unexpectedly",
+        ),
+        (
+            "runner_failed_to_start",
+            "runner process exited with code 1 before connecting",
+            "The session's runner failed to start on the host",
+        ),
+    ],
+)
 def test_unclassified_failure_renders_english_headline_not_raw_code(
     page: Page,
     seeded_session: tuple[str, str],
+    code: str,
+    message: str,
+    headline: str,
 ) -> None:
     """A known failure code reads as a sentence, never the bare enum.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :param code: Failure code persisted on the error item.
+    :param message: Raw error message stored alongside the code.
+    :param headline: Plain-English sentence the pill must lead with.
     :returns: None.
     """
     base_url, session_id = seeded_session
-    _seed_error_item(
-        session_id,
-        code="required_terminal_exited",
-        message="Required terminal exited unexpectedly; the runtime is no longer available.",
-    )
+    _seed_error_item(session_id, code=code, message=message)
 
     page.goto(f"{base_url}/c/{session_id}")
 
     pill = page.get_by_test_id("error-pill")
     # The friendly, code-derived headline is shown...
-    expect(pill).to_contain_text("The agent's terminal exited unexpectedly", timeout=15_000)
+    expect(pill).to_contain_text(headline, timeout=15_000)
     # ...and the raw enum is not surfaced as the headline.
-    expect(pill).not_to_contain_text("Error · required_terminal_exited", timeout=15_000)
+    expect(pill).not_to_contain_text(f"Error · {code}", timeout=15_000)
 
 
 def test_live_native_failure_status_surfaces_each_turn(
