@@ -4937,17 +4937,22 @@ def test_fork_with_prompt_rejected_on_direct_server_dispatch(
     run_chat.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "resume_args",
+    [["--continue"], ["--resume", "1" * 32], ["--resume"]],
+    ids=["continue", "resume-id", "resume-picker"],
+)
 def test_fork_with_resume_rejected_on_direct_server_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, resume_args: list[str]
 ) -> None:
-    """``run --server URL --fork ID --continue`` is rejected before dispatch."""
+    """``run --server URL --fork ID`` with any resume flag is rejected before dispatch."""
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     run_chat = Mock()
     monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
 
     result = CliRunner().invoke(
         cli,
-        ["run", "--server", "http://localhost:8000", "--fork", "0" * 32, "--continue"],
+        ["run", "--server", "http://localhost:8000", "--fork", "0" * 32, *resume_args],
     )
 
     assert result.exit_code != 0
