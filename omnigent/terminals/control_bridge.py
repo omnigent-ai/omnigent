@@ -608,7 +608,7 @@ class _PaneMetadata:
 
 
 _LIVE_MODE_RESET: Final[bytes] = (
-    b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l"
+    b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b[?2004l"
 )
 
 
@@ -1232,7 +1232,7 @@ async def bridge_tmux_control_to_websocket(
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
         with contextlib.suppress(*_WS_CLOSE_EXPECTED_ERRORS):
-            if repair_failed:
+            if repair_failed and not control_ended_first:
                 await websocket.close(
                     code=WS_CLOSE_INTERNAL_ERROR,
                     reason="terminal repaint failed",
