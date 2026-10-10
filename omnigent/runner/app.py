@@ -154,6 +154,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.resource_routes import register_resource_routes
 from omnigent.runner.session_history import build_session_history
 from omnigent.runner.session_init_protocol import (
+    SERVER_CAPABILITY_DURABLE_NOTICES,
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
@@ -302,6 +303,10 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
+# Capabilities the server advertised (``/api/version`` or the session-init
+# envelope); ``None`` until either arrives. A server that advertises none is
+# treated as supporting none, so older servers get the legacy behaviour.
+_server_capabilities: frozenset[str] | None = None
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -351,6 +356,21 @@ def _version_supports_waiting_status(server_version: str) -> bool:
         return False
 
 
+def _server_supports(capability: str) -> bool:
+    """
+    Whether the server advertised *capability*.
+
+    Capabilities are additive and negotiated, not inferred from the version: a
+    server built before a feature shipped can report the same release string.
+
+    :param capability: One of the ``SERVER_CAPABILITY_*`` names, e.g.
+        ``"durable_notices"``.
+    :returns: ``True`` iff the server listed it; ``False`` when it did not or no
+        version probe/envelope has arrived yet.
+    """
+    return _server_capabilities is not None and capability in _server_capabilities
+
+
 async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
     """
     Resolve the server's version via a one-time ``GET /api/version`` probe.
@@ -363,13 +383,21 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
     :returns: The server's reported version (e.g. ``"0.2.0"``), or ``None`` when
         the probe has not yet succeeded.
     """
-    global _server_version
+    global _server_version, _server_capabilities
     if _server_version is not None:
         return _server_version
     try:
         resp = await server_client.get("/api/version")
         resp.raise_for_status()
-        _server_version = resp.json()["version"]
+        payload = resp.json()
+        version = payload["version"]
+        raw_capabilities = payload.get("capabilities")
+        _server_capabilities = frozenset(
+            c
+            for c in (raw_capabilities if isinstance(raw_capabilities, list) else [])
+            if isinstance(c, str)
+        )
+        _server_version = version
         _logger.info(
             "resolved server version: %s",
             _server_version,
@@ -430,6 +458,24 @@ _CLAUDE_VOLUNTARY_EXIT_MARKER = "Resume this session with:"
 # to dispatch locally. See designs/RUNNER_MCP.md §Explicit dispatch
 # marker.
 _RUNNER_DISPATCHED_FIELD = "omnigent_runner_dispatched"
+
+
+def _is_turn_notice_event(event: Mapping[str, object]) -> bool:
+    """Whether *event* completes a harness notice answering the turn's input.
+
+    The executor adapter emits such a notice as a harness-sourced, info-level
+    ``error`` output item. Side notices (sign-in completed, thread reset) are
+    posted as external conversation items and never ride the stream.
+    """
+    if event.get("type") != "response.output_item.done":
+        return False
+    item = event.get("item")
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "error"
+        and item.get("source") == "harness"
+        and item.get("level") == "info"
+    )
 
 
 def _encode_sse_event(event: Mapping[str, object]) -> bytes:
@@ -2065,8 +2111,9 @@ def create_runner_app(
             raise ValueError("session initialization envelope identity mismatch")
         validate_runner_inference_config(envelope.snapshot.inference_config)
 
-        global _server_version
+        global _server_version, _server_capabilities
         _server_version = envelope.server_version
+        _server_capabilities = frozenset(envelope.server_capabilities)
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
@@ -5019,8 +5066,8 @@ def create_runner_app(
         _model_override = msg_body.get("model_override")
         if isinstance(_model_override, str) and _model_override:
             harness_body["model_override"] = _model_override
-        # The web's stable id for this message: stamped on the turn's failure
-        # so the server can settle exactly this queued entry, not the oldest.
+        # The web's stable id for this message: stamped on the turn's failure, or
+        # on a notice answering it, so the server settles exactly this queued entry.
         _stable_id = msg_body.get("stable_id")
         if isinstance(_stable_id, str) and _stable_id:
             harness_body["input_stable_id"] = _stable_id
@@ -5031,6 +5078,10 @@ def create_runner_app(
                 extra={"session_id": conv},
             )
         harness_body.update(input_attributes(msg_body))
+        # Lets the adapter answer a TurnNotice as a notice item only when this
+        # server persists one; servers that never advertised it get a failed turn.
+        await _get_server_version(server_client)
+        harness_body["durable_notices"] = _server_supports(SERVER_CAPABILITY_DURABLE_NOTICES)
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union
@@ -6058,7 +6109,12 @@ def create_runner_app(
                             if event is None:
                                 yield raw_sse_bytes
                                 continue
-                            if event.get("type") == "response.failed":
+                            # A failed turn, or a notice that answers the message in the
+                            # harness's place, names the web message it carried; neither
+                            # ever mirrors that message back to drain its queued entry.
+                            if event.get("type") == "response.failed" or _is_turn_notice_event(
+                                event
+                            ):
                                 _input_stable_id = body.get("input_stable_id")
                                 if isinstance(_input_stable_id, str):
                                     event["input_stable_id"] = _input_stable_id

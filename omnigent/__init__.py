@@ -98,6 +98,9 @@ if TYPE_CHECKING:
     from omnigent.inner.executor import (
         TurnComplete as TurnComplete,
     )
+    from omnigent.inner.executor import (
+        TurnNotice as TurnNotice,
+    )
     from omnigent.inner.loader import load_agent_def as load_agent_def
     from omnigent.inner.open_responses_sdk import OpenResponsesExecutor as OpenResponsesExecutor
     from omnigent.inner.openai_agents_sdk_executor import (
@@ -172,6 +175,7 @@ _LAZY_EXPORTS = {
     "ToolCallRequest": "omnigent.inner.executor",
     "TurnCancelled": "omnigent.inner.executor",
     "TurnComplete": "omnigent.inner.executor",
+    "TurnNotice": "omnigent.inner.executor",
     "FunctionPolicy": "omnigent.inner.policies",
     "Policy": "omnigent.inner.policies",
     "PolicyAction": "omnigent.inner.policies",
@@ -272,6 +276,7 @@ __all__ = [
     "ToolCallRequest",
     "TurnCancelled",
     "TurnComplete",
+    "TurnNotice",
     "disable_tracing",
     "enable_tracing",
     "is_tracing_enabled",

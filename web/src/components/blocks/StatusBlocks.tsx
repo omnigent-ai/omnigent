@@ -85,6 +85,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "This agent no longer exists. Fork this session into another agent to continue.",
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+  claude_native_auth_command: "Sign in or out of Claude Code with omni setup on the host.",
   codex_turn_error: "Codex ran into an error during this turn.",
   databricks_sign_in_pending: "The agent is waiting for a Databricks sign-in.",
   agent_startup_pending: "The agent is still starting in the session terminal.",

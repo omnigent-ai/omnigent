@@ -13180,3 +13180,185 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
     failed = [e for e in published if e.get("type") == "response.failed"]
     assert failed, "response.failed was not published"
     assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+
+
+_SSE_NOTICE_ITEM_DONE = (
+    "event: response.output_item.done\ndata: "
+    '{"type":"response.output_item.done","item":{"id":"err_notice","type":"error",'
+    '"source":"harness","code":"claude_native_auth_command","level":"info",'
+    '"message":"Run omni setup on the host to sign in again."}}\n\n'
+)
+_SSE_SIDE_NOTICE_ITEM_DONE = (
+    "event: response.output_item.done\ndata: "
+    '{"type":"response.output_item.done","item":{"id":"err_side","type":"error",'
+    '"source":"execution","code":"pi_native_effort_ignored","level":"info",'
+    '"message":"Reasoning effort is not supported by this model."}}\n\n'
+)
+
+
+@pytest.mark.asyncio
+async def test_notice_item_event_names_the_web_message_it_answers() -> None:
+    """
+    A harness notice item carries the web message's stable id; other items do not.
+
+    A harness that answers a web message with guidance instead of running it
+    never mirrors that message back, so the server settles its queued entry by
+    this id exactly as it does for a failed turn.
+    """
+    conv = "conv_stable_id_on_notice"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="stable-id-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    published: list[dict[str, Any]] = []
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(
+                _FakeHarnessClient(
+                    [
+                        _SSE_RESPONSE_CREATED,
+                        _SSE_NOTICE_ITEM_DONE,
+                        _SSE_SIDE_NOTICE_ITEM_DONE,
+                        _SSE_RESPONSE_COMPLETED,
+                    ]
+                )
+            ),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_stable",
+                "model": "x",
+                "content": [{"role": "user", "content": "/login"}],
+                "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        queue = app.state.session_event_queues.get(conv)
+        for _ in range(100):
+            while queue is not None and not queue.empty():
+                published.append(queue.get_nowait())
+            if any(e.get("type") == "response.completed" for e in published):
+                break
+            await asyncio.sleep(0.02)
+    items = [e for e in published if e.get("type") == "response.output_item.done"]
+    assert [e["item"]["code"] for e in items] == [
+        "claude_native_auth_command",
+        "pi_native_effort_ignored",
+    ]
+    assert items[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    # An info item that is not a harness notice does not answer the message.
+    assert "input_stable_id" not in items[1]
+    completed = [e for e in published if e.get("type") == "response.completed"]
+    assert completed, "response.completed was not published"
+    assert "input_stable_id" not in completed[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_version", "capabilities", "durable"),
+    [
+        ("0.17.0", frozenset(), False),
+        ("0.18.0.dev0", frozenset(), False),
+        ("0.18.0.dev0", frozenset({"durable_notices"}), True),
+        (None, None, False),
+    ],
+    ids=["old-server", "same-version-without-the-capability", "current-server", "unknown-server"],
+)
+async def test_turn_tells_the_harness_whether_the_server_keeps_notices(
+    monkeypatch: pytest.MonkeyPatch,
+    server_version: str | None,
+    capabilities: frozenset[str] | None,
+    durable: bool,
+) -> None:
+    """
+    The forwarded turn says whether a notice item survives on this server.
+
+    The runner decides from the capabilities the server advertised, never from
+    its version: a server built from the same release line before the feature
+    shipped reports the same version string and must still get the legacy
+    failed-turn shape.
+    """
+    import omnigent.runner.app as app_module
+
+    monkeypatch.setattr(app_module, "_server_version", server_version)
+    monkeypatch.setattr(app_module, "_server_capabilities", capabilities)
+    conv = f"conv_durable_notices_{durable}_{server_version}_{len(capabilities or ())}"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="durable-notice-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    harness = _RecordingHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED])
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(harness)),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_durable",
+                "model": "x",
+                "content": [{"role": "user", "content": "/login"}],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+    assert harness.posted_bodies, "the turn was not forwarded to the harness"
+    assert harness.posted_bodies[-1]["durable_notices"] is durable
+
+
+class _VersionProbeClient:
+    """Server-client stub answering only ``GET /api/version``."""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    async def get(self, url: str) -> httpx.Response:
+        assert url == "/api/version"
+        return httpx.Response(
+            200, json=self._payload, request=httpx.Request("GET", "http://server/api/version")
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "capabilities"),
+    [
+        ({"version": "0.18.0.dev0", "capabilities": ["durable_notices"]}, {"durable_notices"}),
+        ({"version": "0.17.0"}, set()),
+    ],
+    ids=["advertises", "omits"],
+)
+async def test_version_probe_records_the_server_capabilities(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, object], capabilities: set[str]
+) -> None:
+    """``/api/version`` fills the capability cache; an older server leaves it empty."""
+    import omnigent.runner.app as app_module
+
+    monkeypatch.setattr(app_module, "_server_version", None)
+    monkeypatch.setattr(app_module, "_server_capabilities", None)
+    assert await app_module._get_server_version(_VersionProbeClient(payload)) == payload["version"]  # type: ignore[arg-type]
+    assert app_module._server_capabilities == frozenset(capabilities)
+    assert app_module._server_supports("durable_notices") is ("durable_notices" in capabilities)

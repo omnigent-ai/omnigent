@@ -9534,16 +9534,14 @@
     },
     "/api/version": {
       "get": {
-        "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`.",
+        "description": "Return the installed omnigent package version and server capabilities.\n\nUsed by the web UI to include version info in bug reports, and by\nrunners to learn which additive capabilities this server supports.\n\n**Returns:** `{\"version\": \"<semver string>\", \"capabilities\": [...]}`, e.g. `{\"version\": \"0.1.0\", \"capabilities\": [\"durable_notices\"]}`.",
         "operationId": "version_api_version_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
+                  "additionalProperties": true,
                   "title": "Response Version Api Version Get",
                   "type": "object"
                 }
