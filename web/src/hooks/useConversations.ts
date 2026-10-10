@@ -235,6 +235,15 @@ export interface Conversation {
    */
   viewer_last_seen?: number | null;
   /**
+   * Epoch seconds the session's turn last reached a terminal status
+   * (`running` -> `idle`/`failed`, including a child sub-agent's finish
+   * rolled up onto this row), or absent/`null` when the serving replica
+   * never observed such an edge. Compared with `viewer_last_seen` to
+   * suppress turn-end notifications the user watched on another device;
+   * best-effort like the read state itself.
+   */
+  last_finished_at?: number | null;
+  /**
    * Whether the requesting user explicitly marked this session unread.
    * Per-viewer; lifts the active-row dot suppression on the client.
    */

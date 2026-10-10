@@ -2791,6 +2791,16 @@ class SessionListItem(BaseModel):
     :param viewer_unread: Whether the *requesting user* explicitly
         marked this session unread. Per-viewer; lifts the active-row
         dot suppression on the client. ``False`` by default.
+    :param last_finished_at: Unix epoch seconds this session's turn
+        last reached a terminal status (``running``/``waiting`` ->
+        ``idle``/``failed``, including a child sub-agent's finish
+        rolled up onto the parent row), or ``None`` when this replica
+        never observed such an edge. Clients compare it against
+        ``viewer_last_seen`` to suppress turn-end notifications the
+        user already watched on another device. In-memory only, like
+        the read-state it is compared with — resets on a server
+        restart, and a replica that doesn't hold the session's relay
+        serves ``None`` (clients fall back to notifying).
     :param search_snippet: Excerpt of the chat content that matched the
         request's ``search_query``, centered on the match with ``…``
         marking elided ends, so the search UI can show *where* a session
@@ -2823,6 +2833,7 @@ class SessionListItem(BaseModel):
     comments_updated_at: int | None = None
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
+    last_finished_at: int | None = None
     search_snippet: str | None = None
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when

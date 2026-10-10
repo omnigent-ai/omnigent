@@ -593,6 +593,12 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# Epoch seconds a turn last reached ``idle``/``failed`` (child finishes mirror
+# onto the parent). Serves ``SessionListItem.last_finished_at``; same
+# best-effort in-memory domain as the ``_read_last_seen`` baseline.
+_session_finished_at_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
 @dataclass
 class _RunnerStatusProbeBackoff:
     """
@@ -1240,6 +1246,7 @@ __all__ = [
     "_session_active_response_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
+    "_session_finished_at_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

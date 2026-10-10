@@ -6470,6 +6470,19 @@
             "title": "Labels",
             "type": "object"
           },
+          "last_finished_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds this session's turn last reached a terminal status (`running`/`waiting` -> `idle`/`failed`, including a child sub-agent's finish rolled up onto the parent row), or `None` when this replica never observed such an edge. Clients compare it against `viewer_last_seen` to suppress turn-end notifications the user already watched on another device. In-memory only, like the read-state it is compared with \u2014 resets on a server restart, and a replica that doesn't hold the session's relay serves `None` (clients fall back to notifying).",
+            "title": "Last Finished At"
+          },
           "owner": {
             "anyOf": [
               {

@@ -370,11 +370,12 @@ function windowHasFocus(): boolean {
 
 /**
  * Marks the active conversation as seen on mount, on every poll
- * refresh (updatedAt change keeps the stored time fresh), on the
- * window regaining focus, and on cleanup (navigation away).
- * Wall-clock time is stored so any server-side update that happened
- * while the user was viewing is captured, even if the conversations
- * poll hadn't picked it up yet.
+ * refresh (updatedAt change keeps the stored time fresh), on a turn
+ * finishing while viewed (lastFinishedAt change — the cross-device
+ * "watched this turn end" acknowledgement), on the window regaining
+ * focus, and on cleanup (navigation away). Wall-clock time is stored
+ * so any server-side update that happened while the user was viewing
+ * is captured, even if the conversations poll hadn't picked it up yet.
  *
  * Every mark is gated on the window having focus: a thread open in a
  * blurred window is NOT being read, so a turn finishing there must
@@ -385,6 +386,7 @@ function windowHasFocus(): boolean {
 export function useMarkConversationSeen(
   conversationId: string | undefined,
   updatedAt: number | undefined,
+  lastFinishedAt?: number,
 ): void {
   // Opening a thread is reading it, so clear any explicit-unread
   // override before the mark-seen below runs (and runs first, so
@@ -413,9 +415,18 @@ export function useMarkConversationSeen(
       // Anchor at or above the updated_at being viewed: a server clock that
       // leads the client must not leave a just-read turn reading as unseen
       // (updated_at > client wall clock). Wall clock still wins when it's
-      // ahead, capturing an update the poll hasn't picked up yet.
-      if (windowHasFocus()) markConversationSeen(conversationId, Math.max(nowSeconds(), updatedAt));
+      // ahead, capturing an update the poll hasn't picked up yet. The turn
+      // finish stamp is folded in so a focused viewer acknowledges the
+      // finish on the server's own clock; other devices compare their
+      // baseline against that stamp to stay quiet for a finish the user
+      // watched here (`viewerHasSeenTurnEnd`).
+      if (!windowHasFocus()) return;
+      markConversationSeen(conversationId, Math.max(nowSeconds(), updatedAt, lastFinishedAt ?? 0));
     };
+    // `lastFinishedAt` in the deps is load-bearing: a turn finishing while
+    // the user watches appends no content (`updatedAt` stays put), so the
+    // stamp arriving is what re-runs this effect and records "the viewer
+    // watched this finish".
     markIfFocused();
     window.addEventListener("focus", markIfFocused);
     return () => {
@@ -425,5 +436,5 @@ export function useMarkConversationSeen(
       // another client) must not silently mark the thread read.
       markIfFocused();
     };
-  }, [conversationId, updatedAt]);
+  }, [conversationId, updatedAt, lastFinishedAt]);
 }

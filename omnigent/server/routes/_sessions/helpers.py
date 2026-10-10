@@ -231,6 +231,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_finished_at_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -600,6 +601,9 @@ def _prune_session_read_state(session_id: str) -> None:
         seen.pop(session_id, None)
     for unread in _read_explicit_unread.values():
         unread.discard(session_id)
+    # Drop the session-level finish stamp too, so a deleted/archived session
+    # doesn't retain it indefinitely.
+    _session_finished_at_cache.pop(session_id, None)
 
 
 def _discovery_key(user_id: str | None) -> str:
@@ -4743,7 +4747,9 @@ def _require_permission_mode_forward(
     return settled if isinstance(settled, str) and settled else mode
 
 
-def _publish_child_status_to_parent(session_id: str, status: str) -> None:
+def _publish_child_status_to_parent(
+    session_id: str, status: str, *, turn_finished: bool = False
+) -> None:
     """
     Mirror a status transition onto the session's parent stream.
 
@@ -4764,6 +4770,10 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
         e.g. ``"conv_child123"``.
     :param status: The new status, e.g. ``"running"``. Captured here rather
         than re-read on the worker so each edge fans out its own value.
+    :param turn_finished: ``True`` when this transition is a turn finish
+        (in-flight -> terminal). Mirrored onto the parent's finish stamp:
+        the parent's sidebar row rolls up child activity, so a child's
+        finish is the edge a list watcher observes on the parent row.
     """
     store = session_live_state.conversation_store()
     if store is None:
@@ -4774,6 +4784,8 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
         if conv is None or conv.parent_conversation_id is None:
             return
         parent_id = conv.parent_conversation_id
+        if turn_finished:
+            _session_finished_at_cache[parent_id] = int(time.time())
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
         summary = _child_session_summary_from_conversation(
             conv,
@@ -4926,8 +4938,14 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    # Stamp the finish before any list read can observe the edge. An unknown
+    # previous status (restart, first observation) stays unstamped — clients
+    # treat a missing stamp as "not seen" and still notify.
+    turn_finished = status in ("idle", "failed") and previous_status in ("running", "waiting")
+    if turn_finished:
+        _session_finished_at_cache[session_id] = int(time.time())
     if previous_status != status:
-        _publish_child_status_to_parent(session_id, status)
+        _publish_child_status_to_parent(session_id, status, turn_finished=turn_finished)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.

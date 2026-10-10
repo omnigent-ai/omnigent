@@ -335,6 +335,28 @@ describe("useMarkConversationSeen", () => {
     expect(lastPutBody()).toEqual({ last_seen: 6_000, unread: false });
   });
 
+  it("acks a turn finish while viewing: the stamp raises the baseline past it", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    setWindowFocused(true);
+    // Client wall clock (5000) lags the server's finish stamp (6200). The
+    // ack must land at or above the stamp — the user's other devices treat
+    // the finish as watched only when viewer_last_seen >= last_finished_at.
+    vi.useFakeTimers({ now: 5_000_000 });
+
+    const { rerender } = renderHook(
+      ({ finishedAt }) => mod.useMarkConversationSeen("conv-1", 4_000, finishedAt),
+      { initialProps: { finishedAt: undefined as number | undefined } },
+    );
+    expect(lastPutBody()).toEqual({ last_seen: 5_000, unread: false });
+
+    // The turn ends while the user watches: a finish appends no content
+    // (updatedAt stays 4000) — only the finish stamp arrives.
+    rerender({ finishedAt: 6_200 });
+
+    expect(lastPutBody()).toEqual({ last_seen: 6_200, unread: false });
+  });
+
   it("does NOT mark seen while the window is blurred", async () => {
     const mod = await loadFresh();
     mod.seedReadState([]);

@@ -33,8 +33,15 @@ groups.
 
 from __future__ import annotations
 
+import contextlib
+import time
+import uuid
+
+import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
 
 # Records constructed notifications and makes visibility/focus controllable
 # from the test via window.__hidden. Runs before any app script on every
@@ -199,16 +206,38 @@ def _wait_for_observed_session_status(
     )
 
 
-def _send_prompt(page: Page) -> None:
+def _send_prompt(page: Page, prompt: str = _PROMPT) -> None:
     """
-    Type the standard prompt into the composer and click Send.
+    Type a prompt into the composer and click Send.
 
     :param page: Playwright page already navigated to ``/c/{id}``.
+    :param prompt: Message text; defaults to the standard short prompt.
     """
     composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
-    composer.fill(_PROMPT)
+    composer.fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()
+
+
+def _wait_for_mock_gate_pending(mock_llm_server_url: str, *, timeout_s: float = 30.0) -> None:
+    """Poll the mock LLM until a request is actually blocked on its gate.
+
+    Same synchronization as
+    ``test_cross_device_turn_end_notification._wait_for_mock_gate_pending``:
+    a session flips ``running`` before the harness reaches the gate, so
+    releasing off the status alone races the block.
+
+    :param mock_llm_server_url: Mock LLM server base URL.
+    :param timeout_s: Max seconds to wait for a request to reach the gate.
+    :raises AssertionError: If no request blocks on the gate in time.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        resp = httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0, trust_env=False)
+        if resp.json().get("pending") is True:
+            return
+        time.sleep(0.25)
+    raise AssertionError("mock LLM turn never blocked on its gate")
 
 
 def test_idle_notification_fires_when_backgrounded(
@@ -325,6 +354,7 @@ def test_idle_notification_suppressed_when_foreground(
 def test_idle_notification_click_navigates_to_chat(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Clicking the OS notification routes into the session it was raised for.
@@ -335,46 +365,73 @@ def test_idle_notification_click_navigates_to_chat(
     ``navigatePath`` forwarded over IPC). The browser path runs that
     closure directly; this test exercises it end-to-end.
 
-    Flow: open the seeded session, send a real prompt, wait until app
-    traffic reports it ``running`` (seeding the baseline), then navigate
-    AWAY to the new-session screen ("/") via the in-app sidebar link — a
-    client-side navigation that keeps ``useIdleNotifications`` mounted, and
-    leaves no conversation actively viewed so the turn-end still notifies.
-    When the real turn finishes the notification fires; invoking its
-    ``onclick`` must route the app back to ``/c/{session_id}``.
+    Flow: open the seeded session, send a prompt whose reply is HELD on the
+    mock LLM's gate, wait until app traffic reports it ``running`` (seeding
+    the baseline), then navigate AWAY to the new-session screen ("/") via
+    the in-app sidebar link — a client-side navigation that keeps
+    ``useIdleNotifications`` mounted, and leaves no conversation actively
+    viewed. Only then is the gate released, so the turn genuinely completes
+    off-screen: the user left mid-turn and did NOT watch the finish, which
+    must notify (the cross-device watched-finish suppression must not
+    engage). Invoking the notification's ``onclick`` must route the app
+    back to ``/c/{session_id}``.
 
-    A failure means the notification's click handler no longer navigates to
-    its conversation (the desktop "click does nothing but focus" bug, or a
-    regression in the shared path-building wiring).
+    A failure means the turn-end notification no longer fires for a finish
+    the user left mid-turn (over-suppression), or the click handler no
+    longer navigates to its conversation (the desktop "click does nothing
+    but focus" bug, or a regression in the shared path-building wiring).
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a real session
         bound to the spawned runner.
+    :param mock_llm_server_url: Mock LLM server URL; the reply is held on
+        its gate until the user has navigated away.
     """
     base_url, session_id = seeded_session
-    page.add_init_script(_HARNESS_INIT_SCRIPT)
-    page.goto(f"{base_url}/c/{session_id}")
+    marker = f"left-mid-turn-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "Greeting delivered.", "block": True}],
+        key=marker,
+        match=marker,
+    )
+    try:
+        page.add_init_script(_HARNESS_INIT_SCRIPT)
+        page.goto(f"{base_url}/c/{session_id}")
 
-    # User gesture mirrors the real lazy-permission flow (stub reports
-    # "granted", so this is harmless).
-    page.mouse.click(5, 5)
+        # User gesture mirrors the real lazy-permission flow (stub reports
+        # "granted", so this is harmless).
+        page.mouse.click(5, 5)
 
-    _reset_session_status_probe(page)
-    _send_prompt(page)
+        _reset_session_status_probe(page)
+        _send_prompt(page, f"[{marker}] {_PROMPT}")
 
-    # Reach the running baseline while still viewing the session, then leave
-    # for the new-session screen so the turn-end isn't suppressed as
-    # actively-viewed and a click has somewhere to navigate FROM.
-    _wait_for_observed_session_status(page, session_id, "running", timeout=30_000)
-    page.get_by_test_id("new-chat-button").click()
-    page.wait_for_url(lambda url: f"/c/{session_id}" not in url, timeout=10_000)
+        # The turn's LLM request reaches the mock and blocks on its gate,
+        # holding the session ``running`` until released below.
+        _wait_for_mock_gate_pending(mock_llm_server_url)
 
-    # The real turn completes off-screen and raises the notification.
-    page.wait_for_function("window.__notifObjects.length > 0", timeout=90_000)
+        # Reach the running baseline while still viewing the session, then
+        # leave for the new-session screen so the turn-end isn't suppressed
+        # as actively-viewed and a click has somewhere to navigate FROM.
+        _wait_for_observed_session_status(page, session_id, "running", timeout=30_000)
+        page.get_by_test_id("new-chat-button").click()
+        page.wait_for_url(lambda url: f"/c/{session_id}" not in url, timeout=10_000)
 
-    # Click it: the app's onClick focuses then navigates to the session.
-    page.evaluate("window.__notifObjects[0].onclick()")
-    page.wait_for_url(f"**/c/{session_id}", timeout=10_000)
+        # The user is gone; let the turn finish off-screen. It must notify.
+        release = httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0, trust_env=False)
+        assert release.json().get("released") is True, "mock gate had no pending turn to release"
+        page.wait_for_function("window.__notifObjects.length > 0", timeout=90_000)
+
+        # Click it: the app's onClick focuses then navigates to the session.
+        page.evaluate("window.__notifObjects[0].onclick()")
+        page.wait_for_url(f"**/c/{session_id}", timeout=10_000)
+    finally:
+        # Never leave the shared runner blocked on the gate, and clear this
+        # test's content-routed queue, whatever happened above.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0, trust_env=False)
+        with contextlib.suppress(httpx.HTTPError):
+            reset_mock_llm(mock_llm_server_url)
 
 
 @pytest.mark.nightly

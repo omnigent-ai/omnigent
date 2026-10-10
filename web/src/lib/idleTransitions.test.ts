@@ -7,6 +7,7 @@ import {
   detectIdleTransitions,
   detectNewElicitations,
   type ConversationStatus,
+  viewerHasSeenTurnEnd,
 } from "./idleTransitions";
 
 function conv(id: string, status?: Conversation["status"]): Conversation {
@@ -143,6 +144,80 @@ describe("detectNewElicitations", () => {
     const prev = new Map([["a", 0]]);
     const conversation = { ...convE("a", 0), pending_elicitations_count: undefined };
     expect(detectNewElicitations(prev, [conversation])).toEqual([]);
+  });
+});
+
+describe("viewerHasSeenTurnEnd", () => {
+  it("is true when the read baseline caught up with the finish stamp", () => {
+    expect(
+      viewerHasSeenTurnEnd({
+        ...conv("a", "idle"),
+        updated_at: 100,
+        last_finished_at: 105,
+        viewer_last_seen: 105,
+      }),
+    ).toBe(true);
+    expect(
+      viewerHasSeenTurnEnd({
+        ...conv("a", "idle"),
+        updated_at: 100,
+        last_finished_at: 105,
+        viewer_last_seen: 150,
+      }),
+    ).toBe(true);
+  });
+
+  it("is false when the baseline lags the finish stamp", () => {
+    expect(
+      viewerHasSeenTurnEnd({
+        ...conv("a", "idle"),
+        updated_at: 100,
+        last_finished_at: 105,
+        viewer_last_seen: 104,
+      }),
+    ).toBe(false);
+  });
+
+  it("is false when the viewer saw the latest content but not the finish", () => {
+    // A content-less finish: the last append (updated_at 100) was read
+    // mid-turn, then the turn ended at 105 with no new content. Seen
+    // content must NOT read as a watched finish — the user gets notified.
+    expect(
+      viewerHasSeenTurnEnd({
+        ...conv("a", "idle"),
+        updated_at: 100,
+        last_finished_at: 105,
+        viewer_last_seen: 100,
+      }),
+    ).toBe(false);
+  });
+
+  it("is false without read state (absent or null reads as not-watched)", () => {
+    expect(
+      viewerHasSeenTurnEnd({ ...conv("a", "idle"), updated_at: 100, last_finished_at: 105 }),
+    ).toBe(false);
+    expect(
+      viewerHasSeenTurnEnd({
+        ...conv("a", "idle"),
+        updated_at: 100,
+        last_finished_at: 105,
+        viewer_last_seen: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("is false without a finish stamp (absent or null reads as not-watched)", () => {
+    expect(
+      viewerHasSeenTurnEnd({ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 200 }),
+    ).toBe(false);
+    expect(
+      viewerHasSeenTurnEnd({
+        ...conv("a", "idle"),
+        updated_at: 100,
+        last_finished_at: null,
+        viewer_last_seen: 200,
+      }),
+    ).toBe(false);
   });
 });
 
