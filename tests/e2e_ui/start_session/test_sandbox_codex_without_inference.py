@@ -30,7 +30,7 @@ _VIEWPORT = {"width": 1440, "height": 960}
 
 
 @pytest.fixture(scope="module")
-def sandbox_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def sandbox_server(built_spa: None, tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """This checkout's server with only an agent_sandbox target and no inference block."""
     root = tmp_path_factory.mktemp("sandbox_no_inference")
     config = root / "server.yaml"

@@ -10604,6 +10604,36 @@ describe("managed sandbox inference models", () => {
     },
   );
 
+  it("offers the harness default when inference discovery reports Codex unconfigured", async () => {
+    mockHosts([]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+
+    openAgentModels("a2");
+    const menu = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(within(menu).getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    closeMenu();
+
+    const { body } = await submitAndReadBody();
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "agent_sandbox",
+      "codex-native",
+      "a2",
+      null,
+      true,
+    );
+    expect(body.host_type).toBe("managed");
+    expect(body.model_override).toBeUndefined();
+    expect(body.inference_configuration_revision).toBeUndefined();
+  });
+
   it.each(["lakebox", "kubernetes", "agent_sandbox", "modal"])(
     "keeps %s without bindings independent of the preview service",
     async (provider) => {
