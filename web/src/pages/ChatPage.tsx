@@ -85,6 +85,7 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  clearPersistedInitialPrompt,
   committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
@@ -93,6 +94,7 @@ import {
   type PendingInitialPrompt,
   useChatStore,
 } from "@/store/chatStore";
+import { slashCommandEchoText, type AnyBlock } from "@/lib/blocks";
 import {
   claudeNativeSubagentLabel,
   codexNativeSubagentLabel,
@@ -584,8 +586,34 @@ export function ChatPage() {
     // predicate already guarantees these, so this never fires at runtime.
     if (initialPrompt === null || !agentId || !urlConvId) return;
     initialPromptSentForConvRef.current = urlConvId;
-    const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
+    // Clear a duplicate failed-send draft before the delivered check so a
+    // landed interrupt can't strand a copy in the composer for a second send.
+    const draft = getSessionDraft(urlConvId);
+    if (
+      draft !== undefined &&
+      draft.text === initialPrompt.prompt.text &&
+      draft.files.length === 0
+    ) {
+      setSessionDraft(urlConvId, { text: "", files: [] });
+    }
+    // Skip replay when the hydrated transcript already contains the prompt; only
+    // trust `blocks` once the store projects this conversation (a stale mirror
+    // misdetects). The recovered plain message dedupes via its stable id.
+    const store = useChatStore.getState();
+    if (
+      store.conversationId === urlConvId &&
+      isInitialPromptDelivered(store.blocks, initialPrompt.prompt)
+    ) {
+      clearPersistedInitialPrompt(urlConvId);
+      return;
+    }
+    dispatchInitialPrompt(
+      initialPrompt.prompt,
+      agentId,
+      urlConvId,
+      store.send,
+      store.sendSlashCommand,
+    );
   }, [initialPrompt, urlConvId, loadingConversation, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
@@ -4088,6 +4116,38 @@ export function shouldSendInitialPrompt(params: {
 }
 
 /**
+ * Check whether the hydrated transcript already contains a recovered first
+ * message. Plain text matches a user block; a skill matches its receipt or
+ * synthesized user echo.
+ */
+export function isInitialPromptDelivered(
+  blocks: AnyBlock[],
+  prompt: PendingInitialPrompt,
+): boolean {
+  if (prompt.skill !== null) {
+    const { name, args } = prompt.skill;
+    const echo = slashCommandEchoText(name, args);
+    return blocks.some(
+      (block) =>
+        (block.type === "slash_command" &&
+          block.kind === "skill" &&
+          block.name === name &&
+          block.arguments === args) ||
+        (block.type === "user_message" &&
+          block.content.some((c) => c.type === "input_text" && c.text === echo)),
+    );
+  }
+  // An empty plain prompt (image-only draft) has no text block to match, and an
+  // empty-string compare would trivially match every user message.
+  if (prompt.text === "") return false;
+  return blocks.some(
+    (block) =>
+      block.type === "user_message" &&
+      block.content.some((c) => c.type === "input_text" && c.text === prompt.text),
+  );
+}
+
+/**
  * Auto-send the landing composer's first message through the right wire
  * shape. A message the dialog matched to one of the agent's bundled
  * skills posts a ``slash_command`` event (the REPL's shape) so the
@@ -4103,23 +4163,44 @@ export function shouldSendInitialPrompt(params: {
  * @param prompt The consumed pending prompt, e.g.
  *   ``{ text: "/review-pr 123", skill: { name: "review-pr", args: "123" } }``.
  * @param agentId Resolved agent id, e.g. ``"ag_abc123"``.
+ * @param conversationId The conversation the prompt was consumed for; both
+ *   wire shapes pin to it so a stale active mirror can't deliver the first
+ *   message to a different session.
  * @param send ``chatStore.send`` — posts a plain user message with the
  *   prompt's landing attachments (an empty array when none). For an
  *   image-only draft the text is ``""`` and send() omits the
  *   ``input_text`` block, so the message is ``input_image`` blocks alone.
+ *   A recovered plain message reuses its persisted ``stableId`` so a POST
+ *   that already landed dedupes server-side instead of double-delivering.
  * @param sendSlashCommand ``chatStore.sendSlashCommand`` — posts a
  *   ``slash_command`` event.
  */
 export function dispatchInitialPrompt(
   prompt: PendingInitialPrompt,
   agentId: string,
-  send: (text: string, agentId: string, files: File[]) => Promise<void>,
-  sendSlashCommand: (name: string, args: string, agentId: string) => Promise<void>,
+  conversationId: string,
+  send: (
+    text: string,
+    agentId: string,
+    files: File[],
+    opts?: { stableId?: string; pinnedConversationId?: string },
+  ) => Promise<void>,
+  sendSlashCommand: (
+    name: string,
+    args: string,
+    agentId: string,
+    opts?: { pinnedConversationId?: string },
+  ) => Promise<void>,
 ): void {
   if (prompt.skill) {
-    void sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId);
+    void sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId, {
+      pinnedConversationId: conversationId,
+    });
   } else {
-    void send(prompt.text, agentId, prompt.files ?? []);
+    void send(prompt.text, agentId, prompt.files ?? [], {
+      pinnedConversationId: conversationId,
+      ...(prompt.stableId !== undefined ? { stableId: prompt.stableId } : {}),
+    });
   }
 }
 

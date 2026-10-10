@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
-import type { ToolExecution } from "@/lib/blocks";
+import type { AnyBlock, ToolExecution } from "@/lib/blocks";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
@@ -21,6 +21,7 @@ import {
   containsMarkdownTable,
   dispatchInitialPrompt,
   isCostRoutingEligible,
+  isInitialPromptDelivered,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
@@ -1504,13 +1505,16 @@ describe("dispatchInitialPrompt", () => {
         skill: { name: "review-pr", args: "123 focus on auth" },
       },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
     // Name (no leading slash) + raw args reach the slash_command path —
     // the exact values the server's skill lookup and the runner's
     // SKILL.md resolution key off.
-    expect(sendSlashCommand).toHaveBeenCalledWith("review-pr", "123 focus on auth", "ag_abc123");
+    expect(sendSlashCommand).toHaveBeenCalledWith("review-pr", "123 focus on auth", "ag_abc123", {
+      pinnedConversationId: "conv_1",
+    });
     // The plain path must NOT also fire — a double-send would deliver the
     // literal "/name" text alongside the skill invocation.
     expect(send).not.toHaveBeenCalled();
@@ -1522,12 +1526,35 @@ describe("dispatchInitialPrompt", () => {
     dispatchInitialPrompt(
       { text: "read the README", skill: null },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
     // Full text verbatim, no files. This is also the path for native
     // terminal sessions and unknown "/typo" commands (skill stays null).
-    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", []);
+    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", [], {
+      pinnedConversationId: "conv_1",
+    });
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("reuses a recovered submission id so a landed POST dedupes server-side", () => {
+    // The recovery dispatch of a plain message forwards its persisted id, so a
+    // POST that already reached the server before the reload dedupes under it
+    // instead of delivering the first message twice (the native-terminal path).
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    dispatchInitialPrompt(
+      { text: "read the README", skill: null, stableId: "abc123def456" },
+      "ag_abc123",
+      "conv_1",
+      send,
+      sendSlashCommand,
+    );
+    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", [], {
+      pinnedConversationId: "conv_1",
+      stableId: "abc123def456",
+    });
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
 
@@ -1538,12 +1565,15 @@ describe("dispatchInitialPrompt", () => {
     dispatchInitialPrompt(
       { text: "what is this?", skill: null, files: [file] },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
     // The exact File objects picked on the landing screen reach send() —
     // an empty array here means first-message attachments silently vanish.
-    expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
+    expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file], {
+      pinnedConversationId: "conv_1",
+    });
   });
 
   it("dispatches an image-only draft (blank text) through the plain path with its files", () => {
@@ -1557,11 +1587,101 @@ describe("dispatchInitialPrompt", () => {
     dispatchInitialPrompt(
       { text: "", skill: null, files: [file] },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
-    expect(send).toHaveBeenCalledWith("", "ag_abc123", [file]);
+    expect(send).toHaveBeenCalledWith("", "ag_abc123", [file], {
+      pinnedConversationId: "conv_1",
+    });
     expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+});
+
+describe("isInitialPromptDelivered", () => {
+  // Reconciliation must avoid both replaying a delivered prompt and losing
+  // an undelivered one after reload.
+  const ctx = (itemId: string) => ({
+    agent: null,
+    depth: 0,
+    turn: 0,
+    timestamp: 0,
+    responseId: "resp_1",
+    itemId,
+  });
+  const userMessage = (text: string): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx("item_user"),
+    content: [{ type: "input_text", text }],
+  });
+
+  it("finds a delivered plain message in the transcript", () => {
+    expect(
+      isInitialPromptDelivered([userMessage("read the README")], {
+        text: "read the README",
+        skill: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not match a different message or an empty transcript", () => {
+    expect(isInitialPromptDelivered([], { text: "read the README", skill: null })).toBe(false);
+    expect(
+      isInitialPromptDelivered([userMessage("some other turn")], {
+        text: "read the README",
+        skill: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not let a plain prompt match a skill receipt alone", () => {
+    const receipt: AnyBlock = {
+      type: "slash_command",
+      ctx: ctx("item_slash"),
+      kind: "skill",
+      name: "review-pr",
+      arguments: "123",
+      output: null,
+    };
+    expect(
+      isInitialPromptDelivered([receipt], {
+        text: "/review-pr 123",
+        skill: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("finds a delivered skill invocation by its slash_command receipt", () => {
+    const receipt: AnyBlock = {
+      type: "slash_command",
+      ctx: ctx("item_slash"),
+      kind: "skill",
+      name: "review-pr",
+      arguments: "123",
+      output: null,
+    };
+    expect(
+      isInitialPromptDelivered([receipt], {
+        text: "/review-pr 123",
+        skill: { name: "review-pr", args: "123" },
+      }),
+    ).toBe(true);
+    expect(
+      isInitialPromptDelivered([receipt], {
+        text: "/review-pr 456",
+        skill: { name: "review-pr", args: "456" },
+      }),
+    ).toBe(false);
+  });
+
+  it("finds a delivered skill invocation by its synthesized user echo", () => {
+    // Some funnels render a user echo instead of the receipt.
+    expect(
+      isInitialPromptDelivered([userMessage("/review-pr 123")], {
+        text: "/review-pr 123",
+        skill: { name: "review-pr", args: "123" },
+      }),
+    ).toBe(true);
   });
 });
 

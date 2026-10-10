@@ -69,6 +69,8 @@ import {
   ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
   ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
   beginLocalConversation,
+  clearAllPersistedInitialPrompts,
+  clearPersistedInitialPrompt,
   committedItemProvesDelivery,
   consumePendingInitialPrompt,
   handleSessionEvent,
@@ -3609,6 +3611,31 @@ describe("chatStore — first message during native model startup", () => {
     await settle();
     expect(eventBodies().at(-1)?.type).toBe("interrupt");
     expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("drops the stored recovery copy when the first send is interrupted before dispatch", async () => {
+    const persistedFor = (id: string) => {
+      const raw = window.sessionStorage.getItem("omnigent.pendingInitialPrompts");
+      return raw ? (JSON.parse(raw) as Record<string, unknown>)[id] : undefined;
+    };
+    begin();
+    await settle();
+    // Parked waiting for the native model report. The recovery copy is live, so
+    // a forced-relogin reload at this point would still deliver the message.
+    expect(persistedFor(sessionId)).toMatchObject({ text: original });
+    expect(eventBodies()).toEqual([]);
+
+    useChatStore.getState().stop();
+    await settle();
+
+    // The user cancelled before the POST: no message is sent and the recovery
+    // copy is gone, so a later reload cannot resurrect the cancelled message.
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      conversationId: sessionId,
+      text: original,
+    });
+    expect(persistedFor(sessionId)).toBeUndefined();
   });
 
   it("cancels and restores repeated corrected drafts before native startup finishes", async () => {
@@ -14648,19 +14675,215 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 });
 
-// The first-message handoff from the landing composer to ChatPage. The
-// read-once delete is what replaces the old router-state clear: it must
-// return the prompt exactly once so a refresh/back can't replay it.
+// The in-memory handoff is read-once; storage survives until server settlement.
+// A per-heap guard and transcript reconciliation prevent duplicate dispatch.
 describe("pending initial prompt transport", () => {
-  it("returns the stashed prompt exactly once, then null", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  it("returns the stashed prompt exactly once within one page load", () => {
     setPendingInitialPrompt("conv_abc", { text: "read the README", skill: null });
-    // First consume yields the stashed prompt verbatim.
-    expect(consumePendingInitialPrompt("conv_abc")).toEqual({
-      text: "read the README",
+    // First consume yields the stashed prompt, now stamped with a submission
+    // id so a landed-then-reloaded POST dedupes server-side.
+    const first = consumePendingInitialPrompt("conv_abc");
+    expect(first).toMatchObject({ text: "read the README", skill: null });
+    expect(typeof first!.stableId).toBe("string");
+    expect(first!.stableId!.length).toBeGreaterThan(0);
+    // The storage copy must not dispatch again within this heap.
+    expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
+  });
+
+  it("persists a plain text first message with its submission id only", () => {
+    // A unit test cannot reset the module map; inspect the stored payload.
+    setPendingInitialPrompt("conv_hard", {
+      text: "survive the reload",
       skill: null,
     });
-    // Second consume yields null — the delete prevents a replay.
-    expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
+    const raw = window.sessionStorage.getItem("omnigent.pendingInitialPrompts");
+    expect(raw).not.toBeNull();
+    const stored = JSON.parse(raw!).conv_hard;
+    // Only the text and the submission id the recovery dispatch reuses persist.
+    expect(stored).toMatchObject({ text: "survive the reload" });
+    expect(Object.keys(stored).sort()).toEqual(["stableId", "text"]);
+    expect(typeof stored.stableId).toBe("string");
+    expect(stored.stableId.length).toBeGreaterThan(0);
+  });
+
+  it("does not persist a first message that carries attachments", () => {
+    // Files can't survive the reload, so persisting text-only would silently
+    // re-send a materially different message. Keep the whole prompt in memory
+    // and recover nothing after a hard navigation.
+    const file = new File(["x"], "a.png", { type: "image/png" });
+    setPendingInitialPrompt("conv_text_files", {
+      text: "what is in this image?",
+      skill: null,
+      files: [file],
+    });
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+    // The in-memory handoff still delivers the first message within this heap.
+    expect(consumePendingInitialPrompt("conv_text_files")).toEqual({
+      text: "what is in this image?",
+      skill: null,
+      files: [file],
+    });
+  });
+
+  it("does not persist a skill invocation (no slash-path dedup key to recover)", () => {
+    // The slash path carries no idempotency key, so a recovered skill could run
+    // twice. Keep it in memory only; a hard reload simply drops it.
+    setPendingInitialPrompt("conv_skill_persist", {
+      text: "/review-pr 123",
+      skill: { name: "review-pr", args: "123" },
+    });
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+  });
+
+  it("drops a legacy persisted skill entry instead of replaying it as plain text", () => {
+    // An entry stored before skills stopped persisting must not come back as a
+    // literal "/name" plain message.
+    window.sessionStorage.setItem(
+      "omnigent.pendingInitialPrompts",
+      JSON.stringify({
+        conv_legacy_skill: { text: "/review-pr 9", skill: { name: "review-pr", args: "9" } },
+      }),
+    );
+    expect(consumePendingInitialPrompt("conv_legacy_skill")).toBeNull();
+  });
+
+  it("recovers a persisted prompt from a previous page load, once", () => {
+    // A direct storage seed models a fresh page with no in-memory entry.
+    window.sessionStorage.setItem(
+      "omnigent.pendingInitialPrompts",
+      JSON.stringify({ conv_recovered: { text: "came back after wake", skill: null } }),
+    );
+    expect(consumePendingInitialPrompt("conv_recovered")).toEqual({
+      text: "came back after wake",
+      skill: null,
+    });
+    expect(consumePendingInitialPrompt("conv_recovered")).toBeNull();
+  });
+
+  it("recovers a persisted submission id so the reused POST dedupes server-side", () => {
+    // A plain first message persists its submission id; a fresh page after a
+    // sleep/relogin must recover that exact id so re-dispatching it dedupes a
+    // POST that already reached the server instead of double-delivering it.
+    window.sessionStorage.setItem(
+      "omnigent.pendingInitialPrompts",
+      JSON.stringify({
+        conv_resumed: { text: "sent before sleep", skill: null, stableId: "fixedid000111" },
+      }),
+    );
+    expect(consumePendingInitialPrompt("conv_resumed")).toEqual({
+      text: "sent before sleep",
+      skill: null,
+      stableId: "fixedid000111",
+    });
+    expect(consumePendingInitialPrompt("conv_resumed")).toBeNull();
+  });
+
+  it("clearPersistedInitialPrompt drops the recovery copy", () => {
+    setPendingInitialPrompt("conv_clear", { text: "already delivered", skill: null });
+    consumePendingInitialPrompt("conv_clear");
+    // Reconciliation drops the copy when the transcript already has the prompt.
+    clearPersistedInitialPrompt("conv_clear");
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+  });
+
+  it("tolerates a corrupt persisted payload", () => {
+    window.sessionStorage.setItem("omnigent.pendingInitialPrompts", "{not json");
+    expect(consumePendingInitialPrompt("conv_corrupt")).toBeNull();
+    setPendingInitialPrompt("conv_corrupt", { text: "after corruption", skill: null });
+    expect(consumePendingInitialPrompt("conv_corrupt")).toMatchObject({
+      text: "after corruption",
+      skill: null,
+    });
+  });
+
+  it("a settled send clears the persisted copy so a reload can't replay it", async () => {
+    // An acknowledged POST must remove its recovery copy.
+    setPendingInitialPrompt("conv_settle", { text: "hello there", skill: null });
+    expect(consumePendingInitialPrompt("conv_settle")).toMatchObject({
+      text: "hello there",
+      skill: null,
+    });
+    useChatStore.setState({
+      conversationId: "conv_settle",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    await useChatStore.getState().send("hello there", "agent_xyz");
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+  });
+
+  it("a send severed mid-flight keeps the persisted copy, submission id intact, for recovery", async () => {
+    // A network failure leaves the copy available for a later reload. The
+    // submission id must survive unchanged so the recovery dispatch reuses it
+    // and the server dedupes a POST that actually landed before the break.
+    setPendingInitialPrompt("conv_severed", { text: "must survive sleep", skill: null });
+    const consumed = consumePendingInitialPrompt("conv_severed");
+    expect(consumed).toMatchObject({ text: "must survive sleep", skill: null });
+    const submissionId = consumed!.stableId;
+    expect(typeof submissionId).toBe("string");
+    useChatStore.setState({
+      conversationId: "conv_severed",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    fetchMock.mockImplementation(async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/events")) throw new TypeError("network error");
+      return defaultFetchHandler(url, init);
+    });
+    await useChatStore.getState().send("must survive sleep", "agent_xyz");
+    expect(JSON.parse(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")!)).toEqual({
+      conv_severed: { text: "must survive sleep", stableId: submissionId },
+    });
+  });
+
+  it("a settled send retires the recovery copy even when the user edited the text", async () => {
+    // Edited retry: the first send failed and restored the draft, the user
+    // edited it, and the edited send landed. Once any message settles in the
+    // conversation the first-prompt insurance is spent, so a later reload must
+    // not replay the discarded original.
+    setPendingInitialPrompt("conv_edited", { text: "original A", skill: null });
+    consumePendingInitialPrompt("conv_edited");
+    useChatStore.setState({
+      conversationId: "conv_edited",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    await useChatStore.getState().send("edited B", "agent_xyz");
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+  });
+
+  it("a policy-denied first send clears the recovery copy so a reload can't replay it", async () => {
+    // A refused send never reached the transcript, so the user keeps the draft
+    // to retry; a later reload must not silently auto-resend the refused text.
+    setPendingInitialPrompt("conv_denied", { text: "blocked by policy", skill: null });
+    consumePendingInitialPrompt("conv_denied");
+    useChatStore.setState({
+      conversationId: "conv_denied",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_denied/events")) {
+        return mockResponse({ queued: false, denied: true });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("blocked by policy", "agent_xyz");
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+  });
+
+  it("clearAllPersistedInitialPrompts drops every stored prompt on sign-out", () => {
+    setPendingInitialPrompt("conv_one", { text: "one", skill: null });
+    setPendingInitialPrompt("conv_two", { text: "two", skill: null });
+    clearAllPersistedInitialPrompts();
+    expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
+    // The in-heap guard is cleared too, so the next account recovers nothing.
+    expect(consumePendingInitialPrompt("conv_one")).toBeNull();
+    expect(consumePendingInitialPrompt("conv_two")).toBeNull();
   });
 
   it("returns null for a conversation with no pending prompt", () => {
@@ -14704,8 +14927,14 @@ describe("pending initial prompt transport", () => {
     setPendingInitialPrompt("conv_a", { text: "prompt for A", skill: null });
     setPendingInitialPrompt("conv_b", { text: "prompt for B", skill: null });
     // Each conversation consumes only its own prompt.
-    expect(consumePendingInitialPrompt("conv_b")).toEqual({ text: "prompt for B", skill: null });
-    expect(consumePendingInitialPrompt("conv_a")).toEqual({ text: "prompt for A", skill: null });
+    expect(consumePendingInitialPrompt("conv_b")).toMatchObject({
+      text: "prompt for B",
+      skill: null,
+    });
+    expect(consumePendingInitialPrompt("conv_a")).toMatchObject({
+      text: "prompt for A",
+      skill: null,
+    });
   });
 
   it("carries a matched skill invocation through intact", () => {
