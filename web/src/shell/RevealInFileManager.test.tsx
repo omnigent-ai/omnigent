@@ -110,7 +110,9 @@ it("resolves rows against the folder being browsed", async () => {
 it("turns on when this machine's host first connects, without a reload", async () => {
   identity = null;
   await renderTree();
-  expect(fireEvent.contextMenu(screen.getByText("main.ts"))).toBe(true);
+  fireEvent.contextMenu(screen.getByText("main.ts"));
+  expect(screen.queryByRole("menuitem", { name: "Show in Finder" })).toBeNull();
+  fireEvent.keyDown(await screen.findByRole("menu"), { key: "Escape" });
   identity = { cliInstalled: true, hostId: HOST };
   await act(async () => hostStatusChanged());
   fireEvent.contextMenu(screen.getByText("main.ts"));
@@ -136,9 +138,9 @@ it.each([
       return renderTree();
     },
   ],
-])("leaves the native context menu alone in %s", async (_case, setup) => {
+])("keeps the shared menu and hides Finder in %s", async (_case, setup) => {
   await setup();
-  // fireEvent returns false only when a handler called preventDefault().
-  expect(fireEvent.contextMenu(screen.getByText("main.ts"))).toBe(true);
-  expect(screen.queryByRole("menuitem")).toBeNull();
+  fireEvent.contextMenu(screen.getByText("main.ts"));
+  expect(await screen.findByRole("menuitem", { name: "File info" })).toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Show in Finder" })).toBeNull();
 });

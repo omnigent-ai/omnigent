@@ -2,16 +2,8 @@
 // shell, and only when the session's files are on this machine (its host is
 // this machine's host), so a browser tab or a remote session sees no change.
 
-import { FolderOpenIcon } from "lucide-react";
-import { createContext, useContext, useState, useSyncExternalStore, type MouseEvent } from "react";
-import { createPortal } from "react-dom";
+import { createContext, useContext, useSyncExternalStore } from "react";
 import { toast } from "sonner";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import {
   getHostIdentity,
   onHostStatusChanged,
@@ -92,37 +84,4 @@ export function revealInFileManager(target: RevealTarget): void {
   void revealFile(target.hostId, target.path).then((ok) => {
     if (!ok) toast.error("Couldn't show this item in the file manager");
   });
-}
-
-/**
- * Right-click menu for a Files row. Spread ``onContextMenu`` on the row and
- * render ``menu`` inside it; both are inert when the reveal isn't available.
- */
-export function useRevealMenu(path: string | null, directory = false) {
-  const target = useRevealTarget(path);
-  const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
-  if (!target) return { onContextMenu: undefined, menu: null };
-  const onContextMenu = (event: MouseEvent<HTMLElement>) => {
-    event.preventDefault();
-    // A keyboard-opened menu has no pointer position; anchor it to the row.
-    const box = event.currentTarget.getBoundingClientRect();
-    setPoint({ x: event.clientX || box.left, y: event.clientY || box.bottom });
-  };
-  const menu =
-    point &&
-    createPortal(
-      <DropdownMenu open modal={false} onOpenChange={(open) => !open && setPoint(null)}>
-        <DropdownMenuTrigger asChild>
-          <span className="fixed" style={{ left: point.x, top: point.y }} />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" onCloseAutoFocus={(event) => event.preventDefault()}>
-          <DropdownMenuItem onSelect={() => revealInFileManager(target)}>
-            <FolderOpenIcon className="size-4" />
-            {revealLabel(directory)}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>,
-      document.body,
-    );
-  return { onContextMenu, menu };
 }
