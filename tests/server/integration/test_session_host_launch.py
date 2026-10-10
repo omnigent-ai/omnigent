@@ -3985,3 +3985,272 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
             f"host refusal: {item!r}"
         )
         assert "omnigent setup" in item["message"], item
+
+
+class _StagedRunners:
+    """Resolve only runners that have connected, and record what each one receives.
+
+    A session resolves a client only while its row is bound to a connected
+    runner. A connect wait marks the awaited runner connected, as when a runner
+    the host relaunched registers its tunnel.
+    """
+
+    def __init__(self, store: SqlAlchemyConversationStore) -> None:
+        self._store = store
+        self.live: set[str] = set()
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+        self.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(self._handle), base_url="http://runner"
+        )
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            self.posts.append((request.url.path, json.loads(request.content or b"{}")))
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(200, json={})
+
+    async def get_runner_client(
+        self,
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Conversation | None = None,
+    ) -> httpx.AsyncClient | None:
+        del runner_router, conversation
+        conv = self._store.get_conversation(session_id)
+        return self.client if conv is not None and conv.runner_id in self.live else None
+
+    async def wait_for_runner_client(
+        self,
+        session_id: str,
+        runner_router: object,
+        tunnel_registry: object,
+        *,
+        runner_id: str | None,
+        timeout_s: float,
+        runner_exit_reports: object = None,
+    ) -> httpx.AsyncClient | None:
+        del tunnel_registry, timeout_s, runner_exit_reports
+        if runner_id is not None:
+            self.live.add(runner_id)
+        return await self.get_runner_client(session_id, runner_router)
+
+
+async def _side_chat_with_exited_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+) -> tuple[ApplicationCommunicator, _StagedRunners, dict[str, str], str]:
+    """Create a side chat on its source's runner, then let that runner exit.
+
+    The side chat is bound the way the web binds one: fork with ``side_chat``,
+    then point the fork at the source's live runner. The runner's later exit
+    (for example, its idle timeout) leaves the host connected.
+
+    :param harness: Source agent harness, e.g. ``"claude-native"``; ``None``
+        uses the default test agent.
+    :returns: The host communicator, staged runners, source session
+        (``id`` + ``runner_id``), and the side chat's id.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", runners.wait_for_runner_client)
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
+    )
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor=None if harness is None else {"type": "omnigent", "config": {"harness": harness}},
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+    assert created.status_code == 201, created.text
+    source = {"id": created.json()["id"], "runner_id": created.json()["runner_id"]}
+    runners.live.add(source["runner_id"])
+    fork = await client.post(
+        f"/v1/sessions/{source['id']}/fork", json={"title": "Side chat", "side_chat": True}
+    )
+    assert fork.status_code == 201, fork.text
+    side_chat_id = fork.json()["id"]
+    store.replace_runner_id(side_chat_id, source["runner_id"])
+    runners.live.discard(source["runner_id"])
+    return comm, runners, source, side_chat_id
+
+
+@pytest.mark.parametrize("harness", [None, "claude-native"], ids=["sdk", "claude-native"])
+async def test_side_chat_message_relaunches_exited_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+) -> None:
+    """A side chat whose shared runner exited recovers through its source session.
+
+    The side chat has no host of its own, so the send asks the source's host to
+    relaunch the source, then binds the side chat to that runner and initializes
+    it there before forwarding the message.
+    """
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, harness
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        response = await _post_hello(client, side_chat_id)
+        await asyncio.wait_for(responder, timeout=budget(5.0))
+    finally:
+        responder.cancel()
+        await runners.client.aclose()
+
+    assert response.status_code < 300, response.text
+    store = SqlAlchemyConversationStore(db_uri)
+    source_after = store.get_conversation(source["id"])
+    side_chat_after = store.get_conversation(side_chat_id)
+    assert source_after is not None and side_chat_after is not None
+    assert source_after.runner_id != source["runner_id"]
+    assert side_chat_after.runner_id == source_after.runner_id
+    assert side_chat_after.host_id is None
+    paths = [path for path, _ in runners.posts]
+    init = paths.index("/v1/sessions")
+    assert runners.posts[init][1]["session_id"] == side_chat_id
+    assert init < paths.index(f"/v1/sessions/{side_chat_id}/events"), paths
+
+
+@pytest.mark.parametrize("harness", [None, "claude-native"], ids=["sdk", "claude-native"])
+async def test_side_chat_retry_relaunches_exited_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+) -> None:
+    """Resume on a side chat relaunches its source's runner instead of failing."""
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, harness
+    )
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        response = await client.post(
+            f"/v1/sessions/{side_chat_id}/events", json={"type": "retry_session", "data": {}}
+        )
+        await asyncio.wait_for(responder, timeout=budget(5.0))
+    finally:
+        responder.cancel()
+        await runners.client.aclose()
+
+    assert response.status_code == 202, response.text
+    assert response.json()["recovery"] == "runner_relaunched", response.json()
+    store = SqlAlchemyConversationStore(db_uri)
+    source_after = store.get_conversation(source["id"])
+    side_chat_after = store.get_conversation(side_chat_id)
+    assert source_after is not None and side_chat_after is not None
+    assert source_after.runner_id != source["runner_id"]
+    assert side_chat_after.runner_id == source_after.runner_id
+    assert ("/v1/sessions", side_chat_id) in [
+        (path, body.get("session_id")) for path, body in runners.posts
+    ]
+
+
+async def test_side_chat_message_source_refusal_persists_error_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused source relaunch consumes the side chat's message with the reason.
+
+    The refusal comes from the source's host, but the side chat is the session
+    being messaged: its transcript must carry the same actionable error item
+    the source's own send produces, instead of the generic unavailable error
+    keyed to the side chat's old runner binding.
+    """
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, "claude-native"
+    )
+    refusal_text = (
+        "harness 'claude-native' is not configured on host 'laptop' — "
+        "run `omnigent setup` on that machine"
+    )
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=refusal_text,
+            launch_error_code="harness_not_configured",
+        )
+    )
+    try:
+        response = await _post_hello(client, side_chat_id)
+        await asyncio.wait_for(responder, timeout=budget(5.0))
+    finally:
+        responder.cancel()
+        await runners.client.aclose()
+
+    assert response.status_code == 202, (
+        f"expected the message to be consumed, got {response.status_code}: {response.text}"
+    )
+    items = await client.get(f"/v1/sessions/{side_chat_id}/items")
+    assert items.status_code == 200, items.text
+    data = items.json()["data"]
+    user_texts = [
+        part.get("text", "")
+        for item in data
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+    ]
+    assert "hello" in user_texts, f"user message should be persisted, got {user_texts!r}"
+    error_items = [item for item in data if item.get("type") == "error"]
+    assert len(error_items) == 1, f"expected one refusal error item, got {error_items!r}"
+    assert error_items[0]["code"] == "harness_not_configured", error_items[0]
+    assert refusal_text in error_items[0]["message"], error_items[0]
+    # The refusal binds the attempted runner to the source (the same
+    # remediation-friendly rebinding the source's own refused relaunch does);
+    # the side chat keeps its old binding to follow the source's next relaunch.
+    store = SqlAlchemyConversationStore(db_uri)
+    source_after = store.get_conversation(source["id"])
+    side_after = store.get_conversation(side_chat_id)
+    assert source_after is not None and side_after is not None
+    assert source_after.host_id == _HOST_ID
+    assert source_after.runner_id is not None
+    assert source_after.runner_id != source["runner_id"]
+    assert side_after.runner_id == source["runner_id"]
+
+
+async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side chat follows a source that already got a new runner, without a launch."""
+    comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
+        client, app, db_uri, monkeypatch, "claude-native"
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    replacement = token_bound_runner_id("replacement-binding")
+    store.replace_runner_id(source["id"], replacement)
+    runners.live.add(replacement)
+    try:
+        response = await _post_hello(client, side_chat_id)
+        launched = await _expect_no_launch(comm, budget_s=budget(0.5))
+    finally:
+        await runners.client.aclose()
+
+    assert response.status_code < 300, response.text
+    assert not launched
+    side_chat_after = store.get_conversation(side_chat_id)
+    assert side_chat_after is not None and side_chat_after.runner_id == replacement
+    assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]

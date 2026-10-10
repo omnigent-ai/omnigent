@@ -23,7 +23,9 @@ the header menu), and each place is a separate entry point.
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
   closing one stops only that chat. Starting one from a stopped generic hosted
-  parent relaunches the parent first, then shares its replacement runner.
+  parent relaunches the parent first, then shares its replacement runner. An
+  existing side chat whose shared runner exited does the same on its next
+  message or Resume.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both keep
   the existing draft and attachments, and quotes can be removed before sending.
@@ -158,7 +160,10 @@ parent composer, or choose **Start a new side chat** from the composer's add
 tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
-after stopping; this relaunches the parent and both use one runner. Close a side
+after stopping; this relaunches the parent and both use one runner. Sending to
+an existing side chat or choosing Resume after the parent's runner exited (for
+example, on its idle timeout) also relaunches the parent, then moves the side
+chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace.
@@ -321,6 +326,15 @@ plain `uv run pytest`, which starts a private server for the test.
   all histories. An unrelated session stays online, and a new side chat
   relaunches its parent before both share the replacement runner.
   Only model replies are scripted.
+- **`side-chat-lifecycle`, shared-runner recovery (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_session_host_launch.py::test_side_chat_message_relaunches_exited_source_runner`,
+  `tests/server/integration/test_session_host_launch.py::test_side_chat_retry_relaunches_exited_source_runner`,
+  and
+  `tests/server/integration/test_session_host_launch.py::test_side_chat_message_rebinds_to_already_relaunched_source_runner`
+  use a mock host. After the parent's runner exits, a side-chat message or
+  Resume relaunches the parent on its host and initializes the side chat on the
+  replacement runner. A parent that already has a replacement is reused
+  without another launch.
 - **`side-chat-lifecycle`, creation entry points:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py` covers `/side`, the Workspace
   menu, the composer add tray, selected text's Ask in side chat action, and the
@@ -450,6 +464,8 @@ plain `uv run pytest`, which starts a private server for the test.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new
   chat shares that replacement runner and stops with the parent again.
+- A side chat has no host of its own. When its shared runner is gone, recovery
+  goes through the parent and requires edit access to the parent.
 - Ask in side chat reuses only a visible, writable tab belonging to the current
   parent. Hidden, ended, and currently starting tabs are ineligible; another
   selection opens a new unsent tab. Ended chats do not offer Reply.
