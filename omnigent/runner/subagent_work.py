@@ -434,10 +434,9 @@ def note_subagent_child_activity(child_session_id: str) -> _SubagentWorkEntry | 
             child_session_id, work_id=_drained_subagent_work_ids.get(child_session_id)
         )
         if fresh is None:
-            # No local child record (the dispatch was adopted after a restart):
-            # the drain stays forgotten so the turn end's snapshot recovery can
-            # deliver the result. A stale running edge then costs at most one
-            # duplicate, which the receipt policy prefers to a lost result.
+            # No local record (dispatch adopted after a restart): keep the drain
+            # forgotten so turn-end snapshot recovery can deliver; a stale running
+            # edge costs at most one duplicate, which beats a lost result.
             return None
     fresh.status = "running"
     fresh.rearmed = True

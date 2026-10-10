@@ -1235,6 +1235,7 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
+    app.state.session_harness_overrides = _session_harness_overrides
     # session_id → revision of the agent bundle its caches were built from
     _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
@@ -1626,6 +1627,7 @@ def create_runner_app(
 
     # Child -> pending settle of a provisional re-arm (see _settle_subagent_rearm_later).
     _rearm_settle_tasks: dict[str, asyncio.Task[None]] = {}
+    app.state.rearm_settle_tasks = _rearm_settle_tasks
 
     def _cancel_subagent_rearm_settle(child_id: str) -> None:
         task = _rearm_settle_tasks.pop(child_id, None)
@@ -1701,9 +1703,11 @@ def create_runner_app(
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         if status in ("running", "waiting"):
-            # The poller and pane watcher publish a claude-native child's
-            # ``running`` here, never on ``/events``.
-            _note_subagent_child_activity(session_id)
+            # Claude's status-file poller publishes a claude-native child's
+            # ``running`` here, never on ``/events``. Other harnesses' pane
+            # repaints also arrive here and do not mark a new turn.
+            if _session_harness_name(session_id) == "claude-native":
+                _note_subagent_child_activity(session_id)
         elif status == "idle":
             _settle_subagent_rearm_later(session_id)
         _publish_event(session_id, event)

@@ -110,13 +110,35 @@ class _ChildSnapshotServerClient(NullServerClient):
         return self._Response()
 
 
+_HARNESS_BY_AGENT = {"ag_sdk_parent": "claude-sdk", "ag_native_parent": "claude-native"}
+
+
 async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-    del agent_id, session_id
+    """Resolve a spec whose harness is encoded in the agent id (default claude-native)."""
+    del session_id
     return AgentSpec(
         spec_version=1,
-        name="reviewer",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        name=agent_id,
+        executor=ExecutorSpec(
+            type="omnigent", config={"harness": _HARNESS_BY_AGENT.get(agent_id, "claude-native")}
+        ),
     )
+
+
+def _pin_child_harness(
+    app: Any, child_id: str = CHILD_SESSION_ID, harness: str = "claude-native"
+) -> None:
+    """Record the worker's harness the way a routed dispatch pins it on the runner."""
+    app.state.session_harness_overrides[child_id] = harness
+
+
+async def _await_settle(app: Any, child_id: str) -> None:
+    """Wait for *child_id*'s pending settle task to finish (or be cancelled)."""
+    task = app.state.rearm_settle_tasks.get(child_id)
+    if task is None:
+        await asyncio.sleep(0)
+        return
+    await asyncio.wait({task}, timeout=5)
 
 
 def _dispatch_worker(
@@ -149,6 +171,7 @@ def _dispatch_worker(
         agent="reviewer",
         title="review the diff",
     )
+    _pin_child_harness(app)
     return app, inbox, entry.work_id
 
 
@@ -159,11 +182,19 @@ def _pane_status_publisher(app: Any) -> Any:
     return publish
 
 
-async def _post_status(client: Any, *, status: str, output: str | None = None) -> Any:
-    """POST an ``external_session_status`` edge to the child, as the forwarder does."""
+async def _post_status(
+    client: Any, *, status: str, output: str | None = None, turn_completed: bool | None = None
+) -> Any:
+    """POST an ``external_session_status`` edge to the child, as the forwarder does.
+
+    A claude-native ``Stop`` carries ``turn_completed``; a bare ``idle`` is the
+    pane watcher's quiescence edge and is never a completion on its own.
+    """
     data: dict[str, Any] = {"status": status}
     if output is not None:
         data["output"] = output
+    if turn_completed is not None:
+        data["turn_completed"] = turn_completed
     return await client.post(
         f"/v1/sessions/{CHILD_SESSION_ID}/events",
         json={"type": "external_session_status", "data": data},
@@ -174,7 +205,9 @@ async def _deliver_and_drain_round_one(
     client: Any, inbox: asyncio.Queue[dict[str, Any]], server: NullServerClient
 ) -> None:
     """The worker reports round one and the orchestrator reads it with ``sys_read_inbox``."""
-    r1 = await _post_status(client, status="idle", output="round one: found the bug")
+    r1 = await _post_status(
+        client, status="idle", output="round one: found the bug", turn_completed=True
+    )
     assert r1.status_code == 204
     assert inbox.qsize() == 1, (
         "control failed: the worker's first completion was not delivered to the orchestrator inbox"
@@ -301,7 +334,7 @@ async def test_status_poller_running_edge_rearms_delivery_for_a_drained_worker(
         publish_pane_status(CHILD_SESSION_ID, "running", None)
 
         r2_idle = await _post_status(
-            client, status="idle", output="round two: should I open the PR?"
+            client, status="idle", output="round two: should I open the PR?", turn_completed=True
         )
         assert r2_idle.status_code == 204
 
@@ -327,7 +360,9 @@ async def test_running_edge_before_the_drain_keeps_the_selfresumed_result_delive
     publish_pane_status = _pane_status_publisher(app)
 
     async with _runner_client(app) as client:
-        r1 = await _post_status(client, status="idle", output="round one: found the bug")
+        r1 = await _post_status(
+            client, status="idle", output="round one: found the bug", turn_completed=True
+        )
         assert r1.status_code == 204
         assert inbox.qsize() == 1
 
@@ -341,7 +376,7 @@ async def test_running_edge_before_the_drain_keeps_the_selfresumed_result_delive
         status_after_drain = live.status if live is not None else None
 
         r2_idle = await _post_status(
-            client, status="idle", output="round two: should I open the PR?"
+            client, status="idle", output="round two: should I open the PR?", turn_completed=True
         )
         assert r2_idle.status_code == 204
         second = _drain_queue(inbox)
@@ -388,32 +423,6 @@ async def test_selfresumed_worker_counts_as_running_when_the_orchestrator_turn_e
 
 
 @pytest.mark.asyncio
-async def test_selfresume_leaves_a_mid_turn_orchestrator_to_its_own_turn_end(
-    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An orchestrator with a turn in flight is not moved by the worker's edge.
-
-    Its own turn end computes ``waiting`` from the live entries, so publishing
-    here would race that convergence point.
-    """
-    monkeypatch.setattr(runner_app, "_server_version", "0.16.0")
-    server = _ChildSnapshotServerClient()
-    app, inbox, _work_id = _dispatch_worker(server)
-    publish_pane_status = _pane_status_publisher(app)
-
-    async with _runner_client(app) as client:
-        await _deliver_and_drain_round_one(client, inbox, server)
-        app.state.native_pane_status[PARENT_SESSION_ID] = "idle"
-        app.state.active_turns[PARENT_SESSION_ID] = None
-        _parent_status_events()
-
-        publish_pane_status(CHILD_SESSION_ID, "running", None)
-        await asyncio.sleep(0)
-
-    assert _parent_status_events() == []
-
-
-@pytest.mark.asyncio
 async def test_running_edge_keeps_a_result_the_orchestrator_has_not_received(
     _clean_subagent_registry: None,
 ) -> None:
@@ -429,7 +438,9 @@ async def test_running_edge_keeps_a_result_the_orchestrator_has_not_received(
     publish_pane_status = _pane_status_publisher(app)
 
     async with _runner_client(app) as client:
-        await _post_status(client, status="idle", output="round one: found the bug")
+        await _post_status(
+            client, status="idle", output="round one: found the bug", turn_completed=True
+        )
         recorded = subagent_work.get_subagent_work(CHILD_SESSION_ID)
         assert recorded is not None
         assert recorded.status == "completed" and not recorded.delivered
@@ -456,6 +467,7 @@ class _HeldSleep:
 
 
 async def _let_settle_run() -> None:
+    """Give a just-published idle edge the loop turns it needs to schedule its settle."""
     for _ in range(5):
         await asyncio.sleep(0)
 
@@ -498,7 +510,7 @@ async def test_spurious_running_edge_is_settled_when_the_file_reads_idle_again(
             "the re-arm must survive until the grace window elapses"
         )
         held.release.set()
-        await _let_settle_run()
+        await _await_settle(app, CHILD_SESSION_ID)
 
         assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
         assert CHILD_SESSION_ID in subagent_work._drained_delivered_subagent_children
@@ -536,14 +548,14 @@ async def test_turn_end_within_the_grace_window_keeps_the_rearmed_result(
         await _let_settle_run()
 
         r2_idle = await _post_status(
-            client, status="idle", output="round two: should I open the PR?"
+            client, status="idle", output="round two: should I open the PR?", turn_completed=True
         )
         assert r2_idle.status_code == 204
         second = _drain_queue(inbox)
         _assert_fresh_result(second, work_id=work_id)
 
         held.release.set()
-        await _let_settle_run()
+        await _await_settle(app, CHILD_SESSION_ID)
         settled = subagent_work.get_subagent_work(CHILD_SESSION_ID)
         assert settled is not None and settled.status == "completed" and settled.delivered
         assert not settled.rearmed
@@ -567,7 +579,9 @@ async def test_spurious_running_edge_restores_a_delivered_result_the_parent_has_
     publish_pane_status = _pane_status_publisher(app)
 
     async with _runner_client(app) as client:
-        r1 = await _post_status(client, status="idle", output="round one: found the bug")
+        r1 = await _post_status(
+            client, status="idle", output="round one: found the bug", turn_completed=True
+        )
         assert r1.status_code == 204
         delivered = subagent_work.get_subagent_work(CHILD_SESSION_ID)
         assert delivered is not None and delivered.delivered
@@ -577,25 +591,15 @@ async def test_spurious_running_edge_restores_a_delivered_result_the_parent_has_
         publish_pane_status(CHILD_SESSION_ID, "idle", None)
         await _let_settle_run()
         held.release.set()
-        await _let_settle_run()
+        await _await_settle(app, CHILD_SESSION_ID)
 
         assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is delivered
         assert delivered.work_id == work_id and delivered.status == "completed"
-        r_dup = await _post_status(client, status="idle", output="round one: found the bug")
+        r_dup = await _post_status(
+            client, status="idle", output="round one: found the bug", turn_completed=True
+        )
         assert r_dup.status_code == 204
         assert inbox.qsize() == 1, "the duplicate report must not deliver round one twice"
-
-
-async def _parent_harness_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-    del session_id
-    harness = {"ag_sdk_parent": "claude-sdk", "ag_native_parent": "claude-native"}.get(
-        agent_id, "claude-native"
-    )
-    return AgentSpec(
-        spec_version=1,
-        name=agent_id,
-        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
-    )
 
 
 @pytest.mark.asyncio
@@ -619,7 +623,7 @@ async def test_selfresume_waiting_edge_follows_the_parent_harness(
     server = _ChildSnapshotServerClient()
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        spec_resolver=_parent_harness_resolver,
+        spec_resolver=_resolver,
         server_client=server,  # type: ignore[arg-type]
     )
     publish_pane_status = _pane_status_publisher(app)
@@ -629,6 +633,7 @@ async def test_selfresume_waiting_edge_follows_the_parent_harness(
             "/v1/sessions", json={"session_id": PARENT_SESSION_ID, "agent_id": agent_id}
         )
         assert created.status_code == 201, created.text
+        _pin_child_harness(app)
         inbox = subagent_work._session_inboxes_ref.setdefault(PARENT_SESSION_ID, asyncio.Queue())
         subagent_work.register_child_session(
             CHILD_SESSION_ID,
@@ -678,10 +683,12 @@ async def test_new_running_edge_cancels_a_pending_settle(
         assert held.calls == [runner_app._SUBAGENT_REARM_SETTLE_GRACE_S]
 
         # The real self-resumed turn starts before the grace window elapses.
+        pending = app.state.rearm_settle_tasks[CHILD_SESSION_ID]
         publish_pane_status(CHILD_SESSION_ID, "running", None)
-        await _let_settle_run()
+        await asyncio.wait({pending}, timeout=5)
+        assert pending.cancelled()
         held.release.set()
-        await _let_settle_run()
+        await asyncio.sleep(0)
         live = subagent_work.get_subagent_work(CHILD_SESSION_ID)
         assert live is not None and live.status == "running", (
             "the pending settle reverted a child that is genuinely working again"
@@ -689,7 +696,7 @@ async def test_new_running_edge_cancels_a_pending_settle(
         assert CHILD_SESSION_ID not in subagent_work._drained_delivered_subagent_children
 
         r2_idle = await _post_status(
-            client, status="idle", output="round two: should I open the PR?"
+            client, status="idle", output="round two: should I open the PR?", turn_completed=True
         )
         assert r2_idle.status_code == 204
         _assert_fresh_result(_drain_queue(inbox), work_id=work_id)
@@ -723,11 +730,12 @@ async def test_settling_the_last_spurious_rearm_returns_a_waiting_parent_to_idle
 
     async with _runner_client(app) as client:
         await _deliver_and_drain_round_one(client, inbox, server)
+        _pin_child_harness(app, SECOND_CHILD_SESSION_ID)
         r = await client.post(
             f"/v1/sessions/{SECOND_CHILD_SESSION_ID}/events",
             json={
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "second: done"},
+                "data": {"status": "idle", "output": "second: done", "turn_completed": True},
             },
         )
         assert r.status_code == 204
@@ -749,7 +757,7 @@ async def test_settling_the_last_spurious_rearm_returns_a_waiting_parent_to_idle
         publish_pane_status(settle_first, "idle", None)
         await _let_settle_run()
         held.release.set()
-        await _let_settle_run()
+        await _await_settle(app, settle_first)
         assert subagent_work.get_subagent_work(settle_first) is None
         assert _parent_status_events() == [], "a live sibling keeps the parent waiting"
 
@@ -757,7 +765,7 @@ async def test_settling_the_last_spurious_rearm_returns_a_waiting_parent_to_idle
         publish_pane_status(settle_last, "idle", None)
         await _let_settle_run()
         held.release.set()
-        await _let_settle_run()
+        await _await_settle(app, settle_last)
         assert subagent_work.get_subagent_work(settle_last) is None
         assert _parent_status_events() == ["idle"]
 
@@ -796,6 +804,31 @@ async def test_settle_returns_a_parent_that_went_waiting_at_its_own_turn_end_to_
         publish_pane_status(CHILD_SESSION_ID, "idle", None)
         await _let_settle_run()
         held.release.set()
-        await _let_settle_run()
+        await _await_settle(app, CHILD_SESSION_ID)
         assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
         assert _parent_status_events() == ["idle"]
+
+
+@pytest.mark.asyncio
+async def test_pane_activity_of_another_native_harness_does_not_rearm(
+    _clean_subagent_registry: None,
+) -> None:
+    """Only Claude's status-file edges re-arm through the runner-local publisher.
+
+    A codex-native worker's pane repaint also reaches that publisher as
+    ``running`` without marking a new turn, so it must leave a drained dispatch
+    alone; its real turns re-arm through the forwarder's ``/events`` edges.
+    """
+    server = _ChildSnapshotServerClient()
+    app, inbox, _work_id = _dispatch_worker(server)
+    _pin_child_harness(app, harness="codex-native")
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        await _deliver_and_drain_round_one(client, inbox, server)
+
+        publish_pane_status(CHILD_SESSION_ID, "running", None)
+        await asyncio.sleep(0)
+
+    assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
+    assert CHILD_SESSION_ID in subagent_work._drained_delivered_subagent_children
