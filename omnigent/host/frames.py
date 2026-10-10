@@ -1140,6 +1140,8 @@ class HostImportedLocalSession:
         server synthesize one from the first user message.
     :param source: Harness this session came from, e.g. ``"claude"``. Carried
         per session so an "all harnesses" request can mix sources in one batch.
+    :param archived: Whether the harness had archived this session; the server
+        archives the imported conversation too. Absent from older hosts.
     """
 
     external_session_id: str
@@ -1147,6 +1149,7 @@ class HostImportedLocalSession:
     items: list[_JsonObject]
     title: str | None = None
     source: str = ""
+    archived: bool = False
 
 
 @dataclass
@@ -1857,6 +1860,7 @@ def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonO
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 
@@ -2959,12 +2963,16 @@ def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
     source = raw.get("source", "")
     if not isinstance(source, str):
         raise ValueError("session 'source' must be a string")
+    archived = raw.get("archived", False)
+    if not isinstance(archived, bool):
+        raise ValueError("session 'archived' must be a boolean")
     return HostImportedLocalSession(
         external_session_id=_required_str(raw, "external_session_id"),
         workspace=workspace,
         items=items,
         title=title,
         source=source,
+        archived=archived,
     )
 
 

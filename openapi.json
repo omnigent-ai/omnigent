@@ -2918,6 +2918,11 @@
       "ImportSessionRequest": {
         "description": "Request body for importing one local harness session.\n\n`project_id` files the imported session into a first-class project the\ncaller owns, with the same ownership, default-fill, and mismatch-warning\nsemantics as `POST /v1/sessions`.",
         "properties": {
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
           "external_session_id": {
             "maxLength": 128,
             "minLength": 1,

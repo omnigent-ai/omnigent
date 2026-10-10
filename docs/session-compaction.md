@@ -18,27 +18,23 @@ Each harness records the boundary differently:
   source=compact` hook that would otherwise persist the boundary is flaky and
   sometimes never fires. The agent resumes from that summary, so the kept range
   is the summary and everything after it.
-- **Codex** appends a `{type: "compacted", payload: {replacement_history: [...]}}`
+- **Codex** appends a `{type: "compacted", payload: {message, replacement_history: [...]}}`
   record to its rollout JSONL after compacting. `replacement_history` is the
   post-compaction context baseline it resumes from (the summary plus any retained
   messages); the raw pre-compaction `response_item` records stay in the
-  append-only file but the agent no longer sees them. The kept range is the
-  replacement-history baseline and every `response_item` after the record.
+  append-only file but the agent no longer sees them.
 
 A transcript can be compacted more than once, so the boundary that matters is
 the **last** one: everything before it is already folded into that baseline.
 
-## Import trimming
+## Importing Claude Code transcripts
 
-`load_claude_session` / `load_codex_session`
-(`omnigent/session_import/local.py`) mirror the agent's working context when
-importing:
+`load_claude_session` (`omnigent/session_import/local.py`) mirrors the agent's
+working context when importing:
 
 - **Transcript at or below `_IMPORT_COMPACT_TRIM_BYTES` (2 MB)** — the full
   history is imported. The full record is cheap at this size and useful to
-  browse, and a short transcript may not have compacted at all. (For Codex this
-  means the raw pre-compaction records are kept and the `compacted` record is
-  ignored, matching the prior behavior.)
+  browse, and a short transcript may not have compacted at all.
 - **Transcript larger than 2 MB** — it has almost certainly been compacted at
   least once, so the import keeps only the items from the last compaction
   boundary onward. This is what the agent itself would reconstruct on resume, and
@@ -49,3 +45,17 @@ The threshold is on the on-disk transcript byte size, not on the serialized item
 count, so it reflects roughly the same signal the harness uses to decide when to
 compact. A transcript that grew past 2 MB without ever compacting imports whole —
 trimming only ever drops records the agent has already summarized away.
+
+## Importing Codex rollouts
+
+`load_codex_session` imports the whole transcript, whatever its byte size. The
+import API still caps a session at 100,000 normalized items (`_MAX_IMPORT_ITEMS`
+in `omnigent/server/routes/imports.py`), and a Codex thread above that cap is
+rejected rather than trimmed. Every `response_item` stays a visible message, and
+each `compacted` record becomes a `compaction` item whose `compacted_messages`
+carry that record's `replacement_history` — the same item a live codex-native
+session persists when Codex compacts in the terminal. The imported session
+therefore shows the history the user could still read in Codex, while a cold
+resume rebuilds the rollout from the last compaction item and so starts with the
+same context Codex itself would hold. A `compacted` record with no usable
+`replacement_history` is skipped.

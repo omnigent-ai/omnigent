@@ -37,6 +37,9 @@ class LocalSessionImport:
     # title) when the transcript carried one; None to fall back to the first
     # user message.
     native_title: str | None = None
+    # Whether the harness had archived the session (Codex ``threads.archived`` or
+    # an ``archived_sessions/`` rollout); the import lands archived in Omnigent too.
+    archived: bool = False
 
     @property
     def title(self) -> str | None:

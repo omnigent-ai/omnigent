@@ -6678,6 +6678,7 @@ def import_session_command(
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
             "title": imported.native_title,
+            "archived": imported.archived,
             "force": force,
             "items": [
                 {

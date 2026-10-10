@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -383,7 +384,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
 ) -> None:
     """An oversized session is sliced into ordered chunk frames that reassemble."""
     monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
-    session = _session_with_payload("x" * 500)
+    session = dataclasses.replace(_session_with_payload("x" * 500), archived=True)
 
     frames = [
         decode_host_frame(text)
@@ -403,6 +404,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
     reassembled = [assembler.add(f) for f in frames]
     assert reassembled[:-1] == [None] * (len(frames) - 1)
     assert reassembled[-1] == session
+    assert reassembled[-1].archived is True
 
 
 def _session_json(session: HostImportedLocalSession) -> str:
@@ -2423,3 +2425,55 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+def test_import_local_session_archived_flag_round_trips_and_defaults() -> None:
+    """``archived`` survives the tunnel, defaults to False from older hosts, and must be a bool."""
+    archived = decode_host_frame(
+        encode_host_frame(
+            HostImportLocalSessionFrame(
+                request_id="req_imp",
+                total=1,
+                session=HostImportedLocalSession(
+                    external_session_id="s1",
+                    workspace=None,
+                    items=[],
+                    source="codex",
+                    archived=True,
+                ),
+            )
+        )
+    )
+    assert isinstance(archived, HostImportLocalSessionFrame)
+    assert archived.session.archived is True
+
+    legacy_session = {
+        "external_session_id": "s1",
+        "workspace": None,
+        "items": [],
+        "source": "codex",
+    }
+    legacy = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.import_local_session",
+                "request_id": "req_imp",
+                "total": 1,
+                "session": legacy_session,
+            }
+        )
+    )
+    assert isinstance(legacy, HostImportLocalSessionFrame)
+    assert legacy.session.archived is False
+
+    with pytest.raises(ValueError, match="archived"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.import_local_session",
+                    "request_id": "req_imp",
+                    "total": 1,
+                    "session": {**legacy_session, "archived": "yes"},
+                }
+            )
+        )
