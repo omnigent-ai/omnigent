@@ -147,7 +147,8 @@ async def test_agent_detail_returns_current_summary(client) -> None:
         installed = (await _install(client, ALICE, "orion", description)).json()
         detail = await client.get(f"/v1/agents/{installed['id']}", headers=ALICE)
         assert detail.status_code == 200, detail.text
-        assert detail.json() == installed == (await _mine(client, ALICE))["data"][0]
+        assert installed == (await _mine(client, ALICE))["data"][0]
+        assert detail.json() == {**installed, "user_owned": True}
         assert detail.json()["description"] == description
 
     removed = await client.delete(f"/v1/agents/{installed['id']}", headers=ALICE)
@@ -174,9 +175,10 @@ async def test_server_agent_detail_is_shared(client, agent_store, seeded: bool) 
     for headers in (ALICE, BOB):
         response = await client.get(f"/v1/agents/{agent_id}", headers=headers)
         assert response.status_code == 200, response.text
-        assert (
-            response.json() == (await client.get("/v1/agents", headers=headers)).json()["data"][0]
-        )
+        assert response.json() == {
+            **(await client.get("/v1/agents", headers=headers)).json()["data"][0],
+            "user_owned": False,
+        }
         assert response.json()["builtin"] is seeded
         assert response.json()["description"] == "Stored description"
         assert response.json()["harness"] is None
@@ -191,7 +193,7 @@ async def test_agent_detail_on_authless_server(agent_store, artifact_store, tmp_
         installed = (await _install(c, {}, "orion")).json()
         response = await c.get(f"/v1/agents/{installed['id']}")
         assert response.status_code == 200, response.text
-        assert response.json() == installed
+        assert response.json() == {**installed, "user_owned": True}
 
 
 async def test_agent_detail_redacts_mcp_headers(client, monkeypatch) -> None:
