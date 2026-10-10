@@ -2353,13 +2353,25 @@ html[data-electron-mac] .breadcrumb-folder {
 .turn-fold-content-instant[data-state="open"] {
   animation: none;
 }
+/* Hold the collapsed height until the mounted trace receives `hidden`. */
 .turn-fold-content[data-state="closed"] {
-  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  animation: turn-fold-collapse 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 @media (prefers-reduced-motion: reduce) {
   .turn-fold-content[data-state="open"],
   .turn-fold-content[data-state="closed"] {
     animation: none;
+  }
+  /* The global gate turns the hidden-geometry swap into a one-frame
+     transition, which would show the expanded trace scaled down for a frame. */
+  .turn-fold-content {
+    transition: none !important;
+  }
+  /* No collapse animation, so hide the mounted trace at once; the fold's
+     settled-closed inline geometry takes over from here. */
+  .turn-fold-content[data-state="closed"] {
+    height: 0;
+    visibility: hidden;
   }
 }
 /* The summary row grows in over the same beat as the trace shrinks.
