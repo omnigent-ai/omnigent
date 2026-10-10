@@ -756,7 +756,7 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-branch-input")).toBeInTheDocument();
     });
 
-    it("on a different host (e.g. non-owner), expands Advanced and needs a directory", () => {
+    it("on a different host (e.g. non-owner), defaults to the caller's host, warns, and needs a directory", () => {
       // Source ran on a host the caller doesn't have (their useHosts only
       // returns host_1) — the cross-host / non-owner case.
       renderDialog({
@@ -764,7 +764,12 @@ describe("ForkSessionDialog", () => {
         sourceWorkspace: "/owners/repo",
         sourceHostId: "host_other",
       });
-      // Defaults to the caller's own online host, not the source's.
+      // Defaults to the caller's own online host, not the source's: that host
+      // isn't theirs to reconnect, so no offline hint — but the cross-host
+      // warning still explains the limitation.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
+      expect(screen.getByTestId("fork-session-cross-host-warning")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
       // A different machine → no "reuses the working directory" hint, and the
       // source path isn't prefilled (it's on someone else's box).
       expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
@@ -1035,6 +1040,10 @@ describe("ForkSessionDialog", () => {
       // No Enter, no browser — the submit enables purely from the ~-resolve.
       expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
       await waitFor(() => expect(screen.getByTestId("fork-session-submit")).toBeEnabled());
+      // Same host, different directory: the soft file-references note applies,
+      // not the cross-host warning.
+      expect(screen.getByTestId("fork-session-mismatch-warning")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-cross-host-warning")).toBeNull();
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
@@ -1144,6 +1153,60 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
     });
 
+    it("leaves the host unpicked with a reconnect hint when the source host is offline, then warns on an explicit pick", () => {
+      // Offline source host: no silent cross-host default — hint + disabled submit.
+      setHosts([
+        host({ host_id: "host_1", name: "arca", status: "offline" }),
+        host({ host_id: "host_2", name: "other-laptop", status: "online" }),
+      ]);
+      renderDialog(CODING);
+
+      const hint = screen.getByTestId("fork-session-source-host-offline-hint");
+      expect(hint).toHaveTextContent("arca");
+      expect(hint).toHaveTextContent(/isn't supported/);
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Select a host");
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+
+      // Explicitly picking a different machine is still allowed (the user
+      // may want the history there regardless), but the dialog must say the
+      // clone may fail to start — not just the soft file-references note.
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
+
+      const warning = screen.getByTestId("fork-session-cross-host-warning");
+      expect(warning).toHaveTextContent(/isn't supported/);
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
+      // Warned, not blocked: submit now waits only for a directory on that host.
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/elsewhere" },
+      });
+      expect(screen.getByTestId("fork-session-submit")).toBeEnabled();
+      expect(screen.queryByTestId("fork-session-mismatch-warning")).toBeNull();
+    });
+
+    it("drops the cross-host warning once a sandbox is picked instead", () => {
+      // A sandbox is a supported clone target, so the host-to-host warning from
+      // the pick that preceded it must not linger.
+      setHosts([
+        host({ host_id: "host_1", name: "arca", status: "offline" }),
+        host({ host_id: "host_2", name: "other-laptop", status: "online" }),
+      ]);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
+      expect(screen.getByTestId("fork-session-cross-host-warning")).toBeInTheDocument();
+
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
+      expect(screen.queryByTestId("fork-session-cross-host-warning")).toBeNull();
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
+    });
+
     it("clears the worktree branch when the host changes (no stale source branch)", () => {
       // Two online hosts; source ran on host_1 with branch "main" (prefills
       // the base ref). Switching to host_2 must reset the worktree fields so a
@@ -1247,9 +1310,11 @@ describe("ForkSessionDialog", () => {
       });
 
       // The sandbox chrome (repository fields) is active without a manual pick,
-      // and there is no host-directory reuse hint to reproduce.
+      // and there is no host-directory reuse hint to reproduce. The sandbox is a
+      // usable target, so the offline-source reconnect hint doesn't compete with it.
       expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
       expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
     });
 
     it("keeps a connected host as the default — a sandbox is never implicit while one is online", () => {

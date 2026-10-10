@@ -804,6 +804,13 @@ function SupportedForkSessionForm({
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
+  // The caller's own record of the source host while it is offline; null when
+  // it is online or isn't among the caller's hosts at all (e.g. forking a
+  // shared session that ran on someone else's machine — nothing to reconnect).
+  const offlineSourceHost = useMemo(() => {
+    const src = (hosts ?? []).find((h) => h.host_id === sourceHostId) ?? null;
+    return src !== null && src.status === "offline" ? src : null;
+  }, [hosts, sourceHostId]);
   const serverUrl = getCliServerUrl();
 
   // Gates the sandbox rows in the host picker: only servers whose sandbox
@@ -955,20 +962,15 @@ function SupportedForkSessionForm({
   const sameFamilyAsSource = !switching || (sourceFamily !== null && sourceFamily === targetFamily);
   const sameAgentAsSource = !switching;
 
-  // Default the host = source host (when online) else the first online
-  // host, once hosts have loaded. Only fills an empty slot so an explicit
-  // pick is never overridden. A clone defaults to reproducing the source,
-  // so a sandbox is not the default while any host is online — it costs a
-  // fresh provision, and the user asks for it explicitly. But with no host
-  // online a sandbox-only deployment has nothing to reproduce the source
-  // on, so default to the sandbox rather than strand the picker empty and
-  // unsubmittable.
+  // Default host: source host when online, else first online host; only fills
+  // an empty slot. The caller's own offline source host picks nothing (the hint
+  // asks for a reconnect); a sandbox is the fallback only with no host online.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
     if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
     } else if (onlineHosts.length > 0) {
-      setSelectedHostId(onlineHosts[0].host_id);
+      if (offlineSourceHost === null) setSelectedHostId(onlineHosts[0].host_id);
     } else if (managedSandboxesEnabled && sandboxProviderRows.length > 0) {
       setSandboxSelected(true);
       setSandboxProvider(sandboxProviderRows[0]);
@@ -979,6 +981,7 @@ function SupportedForkSessionForm({
     selectedHostId,
     sourceHostId,
     sourceHostOnline,
+    offlineSourceHost,
     onlineHosts,
     managedSandboxesEnabled,
     sandboxProviderRows,
@@ -1128,27 +1131,29 @@ function SupportedForkSessionForm({
     }
   }, [onDifferentHost]);
 
-  // Mismatched-directory warning: the transcript's file references were
-  // grounded in the source's directory ON the source's host. A different
-  // directory — or a different host, where even an identical path is a
-  // different machine — won't resolve them, so the agent must re-orient.
   const hostMismatch =
     sourceHostId != null && selectedHostId !== null && selectedHostId !== sourceHostId;
+  // Cross-host clone warning: a clone on a different machine than the source
+  // isn't supported today and may never start, so flag it the moment a
+  // different host is picked, before any directory is typed.
+  const showCrossHostWarning = isCodingSource && !sandboxSelected && hostMismatch;
+  // Mismatched-directory warning: the transcript's file references were
+  // grounded in the source's directory, so a different directory on the same
+  // host needs the agent to re-orient. Cross-host picks get the warning above.
   const showMismatchWarning =
     isCodingSource &&
     !sandboxSelected &&
-    ((hostMismatch && workspaceTrimmed !== "") ||
-      (sourceWorkspaceNorm !== null &&
-        workspaceTrimmed !== "" &&
-        workspaceTrimmed !== sourceWorkspaceNorm &&
-        // The source's original repo (which worktree sources prefill) is
-        // the same lineage as its worktree — not a mismatch.
-        (sourceRepo === null || workspaceTrimmed !== sourceRepo)));
+    !hostMismatch &&
+    sourceWorkspaceNorm !== null &&
+    workspaceTrimmed !== "" &&
+    workspaceTrimmed !== sourceWorkspaceNorm &&
+    // The source's original repo (which worktree sources prefill) is
+    // the same lineage as its worktree — not a mismatch.
+    (sourceRepo === null || workspaceTrimmed !== sourceRepo);
 
-  // Default state: a coding clone on the source host still pointed at the
-  // source's directory. Drives the "reuses the original's working directory"
-  // indicator, which explains the default without forcing Advanced open. On a
-  // different host this is false (the mismatch warning takes over instead).
+  // Coding clone on the source host still pointed at the source's directory;
+  // drives the "reuses the original's working directory" indicator. On a
+  // different host this is false (the cross-host warning takes over instead).
   const usingSourceDir = onSourceHost && workspaceTrimmed !== "" && !showMismatchWarning;
 
   function commitWorkspacePath(path: string): void {
@@ -1407,6 +1412,35 @@ function SupportedForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
+                {/* Nothing auto-picked because the caller's own source host is
+                    offline: say why instead of silently re-homing the clone. */}
+                {offlineSourceHost !== null && selectedHostId === null && !sandboxSelected && (
+                  <p
+                    className="flex items-start gap-1.5 text-sm text-warning"
+                    data-testid="fork-session-source-host-offline-hint"
+                  >
+                    <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                    <span>
+                      The original session ran on{" "}
+                      <span className="font-mono">{offlineSourceHost.name}</span>, which is offline.
+                      Reconnect it to start the clone there — cloning onto a different host isn't
+                      supported yet, so the clone may fail to start.
+                    </span>
+                  </p>
+                )}
+                {showCrossHostWarning && (
+                  <p
+                    className="flex items-start gap-1.5 text-sm text-warning"
+                    data-testid="fork-session-cross-host-warning"
+                  >
+                    <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                    <span>
+                      This isn't the host the original session ran on. Cloning onto a different host
+                      isn't supported yet — the clone may fail to start, and earlier file references
+                      in the transcript won't apply.
+                    </span>
+                  </p>
+                )}
                 {/* A sandbox is a usable target, so no dead-end even with no
                     host online: offer connecting one as a collapsed, optional
                     step rather than an alarming "no hosts connected" banner. */}
