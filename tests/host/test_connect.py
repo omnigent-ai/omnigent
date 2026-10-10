@@ -144,6 +144,12 @@ def _no_real_model_catalog_prewarm(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_restart_approval_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Host-loop fixtures must not read an actual server's session state."""
+    monkeypatch.setattr(HostProcess, "_recover_restart_approvals", AsyncMock())
+
+
+@pytest.fixture(autouse=True)
 def _no_real_host_maintenance(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host-loop tests from sweeping machine-global developer state."""
 
