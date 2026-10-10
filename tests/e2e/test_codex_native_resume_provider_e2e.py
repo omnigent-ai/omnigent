@@ -185,6 +185,18 @@ def test_connected_codex_resume_routes_to_configured_provider(
             return None
 
         def round_trip(prompt: str, expected_provider: str, terminal: dict | None = None) -> None:
+            def captured_requests():
+                captured = {
+                    name: [
+                        request
+                        for request in get_mock_requests(url)
+                        if request.get("prompt_cache_key") == original.thread_id
+                        and prompt in json.dumps(request.get("input"))
+                    ]
+                    for name, url in providers.items()
+                }
+                return captured if any(captured.values()) else None
+
             replies = {name: f"{name}-reply-{uuid.uuid4().hex}" for name in providers}
             for name, url in providers.items():
                 # Background title requests can share the prompt without exhausting its reply.
@@ -209,18 +221,12 @@ def test_connected_codex_resume_routes_to_configured_provider(
                 # Let Codex's paste detection settle before submitting the message.
                 time.sleep(0.3)
                 subprocess.run([*tmux, "Enter"], check=True, timeout=10)
-
-            def captured_requests():
-                captured = {
-                    name: [
-                        request
-                        for request in get_mock_requests(url)
-                        if request.get("prompt_cache_key") == original.thread_id
-                        and prompt in json.dumps(request.get("input"))
-                    ]
-                    for name, url in providers.items()
-                }
-                return captured if any(captured.values()) else None
+                # A slow TUI can drop Enter while absorbing a paste; retry until it submits.
+                for _ in range(10):
+                    time.sleep(1)
+                    if captured_requests():
+                        break
+                    subprocess.run([*tmux, "Enter"], check=True, timeout=10)
 
             requests = _wait(captured_requests, "Codex inference request")
             (tmp_path / f"{prompt}-requests.json").write_text(json.dumps(requests, indent=2))
