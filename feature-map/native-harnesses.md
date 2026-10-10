@@ -227,6 +227,15 @@ Cross-harness journeys:
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
+- **`resume`, Claude and Pi provider selection after a runner restart:**
+  `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
+  (own environment, real server, runner, native CLI and tmux with local model
+  endpoints) changes the configured default and restarts the runner. Web/API
+  and terminal turns must reach the expected endpoint with the same session
+  identity and history. Unchanged defaults, Claude agent provider pins, and
+  Pi per-harness provider bindings are control cases. Claude requires an
+  environment without machine-wide managed settings; its test config and
+  onboarding state are isolated.
 - **`resume`, Codex persisted effort after a runner restart:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_resume_clamps_persisted_effort`
   (own environment, real Codex with mock model replies).
