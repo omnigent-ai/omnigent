@@ -1757,6 +1757,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Kimi Code",
         "Import from OpenClaw",
         "Custom ACP agent",
+        "ZCode",
         "Quit",
     ]
     assert _overview_row_names(options, selectable) == expected
@@ -2153,10 +2154,7 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
-        # row used to hold. The ACP path is deprecated (not offered), so 11-12
-        # are the remaining builtin ACP CLI rows (Grok Build, Jcode; sorted by
-        # id); every row after them sits one lower.
+        # 10 is Devin's native row. 11-12 are the builtin ACP CLI rows.
         ("10", "_manage_devin_harness"),
         ("11", "_show_acp_cli_harness"),
         ("12", "_show_acp_cli_harness"),
@@ -2164,6 +2162,7 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("14", "_manage_kiro_harness"),
         ("15", "_manage_kimi_harness"),
         ("17", "_add_acp_agent"),
+        ("18", "_manage_zcode_harness"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(

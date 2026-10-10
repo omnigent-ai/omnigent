@@ -8005,6 +8005,7 @@ def _build_spawn_env_from_spec(
             _build_openai_agents_sdk_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
+            _build_zcode_spawn_env,
         )
 
         if harness == "claude-sdk":
@@ -8028,6 +8029,8 @@ def _build_spawn_env_from_spec(
             env = _build_kimi_spawn_env(effective_spec, cwd=cwd)
         elif harness == "hermes":
             env = _build_hermes_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness == "zcode":
+            env = _build_zcode_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "qwen":
             env = _build_qwen_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "goose":
