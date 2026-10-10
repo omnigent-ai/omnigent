@@ -2620,6 +2620,111 @@ def test_context_length_exceeded_re_raises() -> None:
     _run(_t())
 
 
+async def test_connection_error_keeps_connection_error_classification() -> None:
+    """A refused model connection surfaces as ``connection_error``, not a generic error."""
+    import openai
+
+    from omnigent.runtime.harnesses._executor_adapter import classify_inner_exception
+
+    conn_error = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://127.0.0.1:9/v1/responses")
+    )
+    executor = OpenAIAgentsSDKExecutor(client=object())
+    _FakeRunner.last_calls = []
+    _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=conn_error)
+    raised: openai.APIConnectionError | None = None
+    events: list[Any] = []
+    with patch(
+        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+        return_value=_fake_agents_sdk(),
+    ):
+        # Catch only the SDK's own exception so an unrelated setup failure fails
+        # loudly; accept either shape the adapter classifies (re-raise or coded event).
+        try:
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s_conn_error"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+        except openai.APIConnectionError as exc:
+            raised = exc
+
+    if raised is not None:
+        code = classify_inner_exception(raised)
+    else:
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert len(errors) == 1, f"expected one ExecutorError, got events: {events!r}"
+        code = errors[0].code
+    assert code == "connection_error", (
+        f"connection failure lost its classification: raised={raised!r} events={events!r}"
+    )
+
+
+def test_connection_error_caused_by_auth_failure_keeps_actionable_message() -> None:
+    """A connection error caused by a Databricks auth failure still reports the sign-in step."""
+    import openai
+
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    auth_message = (
+        "Databricks authentication failed for profile 'dev'. Run: databricks auth login -p dev"
+    )
+    conn_error = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://127.0.0.1:9/v1/responses")
+    )
+    conn_error.__cause__ = DatabricksAuthError(auth_message)
+
+    async def _t() -> None:
+        executor = OpenAIAgentsSDKExecutor(client=object())
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=conn_error)
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s_wrapped_auth"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert [e.message for e in errors] == [auth_message], f"events: {events!r}"
+
+    _run(_t())
+
+
+def test_unclassifiable_error_still_yields_executor_error() -> None:
+    """An exception no classifier recognizes keeps the stringified fallback."""
+
+    async def _t() -> None:
+        executor = OpenAIAgentsSDKExecutor(client=object())
+
+        _FakeRunner.last_calls = []
+        _FakeRunner.next_result = _FakeResult(
+            events=[], final_output="", exception=ValueError("boom")
+        )
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = await _collect(
+                executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s_generic_error"}],
+                    [],
+                    "Be helpful.",
+                )
+            )
+        errors = [e for e in events if isinstance(e, ExecutorError)]
+        assert len(errors) == 1, f"expected one ExecutorError, got events: {events!r}"
+        assert errors[0].message == "OpenAI Agents SDK error: boom"
+
+    _run(_t())
+
+
 # ── LLM_REQUEST policy evaluation wiring ─────────────────────────────────────
 
 
