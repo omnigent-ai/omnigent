@@ -3074,6 +3074,31 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
+async def test_relaunch_waits_for_the_new_generation_to_connect(db_uri: str) -> None:
+    """The dead generation's ``online`` row must not satisfy the relaunch's wait."""
+    host_store = HostStore(db_uri)
+    online_at_start: list[bool] = []
+
+    def _register(invocation: HostStartInvocation) -> None:
+        online_at_start.append(host_store.is_online(invocation.host_id))
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    gen1 = host_store.get_host(first.host_id)
+    assert gen1 is not None and host_store.is_online(first.host_id)
+
+    await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
+
+    assert online_at_start == [False, False]
+    assert host_store.is_online(first.host_id)
+
+
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
     """
     A FAILED relaunch must not delete the durable host row — deleting
