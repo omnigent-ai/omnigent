@@ -538,6 +538,121 @@ describe("useHostModelOptions", () => {
     },
   );
 
+  it("retries a tooltip-initiated catalog when a picker joins", async () => {
+    let finishRequest!: (response: Response) => void;
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishRequest = resolve;
+        }),
+      )
+      .mockResolvedValue(mockResponse({ models: [{ id: "opus" }] }));
+    const client = new QueryClient();
+    const sharedWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const tooltip = renderHook(
+      () => useHostModelOptions("host_1", "claude-native", true, { once: true }),
+      { wrapper: sharedWrapper },
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const picker = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+      wrapper: sharedWrapper,
+    });
+    finishRequest(mockResponse({ detail: "catalog warming up" }, 502));
+
+    await waitFor(() => expect(picker.result.current.isSuccess).toBe(true), { timeout: 3_000 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(tooltip.result.current.data).toEqual([{ id: "opus" }]);
+  });
+
+  it("does not re-request a failed tooltip catalog across repeated opens until GC", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ detail: "CLI unavailable" }, 502));
+    const client = new QueryClient();
+    const sharedWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const openTooltip = () =>
+        renderHook(() => useHostModelOptions("host_1", "claude-native", true, { once: true }), {
+          wrapper: sharedWrapper,
+        });
+      const first = openTooltip();
+      await waitFor(() => expect(first.result.current.isError).toBe(true));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      first.unmount();
+
+      const second = openTooltip();
+      await waitFor(() => expect(second.result.current.isError).toBe(true));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      second.unmount();
+      const third = openTooltip();
+      await waitFor(() => expect(third.result.current.isError).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      third.unmount();
+      await vi.advanceTimersByTimeAsync(300_001);
+      const afterGC = openTooltip();
+      await waitFor(() => expect(afterGC.result.current.isError).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      afterGC.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers a failed tooltip catalog when a picker mounts", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: "CLI unavailable" }, 502));
+    fetchMock.mockResolvedValue(mockResponse({ models: [{ id: "opus" }] }));
+    const client = new QueryClient();
+    const sharedWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const tooltip = renderHook(
+      () => useHostModelOptions("host_1", "claude-native", true, { once: true }),
+      { wrapper: sharedWrapper },
+    );
+    await waitFor(() => expect(tooltip.result.current.isError).toBe(true));
+    const picker = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+      wrapper: sharedWrapper,
+    });
+    await waitFor(() => expect(picker.result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(tooltip.result.current.data).toEqual([{ id: "opus" }]);
+  });
+
+  it("does not extend a shared picker catalog's cache lifetime", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ models: [{ id: "opus" }] }));
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: 1_000 } } });
+    const sharedWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const picker = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+        wrapper: sharedWrapper,
+      });
+      await waitFor(() => expect(picker.result.current.isSuccess).toBe(true));
+      const tooltip = renderHook(
+        () => useHostModelOptions("host_1", "claude-native", true, { once: true }),
+        { wrapper: sharedWrapper },
+      );
+      expect(tooltip.result.current.data).toEqual([{ id: "opus" }]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      picker.unmount();
+      tooltip.unmount();
+
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect(
+        client.getQueryData(["host-model-options", "host_1", "claude-native"]),
+      ).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["host", "harness", "client"])(
     "does not borrow retries from an active observer of another %s",
     async (scope) => {

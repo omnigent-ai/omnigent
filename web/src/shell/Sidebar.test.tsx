@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+vi.mock("@/components/icons/ClaudeIcon", () => ({
+  ClaudeIcon: () => <svg data-testid="claude-glyph" />,
+}));
+vi.mock("@/components/icons/CodexIcon", () => ({
+  CodexIcon: () => <svg data-testid="codex-glyph" />,
+}));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -15,8 +21,17 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { AUTO_HARNESS_ID, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { buildComposerSessionDescriptor, composerModelChipLabel } from "@/lib/composerModelLabel";
+import {
+  type ConversationsInfiniteData,
+  mergeItemsIntoPages,
+  nullsToUndefined,
+} from "@/lib/sessionListCache";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import type * as HostsModule from "@/hooks/useHosts";
 import {
   markConversationSeen,
   resetReadStateForTests,
@@ -74,12 +89,9 @@ const {
   useHostsMock: vi.fn(),
 }));
 
-vi.mock("@/hooks/useHosts", () => ({
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostsModule>()),
   useHosts: useHostsMock,
-  // The project-settings dialog (mounted by Sidebar rows) resolves model
-  // options through this hook; no test here opens it, so an empty catalog is
-  // enough to keep the module contract satisfied.
-  useHostModelOptions: () => ({ data: [] }),
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -158,7 +170,15 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import * as identity from "@/lib/identity";
+
+const agentsRef = vi.hoisted(() => ({
+  current: [] as AvailableAgent[],
+}));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: () => ({ data: agentsRef.current }),
+}));
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -268,6 +288,7 @@ function closeProjectsMenu() {
 }
 
 beforeEach(() => {
+  agentsRef.current = [];
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -294,7 +315,10 @@ beforeEach(() => {
 function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 const TEST_EXTENSION: ExtensionCatalogItem = {
   object: "extension",
@@ -1367,7 +1391,7 @@ describe("Sidebar session list", () => {
     await waitFor(() => {
       const tooltip = screen.getByTestId("session-tooltip-content");
       expect(tooltip).toHaveTextContent(title);
-      // The tooltip mirrors the pinned-project flyout's compact HoverCard look
+      // The tooltip mirrors the pinned-project flyout's compact Tooltip look
       // (bg-popover surface), not the old wide card.
       expect(tooltip.className).toContain("bg-popover");
       expect(tooltip.className).not.toContain("bg-card-solid");
@@ -1418,6 +1442,1204 @@ describe("Sidebar session list", () => {
     fireEvent.pointerMove(row, { pointerType: "mouse" });
     await waitFor(() => {
       expect(screen.getAllByTestId("session-tooltip-branch")[0]).toHaveTextContent(branch);
+    });
+  });
+
+  describe("session tooltip details", () => {
+    // Every non-spinner state draws one filled, token-coloured dot that falls
+    // back to the system text colour in forced-colors mode.
+    const HARD_CODED_COLOR =
+      /#[0-9a-f]{3,8}|rgba?\(|oklch\(|hsla?\(|-(?:gray|zinc|slate|neutral|stone|red|pink|rose|blue|green|white|black)(?:-\d|\b)/i;
+    function expectStatusDot(status: HTMLElement, token: string) {
+      expect(status.querySelector("svg")).toBeNull();
+      const dot = status.querySelector("span[aria-hidden] > span.rounded-full");
+      expect(dot).toHaveClass("size-2", token, "forced-colors:bg-[CanvasText]");
+      expect(dot?.className).not.toMatch(/\bborder\b/);
+      expect(dot?.className).not.toMatch(HARD_CODED_COLOR);
+    }
+
+    async function hoverTooltip(session: Conversation) {
+      mockConversations([session]);
+      renderSidebar();
+      fireEvent.pointerMove(screen.getByRole("link", { name: new RegExp(session.id) }), {
+        pointerType: "mouse",
+      });
+      return screen.findByTestId("session-tooltip-content");
+    }
+
+    it("widens the card while keeping the viewport clamp", async () => {
+      const tooltip = await hoverTooltip(conv("conv_width", "aria"));
+      expect(tooltip).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
+    });
+
+    it.each([false, true])(
+      "loads native composer metadata only on open, once across rows (failed=%s)",
+      async (failed) => {
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+        });
+        let resolveCatalog!: (response: Response) => void;
+        const catalog = new Promise<Response>((resolve) => {
+          resolveCatalog = resolve;
+        });
+        const fetchSpy = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation((url) =>
+            String(url).includes("/model-options")
+              ? catalog
+              : Promise.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 })),
+          );
+        const row = (id: string) =>
+          conv(id, "claude-native-ui", {
+            host_id: "host_model",
+            llm_model: "opus[1m]",
+            reasoning_effort: "medium",
+            labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          });
+        mockConversations([row("native_one"), row("native_two")]);
+        renderSidebar();
+        const calls = () =>
+          fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options"));
+        expect(calls()).toHaveLength(0);
+        fireEvent.focus(screen.getByRole("link", { name: "native_one" }));
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(/^Claude Code Medium$/);
+        expect(agentLine.querySelector("img")).toHaveAttribute("src", claudeCodeLogo);
+        await waitFor(() => expect(calls()).toHaveLength(1));
+        await act(async () =>
+          resolveCatalog(
+            new Response(
+              JSON.stringify(
+                failed
+                  ? { detail: "offline" }
+                  : {
+                      models: [{ id: "opus[1m]", displayName: "Opus 5.5 (1M context)" }],
+                    },
+              ),
+              { status: failed ? 503 : 200 },
+            ),
+          ),
+        );
+        await waitFor(() =>
+          expect(agentLine).toHaveTextContent(
+            failed ? /^Claude Code Medium$/ : /^Opus 5.5 1M Medium$/,
+          ),
+        );
+        fireEvent.blur(screen.getByRole("link", { name: "native_one" }));
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+        if (failed) {
+          fetchSpy.mockImplementation(
+            async () =>
+              new Response(
+                JSON.stringify({
+                  models: [{ id: "opus[1m]", displayName: "Opus 5.5 (1M context)" }],
+                }),
+              ),
+          );
+        }
+        vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+        fireEvent.focus(screen.getByRole("link", { name: "native_two" }));
+        const second = await screen.findByTestId("session-tooltip-content");
+        await waitFor(() =>
+          expect(within(second).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+            failed ? /^Claude Code Medium$/ : /^Opus 5.5 1M Medium$/,
+          ),
+        );
+        expect(calls()).toHaveLength(1);
+        fetchSpy.mockRestore();
+        vi.mocked(Date.now).mockRestore();
+      },
+    );
+
+    it.each<{
+      field: keyof Conversation;
+      initial: Partial<Conversation>;
+      update: Partial<Conversation>;
+      testId: string;
+      before: string;
+      after: string;
+    }>([
+      {
+        field: "agent_id",
+        initial: { agent_id: "ag_old" },
+        update: { agent_id: "ag_new" },
+        testId: "session-tooltip-agent",
+        before: "Old agent · Claude SDK",
+        after: "New agent · Claude SDK",
+      },
+      {
+        field: "agent_name",
+        initial: { agent_name: "old-agent" },
+        update: { agent_name: "new-agent" },
+        testId: "session-tooltip-agent",
+        before: "old-agent",
+        after: "new-agent",
+      },
+      {
+        field: "workspace",
+        initial: { workspace: "/old/workspace" },
+        update: { workspace: "/new/workspace" },
+        testId: "session-tooltip-cwd",
+        before: "/old/workspace",
+        after: "/new/workspace",
+      },
+      {
+        field: "llm_model",
+        initial: { agent_name: "claude-native-ui", llm_model: "opus[1m]" },
+        update: { llm_model: "sonnet" },
+        testId: "session-tooltip-agent",
+        before: "Opus 5.5 1M Medium",
+        after: "Sonnet Medium",
+      },
+      {
+        field: "harness_override",
+        initial: { agent_name: "claude-native-ui" },
+        update: { harness_override: "cursor-native" },
+        testId: "session-tooltip-agent",
+        before: "Claude Code Medium",
+        after: "Cursor",
+      },
+      {
+        field: "reasoning_effort",
+        initial: { agent_name: "claude-native-ui", reasoning_effort: "medium" },
+        update: { reasoning_effort: "high" },
+        testId: "session-tooltip-agent",
+        before: "Claude Code Medium",
+        after: "Claude Code High",
+      },
+      {
+        field: "host_online",
+        initial: { agent_name: "claude-native-ui", llm_model: "opus[1m]", host_online: true },
+        update: { host_online: false },
+        testId: "session-tooltip-agent",
+        before: "Opus 5.5 1M Medium",
+        after: "Claude Code Medium",
+      },
+    ])("refreshes an open tooltip after a metadata-only $field update", async (testCase) => {
+      agentsRef.current = [
+        {
+          id: "ag_old",
+          name: "old-known",
+          display_name: "Old agent",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+        {
+          id: "ag_new",
+          name: "new-known",
+          display_name: "New agent",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      vi.spyOn(identity, "authenticatedFetch").mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              models: [
+                { id: "opus[1m]", displayName: "Opus 5.5 (1M context)" },
+                { id: "sonnet", displayName: "Sonnet" },
+              ],
+            }),
+          ),
+      );
+      const session = conv("metadata_row", "unknown-agent", {
+        host_id: "host_model",
+        reasoning_effort: "medium",
+        labels:
+          testCase.initial.agent_name === "claude-native-ui"
+            ? { "omnigent.wrapper": "claude-code-native-ui" }
+            : {},
+        updated_at: 100,
+        ...testCase.initial,
+      });
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: "metadata_row" }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      await waitFor(() =>
+        expect(within(tooltip).getAllByTestId(testCase.testId)[0]).toHaveTextContent(
+          testCase.before,
+        ),
+      );
+
+      mockConversations([{ ...session, ...testCase.update }]);
+      rerender(tree());
+
+      await waitFor(() =>
+        expect(within(tooltip).getAllByTestId(testCase.testId)[0]).toHaveTextContent(
+          testCase.after,
+        ),
+      );
+    });
+
+    it.each([false, true])(
+      "uses the native fallback without probing an offline host or old server (offline=%s)",
+      async (offline) => {
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: offline ? "offline" : "online" }],
+        });
+        const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+        const tooltip = await hoverTooltip(
+          conv("native_fallback", "claude-native-ui", {
+            host_id: "host_model",
+            llm_model: offline ? "opus" : undefined,
+            reasoning_effort: "medium",
+            labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          }),
+        );
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          /^Claude Code Medium$/,
+        );
+        expect(
+          fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+        ).toHaveLength(0);
+        fetchSpy.mockRestore();
+      },
+    );
+
+    it("resolves per-session harness overrides for two rows of the same agent", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_aria",
+          name: "aria",
+          display_name: "Aria",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      mockConversations([
+        conv("sdk_default", "aria", { agent_id: "ag_aria" }),
+        conv("sdk_override", "aria", { agent_id: "ag_aria", harness_override: "codex" }),
+      ]);
+      renderSidebar();
+      async function checkRow(title: string, expected: string) {
+        const row = screen.getByRole("link", { name: title });
+        fireEvent.focus(row);
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          expected,
+        );
+        fireEvent.blur(row);
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+      }
+      await checkRow("sdk_default", "Aria · Claude SDK");
+      await checkRow("sdk_override", "Aria · Codex");
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+    });
+
+    it("resolves same-named custom agents only by their bound id", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_deploy_old",
+          name: "deploy-bot",
+          display_name: "Deploy Bot",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+        {
+          id: "ag_deploy_new",
+          name: "deploy-bot",
+          display_name: "Deploy Bot",
+          harness: "codex",
+          description: null,
+          skills: [],
+        },
+      ];
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      mockConversations([
+        conv("deploy_old", "deploy-bot", { agent_id: "ag_deploy_old" }),
+        conv("deploy_new", "deploy-bot", { agent_id: "ag_deploy_new" }),
+        conv("deploy_missing", "deploy-bot", {
+          agent_id: "ag_deploy_missing",
+          llm_model: "opus[1m]",
+          reasoning_effort: "high",
+        }),
+      ]);
+      renderSidebar();
+      async function checkRow(title: string, expected: string) {
+        const row = screen.getByRole("link", { name: title });
+        fireEvent.focus(row);
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expected}$`));
+        if (title === "deploy_missing") {
+          expect(agentLine.querySelector(".lucide-bot")).not.toBeNull();
+          expect(agentLine.querySelector("img")).toBeNull();
+        }
+        fireEvent.blur(row);
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+      }
+      await checkRow("deploy_old", "Deploy Bot · Claude SDK");
+      await checkRow("deploy_new", "Deploy Bot · Codex");
+      await checkRow("deploy_missing", "deploy-bot");
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+    });
+
+    it.each([
+      ["codex-native", "Codex High", true],
+      ["codex", "Bundle · Codex", false],
+      [null, "bundle", false],
+      [undefined, "Bundle · Claude SDK", false],
+    ] as const)(
+      "uses the server child harness %s without inheriting the bundle",
+      async (harness, expected, catalog) => {
+        agentsRef.current = [
+          {
+            id: "ag_bundle",
+            name: "bundle",
+            display_name: "Bundle",
+            harness: "claude-sdk",
+            description: null,
+            skills: [],
+          },
+        ];
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_child", name: "Laptop", status: "online" }],
+        });
+        const fetchSpy = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation(async () => new Response(JSON.stringify({ models: [] })));
+        const tooltip = await hoverTooltip(
+          conv("child_row", "bundle", {
+            agent_id: "ag_bundle",
+            parent_session_id: "parent",
+            host_id: "host_child",
+            llm_model: "model",
+            reasoning_effort: "high",
+            ...(harness === undefined ? {} : { child_harness: harness }),
+          }),
+        );
+        const line = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(line).toHaveTextContent(new RegExp(`^${expected}$`));
+        const descriptor = buildComposerSessionDescriptor(harness ?? "claude-sdk", {}, "parent");
+        expect(composerModelChipLabel({ session: descriptor, effort: "high" }).effortLabel).toBe(
+          harness === "codex-native" ? "High" : null,
+        );
+        if (harness === null) {
+          expect(line.querySelector(".lucide-bot")).not.toBeNull();
+          expect(line.querySelector("img")).toBeNull();
+        }
+        if (harness === "codex-native")
+          expect(line.querySelector("[data-harness-icon='codex']")).not.toBeNull();
+        await waitFor(() =>
+          expect(
+            fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+          ).toHaveLength(catalog ? 1 : 0),
+        );
+        if (catalog)
+          expect(
+            String(fetchSpy.mock.calls.find(([url]) => String(url).includes("/model-options"))![0]),
+          ).toContain("/harnesses/codex-native/model-options");
+      },
+    );
+
+    it("updates routing parity on a mode-only change without querying the catalog", async () => {
+      const info = {
+        ...FALLBACK_SERVER_INFO,
+        smart_routing_enabled: true,
+        smart_routing_sources: { external: true, oss: false },
+      };
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_routing", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi
+        .spyOn(identity, "authenticatedFetch")
+        .mockImplementation(
+          async () =>
+            new Response(JSON.stringify({ models: [{ id: "opus", displayName: "Opus" }] })),
+        );
+      const session = conv("routing_row", "claude-native-ui", {
+        host_id: "host_routing",
+        llm_model: "opus",
+        reasoning_effort: "high",
+        cost_control_mode_override: "on",
+        updated_at: 100,
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      });
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <CapabilitiesProvider info={info}>
+              <TooltipProvider>
+                <MemoryRouter>
+                  <Sidebar open onClose={vi.fn()} />
+                </MemoryRouter>
+              </TooltipProvider>
+            </CapabilitiesProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: "routing_row" }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+        /^Smart Routing$/,
+      );
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+      mockConversations([{ ...session, cost_control_mode_override: "off" }]);
+      rerender(tree());
+      await waitFor(() =>
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          /^Opus High$/,
+        ),
+      );
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(1);
+    });
+
+    it.each(["codex", undefined] as const)(
+      "refreshes an open child tooltip after a %s harness-only metadata update",
+      async (initialHarness) => {
+        agentsRef.current = [
+          {
+            id: "ag_bundle",
+            name: "bundle",
+            display_name: "Bundle",
+            harness: "claude-sdk",
+            description: null,
+            skills: [],
+          },
+        ];
+        const session = conv("child_metadata", "bundle", {
+          agent_id: "ag_bundle",
+          parent_session_id: "parent",
+          ...(initialHarness === undefined ? {} : { child_harness: initialHarness }),
+          updated_at: 100,
+        });
+        mockConversations([session]);
+        const client = new QueryClient();
+        const tree = () => (
+          <QueryClientProvider client={client}>
+            <SidebarDataProvider>
+              <TooltipProvider>
+                <MemoryRouter>
+                  <Sidebar open onClose={vi.fn()} />
+                </MemoryRouter>
+              </TooltipProvider>
+            </SidebarDataProvider>
+          </QueryClientProvider>
+        );
+        const { rerender } = render(tree());
+        fireEvent.focus(screen.getByRole("link", { name: "child_metadata" }));
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+          initialHarness === undefined ? /^Bundle · Claude SDK$/ : /^Bundle · Codex$/,
+        );
+        mockConversations([{ ...session, child_harness: undefined }]);
+        rerender(tree());
+        await waitFor(() =>
+          expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+            /^bundle$/,
+          ),
+        );
+      },
+    );
+
+    it.each([false, true])(
+      "renders an unresolved child after the real cache merge (project folder=%s)",
+      async (inProject) => {
+        agentsRef.current = [
+          {
+            id: "ag_bundle",
+            name: "bundle",
+            display_name: "Bundle",
+            harness: "claude-sdk",
+            description: null,
+            skills: [],
+          },
+        ];
+        const session = conv("child_legacy", "bundle", {
+          agent_id: "ag_bundle",
+          parent_session_id: "parent",
+          updated_at: 100,
+          labels: inProject ? { omni_project: "Alpha" } : {},
+        });
+        const client = new QueryClient();
+        const queryKey = inProject ? ["project-sessions", "Alpha"] : ["conversations", "", false];
+        client.setQueryData<ConversationsInfiniteData>(queryKey, {
+          pages: [{ data: [session], first_id: session.id, last_id: session.id, has_more: false }],
+          pageParams: [undefined],
+        });
+        function syncRows() {
+          const rows = client.getQueryData<ConversationsInfiniteData>(queryKey)!.pages[0].data;
+          mockConversations(inProject ? [] : rows);
+          if (inProject) projectSessionsMock.current.Alpha = rows;
+        }
+        if (inProject) projectsMock.push("Alpha");
+        syncRows();
+        const tree = () => (
+          <QueryClientProvider client={client}>
+            <SidebarDataProvider>
+              <TooltipProvider>
+                <MemoryRouter>
+                  <Sidebar open onClose={vi.fn()} />
+                </MemoryRouter>
+              </TooltipProvider>
+            </SidebarDataProvider>
+          </QueryClientProvider>
+        );
+        const { rerender } = render(tree());
+        if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+        fireEvent.focus(screen.getByRole("link", { name: "child_legacy" }));
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const line = () => within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(line()).toHaveTextContent(/^Bundle · Claude SDK$/);
+        const items = new Map([
+          [session.id, nullsToUndefined({ id: session.id, child_harness: null })],
+        ]);
+        client.setQueryData<ConversationsInfiniteData>(
+          queryKey,
+          (cached) =>
+            mergeItemsIntoPages(
+              cached,
+              items,
+              { searchQuery: "", includeArchived: false },
+              undefined,
+            ).data,
+        );
+        syncRows();
+        rerender(tree());
+        await waitFor(() => expect(line()).toHaveTextContent(/^bundle$/));
+        expect(line().querySelector(".lucide-bot")).not.toBeNull();
+        expect(line().querySelector("img")).toBeNull();
+        expect(
+          client.getQueryData<ConversationsInfiniteData>(queryKey)!.pages[0].data[0].updated_at,
+        ).toBe(session.updated_at);
+      },
+    );
+
+    it("keeps the native wrapper icon, model and effort for an auto harness override", async () => {
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch").mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              models: [{ id: "opus[1m]", displayName: "Opus 5.5 (1M context)" }],
+            }),
+          ),
+      );
+      const tooltip = await hoverTooltip(
+        conv("native_auto", "claude-native-ui", {
+          host_id: "host_model",
+          harness_override: AUTO_HARNESS_ID,
+          llm_model: "opus[1m]",
+          reasoning_effort: "medium",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        }),
+      );
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      await waitFor(() => expect(agentLine).toHaveTextContent(/^Opus 5.5 1M Medium$/));
+      expect(agentLine.querySelector("[data-harness-icon='claude']")).not.toBeNull();
+      const catalogCalls = fetchSpy.mock.calls.filter(([url]) =>
+        String(url).includes("/model-options"),
+      );
+      expect(catalogCalls).toHaveLength(1);
+      expect(String(catalogCalls[0][0])).toContain("/harnesses/claude-native/model-options");
+    });
+
+    it("shows unresolved Smart Routing for a non-native auto harness", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_polly",
+          name: "polly",
+          display_name: "Polly",
+          harness: "pi",
+          description: null,
+          skills: [],
+        },
+      ];
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      const tooltip = await hoverTooltip(
+        conv("polly_auto", "polly", {
+          agent_id: "ag_polly",
+          host_id: "host_model",
+          harness_override: AUTO_HARNESS_ID,
+          llm_model: "model",
+          reasoning_effort: "medium",
+        }),
+      );
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      expect(agentLine).toHaveTextContent(new RegExp(`^Polly · ${SMART_ROUTING_LABEL}$`));
+      expect(agentLine.querySelector("[data-harness-icon]")).toBeNull();
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+    });
+
+    it("updates an open non-native routing tooltip when auto resolves to a concrete harness", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_polly",
+          name: "polly",
+          display_name: "Polly",
+          harness: "pi",
+          description: null,
+          skills: [],
+        },
+      ];
+      const session = conv("polly_routed", "polly", {
+        agent_id: "ag_polly",
+        harness_override: AUTO_HARNESS_ID,
+        reasoning_effort: "medium",
+        updated_at: 100,
+      });
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: session.id }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      expect(agentLine).toHaveTextContent(new RegExp(`^Polly · ${SMART_ROUTING_LABEL}$`));
+
+      mockConversations([{ ...session, harness_override: "codex" }]);
+      rerender(tree());
+
+      await waitFor(() => expect(agentLine).toHaveTextContent(/^Polly · Codex$/));
+    });
+
+    it.each([
+      ["an agent-declared native harness", "custom-native", "Custom Native", true],
+      ["only a canonical native agent name", "claude-native-ui", "claude-native-ui", false],
+    ] as const)(
+      "keeps auto unresolved with %s but no wrapper label",
+      async (_evidence, name, displayName, declaredHarness) => {
+        agentsRef.current = declaredHarness
+          ? [
+              {
+                id: "ag_native",
+                name,
+                display_name: displayName,
+                harness: "claude-native",
+                description: null,
+                skills: [],
+              },
+            ]
+          : [];
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+        });
+        const fetchSpy = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation(async () => new Response(JSON.stringify({ models: [] })));
+        const tooltip = await hoverTooltip(
+          conv("native_without_wrapper", name, {
+            agent_id: "ag_native",
+            host_id: "host_model",
+            harness_override: AUTO_HARNESS_ID,
+            llm_model: "opus[1m]",
+            reasoning_effort: "medium",
+          }),
+        );
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(
+          new RegExp(`^${displayName} · ${SMART_ROUTING_LABEL}$`),
+        );
+        expect(agentLine.querySelector(".lucide-bot")).not.toBeNull();
+        expect(
+          fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+        ).toHaveLength(0);
+      },
+    );
+
+    it("refreshes an open tooltip after a parent-only metadata update", async () => {
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const modelOptions = [
+        {
+          id: "codex-model",
+          displayName: "Codex model",
+          supportedReasoningEfforts: [],
+        },
+      ];
+      const fetchSpy = vi
+        .spyOn(identity, "authenticatedFetch")
+        .mockImplementation(async () => new Response(JSON.stringify({ models: modelOptions })));
+      const session = conv("parent_metadata", "codex-native-ui", {
+        host_id: "host_model",
+        llm_model: "codex-model",
+        reasoning_effort: "medium",
+        parent_session_id: null,
+        labels: {},
+        updated_at: 100,
+      });
+      const childSession = { ...session, parent_session_id: "parent_session" };
+      function expectedAgentLine(row: Conversation) {
+        const { label, effortLabel } = composerModelChipLabel({
+          session: buildComposerSessionDescriptor(
+            "codex-native",
+            row.labels,
+            row.parent_session_id,
+          ),
+          model: row.llm_model,
+          modelOptions,
+          modelSummary: "Codex model",
+          effort: row.reasoning_effort,
+        });
+        return [label, effortLabel].filter(Boolean).join(" ");
+      }
+      expect(expectedAgentLine(session)).toBe("Codex model");
+      expect(expectedAgentLine(childSession)).toBe("Codex model Medium");
+      mockConversations([session]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const onClose = vi.fn();
+      const tree = () => (
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={onClose} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const view = render(tree());
+      fireEvent.focus(screen.getByRole("link", { name: session.id }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      await waitFor(() =>
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expectedAgentLine(session)}$`)),
+      );
+      mockConversations([childSession]);
+      view.rerender(tree());
+      expect(childSession.updated_at).toBe(session.updated_at);
+      await waitFor(() =>
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expectedAgentLine(childSession)}$`)),
+      );
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(1);
+      client.clear();
+    });
+
+    it("uses reachable brain-harness overrides for labels, icons and catalog keys", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_aria",
+          name: "aria",
+          display_name: "Aria",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+      });
+      const fetchSpy = vi
+        .spyOn(identity, "authenticatedFetch")
+        .mockImplementation(async () => new Response(JSON.stringify({ models: [] })));
+      const row = (id: string, harness: string) =>
+        conv(id, "aria", {
+          agent_id: "ag_aria",
+          host_id: "host_model",
+          llm_model: "model",
+          reasoning_effort: "medium",
+          harness_override: harness,
+          labels: {},
+        });
+      mockConversations([row("brain_claude", "claude-sdk"), row("brain_codex", "codex")]);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={client}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>,
+      );
+      async function checkRow(title: string, expected: string, harness: string, glyph: string) {
+        const link = screen.getByRole("link", { name: title });
+        fireEvent.focus(link);
+        const tooltip = await screen.findByTestId("session-tooltip-content");
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(new RegExp(`^${expected}$`));
+        expect(within(agentLine).getByTestId(glyph)).toBeInTheDocument();
+        const queryKey = ["host-model-options", "host_model", harness];
+        expect(client.getQueryCache().find({ queryKey, exact: true })?.queryKey).toEqual(queryKey);
+        fireEvent.blur(link);
+        await waitFor(() => expect(screen.queryByTestId("session-tooltip-content")).toBeNull());
+      }
+      await checkRow("brain_claude", "Aria · Claude SDK", "claude-sdk", "claude-glyph");
+      await checkRow("brain_codex", "Aria · Codex", "codex", "codex-glyph");
+      expect(
+        client.getQueryCache().findAll({ queryKey: ["host-model-options", "host_model"] }),
+      ).toHaveLength(2);
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+      client.clear();
+    });
+
+    it.each([false, true])(
+      "uses the Codex model effort ladder after opening (hasEffort=%s)",
+      async (hasEffort) => {
+        useHostsMock.mockReturnValue({
+          data: [{ host_id: "host_model", name: "Laptop", status: "online" }],
+        });
+        let resolveCatalog!: (response: Response) => void;
+        const catalog = new Promise<Response>((resolve) => {
+          resolveCatalog = resolve;
+        });
+        vi.spyOn(identity, "authenticatedFetch").mockImplementation((url) =>
+          String(url).includes("/model-options")
+            ? catalog
+            : Promise.resolve(new Response(JSON.stringify({ data: [] }))),
+        );
+        const tooltip = await hoverTooltip(
+          conv("codex_effort", "codex-native-ui", {
+            host_id: "host_model",
+            llm_model: "model",
+            reasoning_effort: "medium",
+            labels: { "omnigent.wrapper": "codex-native-ui" },
+          }),
+        );
+        const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+        expect(agentLine).toHaveTextContent(/^Codex$/);
+        await act(async () =>
+          resolveCatalog(
+            new Response(
+              JSON.stringify({
+                models: [
+                  {
+                    id: "model",
+                    displayName: "Codex model",
+                    supportedReasoningEfforts: hasEffort ? [{ reasoningEffort: "medium" }] : [],
+                  },
+                ],
+              }),
+            ),
+          ),
+        );
+        await waitFor(() =>
+          expect(agentLine).toHaveTextContent(hasEffort ? /^Codex model Medium$/ : /^Codex model$/),
+        );
+      },
+    );
+
+    it("shows a known non-native agent and harness without a model catalog", async () => {
+      agentsRef.current = [
+        {
+          id: "ag_aria",
+          name: "aria",
+          display_name: "Aria",
+          harness: "claude-sdk",
+          description: null,
+          skills: [],
+        },
+      ];
+      const fetchSpy = vi.spyOn(identity, "authenticatedFetch");
+      const tooltip = await hoverTooltip(
+        conv("conv_known", "aria", { agent_id: "ag_aria", reasoning_effort: "high" }),
+      );
+      const agentLine = within(tooltip).getAllByTestId("session-tooltip-agent")[0];
+      expect(agentLine).toHaveTextContent(/^Aria · Claude SDK$/);
+      expect(
+        fetchSpy.mock.calls.filter(([url]) => String(url).includes("/model-options")),
+      ).toHaveLength(0);
+      fetchSpy.mockRestore();
+    });
+
+    it("shows the unknown agent name without effort or model", async () => {
+      const tooltip = await hoverTooltip(
+        conv("conv_agent", "aria", {
+          llm_model: "opus[1m]",
+          reasoning_effort: "high",
+        }),
+      );
+      expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+        /^aria$/,
+      );
+      expect(
+        within(tooltip).getAllByTestId("session-tooltip-agent")[0].querySelector(".lucide-bot"),
+      ).not.toBeNull();
+    });
+
+    it("omits the agent line when the agent is unknown", async () => {
+      const tooltip = await hoverTooltip(
+        conv("conv_no_agent", "", { agent_name: null, workspace: "/srv/repo" }),
+      );
+      expect(within(tooltip).getByTestId("session-tooltip-cwd")).toBeInTheDocument();
+      expect(within(tooltip).queryByTestId("session-tooltip-agent")).toBeNull();
+    });
+
+    it("shows a short working directory in full", async () => {
+      const tooltip = await hoverTooltip(conv("conv_cwd", "aria", { workspace: "/srv/repo" }));
+      const cwd = within(tooltip).getAllByTestId("session-tooltip-cwd")[0];
+      expect(cwd.querySelector("[aria-hidden='true'].truncate")).toHaveTextContent(/^\/srv\/repo$/);
+    });
+
+    it("trims a long working directory from the left, keeping the last folder", async () => {
+      // jsdom has no layout: model an 8px-per-character line in a 120px box.
+      const scrollWidth = vi
+        .spyOn(HTMLElement.prototype, "scrollWidth", "get")
+        .mockImplementation(function (this: HTMLElement) {
+          return (this.textContent?.length ?? 0) * 8;
+        });
+      const clientWidth = vi
+        .spyOn(HTMLElement.prototype, "clientWidth", "get")
+        .mockReturnValue(120);
+      try {
+        const workspace = "/Users/me/omnigent-worktrees/fix-sse";
+        const tooltip = await hoverTooltip(conv("conv_long_cwd", "aria", { workspace }));
+        const cwd = within(tooltip).getAllByTestId("session-tooltip-cwd")[0];
+        await waitFor(() => {
+          expect(cwd.querySelector("[aria-hidden='true'].truncate")).toHaveTextContent(
+            /^…\/fix-sse$/,
+          );
+        });
+        // Assistive tech still gets the untrimmed path.
+        expect(cwd.querySelector(".sr-only")).toHaveTextContent(workspace);
+      } finally {
+        scrollWidth.mockRestore();
+        clientWidth.mockRestore();
+      }
+    });
+
+    it("omits the working-directory line when the workspace is unknown", async () => {
+      const tooltip = await hoverTooltip(conv("conv_no_cwd", "aria", { workspace: null }));
+      expect(within(tooltip).getByTestId("session-tooltip-agent")).toBeInTheDocument();
+      expect(within(tooltip).queryByTestId("session-tooltip-cwd")).toBeNull();
+    });
+
+    it.each([
+      {
+        name: "Working",
+        partial: { status: "running" as const },
+        state: "running",
+        key: "working",
+      },
+      { name: "Idle", partial: { status: "idle" as const }, state: "idle", key: "idle" },
+      { name: "Error", partial: { status: "failed" as const }, state: "error", key: "error" },
+      {
+        name: "Needs response",
+        partial: { status: "idle" as const, pending_elicitations_count: 1 },
+        state: "awaiting",
+        key: "needs-response",
+      },
+    ])("shows the $name status as the last line", async ({ name, partial, state, key }) => {
+      const tooltip = await hoverTooltip(conv(`conv_status_${state}`, "aria", partial));
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(new RegExp(`^${name}$`));
+      expect(status).toHaveAttribute("data-state", key);
+      if (state === "error") {
+        expect(status).toHaveClass("text-destructive");
+        expect(status.nextElementSibling).toBe(
+          within(tooltip).getAllByTestId("session-tooltip-error")[0],
+        );
+      } else {
+        expect(status.nextElementSibling?.getAttribute("data-testid")).not.toBe(
+          "session-tooltip-error",
+        );
+      }
+    });
+
+    it("labels an unread session New messages, matching the row's unread dot", async () => {
+      const session = conv("conv_status_unseen", "aria", { status: "idle", updated_at: 200 });
+      seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+      const tooltip = await hoverTooltip(session);
+      const row = screen.getByRole("link", { name: /conv_status_unseen/ }).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "unseen",
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(/^New messages$/);
+      expect(status).toHaveAttribute("data-state", "new-messages");
+    });
+
+    it("shows Host disconnected when the latest item is a runner disconnect", async () => {
+      const fetchPage = vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
+        items: [
+          {
+            id: "disconnect1",
+            response_id: "response1",
+            type: "error",
+            status: "completed",
+            source: "execution",
+            code: "runner_disconnected",
+            message: "Runner disconnected unexpectedly.",
+          },
+        ],
+        hasMore: false,
+      });
+      try {
+        const tooltip = await hoverTooltip(
+          conv("conv_status_disconnected", "aria", { status: "idle" }),
+        );
+        await waitFor(() => {
+          const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+          expect(status).toHaveTextContent(/^Host disconnected$/);
+          expect(status).toHaveAttribute("data-state", "disconnected");
+          expectStatusDot(status, "bg-muted-foreground");
+        });
+        expect(within(tooltip).queryByTestId("session-tooltip-error")).toBeNull();
+      } finally {
+        fetchPage.mockRestore();
+      }
+    });
+
+    it("shows Starting up while the bound session is waking", async () => {
+      useChatStore.setState({ conversationId: "conv_status_starting", status: "streaming" });
+      const tooltip = await hoverTooltip(
+        conv("conv_status_starting", "aria", { status: "failed" }),
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(/^Starting up$/);
+      expect(within(tooltip).queryByTestId("session-tooltip-error")).toBeNull();
+    });
+
+    it("renders the persisted error message on its own line below Error", async () => {
+      const message = "Codex exited — 403 budget limit reached for this workspace";
+      const tooltip = await hoverTooltip(
+        conv("conv_error_message", "aria", {
+          status: "failed",
+          labels: { "omnigent.last_task_error_message": message },
+        }),
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      const error = within(tooltip).getAllByTestId("session-tooltip-error")[0];
+      expect(status).toHaveTextContent(/^Error$/);
+      expect(status.nextElementSibling).toBe(error);
+      expect(error).toHaveTextContent(message);
+      expect(error).toHaveClass("text-destructive", "line-clamp-3");
+    });
+
+    it("falls back to the generic error text without a persisted message", async () => {
+      const tooltip = await hoverTooltip(conv("conv_error_fallback", "aria", { status: "failed" }));
+      expect(within(tooltip).getAllByTestId("session-tooltip-error")[0]).toHaveTextContent(
+        /^Latest message is an error$/,
+      );
+    });
+
+    it.each([
+      { state: "idle", partial: {}, token: "bg-popover-foreground/70" },
+      {
+        state: "needs-response",
+        partial: { pending_elicitations_count: 1 },
+        token: "bg-brand-accent",
+      },
+      { state: "error", partial: { status: "failed" as const }, token: "bg-destructive" },
+    ])("draws $state as a theme-token dot", async ({ state, partial, token }) => {
+      const tooltip = await hoverTooltip(conv(`conv_dot_${state}`, "aria", partial));
+      const status = within(tooltip).getByTestId("session-tooltip-status");
+      expect(status).toHaveAttribute("data-state", state);
+      expectStatusDot(status, token);
+    });
+
+    it("draws New messages as a brand-accent dot like the row's unread dot", async () => {
+      const session = conv("conv_dot_unseen", "aria", { status: "idle", updated_at: 200 });
+      seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+      const tooltip = await hoverTooltip(session);
+      expectStatusDot(within(tooltip).getByTestId("session-tooltip-status"), "bg-brand-accent");
+    });
+
+    it("keeps the spinner for Working", async () => {
+      const tooltip = await hoverTooltip(conv("conv_dot_working", "aria", { status: "running" }));
+      const status = within(tooltip).getByTestId("session-tooltip-status");
+      expect(within(status).getByTestId("running-dot")).toHaveClass("animate-spin");
+    });
+
+    it("shows the same details on a pinned, project-owned session", async () => {
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned_details"]);
+      mockConversations([
+        conv("conv_pinned_details", "aria", {
+          status: "running",
+          workspace: "/srv/repo",
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderSidebar();
+      fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_details/ }));
+      const flyout = await screen.findByTestId("session-tooltip-content");
+      expect(flyout).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
+      expect(within(flyout).getByText("Customer X")).toBeInTheDocument();
+      expect(within(flyout).getByTestId("session-tooltip-agent")).toHaveTextContent(/^aria$/);
+      expect(within(flyout).getByTestId("session-tooltip-cwd")).toHaveTextContent("/srv/repo");
+      expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Working$/);
+    });
+
+    it("hides the project line on an unpinned row inside a project folder", async () => {
+      projectsMock.push("Customer X");
+      mockConversations([
+        conv("project_unpinned", "aria", { labels: { omni_project: "Customer X" } }),
+      ]);
+      renderSidebar();
+      fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+      fireEvent.focus(screen.getByRole("link", { name: "project_unpinned" }));
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      expect(within(tooltip).queryByTestId("session-tooltip-project")).toBeNull();
+      expect(tooltip).toHaveTextContent("project_unpinned");
+    });
+
+    it("hides unknown lines on a pinned session instead of filling them in", async () => {
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned_sparse"]);
+      mockConversations([
+        conv("conv_pinned_sparse", "", {
+          agent_name: null,
+          workspace: null,
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderSidebar();
+      fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_sparse/ }));
+      const flyout = await screen.findByTestId("session-tooltip-content");
+      expect(within(flyout).queryByTestId("session-tooltip-agent")).toBeNull();
+      expect(within(flyout).queryByTestId("session-tooltip-cwd")).toBeNull();
+      expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Idle$/);
     });
   });
 
@@ -1652,15 +2874,18 @@ describe("Sidebar failed session indicator", () => {
       );
       if (pinned) fireEvent.focus(row);
       else fireEvent.pointerMove(row, { pointerType: "mouse" });
-      return screen.findByTestId(pinned ? "pinned-project-flyout" : "session-tooltip-content");
+      return screen.findByTestId("session-tooltip-content");
     }
 
     it("explains the error through the row's existing hover surface", async () => {
       const content = await openExplanation("error");
-      expect(content).toHaveTextContent("Latest message is an error");
-      const hint = content.querySelector("p.text-destructive");
-      expect(hint).toHaveTextContent("Latest message is an error");
-      expect(hint?.querySelector("svg.lucide-circle-alert")).toHaveAttribute("aria-hidden", "true");
+      // Both surfaces label the state "Error" and explain it on the line below.
+      const status = within(content).getByTestId("session-tooltip-status");
+      expect(status).toHaveTextContent(/^Error$/);
+      expect(status).toHaveClass("text-destructive");
+      expect(status.querySelector("span.rounded-full")).toHaveClass("bg-destructive");
+      expect(status.nextElementSibling).toBe(within(content).getByTestId("session-tooltip-error"));
+      expect(status.nextElementSibling).toHaveTextContent("Latest message is an error");
     });
 
     it.each(["running", "awaiting", "starting"] as const)(
@@ -1675,6 +2900,7 @@ describe("Sidebar failed session indicator", () => {
 
 describe("Sidebar idle latest-message error", () => {
   beforeEach(() => {
+    agentsRef.current = [];
     vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
       items: [
         {

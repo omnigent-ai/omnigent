@@ -2729,6 +2729,16 @@ class SessionListItem(BaseModel):
         Distinguishes "runner down but host can relaunch" from
         "host offline" for the open-session view; not used by the
         sidebar.
+    :param llm_model: Concrete reported model, else the session's
+        model override.
+    :param harness_override: Session's explicit harness. ``None``
+        means the agent's declared harness.
+    :param child_harness: Present only for sub-agent children without
+        a harness override. ``None`` means the server could not resolve
+        it; clients must not fall back to the parent's harness.
+        Absent when not applicable or on older servers.
+    :param cost_control_mode_override: Session's Smart Routing mode,
+        ``"on"`` or ``"off"``, or ``None`` when unset.
     :param reasoning_effort: Per-session reasoning-effort hint.
     :param permission_level: The requesting user's numeric
         permission level on this session: ``1`` = read, ``2`` =
@@ -2811,6 +2821,10 @@ class SessionListItem(BaseModel):
     host_id: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
+    llm_model: str | None = None
+    harness_override: str | None = None
+    child_harness: str | None = None
+    cost_control_mode_override: str | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
     owner: str | None = None

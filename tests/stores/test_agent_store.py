@@ -389,6 +389,45 @@ def test_get_names_empty_input(agent_store: SqlAlchemyAgentStore) -> None:
     assert agent_store.get_names([]) == {}
 
 
+def test_list_metadata_is_one_workspace_scoped_read_without_owner_lookup(tmp_path: Path) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    store = SqlAlchemyAgentStore(
+        f"sqlite:///{tmp_path}/agents.db", f"sqlite:///{tmp_path}/sessions.db"
+    )
+    server_id, user_id, missing_id = (uuid.uuid4().hex for _ in range(3))
+    with workspace_scope(11):
+        store.create(server_id, "operator", f"{server_id}/bundle")
+        store.create_user_agent(user_id, "tenant", f"{user_id}/bundle", owner="alice")
+    with workspace_scope(22):
+        store.create(server_id, "other workspace", f"{server_id}/other")
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    sa.event.listen(store._engine, "before_cursor_execute", capture)
+    sa.event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        with workspace_scope(11):
+            rows = store.get_list_metadata([server_id, user_id, missing_id])
+        assert len(statements) == 1
+        assert "SELECT" in statements[0] and " IN " in statements[0]
+        assert set(rows) == {server_id, user_id}
+        assert rows[server_id].name == "operator"
+        assert rows[server_id].bundle_location == f"{server_id}/bundle"
+        assert rows[server_id].operator_authored is True
+        assert rows[user_id].name == "tenant"
+        assert rows[user_id].operator_authored is False
+        statements.clear()
+        assert store.get_list_metadata([]) == {}
+        assert statements == []
+    finally:
+        sa.event.remove(store._engine, "before_cursor_execute", capture)
+        sa.event.remove(store._conv_engine, "before_cursor_execute", capture)
+
+
 # ── list edge cases ───────────────────────────────────────────────
 
 

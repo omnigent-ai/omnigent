@@ -4,8 +4,25 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from omnigent.entities import Agent, PagedList
+
+
+@dataclass(frozen=True)
+class AgentListMetadata:
+    """Batch display/load inputs, not an agent ownership authorization record."""
+
+    id: str
+    name: str
+    bundle_location: str
+    kind: str
+    created_by: str | None = None
+
+    @property
+    def operator_authored(self) -> bool:
+        """Tenant agents never expand server env, even when no session owns them."""
+        return self.kind == "server" and self.created_by is None
 
 
 class AgentStore(ABC):
@@ -99,6 +116,10 @@ class AgentStore(ABC):
         :returns: A :class:`PagedList` of :class:`Agent` objects.
         """
         ...
+
+    def get_list_metadata(self, agent_ids: builtins.list[str]) -> dict[str, AgentListMetadata]:
+        """Read names and bundle provenance in one batch, without ownership lookups."""
+        raise NotImplementedError("Agent list metadata is not supported by this store")
 
     @abstractmethod
     def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:

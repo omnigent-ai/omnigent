@@ -1,3 +1,18 @@
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import {
+  buildComposerSessionDescriptor,
+  isCostRoutingEligible,
+  composerModelChipLabel,
+  formatStatusModelLabel,
+} from "@/lib/composerModelLabel";
+import { AUTO_HARNESS_ID, BRAIN_HARNESS_LABELS, SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import {
+  nativeCodingAgentForWrapper,
+  nativeCodingAgentForAvailableAgent,
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
@@ -27,12 +42,12 @@ import {
   ArchiveIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
+  BotIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   ClockIcon,
-  CircleAlertIcon,
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
@@ -123,7 +138,6 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -162,12 +176,13 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
+import { useLeftTrimmedPath } from "@/lib/leftTrimmedPath";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
@@ -178,6 +193,7 @@ import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
+import { RunningDot } from "@/components/RunningDot";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { isSessionStoppable } from "@/lib/sessionStop";
@@ -3764,41 +3780,184 @@ function ConversationMenuItems({
   );
 }
 
-function SessionErrorHint() {
-  return (
-    <p className="mt-1 flex items-center gap-1.5 text-sm text-destructive">
-      <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
-      <span>Latest message is an error</span>
-    </p>
-  );
-}
-
-function SessionTooltipContent({
-  conversation,
-  hostsById,
-  hasError,
-}: {
+interface SessionTooltipProps {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
-  hasError: boolean;
-}) {
-  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
-  const locationLabel = !conversation.host_id
-    ? "Local machine"
-    : host?.sandbox_provider
-      ? sandboxOptionLabel(host.sandbox_provider)
-      : (host?.name ?? conversation.host_id);
+  state: SessionState | null;
+  pinnedProject: { name: string; icon: string | null } | null;
+}
 
+function SessionTooltipContent(props: SessionTooltipProps) {
   return (
     <TooltipContent
       side="right"
       align="start"
       sideOffset={8}
       data-testid="session-tooltip-content"
-      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
-      // then muted, small-icon metadata lines.
-      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
     >
+      <SessionTooltipDetails {...props} />
+    </TooltipContent>
+  );
+}
+
+function SessionTooltipDetails({
+  conversation,
+  hostsById,
+  state,
+  pinnedProject,
+}: SessionTooltipProps) {
+  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
+  const locationLabel = !conversation.host_id
+    ? "Local machine"
+    : host?.sandbox_provider
+      ? sandboxOptionLabel(host.sandbox_provider)
+      : (host?.name ?? conversation.host_id);
+  const { data: agents = [] } = useAvailableAgents();
+  const agent = agents.find((candidate) => candidate.id === conversation.agent_id);
+  const hasChildHarness = "child_harness" in conversation;
+  const unresolvedChild =
+    hasChildHarness && !conversation.child_harness && !conversation.harness_override;
+  const nativePaneAgent = nativeCodingAgentForWrapper(conversation.labels?.["omnigent.wrapper"]);
+  const declaredNativeAgent =
+    nativePaneAgent ??
+    nativeCodingAgentForAvailableAgent(agent) ??
+    nativeCodingAgentForAgentName(conversation.agent_name);
+  const harnessOverride =
+    conversation.harness_override === AUTO_HARNESS_ID && nativePaneAgent
+      ? null
+      : conversation.harness_override;
+  const harness = hasChildHarness
+    ? (harnessOverride ?? conversation.child_harness ?? null)
+    : (harnessOverride ?? declaredNativeAgent?.harness ?? agent?.harness ?? null);
+  const nativeAgent = nativeCodingAgentForHarness(harness);
+  const iconAgent = unresolvedChild
+    ? null
+    : nativeAgent
+      ? { name: nativeAgent.agentName, harness }
+      : agent
+        ? { name: agent.name, harness }
+        : hasChildHarness && harness
+          ? { name: conversation.agent_name ?? "agent", harness }
+          : null;
+  const session = buildComposerSessionDescriptor(
+    harness,
+    conversation.labels,
+    conversation.parent_session_id,
+  );
+  const serverInfo = useContext(ServerInfoContext);
+  const routingOn =
+    !unresolvedChild &&
+    isCostRoutingEligible(
+      serverInfo,
+      { ...session, labels: conversation.labels ?? {}, agentName: conversation.agent_name ?? null },
+      host,
+    ) &&
+    conversation.cost_control_mode_override === "on";
+  const catalogEnabled =
+    !routingOn &&
+    nativeAgent !== undefined &&
+    !!conversation.llm_model &&
+    host?.status === "online" &&
+    conversation.host_online !== false;
+  const { data: models } = useHostModelOptions(
+    conversation.host_id ?? null,
+    nativeAgent?.harness ?? harness ?? "",
+    catalogEnabled,
+    { once: true },
+  );
+  const harnessLabel =
+    harness === AUTO_HARNESS_ID
+      ? SMART_ROUTING_LABEL
+      : harness
+        ? BRAIN_HARNESS_LABELS[harness]
+        : null;
+  const { label: agentLabel, effortLabel } = composerModelChipLabel({
+    modelSummary:
+      catalogEnabled && models?.length
+        ? formatStatusModelLabel(conversation.llm_model ?? null, models)
+        : null,
+    nativeDisplayName: nativeAgent?.displayName,
+    harnessLabel:
+      !unresolvedChild && (agent || (hasChildHarness && harness) || harness === AUTO_HARNESS_ID)
+        ? [agent?.display_name ?? conversation.agent_name, harnessLabel].filter(Boolean).join(" · ")
+        : conversation.agent_name,
+    session: iconAgent ? session : null,
+    model: conversation.llm_model ?? null,
+    modelOptions: catalogEnabled ? models : [],
+    effort: conversation.reasoning_effort,
+    routingOn,
+  });
+  const workspace = conversation.workspace ?? "";
+  const trimmedWorkspace = useLeftTrimmedPath<HTMLSpanElement>(workspace);
+  // Runner-owned failure detail the server persists as a label; transcript-only
+  // errors have none, so they keep the generic explanation.
+  const errorMessage =
+    conversation.labels?.["omnigent.last_task_error_message"] || "Latest message is an error";
+  // One filled dot per state, coloured by theme tokens; forced-colors mode
+  // drops author backgrounds, so the dot falls back to the system text colour.
+  const dot = (className: string) => (
+    <span aria-hidden className="flex size-3.5 shrink-0 items-center justify-center">
+      <span
+        className={cn(
+          "size-2 rounded-full forced-colors:bg-[CanvasText] forced-colors:forced-color-adjust-none",
+          className,
+        )}
+      />
+    </span>
+  );
+  // Labels mirror the row's SessionStateBadge; `key` feeds `data-state`.
+  const status = (() => {
+    switch (state?.kind) {
+      case "running":
+      case "starting":
+        return {
+          key: state.kind === "running" ? "working" : "starting",
+          label: state.kind === "running" ? "Working" : "Starting up",
+          icon: <RunningDot className="size-3.5" />,
+          tone: "",
+        };
+      case "awaiting":
+        return {
+          key: "needs-response",
+          label: "Needs response",
+          icon: dot("bg-brand-accent"),
+          tone: "text-brand-accent",
+        };
+      case "error":
+        return {
+          key: "error",
+          label: "Error",
+          icon: dot("bg-destructive"),
+          tone: "text-destructive",
+        };
+      case "disconnected":
+        return {
+          key: "disconnected",
+          label: "Host disconnected",
+          icon: dot("bg-muted-foreground"),
+          tone: "",
+        };
+      case "unseen":
+        return {
+          key: "new-messages",
+          label: "New messages",
+          icon: dot("bg-brand-accent"),
+          tone: "",
+        };
+      case undefined:
+        return {
+          key: "idle",
+          label: "Idle",
+          // The card paints bg-popover, so Idle dims that surface's own text token.
+          icon: dot("bg-popover-foreground/70"),
+          tone: "",
+        };
+    }
+  })();
+
+  return (
+    <>
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
         <span className="font-normal text-muted-foreground">
@@ -3806,6 +3965,40 @@ function SessionTooltipContent({
           {relativeTime(conversation.updated_at * 1000)}
         </span>
       </p>
+      {pinnedProject && (
+        <p
+          data-testid="session-tooltip-project"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <ProjectRowIcon icon={pinnedProject.icon} />
+          <span className="truncate">{pinnedProject.name}</span>
+        </p>
+      )}
+      {conversation.agent_name && (
+        <p
+          data-testid="session-tooltip-agent"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          {iconAgent ? (
+            <ComposerAgentIcon agent={iconAgent} className="size-3.5" />
+          ) : (
+            <BotIcon aria-hidden className="size-3.5 shrink-0" />
+          )}
+          <span className="truncate">{[agentLabel, effortLabel].filter(Boolean).join(" ")}</span>
+        </p>
+      )}
+      {workspace && (
+        <p
+          data-testid="session-tooltip-cwd"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <FolderIcon aria-hidden className="size-3.5 shrink-0" />
+          <span ref={trimmedWorkspace.ref} aria-hidden className="truncate">
+            {trimmedWorkspace.text}
+          </span>
+          <span className="sr-only">{workspace}</span>
+        </p>
+      )}
       <p
         data-testid="session-tooltip-location"
         className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
@@ -3822,8 +4015,26 @@ function SessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
-      {hasError && <SessionErrorHint />}
-    </TooltipContent>
+      <p
+        data-testid="session-tooltip-status"
+        data-state={status.key}
+        className={cn(
+          "mt-1 flex items-center gap-1.5 text-sm",
+          status.tone || "text-muted-foreground",
+        )}
+      >
+        {status.icon}
+        <span className="truncate">{status.label}</span>
+      </p>
+      {state?.kind === "error" && (
+        <p
+          data-testid="session-tooltip-error"
+          className="mt-0.5 line-clamp-3 pl-5 text-sm break-words text-destructive"
+        >
+          {errorMessage}
+        </p>
+      )}
+    </>
   );
 }
 
@@ -3866,9 +4077,6 @@ function ConversationRowImpl({
   // yet, so per-row mutations are disabled until it's rekeyed to the real id —
   // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
   const isProvisionalRow = conversation.provisional === true;
-  // Mobile has no real hover, so a tap that navigates would also trip the
-  // project flyout's HoverCard and leave it lingering over the chat. Gate the
-  // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
   // When this row becomes the active conversation (e.g. a freshly created
   // session navigated to via `/c/:id`), scroll it toward the center of the
@@ -3954,19 +4162,8 @@ function ConversationRowImpl({
   const firstClassProjectName =
     conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
-  // Pinned sessions are lifted OUT of their project folder into the flat
-  // "Pinned" section, so the row no longer shows which project it belongs to.
-  // For those rows only, surface the project in a hover flyout. Non-pinned
-  // rows already sit inside their project folder, so they don't need it.
-  // Disabled on mobile: there's no hover, so a tap would open the HoverCard
-  // and leave it overlaying the chat after navigation. Forcing null there
-  // routes the row through the plain ContextMenu/link path and restores the
-  // native `title` tooltip.
-  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
-  // First-class projects can carry a chosen emoji; label-only projects have
-  // none, so the flyout falls back to the folder glyph for those.
   const projectIconsById = useContext(ProjectIconsContext);
-  const projectFlyoutIcon =
+  const projectIcon =
     conversation.project_id != null
       ? (projectIconsById.get(conversation.project_id) ?? null)
       : null;
@@ -4227,6 +4424,17 @@ function ConversationRowImpl({
     runArchive,
   };
 
+  const sessionTooltip = (
+    <SessionTooltipContent
+      conversation={conversation}
+      hostsById={hostsById}
+      state={sessionState}
+      pinnedProject={
+        isPinned && currentProject ? { name: currentProject, icon: projectIcon } : null
+      }
+    />
+  );
+
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
@@ -4359,57 +4567,16 @@ function ConversationRowImpl({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
+          merges its handler onto the Link, preserving left-click / double-click. */}
       {selectionMode ? (
-        projectFlyoutName ? (
-          <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            <PinnedProjectFlyoutContent
-              title={conversation.title ?? conversation.id}
-              projectName={projectFlyoutName}
-              projectIcon={projectFlyoutIcon}
-              gitBranch={gitBranch}
-              hasError={sessionState?.kind === "error"}
-            />
-          </HoverCard>
-        ) : isMobile ? (
+        isMobile ? (
           rowLink
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <SessionTooltipContent
-              conversation={conversation}
-              hostsById={hostsById}
-              hasError={sessionState?.kind === "error"}
-            />
+            {sessionTooltip}
           </Tooltip>
         )
-      ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-            projectIcon={projectFlyoutIcon}
-            gitBranch={gitBranch}
-            hasError={sessionState?.kind === "error"}
-          />
-        </HoverCard>
       ) : isMobile ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
@@ -4437,11 +4604,7 @@ function ConversationRowImpl({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <SessionTooltipContent
-            conversation={conversation}
-            hostsById={hostsById}
-            hasError={sessionState?.kind === "error"}
-          />
+          {sessionTooltip}
         </Tooltip>
       )}
       {selectionMode ? (
@@ -4823,19 +4986,27 @@ function ConversationRowImpl({
   );
 }
 
-// The `conversation` fields the row renders. The comparator below compares
-// these (not object identity), so a live-updates merge that only touches an
-// unrendered field (e.g. an updated_at bump) doesn't re-render the row.
-// Keep in sync with the row + its helpers (conversationDisplayLabel,
-// getSessionState, isOwnedByViewer, isSessionStoppable).
+// Compare rendered fields by value. Keep in sync with the row + its helpers:
+// conversationDisplayLabel, getSessionState, isOwnedByViewer,
+// isSessionStoppable, SessionTooltipDetails.
 const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "id",
   "title",
+  "agent_id",
+  "agent_name",
+  "workspace",
+  "llm_model",
+  "harness_override",
+  "child_harness",
+  "cost_control_mode_override",
+  "reasoning_effort",
+  "parent_session_id",
   "archived",
   "status",
   "updated_at",
   "git_branch",
   "host_id",
+  "host_online",
   "runner_id",
   "project_id",
   "owner",
@@ -4845,6 +5016,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
   if (a === b) return true;
+  if ("child_harness" in a !== "child_harness" in b) return false;
   for (const key of RENDERED_CONVERSATION_FIELDS) {
     if (a[key] !== b[key]) return false;
   }
@@ -4868,58 +5040,6 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     conversationRenderEqual(prev.conversation, next.conversation)
   );
 });
-
-/**
- * Hover flyout body for a pinned, project-owned conversation row.
- *
- * Pinning lifts a session out of its project folder into the flat "Pinned"
- * section, dropping the visual project cue the folder provided. Hovering the
- * row surfaces it again: the session title, project name, and optional branch.
- * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
- * and the muted, small-icon foreground used elsewhere in the sidebar.
- */
-function PinnedProjectFlyoutContent({
-  title,
-  projectName,
-  projectIcon,
-  gitBranch,
-  hasError,
-}: {
-  title: string;
-  projectName: string;
-  projectIcon: string | null;
-  gitBranch: string | null;
-  hasError: boolean;
-}) {
-  return (
-    <HoverCardContent
-      side="right"
-      align="start"
-      sideOffset={8}
-      className="w-64"
-      data-testid="pinned-project-flyout"
-    >
-      {/* Titles have no length cap (server + rename input are unbounded), so
-          clamp to 3 wrapped lines to keep the card tidy — full text stays in
-          the DOM. */}
-      <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
-      <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <ProjectRowIcon icon={projectIcon} />
-        <span className="truncate">{projectName}</span>
-      </p>
-      {gitBranch && (
-        <p
-          data-testid="pinned-project-flyout-branch"
-          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
-        >
-          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{gitBranch}</span>
-        </p>
-      )}
-      {hasError && <SessionErrorHint />}
-    </HoverCardContent>
-  );
-}
 
 function ProjectFolderActions({
   projectName,

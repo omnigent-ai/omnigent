@@ -6383,6 +6383,18 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "child_harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only for sub-agent children without a harness override. `None` means the server could not resolve it; clients must not fall back to the parent's harness. Absent when not applicable or on older servers.",
+            "title": "Child Harness"
+          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -6402,6 +6414,18 @@
             ],
             "description": "Unix epoch **microseconds** of the most recently mutated comment on this session (max `updated_at` across its comments). Microsecond precision keeps back-to-back mutations within one second distinguishable while staying an exact integer in JavaScript; clients only compare it for change. `None` when the session has no comments or the server has no comment store wired.",
             "title": "Comments Updated At"
+          },
+          "cost_control_mode_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session's Smart Routing mode, `\"on\"` or `\"off\"`, or `None` when unset.",
+            "title": "Cost Control Mode Override"
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
@@ -6432,6 +6456,18 @@
             ],
             "description": "Git branch checked out in the session's worktree, e.g. `\"feature/login\"`. Set only when the session was created with a server-created git worktree; `None` otherwise. The Web UI uses a non-`None` value to offer the \"delete local branch\" cleanup checkbox on session delete. See designs/SESSION_GIT_WORKTREE.md.",
             "title": "Git Branch"
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session's explicit harness. `None` means the agent's declared harness.",
+            "title": "Harness Override"
           },
           "host_id": {
             "anyOf": [
@@ -6469,6 +6505,18 @@
             "description": "Session-scoped guardrails labels.",
             "title": "Labels",
             "type": "object"
+          },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Concrete reported model, else the session's model override.",
+            "title": "Llm Model"
           },
           "owner": {
             "anyOf": [

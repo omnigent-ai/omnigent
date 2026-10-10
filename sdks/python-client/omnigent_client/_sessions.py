@@ -279,6 +279,8 @@ class SessionListItem:
         sessions.
     :param parent_session_id: Parent session for a sub-agent child; ``None``
         for top-level sessions or when omitted by an older server.
+    :param child_harness_present: Whether the server supplied ``child_harness``;
+        an explicit ``None`` is unresolved, not an older-server fallback.
     """
 
     id: str
@@ -296,6 +298,12 @@ class SessionListItem:
     pending_elicitations_count: int = 0
     archived: bool = False
     parent_session_id: str | None = None
+    llm_model: str | None = None
+    harness_override: str | None = None
+    # Child-only server answer; a failed resolution has no harness.
+    child_harness: str | None = None
+    cost_control_mode_override: str | None = None
+    child_harness_present: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -317,12 +325,17 @@ class SessionListItem:
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
             host_id=raw.get("host_id"),
+            llm_model=raw.get("llm_model"),
+            harness_override=raw.get("harness_override"),
+            child_harness=raw.get("child_harness"),
+            cost_control_mode_override=raw.get("cost_control_mode_override"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
             parent_session_id=raw.get("parent_session_id"),
+            child_harness_present="child_harness" in raw,
         )
 
 

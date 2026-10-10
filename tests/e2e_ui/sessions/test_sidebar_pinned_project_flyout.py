@@ -4,8 +4,8 @@ Pinning lifts a session out of its project folder into the flat "Pinned"
 section (see ``test_sidebar_pin_unpin`` / ``test_sidebar_projects``), which
 drops the visual cue for which project the session came from. To restore it,
 hovering a pinned, project-owned row opens a flyout
-(``data-testid="pinned-project-flyout"``) showing the session title plus a
-folder icon and the project name (``ConversationRow`` / ``HoverCard`` in
+(``data-testid="session-tooltip-content"``) showing the session title plus a
+folder icon and the project name (``ConversationRow`` / ``Tooltip`` in
 Sidebar.tsx).
 
 This drives the real chain the ``Sidebar`` unit tests mock out: the live
@@ -13,7 +13,7 @@ This drives the real chain the ``Sidebar`` unit tests mock out: the live
 refreshed ``GET /v1/sessions`` list → the pinned peel keeping that membership →
 the hover flyout resolving the project name (``project_id`` → name via the
 project list, falling back to the legacy ``omni_project`` label). A browser
-hover (which jsdom can't do) is what actually opens the Radix HoverCard here.
+hover (which jsdom can't do) is what actually opens the Radix Tooltip here.
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def test_pinned_project_row_hover_shows_project_name(
     # Hovering the pinned row opens the project flyout with the folder icon +
     # project name and the session title.
     pinned_row.get_by_role("link").hover()
-    flyout = page.get_by_test_id("pinned-project-flyout")
+    flyout = page.get_by_test_id("session-tooltip-content")
     expect(flyout).to_be_visible()
     expect(flyout).to_contain_text(project)
     expect(flyout).to_contain_text(title)
