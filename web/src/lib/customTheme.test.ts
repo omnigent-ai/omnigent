@@ -8,7 +8,7 @@ import {
   readCustomTheme,
   writeCustomTheme,
 } from "./customTheme";
-import { PALETTES } from "./themePalette";
+import { PALETTE_TOKEN_CSS_NAMES, PALETTES } from "./themePalette";
 import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:custom-theme";
@@ -309,5 +309,70 @@ describe("customTheme", () => {
     expect(inner).toHaveAttribute("data-custom-translucent-sidebar");
     expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe("");
     expect(document.documentElement).not.toHaveAttribute("data-custom-translucent-sidebar");
+  });
+
+  it("pins palette-token var() references to the variant's own custom variables", () => {
+    // Non-omni bases keep `sidebarBackground: var(--sidebar)`; that reference
+    // substitutes at the declaring style root (embedded: the scope root, which
+    // never carries `.dark`), so it must be pinned to the mode's own variable.
+    const scope = document.createElement("div");
+    const inner = document.createElement("div");
+    setEmbedScopeRoot(scope);
+    setEmbedRoot(inner);
+    applyCustomTheme({
+      basePalette: "dracula",
+      accent: "#7c3aed",
+      darkAccent: "#bd93f9",
+      tint: "#f7f5fd",
+      darkTint: "#282a36",
+      contrast: 60,
+      translucentSidebar: false,
+    });
+
+    const style = scope.style;
+    expect(style.getPropertyValue("--custom-dark-sidebar-background")).toBe(
+      "var(--custom-dark-sidebar)",
+    );
+    expect(style.getPropertyValue("--custom-light-sidebar-background")).toBe(
+      "var(--custom-light-sidebar)",
+    );
+    // Values mixing several token references are pinned per reference.
+    expect(style.getPropertyValue("--custom-dark-sidebar-active")).toBe(
+      "color-mix(in srgb, var(--custom-dark-sidebar-foreground) 7%, var(--custom-dark-sidebar))",
+    );
+    expect(style.getPropertyValue("--custom-dark-sidebar-active-foreground")).toBe(
+      "var(--custom-dark-sidebar-foreground)",
+    );
+    // The pinned target resolves to a concrete color on the same root.
+    expect(style.getPropertyValue("--custom-dark-sidebar")).not.toContain("var(");
+    // Concrete values pass through untouched.
+    expect(style.getPropertyValue("--custom-dark-background")).toBe("#282a36");
+  });
+
+  it.each(PALETTES)("leaves no raw palette-token reference in applied $label values", (palette) => {
+    applyCustomTheme(createCustomThemeFromPalette(palette));
+
+    const style = document.documentElement.style;
+    const rawReference = new RegExp(
+      `var\\(\\s*--(${Object.values(PALETTE_TOKEN_CSS_NAMES).join("|")})\\b`,
+    );
+    const applied = Array.from(style).filter((property) => property.startsWith("--custom-"));
+    expect(applied.length).toBeGreaterThan(0);
+    for (const property of applied) {
+      expect(style.getPropertyValue(property)).not.toMatch(rawReference);
+    }
+  });
+
+  it("pins Omnigent's shell-background reference and keeps its concrete gradient", () => {
+    const omni = PALETTES.find((palette) => palette.id === "omni")!;
+    applyCustomTheme({ ...createCustomThemeFromPalette(omni), contrast: 60 });
+
+    const style = document.documentElement.style;
+    expect(style.getPropertyValue("--custom-light-shell-background")).toBe(
+      "var(--custom-light-background)",
+    );
+    expect(style.getPropertyValue("--custom-dark-shell-background")).toBe(
+      omni.tokens.dark.shellBackground,
+    );
   });
 });
