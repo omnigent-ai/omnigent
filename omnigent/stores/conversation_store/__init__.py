@@ -770,6 +770,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        host_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -828,6 +829,9 @@ class ConversationStore(ABC):
             based so session-scoped agents created by multipart
             ``POST /v1/sessions`` remain resumable without sharing
             a template ``agent_id``. ``None`` disables the filter.
+        :param host_id: Filter by persisted host binding. Accepts bare
+            or hyphenated UUIDs, including hosts that are offline or no
+            longer registered. ``None`` disables the filter.
         :param has_agent_id: When ``True``, only return
             conversations whose ``agent_id`` column is not
             ``None`` — i.e. sessions created via

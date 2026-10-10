@@ -1375,15 +1375,16 @@ async def test_list_defaults_to_all_visibility(include_archived: bool) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("visibility", ["all", "mine", "shared", "archived"])
 @pytest.mark.parametrize("cursor", ["after", "before"])
+@pytest.mark.parametrize("with_host_id", [False, True])
 async def test_list_visibility_preserves_pagination_and_filters(
-    visibility: Literal["all", "mine", "shared", "archived"], cursor: str
+    visibility: Literal["all", "mine", "shared", "archived"], cursor: str, with_host_id: bool
 ) -> None:
-    """Visibility travels with the existing filters on either pagination direction."""
+    """Visibility and filters (including host_id) travel on either pagination direction."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         assert request.url.path == "/v1/sessions"
-        assert dict(request.url.params) == {
+        expected_params = {
             "limit": "50",
             "order": "asc",
             "sort_by": "updated_at",
@@ -1392,6 +1393,9 @@ async def test_list_visibility_preserves_pagination_and_filters(
             "agent_id": "ag_abc",
             "agent_name": "my agent",
         }
+        if with_host_id:
+            expected_params["host_id"] = "a1b2c3d4e5f67890abcdef12345678901"
+        assert dict(request.url.params) == expected_params
         return httpx.Response(200, json={"data": []})
 
     ns, client = _make_namespace(handler)
@@ -1403,6 +1407,7 @@ async def test_list_visibility_preserves_pagination_and_filters(
             before="conv_cursor" if cursor == "before" else None,
             agent_id="ag_abc",
             agent_name="my agent",
+            host_id="a1b2c3d4e5f67890abcdef12345678901" if with_host_id else None,
             order="asc",
             sort_by="updated_at",
         )

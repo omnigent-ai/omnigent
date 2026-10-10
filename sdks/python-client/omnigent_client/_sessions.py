@@ -613,6 +613,7 @@ class SessionsNamespace:
         include_archived: bool = False,
         visibility: Literal["all", "mine", "shared", "archived"] = "all",
         kind: Literal["default", "sub_agent", "any"] | None = None,
+        host_id: str | None = None,
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -629,6 +630,9 @@ class SessionsNamespace:
         :param agent_name: Filter to sessions whose bound agent row
             has this name, including distinct session-scoped agents
             that share the name. ``None`` returns all names.
+        :param host_id: Filter by persisted host binding, including
+            offline hosts. Accepts bare or hyphenated UUIDs.
+            ``None`` returns sessions on any host, including unbound sessions.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
@@ -665,6 +669,8 @@ class SessionsNamespace:
             params["agent_id"] = agent_id
         if agent_name is not None:
             params["agent_name"] = agent_name
+        if host_id is not None:
+            params["host_id"] = host_id
         if include_archived:
             params["include_archived"] = "true"
         if kind is not None:

@@ -9,7 +9,8 @@ import json
 import secrets
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
+from uuid import UUID
 
 import httpx
 from fastapi import (
@@ -1406,6 +1407,10 @@ def register_core_routes(
         before: str | None = Query(default=None),
         agent_id: str | None = Query(default=None),
         agent_name: str | None = Query(default=None),
+        host_id: Annotated[
+            UUID | None,
+            Query(description="Filter by persisted host binding, including offline hosts."),
+        ] = None,
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
         search_query: str | None = Query(default=None),
@@ -1537,6 +1542,7 @@ def register_core_routes(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
+            host_id=host_id.hex if host_id is not None else None,
             accessible_by=accessible_by_param,
             owned_by=owned_by_param,
             shared_only=shared_only_param,
