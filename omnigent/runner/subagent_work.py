@@ -554,7 +554,8 @@ async def _recover_subagent_results_from_server(
         interrupted = status == "in_progress" or (
             status == "failed"
             and isinstance(error, dict)
-            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+            and error.get("code")
+            in {"runner_disconnected", "runner_failed_to_start", "session_stream_lost"}
         )
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue

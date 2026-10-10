@@ -1,4 +1,5 @@
 import type { AnyBlock, BlockContext } from "./blocks";
+import { isDisconnectFailureCode } from "./blocks";
 
 export type LatestSessionError = "error" | "disconnected" | "recovered_disconnect";
 
@@ -34,7 +35,7 @@ export function latestActivityErrorWindow(
         if (block.level === "info") {
           return { state: resolvedFailure(), boundaryResolved: true };
         }
-        if (block.code === "runner_disconnected") {
+        if (isDisconnectFailureCode(block.code)) {
           disconnect = hostOnline === true ? "recovered_disconnect" : "disconnected";
           break;
         }

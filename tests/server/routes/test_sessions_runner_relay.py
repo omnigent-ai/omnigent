@@ -1575,6 +1575,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
     ("prior_error_code", "expect_cleared"),
     [
         ("runner_disconnected", True),
+        ("session_stream_lost", True),
         ("agent_error", False),
     ],
 )
@@ -3335,3 +3336,157 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+@pytest.mark.asyncio
+async def test_relay_labels_session_stream_loss_distinctly_from_runner_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost session stream over a still-registered runner is not a runner disconnect.
+
+    When the runner's tunnel stays registered (``wait_for_runner`` resolves
+    True) but the per-session SSE stream keeps failing mid-turn, the disconnect
+    decision tree never consults tunnel registration and falls into
+    ``failed_mid_turn``, hard-coding ``runner_disconnected``. The runner never
+    left, so the interrupted turn must carry a distinct ``session_stream_lost``
+    attribution instead of blaming the host connection.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.3,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.05,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _RegisteredRunnerHttpErrorClient(gate)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "d4c3b2a1908f7e6d5c4b3a2918f7e6d5"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_stream_lost_tunnel_alive",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+        while event.get("type") != "session.status" or event.get("status") != "failed":
+            event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+        published_code = event["error"]["code"]
+
+        persisted = store.labels.get(session_id) or {}
+        persisted_code = persisted.get(sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY)
+
+        assert published_code == "session_stream_lost", (
+            "session stream loss over a still-registered runner was published as "
+            f"{published_code!r}; the runner never disconnected"
+        )
+        assert persisted_code == "session_stream_lost", (
+            f"durable last_task_error code was {persisted_code!r}, not session_stream_lost"
+        )
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+class _UnregisteredRunnerTunnelCloseClient:
+    """Tunnel-close client whose registration waiter reports the runner gone.
+
+    The stream drops like a closed tunnel and ``wait_for_runner`` resolves
+    False, so the relay must attribute the interrupted turn to the absent
+    runner rather than to a lost session stream.
+    """
+
+    class _Transport:
+        async def wait_for_runner(self, timeout_s: float) -> bool:
+            del timeout_s
+            return False
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self._gate = gate
+        self._transport = self._Transport()
+
+    def stream(self, method: str, path: str, *, timeout: Any) -> _TunnelCloseStreamResponse:
+        del method, path, timeout
+        return _TunnelCloseStreamResponse(self._gate)
+
+
+@pytest.mark.asyncio
+async def test_relay_labels_runner_disconnect_when_the_tunnel_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unregistered runner keeps the ``runner_disconnected`` attribution.
+
+    The registration waiter resolves False while a turn is in flight, so the
+    relay blames the absent runner and records the matching
+    ``runner_disconnected_mid_turn`` origin rather than ``session_stream_lost``.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _UnregisteredRunnerTunnelCloseClient(gate)
+    store = _RecordingLabelStore()
+    session_id = "a1b2c3d4e5f6071829304a5b6c7d8e9f"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_gone_unregistered",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        persisted = store.labels.get(session_id) or {}
+        persisted_code = persisted.get(sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY)
+        assert persisted_code == "runner_disconnected", (
+            f"an absent runner persisted {persisted_code!r}, not runner_disconnected"
+        )
+
+        failed = next(
+            r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+        )
+        assert failed.attributes["origin"] == "runner_disconnected_mid_turn"
+        assert failed.attributes["code"] == "runner_disconnected"
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

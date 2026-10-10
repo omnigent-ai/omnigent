@@ -101,7 +101,8 @@ Both harnesses; this is server behavior. With the host's links down for 20 s, a 
 `202` after about 10 s. The server then tried to relaunch the runner through
 the unreachable host and published `failed` with `runner_failed_to_start`. The
 message never reached the runner. The failure stayed after the host
-reconnected, because passive recovery clears only `runner_disconnected`.
+reconnected, because passive recovery clears only disconnect-class causes
+(`runner_disconnected`, `session_stream_lost`), not a start failure.
 
 ### R4: Stop reports success while the host is unreachable
 
