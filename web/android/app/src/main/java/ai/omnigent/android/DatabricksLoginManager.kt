@@ -15,8 +15,8 @@ internal class DatabricksLoginManager(
         DatabricksPendingAuthStore(context.applicationContext),
     private val client: DatabricksOAuthClient = DatabricksOAuthClient(),
     private val tokens: DatabricksTokenManager = DatabricksTokenManager.shared(context),
-    private val callbackHandoff: DatabricksCallbackHandoff =
-        DatabricksCallbackHandoff(context.applicationContext),
+    private val callbackHandoff: OAuthCallbackHandoff =
+        OAuthCallbackHandoff(context.applicationContext),
 ) {
     fun start(
         launcher: ActivityResultLauncher<Intent>,

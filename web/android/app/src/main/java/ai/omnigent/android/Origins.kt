@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.net.Uri
+import java.net.URI
 
 /**
  * Normalizes a URL to its origin (`scheme://host[:port]`), the unit of trust
@@ -34,6 +35,22 @@ fun originOf(url: String?): String? {
 fun isHttpScheme(scheme: String?): Boolean {
     val normalized = scheme?.lowercase() ?: return false
     return normalized == "http" || normalized == "https"
+}
+
+/**
+ * [routePath] (absolute, e.g. `/auth/login`) under [serverUrl]'s mount, without its query or
+ * fragment: `https://h/omnigent/` + `/v1/me` is `https://h/omnigent/v1/me`.
+ */
+internal fun serverEndpoint(
+    serverUrl: String,
+    routePath: String,
+): URI? {
+    if (!routePath.startsWith("/")) return null
+    val uri = runCatching { URI(serverUrl) }.getOrNull() ?: return null
+    if (!isHttpScheme(uri.scheme) || uri.rawUserInfo != null) return null
+    val authority = uri.rawAuthority?.takeIf(String::isNotEmpty) ?: return null
+    val mount = uri.rawPath.orEmpty().trimEnd('/')
+    return runCatching { URI("${uri.scheme.lowercase()}://$authority$mount$routePath") }.getOrNull()
 }
 
 /** Authentication strategy for a pinned Omnigent server. */

@@ -2,8 +2,6 @@ package ai.omnigent.android
 
 import org.json.JSONObject
 import java.net.URI
-import java.security.MessageDigest
-import java.security.SecureRandom
 import java.util.Base64
 
 /** Transient material for one authorization-code flow. */
@@ -22,7 +20,7 @@ data class DatabricksOAuthAttempt(
                     "response_type" to "code",
                     "scope" to SCOPE,
                     "state" to state,
-                    "code_challenge" to challenge(verifier),
+                    "code_challenge" to OAuthSupport.challenge(verifier),
                     "code_challenge_method" to "S256",
                 )
             credentialScope.workspaceId?.let { fields += "o" to it }
@@ -82,22 +80,18 @@ data class DatabricksOAuthAttempt(
 
     companion object {
         private const val SCOPE = "all-apis offline_access"
-        private val secureRandom = SecureRandom()
 
         fun create(
             workspaceUrl: URI,
             configuration: DatabricksOAuthConfiguration,
-            randomBytes: (Int) -> ByteArray = ::secureRandomBytes,
+            randomBytes: (Int) -> ByteArray = OAuthSupport::randomBytes,
         ): DatabricksOAuthAttempt =
             DatabricksOAuthAttempt(
                 configuration = configuration,
                 credentialScope = DatabricksCredentialScope.from(workspaceUrl, configuration),
-                state = mobileRedirectState(base64Url(randomBytes(32))),
-                verifier = base64Url(randomBytes(32)),
+                state = mobileRedirectState(OAuthSupport.randomValue(randomBytes)),
+                verifier = OAuthSupport.randomValue(randomBytes),
             )
-
-        fun challenge(verifier: String): String =
-            base64Url(MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray()))
 
         fun mobileRedirectState(nonce: String): String {
             val document =
@@ -109,11 +103,5 @@ data class DatabricksOAuthAttempt(
         }
 
         const val MOBILE_REDIRECT_SCHEME = "ai.omnigent.android"
-
-        private fun secureRandomBytes(size: Int): ByteArray =
-            ByteArray(size).also(secureRandom::nextBytes)
-
-        private fun base64Url(bytes: ByteArray): String =
-            Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
     }
 }
