@@ -495,6 +495,34 @@ def _unlink_if_empty(path: Path) -> None:
             path.unlink()
 
 
+def ensure_stdio_survives_unencodable_output() -> None:
+    """Keep stdio writes from aborting when the stream encoding is legacy.
+
+    A non-UTF-8 stdio encoding (a Windows ANSI code page like cp1252, or a
+    C/latin-1 locale) can't encode Omnigent's decorative glyphs (``✓``, ``⚠``),
+    so a plain ``print`` raises ``UnicodeEncodeError`` and kills the process --
+    mid-command in the CLI, or in a background daemon whose stdio is its log
+    file. Relax the error handler to ``replace`` (and switch to UTF-8 on
+    Windows) so the glyph degrades to a placeholder. ``PYTHONUTF8`` can't help:
+    PEP 540 reads it only at interpreter startup.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if encoding in {"utf-8", "utf8"}:
+            continue
+        # errors="replace" is process-wide: unencodable output degrades to "?"
+        # rather than raising. Detached or captured streams can't be
+        # reconfigured, which is fine -- their writes keep their old behavior.
+        with contextlib.suppress(ValueError, OSError):
+            if sys.platform == "win32":
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
+
+
 def configure_process_logging(
     destination: str,
     *,
