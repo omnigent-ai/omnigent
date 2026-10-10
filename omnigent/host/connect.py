@@ -3583,6 +3583,7 @@ class HostProcess:
         if op == "search":
             return r.search(
                 str(params.get("q", "")),
+                path=str(params.get("path", "") or ""),
                 include=cast("str | None", params.get("include")),
                 exclude=cast("str | None", params.get("exclude")),
                 limit=_coerce_int(params.get("limit", 500)),
