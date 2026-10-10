@@ -173,6 +173,7 @@ import {
   writeLastHarness,
 } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
+import { useHiddenPickerAgents } from "@/hooks/useHiddenPickerAgents";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
@@ -1691,6 +1692,11 @@ export function AgentHarnessPicker({
   // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
   // nothing is hidden in those cases, and unrecognized harnesses stay visible.
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
+  // Per-entry hides the user chose in Settings › Appearance. Orthogonal to
+  // hideUnconfigured above, which can only drop rows that cannot launch. The
+  // selected entry is never hidden, so a stored pick can't vanish from its own
+  // picker.
+  const hiddenAgents = useHiddenPickerAgents();
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     const more: AvailableAgent[] = [];
@@ -1698,6 +1704,7 @@ export function AgentHarnessPicker({
     const secondaryOrder = ["opencode", "pi"];
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
+      if (!selected && hiddenAgents.has(agent.name)) continue;
       const readiness = harnessReadinessOnHost(agent.harness, host);
       const unavailable = !readiness.selectable && readiness.fallbackRelevant;
       if (!selected && hideUnconfigured && unavailable) continue;
@@ -1716,7 +1723,7 @@ export function AgentHarnessPicker({
     ready.sort((first, second) => rank(first, primaryOrder) - rank(second, primaryOrder));
     more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
-  }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
+  }, [harnessEntries, host, hideUnconfigured, hiddenAgents, effectiveAgentId, promotedHarnessId]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1727,8 +1734,11 @@ export function AgentHarnessPicker({
   // in the main list; user-registered custom agents fold into an "Other..."
   // submenu so a long roster doesn't crowd out the recommended picks.
   const { builtins: bundleEntries, customs: customEntries } = useMemo(
-    () => partitionAgentsByKind(agentEntries),
-    [agentEntries],
+    () =>
+      partitionAgentsByKind(
+        agentEntries.filter((a) => a.id === effectiveAgentId || !hiddenAgents.has(a.name)),
+      ),
+    [agentEntries, hiddenAgents, effectiveAgentId],
   );
 
   // Existing custom / pending agents fold into an "Other..." submenu so a

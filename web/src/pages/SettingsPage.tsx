@@ -218,6 +218,11 @@ import {
   readHideUnconfiguredHarnesses,
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
+import { resetHiddenPickerAgents, setPickerAgentHidden } from "@/lib/pickerEntryVisibility";
+import { useHiddenPickerAgents } from "@/hooks/useHiddenPickerAgents";
+import { useAgentCatalog } from "@/hooks/useAvailableAgents";
+import { partitionAgentsByKind, selectableSessionAgents } from "@/lib/agentGrouping";
+import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
 import {
   applyThemePalette,
   DEFAULT_PALETTE,
@@ -810,6 +815,80 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+/**
+ * Per-entry show/hide list for the new-session picker.
+ *
+ * Complements "Hide unconfigured harnesses" above, which can only drop rows
+ * that cannot launch on the selected host. This one is the user's own choice,
+ * and it reaches the bundle agents (Polly / Debby) that readiness filtering
+ * never touches. Device-local, like the other Appearance preferences.
+ */
+function PickerEntryVisibilityControl() {
+  const hidden = useHiddenPickerAgents();
+  const { data: agents, isLoading } = useAgentCatalog();
+  const groups = useMemo(() => {
+    const selectable = selectableSessionAgents(agents ?? []);
+    const harnesses = selectable.filter(isNativeCodingAgent);
+    const rest = selectable.filter((a) => !isNativeCodingAgent(a));
+    const { builtins, customs } = partitionAgentsByKind(rest);
+    return [
+      { label: "Harnesses", entries: harnesses },
+      { label: "Agents", entries: [...builtins, ...customs] },
+    ].filter((group) => group.entries.length > 0);
+  }, [agents]);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-start justify-between gap-6">
+        <div className="flex flex-col">
+          <span className="text-ui font-medium">Show in the new-chat picker</span>
+          <span className="text-sm text-muted-foreground">
+            Turn off any harness or agent you don't use to keep the picker short. Hiding one here
+            never affects existing sessions, and the entry you have selected always stays visible.
+          </span>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="mt-0.5 shrink-0"
+          disabled={hidden.size === 0}
+          onClick={resetHiddenPickerAgents}
+          data-testid="picker-visibility-reset"
+          componentId="settings.appearance.picker_visibility_reset"
+        >
+          Show all
+        </Button>
+      </div>
+      {isLoading && groups.length === 0 ? (
+        <span className="text-sm text-muted-foreground">Loading agents…</span>
+      ) : groups.length === 0 ? (
+        <span className="text-sm text-muted-foreground">
+          No agents available on this server yet.
+        </span>
+      ) : (
+        groups.map((group) => (
+          <div key={group.label} className="flex flex-col gap-1">
+            <span className="text-sm text-muted-foreground">{group.label}</span>
+            {group.entries.map((agent) => (
+              <div key={agent.id} className="flex items-center justify-between gap-6 py-0.5">
+                <span className="truncate text-ui">{agent.display_name}</span>
+                <Switch
+                  aria-label={`Show ${agent.display_name} in the new-chat picker`}
+                  checked={!hidden.has(agent.name)}
+                  onCheckedChange={(next) => setPickerAgentHidden(agent.name, !next)}
+                  data-testid={`picker-visibility-toggle-${agent.name}`}
+                  className="shrink-0"
+                  componentId="settings.appearance.picker_visibility_entry"
+                />
+              </div>
+            ))}
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
   // replace it with a note (plus a link to the host's own theme settings when
@@ -870,6 +949,7 @@ function AppearanceSection() {
           "omnigent:default-workspace-panel",
           "omnigent:default-workspace-tab",
           "omnigent:hide-unconfigured-harnesses",
+          "omnigent:hidden-picker-agents",
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -982,6 +1062,7 @@ function AppearanceSection() {
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+              <PickerEntryVisibilityControl />
             </div>
           </SettingsGroup>
 

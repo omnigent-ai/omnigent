@@ -430,6 +430,27 @@ const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
 export const USER_AGENTS_QUERY_KEY = ["available-agents-user"] as const;
 const AVAILABLE_AGENTS_STALE_MS = 30_000;
 
+/**
+ * The server's agent catalog alone — no session discovery.
+ *
+ * Shares {@link AGENT_CATALOG_QUERY_KEY} with {@link useAvailableAgents}, so a
+ * consumer mounted alongside the picker reuses its fetch rather than issuing a
+ * second one. Unlike the full hook this does not read ``useSidebarData``, so it
+ * works outside a ``SidebarDataProvider`` (e.g. the Settings page). The
+ * trade-off is that agents discovered only from a session — a one-off upload
+ * never registered as a template — are absent.
+ *
+ * @param enabled - Whether to fetch; defaults true.
+ */
+export function useAgentCatalog(enabled = true) {
+  return useQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: fetchAgentCatalog,
+    enabled,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+}
+
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
   /**
