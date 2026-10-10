@@ -1,10 +1,11 @@
 """Native hook subprocesses → local relay → non-git filesystem registry.
 
-Drives the real observer hook (the documented PostToolUse contract) through
-the tool relay's ``/hook/observe-tool`` with a ``file_change_observer``, the
-same wiring the runner installs, and verifies native file-mutating tool calls
-land in an :class:`AgentEditFilesystemRegistry` — the registry non-git
-workspaces use for ``GET .../changes``.
+Drives the real observer hook (the documented PostToolUse contract) — and, for
+Claude Code, the exact command its settings register — through the tool
+relay's ``/hook/observe-tool`` with a ``file_change_observer``, the same wiring
+the runner installs, and verifies native file-mutating tool calls land in an
+:class:`AgentEditFilesystemRegistry` — the registry non-git workspaces use for
+``GET .../changes``.
 """
 
 from __future__ import annotations
@@ -26,7 +27,26 @@ from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
 _SESSION_ID = "conv_owned"
 
 
-@pytest.mark.parametrize("harness", ["claude_native", "codex_native"])
+def _observer_command(harness: str, bridge_dir: Path) -> list[str]:
+    """Observer hook invocation; ``claude_native_registered`` is the exact
+    command ``build_hook_settings`` registers (the curl fast path). Its Python
+    fallback points at a missing interpreter, so a clean exit with the change
+    recorded proves curl delivered rather than the interpreter the fix drops
+    from the hot path."""
+    if harness == "claude_native_registered":
+        settings = bridge.build_hook_settings(bridge_dir, python_executable="/nonexistent-python")
+        [command] = [
+            hook["command"]
+            for entry in settings["hooks"]["PostToolUse"]
+            if not entry.get("matcher")
+            for hook in entry["hooks"]
+        ]
+        return ["/bin/sh", "-c", str(command)]
+    hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
+    return shlex.split(str(hook["command"]))
+
+
+@pytest.mark.parametrize("harness", ["claude_native", "codex_native", "claude_native_registered"])
 async def test_native_write_reaches_changes_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
 ) -> None:
@@ -52,8 +72,7 @@ async def test_native_write_reaches_changes_registry(
         session_id=_SESSION_ID,
         file_change_observer=_observe,
     )
-    hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
-    command = shlex.split(str(hook["command"]))
+    command = _observer_command(harness, bridge_dir)
     try:
         report = workspace / "report.md"
         report.write_text("hi\n")
