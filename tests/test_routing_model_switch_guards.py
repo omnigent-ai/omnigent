@@ -58,13 +58,15 @@ def test_the_users_claude_settings_file_is_only_ever_read() -> None:
         if not isinstance(node, ast.Attribute):
             continue
         if not (
-            isinstance(node.value, ast.Name) and node.value.id == "_USER_CLAUDE_SETTINGS_PATH"
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_user_claude_settings_path"
         ):
             continue
         reads.append(node.attr)
-    # The definition itself is an assignment, not an attribute access, so every
-    # hit here is a use.
-    assert reads, "the guard found no usages at all — has the constant been renamed?"
+    # The accessor's own definition is not an attribute access, so every hit here
+    # is a use.
+    assert reads, "the guard found no usages at all — has the accessor been renamed?"
     assert set(reads) <= {"read_text", "read_bytes", "exists", "is_file"}, (
         f"non-read access to the user's settings file: {sorted(set(reads))}"
     )
