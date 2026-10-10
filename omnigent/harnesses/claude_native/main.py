@@ -2455,7 +2455,10 @@ def _copy_transcript_with_cwd(
         clone's own Claude session id rather than the source's. ``None``
         (the cwd-only redirect/move path) leaves ``sessionId`` untouched.
         The ``uuid`` / ``parentUuid`` chain is preserved verbatim in
-        either case.
+        either case. A clone also sheds the source's live background
+        sub-agent launch handles (see
+        :func:`_detach_cloned_background_launch`); the move keeps them,
+        since that session's own process really did exit.
     :returns: None.
     :raises click.ClickException: If a transcript line is malformed.
     """
@@ -2475,10 +2478,66 @@ def _copy_transcript_with_cwd(
             if isinstance(payload, dict):
                 if isinstance(payload.get("cwd"), str):
                     payload["cwd"] = current_text
-                if new_session_id is not None and isinstance(payload.get("sessionId"), str):
-                    payload["sessionId"] = new_session_id
+                if new_session_id is not None:
+                    if isinstance(payload.get("sessionId"), str):
+                        payload["sessionId"] = new_session_id
+                    _detach_cloned_background_launch(payload)
                 _sanitize_cloned_tool_result_record(payload)
             dst.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def _is_background_subagent_launch(tool_use_result: object) -> bool:
+    """
+    Whether ``toolUseResult`` metadata is a live background sub-agent handle.
+
+    These are the shapes Claude Code's ``--resume`` scan treats as a background
+    agent still owed a ``<task-notification>``: an ``Agent`` launch with
+    ``status: "async_launched"``, or a ``Skill`` fork with ``status: "forked"``
+    and ``background: true``, each carrying the agent id.
+
+    :param tool_use_result: The record's ``toolUseResult`` value.
+    :returns: ``True`` for a background launch handle.
+    """
+    if not isinstance(tool_use_result, dict):
+        return False
+    if not isinstance(tool_use_result.get("agentId"), str):
+        return False
+    status = tool_use_result.get("status")
+    return status == "async_launched" or (
+        status == "forked" and tool_use_result.get("background") is True
+    )
+
+
+def _detach_cloned_background_launch(payload: _JsonObject) -> None:
+    """
+    Detach a background sub-agent launch handle from one cloned record, in place.
+
+    On ``--resume`` Claude Code reads ``toolUseResult`` metadata for background
+    agents that were launched but never reported back and treats them as
+    orphaned by a process exit: it injects a failed/stopped
+    ``<task-notification>`` for each (and may restart the agent), and the model
+    then answers that notice in the resumed session. A clone is a new Claude
+    session that cannot own the source's still-running agents, so the handle is
+    replaced with the JSON-safe string form Omnigent writes for rebuilt tool
+    results. The model-visible ``tool_result`` content is left as it was.
+
+    :param payload: One decoded transcript record (mutated).
+    :returns: None.
+    """
+    if not _is_background_subagent_launch(payload.get("toolUseResult")):
+        return
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    result_text = ""
+    for block in content if isinstance(content, list) else ():
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            inner = block.get("content")
+            if isinstance(inner, str):
+                result_text = inner
+            elif inner is not None:
+                result_text = json.dumps(inner, separators=(",", ":"))
+            break
+    payload["toolUseResult"] = _json_safe_tool_use_result(result_text)
 
 
 def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:

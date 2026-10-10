@@ -7575,6 +7575,225 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
     assert not clone_project_dir.exists() or not any(clone_project_dir.iterdir())
 
 
+_BACKGROUND_LAUNCH_BLOCKS = [
+    {
+        "type": "text",
+        "text": (
+            "Async agent launched successfully.\nagentId: a46f605cc60f701a8\n"
+            "The agent is working in the background. You will be notified "
+            "automatically when it completes."
+        ),
+    }
+]
+_BACKGROUND_AGENT_HANDLE = {
+    "isAsync": True,
+    "status": "async_launched",
+    "agentId": "a46f605cc60f701a8",
+    "description": "Background module investigation",
+    "prompt": "inspect the module for leaks",
+    "outputFile": "/tmp/claude/tasks/a46f605cc60f701a8.output",
+    "canReadOutputFile": True,
+}
+_BACKGROUND_SKILL_HANDLE = {
+    "status": "forked",
+    "background": True,
+    "agentId": "b2c3d4e5f6a7b8c9d",
+    "commandName": "/investigate",
+    "result": "Forked skill launched in the background.",
+}
+_COMPLETED_AGENT_RESULT = {
+    "status": "completed",
+    "agentId": "c3d4e5f6a7b8c9d0e",
+    "prompt": "summarize the module",
+    "content": [{"type": "text", "text": "Summary ready."}],
+    "totalDurationMs": 1200,
+}
+_FOREGROUND_SKILL_RESULT = {"status": "forked", "agentId": "d4e5f6a7b8c9d0e1f", "result": "done"}
+
+
+def _claude_tool_result_record(
+    uuid: str,
+    parent_uuid: str | None,
+    *,
+    workspace: Path,
+    session_uuid: str,
+    call_id: str,
+    content: object,
+    tool_use_result: object,
+) -> dict[str, object]:
+    return {
+        "type": "user",
+        "cwd": str(workspace.resolve()),
+        "sessionId": session_uuid,
+        "uuid": uuid,
+        "parentUuid": parent_uuid,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": content}],
+        },
+        "toolUseResult": tool_use_result,
+    }
+
+
+def test_clone_claude_transcript_detaches_live_background_subagent_handles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A clone keeps a background launch's visible result but not the metadata
+    handle Claude Code's resume scan uses to report that agent as orphaned.
+
+    The clone is a new Claude session that cannot own the source's
+    still-running agents; without this a side chat opened mid-fork receives a
+    synthesized failed ``<task-notification>`` for the main chat's agent and
+    the model answers it there. Completed and foreground results keep their
+    metadata, and the source transcript is untouched.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    common = {"workspace": source_workspace, "session_uuid": source_uuid}
+    records: list[dict[str, object]] = [
+        {
+            "type": "user",
+            "cwd": str(source_workspace.resolve()),
+            "sessionId": source_uuid,
+            "uuid": "u1",
+            "parentUuid": None,
+            "message": {"role": "user", "content": "investigate the module in the background"},
+        },
+        {
+            "type": "assistant",
+            "cwd": str(source_workspace.resolve()),
+            "sessionId": source_uuid,
+            "uuid": "u2",
+            "parentUuid": "u1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bg",
+                        "name": "Agent",
+                        "input": {"subagent_type": "fork", "prompt": "inspect the module"},
+                    }
+                ],
+            },
+        },
+        _claude_tool_result_record(
+            "u3",
+            "u2",
+            call_id="toolu_bg",
+            content=_BACKGROUND_LAUNCH_BLOCKS,
+            tool_use_result=_BACKGROUND_AGENT_HANDLE,
+            **common,
+        ),
+        _claude_tool_result_record(
+            "u4",
+            "u3",
+            call_id="toolu_skill",
+            content="Forked skill launched in the background.",
+            tool_use_result=_BACKGROUND_SKILL_HANDLE,
+            **common,
+        ),
+        _claude_tool_result_record(
+            "u5",
+            "u4",
+            call_id="toolu_sync",
+            content="Summary ready.",
+            tool_use_result=_COMPLETED_AGENT_RESULT,
+            **common,
+        ),
+        _claude_tool_result_record(
+            "u6",
+            "u5",
+            call_id="toolu_fg",
+            content="done",
+            tool_use_result=_FOREGROUND_SKILL_RESULT,
+            **common,
+        ),
+    ]
+    source_text = "".join(json.dumps(record) + "\n" for record in records)
+    source_path.write_text(source_text, encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None and result.is_file()
+    cloned = {
+        payload["uuid"]: payload
+        for payload in (
+            json.loads(line) for line in result.read_text(encoding="utf-8").splitlines() if line
+        )
+    }
+    # Live background handles become the JSON-safe string of the visible
+    # result, the form Omnigent already writes for rebuilt tool results; the
+    # model-visible content block is unchanged.
+    assert cloned["u3"]["toolUseResult"] == json.dumps(
+        _BACKGROUND_LAUNCH_BLOCKS, separators=(",", ":")
+    )
+    assert cloned["u3"]["message"] == records[2]["message"]
+    assert cloned["u4"]["toolUseResult"] == json.dumps("Forked skill launched in the background.")
+    assert cloned["u4"]["message"] == records[3]["message"]
+    for payload in (cloned["u3"], cloned["u4"]):
+        assert not isinstance(json.loads(payload["toolUseResult"]), dict)
+    # Results that owe no notification keep Claude's own metadata.
+    assert cloned["u5"]["toolUseResult"] == _COMPLETED_AGENT_RESULT
+    assert cloned["u6"]["toolUseResult"] == _FOREGROUND_SKILL_RESULT
+    # The clone rewrite itself is unchanged: new session id, clone cwd, chain kept.
+    assert all(payload["sessionId"] == target_uuid for payload in cloned.values())
+    assert all(payload["cwd"] == str(clone_workspace.resolve()) for payload in cloned.values())
+    assert [(payload["uuid"], payload["parentUuid"]) for payload in cloned.values()] == [
+        ("u1", None),
+        ("u2", "u1"),
+        ("u3", "u2"),
+        ("u4", "u3"),
+        ("u5", "u4"),
+        ("u6", "u5"),
+    ]
+    assert source_path.read_text(encoding="utf-8") == source_text
+
+
+def test_copy_transcript_with_cwd_keeps_background_handles_for_the_same_session(
+    tmp_path: Path,
+) -> None:
+    """
+    Moving a session's own transcript between project dirs keeps the handle:
+    that Claude process really did exit, so its orphan accounting must still run.
+    """
+    record = _claude_tool_result_record(
+        "u1",
+        None,
+        workspace=tmp_path / "old",
+        session_uuid="11111111-1111-1111-1111-111111111111",
+        call_id="toolu_bg",
+        content=_BACKGROUND_LAUNCH_BLOCKS,
+        tool_use_result=_BACKGROUND_AGENT_HANDLE,
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    target = tmp_path / "target.jsonl"
+
+    claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+
+    moved = json.loads(target.read_text(encoding="utf-8"))
+    assert moved["toolUseResult"] == _BACKGROUND_AGENT_HANDLE
+    assert moved["cwd"] == str(tmp_path)
+
+
 def test_clone_claude_transcript_repairs_stale_image_duplication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
