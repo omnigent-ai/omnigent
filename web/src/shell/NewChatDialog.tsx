@@ -3185,6 +3185,13 @@ export function NewChatLandingScreen() {
         : null))
     : null;
   const sandboxCatalog = sandboxInferenceConfigured ? sandboxModels.data!.models : undefined;
+  // Without an inference catalog the sandbox launches whatever its harness
+  // resolves, so the picker offers that default instead of "Models unavailable".
+  const sandboxUsesHarnessDefault =
+    sandboxSelected &&
+    sandboxCatalog === undefined &&
+    !sandboxCatalogPending &&
+    sandboxCatalogError === null;
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -3819,16 +3826,18 @@ export function NewChatLandingScreen() {
                           Loading models…
                         </div>
                       )}
-                      {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="px-2 py-1 text-xs text-muted-foreground">
-                          {pickerModelsError?.message ?? "Models unavailable"}
-                        </div>
-                      )}
+                      {!pickerModelsLoading &&
+                        pickerModelOptions.length === 0 &&
+                        !sandboxUsesHarnessDefault && (
+                          <div className="px-2 py-1 text-xs text-muted-foreground">
+                            {pickerModelsError?.message ?? "Models unavailable"}
+                          </div>
+                        )}
                     </>
                   ),
                   choices: [
                     ...(!sandboxInferenceConfigured &&
-                    pickerModelOptions.length > 0 &&
+                    (pickerModelOptions.length > 0 || sandboxUsesHarnessDefault) &&
                     !pickerModelOptions.some((option) => option.isDefault)
                       ? [
                           {

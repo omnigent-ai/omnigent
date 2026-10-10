@@ -10564,6 +10564,64 @@ describe("managed sandbox inference models", () => {
     });
   }
 
+  it("offers Codex a model choice on a sandbox without inference config, like Claude Code", () => {
+    mockHosts([]);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+    });
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeInTheDocument();
+
+    openAgentModels("a1");
+    const claudeModels = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(claudeModels).queryAllByRole("menuitemcheckbox").length).toBeGreaterThan(0);
+    closeMenu();
+
+    openAgentModels("a2");
+    const codexModels = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(codexModels).queryByText("Models unavailable")).toBeNull();
+    expect(within(codexModels).queryAllByRole("menuitemcheckbox").length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ["Codex", "a2"],
+    ["Pi", "a4"],
+  ])(
+    "launches %s with the harness default from a sandbox without inference config",
+    async (_harness, agentId) => {
+      mockHosts([]);
+      mockAgents([
+        ...DEFAULT_LANDING_AGENTS,
+        testAgent("a4", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+      ]);
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+      });
+
+      openAgentModels(agentId);
+      const menu = screen.getByTestId("new-chat-landing-agent-models");
+      expect(within(menu).queryByText("Models unavailable")).toBeNull();
+      expect(within(menu).getAllByRole("menuitemcheckbox")).toHaveLength(1);
+      expect(within(menu).getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+      closeMenu();
+
+      const { body } = await submitAndReadBody();
+      expect(body.agent_id).toBe(agentId);
+      expect(body.host_type).toBe("managed");
+      expect(body.model_override).toBeUndefined();
+    },
+  );
+
   it.each(["lakebox", "kubernetes", "agent_sandbox", "modal"])(
     "keeps %s without bindings independent of the preview service",
     async (provider) => {
