@@ -346,11 +346,13 @@ def create_accounts_auth_router(
             from omnigent.server.routes.device_auth import issue_login_grant
 
             try:
-                body_payload["refresh_token"] = issue_login_grant(
+                login_grant = issue_login_grant(
                     device_grant_store,
                     user_id=username,
                     cookie_secret=config.cookie_secret,
                 )
+                body_payload["refresh_token"] = login_grant.refresh_token
+                body_payload["refresh_expires_at"] = login_grant.refresh_expires_at
             except Exception:  # grant failure must never break login
                 _logger.exception(
                     "auth/login: refresh grant issuance failed for %s",
