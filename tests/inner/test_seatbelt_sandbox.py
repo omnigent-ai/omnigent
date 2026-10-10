@@ -573,6 +573,42 @@ def test_profile_emits_extra_read_roots(tmp_path: Path) -> None:
     assert expected in profile
 
 
+def test_profile_keeps_approved_root_after_symlink_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Extra roots are emitted exactly as stored on the policy. Roots are
+    canonicalised when accepted (``_resolve_root``, ``with_additional_*``),
+    so re-resolving at render time would let a sandboxed process that swaps
+    an approved directory for a symlink widen a reused policy's grant to the
+    link's target.
+    """
+    import tempfile
+
+    # Anchor the system tempdir inside tmp_path so the approved write root
+    # below is not classified as the always-canonicalised scratch tmpdir.
+    fake_sys_tmp = tmp_path / "systmp"
+    fake_sys_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(fake_sys_tmp))
+
+    approved = tmp_path / "build"
+    approved.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    stored = approved.resolve(strict=False)
+    policy = _make_policy(tmp_path, read_roots=[stored], write_roots=[stored])
+    cwd = tmp_path.resolve(strict=False)
+    assert f'(allow file-write* (subpath "{stored}"))' in _build_profile(policy, cwd)
+
+    approved.rmdir()
+    approved.symlink_to(elsewhere)
+    profile = _build_profile(policy, cwd)
+
+    assert f'(allow file-read* (subpath "{stored}"))' in profile
+    assert f'(allow file-write* (subpath "{stored}"))' in profile
+    assert f'(subpath "{elsewhere.resolve(strict=False)}")' not in profile
+
+
 def test_profile_network_section_for_allow_network_true_no_egress(
     tmp_path: Path,
 ) -> None:

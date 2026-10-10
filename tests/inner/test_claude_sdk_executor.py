@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -467,7 +468,7 @@ class TestConstructor(unittest.TestCase):
         self.assertEqual(executor._cli_path, "/tmp/omnigent-claude-wrapper")
         self.assertEqual(executor._cwd, "/tmp/work")
 
-    def test_prepare_claude_cli_path_adds_internal_roots_to_read_allowlist(self):
+    def test_prepare_claude_cli_path_adds_internal_roots_to_read_and_write_allowlists(self):
         from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
         from omnigent.inner.sandbox import SandboxPolicy
@@ -524,6 +525,7 @@ class TestConstructor(unittest.TestCase):
         # across platforms.
         expected = Path("/home/test/.claude/sessions").resolve(strict=False)
         self.assertIn(expected, captured["sandbox"].read_roots)
+        self.assertIn(expected, captured["sandbox"].write_roots)
 
     def test_default_process_sandbox_wraps_cli_without_enabling_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -1499,6 +1501,163 @@ class TestConstructor(unittest.TestCase):
                 paths = _claude_internal_write_files()
 
             self.assertEqual(paths, [config_path, credentials_path])
+
+    def _claude_runtime_roots(self, td: str, *, system_tmp: Path, cli_tmp: Path) -> list[Path]:
+        """Run ``_claude_internal_write_roots`` with HOME and both tmp roots under *td*."""
+        from omnigent.inner.claude_sdk_executor import _claude_internal_write_roots
+
+        home = Path(td) / "home"
+        home.mkdir(exist_ok=True)
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor.pathlib.Path.home",
+                return_value=home,
+            ),
+            patch.object(tempfile, "tempdir", str(system_tmp)),
+            patch("omnigent.inner.claude_sdk_executor._CLAUDE_CLI_TMP_ROOT", cli_tmp),
+        ):
+            return _claude_internal_write_roots()
+
+    def test_claude_internal_write_roots_grant_cli_tmp_runtime_dir(self):
+        """Both per-uid runtime dirs are granted and created owner-only when the
+        system tempdir (macOS: ``/var/folders/.../T``) is not the CLI's ``/tmp``."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+
+            roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            for runtime_dir in (system_tmp / f"claude-{uid}", cli_tmp / f"claude-{uid}"):
+                self.assertIn(runtime_dir, roots)
+                self.assertEqual(stat.S_IMODE(runtime_dir.stat().st_mode), 0o700)
+
+    def test_claude_internal_write_roots_dedupe_when_tempdir_is_cli_tmp_root(self):
+        """When the system tempdir already is the CLI's root, one grant suffices,
+        whether both are spelled the same or one goes through a symlink."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        for spelling in ("same", "symlinked"):
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory() as td:
+                cli_tmp = Path(td) / "tmp"
+                cli_tmp.mkdir()
+                system_tmp = cli_tmp
+                if spelling == "symlinked":
+                    system_tmp = Path(td) / "private-tmp"
+                    system_tmp.symlink_to(cli_tmp)
+
+                roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+                self.assertEqual(
+                    [root for root in roots if root.name == f"claude-{uid}"],
+                    [system_tmp / f"claude-{uid}"],
+                )
+
+    def test_claude_internal_write_roots_skip_planted_leaf(self):
+        """A symlink or regular file planted at ``/tmp/claude-<uid>`` is neither
+        followed nor granted, with a warning; the other runtime dir stays granted."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        for kind, warning in (("symlink", "is a symlink"), ("file", "not a directory")):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as td:
+                system_tmp = Path(td) / "var_folders" / "T"
+                system_tmp.mkdir(parents=True)
+                cli_tmp = Path(td) / "tmp"
+                cli_tmp.mkdir()
+                elsewhere = Path(td) / "elsewhere"
+                elsewhere.mkdir()
+                planted = cli_tmp / f"claude-{uid}"
+                if kind == "symlink":
+                    planted.symlink_to(elsewhere)
+                else:
+                    planted.write_text("")
+
+                with self.assertLogs(
+                    "omnigent.inner.claude_sdk_executor", level="WARNING"
+                ) as logs:
+                    roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+                self.assertNotIn(planted, roots)
+                self.assertNotIn(elsewhere, roots)
+                self.assertIn(system_tmp / f"claude-{uid}", roots)
+                self.assertEqual(planted.is_symlink(), kind == "symlink")
+                self.assertTrue(any(warning in line for line in logs.output), logs.output)
+
+    def test_claude_internal_write_roots_tighten_loose_runtime_dir_mode(self):
+        """An existing runtime dir we own is granted and reset to owner-only."""
+        from omnigent._platform import stable_user_id
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+            existing = cli_tmp / f"claude-{uid}"
+            existing.mkdir()
+            existing.chmod(0o755)
+
+            roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            self.assertIn(existing, roots)
+            self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o700)
+
+    def test_claude_cli_tmp_root_is_the_reported_denied_path(self):
+        """The macOS launch failure was EPERM opening ``/tmp/claude-<uid>``; the extra
+        grant must keep targeting that root whatever the system temp dir is."""
+        from omnigent.inner.claude_sdk_executor import _CLAUDE_CLI_TMP_ROOT
+
+        self.assertEqual(_CLAUDE_CLI_TMP_ROOT, Path("/tmp"))
+
+    def test_claude_internal_write_roots_skip_runtime_dir_that_cannot_be_created(self):
+        """A runtime dir whose creation or ownership check fails is omitted with a
+        warning while the other runtime dir is still granted."""
+        from omnigent._platform import stable_user_id
+        from omnigent.harnesses.claude_native import bridge
+
+        if os.name != "posix":
+            self.skipTest("the CLI's /tmp/claude-<uid> runtime dir is POSIX-only")
+
+        uid = stable_user_id()
+        with tempfile.TemporaryDirectory() as td:
+            system_tmp = Path(td) / "var_folders" / "T"
+            system_tmp.mkdir(parents=True)
+            cli_tmp = Path(td) / "tmp"
+            cli_tmp.mkdir()
+            real_ensure = bridge.ensure_private_dir
+
+            def fail_for_cli_root(path: Path, my_uid: int | None) -> None:
+                if path.parent == cli_tmp:
+                    raise PermissionError(f"refusing to use {path}: owned by uid 0")
+                real_ensure(path, my_uid)
+
+            with (
+                patch.object(bridge, "ensure_private_dir", side_effect=fail_for_cli_root),
+                self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+            ):
+                roots = self._claude_runtime_roots(td, system_tmp=system_tmp, cli_tmp=cli_tmp)
+
+            self.assertNotIn(cli_tmp / f"claude-{uid}", roots)
+            self.assertIn(system_tmp / f"claude-{uid}", roots)
+            self.assertTrue(any("owned by uid 0" in line for line in logs.output), logs.output)
 
 
 # ---------------------------------------------------------------------------

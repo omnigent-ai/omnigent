@@ -31,8 +31,10 @@ no platform branching inside the tests themselves.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -44,6 +46,26 @@ from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec
 
 _BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 _SANDBOX_EXEC_AVAILABLE = shutil.which("sandbox-exec") is not None
+
+
+@functools.lru_cache(maxsize=1)
+def _bwrap_functional() -> bool:
+    """Whether bwrap can actually create a namespace on this host.
+
+    A seccomp-confined CI runner can have ``bwrap`` on PATH while the kernel
+    denies unprivileged user namespaces; runtime tests skip there instead of
+    failing for a reason unrelated to the behaviour under test.
+    """
+    bwrap = shutil.which("bwrap")
+    if bwrap is None or not sys.platform.startswith("linux"):
+        return False
+    try:
+        proc = subprocess.run(
+            [bwrap, "--ro-bind", "/", "/", "/bin/true"], capture_output=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
 
 
 def _repo_root_for_pythonpath() -> str:

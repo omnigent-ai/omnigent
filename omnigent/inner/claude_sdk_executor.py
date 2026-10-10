@@ -1295,6 +1295,48 @@ def _parse_optional_int(value: str | None) -> int | None:
         return None
 
 
+# Claude CLI versions use either the system temp root or fixed /tmp, so grant both.
+_CLAUDE_CLI_TMP_ROOT = pathlib.Path("/tmp")
+
+
+def _claude_runtime_dirs() -> list[pathlib.Path]:
+    """Per-uid runtime dirs the Claude CLI writes, created owner-only.
+
+    Both live under shared temp roots, so a pre-existing leaf is granted only
+    when it is a real directory owned by this user. A planted symlink or
+    foreign directory is skipped with a warning instead of widening the sandbox
+    to wherever it points. Under bwrap each granted dir is bind-mounted over
+    the private /tmp.
+    """
+    from omnigent.harnesses.claude_native.bridge import ensure_private_dir
+
+    uid = stable_user_id()
+    my_uid = os.getuid() if hasattr(os, "getuid") else None
+    candidates = [pathlib.Path(tempfile.gettempdir()) / f"claude-{uid}"]
+    if os.name == "posix":
+        candidates.append(_CLAUDE_CLI_TMP_ROOT / f"claude-{uid}")
+    dirs: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+    for candidate in candidates:
+        # Dedupe on the parent's real path; resolving the leaf itself would
+        # follow exactly the planted symlink rejected below.
+        key = candidate.parent.resolve(strict=False) / candidate.name
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            ensure_private_dir(candidate, my_uid)
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "Not granting the Claude CLI runtime dir %s to the sandboxed CLI: %s",
+                candidate,
+                exc,
+            )
+            continue
+        dirs.append(candidate)
+    return dirs
+
+
 def _claude_internal_write_roots() -> list[pathlib.Path]:
     """Writable roots the Claude CLI needs for its own local session state."""
 
@@ -1304,11 +1346,10 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
-    return roots
+    return roots + _claude_runtime_dirs()
 
 
 def _claude_internal_write_files() -> list[pathlib.Path]:
@@ -1399,8 +1440,9 @@ def prepare_claude_cli_path(
         # whole native-tool process tree inside a network-denying sandbox.
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
 
-    sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+    internal_roots = _claude_internal_write_roots()
+    sandbox = with_additional_read_roots(sandbox, internal_roots)
+    sandbox = with_additional_write_roots(sandbox, internal_roots)
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
     # Dry-run the spawn-time wrap now, while degrading is still possible.
     # The real wrap happens later inside run_launcher, where an OSError
