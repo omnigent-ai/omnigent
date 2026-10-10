@@ -5,6 +5,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -310,9 +311,11 @@ export function AppShell() {
   // reintroduce the trap: by then the title-bar toggle is back and the Back row
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
+  // useLayoutEffect: pin/restore must land in the same paint as the route change,
+  // or a collapsed sidebar shows one full-width frame first.
   const { inSettings } = useSettingsRoute();
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (inSettings) {
       // Stash inside the updater so it reads the CURRENT value rather than a
       // closure captured before the pin, and so a re-render while already on
