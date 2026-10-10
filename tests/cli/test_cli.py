@@ -4913,6 +4913,68 @@ def test_run_server_without_agent_dispatches_direct_server(
     )
 
 
+def test_fork_with_prompt_rejected_on_direct_server_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject fork/prompt conflicts before the early-returning direct-server dispatch."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "http://localhost:8000", "--fork", "0" * 32, "-p", "hi"],
+    )
+
+    assert result.exit_code != 0
+    assert "--fork requires interactive REPL mode" in result.output
+    run_chat.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "resume_args",
+    [["--continue"], ["--resume", "1" * 32], ["--resume"]],
+    ids=["continue", "resume-id", "resume-picker"],
+)
+def test_fork_with_resume_rejected_on_direct_server_dispatch(
+    monkeypatch: pytest.MonkeyPatch, resume_args: list[str]
+) -> None:
+    """``run --server URL --fork ID`` with any resume flag is rejected before dispatch."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "http://localhost:8000", "--fork", "0" * 32, *resume_args],
+    )
+
+    assert result.exit_code != 0
+    assert "--fork is mutually exclusive with --resume and --continue" in result.output
+    run_chat.assert_not_called()
+
+
+def test_fork_with_prompt_rejected_before_native_harness_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject fork/prompt conflicts before native-harness dispatch."""
+    native_dispatch = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.cli._dispatch_native_terminal_harness", native_dispatch)
+
+    with pytest.raises(ClickException, match="--fork requires interactive REPL mode"):
+        _dispatch_run(
+            target=None,
+            tools=None,
+            harness="claude-native",
+            model=None,
+            prompt="hi",
+            system_prompt=None,
+            fork_session_id="0" * 32,
+        )
+
+    native_dispatch.assert_not_called()
+
+
 @pytest.mark.parametrize("alias", ["", "local", "LOCAL", " local "])
 def test_run_local_server_alias_beats_configured_remote(
     alias: str, monkeypatch: pytest.MonkeyPatch
