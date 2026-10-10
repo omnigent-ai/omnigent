@@ -7,10 +7,8 @@
 // on a pod that never saw the user's read-state PUT, so its
 // `viewer_last_seen` / `viewer_unread` fields can be null even for a
 // session the user has read. The local copy is therefore the durable
-// source; the server seed only ever *raises* a baseline (max-merge), which
-// also picks up newer reads from the user's other devices when the serving
-// replica happens to have them. Cross-device unread is best-effort by
-// design.
+// source; both the server seed and later list refreshes only ever *raise* a
+// baseline, never lower it (see seedReadState and mergeNewerServerReadState).
 //
 // A conversation is "unseen" when its server-side updated_at exceeds the
 // stored baseline. A conversation with no baseline anywhere seeds to its
@@ -89,11 +87,9 @@ function persistToStorage(): void {
 
 hydrateFromStorage();
 
-// Sessions already seeded from the list. Seeding is once-per-session: the
-// first time a conversation is seen we copy its server `viewer_*` into the
-// mirror, then ignore later list values so an in-flight poll can't clobber a
-// local optimistic write. Cross-device changes after first load surface on a
-// reload (a deliberate Phase-1 scope: live merge is a follow-up).
+// Sessions already seeded from the list. Their first list value is merged in
+// full; later values go through mergeNewerServerReadState, so another
+// device's read clears the dot here without a reload.
 const seeded = new Set<string>();
 
 // Until the first seed runs we don't know the server's baselines, so the
@@ -136,21 +132,41 @@ export interface ReadStateSeed {
 }
 
 /**
+ * Live merge for an already-seeded conversation: raise the seen baseline to a
+ * strictly-newer server value (a read on another device), which clears an
+ * activity dot here without a reload. Older, equal and missing values are
+ * ignored, so a stale replica can't lower the baseline. An explicitly-unread
+ * conversation is skipped: the local "Mark as unread" is authoritative, and a
+ * replica that missed the read-state PUT would otherwise serve a pre-mark read,
+ * raise the baseline and clear the dot, reverting the user's action. It stays
+ * unread until the user reads or reopens it here.
+ */
+function mergeNewerServerReadState(conv: ReadStateSeed): boolean {
+  if (typeof conv.viewer_last_seen !== "number") return false;
+  if (explicitlyUnread.has(conv.id)) return false;
+  const local = lastSeenMap[conv.id];
+  if (local !== undefined && conv.viewer_last_seen <= local) return false;
+  lastSeenMap[conv.id] = conv.viewer_last_seen;
+  return true;
+}
+
+/**
  * Seeds the local mirror from the conversation list (the server's per-viewer
- * read path). Once-per-session: a conversation is merged the first time it
- * appears, then ignored, so an in-flight list poll can't clobber a local
- * optimistic write. The merge is max(localStorage baseline, server value) —
- * last-seen is monotonic, so taking the max is always safe and picks up a
- * newer read from another device when the serving replica has it. A session
- * with no baseline on either side seeds to its `updated_at` ("read as of
- * load"): pod-independent, so a replica that can't see the user's read-state
- * can never freeze a row's dot off. Flips {@link hydrated} on the first call
- * (even for an empty list) so the automatic mark-seen can resume.
+ * read path). A conversation's first list value merges as max(localStorage
+ * baseline, server value) — last-seen is monotonic, so the max is always safe.
+ * With no baseline on either side it seeds to its `updated_at` ("read as of
+ * load"), so a replica that can't see the user's read-state can't freeze a
+ * row's dot off. Later values go through {@link mergeNewerServerReadState}.
+ * Flips {@link hydrated} on the first call (even for an empty list) so the
+ * automatic mark-seen can resume.
  */
 export function seedReadState(conversations: readonly ReadStateSeed[]): void {
   let changed = false;
   for (const conv of conversations) {
-    if (seeded.has(conv.id)) continue;
+    if (seeded.has(conv.id)) {
+      if (mergeNewerServerReadState(conv)) changed = true;
+      continue;
+    }
     seeded.add(conv.id);
     const local = lastSeenMap[conv.id];
     const server = typeof conv.viewer_last_seen === "number" ? conv.viewer_last_seen : undefined;
