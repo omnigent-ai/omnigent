@@ -7215,9 +7215,9 @@ def test_item_data_seam_subclass_encodes_and_decodes(db_uri: str) -> None:
 def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
     """The ``_item_search_text`` hook controls what lands in ``search_text``.
 
-    (Returning ``None`` from the hook — to skip the column on a schema that
-    omits it — is exercised by such a backend; the OSS SQLite schema keeps
-    ``search_text`` NOT NULL, so this asserts the string-returning path.)
+    (The ``None``-returning path — a store that cannot derive a plaintext
+    body — is asserted separately below; this asserts the string-returning
+    path.)
     """
     from sqlalchemy import select
 
@@ -7251,6 +7251,84 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+class _SearchTextlessStore(SqlAlchemyConversationStore):
+    """Models an opaque-data store: the search-text seam returns None."""
+
+    def _item_search_text(self, item: NewConversationItem) -> str | None:
+        return None
+
+
+def test_item_search_text_seam_none_persists_null(db_uri: str) -> None:
+    """A None search-text result must persist the item with a NULL column."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    store = _SearchTextlessStore(db_uri)
+    conv = store.create_conversation()
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_opaque",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "opaque body"}]
+                ),
+            )
+        ],
+    )
+
+    with store._conv_session("test_setup") as session:
+        stored = list(
+            session.execute(
+                select(SqlConversationItem.search_text).where(
+                    SqlConversationItem.conversation_id == conv.id
+                )
+            ).scalars()
+        )
+    assert stored == [None]
+
+    [item] = store.list_items(conv.id).data
+    assert item.data.content[0]["text"] == "opaque body"
+
+
+def test_fork_copies_items_without_search_text(db_uri: str) -> None:
+    """Forking items stored with a NULL ``search_text`` copies them with the NULL intact."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    store = _SearchTextlessStore(db_uri)
+    source = store.create_conversation()
+    store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_opaque",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "opaque body"}]
+                ),
+            )
+        ],
+    )
+
+    fork = store.fork_conversation(source.id, title="fork")
+
+    [item] = store.list_items(fork.id).data
+    assert item.data.content[0]["text"] == "opaque body"
+    with store._conv_session("test_setup") as session:
+        stored = list(
+            session.execute(
+                select(SqlConversationItem.search_text).where(
+                    SqlConversationItem.conversation_id == fork.id
+                )
+            ).scalars()
+        )
+    assert stored == [None]
 
 
 def _acl_perms(db_uri: str):

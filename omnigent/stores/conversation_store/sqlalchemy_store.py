@@ -2365,15 +2365,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         return stored
 
     def _item_search_text(self, item: NewConversationItem) -> str | None:
-        """
-        Plain-text extraction of *item* persisted in ``search_text`` and indexed
-        for full-text search by :meth:`append`.
+        """Extract plaintext for search_text and full-text indexing.
 
-        The default extracts the searchable text as before. A subclass whose
-        schema omits ``search_text`` (e.g. because ``data`` is stored opaquely
-        and cannot be searched in SQL) returns ``None`` to skip persisting the
-        column and its FTS row entirely.
-        """
+        Opaque-data stores may return None to omit the column and its FTS row.
+        The mainline schema stores NULL in that case."""
         return strip_nul_bytes(extract_search_text(item))
 
     def append(
@@ -2430,10 +2425,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "data": data,
                 "created_by": item.created_by,
             }
-            # A backend may omit search_text (see _item_search_text): when it
-            # returns None we drop the column so a schema without it still
-            # works, and skip its FTS row. The hook is all-or-nothing per
-            # store, so the key set stays uniform across the executemany.
+            # None from _item_search_text drops the column (NULL here) and skips the
+            # FTS row; the hook is per-store, so executemany key sets stay uniform.
             if search is not None:
                 values["search_text"] = search
             prepared_rows.append((item, values, search))
