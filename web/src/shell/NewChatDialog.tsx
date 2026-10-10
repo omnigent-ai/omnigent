@@ -3190,9 +3190,7 @@ export function NewChatLandingScreen() {
   const sandboxUsesHarnessDefault =
     sandboxSelected &&
     info !== "loading" &&
-    sandboxCatalog === undefined &&
-    !sandboxCatalogPending &&
-    sandboxCatalogError === null;
+    (!sandboxPreviewEnabled || sandboxModels.data?.configured === false);
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
