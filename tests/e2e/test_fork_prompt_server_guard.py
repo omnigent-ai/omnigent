@@ -71,7 +71,9 @@ def _cli_env(tmp_path: Path) -> dict[str, str]:
     subprocess ``cwd``, which we pin to the repo root) so the CLI imports the
     worktree's ``omnigent`` and ``omnigent_client``.
 
-    :param tmp_path: Per-test tmp dir for an isolated OMNIGENT_CONFIG_HOME.
+    :param tmp_path: Per-test tmp dir for an isolated OMNIGENT_CONFIG_HOME and
+        OMNIGENT_DATA_DIR, so a crashing run never writes logs or crash reports
+        into the developer's real data dir.
     :returns: Env mapping for ``subprocess.run``.
     """
     config_home = tmp_path / "omnigent-config"
@@ -80,6 +82,7 @@ def _cli_env(tmp_path: Path) -> dict[str, str]:
     env = {
         **os.environ,
         "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
         "OPENAI_API_KEY": "mock-key",
     }
     env.pop("DATABRICKS_TOKEN", None)
@@ -161,7 +164,7 @@ def bare_server_with_session(
                     healthy = True
                     break
             except httpx.ConnectError:
-                pass
+                pass  # not listening yet; keep polling until the deadline
             time.sleep(POLL_INTERVAL_S)
         if not healthy:
             raise RuntimeError(
