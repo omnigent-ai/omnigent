@@ -9,6 +9,10 @@ import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "@/shell/TerminalFirstContext";
 import { SideChatPane } from "./SideChatPane";
 
 vi.mock("@/store/chatStore", async (importOriginal) => ({
@@ -109,6 +113,45 @@ describe("side-chat working indicator", () => {
 
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Blocked on: tool approval");
     expect(screen.getByRole("button", { name: "Interrupt side chat" })).toBeEnabled();
+  });
+
+  it("names the side chat's own terminal for its dialog, not this session's Terminal view", () => {
+    const setView = vi.fn();
+    const terminalFirst: TerminalFirstContextValue = {
+      isClaudeNative: true,
+      isNativeWrapper: true,
+      isTerminalFirst: true,
+      isShellView: false,
+      view: "chat",
+      terminalViewKey: null,
+      setView,
+      terminalsAvailable: true,
+      terminalStartingUp: false,
+    };
+    renderPane(
+      <TerminalFirstContextProvider value={terminalFirst}>
+        <SideChatPane childId={childId} />
+      </TerminalFirstContextProvider>,
+    );
+
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        sessionStatus: "waiting",
+        blockedOn: "dialog open",
+        activeResponse: { responseId: "codex_turn_side", state: "streaming", error: null },
+      }),
+    );
+
+    // The side chat is its own session: this Terminal view shows the parent's
+    // terminal and never its dialog, so neither the label nor a button may point there.
+    const indicator = screen.getByTestId("working-indicator");
+    expect(indicator).toHaveTextContent("Waiting on a dialog in the side chat's own terminal.");
+    expect(indicator).not.toHaveTextContent(/terminal view/i);
+    expect(screen.getAllByRole("status").map((el) => el.textContent)).toContain(
+      "Waiting on a dialog in the side chat's own terminal.",
+    );
+    expect(screen.queryByRole("button", { name: /terminal view/i })).toBeNull();
+    expect(setView).not.toHaveBeenCalled();
   });
 
   it("shows progress while creating a fork and restores the draft after failure", async () => {

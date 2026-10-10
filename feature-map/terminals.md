@@ -26,7 +26,9 @@ reattach when the session moves to another host.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
-  says so and routes the user to the terminal.
+  says so, names the Terminal view (not a rail shell tab), and offers an "Open
+  the Terminal view to respond" button that switches to it. A side chat only
+  names its own terminal.
 
 ## How to get to it (user POV)
 
@@ -34,6 +36,8 @@ reattach when the session moves to another host.
 
 - Use the Chat/Terminal switcher in the session header.
 - On a phone, use the view mode choice in the header menu.
+- When chat is parked on a harness dialog, use the working indicator's "Open
+  the Terminal view to respond" button.
 - Choose Resume when the terminal shows as stopped.
 
 **User shells:**
@@ -94,6 +98,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  (injected status),
+  `tests/e2e_ui/chat/test_blocked_dialog_names_wrong_terminal.py::test_chat_blocked_on_dialog_names_the_terminal_that_holds_it`
+  (real Claude Code dialog with a rail shell open; clicks the indicator's button)
 
 ## Gotchas
 
