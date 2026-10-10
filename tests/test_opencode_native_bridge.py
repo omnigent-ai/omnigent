@@ -19,6 +19,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     ensure_auth_secret,
     prepare_bridge_dir,
     read_bridge_state,
+    split_model_variant,
     update_active_message_id,
     update_last_event_id,
     update_model_override,
@@ -124,6 +125,49 @@ def test_update_model_override(bridge_dir: Path) -> None:
 def test_update_model_override_no_state_returns_false(bridge_dir: Path) -> None:
     # No bridge state written yet (server not launched).
     assert update_model_override(bridge_dir, "x/y") is False
+
+
+def test_variant_override_round_trips(bridge_dir: Path) -> None:
+    write_bridge_state(
+        bridge_dir,
+        _state(
+            bridge_dir,
+            model_override="opencode-go/deepseek-v4.1-flash",
+            variant_override="max",
+        ),
+    )
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.model_override == "opencode-go/deepseek-v4.1-flash"
+    assert loaded.variant_override == "max"
+
+
+def test_update_model_override_splits_variant_suffix(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir))
+    assert update_model_override(bridge_dir, "opencode-go/muse-spark-1.3-contributor#xhigh")
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.model_override == "opencode-go/muse-spark-1.3-contributor"
+    assert loaded.variant_override == "xhigh"
+
+
+def test_update_model_override_clears_stale_variant(bridge_dir: Path) -> None:
+    write_bridge_state(
+        bridge_dir,
+        _state(bridge_dir, model_override="opencode-go/a", variant_override="max"),
+    )
+    assert update_model_override(bridge_dir, "anthropic/claude-opus-4")
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.model_override == "anthropic/claude-opus-4"
+    assert loaded.variant_override is None
+
+
+def test_split_model_variant() -> None:
+    assert split_model_variant("opencode-go/muse#xhigh") == ("opencode-go/muse", "xhigh")
+    assert split_model_variant("opencode-go/muse") == ("opencode-go/muse", None)
+    # A dangling ``#`` yields the base id with no variant.
+    assert split_model_variant("opencode-go/muse#") == ("opencode-go/muse", None)
 
 
 def test_write_relay_bridge_config_writes_token_and_is_idempotent(bridge_dir: Path) -> None:

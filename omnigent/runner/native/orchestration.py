@@ -1559,7 +1559,18 @@ async def _auto_create_opencode_terminal(
             await leftover.close()
     clear_bridge_state(bridge_dir)
 
-    model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
+    # Resolve the model and its variant pin together. A session/CLI model
+    # override replaces the bundle's model and does not inherit the bundle's
+    # executor.variant; only a model#variant suffix on the chosen model travels
+    # with it. The pin is carried in bridge state and sent as a top-level prompt
+    # key; the gateway/config resolution below sees only the base model id.
+    model_override, variant_override = _resolve_opencode_launch_model_variant(
+        launch_config.model_override, agent_spec, session_id=session_id
+    )
+    # The gateway/managed-connect resolution below can swap in a different
+    # served model; a variant belongs to the model it was pinned with, so keep
+    # the pinned model to drop the pin if a different model is selected.
+    variant_pinned_model = model_override
     # Route opencode through the Databricks Unity Gateway when the spec names a
     # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
     # CLI translates), opencode reads provider/auth from its own config file, so
@@ -1661,6 +1672,12 @@ async def _auto_create_opencode_terminal(
             # model-id prefix against its own auth.json, so no provider block is
             # needed.
             config = dict(build_opencode_model_default_config(model_override))
+
+    # If the gateway/managed-connect path replaced the pinned model, the variant
+    # no longer applies to it, so clear it.
+    variant_override = _variant_for_launch_model(
+        variant_override, variant_pinned_model, model_override
+    )
 
     # Build opencode's ``mcp`` block: the Omnigent builtin-tool relay (so the
     # model can call sys_*/load_skill/web_fetch — the real "connects to Omnigent
@@ -1805,6 +1822,7 @@ async def _auto_create_opencode_terminal(
                 xdg_data_home=str(server.xdg_data_home),
                 xdg_config_home=str(server.xdg_config_home),
                 model_override=model_override,
+                variant_override=variant_override,
                 workspace=workspace,
             ),
         )
@@ -2044,6 +2062,82 @@ def _opencode_native_model_from_spec(
         return _resolve_spec_model(spec)
     except Exception:  # noqa: BLE001 - model resolution is best effort.
         return None
+
+
+def _opencode_native_variant_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
+    """
+    Resolve the OpenCode variant pin from a resolved agent spec.
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's ``executor.variant``, or ``None``.
+    """
+    if agent_spec is None:
+        return None
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    return spec.executor.variant
+
+
+def _resolve_opencode_launch_model_variant(
+    session_model_override: str | None,
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    *,
+    session_id: str = "",
+) -> tuple[str | None, str | None]:
+    """
+    Resolve the ``(model, variant)`` pair for an opencode-native launch.
+
+    A session/CLI model override replaces the bundle's model and does not
+    inherit the bundle's ``executor.variant``; only a ``model#variant`` suffix
+    on the chosen model travels with it. For the bundle's own model an explicit
+    ``executor.variant`` wins over a model-id suffix (logged on conflict). A
+    variant-only spec keeps its pin with no model, so it still reaches the
+    serve on OpenCode's own default model.
+
+    :param session_model_override: Persisted/CLI model override, or ``None``.
+    :param agent_spec: Optional resolved agent spec.
+    :param session_id: Conversation id, used only for the conflict log.
+    :returns: ``(model, variant)`` with the base model id and resolved variant.
+    """
+    from omnigent.harnesses.opencode_native.bridge import split_model_variant
+
+    if session_model_override:
+        return split_model_variant(session_model_override)
+    variant = _opencode_native_variant_from_spec(agent_spec)
+    model = _opencode_native_model_from_spec(agent_spec)
+    if not model:
+        return None, variant
+    model, suffix_variant = split_model_variant(model)
+    if variant and suffix_variant and variant != suffix_variant:
+        _logger.warning(
+            "opencode launch for session %s: executor.variant %r overrides the "
+            "model-id suffix variant %r.",
+            session_id or "<unknown>",
+            variant,
+            suffix_variant,
+        )
+    return model, variant or suffix_variant
+
+
+def _variant_for_launch_model(
+    variant: str | None, pinned_model: str | None, launch_model: str | None
+) -> str | None:
+    """
+    Drop a variant whose model gateway/managed-connect selection replaced.
+
+    A variant pin belongs to the model it was resolved with. When the gateway
+    or managed-connect path swaps in a different served model, the pin no
+    longer applies, so clear it.
+
+    :param variant: The variant resolved for ``pinned_model``.
+    :param pinned_model: The model the variant was resolved against.
+    :param launch_model: The model actually selected for the launch.
+    :returns: ``variant`` when the model is unchanged, else ``None``.
+    """
+    if variant and launch_model != pinned_model:
+        return None
+    return variant
 
 
 def _resolve_opencode_compact_model(
