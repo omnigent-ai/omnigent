@@ -140,6 +140,13 @@ class SysScheduledTaskCreateTool(Tool):
                                 "with it. Requires managed sandboxes configured on the server."
                             ),
                         },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional Project id for organizational filing. Omit or pass "
+                                "an empty string to create the task unfiled."
+                            ),
+                        },
                     },
                     "required": ["name", "prompt", "rrule", "agent_id"],
                     "additionalProperties": False,
@@ -263,6 +270,13 @@ class SysScheduledTaskUpdateTool(Tool):
                         "state": {
                             "type": "string",
                             "description": "'active' or 'paused'.",
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "New Project id. Omit to preserve the assignment or pass an "
+                                "empty string to unfile."
+                            ),
                         },
                     },
                     "required": ["scheduled_task_id"],
