@@ -849,6 +849,76 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     assert "host startup failed" in sandbox_status["error"]
 
 
+async def test_parked_message_rides_out_a_clone_longer_than_the_rendezvous_budget(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message parked on a launch whose clone outlives the rendezvous budget waits for
+    the launch's own verdict instead of failing "still provisioning": the fake launcher
+    holds ``git clone`` for several budgets, then the launch fails at host start."""
+    import threading
+
+    env = managed_session_env
+    budget_s = 0.3
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", budget_s
+    )
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts.MANAGED_LAUNCH_PROGRESS_POLL_S", 0.02, raising=False
+    )
+    clone_gate = threading.Event()
+
+    def _hold_clone(command: str) -> None:
+        if "git clone" in command:
+            assert clone_gate.wait(timeout=30), "test never released the clone gate"
+
+    fake = FakeSandboxLauncher(on_command=_hold_clone, fail_on_host_start=True)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="managed-monorepo-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "workspace": "https://github.com/org/monorepo.git",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    message_task = asyncio.create_task(
+        env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "summarize the repo"}],
+                },
+            },
+        )
+    )
+    # Several budgets pass with the clone still held: the message must stay
+    # parked on the cloning stage rather than time out.
+    done, _ = await asyncio.wait({message_task}, timeout=4 * budget_s)
+    assert not done, (
+        f"message POST gave up mid-clone: "
+        f"{message_task.result().status_code} {message_task.result().text}"
+    )
+    snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["sandbox_status"] == {"stage": "cloning", "error": None}
+
+    clone_gate.set()
+    message_resp = await asyncio.wait_for(message_task, timeout=15.0)
+    assert message_resp.status_code == 503, message_resp.text
+    assert "still provisioning" not in message_resp.text
+    assert "managed sandbox failed to launch" in message_resp.text
+    assert "host startup failed" in message_resp.text
+    assert fake.terminated == ["sb-fake-1"]
+
+
 async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
