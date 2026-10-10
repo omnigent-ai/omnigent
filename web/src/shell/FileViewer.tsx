@@ -79,6 +79,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
+import { isVideoFile } from "@/lib/video";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import {
   type Comment,
@@ -400,8 +401,9 @@ function FileViewerBody({
   // visible. No-op off iOS / with the keyboard closed. Not needed frameless
   // (embedded in the desktop aside, never a fixed overlay).
   const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
-  const fileQuery = useFileContent(conversationId, path);
-  const diffQuery = useFileDiff(conversationId, path);
+  // Video playback reads the complete binary on demand, never the capped JSON preview.
+  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path);
+  const diffQuery = useFileDiff(conversationId, isVideoFile(path) ? null : path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -683,6 +685,7 @@ function FileViewerBody({
   // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
   const isPdf = isPdfFile(path, fileQuery.data?.content_type);
+  const isVideo = isVideoFile(path, fileQuery.data?.content_type);
   // 3D models render through CodeViewer's <ModelViewer> — like images and PDFs,
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
@@ -694,6 +697,7 @@ function FileViewerBody({
   const isDiffAvailable =
     !isImage &&
     !isPdf &&
+    !isVideo &&
     !isModel &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
@@ -854,7 +858,13 @@ function FileViewerBody({
   // would swallow the browser's find-in-page with no find widget to show.
   const isMonacoFindSurface =
     diffViewActive ||
-    (lang !== "markdown" && viewMode !== "preview" && !isImage && !isPdf && !isModel && !isBinary);
+    (lang !== "markdown" &&
+      viewMode !== "preview" &&
+      !isImage &&
+      !isPdf &&
+      !isVideo &&
+      !isModel &&
+      !isBinary);
   // Cmd+F must open find-in-file only while the file viewer is the surface the
   // user is working in. The viewer stays mounted beside the chat, so `open`
   // alone can't tell them apart, and reading `document.activeElement` at
@@ -1180,7 +1190,7 @@ function FileViewerBody({
       onSelect: () => revealInFileManager(revealTarget),
     });
   }
-  if (!isDeletedFile && fileQuery.data) {
+  if (!isDeletedFile && (fileQuery.data || isVideo)) {
     settingsMenu.push({
       key: "download",
       label: "Download file",

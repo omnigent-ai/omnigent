@@ -22,6 +22,8 @@ import {
   WORKSPACE_FILE_LINK_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { VideoPlayer } from "@/components/VideoPlayer";
+import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
 import { isNativeShell } from "@/lib/nativeBridge";
@@ -97,7 +99,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
   const { exists, settled } = useWorkspaceFileExists(
     conversationId,
     openFile && linkPath && !isChanged ? linkPath : null,
-    explicitLink || (resolution?.trusted ?? false),
+    explicitLink || (resolution?.trusted ?? false) || isVideoFile(cited),
   );
 
   if (!openFile || !linkPath || !(isChanged || exists)) {
@@ -305,6 +307,14 @@ function WorkspaceFileLink({
   const conversationId = useFileViewerConversationId();
 
   if (!path) {
+    if (typeof href === "string" && isRemoteVideoUrl(href)) {
+      return (
+        <VideoPlayer
+          src={href}
+          title={typeof children === "string" ? children : "Video recording"}
+        />
+      );
+    }
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
     // `/c/<id>`) under the deployment base path; no-op for external URLs, `#`
     // fragments, and at the origin root. The router basename does not reach raw
@@ -384,6 +394,19 @@ function WorkspaceFileLink({
       <span className={className} title={title ?? path}>
         {children}
       </span>
+    );
+  }
+
+  if (conversationId && isVideoFile(resolvedPath)) {
+    return (
+      <VideoPlayer
+        conversationId={conversationId}
+        path={resolvedPath}
+        title={
+          typeof children === "string" ? children : (resolvedPath.split("/").pop() ?? resolvedPath)
+        }
+        onOpenFile={openWorkspaceFile}
+      />
     );
   }
 
