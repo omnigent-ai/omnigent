@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from functools import cache
 
@@ -157,6 +158,31 @@ def _cli_probe_args(binary: str) -> list[str]:
         # e2e rows skip instead of failing deep inside ``PiExecutor``.
         return [binary, "--help"]
     return [binary, "--version"]
+
+
+@cache
+def bwrap_namespace_unavailable() -> str | None:
+    """Return ``None`` when bwrap can spawn a namespace here, else a skip reason.
+
+    Agents already running inside a sandbox usually cannot create user
+    namespaces, so tests that execute a bwrap mount plan skip there.
+    """
+    if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
+        return "Linux with bubblewrap is required"
+    try:
+        probe = subprocess.run(
+            ["bwrap", "--ro-bind", "/", "/", "true"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"bwrap probe failed to run: {exc}"
+    if probe.returncode == 0:
+        return None
+    detail = (probe.stderr or probe.stdout).strip().splitlines()
+    return detail[0] if detail else f"bwrap exited {probe.returncode}"
 
 
 @cache

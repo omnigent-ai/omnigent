@@ -45,7 +45,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-from functools import cache
 from pathlib import Path
 
 import pytest
@@ -57,7 +56,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
-from tests.e2e._harness_probes import cli_unavailable_reason
+from tests.e2e._harness_probes import bwrap_namespace_unavailable, cli_unavailable_reason
 
 pytestmark = [
     pytest.mark.skipif(
@@ -77,32 +76,6 @@ _SKILL_MARKER = "bundle-skill methodology marker 4f8a1c"
 
 # A checkout-wide grant masks its .venv; grant only the Python runtime and source.
 _RUNTIME_READ_PATHS = [str(Path(__file__).resolve().parents[2] / "omnigent"), sys.prefix]
-
-
-@cache
-def _bwrap_namespace_unavailable() -> str | None:
-    """Return a skip reason when bwrap cannot create namespaces here.
-
-    Nested sandboxes (CI agents already running inside bubblewrap) cannot
-    create user namespaces, so mount-executing tests must skip there while
-    the mount-plan tests keep running.
-
-    :returns: ``None`` when a trivial bwrap namespace spawns, else the
-        first stderr line explaining why it cannot.
-    """
-    if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
-        return "Linux with bubblewrap is required"
-    probe = subprocess.run(
-        ["bwrap", "--ro-bind", "/", "/", "true"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if probe.returncode == 0:
-        return None
-    detail = (probe.stderr or probe.stdout).strip().splitlines()
-    return detail[0] if detail else f"bwrap exited {probe.returncode}"
 
 
 def _build_workspace_and_bundle(root: Path) -> tuple[Path, Path]:
@@ -417,8 +390,8 @@ async def test_manifest_skill_path_readable_in_sandbox_mount_plan(tmp_path: Path
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    _bwrap_namespace_unavailable() is not None,
-    reason=f"cannot execute bwrap namespaces here: {_bwrap_namespace_unavailable()}",
+    bwrap_namespace_unavailable() is not None,
+    reason=f"cannot execute bwrap namespaces here: {bwrap_namespace_unavailable()}",
 )
 async def test_manifest_skill_readable_through_real_bwrap_namespace(tmp_path: Path) -> None:
     """Same contract, executed in a real bwrap namespace.
@@ -454,8 +427,8 @@ async def test_manifest_skill_readable_through_real_bwrap_namespace(tmp_path: Pa
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    _bwrap_namespace_unavailable() is not None,
-    reason=f"cannot execute bwrap namespaces here: {_bwrap_namespace_unavailable()}",
+    bwrap_namespace_unavailable() is not None,
+    reason=f"cannot execute bwrap namespaces here: {bwrap_namespace_unavailable()}",
 )
 @pytest.mark.parametrize("copy_on_write", [False, True])
 async def test_manifest_skill_readable_through_cached_os_environment(
@@ -564,8 +537,8 @@ async def test_manifest_skill_readable_through_cached_os_environment(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    _bwrap_namespace_unavailable() is not None,
-    reason=f"cannot execute bwrap namespaces here: {_bwrap_namespace_unavailable()}",
+    bwrap_namespace_unavailable() is not None,
+    reason=f"cannot execute bwrap namespaces here: {bwrap_namespace_unavailable()}",
 )
 @pytest.mark.parametrize("second_filter", ["all", "none"])
 async def test_sessions_only_read_their_own_staged_skills(
