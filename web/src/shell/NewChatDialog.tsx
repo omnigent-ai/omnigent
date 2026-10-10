@@ -4860,16 +4860,15 @@ export function NewChatLandingScreen() {
     }
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
-  const canSubmit =
-    (message.trim().length > 0 || files.length > 0) &&
+  const canSubmitBody =
     !pickerLoading &&
     !workspaceLoading &&
     !pendingSkillCompletion &&
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
     selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
-    !creating;
+    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid);
+  const canSubmit = (message.trim().length > 0 || files.length > 0) && canSubmitBody && !creating;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
   // order a user fills the form — location first, then message — so the
@@ -5202,11 +5201,16 @@ export function NewChatLandingScreen() {
     }
   }
 
-  async function handleCreate() {
+  async function handleCreate(overrideMessage?: string) {
+    // A voice finish passes the draft the hook just wrote. ``message`` is still
+    // the previous render until React flushes that update, which would drop the
+    // tail or refuse a send that only the tail made non-empty.
+    const promptSource = overrideMessage ?? message;
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
-    if (!canSubmit) return;
+    if (!((promptSource.trim().length > 0 || files.length > 0) && canSubmitBody && !creating))
+      return;
     // A create is actually happening: report it for pointer clicks (via the
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
     // don't emit, matching the disabled Start button.
@@ -5355,7 +5359,7 @@ export function NewChatLandingScreen() {
       // prompt the agent actually receives, not the raw textarea value.
       const initialPrompt =
         buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
-        sanitizeInitialPrompt(message);
+        sanitizeInitialPrompt(promptSource);
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
       // selects which CLI bridge the runner launches — the values are the
@@ -6842,6 +6846,9 @@ export function NewChatLandingScreen() {
                       onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
+                      onVoiceSend={() => {
+                        void handleCreate(dictation.readDraft());
+                      }}
                     />
                     <TooltipProvider>
                       <Tooltip>

@@ -98,6 +98,8 @@ export function useDictationInsert(
   replaceInterim: (text: string) => void;
   /** Report that the composer has been focused, so its caret is real. */
   noteFocus: () => void;
+  /** The draft after the latest insert, including one React has not rendered. */
+  readDraft: () => string;
 } {
   // The draft as last seen. Refreshed on every render so external changes
   // win, and written on insert so a second transcript in the same batch
@@ -134,7 +136,7 @@ export function useDictationInsert(
     const ta = textareaRef?.current;
     if (!ta) return;
     // Deliberately does not focus: a take is usually driven from the mic
-    // button, and stealing focus drops its Enter-commit / Esc-cancel keys.
+    // button, and stealing focus drops its Enter-to-send / Esc-cancel keys.
     // Some browsers scroll an unfocused element to reveal the new selection,
     // so the scroll position is restored around the write; a dictating user
     // watching one part of a long draft shouldn't get yanked elsewhere.
@@ -203,5 +205,9 @@ export function useDictationInsert(
     noteFocus: useCallback(() => {
       focusedRef.current = true;
     }, []),
+    // A voice send reads this in the same turn as appendFinal. setDraft has
+    // not re-rendered yet, so the parent's state would still be the pre-tail
+    // draft and the last words would never leave the composer.
+    readDraft: useCallback(() => draftRef.current, []),
   };
 }
