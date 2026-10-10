@@ -28,7 +28,7 @@ from pathlib import Path
 
 from fakes import OMNIGENT_ENDPOINTS
 
-_SRC = Path(__file__).resolve().parents[1] / "src" / "omnigent_slack"
+_SRC = Path(__file__).resolve().parents[1] / "src" / "omnigent_bot_core"
 # Modules whose HTTP client is bound to the Omnigent server base URL.
 _SCANNED_SOURCES = [_SRC / "omnigent.py", _SRC / "oauth.py"]
 

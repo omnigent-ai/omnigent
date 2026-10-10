@@ -23,8 +23,8 @@ from pathlib import Path
 
 import respx
 from fakes import FakeOmnigentServer, RecordingSlackClient
+from omnigent_bot_core.omnigent import OmnigentClientPool
 from omnigent_slack.models import UserConfig
-from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import _MANAGED_SANDBOX_NOT_READY_TEXT, SlackOmnigentService
 from omnigent_slack.store import SQLiteStore
 from omnigent_slack.text import GENERIC_FAILURE_TEXT
