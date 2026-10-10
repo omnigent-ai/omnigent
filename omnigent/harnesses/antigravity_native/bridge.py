@@ -521,13 +521,9 @@ def write_mcp_config(
     config. Mirrors cursor #742's :func:`omnigent.harnesses.cursor_native.bridge.write_mcp_config`,
     adapted to agy's hidden ``--gemini_dir`` flag.
 
-    The user's real ``~/.gemini/config/mcp_config.json`` is the base of the
-    isolated file: agy loads MCP servers only from the ``--gemini_dir`` it is
-    launched with, so without this merge a dispatched worker silently loses every
-    server the user's interactive agy has. The Omnigent relay is layered on top
-    and wins a name collision. The real file is re-read on every write (a relaunch
-    picks up edits) and never modified; a missing or malformed file seeds only
-    the relay.
+    The user's real ``~/.gemini/config/mcp_config.json`` is re-read on every write
+    and merged beneath the relay, which wins a name collision. A missing or
+    malformed file seeds only the relay; the real file is never modified.
 
     :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
         and the isolated agy Gemini dir).

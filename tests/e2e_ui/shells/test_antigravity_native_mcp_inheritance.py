@@ -108,6 +108,7 @@ def _mcp_connected(mcp_dir: Path, server: str) -> bool:
 @pytest.fixture
 def user_home(antigravity_model: list[str] | None, tmp_path: Path) -> Path:
     """Register the user's own stdio MCP servers with ``agy mcp add`` in the journey HOME."""
+    _TOOL_LISTING.requests.clear()
     home = Path(os.environ["HOME"])
     assert not (home / ".gemini" / "config" / "mcp_config.json").exists(), (
         f"refusing to run `agy mcp add` against a non-fresh HOME {home}"
@@ -148,7 +149,6 @@ def _retain_evidence(files: dict[str, str | bytes]) -> None:
 def test_dispatched_agy_worker_keeps_user_mcp_servers(
     browser: Browser, tmp_path: Path, user_home: Path, antigravity_model: list[str] | None
 ) -> None:
-    _TOOL_LISTING.requests.clear()
     user_config = user_home / ".gemini" / "config" / "mcp_config.json"
     user_config_before = user_config.read_bytes()
     evidence: dict[str, str | bytes] = {
@@ -208,20 +208,19 @@ def test_dispatched_agy_worker_keeps_user_mcp_servers(
             reply.scroll_into_view_if_needed()
             expect(reply).to_be_visible()
             reply_text = reply.inner_text()
-            page.wait_for_timeout(3_000)
+            if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+                page.wait_for_timeout(3_000)  # let the recording linger on the reply
         finally:
             evidence["worker-pane.txt"] = pane_text()
+            evidence["assistant-reply.txt"] = reply_text
+            evidence.update(
+                {f"model-request-{i}.json": raw for i, raw in enumerate(_TOOL_LISTING.requests)}
+            )
+            _retain_evidence(evidence)
             context.close()
 
         worker_list = _agy_mcp_list(agy_home_dir(session.bridge_dir))
-        evidence.update(
-            {
-                "worker-agy-mcp-list.txt": worker_list,
-                "assistant-reply.txt": reply_text,
-                **{f"model-request-{i}.json": raw for i, raw in enumerate(_TOOL_LISTING.requests)},
-            }
-        )
-        _retain_evidence(evidence)
+        _retain_evidence({"worker-agy-mcp-list.txt": worker_list})
 
     # The worker launch must not touch the user's real config, and interactive agy
     # still sees the user's servers (the asymmetry the bug is about).

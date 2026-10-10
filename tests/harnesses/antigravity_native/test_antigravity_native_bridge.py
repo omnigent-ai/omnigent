@@ -1462,21 +1462,24 @@ def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path)
 
 
 def test_write_mcp_config_targets_isolated_agy_gemini_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """write_mcp_config writes into the isolated agy Gemini dir, not ~/.gemini."""
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "real-home"))
+    """Without a user config, the relay alone lands in the isolated agy Gemini dir, silently."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    path = write_mcp_config(bridge_dir, python_executable="python-test")
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
 
-    # The config lands under the isolated --gemini_dir config path, so the user's
-    # real ~/.gemini is untouched.
     assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
     assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
     # The bridge token the shared relay requires is written into the bridge dir.
     assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+    assert not [record for record in caplog.records if record.name == _mod.__name__]
 
 
 def _write_user_mcp_config(fake_home: Path, payload: str) -> Path:
@@ -1608,24 +1611,6 @@ def test_write_mcp_config_restricts_isolated_config_to_owner(
     assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["graft"]["env"] == {
         "GRAFT_TOKEN": "s"
     }
-
-
-def test_write_mcp_config_without_user_config_seeds_only_the_relay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A user without their own MCP servers gets the relay and no warning."""
-    fake_home = tmp_path / "real-home"
-    fake_home.mkdir()
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
-
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
-        path = write_mcp_config(bridge_dir, python_executable="python-test")
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
-    assert not [record for record in caplog.records if record.name == _mod.__name__]
 
 
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
