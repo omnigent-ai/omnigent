@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
   isEmbedded: false,
+  resolvedTheme: undefined as string | undefined,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
   bulkArchiveMutate: vi.fn(),
@@ -49,7 +50,12 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("next-themes", () => ({
-  useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
+  useTheme: () => ({
+    theme: mocks.theme,
+    resolvedTheme: mocks.resolvedTheme,
+    systemTheme: "light",
+    setTheme: mocks.setTheme,
+  }),
 }));
 vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -229,6 +235,7 @@ beforeEach(() => {
   mocks.conversationQuery.mockReset();
   mocks.theme = "system";
   mocks.isEmbedded = false;
+  mocks.resolvedTheme = undefined;
   mocks.accountsEnabled = true;
   mocks.importSessionsPanel.mockClear();
   mocks.loginUrl = "/login";
@@ -569,6 +576,142 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("renders the Extra keys row select in the Touch & mobile section, defaulting to Auto", () => {
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+    expect(select.value).toBe("auto");
+    expect(screen.getByText("Auto (touch devices)")).toBeInTheDocument();
+    expect(screen.getByText("Always")).toBeInTheDocument();
+    expect(screen.getByText("Never")).toBeInTheDocument();
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
+
+    const touch = screen.getByRole("heading", { level: 2, name: "Touch & mobile" });
+    const codeWeight = screen.getByText("Heavier code font");
+    const extraKeys = screen.getByText("Extra keys row");
+    const exportButton = screen.getByTestId("export-settings-button");
+    const follows = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(follows(codeWeight, touch)).toBe(true);
+    expect(follows(touch, extraKeys)).toBe(true);
+    expect(follows(extraKeys, exportButton)).toBe(true);
+  });
+
+  it("persists Always / Never for the extra keys row and clears the key for Auto", () => {
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+
+    fireEvent.change(select, { target: { value: "on" } });
+    expect(select.value).toBe("on");
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("on");
+
+    fireEvent.change(select, { target: { value: "off" } });
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("off");
+
+    fireEvent.change(select, { target: { value: "auto" } });
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
+  });
+
+  it("reflects a stored extra keys row preference on mount", () => {
+    localStorage.setItem("omnigent:terminal-extra-keys", "off");
+    renderPage("/settings/appearance");
+    expect((screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement).value).toBe(
+      "off",
+    );
+  });
+
+  it("describes the extra keys row by the keys it adds, without truncating", () => {
+    renderPage("/settings/appearance");
+    const description = screen.getByText(
+      "Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.",
+    );
+    const card = description.closest<HTMLElement>(".rounded-xl");
+    expect(card).not.toBeNull();
+    // Nothing from the text up to the card may clip it to one line or a line count.
+    for (let el: HTMLElement | null = description; el && el !== card!.parentElement;) {
+      const utilities = Array.from(el.classList, (token) => token.split(":").pop()!);
+      expect(
+        utilities.filter(
+          (u) => u === "truncate" || u === "whitespace-nowrap" || u.startsWith("line-clamp-"),
+        ),
+      ).toEqual([]);
+      el = el.parentElement;
+    }
+  });
+
+  it("switches the extra keys preview between Always, Never and Auto", () => {
+    renderPage("/settings/appearance");
+    const preview = screen.getByTestId("terminal-extra-keys-preview");
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+
+    // A scene is a frame of terminal lines, optional key pills, then a 20-key keyboard.
+    const scene = () => {
+      const parts = Array.from(preview.firstElementChild!.children);
+      return {
+        terminalLines: parts[0]!.children.length,
+        pills: parts.length === 3,
+        keyboardKeys: parts[parts.length - 1]!.children.length,
+      };
+    };
+
+    fireEvent.change(select, { target: { value: "on" } });
+    expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
+    expect(within(preview).getAllByTestId("extra-keys-preview-pills")).toHaveLength(1);
+    expect(scene()).toEqual({ terminalLines: 2, pills: true, keyboardKeys: 20 });
+
+    fireEvent.change(select, { target: { value: "off" } });
+    expect(within(preview).queryByTestId("extra-keys-preview-auto")).toBeNull();
+    expect(within(preview).queryByTestId("extra-keys-preview-pills")).toBeNull();
+    expect(scene()).toEqual({ terminalLines: 3, pills: false, keyboardKeys: 20 });
+
+    fireEvent.change(select, { target: { value: "auto" } });
+    expect(within(preview).getByTestId("extra-keys-preview-auto")).toBeInTheDocument();
+  });
+
+  it("composites Always and Never on System's diagonal for the Auto preview", () => {
+    renderPage("/settings/appearance");
+    const auto = within(screen.getByTestId("terminal-extra-keys-preview")).getByTestId(
+      "extra-keys-preview-auto",
+    );
+    const [always, never] = Array.from(auto.children) as HTMLElement[];
+    expect(auto).toHaveClass("grid");
+    expect(auto.children).toHaveLength(2);
+    // Both layers share one grid cell so the frames line up.
+    for (const layer of [always!, never!]) {
+      expect(layer).toHaveClass("col-start-1", "row-start-1");
+    }
+    expect(always!.style.clipPath).toBe("");
+    expect(within(always!).getByTestId("extra-keys-preview-pills")).toBeInTheDocument();
+    expect(never!.style.clipPath).toBe("polygon(62% 0, 100% 0, 100% 100%, 38% 100%)");
+    expect(within(never!).queryByTestId("extra-keys-preview-pills")).toBeNull();
+  });
+
+  it("draws the extra keys preview in the current light or dark palette", () => {
+    const frameColors = () =>
+      Array.from(
+        screen
+          .getByTestId("extra-keys-preview-auto")
+          .querySelectorAll<HTMLElement>(".h-16.p-1\\.5"),
+        (frame) => frame.style.backgroundColor,
+      );
+
+    renderPage("/settings/appearance");
+    expect(frameColors()).toEqual(["rgb(233, 235, 238)", "rgb(233, 235, 238)"]);
+    cleanup();
+
+    mocks.resolvedTheme = "dark";
+    renderPage("/settings/appearance");
+    expect(frameColors()).toEqual(["rgb(14, 16, 19)", "rgb(14, 16, 19)"]);
+
+    // Always and Never on their own use the dark palette too (DARK_MODE_PREVIEW.bg).
+    const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
+    const frame = () =>
+      screen.getByTestId("terminal-extra-keys-preview").firstElementChild as HTMLElement;
+    for (const mode of ["on", "off"]) {
+      fireEvent.change(select, { target: { value: mode } });
+      expect(frame().style.backgroundColor).toBe("rgb(14, 16, 19)");
+    }
+  });
+
   it("defaults transcripts to Chat and persists a Terminal default", () => {
     renderPage("/settings/appearance");
 
@@ -817,6 +960,9 @@ describe("SettingsPage", () => {
     mocks.theme = "dark";
     fireEvent.click(screen.getByTestId("theme-dark"));
     fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.change(screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement, {
+      target: { value: "on" },
+    });
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
@@ -838,6 +984,7 @@ describe("SettingsPage", () => {
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBe("on");
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
@@ -868,8 +1015,13 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
+    // Terminal theme, extra keys row, transcript view, workspace defaults, and
+    // harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect((screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement).value).toBe(
+      "auto",
+    );
+    expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
       "true",
