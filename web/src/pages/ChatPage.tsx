@@ -261,6 +261,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
+import { COMPOSER_POPOVER_MAX_H, COMPOSER_POPOVER_Z } from "./chatLayout";
 import { Transcript } from "@/components/chat/Transcript";
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
@@ -2977,6 +2978,8 @@ function ComposerImpl(
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
+          dirtyRef.current = true;
+          setValue("");
           setCommandError(
             `Model: ${current}\nUsage: /model <name>${supportsModelReset ? " | default" : ""}`,
           );
@@ -3031,11 +3034,15 @@ function ComposerImpl(
           lines.push("No usage data yet — send a message first.");
         }
         lines.push(`Items in context: ${blocks.length}`);
+        dirtyRef.current = true;
+        setValue("");
         setCommandError(lines.join("\n"));
         return true;
       }
       case "/help": {
         const lines = Object.entries(slashCommands).map(([name, desc]) => `${name} — ${desc}`);
+        dirtyRef.current = true;
+        setValue("");
         setCommandError(lines.join("\n"));
         return true;
       }
@@ -3686,6 +3693,21 @@ function ComposerImpl(
                   onRetrySkills={() => void refreshSkills()}
                 />
               )}
+              {commandError !== null && (
+                <div
+                  data-testid="composer-command-output"
+                  role="status"
+                  className={cn(
+                    "absolute inset-x-0 bottom-full mb-2 overflow-y-auto overscroll-contain rounded-[12px] border border-border bg-popover px-3 py-2 shadow-menu",
+                    COMPOSER_POPOVER_Z,
+                    COMPOSER_POPOVER_MAX_H,
+                  )}
+                >
+                  <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-muted-foreground">
+                    {commandError}
+                  </p>
+                </div>
+              )}
               {/* "@"-file-mention browser — native coding-agent sessions only.
             Also shown (as a loading row) while the listing is still fetching,
             so "@" isn't silently dead during runner cold-boot or a drill-in. */}
@@ -3775,8 +3797,6 @@ function ComposerImpl(
                 onRemove={removeMentionedItem}
                 showLineRange
               />
-              {/* Inline slash-command feedback: errors and /help output */}
-              {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>
           ),
         }}
