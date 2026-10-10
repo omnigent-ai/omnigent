@@ -41,6 +41,12 @@ val appVersionName = buildProperty("versionName") ?: "0.1.3"
 val databricksOAuthClientId = buildProperty("databricksOAuthClientId") ?: ""
 val databricksOAuthRedirectUrl =
     buildProperty("databricksOAuthRedirectUrl") ?: "https://login.databricks.com/mobile-redirect"
+val databricksOAuthRedirectUri = URI(databricksOAuthRedirectUrl)
+require(
+    databricksOAuthRedirectUri.scheme == "https" &&
+        !databricksOAuthRedirectUri.host.isNullOrBlank() &&
+        !databricksOAuthRedirectUri.path.isNullOrBlank(),
+) { "databricksOAuthRedirectUrl must be an HTTPS URL with a host and path" }
 
 fun quotedBuildConfig(value: String): String =
     "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -65,6 +71,12 @@ android {
             "DATABRICKS_OAUTH_REDIRECT_URL",
             quotedBuildConfig(databricksOAuthRedirectUrl),
         )
+        manifestPlaceholders["databricksOAuthRedirectScheme"] =
+            databricksOAuthRedirectUri.scheme
+        manifestPlaceholders["databricksOAuthRedirectHost"] =
+            databricksOAuthRedirectUri.host
+        manifestPlaceholders["databricksOAuthRedirectPath"] =
+            databricksOAuthRedirectUri.path
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
@@ -138,6 +150,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity)
     implementation(libs.androidx.appcompat)
+    implementation(libs.androidx.browser)
     implementation(libs.androidx.webkit)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

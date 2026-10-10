@@ -19,6 +19,9 @@ data class DatabricksOAuthConfiguration(
     }
 
     fun matchesCallback(uri: URI): Boolean =
+        matchesRegisteredRedirect(uri) || matchesPrivateCallback(uri)
+
+    private fun matchesRegisteredRedirect(uri: URI): Boolean =
         uri.scheme.equals("https", ignoreCase = true) &&
             uri.host.equals(redirectUri.host, ignoreCase = true) &&
             effectivePort(uri) == effectivePort(redirectUri) &&
@@ -26,7 +29,18 @@ data class DatabricksOAuthConfiguration(
             uri.rawUserInfo == null &&
             uri.rawFragment == null
 
+    private fun matchesPrivateCallback(uri: URI): Boolean =
+        uri.scheme.equals(PRIVATE_CALLBACK_SCHEME, ignoreCase = true) &&
+            uri.host.equals(PRIVATE_CALLBACK_HOST, ignoreCase = true) &&
+            uri.port == -1 &&
+            uri.rawUserInfo == null &&
+            uri.rawPath.isNullOrEmpty() &&
+            uri.rawFragment == null
+
     companion object {
+        const val PRIVATE_CALLBACK_SCHEME = DatabricksOAuthAttempt.MOBILE_REDIRECT_SCHEME
+        const val PRIVATE_CALLBACK_HOST = "mobile-redirect"
+
         fun fromBuildConfig(): DatabricksOAuthConfiguration =
             DatabricksOAuthConfiguration(
                 clientId = BuildConfig.DATABRICKS_OAUTH_CLIENT_ID,
