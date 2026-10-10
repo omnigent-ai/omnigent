@@ -99,6 +99,11 @@ def set_count_persist_hook(hook: Callable[[str, int], None] | None) -> None:
     _count_persist_hook = hook
 
 
+def get_count_persist_hook() -> Callable[[str, int], None] | None:
+    """Return the registered pending-count persist hook, or ``None``."""
+    return _count_persist_hook
+
+
 def _notify_count_hook(conversation_id: str, count: int) -> None:
     """Fire the count persist hook, if any (read-once, like the observer)."""
     hook = _count_persist_hook

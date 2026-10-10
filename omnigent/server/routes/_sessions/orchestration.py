@@ -2200,6 +2200,29 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+async def _runner_confirmed_offline(session_id: str, runner_router: RunnerRouter | None) -> bool:
+    """Whether the session's bound runner is confirmed gone, not merely elsewhere.
+
+    The orphaned-count reconcile may fire only on positive proof the runner is
+    gone (``RUNNER_UNAVAILABLE``). Any other outcome leaves the authoritative
+    count untouched: a ``WRONG_REPLICA`` miss means the runner is live on another
+    replica that owns the count, and a ``NOT_FOUND``/``CONFLICT``/transient error
+    is inconclusive. Reconciling on those would zero the durable count from an
+    empty local index and clear the badge without the answer ever landing.
+    """
+    if runner_router is None:
+        return await _get_runner_client(session_id, runner_router) is None
+    try:
+        runner_router.client_for_session_resources(session_id)
+    except OmnigentError as exc:
+        return exc.code == ErrorCode.RUNNER_UNAVAILABLE
+    except (LookupError, httpx.HTTPError):
+        # A routing/transport failure is not proof the runner is gone; the
+        # reconcile is best-effort, so never fail an already-resolved answer.
+        return False
+    return False
+
+
 async def _resolve_elicitation(
     session_id: str,
     data: dict[str, Any],
@@ -2357,6 +2380,15 @@ async def _resolve_elicitation(
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
     await _forward_approval_to_runner(session_id, data, runner_router)
+
+    # A restart with a dead runner orphans the persisted pending count: the empty
+    # index makes ``resolve`` above a no-op. Reconcile the live count only when the
+    # runner is confirmed offline; a runner on another replica owns that write.
+    if isinstance(elicitation_id, str) and elicitation_id:
+        if await _runner_confirmed_offline(session_id, runner_router):
+            session_live_state.persist_pending_count(
+                session_id, pending_elicitations.count_for(session_id)
+            )
 
 
 def _spawn_native_approval_popup_forward(
