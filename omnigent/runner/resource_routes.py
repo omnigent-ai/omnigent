@@ -51,6 +51,7 @@ from omnigent.runner.native import (
     _auto_create_qwen_terminal,
     _auto_create_repl_terminal,
     _claude_native_bridge_id_for_session,
+    _codex_bridge_torn_down_for_live_pane,
     _codex_ensure_response_with_policy_notice,
     _ensure_native_terminal,
     _is_runner_owned_antigravity_terminal,
@@ -639,14 +640,18 @@ def register_resource_routes(
         for a crashed pane) always restarts a fresh TUI. Either way the prior
         turns are guaranteed only in the server transcript.
 
-        Detection has two layers: (1) the reaper POPPING the registry entry
+        Detection has three layers: (1) the reaper POPPING the registry entry
         when it reaps (``registry.close()`` -> ``get()`` returns ``None``),
-        and (2) an ``is_alive()`` probe when the registry entry exists, catching
+        (2) an ``is_alive()`` probe when the registry entry exists, catching
         crashed-but-registered panes (tmux killed externally without
-        ``close()``). The probe runs only when a turn arrives, not on a
-        poll. Every native short-name this can target has a matching
-        ``ensure_native_terminal`` branch in ``create_session_terminal``
-        (kept in lockstep with ``harness_aliases.NATIVE_HARNESSES``).
+        ``close()``), and (3) for codex, a live pane whose bridge dir was torn
+        down by a session teardown: the executor would find neither bridge
+        state nor a recorded startup error and fail the turn generically, so
+        the pane is closed and relaunched to restore a deliverable bridge. The
+        probes run only when a turn arrives, not on a poll. Every native
+        short-name this can target has a matching ``ensure_native_terminal``
+        branch in ``create_session_terminal`` (kept in lockstep with
+        ``harness_aliases.NATIVE_HARNESSES``).
         """
         terminal_name = native_terminal_name(harness_name)
         if terminal_name is None:
@@ -656,14 +661,32 @@ def register_resource_routes(
             return
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
-            if await instance.is_alive():
-                return  # pane is registered and alive — nothing to heal
-            _logger.info(
-                "native pane registered but dead for conv=%s harness=%s; closing stale entry",
-                conv_id,
-                harness_name,
-                extra={"session_id": conv_id},
+            pane_alive = await instance.is_alive()
+            bridge_torn_down = (
+                pane_alive
+                and terminal_name == "codex"
+                and await _codex_bridge_torn_down_for_live_pane(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
             )
+            if pane_alive and not bridge_torn_down:
+                return  # pane is registered and alive with its bridge intact
+            if bridge_torn_down:
+                _logger.info(
+                    "native pane alive but its bridge was torn down for conv=%s harness=%s; "
+                    "relaunching so turn delivery finds fresh bridge state",
+                    conv_id,
+                    harness_name,
+                    extra={"session_id": conv_id},
+                )
+            else:
+                _logger.info(
+                    "native pane registered but dead for conv=%s harness=%s; closing stale entry",
+                    conv_id,
+                    harness_name,
+                    extra={"session_id": conv_id},
+                )
             # Re-check the registry before closing: a concurrent ensure/recreate
             # path may have already replaced this entry with a live pane between
             # our get() and now.  Only close if the registry still points at the

@@ -1,0 +1,377 @@
+"""Turn delivery relaunches a live codex pane whose bridge files are gone.
+
+``_delete_native_bridge_dirs`` (session delete / resource cleanup) can remove a
+session's bridge dir while its tmux pane survives. The turn-time self-heal
+(``_ensure_native_terminal_for_turn``) closes and re-creates such a pane before
+forwarding the turn, leaves a pane with an intact bridge alone, and never
+relaunches when the session's bridge identity is rotated or cannot be read.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.bridge import (
+    CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    bridge_dir_for_bridge_id,
+    bridge_torn_down,
+    prepare_bridge_dir,
+    write_mcp_bridge_config,
+)
+from omnigent.inner.databricks_executor import DatabricksAuthError
+from omnigent.runner import create_runner_app
+from omnigent.runner.native.orchestration import _codex_bridge_torn_down_for_live_pane
+from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.terminals import TerminalRegistry
+from tests.runner.conftest import (
+    _FakeProcessManager,
+    _runner_client,
+    _ScriptedHarnessClient,
+    _sse,
+)
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+
+
+class _LabelServerClient:
+    """Server-client stub for the session labels endpoint, counting calls.
+
+    ``labels`` is served as ``{"labels": labels}``; ``body`` replaces the whole
+    payload instead. With neither, ``json()`` raises like a non-JSON body. An
+    ``error`` is raised instead of answering.
+    """
+
+    def __init__(
+        self,
+        labels: dict[str, str] | None = None,
+        *,
+        status_code: int = 200,
+        body: Any = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._payload = {"labels": labels} if labels is not None else body
+        self._status_code = status_code
+        self._error = error
+        self.calls = 0
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Answer the labels lookup as configured."""
+        del url, kwargs
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        code, payload = self._status_code, self._payload
+
+        class _Response:
+            status_code = code
+
+            def json(self) -> Any:
+                if payload is None:
+                    raise ValueError("not JSON")
+                return payload
+
+        return _Response()
+
+
+class _UnlabeledServerClient(NullServerClient):
+    """Null server client whose labels endpoint answers with an empty mapping."""
+
+    class _LabelsResponse(NullServerClient._Response):
+        def json(self) -> dict[str, Any]:
+            return {"labels": {}}
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Serve ``{"labels": {}}`` for any GET."""
+        del url, kwargs
+        return self._LabelsResponse()
+
+
+def _plant_live_codex_pane(
+    registry: TerminalRegistry,
+    conv_id: str,
+    tmp_path: Path,
+) -> list[bool]:
+    """Register a live codex pane whose close calls are recorded.
+
+    :param registry: The runner's terminal registry.
+    :param conv_id: Session/conversation id the pane is keyed under.
+    :param tmp_path: Temp dir for the instance's private paths.
+    :returns: A list that receives one entry per ``close()`` call.
+    """
+    live = make_test_terminal_instance("codex", "main", tmp_path, running=True)
+    closes: list[bool] = []
+
+    async def _close() -> None:
+        closes.append(True)
+
+    live.close = _close  # type: ignore[method-assign]
+    with registry._lock:
+        registry._by_conversation[conv_id] = {("codex", "main"): live}
+        registry._instance_locks[(conv_id, "codex", "main")] = threading.Lock()
+    return closes
+
+
+def _build_codex_native_app(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    auto_create_calls: list[str],
+) -> tuple[Any, TerminalRegistry, _ScriptedHarnessClient]:
+    """Build a runner app for codex-native turns with a stubbed pane launch.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param auto_create_calls: Receives the session id per stubbed launch.
+    :returns: ``(app, registry, harness_client)``.
+    """
+
+    async def _stub_auto_create(
+        session_id: str,
+        resource_registry: object,
+        publish_event: object,
+        **_kwargs: object,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        auto_create_calls.append(session_id)
+        return SessionResourceView(
+            id="terminal_codex_main",
+            type="terminal",
+            session_id=session_id,
+            name="codex",
+        )
+
+    # The real _launch_codex adapter resolves this name at call time.
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _stub_auto_create,
+    )
+    # A native turn also nudges the tool relay, which waits 30s for a bridge
+    # server-info file no fake harness ever writes.
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda *_a, **_kw: None)
+
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_UnlabeledServerClient(),  # type: ignore[arg-type]
+        terminal_registry=registry,
+    )
+    return app, registry, harness_client
+
+
+async def _post_codex_turn(app: Any, conv_id: str, harness_client: _ScriptedHarnessClient) -> None:
+    """Deliver one codex-native user turn and wait for the harness to see it.
+
+    :param app: The runner app.
+    :param conv_id: Session/conversation id.
+    :param harness_client: The scripted harness receiving the turn.
+    """
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "codex-native",
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        for _ in range(500):
+            if harness_client.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+    assert harness_client.posted_bodies, "harness never received the turn"
+
+
+@pytest.mark.asyncio
+async def test_turn_relaunches_live_codex_pane_when_bridge_torn_down(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live pane with every bridge file gone is closed and relaunched.
+
+    No bridge dir exists under the isolated bridge root, modeling
+    ``_delete_native_bridge_dirs`` having run while the pane survived.
+    """
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    conv_id = "f1e2d3c4b5a60718293a4b5c6d7e8f90"
+    auto_create_calls: list[str] = []
+    app, registry, harness_client = _build_codex_native_app(
+        monkeypatch, auto_create_calls=auto_create_calls
+    )
+    closes = _plant_live_codex_pane(registry, conv_id, tmp_path)
+
+    await _post_codex_turn(app, conv_id, harness_client)
+
+    assert closes == [True], (
+        f"the stale live pane must be closed before relaunch; close calls: {closes!r}"
+    )
+    assert auto_create_calls == [conv_id], (
+        f"a live pane with a torn-down bridge must be relaunched before the turn; "
+        f"got auto_create_calls={auto_create_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_keeps_live_codex_pane_when_bridge_intact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live pane whose launch-seeded bridge config exists is left alone.
+
+    Only ``bridge.json`` exists (a cold boot that has not yet written
+    ``state.json``), so healing here would kill a booting TUI.
+    """
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    conv_id = "a2b3c4d5e6f708192a3b4c5d6e7f8091"
+    write_mcp_bridge_config(prepare_bridge_dir(conv_id))
+    auto_create_calls: list[str] = []
+    app, registry, harness_client = _build_codex_native_app(
+        monkeypatch, auto_create_calls=auto_create_calls
+    )
+    closes = _plant_live_codex_pane(registry, conv_id, tmp_path)
+
+    await _post_codex_turn(app, conv_id, harness_client)
+
+    assert closes == [], f"an intact live pane must not be closed; close calls: {closes!r}"
+    assert auto_create_calls == [], (
+        f"an intact live pane must not be relaunched; got {auto_create_calls!r}"
+    )
+
+
+def test_bridge_torn_down_requires_every_bridge_file_gone(tmp_path: Path) -> None:
+    """Any single runner-written bridge file keeps the bridge un-torn."""
+    bridge_dir = tmp_path / "bridge"
+    assert bridge_torn_down(bridge_dir), "a missing dir has no bridge files"
+    bridge_dir.mkdir()
+    assert bridge_torn_down(bridge_dir), "an empty dir (resurrected content) is torn down"
+    for name in ("state.json", "startup_error.json", "bridge.json"):
+        marker = bridge_dir / name
+        marker.write_text("{}", encoding="utf-8")
+        assert not bridge_torn_down(bridge_dir), f"{name} alone must keep the bridge un-torn"
+        marker.unlink()
+
+
+@pytest.mark.asyncio
+async def test_torn_down_check_does_not_flag_rotated_bridge_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A rotated bridge id (a ``/new`` fork) is never flagged for the heal.
+
+    The heal's relaunch seeds the session-id dir (``_auto_create_codex_terminal``
+    -> ``prepare_bridge_dir(session_id)``), so it cannot restore a forked
+    session's rotated executor dir. Firing it would close a live pane without
+    fixing delivery, so the detector leaves a rotated session unflagged whether
+    or not its rotated dir is torn down; forked recovery needs a rotated-dir-aware
+    relaunch that this heal does not provide.
+    """
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    conv_id = "b3c4d5e6f708192a3b4c5d6e7f8091a2"
+    client = _LabelServerClient({CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: "rotated-bridge"})
+
+    # No dir under either key: a rotated session must not trigger the
+    # session-id relaunch.
+    assert not await _codex_bridge_torn_down_for_live_pane(
+        server_client=client,  # type: ignore[arg-type]
+        session_id=conv_id,
+    ), "a rotated session must not trigger the session-id relaunch heal"
+
+    # An intact rotated dir is likewise left to its normal delivery path.
+    write_mcp_bridge_config(prepare_bridge_dir("rotated-bridge"))
+    assert not await _codex_bridge_torn_down_for_live_pane(
+        server_client=client,  # type: ignore[arg-type]
+        session_id=conv_id,
+    ), "an intact rotated dir is not a teardown the session-id heal handles"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client",
+    [
+        _LabelServerClient(error=httpx.ReadTimeout("labels lookup timed out")),
+        _LabelServerClient(error=httpx.ConnectError("connection refused")),
+        _LabelServerClient(error=DatabricksAuthError("not signed in")),
+        _LabelServerClient({}, status_code=503),
+        _LabelServerClient(),
+        _LabelServerClient(body=[]),
+        _LabelServerClient(body={"labels": "rotated-bridge"}),
+        _LabelServerClient(body={}),
+        None,
+    ],
+    ids=[
+        "timeout",
+        "transport_error",
+        "auth_error",
+        "non_200",
+        "not_json",
+        "payload_not_object",
+        "labels_not_mapping",
+        "labels_missing",
+        "no_server_client",
+    ],
+)
+async def test_torn_down_check_fails_closed_when_labels_are_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    client: Any,
+) -> None:
+    """An inconclusive label lookup must not fire the pane-closing heal.
+
+    The session-id dir is torn down, but without labels a rotated bridge id
+    cannot be ruled out, and relaunching would kill a live forked pane.
+    """
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    conv_id = "d5e6f708192a3b4c5d6e7f8091a2b3c4"
+    assert bridge_torn_down(bridge_dir_for_bridge_id(conv_id))
+
+    assert not await _codex_bridge_torn_down_for_live_pane(
+        server_client=client,
+        session_id=conv_id,
+    ), "unreadable labels must leave the live pane alone"
+
+
+@pytest.mark.asyncio
+async def test_torn_down_check_skips_label_lookup_when_default_dir_intact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A healthy session-keyed bridge dir short-circuits the label fetch."""
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    conv_id = "c4d5e6f708192a3b4c5d6e7f8091a2b3"
+    write_mcp_bridge_config(prepare_bridge_dir(conv_id))
+    assert bridge_dir_for_bridge_id(conv_id).is_dir()
+    client = _LabelServerClient({})
+
+    torn_down = await _codex_bridge_torn_down_for_live_pane(
+        server_client=client,  # type: ignore[arg-type]
+        session_id=conv_id,
+    )
+
+    assert not torn_down
+    assert client.calls == 0, "an intact default dir must not pay a label lookup"

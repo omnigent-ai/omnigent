@@ -9334,6 +9334,60 @@ async def _delete_native_bridge_dirs(
             )
 
 
+async def _codex_bridge_torn_down_for_live_pane(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> bool:
+    """
+    Return whether a codex session's bridge was torn out from under a live pane.
+
+    Flags the session-id bridge dir missing every runner-written file
+    (:func:`~omnigent.harnesses.codex_native.bridge.bridge_torn_down`) only when
+    the session labels confirm an unrotated bridge. A rotated label or an
+    inconclusive lookup leaves the pane untouched: the relaunch seeds only the
+    session-id dir, and closing a live pane on a guess is worse than a failed
+    turn. Turn setup then re-seeds ``bridge.json``, so a session skipped once
+    is not retried until its pane dies. The stat check runs first, so a
+    healthy turn never pays the label lookup.
+
+    :param server_client: Omnigent server client used to resolve a rotated
+        bridge-id label. ``None`` cannot rule out a rotated label, so the pane
+        is left alone.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` only for a non-forked session whose session-id bridge
+        dir was torn down (the case the session-id relaunch can restore).
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+        bridge_dir_for_bridge_id,
+        bridge_torn_down,
+    )
+
+    if not bridge_torn_down(bridge_dir_for_bridge_id(session_id)):
+        return False
+    labels = (
+        await _lookup_session_labels(server_client=server_client, session_id=session_id)
+        if server_client is not None
+        else None
+    )
+    if labels is None:
+        _logger.info(
+            "codex bridge for conv=%s looks torn down but its labels could not be read; "
+            "leaving the live pane alone",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return False
+    bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
+    if bridge_id and bridge_id != session_id:
+        # A rotated label (a /new fork) points the executor at the rotated dir,
+        # but the relaunch seeds only the session-id dir: it cannot restore
+        # delivery and would only close a live pane.
+        return False
+    return True
+
+
 async def _claude_native_bridge_id_for_session(
     *,
     server_client: httpx.AsyncClient,
@@ -10189,6 +10243,27 @@ async def _session_labels_for_runner_spawn(
         ``"conv_abc123"``.
     :returns: String label mapping. Empty on lookup failure.
     """
+    labels = await _lookup_session_labels(server_client=server_client, session_id=session_id)
+    return labels if labels is not None else {}
+
+
+async def _lookup_session_labels(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> dict[str, str] | None:
+    """
+    Fetch session labels, or ``None`` when the lookup is inconclusive.
+
+    :param server_client: Omnigent server client used to fetch the session
+        labels endpoint.
+    :param session_id: Omnigent session/conversation id, e.g.
+        ``"conv_abc123"``.
+    :returns: String label mapping, or ``None`` on a timeout, transport or
+        auth error, non-200 status, an unparseable body, or a ``labels`` value
+        that is not a mapping. Callers that must tell "no labels" from "could
+        not read labels" use this directly.
+    """
     from omnigent.inner.databricks_executor import DatabricksAuthError
 
     path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
@@ -10204,7 +10279,7 @@ async def _session_labels_for_runner_spawn(
             type(exc).__name__,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
     except (httpx.HTTPError, DatabricksAuthError) as exc:
         # DatabricksAuthError: the host credential service couldn't sign the
         # request. Like any other lookup failure, that must not fail the turn.
@@ -10214,7 +10289,7 @@ async def _session_labels_for_runner_spawn(
             type(exc).__name__,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
     if resp.status_code != 200:
         _logger.warning(
             "Failed to resolve session labels; session=%s status=%s",
@@ -10222,9 +10297,9 @@ async def _session_labels_for_runner_spawn(
             resp.status_code,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
     try:
-        labels = resp.json().get("labels")
+        payload = resp.json()
     except ValueError:
         # A 200 with a non-JSON body (e.g. an empty response from the
         # Databricks Apps proxy when the server event loop is starved,
@@ -10237,9 +10312,10 @@ async def _session_labels_for_runner_spawn(
             resp.status_code,
             extra={"session_id": session_id},
         )
-        return {}
+        return None
+    labels = payload.get("labels") if isinstance(payload, dict) else None
     if not isinstance(labels, dict):
-        return {}
+        return None
     return {str(key): str(value) for key, value in labels.items()}
 
 

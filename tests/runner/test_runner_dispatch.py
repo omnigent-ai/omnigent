@@ -13030,6 +13030,9 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     conv = f"conv_signin_{harness.replace('-', '_')}"
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    if harness == "codex-native":
+        # Model a launched Codex pane by seeding bridge.json.
+        codex_bridge.write_mcp_bridge_config(codex_bridge.prepare_bridge_dir(conv))
 
     class _RecordingServerClient(NullServerClient):
         def __init__(self) -> None:
