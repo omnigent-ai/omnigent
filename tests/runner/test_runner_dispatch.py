@@ -2841,6 +2841,58 @@ async def test_runner_os_env_placeholder_cwd_uses_cli_workspace(
 
 
 @pytest.mark.asyncio
+async def test_runner_os_env_tool_reports_helper_spawn_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A helper that cannot be spawned yields a structured error, not a bare errno.
+
+    Fork ``EAGAIN`` is injected at the helper's ``subprocess.Popen`` so the real
+    dispatch → ``CallerProcessOSEnvironment`` → ``_HelperProcessClient`` chain
+    runs without exhausting the host's process table.
+
+    :param monkeypatch: Patches the OS-env root and ``subprocess.Popen``.
+    :param tmp_path: Per-test root for the workspace and fallback paths.
+    :param caplog: Captures the dispatch logger; its catch-all must stay silent.
+    """
+    import errno
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path / "fallback"))
+    fork_eagain = str(BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN)))
+    spawn_attempts = 0
+
+    def _refuse_spawn(*args: object, **kwargs: object) -> object:
+        nonlocal spawn_attempts
+        spawn_attempts += 1
+        raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+
+    monkeypatch.setattr("omnigent.inner.os_env.subprocess.Popen", _refuse_spawn)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.tool_dispatch"):
+        out = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "README.md", "offset": 1},
+            agent_spec=spec,
+            conversation_id="conv_spawn_eagain",
+        )
+
+    assert spawn_attempts == 1
+    assert json.loads(out) == {"error": f"os_env helper failed to start: {fork_eagain}"}
+    # The helper client handled the failure, so the dispatch catch-all never fired.
+    assert not [r for r in caplog.records if r.name == "omnigent.runner.tool_dispatch"]
+
+
+@pytest.mark.asyncio
 async def test_runner_os_env_tools_default_to_conversation_workspace(monkeypatch) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool

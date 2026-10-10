@@ -438,7 +438,14 @@ class _HelperProcessClient:
         if self._closed:
             return {"error": "OS environment helper is closed"}
 
-        self._ensure_started_locked()
+        try:
+            self._ensure_started_locked()
+        except OSError as exc:
+            # Only OS-level launch failures (fork EAGAIN, missing launcher) become
+            # results; other startup errors, such as a lost copy-on-write
+            # environment, keep raising.
+            self._stop_locked()
+            return {"error": f"os_env helper failed to start: {exc}"}
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
@@ -456,7 +463,8 @@ class _HelperProcessClient:
         except Exception as exc:  # noqa: BLE001 — helper IO failures are retried or surfaced via error dict
             self._stop_locked()
             if allow_retry and not self._closed:
-                self._ensure_started_locked()
+                # The retry restarts the helper itself, so a respawn
+                # failure also surfaces as a structured error above.
                 return self._request_locked(payload, allow_retry=False)
             return {"error": f"os_env helper failed: {exc}"}
 
