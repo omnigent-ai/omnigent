@@ -143,6 +143,27 @@ describe("KeyboardShortcutsDialog", () => {
     await waitFor(() => expect(screen.queryByText("Send message")).toBeNull());
   });
 
+  it("yields the hotkey to a focused surface that already claimed it", () => {
+    // The terminal preventDefaults Ctrl+/ to forward it to the PTY (Codex's
+    // side-conversation toggle), so the dialog must not open over the pane; an
+    // unclaimed press from the same element still opens it.
+    render(<KeyboardShortcutsDialog />);
+    const paneInput = document.createElement("textarea");
+    document.body.appendChild(paneInput);
+    const claim = (e: Event) => e.preventDefault();
+    paneInput.addEventListener("keydown", claim);
+    try {
+      fireEvent.keyDown(paneInput, { key: "/", ctrlKey: true });
+      expect(screen.queryByText("Keyboard shortcuts")).toBeNull();
+
+      paneInput.removeEventListener("keydown", claim);
+      fireEvent.keyDown(paneInput, { key: "/", ctrlKey: true });
+      expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
+    } finally {
+      paneInput.remove();
+    }
+  });
+
   it("opens when openKeyboardShortcuts() is dispatched (menu entry path)", async () => {
     render(<KeyboardShortcutsDialog />);
     openKeyboardShortcuts();

@@ -9,6 +9,7 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CTRL_SLASH_UNIT_SEPARATOR,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
@@ -333,6 +334,34 @@ describe("terminalKeyEventPayload", () => {
 
   it("leaves plain Enter on xterm's default path", () => {
     expect(terminalKeyEventPayload(keyEvent({ key: "Enter" }))).toBeNull();
+  });
+
+  it("encodes Ctrl+/ as the ^_ control byte", () => {
+    // xterm's Ctrl table has no entry for "/", so the chord produced no bytes
+    // and bubbled to the app's Ctrl+/ shortcuts-dialog hotkey. A native terminal
+    // sends 0x1F (the byte Ctrl+7 shares), which TUIs such as Codex bind.
+    const payload = terminalKeyEventPayload(keyEvent({ key: "/", ctrlKey: true }));
+    expect(payload).toBe("\x1f");
+    expect(payload).toBe(CTRL_SLASH_UNIT_SEPARATOR);
+  });
+
+  it("leaves other slash chords on xterm's default path", () => {
+    // Plain "/" types the character, Cmd+/ stays with the browser/app, and
+    // Alt/Shift variants keep xterm's own encoding.
+    expect(terminalKeyEventPayload(keyEvent({ key: "/" }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "/", metaKey: true }))).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "/", ctrlKey: true, altKey: true }))).toBeNull();
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "/", ctrlKey: true, shiftKey: true })),
+    ).toBeNull();
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "/", ctrlKey: true, metaKey: true })),
+    ).toBeNull();
+    expect(terminalKeyEventPayload(keyEvent({ key: "?", ctrlKey: true }))).toBeNull();
+    // Mid-composition the IME owns the key, as for every other mapping.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "/", ctrlKey: true, isComposing: true })),
+    ).toBeNull();
   });
 
   it("releases Shift+Enter to xterm during an IME composition", () => {
