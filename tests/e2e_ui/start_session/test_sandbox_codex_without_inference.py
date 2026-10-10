@@ -17,11 +17,11 @@ from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop
 from tests._helpers.live_server import isolated_local_server
-from tests.e2e_ui.start_session.helpers import select_landing_agent
-from tests.e2e_ui.start_session.test_start_session import (
-    _close_entry_models,
-    _open_entry_models,
-    _wait_until,
+from tests.e2e_ui.start_session.helpers import (
+    close_entry_models,
+    open_entry_models,
+    select_landing_agent,
+    wait_until,
 )
 
 _REPO_URL = "https://github.com/omnigent-ai/omnigent.git"
@@ -80,14 +80,14 @@ async def _open_composer(page: Any, base_url: str) -> None:
 
 
 async def _dismiss_entry_models(page: Any) -> None:
-    await _close_entry_models(page)
+    await close_entry_models(page)
     # The closed menu's dismissal layer swallows the next click until it unmounts.
     await expect(page.locator("[data-radix-popper-content-wrapper]")).to_have_count(0)
 
 
 async def _settled_model_menu(page: Any, agent_id: str) -> Any:
     """Open *agent_id*'s model list and wait until it shows rows or the unavailable note."""
-    await _open_entry_models(page, agent_id)
+    await open_entry_models(page, agent_id)
     models = page.get_by_test_id("new-chat-landing-agent-models")
     await expect(models).to_be_visible()
     await expect(models).not_to_contain_text("Loading models")
@@ -108,7 +108,9 @@ async def _drive_journey(base_url: str, codex_id: str, claude_id: str, evidence_
                 if route.request.method != "POST":
                     await route.continue_()
                     return
-                creates.append(route.request.post_data_json)
+                payload = route.request.post_data_json
+                assert payload is not None, "session create POST had no JSON body"
+                creates.append(payload)
                 await route.fulfill(status=200, json={"id": "conv_sandbox_codex"})
 
             await page.route(_SESSIONS_RE, handle_sessions)
@@ -143,7 +145,7 @@ async def _drive_journey(base_url: str, codex_id: str, claude_id: str, evidence_
             await expect(submit).to_be_enabled()
             await page.screenshot(path=evidence_dir / "codex-sandbox-start.png")
             await submit.click()
-            await _wait_until(lambda: len(creates) == 1)
+            await wait_until(lambda: len(creates) == 1)
             body = creates[0]
             assert body["agent_id"] == codex_id, body
             assert body["host_type"] == "managed", body
