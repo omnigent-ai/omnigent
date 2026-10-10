@@ -888,12 +888,32 @@ class TunnelRegistry:
                         return
                     await asyncio.sleep(_OUTBOUND_SEND_POLL_S)
             finally:
-                _resolve(_replaced_error())
+                # Clean up if no normal path resolved ack (e.g., task was cancelled
+                # or an unexpected exception escaped the loop). Use the accurate
+                # error message based on session state.
+                if not ack.done():
+                    error = (
+                        _replaced_error()
+                        if _stale()
+                        else ConnectionError(
+                            f"runner {session.runner_id!r} outbound send interrupted"
+                        )
+                    )
+                    _resolve(error)
 
         def _finalize_enqueue(task: asyncio.Task[None]) -> None:
             """Settle sends whose enqueue task was cancelled before starting."""
             if task.cancelled():
-                _resolve(_replaced_error())
+                # Check whether the session was actually replaced or the task was
+                # just cancelled during shutdown, so we report the accurate error.
+                error = (
+                    _replaced_error()
+                    if _stale()
+                    else ConnectionError(
+                        f"runner {session.runner_id!r} outbound enqueue was cancelled"
+                    )
+                )
+                _resolve(error)
             else:
                 _ = task.exception()
 
@@ -909,17 +929,32 @@ class TunnelRegistry:
             raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is closed") from exc
         wrapped_ack = asyncio.wrap_future(ack)
         try:
-            await asyncio.shield(wrapped_ack)
+            # Add a caller-side timeout backstop: if the owner loop stops without
+            # closing (or stops while _enqueue waits for room), ack is never settled
+            # and the caller would await forever. call_soon_threadsafe only raises
+            # for a closed loop, not a stopped one.
+            await asyncio.wait_for(
+                asyncio.shield(wrapped_ack),
+                timeout=_OUTBOUND_SEND_STALL_S + 2.0,
+            )
         except asyncio.CancelledError:
-            # Cancellation and enqueue use the same registry lock. Whichever
-            # wins is externally consistent: a cancelled send never lands, and
-            # a send already enqueued completes successfully instead of being
-            # reported to its caller as cancelled.
+            # Cancellation and enqueue use the same registry lock: a cancelled
+            # send never lands, and an already-enqueued send completes rather
+            # than reporting cancellation. Always propagate CancelledError since
+            # callers that cancel and await need to detect termination.
             with self._lock:
                 if enqueued:
-                    return
+                    # Frame was accepted; caller's cancellation must not suppress
+                    # the task's termination, so propagate the CancelledError.
+                    task = asyncio.current_task()
+                    if task is not None:
+                        task.uncancel()
+                    raise
                 cancelled = True
             ack.cancel()
+            # Consume wrapped_ack's exception if already set before cancellation,
+            # to avoid "Future exception was never retrieved" noise.
+            wrapped_ack.add_done_callback(lambda f: None if f.cancelled() else f.exception())
             raise
 
     # ── Routing incoming frames ──────────────────────────

@@ -937,7 +937,7 @@ async def test_seed_plain_shell_replays_no_modes() -> None:
 
 def test_repair_snapshot_resets_alt_screen_and_mouse_after_gap() -> None:
     """A live repair heals mode-disable bytes lost while a TUI exits."""
-    import pyte
+    pyte = pytest.importorskip("pyte")
 
     screen = pyte.Screen(40, 5)
     stream = pyte.ByteStream(screen)
