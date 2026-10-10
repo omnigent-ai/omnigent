@@ -58,6 +58,7 @@ from omnigent.runner.native import (
     _log_terminal_lookup_miss,
     _publish_tmux_target_for_bridge,
     _resolved_spec_workdir,
+    _session_reset_during_launch_response,
     _unwrap_resolved_spec,
 )
 from omnigent.runner.resource_registry import (
@@ -65,9 +66,11 @@ from omnigent.runner.resource_registry import (
     OMNIGENT_REPL_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    terminal_launch_fence,
 )
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.registry import TerminalLaunchSupersededError
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -132,6 +135,7 @@ def register_resource_routes(
     _resp_to_conv: dict[str, str],
     _search_registry_for_root: Callable[[Path], FilesystemRegistry],
     _session_comment_relays: dict[str, _CommentRelayBinding],
+    _terminal_registration_fence: Callable[[str], Callable[[], bool]],
     auth_token_factory: Callable[[], str | None] | None,
     filesystem_registry: FilesystemRegistry | None,
     resource_registry: SessionResourceRegistry,
@@ -396,6 +400,7 @@ def register_resource_routes(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                registration_is_current=_terminal_registration_fence(session_id),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
@@ -506,7 +511,12 @@ def register_resource_routes(
         sandbox_override = body.get("sandbox")
         spec = body.get("spec") or {}
 
+        # Capture before spec resolution so a reset invalidates this launch.
+        registration_is_current = _terminal_registration_fence(session_id)
+
         agent_spec = await _resolve_session_agent_spec(session_id)
+        if not registration_is_current():
+            return _session_reset_during_launch_response()
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
         declared_terminal = None
@@ -585,16 +595,28 @@ def register_resource_routes(
                 if bridge_inject
                 else resource_registry.launch_auxiliary_terminal
             )
-            resource_view = await launch_method(
-                session_id=session_id,
-                terminal_name=terminal_name,
-                session_key=session_key,
-                spec=env_spec,
-                cwd_override=cwd_override,
-                sandbox_override=sandbox_override,
-                parent_os_env=agent_os_env,
-                resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
+            with terminal_launch_fence(registration_is_current):
+                resource_view = await launch_method(
+                    session_id=session_id,
+                    terminal_name=terminal_name,
+                    session_key=session_key,
+                    spec=env_spec,
+                    cwd_override=cwd_override,
+                    sandbox_override=sandbox_override,
+                    parent_os_env=agent_os_env,
+                    resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
+                )
+        except TerminalLaunchSupersededError:
+            _logger.info(
+                "Discarding terminal %s:%s for %s: session was reset mid-launch",
+                terminal_name,
+                session_key,
+                session_id,
+                extra={"session_id": session_id},
             )
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            return _session_reset_during_launch_response()
         except RuntimeError as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
@@ -607,6 +629,19 @@ def register_resource_routes(
                     }
                 },
             )
+
+        if not registration_is_current():
+            _logger.info(
+                "Discarding terminal %s:%s for %s: session was reset mid-launch",
+                terminal_name,
+                session_key,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            await resource_registry.close_terminal_if_matching_view(session_id, resource_view)
+            return _session_reset_during_launch_response()
 
         if bridge_inject:
             _publish_tmux_target_for_bridge(

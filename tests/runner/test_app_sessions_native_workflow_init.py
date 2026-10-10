@@ -394,6 +394,7 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
                 "server_client",
                 "session_init",
                 "ensure_comment_relay",
+                "registration_is_current",
             },
         ),
     ],
