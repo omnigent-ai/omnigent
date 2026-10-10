@@ -147,6 +147,7 @@ def _wait_until_online(
 
 @pytest.fixture(scope="module")
 def faulted_stack(
+    built_spa: None,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[_FaultedStack]:

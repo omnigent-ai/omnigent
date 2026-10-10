@@ -647,7 +647,8 @@ class _HelperProcessClient:
                     if attempt == _SPAWN_TRANSIENT_ATTEMPTS:
                         raise
                     time.sleep(_SPAWN_TRANSIENT_BACKOFF_S * 2 ** (attempt - 1))
-            assert proc is not None  # the loop either breaks with a proc or raises
+            if proc is None:  # the loop either breaks with a proc or raises
+                raise RuntimeError("helper spawn retry loop exited without a process")
             self._proc = proc
         except Exception:
             cleanup_private_tmpdir(self._tmpdir)

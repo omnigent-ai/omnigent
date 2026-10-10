@@ -321,14 +321,11 @@ class ProxyMcpManager:
 
         **Transient proxy failures**: a status in
         :data:`_TRANSIENT_PROXY_STATUSES` is re-posted a bounded number of
-        times with the same operation id and a fresh JSON-RPC id, so the
-        runner's execution registry attaches the re-post to work it already
-        started instead of running it again. Server-side work before the
-        forward is not deduplicated: a re-post repeats policy evaluation and
-        label writes, an ASK-gated call whose approval request was already
-        published can show a second approval card, and one whose approval was
-        already consumed still fails with ``Elicitation not found or already
-        resolved``, as before this retry.
+        times with the same operation id and a fresh JSON-RPC id. Re-posts
+        reuse runner work already started but may repeat pre-forward policy,
+        label, and approval side effects: an already-published approval
+        request can show a second card, and a consumed approval fails with
+        ``Elicitation not found or already resolved``.
 
         :param spec: Ignored — accepted for interface parity with
             :class:`RunnerMcpManager`.  ``None`` is acceptable for callers

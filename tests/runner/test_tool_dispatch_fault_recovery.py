@@ -78,16 +78,10 @@ async def test_shell_proxy_transient_500_recovers(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One 500 from the server MCP proxy must be retried, not fail the call.
+    """One 500 from the MCP proxy is retried and the dispatch result is the tool output.
 
-    The proxy answers 500 on the first ``tools/call`` post and succeeds on
-    the second — the transient shape of the production failure. The runner
-    must re-post under the same operation id (so the server can reattach any
-    work already started instead of replaying it) and return the successful
-    result, without emitting the dispatch ERROR log.
-
-    **What breaks if wrong:** a single server blip during a shell tool call
-    permanently fails the agent's command.
+    The re-post keeps the operation id, takes a fresh JSON-RPC id, and emits no
+    dispatch ERROR log.
     """
     monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
     session_id = "conv_proxy_transient_500"
@@ -135,20 +129,10 @@ async def test_shell_proxy_persistent_500_surfaces_as_tool_error(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 500 that never clears must surface as a tool error after bounded retries.
+    """A 500 that never clears becomes a model-facing tool error after the bounded retries.
 
-    Drives ``execute_tool`` with a real :class:`ProxyMcpManager` whose server
-    client answers every ``tools/call`` with HTTP 500. The runner must:
-
-    * stop after the bounded retry budget (never loop forever),
-    * return the failure to the LLM as an ``Error: RuntimeError: MCP proxy
-      call failed for tool 'sys_os_shell' ...500...`` tool result (never
-      swallow it or raise out of dispatch), and
-    * emit the ``tool sys_os_shell failed`` ERROR log at
-      ``omnigent.runner.tool_dispatch``.
-
-    **What breaks if wrong:** a persistent server-side failure is silently
-    dropped, crashes the turn, or retries without bound.
+    Dispatch returns ``Error: RuntimeError: MCP proxy call failed ...`` instead of
+    raising, and logs ``tool sys_os_shell failed``.
     """
     monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
     session_id = "conv_proxy_persistent_500"
@@ -194,18 +178,10 @@ async def test_shell_helper_transient_fork_failure_recovers(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One fork ``EAGAIN`` while spawning the helper must be retried, not fail.
+    """One fork ``EAGAIN`` on the helper spawn is retried and the shell command runs.
 
-    Drives ``execute_tool`` down the runner-local OSEnvironment path
-    (``mcp_manager=None``) with ``subprocess.Popen`` raising
-    ``BlockingIOError`` on the first spawn only — the transient shape of host
-    fork pressure. The helper never started, so the retry is side-effect
-    free; the shell command must then run and succeed. The os_env is pinned
-    to an unsandboxed spec so the retried helper spawns identically on any
-    host (an active sandbox backend would need this checkout mounted).
-
-    **What breaks if wrong:** momentary host fork pressure permanently fails
-    the agent's shell command.
+    The runner-local path (``mcp_manager=None``) returns the structured shell result
+    with no dispatch ERROR log; the unsandboxed spec keeps the spawn host-independent.
     """
     monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
     real_popen = subprocess.Popen
@@ -245,20 +221,10 @@ async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fork ``EAGAIN`` that never clears must surface as a structured tool error.
+    """Persistent fork ``EAGAIN`` becomes a structured tool error after the bounded attempts.
 
-    Drives ``execute_tool`` down the runner-local OSEnvironment path with
-    every ``subprocess.Popen`` raising ``BlockingIOError(35)`` (the host stays
-    out of fork capacity). The runner must:
-
-    * stop after the bounded spawn attempts (never loop forever),
-    * return a structured ``{"error": "[Errno 35] Resource temporarily
-      unavailable"}`` tool result (never raise out of dispatch), and
-    * emit the ``runner OSEnvironment dispatch failed for sys_os_shell``
-      ERROR log at ``omnigent.runner.tool_dispatch``.
-
-    **What breaks if wrong:** persistent host resource exhaustion crashes the
-    turn or is dropped instead of being surfaced as an attributable error.
+    Dispatch returns ``{"error": "[Errno 35] ..."}`` instead of raising and logs
+    ``runner OSEnvironment dispatch failed for sys_os_shell``.
     """
     monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
     real_popen = subprocess.Popen
