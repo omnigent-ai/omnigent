@@ -616,6 +616,11 @@ Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
+- Caption only moments you established — a driver step, an assertion, a saved
+  screenshot, or a frame you viewed. Write "the app loads" for an opening you
+  did not verify instead of naming its view, and never infer what footage shows
+  from a pixel-similarity score against a screenshot (see "Finishing a clip" in
+  `dev/recording-lanes.md`).
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -760,8 +765,10 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
-  of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
+  own steps), distinct from the bug-level `journey` field. Describe only moments
+  the driver's events, assertions, or saved screenshots established (Step 4); an
+  opening you did not verify is "the app loads", not a named view. `capture_mode`
+  is one of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
   recording. Empty list when nothing valid was recorded.
 - `recording_unavailable_reason` — leave empty when every expected clip is

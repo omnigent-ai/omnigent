@@ -329,3 +329,14 @@ For each recording, write a short **`caption`** in its handoff entry describing
 what the clip shows: e.g. `"start a session → open the model picker → select the
 catalog → picker shows raw IDs"`. This is what a reader sees under the video on
 the ticket, so make it read like a journey, not a restatement of the bug title.
+
+Describe only moments you actually established: a step the driver performed, a
+state it asserted, a screenshot the run saved, or a frame you viewed yourself.
+Everything before the first established moment is unverified — write "the app
+loads" rather than naming the view the clip opens on, and attach no timestamps
+to it. Never infer what footage shows from a pixel-similarity score (a
+mean-absolute-error or diff against a reference screenshot): a blank or
+"Loading Omnigent..." frame scores as close to a mostly white terminal
+screenshot as the real view does, so the number says nothing about what the
+frame shows. If you cannot view the frames, say so in `evidence` and keep the
+caption to the driver's events and assertions.
