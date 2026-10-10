@@ -559,6 +559,25 @@ For instruction-only changes, reuse applicable contract/bundle checks when
 sufficient; do not create a module that matches prose verbatim or invent a
 behavioral failure. If the journey remains unverified, report that honestly.
 
+**Assert the reported behavior, not the shape of the fix you imagine.** Resolve
+must not weaken your assertions to make its fix pass, so an assertion no
+correct fix can satisfy rejects the fix rather than the bug and sends the
+reproduction back for revision. Before handing off, check each assertion:
+
+- Assert the user-visible outcome the report describes — "Models unavailable"
+  no longer appears, a persist choice is offered — not the exact text, ids, or
+  element count a particular implementation would render.
+- Match values the harness or environment controls (model aliases, menu
+  labels, version strings) by family or pattern, never by the exact spelling
+  the installed version happens to use: a probe offering `opus[1m]` satisfies
+  an expectation for the `opus` family.
+- When more than one matching control is acceptable, use `.first` or a count
+  assertion. A bare Playwright locator is strict and fails when the fix renders
+  two matches.
+- Cross-check every literal in an assertion against the probe output recorded
+  in your own `evidence`. A value your probe did not show does not belong in
+  the assertion.
+
 In `evidence`, briefly identify existing coverage, the smallest useful check,
 and any e2e needed only for investigation or recording. Resolve chooses which
 tests ship permanently. The e2e itself may be the minimal reliable test; do not
