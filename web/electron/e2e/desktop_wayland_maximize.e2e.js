@@ -182,9 +182,10 @@ async function startCompositor() {
   return { socket, runtimeDir, events, command, stop };
 }
 
-// Overlay windows have a parent; the main window does not.
-async function describeWindows(electronApp) {
-  return electronApp.evaluate(({ BrowserWindow }) =>
+// Overlay windows have a parent; the main window does not. A trapped main
+// process may stop answering without exiting, so never wait on it unbounded.
+async function describeWindows(electronApp, timeout = 5_000) {
+  const pending = electronApp.evaluate(({ BrowserWindow }) =>
     BrowserWindow.getAllWindows().map((win) => ({
       overlay: win.getParentWindow() !== null,
       title: win.getTitle(),
@@ -193,6 +194,13 @@ async function describeWindows(electronApp) {
       bounds: win.getBounds(),
     })),
   );
+  pending.catch(() => {});
+  return Promise.race([
+    pending,
+    sleep(timeout).then(() => {
+      throw new Error(`timed out describing windows after ${timeout}ms`);
+    }),
+  ]);
 }
 
 test("desktop shell survives maximize on Wayland", async (t) => {
@@ -218,6 +226,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
   let server;
   let compositor;
   let electronApp;
+  let userDataDir = null;
   let stopDisplayCapture = async () => {};
   let exitInfo = null;
   const evidence = { timeline: {} };
@@ -225,6 +234,14 @@ test("desktop shell survives maximize on Wayland", async (t) => {
   let launchedAt = Date.now();
   const mark = (name) => {
     evidence.timeline[name] = Date.now() - launchedAt;
+  };
+  const writeEvidence = () => {
+    evidence.exitAtEnd = exitInfo;
+    try {
+      fs.writeFileSync(path.join(RECORD_DIR, "evidence.json"), JSON.stringify(evidence, null, 2));
+    } catch {
+      // Diagnostics only; the assertions carry the verdict.
+    }
   };
 
   try {
@@ -245,6 +262,7 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       },
     });
     electronApp = launched.electronApp;
+    userDataDir = launched.userDataDir;
     stopDisplayCapture = launched.stopDisplayCapture;
     for (const page of electronApp.windows()) pagesSeen.add(page);
     electronApp.on("window", (page) => pagesSeen.add(page));
@@ -287,7 +305,10 @@ test("desktop shell survives maximize on Wayland", async (t) => {
     mark("homeScreenChecked");
     await sleep(2000);
 
-    evidence.windowsBefore = await describeWindows(electronApp);
+    evidence.windowsBefore = await describeWindows(electronApp).catch((err) => {
+      evidence.windowsBeforeError = String(err);
+      return null;
+    });
 
     // Maximizing the largest non-child toplevel models a user maximizing the
     // main window (not the overlay); the shell then repositions the overlay.
@@ -357,13 +378,10 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       `zero-sized window geometry reached the compositor: ${JSON.stringify(evidence.invalidGeometry)}`,
     );
   } finally {
-    evidence.exitAtEnd = exitInfo;
-    try {
-      fs.writeFileSync(path.join(RECORD_DIR, "evidence.json"), JSON.stringify(evidence, null, 2));
-    } catch {
-      // Diagnostics only; the assertions carry the verdict.
-    }
+    writeEvidence();
     if (electronApp) await electronApp.close().catch(() => {});
+    writeEvidence();
+    if (userDataDir) fs.rmSync(userDataDir, { recursive: true, force: true });
     await stopDisplayCapture().catch(() => {});
     if (compositor) await compositor.stop().catch(() => {});
     if (server) await server.close().catch(() => {});
