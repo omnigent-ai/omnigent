@@ -12,17 +12,9 @@
 //    recent steps. Still-in-progress spinners and durable
 //    routing/fan-out cards never fold regardless of position.
 //
-// 2. Turn folding: once the turn settles (`turnLifecycle` leaves
-//    "streaming"), the whole process trace — interstitial narration,
-//    tool folds, reasoning — collapses behind one muted "Worked for
-//    Xs" row (`TurnWorkedFold`), leaving only the trailing final
-//    answer visible. This mirrors the Codex desktop treatment: the
-//    demarcation makes "where do I start reading" obvious instead of
-//    a wall of uniform prose. Resolved approval cards fold with the
-//    trace in document order; pending elicitations and persistent
-//    routing/dispatch cards stay visible outside the fold; a turn
-//    with no trailing answer (interrupted / failed / tool-only step
-//    bubbles) keeps its trace expanded.
+// 2. Turn folding: once settled, each work run collapses behind a
+//    "Worked" row. Assistant messages remain visible in order;
+//    pending elicitations and routing cards stay visible too.
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -77,18 +69,15 @@ interface BlockRendererProps {
   onRetryError?: (item: Extract<RenderItem, { kind: "error" }>) => Promise<void>;
   /**
    * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
-   * `"streaming"` keeps the process trace expanded; any settled state
-   * folds it behind the "Worked for Xs" row. When omitted, liveness
-   * falls back to `sessionStatus` (running/waiting ⇒ live).
+   * `"streaming"` keeps work expanded; settled states can fold it.
+   * When omitted, liveness falls back to `sessionStatus`.
    */
   turnLifecycle?: ActiveResponse["state"];
   /** Wall-clock seconds the turn worked (`Bubble.workedForS`). */
   workedForS?: number;
   /**
-   * The turn continues in a later assistant bubble (`Bubble.continued`)
-   * — it yielded mid-task (e.g. awaiting sub-agents), so the answer
-   * lands elsewhere. Such a bubble folds its whole trace despite having
-   * no trailing answer of its own.
+   * The turn continues in a later bubble (`Bubble.continued`). Its
+   * tool work can fold even when the answer lands elsewhere.
    */
   continued?: boolean;
   /**
@@ -159,62 +148,39 @@ function turnLiveness({
   return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
 }
 
-/**
- * Whether the turn's CONTENT can fold: it did work, and either answered
- * here or continues in a later bubble. A turn that did no work, or that
- * dead-ends with no answer anywhere, renders expanded — there is nothing
- * to demarcate.
- *
- * A `continued` bubble additionally has to have RUN something. That is
- * the shape the flag exists for (narration + tool calls, then a yield to
- * await sub-agents), and it keeps a stray narration- or reasoning-only
- * fragment of a split turn from folding into a lone "Worked" row with
- * nothing behind it.
- *
- * Liveness is the caller's half of the decision — `BlockRenderer` pairs
- * this with its fold latch.
- */
+/** Work folds after an assistant message or in a tool-bearing continuation. */
 function hasFoldableShape(
   items: RenderItem[],
-  { process, final }: TurnPartition,
+  { segments }: TurnPartition,
   continued = false,
 ): boolean {
+  const lastItem = items.findLast((item) => !isTrailingWrapup(item));
+  // A terminal failure or denial must stay visible beside the assistant text.
+  if (
+    lastItem?.kind === "error" ||
+    lastItem?.kind === "retry" ||
+    lastItem?.kind === "policy_denied"
+  ) {
+    return false;
+  }
   return (
     !isProvisionalTrace(items) &&
-    process.length > 0 &&
-    (final.length > 0 || (continued && process.some(isToolItem)))
+    segments.some((segment) => segment.kind === "work") &&
+    (segments.some((segment) => segment.kind === "text") ||
+      (continued &&
+        segments.some((segment) => segment.kind === "work" && segment.items.some(isToolItem))))
   );
 }
 
-/**
- * Whether the bubble renders NOTHING but the collapsed "Worked for" row:
- * a turn fragment that yielded mid-task, so its whole trace folds and the
- * answer lands in a later bubble.
- *
- * Such a bubble has no visible content to anchor bubble-level chrome to.
- * The copy/fork actions key off ALL the bubble's text, including text
- * sealed inside the fold, so they would hang a row of hover-only (hence
- * invisible) height off it — but only when the HIDDEN trace happened to
- * narrate, leaving consecutive collapsed rows at two different gaps with
- * nothing on screen to explain the difference.
- *
- * Deliberately conservative about the possibly-live last bubble: this
- * can't see `BlockRenderer`'s fold latch, so it reports false there and
- * the trailing bubble keeps its actions. True here always means the trace
- * folded — never the reverse, which would strip actions off a visible
- * answer.
- *
- * Shape and liveness only — no debounce. Across `BlockRenderer`'s settle
- * window the two answers may differ for a beat; on a bubble with no
- * answer to anchor them to, that costs nothing visible.
- */
+/** Hide bubble actions only when settled work is its sole visible content. */
 export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
   const partition = partitionTurn(inputs.items);
   return (
-    hasFoldableShape(inputs.items, partition, inputs.continued) && partition.final.length === 0
+    hasFoldableShape(inputs.items, partition, inputs.continued) &&
+    partition.segments.every((segment) => segment.kind === "work")
   );
 }
 
@@ -250,14 +216,10 @@ export function BlockRenderer({
     showsWorking,
   });
 
-  // Fold a turn that did work AND either answered here or continues in a
-  // later bubble: the trace collapses behind the "Worked for" row, exempt
-  // cards stay visible after it, and the answer (when this bubble carries
-  // one) renders last at full style. A turn that did no work, or that
-  // dead-ends with no answer anywhere, renders expanded — there is
-  // nothing to demarcate.
+  // A native assistant message has no reliable final-answer marker.
+  // Keep each message visible even when a later tool call follows it.
   const partition = partitionTurn(items);
-  const { process, exempt, final, finalStart } = partition;
+  const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
   // firing) flips the session to running — Working shimmer included —
@@ -321,21 +283,41 @@ export function BlockRenderer({
   });
 
   if (showFold) {
-    return (
-      <>
+    const rendered: ReactNode[] = [];
+    for (const segment of partition.segments) {
+      if (segment.kind === "text") {
+        rendered.push(
+          ...renderSequence(segment.items, {
+            liveEdge: false,
+            indexBase: segment.startIndex,
+            onRetryError,
+          }),
+        );
+        continue;
+      }
+      if (segment.kind === "exempt") {
+        rendered.push(
+          renderItem(segment.item, segment.index, false, false, false, false, onRetryError),
+        );
+        continue;
+      }
+      // The available duration spans the entire turn, not each work run.
+      rendered.push(
         <TurnWorkedFold
-          workedForS={workedForS}
+          key={`worked:${segment.startIndex}`}
+          workedForS={workRunCount === 1 ? workedForS : undefined}
           animateCollapse={animateCollapse}
           defaultOpen={defaultExpanded}
         >
-          {renderSequence(process, { liveEdge: false })}
-        </TurnWorkedFold>
-        {exempt.map(({ item, index }) =>
-          renderItem(item, index, false, false, false, false, onRetryError),
-        )}
-        {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
-      </>
-    );
+          {renderSequence(segment.items, {
+            liveEdge: false,
+            indexBase: segment.startIndex,
+            onRetryError,
+          })}
+        </TurnWorkedFold>,
+      );
+    }
+    return rendered;
   }
 
   return renderSequence(items, {
@@ -435,48 +417,25 @@ interface TurnSequenceOptions {
 }
 
 interface TurnPartition {
-  process: RenderItem[];
-  exempt: { item: RenderItem; index: number }[];
-  final: RenderItem[];
-  finalStart: number;
+  segments: TurnSegment[];
 }
 
-// Bookkeeping tools some harnesses append AFTER the turn's final
-// message (codex-native mirrors the turn's file diff as a trailing
-// `turn_diff` call). They must not stop the answer detection — they
-// fold into the process trace instead.
+type TurnSegment =
+  | { kind: "work" | "text"; items: RenderItem[]; startIndex: number }
+  | { kind: "exempt"; item: RenderItem; index: number };
+
+// A trailing `turn_diff` belongs with earlier work, after the last message.
 const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff"]);
 
-/**
- * Whether a trailing item is wrap-up rather than part of the answer.
- *
- * Reasoning counts: it is process by definition, never the answer, and
- * codex opens a reasoning section as the turn ends — landing it after
- * the final message, where it blocked the fold live (the item is
- * transient, so a reload folded the same turn and the two views
- * disagreed).
- */
+/** Trailing reasoning joins earlier work so live and reloaded views agree. */
 function isTrailingWrapup(item: RenderItem): boolean {
   if (item.kind === "reasoning") return true;
   return item.kind === "tool" && TRAILING_WRAPUP_TOOLS.has(item.execution.name);
 }
 
 /**
- * Split a settled turn into the foldable process trace, the always-
- * visible exempt items, and the trailing final answer.
- *
- * `final` is the trailing run of text items — the turn's answer —
- * looking past any trailing bookkeeping tools (`turn_diff`), which
- * fold as process. Everything before the answer is process too —
- * including resolved approval cards, which are part of the work's
- * history and fold in document order — except items the user must
- * keep seeing without an extra click: still-PENDING elicitations
- * (normally floated out of the bubble by ChatPage, exempted here
- * defensively so an actionable card can never be hidden), persistent
- * routing/dispatch cards, and (defensively) tools still in progress.
- * Errors, retries and policy denials DO fold — when the turn still
- * produced an answer they're recovered noise, and a turn that ended
- * on one has no trailing text so it never folds in the first place.
+ * Split work from assistant text while preserving order. Text lacks a
+ * reliable final-answer marker, so every completed message stays visible.
  */
 function partitionTurn(items: RenderItem[]): TurnPartition {
   let end = items.length;
@@ -485,20 +444,24 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
     wrapup.unshift(items[end - 1]!);
     end -= 1;
   }
-  let finalStart = end;
-  while (finalStart > 0 && items[finalStart - 1]!.kind === "text") finalStart -= 1;
-  const process: RenderItem[] = [];
-  const exempt: { item: RenderItem; index: number }[] = [];
-  for (let i = 0; i < finalStart; i += 1) {
+  const segments: TurnSegment[] = [];
+  for (let i = 0; i < end; i += 1) {
     const item = items[i]!;
     if (isPendingElicitation(item) || isPersistentToolCard(item) || isInProgressTool(item)) {
-      exempt.push({ item, index: i });
-    } else {
-      process.push(item);
+      segments.push({ kind: "exempt", item, index: i });
+      continue;
     }
+    const kind = item.kind === "text" ? "text" : "work";
+    const previous = segments[segments.length - 1];
+    if (previous?.kind === kind) previous.items.push(item);
+    else segments.push({ kind, items: [item], startIndex: i });
   }
-  process.push(...wrapup);
-  return { process, exempt, final: items.slice(finalStart, end), finalStart };
+  if (wrapup.length > 0) {
+    const lastWork = segments.findLast((segment) => segment.kind === "work");
+    if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
+    else segments.push({ kind: "work", items: wrapup, startIndex: end });
+  }
+  return { segments };
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
@@ -523,11 +486,7 @@ function isProvisionalTrace(items: RenderItem[]): boolean {
 }
 
 /**
- * Codex-style demarcation for a completed turn: the whole process
- * trace (narration, tool folds, reasoning) collapses behind one muted
- * "Worked for Xs" disclosure, so the final answer below is
- * unambiguously where reading starts. Expanding replays the trace
- * beside a compact vertical guide.
+ * Disclosure for one work run between visible assistant messages.
  *
  * `animateCollapse` marks the render where the fold appeared while the
  * user was watching. The fold then MOUNTS OPEN — showing exactly the
