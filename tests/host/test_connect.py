@@ -4089,15 +4089,18 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     """
     from omnigent.cli import _build_host_daemon_env
 
+    motion_bin = "/opt/motion/bin/motion-core"
     monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
-    monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
-    monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MOTION_CORE_BIN")
+    monkeypatch.setenv("MOTION_CORE_BIN", motion_bin)
+    monkeypatch.setenv("MOTION_UNLISTED_SECRET", "should-not-forward")
 
     server = "https://example.databricksapps.com"
     daemon_env = _build_host_daemon_env(server_url=server)
     # The first hop must keep the control var (regression guard for the remote no-op).
-    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MOTION_CORE_BIN"
+    assert daemon_env["MOTION_CORE_BIN"] == motion_bin
+    assert "MOTION_UNLISTED_SECRET" not in daemon_env
 
     runner_env = _build_runner_env(
         daemon_env,
@@ -4109,8 +4112,8 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     )
 
     # The named var reaches the runner; an unnamed one does not.
-    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
-    assert "DATABRICKS_UNNAMED" not in runner_env
+    assert runner_env["MOTION_CORE_BIN"] == motion_bin
+    assert "MOTION_UNLISTED_SECRET" not in runner_env
 
 
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])

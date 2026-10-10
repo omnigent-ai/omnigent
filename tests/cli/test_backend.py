@@ -398,10 +398,30 @@ def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
     """
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_TOKEN")
+    monkeypatch.setenv("MY_GATEWAY_TOKEN", "gateway-secret")
+    monkeypatch.setenv("UNLISTED_GATEWAY_SECRET", "must-not-forward")
 
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
 
     assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_TOKEN"
+    assert env["MY_GATEWAY_TOKEN"] == "gateway-secret"
+    assert "UNLISTED_GATEWAY_SECRET" not in env
+
+
+def test_build_host_daemon_env_local_forwards_passthrough_named_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local daemon hop forwards values named in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` only."""
+    motion_bin = "/Users/alice/repos/motion-core/bin/motion-core"
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MOTION_CORE_BIN")
+    monkeypatch.setenv("MOTION_CORE_BIN", motion_bin)
+    monkeypatch.setenv("MOTION_UNLISTED_SECRET", "must-not-forward")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["MOTION_CORE_BIN"] == motion_bin
+    assert "MOTION_UNLISTED_SECRET" not in env
 
 
 def test_ensure_host_daemon_reuses_same_target(
