@@ -7,11 +7,24 @@ test agent directly via the agent_store to verify the endpoint works.
 
 from __future__ import annotations
 
-import httpx
-import pytest_asyncio
+import io
+import tarfile
+from dataclasses import replace
+from pathlib import Path
 
+import httpx
+import pytest
+import pytest_asyncio
+import yaml
+
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.db.utils import builtin_agent_id, generate_agent_id
+from omnigent.onboarding.acp_auth import AcpAgentEntry, acp_agents
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server import app as server_app
+from omnigent.server.routes.builtin_agents import _resolve_icon_file
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 
 @pytest_asyncio.fixture()
@@ -87,3 +100,353 @@ async def test_builtin_flag_distinguishes_seeded_from_registered(
     by_id = {a["id"]: a for a in resp.json()["data"]}
     assert by_id[seeded_id]["builtin"] is True
     assert by_id[registered_id]["builtin"] is False
+
+
+# ── Icon payload + read-only icon endpoint ─────────────────────
+
+_SVG_BYTES = b'<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'
+
+
+def _make_bundle(files: dict[str, bytes]) -> bytes:
+    """Pack ``{archive_path: content}`` into a ``.tar.gz`` bundle."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def _seed_agent_with_bundle(
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    name: str,
+    config: dict[str, object],
+    extra_files: dict[str, bytes] | None = None,
+) -> str:
+    """Seed a built-in agent whose bundle the app's cache can load.
+
+    The bundle is written to the same on-disk artifact root the ``app``
+    fixture wires up (``tmp_path / "artifacts"``), so the app's own
+    ``AgentCache`` downloads and extracts it on demand.
+    """
+    agent_id = generate_agent_id()
+    files: dict[str, bytes] = {"config.yaml": yaml.dump(config).encode()}
+    files.update(extra_files or {})
+    bundle_location = f"{agent_id}/bundle.tar.gz"
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    artifact_store.put(bundle_location, _make_bundle(files))
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_store.create(agent_id, name=name, bundle_location=bundle_location)
+    return agent_id
+
+
+def _min_config(name: str, **extra: object) -> dict[str, object]:
+    """A minimal loadable omnigent agent config, plus any extra keys."""
+    return {
+        "spec_version": 1,
+        "name": name,
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        "prompt": "hi",
+        **extra,
+    }
+
+
+async def test_payload_includes_emoji_icon(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """An emoji ``icon`` in the spec passes through to the payload verbatim."""
+    agent_id = _seed_agent_with_bundle(
+        db_uri, tmp_path, name="emoji-agent", config=_min_config("emoji-agent", icon="🔥")
+    )
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    by_id = {a["id"]: a for a in resp.json()["data"]}
+    assert by_id[agent_id]["icon"] == "🔥"
+
+
+async def test_payload_icon_none_when_unset(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """An agent with no ``icon`` reports ``icon: null`` (client uses default)."""
+    agent_id = _seed_agent_with_bundle(
+        db_uri, tmp_path, name="plain-agent", config=_min_config("plain-agent")
+    )
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    by_id = {a["id"]: a for a in resp.json()["data"]}
+    assert by_id[agent_id]["icon"] is None
+
+
+async def test_configured_acp_agent_payload_includes_declared_icon(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured ACP row's icon reaches its seeded picker payload."""
+    entry = AcpAgentEntry(slug="fox", name="Fox", command="fox acp", icon="🦊")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda: [entry])
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    server_app._ensure_default_acp_agents(
+        SqlAlchemyAgentStore(db_uri),
+        artifact_store,
+        AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    by_id = {agent["id"]: agent for agent in resp.json()["data"]}
+    assert by_id[builtin_agent_id("fox")]["icon"] == "🦊"
+
+
+async def test_builtin_acp_agent_payload_keeps_icon_unset(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Builtin ACP rows keep their existing iconless payload by default."""
+    key, harness = next(iter(ACP_CLI_HARNESSES.items()))
+    assert harness.icon is None
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    server_app._ensure_default_acp_agents(
+        SqlAlchemyAgentStore(db_uri),
+        artifact_store,
+        AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    by_id = {agent["id"]: agent for agent in resp.json()["data"]}
+    assert by_id[builtin_agent_id(key)]["icon"] is None
+
+
+async def test_builtin_acp_agent_payload_includes_catalog_icon(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A builtin ACP catalog icon reaches its seeded picker payload."""
+    key, harness = next(iter(ACP_CLI_HARNESSES.items()))
+    monkeypatch.setattr(
+        "omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES",
+        {key: replace(harness, icon="🦊")},
+    )
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    server_app._ensure_default_acp_agents(
+        SqlAlchemyAgentStore(db_uri),
+        artifact_store,
+        AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200
+    by_id = {agent["id"]: agent for agent in resp.json()["data"]}
+    assert by_id[builtin_agent_id(key)]["icon"] == "🦊"
+
+
+def test_configured_acp_agent_invalid_refresh_does_not_stop_seeding(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An invalid refresh leaves the stored bundle intact and continues."""
+    configured = [
+        AcpAgentEntry(slug="escape", name="Escape", command="escape acp", icon="🦊"),
+        AcpAgentEntry(slug="healthy", name="Healthy", command="healthy acp", icon="🔥"),
+    ]
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: configured)
+    monkeypatch.setattr("omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES", {})
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+    server_app._ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
+
+    escape = agent_store.get_by_name("escape")
+    healthy = agent_store.get_by_name("healthy")
+    assert escape is not None
+    assert healthy is not None
+    assert agent_cache.load(escape.id, escape.bundle_location).spec.icon == "🦊"
+    assert agent_cache.load(healthy.id, healthy.bundle_location).spec.icon == "🔥"
+    escape_bundle_location = escape.bundle_location
+    escape_version = escape.version
+    escape_artifact_dir = tmp_path / "artifacts" / escape.id
+    escape_artifacts = {
+        path.name: path.read_bytes() for path in escape_artifact_dir.iterdir() if path.is_file()
+    }
+
+    configured[:] = [
+        replace(configured[0], icon="../secret.png"),
+        replace(configured[1], icon="🪿"),
+    ]
+    server_app._ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
+
+    refreshed_escape = agent_store.get_by_name("escape")
+    refreshed_healthy = agent_store.get_by_name("healthy")
+    assert refreshed_escape is not None
+    assert refreshed_healthy is not None
+    assert refreshed_escape.bundle_location == escape_bundle_location
+    assert refreshed_escape.version == escape_version
+    assert {
+        path.name: path.read_bytes() for path in escape_artifact_dir.iterdir() if path.is_file()
+    } == escape_artifacts
+    fresh_cache = AgentCache(
+        artifact_store=artifact_store,
+        cache_dir=tmp_path / "fresh-cache",
+    )
+    assert (
+        fresh_cache.load(refreshed_escape.id, refreshed_escape.bundle_location).spec.icon == "🦊"
+    )
+    assert (
+        agent_cache.load(refreshed_healthy.id, refreshed_healthy.bundle_location).spec.icon == "🪿"
+    )
+    assert not (tmp_path / "cache" / f"{escape.id}_staging").exists()
+    assert "Skipping invalid ACP agent escape: invalid agent spec: icon:" in caplog.text
+
+
+def test_configured_acp_agent_invalid_icon_uses_spec_validation(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shared spec validator rejects a new invalid ACP row before storage."""
+    entry = acp_agents(
+        {"acp": {"agents": [{"name": "Escape", "command": "escape acp", "icon": "../secret.png"}]}}
+    )[0]
+    assert entry.icon == "../secret.png"
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    monkeypatch.setattr("omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES", {})
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+    server_app._ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
+
+    assert agent_store.get_by_name("escape") is None
+    assert not any((tmp_path / "artifacts").rglob("*"))
+    assert not (tmp_path / "cache").exists()
+    assert "Skipping invalid ACP agent escape: invalid agent spec: icon:" in caplog.text
+
+
+def test_configured_acp_agent_unexpected_store_error_propagates(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected persistence failures remain fatal during ACP seeding."""
+    entry = AcpAgentEntry(slug="fox", name="Fox", command="fox acp", icon="🦊")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    monkeypatch.setattr("omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES", {})
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    def fail_put(_key: str, _data: bytes) -> None:
+        raise RuntimeError("artifact store unavailable")
+
+    monkeypatch.setattr(artifact_store, "put", fail_put)
+    with pytest.raises(RuntimeError, match="artifact store unavailable"):
+        server_app._ensure_default_acp_agents(
+            SqlAlchemyAgentStore(db_uri),
+            artifact_store,
+            AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        )
+
+
+async def test_icon_endpoint_serves_svg(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A path-like icon streams the file bytes with the svg media type."""
+    agent_id = _seed_agent_with_bundle(
+        db_uri,
+        tmp_path,
+        name="svg-agent",
+        config=_min_config("svg-agent", icon="brand/logo.svg"),
+        extra_files={"brand/logo.svg": _SVG_BYTES},
+    )
+    resp = await client.get(f"/v1/agents/{agent_id}/icon")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("image/svg+xml")
+    assert resp.content == _SVG_BYTES
+
+
+async def test_icon_endpoint_404_for_no_icon(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """An agent without an icon has no file to serve — 404."""
+    agent_id = _seed_agent_with_bundle(
+        db_uri, tmp_path, name="noicon-agent", config=_min_config("noicon-agent")
+    )
+    resp = await client.get(f"/v1/agents/{agent_id}/icon")
+    assert resp.status_code == 404
+
+
+async def test_icon_endpoint_404_for_emoji_icon(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """An emoji icon has no backing file — the endpoint returns 404."""
+    agent_id = _seed_agent_with_bundle(
+        db_uri, tmp_path, name="emoji2-agent", config=_min_config("emoji2-agent", icon="🔥")
+    )
+    resp = await client.get(f"/v1/agents/{agent_id}/icon")
+    assert resp.status_code == 404
+
+
+async def test_icon_endpoint_404_for_unknown_agent(client: httpx.AsyncClient) -> None:
+    """An unknown agent id yields 404, not a 500."""
+    resp = await client.get("/v1/agents/ag_does_not_exist/icon")
+    assert resp.status_code == 404
+
+
+def test_resolve_icon_file_returns_contained_path(tmp_path: Path) -> None:
+    """A clean relative icon resolves to the file under the agent dir."""
+    (tmp_path / "brand").mkdir()
+    icon = tmp_path / "brand" / "logo.svg"
+    icon.write_bytes(_SVG_BYTES)
+    assert _resolve_icon_file(tmp_path, "brand/logo.svg") == icon.resolve()
+
+
+def test_resolve_icon_file_rejects_missing_file(tmp_path: Path) -> None:
+    """A path with no file on disk resolves to None."""
+    assert _resolve_icon_file(tmp_path, "brand/logo.svg") is None
+
+
+def test_resolve_icon_file_rejects_traversal(tmp_path: Path) -> None:
+    """Parent-dir escapes are rejected even if the target exists."""
+    secret = tmp_path / "secret.svg"
+    secret.write_bytes(b"secret")
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    assert _resolve_icon_file(agent_dir, "../secret.svg") is None
+
+
+def test_resolve_icon_file_rejects_absolute(tmp_path: Path) -> None:
+    """An absolute icon path is rejected."""
+    secret = tmp_path / "secret.svg"
+    secret.write_bytes(b"secret")
+    assert _resolve_icon_file(tmp_path, str(secret)) is None
+
+
+def test_resolve_icon_file_rejects_symlink_escape(tmp_path: Path) -> None:
+    """A symlink inside the agent dir pointing outside is rejected."""
+    secret = tmp_path / "secret.svg"
+    secret.write_bytes(b"secret")
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "evil.svg").symlink_to(secret)
+    assert _resolve_icon_file(agent_dir, "evil.svg") is None

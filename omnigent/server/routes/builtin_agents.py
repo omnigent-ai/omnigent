@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 from starlette.types import Message
@@ -36,6 +37,7 @@ from omnigent.server.bundles import content_bundle_location, validate_agent_bund
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
+from omnigent.spec.validator import icon_looks_path_like
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 
@@ -49,6 +51,47 @@ _MULTIPART_OVERHEAD_BYTES = 64 * 1024
 _USER_AGENTS_PAGE_LIMIT = 50
 # How many sessions using an agent we count before reporting "N+".
 _IN_USE_COUNT_CAP = 100
+# Media type served for each allowed icon suffix (lowercase, leading
+# dot). Mirrors ``omnigent.spec.validator._ICON_IMAGE_SUFFIXES`` — a
+# suffix the spec layer accepts but this map omits would 404 below.
+_ICON_MEDIA_TYPES: dict[str, str] = {
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+
+
+def _resolve_icon_file(workdir: Path, icon: str) -> Path | None:
+    """Resolve a spec ``icon`` path to a real file strictly under *workdir*.
+
+    Defense-in-depth: the spec layer rejects absolute paths and ``..``
+    at parse time, but this endpoint must not rely on that alone. The
+    icon is resolved against the agent's extracted config directory and
+    the result must stay inside it (following symlinks), or ``None`` is
+    returned. ``None`` also covers a missing file.
+
+    :param workdir: The agent's extracted image directory (icon root).
+    :param icon: The spec's ``icon`` value, expected to be a
+        path-like, agent-dir-relative image path.
+    :returns: The resolved, contained file path, or ``None`` when the
+        path escapes the directory or no file exists there.
+    """
+    # Reject absolute paths and parent-dir escapes up front: joining an
+    # absolute path onto *workdir* would discard *workdir* entirely, and
+    # a ``..`` component can climb out before the containment check.
+    normalized = icon.replace("\\", "/")
+    rel = Path(normalized)
+    if rel.is_absolute() or ".." in rel.parts:
+        return None
+    base = workdir.resolve()
+    candidate = (workdir / rel).resolve()
+    if not candidate.is_relative_to(base):
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
 
 
 def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
@@ -75,6 +118,10 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     # YAML agents don't persist it at registration today). Lets the
     # new-session picker show a hover description without a migration.
     description: str | None = agent.description
+    # Icon is spec-only (no stored column, no migration): an emoji
+    # grapheme or an agent-dir-relative image path. Stays None when the
+    # spec declares none or the bundle can't be loaded.
+    icon: str | None = None
     try:
         # Only operator-authored agents (built-ins, ``--agent``) expand
         # ${VAR} against the server env; user agents are tenant input.
@@ -83,6 +130,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         )
         if description is None:
             description = loaded.spec.description
+        icon = loaded.spec.icon
         # Declared terminal names, in spec order (mirrors the
         # session-agent endpoint so both report it consistently).
         terminals = list(loaded.spec.terminals or {})
@@ -118,6 +166,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         name=agent.name,
         version=agent.version,
         description=description,
+        icon=icon,
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
@@ -416,5 +465,44 @@ def create_builtin_agents_router(
         await asyncio.to_thread(agent_store.delete, agent.id)
         agent_cache.evict(agent.id)
         return {"id": agent.id, "deleted": True}
+
+    @router.get("/agents/{agent_id}/icon")
+    async def get_agent_icon(request: Request, agent_id: str) -> FileResponse:
+        """Serve an agent's icon file (read-only).
+
+        Mounted with ``prefix="/v1"`` so the final path is
+        ``/v1/agents/{agent_id}/icon``. Only agents whose spec declares
+        a *path-like* icon have a file to serve; an emoji icon, an
+        unset icon, a missing file, or an unknown agent all yield 404.
+        The icon path is resolved strictly under the agent's extracted
+        config directory (see :func:`_resolve_icon_file`).
+
+        :param request: The incoming FastAPI request (for auth).
+        :param agent_id: The id of the agent whose icon to serve.
+        :returns: The icon file with a suffix-derived media type.
+        :raises HTTPException: 404 when the agent, its icon, or the
+            icon file does not exist, or the icon is an emoji.
+        """
+        _require_user(request, auth_provider)
+        agent = agent_store.get(agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        try:
+            loaded = agent_cache.load(
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
+            )
+        except Exception as exc:
+            _logger.debug("Failed to load spec for agent %s icon", agent.id, exc_info=True)
+            raise HTTPException(status_code=404, detail="agent icon not found") from exc
+        icon = loaded.spec.icon
+        if icon is None or not icon_looks_path_like(icon):
+            raise HTTPException(status_code=404, detail="agent icon not found")
+        media_type = _ICON_MEDIA_TYPES.get(Path(icon).suffix.lower())
+        if media_type is None:
+            raise HTTPException(status_code=404, detail="agent icon not found")
+        resolved = _resolve_icon_file(loaded.workdir, icon)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="agent icon not found")
+        return FileResponse(resolved, media_type=media_type)
 
     return router

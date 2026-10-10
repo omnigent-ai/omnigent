@@ -1,6 +1,7 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
 import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import type { SubagentIconSource } from "./subagentIcons";
 import { childStatus, type AgentActivity } from "./subagentStatus";
 
 export type { AgentActivity };
@@ -12,6 +13,7 @@ export interface AgentNodeData {
   sessionId: string;
   isActive: boolean;
   preview: string | null;
+  identity: SubagentIconSource;
   [key: string]: unknown;
 }
 
@@ -21,6 +23,7 @@ export interface TreeNode {
   activity: AgentActivity;
   statusLabel: string;
   preview: string | null;
+  identity: SubagentIconSource;
   children: TreeNode[];
 }
 
@@ -92,6 +95,7 @@ export function layoutTree(
         sessionId: node.id,
         isActive: node.id === activeId,
         preview: node.preview,
+        identity: node.identity,
       },
     });
 
@@ -137,6 +141,7 @@ export function buildTree(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
+  identity: SubagentIconSource,
   visited = new Set<string>(),
 ): TreeNode {
   visited.add(rootId);
@@ -147,6 +152,7 @@ export function buildTree(
     activity: rootActivity,
     statusLabel: rootStatusLabel,
     preview: rootPreview,
+    identity,
     children:
       depth >= MAX_TREE_DEPTH
         ? []
@@ -180,6 +186,11 @@ export function buildTree(
                 child.last_message_preview,
                 childrenMap,
                 depth + 1,
+                {
+                  kind: "child",
+                  wrapper: child.labels?.[WRAPPER_LABEL_KEY] ?? null,
+                  tool: child.tool,
+                },
                 visited,
               );
             }),
@@ -194,6 +205,7 @@ export function buildGraphLayout(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   activeId: string,
+  rootIdentity: Extract<SubagentIconSource, { kind: "root" }>,
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
   const tree = buildTree(
     rootId,
@@ -203,6 +215,7 @@ export function buildGraphLayout(
     rootPreview,
     childrenMap,
     0,
+    rootIdentity,
   );
   return layoutTree(tree, activeId);
 }
