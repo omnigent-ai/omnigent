@@ -83,6 +83,7 @@ class MainActivity : AppCompatActivity() {
     // field and the fresh page simply has no pending input. No hang or crash.
     private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
     private var pendingMicRequest: PermissionRequest? = null
+    private var httpErrorRecoveryStarted = false
 
     private val requestNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -301,6 +302,13 @@ class MainActivity : AppCompatActivity() {
         startActivity(Intent(this, ConnectActivity::class.java))
     }
 
+    private fun recoverFromMainFrameHttpError() {
+        if (httpErrorRecoveryStarted) return
+        httpErrorRecoveryStarted = true
+        startActivity(Intent(this, ConnectActivity::class.java))
+        finish()
+    }
+
     /** Build a WebView wired with the shell's settings, clients, and listeners. */
     @SuppressLint("SetJavaScriptEnabled")
     private fun buildWebView(): WebView =
@@ -319,6 +327,7 @@ class MainActivity : AppCompatActivity() {
                     onNavigationStarted = ::armServerSwitcherWatchdog,
                     onLoginRequired = ::startLogin,
                     onRendererGone = ::recoverFromRendererDeath,
+                    onMainFrameHttpError = { recoverFromMainFrameHttpError() },
                 )
             webChromeClient =
                 OmnigentWebChromeClient(
