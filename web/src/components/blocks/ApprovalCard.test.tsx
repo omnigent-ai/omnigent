@@ -1575,30 +1575,15 @@ describe("ApprovalCard — gating message emphasis", () => {
     expect(within(card).getByText("Bash", { selector: "strong" })).toBeDefined();
   });
 
-  it.each([
-    [
-      "approve_shell_commands",
-      "tool_call",
-      "Agent wants to call sys_os_shell('rm *.o *.a pkg/__init__.py'). Approve?",
-    ],
-    [
-      "approve_shell_commands",
-      "tool_call",
-      "Agent wants to call sys_os_shell('echo **x** y'). Approve?",
-    ],
-    [
-      "agy_native_permission",
-      "agy_permission",
-      'Antigravity wants to run: python -c "print(2**3**2)" && ls src/**/foo/**',
-    ],
-  ])("leaves a %s prompt's raw command text verbatim", (policyName, phase, message) => {
-    // Policy ASK reasons and native command prompts embed unescaped commands:
-    // `_`, `*`, and even balanced `**` pairs are text the user is approving.
+  it("leaves a policy prompt's raw command text verbatim", () => {
+    // Policy ASK reasons embed the unescaped command the user is approving; the
+    // full set of non-matching shapes lives in ElicitationMessage.test.tsx.
+    const message = "Agent wants to call sys_os_shell('echo **x** y pkg/__init__.py'). Approve?";
     render(
       <ApprovalCard
         {...props}
-        phase={phase}
-        policyName={policyName}
+        phase="tool_call"
+        policyName="approve_shell_commands"
         message={message}
         status="pending"
         response={null}
