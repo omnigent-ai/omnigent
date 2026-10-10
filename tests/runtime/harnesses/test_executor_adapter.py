@@ -161,6 +161,12 @@ def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_error_with_sdk_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields an ExecutorError carrying the caught SDK exception."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "error_with_sdk_cause")
+
+
+@pytest.fixture
 def use_provider_auth_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "provider_auth_failure")
 
@@ -412,6 +418,27 @@ async def test_executor_error_terminates_with_response_failed(
     # via the RuntimeError wrap in the adapter; the scaffold
     # builds an ErrorDetail with the exception's str().
     assert "mock error" in error_detail["message"]
+
+
+async def test_executor_error_sdk_cause_classifies_response_failed(
+    use_error_with_sdk_cause: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """The harness process preserves the SDK cause in its response.failed event."""
+    conv_id = "conv_err_sdk_cause"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    error_detail = events[-1].data["response"]["error"]
+    assert error_detail is not None
+    assert error_detail["code"] == "rate_limit_exceeded"
+    assert "Selected model is at capacity" in error_detail["message"]
 
 
 @pytest.mark.asyncio
@@ -673,6 +700,75 @@ async def test_executor_delivery_evidence_survives_without_an_error_code(
         assert detail.message == (
             "Terminal is not ready" if code else "inner executor error: Terminal is not ready"
         )
+    finally:
+        await adapter.on_shutdown()
+
+
+def _rate_limit_error(message: str) -> Exception:
+    """Build the ``openai.RateLimitError`` the SDK raises for an HTTP 429."""
+    import openai
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    return openai.RateLimitError(message, response=httpx.Response(429, request=request), body=None)
+
+
+@pytest.mark.asyncio
+async def test_undelivered_executor_error_classifies_by_its_sdk_cause() -> None:
+    """An uncoded undelivered failure still classifies by the SDK exception it carries."""
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    rate = _rate_limit_error("Selected model is at capacity. Please try a different model.")
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message=f"SDK error: {rate}", undelivered=True, exception=rate)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_undelivered_429", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        assert raised.value.__cause__ is rate
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.code == "rate_limit_exceeded"
+        assert detail.undelivered is True
+        assert "Selected model is at capacity" in detail.message
+    finally:
+        await adapter.on_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_explicit_executor_code_wins_over_its_sdk_cause() -> None:
+    """An executor that names its failure keeps that code even when an SDK cause is attached."""
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    rate = _rate_limit_error("Selected model is at capacity. Please try a different model.")
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Sign in first", code="databricks_sign_in_pending", exception=rate)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_coded_429", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        assert raised.value.__cause__ is rate
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.code == "databricks_sign_in_pending"
+        assert detail.message == "Sign in first"
     finally:
         await adapter.on_shutdown()
 
@@ -1110,6 +1206,28 @@ def test_classify_inner_exception_dispatches_across_sdks(
     # Fall-through: an exception no classifier recognizes
     # returns None. Caller is expected to use the class name.
     assert classify_inner_exception(RuntimeError("unknown")) is None
+
+
+def test_classify_inner_exception_walks_cause_chain() -> None:
+    """SDK causes retain their classification; unknown and cyclic chains terminate safely."""
+    from omnigent.runtime.harnesses._executor_adapter import (
+        classify_inner_exception,
+    )
+
+    rate = _rate_limit_error("Selected model is at capacity. Please try a different model.")
+    wrapper = RuntimeError("inner executor error: OpenAI Agents SDK error: …")
+    wrapper.__cause__ = rate
+    assert classify_inner_exception(wrapper) == "rate_limit_exceeded"
+
+    # A chain with no classifiable link still falls through to None.
+    unknown = RuntimeError("inner executor error: boom")
+    unknown.__cause__ = ValueError("boom")
+    assert classify_inner_exception(unknown) is None
+
+    # A cyclic cause chain terminates instead of looping forever.
+    cyclic = RuntimeError("a")
+    cyclic.__cause__ = cyclic
+    assert classify_inner_exception(cyclic) is None
 
 
 class _StubExecutor(Executor):

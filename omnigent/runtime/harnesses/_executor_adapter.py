@@ -486,8 +486,9 @@ class ExecutorAdapter(HarnessApp):
                                 title=event.title,
                                 remediation=event.remediation,
                                 undelivered=event.undelivered,
-                            )
-                        raise RuntimeError(f"inner executor error: {detail}")
+                            ) from event.exception
+                        # Preserve the SDK cause for semantic error classification.
+                        raise RuntimeError(f"inner executor error: {detail}") from event.exception
                 log_input_event(
                     _logger,
                     "native_input_execution_finished",
@@ -1184,7 +1185,9 @@ class ExecutorAdapter(HarnessApp):
             )
         if isinstance(exception, InnerExecutorError):
             if not exception.code:
-                detail = self._build_error_detail(RuntimeError(str(exception)))
+                uncoded = RuntimeError(str(exception))
+                uncoded.__cause__ = exception.__cause__
+                detail = self._build_error_detail(uncoded)
                 return detail.model_copy(
                     update={"undelivered": True if exception.undelivered else None}
                 )
@@ -1303,22 +1306,28 @@ def _classify_anthropic_exception(exception: BaseException) -> str | None:
 
 
 def classify_inner_exception(exception: BaseException) -> str | None:
-    """Fan out across per-SDK classifiers; first match wins. Returns ``None`` when unrecognized.
+    """Classify the exception and its explicit causes; the first SDK match wins.
 
-    New classifiers plug in here once. Order matters if SDK hierarchies ever overlap —
-    more-specific classifiers should come first.
+    Walks ``__cause__`` so a wrapper raised ``from`` an SDK error classifies by that
+    error, then scans the whole chain once for a context-length signal. Unrecognized
+    or cyclic chains return ``None``. Keep specific classifiers first.
     """
-    for classifier in (
-        _classify_openai_exception,
-        _classify_anthropic_exception,
-        _classify_claude_sdk_exception,
-        _classify_httpx_exception,
-    ):
-        code = classifier(exception)
-        if code is not None:
-            return code
     from omnigent.llms.errors import is_context_length_exceeded
 
+    seen: set[int] = set()
+    current: BaseException | None = exception
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for classifier in (
+            _classify_openai_exception,
+            _classify_anthropic_exception,
+            _classify_claude_sdk_exception,
+            _classify_httpx_exception,
+        ):
+            code = classifier(current)
+            if code is not None:
+                return code
+        current = current.__cause__
     if is_context_length_exceeded(exception):
         return "context_length_exceeded"
     return None

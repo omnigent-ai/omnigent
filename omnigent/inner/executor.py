@@ -363,6 +363,9 @@ class ExecutorError(ExecutorEvent):
         prompt that never rendered), so the message never reached the
         transcript and its sender's queued copy is the only record of it.
         ``False`` (default) once the harness may have accepted it.
+    :param exception: Original SDK error for semantic classification through
+        the adapter's explicit cause chain; None for non-exception failures.
+        Appended last so positional construction keeps its meaning.
     """
 
     message: str
@@ -373,6 +376,7 @@ class ExecutorError(ExecutorEvent):
     title: str | None = None
     remediation: str | None = None
     undelivered: bool = False
+    exception: BaseException | None = None
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:
