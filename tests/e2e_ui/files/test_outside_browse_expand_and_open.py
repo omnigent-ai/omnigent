@@ -73,11 +73,11 @@ def test_outside_browse_expand_and_open_survive_a_slash_merging_proxy(
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible(timeout=15_000)
     picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+    picker.get_by_test_id("workspace-picker-select").click()
 
     expect(path_button).to_contain_text(outside.name, timeout=30_000)
     expect(rail.get_by_role("button", name="notes.txt", exact=True)).to_be_visible(timeout=30_000)
     expect(rail.get_by_text("No files in workspace")).to_have_count(0)
-    page.keyboard.press("Escape")
 
     dir_row = rail.get_by_role("button", name="nested/", exact=True)
     expect(dir_row).to_be_visible(timeout=30_000)
