@@ -49,6 +49,13 @@ _logger = logging.getLogger(__name__)
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
 
+# Bounded retry for brief HTTP failures from the MCP proxy (LB blip, momentary
+# overload); a lost connection takes the reconnect path instead, and 429 is left
+# out because a rate-limited proxy must not be re-posted within this budget.
+_TRANSIENT_PROXY_STATUSES = frozenset({500, 502, 503, 504})
+_TRANSIENT_PROXY_MAX_RETRIES = 2
+_TRANSIENT_PROXY_BACKOFF_S = 0.5
+
 
 def _json_object(value: object) -> _JsonObject | None:
     """Return a string-keyed object mapping when the value has that shape."""
@@ -312,6 +319,14 @@ class ProxyMcpManager:
         runner-side approval Future until the user accepts or declines, then
         retries once with the user's decision in ``inputResponses``.
 
+        **Transient proxy failures**: a status in
+        :data:`_TRANSIENT_PROXY_STATUSES` is re-posted a bounded number of
+        times with the same operation id and a fresh JSON-RPC id. Re-posts
+        reuse runner work already started but may repeat pre-forward policy,
+        label, and approval side effects: an already-published approval
+        request can show a second card, and a consumed approval fails with
+        ``Elicitation not found or already resolved``.
+
         :param spec: Ignored — accepted for interface parity with
             :class:`RunnerMcpManager`.  ``None`` is acceptable for callers
             that have no spec context (e.g. the claude-native relay executor).
@@ -381,6 +396,7 @@ class ProxyMcpManager:
 
         payload = _initial_payload()
         approval_retries = 0
+        transient_retries = 0
 
         while True:
             request_generation = pending_approvals.current_server_generation()
@@ -409,6 +425,31 @@ class ProxyMcpManager:
                 request_id += 1
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if (
+                    status in _TRANSIENT_PROXY_STATUSES
+                    and transient_retries < _TRANSIENT_PROXY_MAX_RETRIES
+                ):
+                    # Back off and re-post under the same operation id (see call_tool).
+                    transient_retries += 1
+                    _logger.warning(
+                        "MCP proxy returned HTTP %s for tool %r in session %r; retrying (%d/%d)",
+                        status,
+                        tool_name,
+                        self._session_id,
+                        transient_retries,
+                        _TRANSIENT_PROXY_MAX_RETRIES,
+                        extra={"session_id": self._session_id},
+                    )
+                    await asyncio.sleep(_TRANSIENT_PROXY_BACKOFF_S * 2 ** (transient_retries - 1))
+                    request_id += 1
+                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    continue
+                raise RuntimeError(
+                    f"MCP proxy call failed for tool {tool_name!r} in session "
+                    f"{self._session_id!r}: {exc}"
+                ) from exc
             except Exception as exc:
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
