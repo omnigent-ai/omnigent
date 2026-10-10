@@ -1461,7 +1461,11 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    # The initial session-info post can arrive before the answer even starts.
+    # Wait for the spawned turn task itself to finish. A new session can post its
+    # initial session-info message before the answer starts, and post-count / ack
+    # heuristics can fire too early while streaming is still in flight. Waiting on
+    # the turn task guarantees the reopened stream has delivered all text and the
+    # failure notice has been posted before shutdown.
     await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=5)
     await service.shutdown()
 
