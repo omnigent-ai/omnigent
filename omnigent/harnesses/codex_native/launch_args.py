@@ -111,6 +111,9 @@ _CODEX_VALUE_FLAGS = frozenset(
         "--local-provider",
         "--enable",
         "--disable",
+        # Names an env var holding the remote auth token; unlike the reserved
+        # ``--remote`` transport flag it takes a value and is caller-settable.
+        "--remote-auth-token-env",
     }
 )
 
@@ -202,26 +205,7 @@ def codex_config_profile(args: Sequence[str]) -> str | None:
             profile = canonical[index + 1]
             if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
                 raise ValueError("Invalid Codex config profile name")
-        if arg in {
-            "-c",
-            "--config",
-            "-s",
-            "--sandbox",
-            "-a",
-            "--ask-for-approval",
-            "-p",
-            "--profile",
-            "--add-dir",
-            "-m",
-            "--model",
-            "-C",
-            "--cd",
-            "-i",
-            "--image",
-            "--local-provider",
-            "--enable",
-            "--disable",
-        }:
+        if arg in _CODEX_VALUE_FLAGS:
             index += 1
         index += 1
     return profile
@@ -236,6 +220,25 @@ def without_codex_config_profile(args: Sequence[str]) -> list[str]:
         if arg in {"--profile", "-p"} and canonical[index + 1] == profile:
             return [*canonical[:index], *canonical[index + 2 :]]
     return canonical
+
+
+def without_codex_positional_prompt(args: Sequence[str]) -> list[str]:
+    """Drop the ``[PROMPT]`` positional and any ``--`` tail; options keep their values."""
+    canonical = canonical_codex_launch_args(args)
+    kept: list[str] = []
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            break
+        if arg in _CODEX_VALUE_FLAGS:
+            kept.extend(canonical[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith("-") and arg != "-":
+            kept.append(arg)
+        index += 1
+    return kept
 
 
 def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> None:
