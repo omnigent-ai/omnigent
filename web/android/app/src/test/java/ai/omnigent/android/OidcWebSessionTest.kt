@@ -116,6 +116,52 @@ class OidcWebSessionTest {
     }
 
     @Test
+    fun `the web view's cookie info gives the session cookie's expiry`() {
+        val info =
+            listOf(
+                "theme=dark; path=/",
+                "ap_session=t; domain=omni.example; path=/; expires=Tue, 14 Nov 2023 22:13:20 GMT; httponly",
+            )
+
+        assertEquals(1_700_000_000_000L, OidcWebSession.cookieExpiry(info, "ap_session"))
+        assertNull(OidcWebSession.cookieExpiry(listOf("ap_session=t; path=/"), "ap_session"))
+        assertNull(OidcWebSession.cookieExpiry(listOf("ap_session=t; expires=soon"), "ap_session"))
+        assertNull(OidcWebSession.cookieExpiry(info, "other"))
+    }
+
+    @Test
+    fun `renewal starts a fifth of the lifetime early, at most a minute`() {
+        assertEquals(3_540_000L, OidcWebSession.renewalDelay(expiresAt = 3_600_000L, now = 0L))
+        assertEquals(80_000L, OidcWebSession.renewalDelay(expiresAt = 100_000L, now = 0L))
+        assertEquals(0L, OidcWebSession.renewalDelay(expiresAt = 5_000L, now = 5_000L))
+        assertEquals(0L, OidcWebSession.renewalDelay(expiresAt = 1_000L, now = 5_000L))
+    }
+
+    @Test
+    fun `a lost grant explains a later prompt and sign-out reports what it finished`() {
+        val rejected = OidcSignInException.GrantRejected("h")
+        assertEquals(rejected, OidcWebSession.rememberedRenewalCause(rejected))
+        assertNull(OidcWebSession.rememberedRenewalCause(OidcSignInException.Network("h")))
+        assertEquals(
+            rejected,
+            OidcWebSession.reauthenticationCause(OidcSignInException.NoStoredGrant("h"), rejected),
+        )
+        val network = OidcSignInException.Network("h")
+        assertEquals(network, OidcWebSession.reauthenticationCause(network, rejected))
+        assertEquals(
+            "You're signed out of h.",
+            OidcWebSession.signedOutMessage("h", complete = true),
+        )
+        assertTrue(
+            OidcWebSession
+                .signedOutMessage(
+                    "h",
+                    complete = false,
+                ).startsWith("Couldn't finish signing out of h"),
+        )
+    }
+
+    @Test
     fun `prompts explain why the session needs a sign-in`() {
         assertEquals(
             "Sign in to omni.example to continue.",

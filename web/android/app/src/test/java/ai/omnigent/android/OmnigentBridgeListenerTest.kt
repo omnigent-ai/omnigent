@@ -180,6 +180,24 @@ class OmnigentBridgeListenerTest {
     }
 
     @Test
+    fun `every bridge forwards signOutOfServer for the shell to answer`() {
+        var requests = 0
+        val wired =
+            OmnigentBridgeListener(
+                notifications = NativeNotificationManager(context),
+                blobSaver = BlobSaver(context),
+                onSignOutOfServer = { requests++ },
+            )
+
+        wired.handle("""{"method":"signOutOfServer"}""")
+
+        assertEquals(1, requests)
+        assertTrue(NativeBridgeScript.source.contains("signOutOfServer()"))
+        assertTrue(NativeBridgeScript.source.contains("__omnigentNativeEmitSignOutResult"))
+        assertTrue(NativeBridgeScript.source.contains("canSignOut: payload.canSignOut === true"))
+    }
+
+    @Test
     fun `switchServer forwards the URL and drops an empty or missing one`() {
         val switchCalls = mutableListOf<String>()
         val wired = serverSelectionListener(switchCalls = switchCalls)

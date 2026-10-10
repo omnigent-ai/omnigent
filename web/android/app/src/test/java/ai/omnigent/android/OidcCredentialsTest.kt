@@ -96,6 +96,28 @@ class OidcCredentialsTest {
     }
 
     @Test
+    fun `a sign-in restored after a restart still completes`() {
+        credentials.beginSignIn(server, "ap_session")
+        val restarted =
+            OidcCredentials(
+                store,
+                OidcPendingSignInStore(context, pendingRecords) { 1_000L },
+                transport,
+                transport,
+                executor,
+                { 1_000L },
+            ) { "unused" }
+        transport.respond(
+            200,
+            """{"token":"jwt.payload.sig","expires_in":60,"refresh_token":"refresh-1"}""",
+        )
+
+        restarted.completeSignIn(callback("state=state-1&code=code-1"))
+
+        assertEquals("refresh-1", store.grants[origin]?.refreshToken)
+    }
+
+    @Test
     fun `a server without refresh grants forgets the older grant`() {
         store.grants[origin] = OidcRefreshGrant("old", null)
         credentials.beginSignIn(server, "ap_session")
@@ -435,6 +457,113 @@ class OidcCredentialsTest {
     }
 
     @Test
+    fun `an exchange that finishes after sign-out stores no grant`() {
+        credentials.beginSignIn(server, "ap_session")
+        transport.respond(200, """{"token":"t","refresh_token":"late-grant"}""")
+        transport.respond(200, """{"revoked":true}""")
+        transport.onRequest = { request ->
+            if (request.uri.path.endsWith("/auth/native-token")) credentials.signOut(server)
+        }
+
+        assertThrows(CancellationException::class.java) {
+            credentials.completeSignIn(callback("state=state-1&code=c"))
+        }
+        executor.runAll()
+
+        assertNull(store.grants[origin])
+        assertEquals(
+            "/omnigent/oauth/revoke",
+            transport.requests
+                .last()
+                .uri.path,
+        )
+        assertEquals(mapOf("refresh_token" to "late-grant"), form(transport.requests.last()))
+    }
+
+    @Test
+    fun `a token-only exchange that finishes after sign-out completes nothing`() {
+        credentials.beginSignIn(server, "ap_session")
+        transport.respond(200, """{"token":"t"}""")
+        transport.onRequest = { request ->
+            if (request.uri.path.endsWith("/auth/native-token")) credentials.signOut(server)
+        }
+
+        assertThrows(CancellationException::class.java) {
+            credentials.completeHandedOffSignIn(callback("state=state-1&code=c"))
+        }
+        assertNull(credentials.takeHandedOff())
+    }
+
+    @Test
+    fun `sign-out drops a finished sign-in not yet installed for that origin only`() {
+        transport.respond(200, """{"token":"for-omni"}""")
+        credentials.beginSignIn(server, "ap_session")
+        credentials.completeHandedOffSignIn(callback("state=state-1&code=c"))
+
+        credentials.signOut(server)
+        assertNull(credentials.takeHandedOff())
+
+        transport.respond(200, """{"token":"for-other"}""")
+        credentials.beginSignIn("https://other.example", "ap_session")
+        credentials.completeHandedOffSignIn(callback("state=state-1&code=c"))
+        credentials.signOut(server)
+        assertEquals("for-other", credentials.takeHandedOff()?.session?.token)
+    }
+
+    @Test
+    fun `sign-out ends a sign-in still open in the browser for that origin only`() {
+        credentials.beginSignIn("https://other.example", "ap_session")
+        credentials.signOut(server)
+        transport.respond(200, """{"token":"t"}""")
+        assertEquals(
+            "t",
+            credentials.completeSignIn(callback("state=state-1&code=c")).session.token,
+        )
+
+        credentials.beginSignIn(server, "ap_session")
+        credentials.signOut(server)
+        assertThrows(OidcSignInException.InvalidCallback::class.java) {
+            credentials.completeSignIn(callback("state=state-1&code=c"))
+        }
+    }
+
+    @Test
+    fun `a browser sign-in sign-out couldn't read or clear still never completes`() {
+        // Once in the process that began the attempt, once after a restart restored it.
+        listOf(false, true).forEach { restarted ->
+            listOf(FlakyPending.Fault.LOAD, FlakyPending.Fault.CLEAR).forEach { fault ->
+                val case = "${fault.name} restarted=$restarted"
+                val flaky = FlakyPending(OidcPendingSignInStore(context, pendingRecords) { 1_000L })
+                val credentials = {
+                    OidcCredentials(
+                        store,
+                        flaky,
+                        transport,
+                        transport,
+                        executor,
+                        { 1_000L },
+                    ) { "state-1" }
+                }
+                val began = credentials()
+                began.beginSignIn(server, "ap_session")
+                val current = if (restarted) credentials() else began
+
+                flaky.fault = fault
+                assertThrows(case, OidcSignInException.StorageUnavailable::class.java) {
+                    current.signOut(server)
+                }
+                // Storage recovers and the browser delivers the old attempt's callback.
+                flaky.fault = null
+                assertThrows(case, CancellationException::class.java) {
+                    current.completeSignIn(callback("state=state-1&code=c"))
+                }
+            }
+        }
+        assertFalse(transport.requests.any { it.uri.path.endsWith("/auth/native-token") })
+        assertNull(store.grants[origin])
+    }
+
+    @Test
     fun `sign-out reports a grant it couldn't delete`() {
         store.grants[origin] = OidcRefreshGrant("refresh-1", null)
         store.failDelete = true
@@ -520,6 +649,25 @@ class OidcCredentialsTest {
             onRequest(request)
             val response = responses.removeFirst() ?: throw OAuthNetworkException()
             return response.copy(uri = request.uri)
+        }
+    }
+
+    /** A real pending store whose reads or clears can be made to fail. */
+    private class FlakyPending(
+        private val store: OidcPendingSignInStore,
+    ) : OidcPendingSignIns by store {
+        enum class Fault { LOAD, CLEAR }
+
+        var fault: Fault? = null
+
+        override fun load(): OidcPendingSignInStore.PendingSignIn? {
+            if (fault == Fault.LOAD) throw CredentialStorageException.InvalidData()
+            return store.load()
+        }
+
+        override fun clear() {
+            if (fault == Fault.CLEAR) throw CredentialStorageException.Unavailable()
+            store.clear()
         }
     }
 

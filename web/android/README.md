@@ -139,10 +139,20 @@ and `auth.session_cookie` is set:
   with the reason when the saved sign-in had expired or been ended. A refused
   sign-in shows the server's reason, and an unreachable server shows the
   connection error.
-- **While connected,** the page's own navigation to `<mount>/auth/login`, or a
+- **While connected,** the app renews the cookie shortly before it expires, and
+  on return to the foreground when the cookie is missing or due. A renewal that
+  can't reach the server retries after 30 seconds, and none runs while the app
+  is in the background. The page's own navigation to `<mount>/auth/login`, or a
   redirect to the identity provider, renews silently and reloads the page you
   were on. If the page asks again within 15 seconds, or the renewal fails, the
   app asks to sign in again and names the cause.
+- **Sign out** (the web app's `<mount>/auth/logout`, **Sign Out** in the native
+  server menu, or **Sign out of <server>** in the sidebar picker) forgets the
+  grant, clears the session cookie, stops reopening that server on launch, and
+  shows "You're signed out of <host>." The grant is revoked at
+  `POST <mount>/oauth/revoke` as a best effort. The browser stays signed in to
+  the identity provider, so the next sign-in may finish without a prompt. The
+  sidebar picker offers the same sign-out for Databricks workspaces.
 
 The refresh grant is stored per server origin, and the sign-in in progress is
 stored so it survives Android stopping the app while the browser is open. Both

@@ -1,9 +1,12 @@
 package ai.omnigent.android
 
 import android.webkit.CookieManager
+import androidx.webkit.CookieManagerCompat
+import androidx.webkit.WebViewFeature
 import java.net.URI
 import java.time.Instant
 import java.time.ZoneOffset
+import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 
 /** A web view connection whose OIDC session the shell owns: the server and its session cookie. */
@@ -104,6 +107,77 @@ internal object OidcWebSession {
             ?.substringAfter('=')
             ?.takeIf(String::isNotEmpty)
 
+    /**
+     * When a `Set-Cookie`-style string from [CookieManagerCompat.getCookieInfo] for [name]
+     * expires, or null for a session cookie or an unreadable date.
+     */
+    fun cookieExpiry(
+        cookieInfo: List<String>,
+        name: String,
+    ): Long? {
+        val cookie = cookieInfo.firstOrNull { it.trimStart().startsWith("$name=") } ?: return null
+        val expires =
+            cookie
+                .split(';')
+                .map(String::trim)
+                .firstOrNull { it.startsWith("expires=", ignoreCase = true) }
+                ?.substringAfter('=')
+                ?: return null
+        return runCatching {
+            ZonedDateTime
+                .parse(
+                    expires.trim(),
+                    DateTimeFormatter.RFC_1123_DATE_TIME,
+                ).toInstant()
+                .toEpochMilli()
+        }.getOrNull()
+    }
+
+    /**
+     * How long to wait before renewing a cookie that expires at [expiresAt]: a fifth of the
+     * remaining lifetime early, at most a minute; zero once it is due.
+     */
+    fun renewalDelay(
+        expiresAt: Long,
+        now: Long,
+    ): Long {
+        val remaining = expiresAt - now
+        if (remaining <= 0) return 0
+        return maxOf(0, remaining - minOf(60_000L, remaining / 5))
+    }
+
+    /** A background renewal failure worth remembering: it deleted the grant. */
+    fun rememberedRenewalCause(error: Throwable?): OidcSignInException? =
+        when (error) {
+            is OidcSignInException.GrantExpired, is OidcSignInException.GrantRejected -> error
+            else -> null
+        }
+
+    /** The error to explain at the next prompt: a remembered cause replaces "no stored grant". */
+    fun reauthenticationCause(
+        error: Throwable,
+        remembered: OidcSignInException?,
+    ): Throwable =
+        if (remembered != null &&
+            error is OidcSignInException.NoStoredGrant
+        ) {
+            remembered
+        } else {
+            error
+        }
+
+    /** The Connect screen message after a sign-out; [complete] is false when something survived. */
+    fun signedOutMessage(
+        host: String,
+        complete: Boolean,
+    ): String =
+        if (complete) {
+            "You're signed out of $host."
+        } else {
+            "Couldn't finish signing out of $host; its saved sign-in may still be used. " +
+                "Connect, then sign out again."
+        }
+
     /** An unreachable server is a connection error, never a reason to sign in again. */
     fun isNetworkFailure(error: Throwable?): Boolean = error is OidcSignInException.Network
 
@@ -170,6 +244,12 @@ internal interface OidcCookieJar {
     )
 
     fun flush()
+
+    /** When the cookie [name] sent to [url] expires, when the web view can tell. */
+    fun expiry(
+        url: String,
+        name: String,
+    ): Long? = null
 }
 
 /** The default WebView profile, which generic servers share as they always have. */
@@ -187,4 +267,14 @@ internal object DefaultProfileCookieJar : OidcCookieJar {
     }
 
     override fun flush() = CookieManager.getInstance().flush()
+
+    override fun expiry(
+        url: String,
+        name: String,
+    ): Long? {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.GET_COOKIE_INFO)) return null
+        val cookies =
+            runCatching { CookieManagerCompat.getCookieInfo(CookieManager.getInstance(), url) }
+        return OidcWebSession.cookieExpiry(cookies.getOrNull().orEmpty(), name)
+    }
 }

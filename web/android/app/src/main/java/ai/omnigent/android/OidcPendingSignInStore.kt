@@ -4,6 +4,22 @@ import android.content.Context
 import org.json.JSONObject
 import java.util.UUID
 
+/** The one native OIDC sign-in in progress; [OidcPendingSignInStore] keeps it on device. */
+internal interface OidcPendingSignIns {
+    fun begin(
+        serverUrl: String,
+        cookieName: String,
+        state: String,
+        verifier: String,
+    ): OidcPendingSignInStore.PendingSignIn
+
+    fun load(): OidcPendingSignInStore.PendingSignIn?
+
+    fun consume(expectedId: String): OidcPendingSignInStore.PendingSignIn?
+
+    fun clear()
+}
+
 /**
  * The one native OIDC sign-in in progress, encrypted so it survives Android killing the app
  * while the browser is in front. Consumed once by the callback that completes it.
@@ -13,7 +29,7 @@ internal class OidcPendingSignInStore(
     private val records: EncryptedRecordStore =
         EncryptedRecordStore(context, "oidc-sign-in-attempt"),
     private val now: () -> Long = System::currentTimeMillis,
-) {
+) : OidcPendingSignIns {
     data class PendingSignIn(
         val id: String,
         val createdAtEpochMillis: Long,
@@ -28,7 +44,7 @@ internal class OidcPendingSignInStore(
     }
 
     @Synchronized
-    fun begin(
+    override fun begin(
         serverUrl: String,
         cookieName: String,
         state: String,
@@ -49,7 +65,7 @@ internal class OidcPendingSignInStore(
 
     /** The attempt in progress; an expired one is discarded. */
     @Synchronized
-    fun load(): PendingSignIn? {
+    override fun load(): PendingSignIn? {
         val data = records.read(RECORD_KEY) ?: return null
         val pending = decode(data)
         val age = now() - pending.createdAtEpochMillis
@@ -62,7 +78,7 @@ internal class OidcPendingSignInStore(
 
     /** Removes and returns the attempt, only if it is still [expectedId]. */
     @Synchronized
-    fun consume(expectedId: String): PendingSignIn? {
+    override fun consume(expectedId: String): PendingSignIn? {
         val pending = load() ?: return null
         if (pending.id != expectedId) return null
         records.remove(RECORD_KEY)
@@ -70,7 +86,7 @@ internal class OidcPendingSignInStore(
     }
 
     @Synchronized
-    fun clear() {
+    override fun clear() {
         records.remove(RECORD_KEY)
     }
 
