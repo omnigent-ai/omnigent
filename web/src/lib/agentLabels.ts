@@ -40,9 +40,10 @@ export interface SetupStepWire {
 interface HarnessCatalogRow {
   id?: string;
   label?: string;
-  // Declared capability profile. Only ``integration_mode`` is read here, to
-  // recognize the generic-ACP family without hardcoding vendor ids.
-  capabilities?: { integration_mode?: string | null } | null;
+  // Declared capability profile: ``integration_mode`` recognizes the
+  // generic-ACP family and ``effort`` names the reasoning-effort ladder, so
+  // neither needs vendor ids hardcoded here.
+  capabilities?: { integration_mode?: string | null; effort?: string | null } | null;
 }
 
 /** ``capabilities.integration_mode`` of every generic-ACP harness. */
@@ -62,9 +63,23 @@ interface HarnessCatalog {
   setupSteps: Record<string, SetupStepWire[]>;
   /** ids the server declares generic-ACP — see {@link useAcpHarnessIds}. */
   acpHarnesses: ReadonlySet<string>;
+  /** harness id → declared effort family (``anthropic``, ``openai``, …). */
+  effortFamilies: Record<string, string>;
 }
 
-async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
+/** Pull each row's declared effort family; rows without one are skipped. */
+export function effortFamiliesFromCatalog(
+  rows: readonly HarnessCatalogRow[],
+): Record<string, string> {
+  const families: Record<string, string> = {};
+  for (const row of rows) {
+    const family = row.capabilities?.effort;
+    if (typeof row.id === "string" && typeof family === "string") families[row.id] = family;
+  }
+  return families;
+}
+
+export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   const res = await authenticatedFetch("/v1/harnesses");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HarnessCatalogWire;
@@ -79,7 +94,12 @@ async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   // so the dialog resolves whatever harness the session declares.
   const setupSteps =
     body.setup_steps && typeof body.setup_steps === "object" ? body.setup_steps : {};
-  return { labels, setupSteps, acpHarnesses };
+  return {
+    labels,
+    setupSteps,
+    acpHarnesses,
+    effortFamilies: effortFamiliesFromCatalog(body.data ?? []),
+  };
 }
 
 // Every hook below shares one request + cache entry, each selecting its own
@@ -171,6 +191,13 @@ const NO_ACP_HARNESSES: ReadonlySet<string> = new Set<string>();
  */
 export function useAcpHarnessIds(enabled = true): ReadonlySet<string> {
   return useHarnessCatalog((c) => c.acpHarnesses, NO_ACP_HARNESSES, enabled);
+}
+
+const NO_EFFORT_FAMILIES: Record<string, string> = {};
+
+/** harness id → declared effort family, from ``/v1/harnesses`` ``capabilities.effort``. */
+export function useHarnessEffortFamilies(enabled = true): Record<string, string> {
+  return useHarnessCatalog((c) => c.effortFamilies, NO_EFFORT_FAMILIES, enabled);
 }
 
 /**

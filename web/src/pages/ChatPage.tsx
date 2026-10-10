@@ -64,6 +64,7 @@ import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
@@ -244,7 +245,7 @@ import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { effortLevelsForFamily, supportsEffortControl } from "@/lib/sessionCapabilities";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -1046,16 +1047,26 @@ export function ChatPage() {
   // returns a fresh array each call; a new identity here would defeat the memo()
   // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
   // codexModelOptions rationale).
+  const harnessEffortFamilies = useHarnessEffortFamilies();
+  // Declared effort family for a non-native harness (claude-sdk, codex, …), whose
+  // effort rides ``reasoning_effort`` into the SDK executor. Native harnesses keep
+  // their label-driven ladders, so a label-less native row never reads this.
+  const sdkEffortFamily =
+    capabilitySource.harness && !nativeCodingAgentForHarness(capabilitySource.harness)
+      ? (harnessEffortFamilies[capabilitySource.harness] ?? null)
+      : null;
   const effortLevels = useMemo(
     () =>
       effortLevelsForConv(
         capabilitySource,
         codexModelOptions,
         llmModel ?? sessionModelOverrideForEffort,
+        sdkEffortFamily,
       ),
-    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, sdkEffortFamily],
   );
-  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
+  const showEffort =
+    shouldShowEffortPicker(capabilitySource, sdkEffortFamily) && effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -4290,6 +4301,7 @@ export function effortLevelsForConv(
     | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
+  effortFamily: string | null = null,
 ): readonly string[] {
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
@@ -4305,7 +4317,9 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return EFFORT_LEVELS;
+      // A non-native harness offers its declared family's ladder (claude-sdk →
+      // anthropic, codex → openai); with no family the shared default holds.
+      return effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS;
   }
 }
 
@@ -4387,9 +4401,16 @@ export function shouldShowModelPicker(
  */
 export function shouldShowEffortPicker(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
+  effortFamily: string | null = null,
 ): boolean {
-  return supportsEffortControl(conv);
+  return supportsEffortControl(conv, effortFamily);
 }
 
 export function shouldShowCodexPlanModeControl(
