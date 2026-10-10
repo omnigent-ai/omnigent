@@ -2847,7 +2847,7 @@ def _session_cost_estimate(
     call via :func:`asyncio.to_thread`. ``C`` is the forwarder's real-time
     estimate: the parent transcript's own cost (sidechains excluded) plus
     the sum of each tracked sub-agent's own transcript cost (each priced
-    once per ``requestId`` — see
+    once per API response — see
     :func:`compute_transcript_cumulative_cost`). ``S`` is the statusLine
     total. See :func:`_forward_session_cost` for why the two are combined
     with ``max`` rather than added.
@@ -2915,8 +2915,8 @@ async def _forward_session_cost(
       for display.
     - ``policy_cost_usd`` = ``max(S, C)`` — the POLICY/budget cost. ``C``
       is the forwarder's real-time estimate (parent transcript own
-      messages + each tracked sub-agent's transcript, each priced once
-      per ``requestId``). ``C`` advances while ``S`` is frozen, so the
+      messages + each tracked sub-agent's transcript, each response
+      priced once). ``C`` advances while ``S`` is frozen, so the
       gate sees in-flight sub-agent spend and can block mid-turn. With no
       sub-agent there is no lag, so it equals ``S``.
 

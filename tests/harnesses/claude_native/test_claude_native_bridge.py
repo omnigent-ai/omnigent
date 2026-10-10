@@ -8892,6 +8892,7 @@ def _assistant_entry(
     output_tokens: int,
     is_sidechain: bool = False,
     request_id: str | None = None,
+    message_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Build one assistant transcript record with a usage block.
@@ -8902,8 +8903,9 @@ def _assistant_entry(
     :param is_sidechain: When ``True`` mark the record ``isSidechain``
         (how a sub-agent message is inlined into a parent transcript).
     :param request_id: Top-level ``requestId`` to stamp, e.g.
-        ``"req_A"``. ``None`` omits it (records without a ``requestId``
-        are each billed once, never collapsed together).
+        ``"req_A"``. ``None`` omits it.
+    :param message_id: ``message.id`` to stamp, e.g. ``"msg_A"``.
+        ``None`` omits it.
     :returns: A decoded transcript record dict.
     """
     entry: dict[str, Any] = {
@@ -8917,45 +8919,87 @@ def _assistant_entry(
         entry["isSidechain"] = True
     if request_id is not None:
         entry["requestId"] = request_id
+    if message_id is not None:
+        entry["message"]["id"] = message_id
     return entry
 
 
-def test_compute_transcript_cumulative_cost_dedupes_by_request_id(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "identities",
+    [
+        pytest.param([("msg_A", None), ("msg_A", None)], id="message"),
+        pytest.param([(None, "req_A"), (None, "req_A")], id="request"),
+        pytest.param([("msg_A", "req_A"), ("msg_A", "req_A")], id="both"),
+        pytest.param([("msg_A", None), ("msg_A", "req_A")], id="request-late"),
+        pytest.param([("msg_A", "req_A"), ("msg_A", None)], id="request-missing"),
+        pytest.param([(None, "req_A"), ("msg_A", "req_A")], id="message-late"),
+        pytest.param([("msg_A", "req_A"), (None, "req_A")], id="message-missing"),
+    ],
+)
+def test_compute_transcript_cumulative_cost_dedupes_inference_records(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identities: list[tuple[str | None, str | None]],
 ) -> None:
-    """
-    Records sharing a ``requestId`` are billed once, not once per record.
-
-    Claude writes the same API response as multiple transcript records (a
-    streamed partial plus the final record), each carrying that response's
-    full ``usage`` under one ``requestId``. Summing every record
-    double-bills (observed ~2x inflation, which leaked into the parent
-    badge and the cost-budget gate). The cost must dedupe by ``requestId``.
-    """
+    """Repeated inference records retain the last priceable usage, including legacy IDs."""
     from omnigent.llms.context_window import ModelPricing
 
     pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
-    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: pricing if model == "m" else None,
+    )
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
     path = tmp_path / "transcript.jsonl"
+    (first_message_id, first_request_id), (last_message_id, last_request_id) = identities
     _write_transcript_jsonl(
         path,
         [
-            # Two records, SAME requestId = one billed response (2*10 + 3*20 = 80).
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
-            # Distinct requestId = a second billed response (1*10 + 1*20 = 30).
-            _assistant_entry(model="m", input_tokens=1, output_tokens=1, request_id="req_B"),
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=1,
+                message_id=first_message_id,
+                request_id=first_request_id,
+            ),
+            _assistant_entry(
+                model="m", input_tokens=1, output_tokens=1, message_id="msg_B", request_id="req_B"
+            ),
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=3,
+                message_id=last_message_id,
+                request_id=last_request_id,
+            ),
+            _assistant_entry(
+                model="unpriced",
+                input_tokens=99,
+                output_tokens=99,
+                message_id="msg_A",
+                request_id="req_A",
+            ),
         ],
     )
     cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
-    # 80 + 30 = 110. Without dedup the duplicate req_A record adds another
-    # 80 → 190, the ~2x over-report this dedup fixes.
     assert cost == pytest.approx(110.0)
 
 
+@pytest.mark.parametrize(
+    "identities",
+    [
+        pytest.param([(None, None), (None, None)], id="anonymous"),
+        pytest.param([("", ""), ("", "")], id="empty-ids"),
+        pytest.param([(None, "req_A"), (None, "req_B")], id="distinct-requests"),
+        pytest.param([("same", None), (None, "same")], id="separate-namespaces"),
+        pytest.param([(None, None), (None, "__no_request_id_0")], id="anonymous-label-collision"),
+    ],
+)
 def test_compute_transcript_cumulative_cost_sums_priced_messages(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identities: list[tuple[str | None, str | None]],
 ) -> None:
     """
     Cost is the sum over every priced assistant message in the transcript.
@@ -8968,14 +9012,28 @@ def test_compute_transcript_cumulative_cost_sums_priced_messages(
 
     pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
     monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
     path = tmp_path / "transcript.jsonl"
+    (first_message_id, first_request_id), (last_message_id, last_request_id) = identities
     _write_transcript_jsonl(
         path,
         [
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3),  # 2*10 + 3*20 = 80
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=3,
+                message_id=first_message_id,
+                request_id=first_request_id,
+            ),
             {"message": {"role": "user", "content": "hi"}},  # no usage → skipped
-            _assistant_entry(model="m", input_tokens=1, output_tokens=1),  # 1*10 + 1*20 = 30
+            _assistant_entry(
+                model="m",
+                input_tokens=1,
+                output_tokens=1,
+                message_id=last_message_id,
+                request_id=last_request_id,
+            ),
         ],
     )
     cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)

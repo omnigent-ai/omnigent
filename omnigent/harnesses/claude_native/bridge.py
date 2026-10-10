@@ -3432,18 +3432,12 @@ def compute_transcript_cumulative_cost(
     pricing the token totals — but per-message pricing also stays correct
     across a model switch within one transcript.
 
-    **Deduplicated by ``requestId``.** Claude writes more than one
-    transcript record for a single API response (a streamed partial plus
-    the final record, retries, etc.), and those records share one
-    ``requestId`` while each carries that response's full ``message.usage``
-    (not an increment). Summing every record would bill the same response
-    two-plus times — observed ~2x inflation, with the parent badge and the
-    cost-budget gate both reading the doubled figure. So records are keyed
-    by ``requestId`` (last priceable record per id wins, as its usage is
-    the authoritative final figure) and each billed response is counted
-    exactly once. A record with no ``requestId`` (rare non-API assistant
-    entry) gets a per-record unique key so it is never collapsed with
-    another.
+    Claude can write several records per API response, each repeating its
+    usage. ``requestId`` may be absent without an Anthropic ``request-id``
+    response header. Deduplicate by ``message.id``, falling back to
+    ``requestId`` for records without one. Priceable records carrying both IDs
+    link request-only fragments to the same response. The last priceable record
+    wins; records with neither ID remain separate.
 
     :param transcript_path: Path to a Claude transcript JSONL, e.g.
         ``".../<session>.jsonl"`` (parent) or
@@ -3470,13 +3464,9 @@ def compute_transcript_cumulative_cost(
     provider_config = load_config()
     provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
-    # Per-``requestId`` cost (USD); last priceable record per id wins so a
-    # response written across multiple transcript records is counted once.
-    cost_by_request: dict[str, float] = {}
-    # Counter minting unique keys for records lacking a ``requestId`` so
-    # they each count once instead of collapsing onto a shared key.
-    no_request_id_index = 0
-    for record in read_result.records:
+    cost_by_response: dict[tuple[str, str | int], float] = {}
+    message_keys_by_request: dict[str, tuple[str, str | int]] = {}
+    for index, record in enumerate(read_result.records):
         if record.text is None:
             continue
         try:
@@ -3500,14 +3490,27 @@ def compute_transcript_cumulative_cost(
         )
         if pricing is None:
             continue
+        message = entry.get("message")
+        message_id = message.get("id") if isinstance(message, dict) else None
+        if not isinstance(message_id, str) or not message_id:
+            message_id = None
         request_id = entry.get("requestId")
         if not isinstance(request_id, str) or not request_id:
-            request_id = f"__no_request_id_{no_request_id_index}"
-            no_request_id_index += 1
-        cost_by_request[request_id] = compute_llm_cost(usage, pricing)
-    if not cost_by_request:
+            request_id = None
+        if message_id is not None:
+            key = ("message", message_id)
+            if request_id is not None:
+                # A later fragment can supply the identity missing from earlier ones.
+                cost_by_response.pop(("request", request_id), None)
+                message_keys_by_request[request_id] = key
+        elif request_id is not None:
+            key = message_keys_by_request.get(request_id, ("request", request_id))
+        else:
+            key = ("record", index)
+        cost_by_response[key] = compute_llm_cost(usage, pricing)
+    if not cost_by_response:
         return None
-    return sum(cost_by_request.values())
+    return sum(cost_by_response.values())
 
 
 def count_hook_events(bridge_dir: Path) -> int:
