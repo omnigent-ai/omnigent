@@ -152,6 +152,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
+    _remove_session_worktree_best_effort,
     _require_codex_approval_mode_forward,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
@@ -932,6 +933,50 @@ def register_core_routes(
                     _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
+                if (
+                    launch_failed
+                    and body.git is not None
+                    and not body.git.existing_worktree
+                    and conv is not None
+                    and conv.workspace is not None
+                    and conv.git_branch is not None
+                ):
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        recorded_worktree_root,
+                    )
+
+                    # Nothing reaps worktrees, so roll back the one this create
+                    # made, as the bind and delete paths do. The stored workspace
+                    # may be a relocated subdirectory; remove the recorded root.
+                    worktree_root = recorded_worktree_root(
+                        conv.workspace, conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                    )
+                    if worktree_root is None:
+                        _logger.warning(
+                            "Workspace %s no longer matches its recorded cleanup root",
+                            conv.workspace,
+                        )
+                    else:
+                        await _remove_session_worktree_best_effort(
+                            host_id=launch_host_id,
+                            worktree_path=worktree_root,
+                            branch=conv.git_branch,
+                            # Never -D a pre-existing branch the user checked out.
+                            delete_branch=not body.git.existing_branch,
+                            host_registry=getattr(request.app.state, "host_registry", None),
+                            reason="create-launch-failure",
+                        )
+                    conv = await asyncio.to_thread(conversation_store.clear_host_binding, resp.id)
+                    await asyncio.to_thread(
+                        conversation_store.delete_label, resp.id, WORKTREE_ROOT_LABEL_KEY
+                    )
+                    resp.runner_id = None
+                    resp.host_id = None
+                    resp.workspace = None
+                    resp.git_branch = None
+                    resp.labels.pop(WORKTREE_ROOT_LABEL_KEY, None)
+                    launch_host_id = None
 
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
