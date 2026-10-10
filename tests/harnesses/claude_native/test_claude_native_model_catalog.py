@@ -655,3 +655,50 @@ async def test_catalog_keeps_canonical_rows_for_bare_id_gateway(
     assert "sonnet" in ids
     assert "claude-opus-4" in models  # Concrete id from gateway listing
     assert "claude-sonnet-4" in models  # Concrete id from gateway listing
+
+
+async def test_catalog_drops_bare_rows_when_configured_databricks_listing_is_undetermined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured Databricks AI Gateway whose /v1/models fails keeps no bare claude-* rows.
+
+    The gateway routes only its own namespaced ids, so an undetermined listing
+    fails closed there instead of offering aliases that fail at the first turn.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+                {"id": "sonnet", "model": "claude-sonnet-4", "displayName": "Sonnet 4"},
+            ],
+            default_model="claude-opus-5",
+            empty_picker=False,
+            disabled_models=set(),
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    original_fetch = model_catalog._fetch_openai_compatible_listing
+
+    def _not_found_fetch(
+        provider: model_catalog.ResolvedModelProvider, **kwargs: Any
+    ) -> model_catalog.ModelListing:
+        kwargs["transport"] = httpx.MockTransport(lambda _request: httpx.Response(404))
+        return original_fetch(provider, **kwargs)
+
+    monkeypatch.setattr(model_catalog, "_fetch_openai_compatible_listing", _not_found_fetch)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={},
+        model=None,
+        listing_provider=model_catalog.ResolvedModelProvider(
+            kind=GATEWAY_KIND,
+            family=ANTHROPIC_FAMILY,
+            base_url="https://example.cloud.databricks.com/ai-gateway/anthropic",
+            api_key="test-key",
+            detail="databricks gateway",
+        ),
+    )
+
+    catalog = await claude_native.claude_model_catalog(config)
+
+    assert [row for row in catalog or [] if str(row.get("model", "")).startswith("claude-")] == []
