@@ -2745,6 +2745,10 @@ class _PendingToolResult:
 INPUT_TOO_LARGE_CODE = "input_too_large"
 _INPUT_TOO_LARGE_TITLE = "Message is too large for Codex"
 _INPUT_TOO_LARGE_REMEDIATION = "Shorten the message or split large pasted content across turns."
+_CONVERSATION_TOO_LARGE_TITLE = "Conversation is too large for Codex"
+_CONVERSATION_TOO_LARGE_REMEDIATION = (
+    "Fork the session from a message before the oversized one, or start a new session."
+)
 
 
 class _CodexRequestError(RuntimeError):
@@ -2755,10 +2759,14 @@ class _CodexRequestError(RuntimeError):
         self.error = error
 
 
-def _input_too_large_error(error: object) -> ExecutorError | None:
+def _input_too_large_error(
+    error: object, *, replayed_history: bool = False
+) -> ExecutorError | None:
     """Translate an ``input_too_large`` rejection into a coded turn error.
 
-    Returns ``None`` for any other JSON-RPC error payload.
+    Returns ``None`` for any other JSON-RPC error payload. ``replayed_history``
+    marks a fresh thread's first prompt, where the earlier conversation rather
+    than the latest message is what exceeds the limit.
     """
     if not isinstance(error, dict):
         return None
@@ -2767,18 +2775,32 @@ def _input_too_large_error(error: object) -> ExecutorError | None:
         return None
     actual = data.get("actual_chars")
     limit = data.get("max_chars")
-    if isinstance(actual, int) and isinstance(limit, int):
-        message = f"This turn's input is {actual:,} characters; Codex accepts at most {limit:,}."
+    counted = isinstance(actual, int) and isinstance(limit, int)
+    if replayed_history:
+        title = _CONVERSATION_TOO_LARGE_TITLE
+        remediation = _CONVERSATION_TOO_LARGE_REMEDIATION
+        message = (
+            f"Replaying this conversation to Codex takes {actual:,} characters; "
+            f"Codex accepts at most {limit:,}."
+            if counted
+            else "Replaying this conversation to Codex exceeds its input limit."
+        )
     else:
-        message = "This turn's input is too large for Codex."
+        title = _INPUT_TOO_LARGE_TITLE
+        remediation = _INPUT_TOO_LARGE_REMEDIATION
+        message = (
+            f"This turn's input is {actual:,} characters; Codex accepts at most {limit:,}."
+            if counted
+            else "This turn's input is too large for Codex."
+        )
     return ExecutorError(
         message=message,
         retryable=False,
         # Refused before any turn started, so the thread stays idle and reusable.
         preserve_session=True,
         code=INPUT_TOO_LARGE_CODE,
-        title=_INPUT_TOO_LARGE_TITLE,
-        remediation=_INPUT_TOO_LARGE_REMEDIATION,
+        title=title,
+        remediation=remediation,
     )
 
 
@@ -3742,10 +3764,11 @@ class _CodexAppServerSession:
         except _CodexRequestError as exc:
             # Refused before any turn exists, so name the limit instead of
             # leaking the app-server's raw JSON-RPC error to the user.
-            too_large = _input_too_large_error(exc.error)
+            replayed_history = is_new_thread and _has_prior_history(prompt_messages)
+            too_large = _input_too_large_error(exc.error, replayed_history=replayed_history)
             if too_large is None:
                 raise
-            if is_new_thread and _has_prior_history(prompt_messages):
+            if replayed_history:
                 # The fresh thread never received the replayed history; drop it so
                 # the next turn replays into a new thread instead of sending only
                 # the latest message.

@@ -574,9 +574,14 @@ class TestCodexExecutor(unittest.TestCase):
                 {"role": "user", "content": "x" * 32},
             ]
             events = [event async for event in session.run_turn(messages=history, **_TURN_KWARGS)]
-            self.assertIsInstance(events[0], ExecutorError)
-            self.assertTrue(events[0].preserve_session)
+            error = events[0]
+            self.assertIsInstance(error, ExecutorError)
+            self.assertTrue(error.preserve_session)
             self.assertIsNone(session.thread_id)
+            # The replayed conversation, not the latest message, is what exceeded the limit.
+            self.assertEqual(error.title, "Conversation is too large for Codex")
+            self.assertIn("Replaying this conversation to Codex takes 1,449,987", error.message)
+            self.assertIn("Fork the session", error.remediation)
 
             async def _inject_turn_completed() -> None:
                 await asyncio.sleep(0.01)
@@ -621,6 +626,7 @@ class TestCodexExecutor(unittest.TestCase):
             ]
             events = [event async for event in session.run_turn(messages=history, **_TURN_KWARGS)]
             self.assertTrue(events[0].preserve_session)
+            self.assertEqual(events[0].title, "Message is too large for Codex")
             self.assertEqual(session.thread_id, "thread-1")
 
             async def _inject_turn_completed() -> None:
@@ -684,6 +690,13 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertEqual(error.code, "input_too_large")
         self.assertIn("too large", error.message)
+        replay = _input_too_large_error(
+            {"code": -32602, "data": {"input_error_code": "input_too_large"}},
+            replayed_history=True,
+        )
+        self.assertEqual(
+            replay.message, "Replaying this conversation to Codex exceeds its input limit."
+        )
         self.assertIsNone(_input_too_large_error({"code": -32600, "message": "Invalid request"}))
         self.assertIsNone(_input_too_large_error("Invalid request"))
 
