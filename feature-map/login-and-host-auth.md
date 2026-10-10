@@ -12,6 +12,8 @@ be able to write resources without a separate Omnigent account.
 
 ## Sub-features
 
+- `browser-oidc-recovery`: provider expiry may retry once with valid signed
+  state; denial, repeated expiry and unverifiable state offer a browser restart.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
@@ -51,6 +53,10 @@ be able to write resources without a separate Omnigent account.
 
 ## How to get to it (user POV)
 
+**Browser:** open an OIDC server, or follow the CLI's browser login link. A
+provider-error callback may show **Sign in again**; clicking it starts a fresh
+browser authorization request.
+
 **CLI sign-in:** `omnigent login <server-url>`.
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
@@ -84,6 +90,18 @@ Preconditions: the verification instance runs a header-mode server with no
 sign-in and no host daemon, so most of this feature cannot be driven there.
 Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 
+- **`browser-oidc-recovery` (own environment, fake IdP):** run
+  `tests/e2e_ui/auth/test_oidc_login_flow.py` with plain pytest and browser
+  recording. The suite starts isolated OIDC servers for discovery/confidential
+  and explicit/public-client profiles. It covers automatic expiry retry,
+  repeated expiry with manual restart, provider denial, missing callback state,
+  and expiry recovery for a CLI ticket. These are injected provider responses,
+  not live IdP timeout tests. State, cookie, base-path and native error controls
+  are in `tests/server/test_oidc_recovery.py` and
+  `tests/server/integration/test_oidc_native_login.py`.
+  `tests/e2e_ui/base_path/test_oidc_recovery.py` drives missing-state recovery,
+  one expiry retry and repeated expiry through the real server's base-path
+  middleware, provider callback and authenticated SPA.
 - **Isolated CLI loop:** use [cli-setup-verify](../.claude/skills/cli-setup-verify/SKILL.md),
   which drives the real `omnigent` binary in a PTY with a throwaway config and
   data directory, for sign-in prompts and host commands.
@@ -139,6 +157,12 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 
 ## Gotchas
 
+- Expiry retry requires matching signed state within its five-minute lifetime;
+  older callbacks need manual restart. Missing or mismatched state preserves
+  another tab's pending login. Code-only callbacks retain their existing state
+  mismatch error. Verified native errors return immediately to the app.
+  Unverifiable native state cannot restore the app's redirect binding: the
+  generic page advises retrying from the app, and its link starts browser login.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

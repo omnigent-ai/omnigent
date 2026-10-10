@@ -139,7 +139,8 @@ map an area, remove it here in the same change.
 - In-app browser: `tests/e2e_ui/browser/` (session cookie sharing is covered in
   Sessions; other browser behavior remains unmapped)
 - Desktop app: `tests/e2e_ui/desktop/`
-- Web sign-in: `tests/e2e_ui/auth/`
+- Web sign-in beyond provider-error recovery: `tests/e2e_ui/auth/` (recovery is
+  mapped in [Login and host authentication](./login-and-host-auth.md))
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity

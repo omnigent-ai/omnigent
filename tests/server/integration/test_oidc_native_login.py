@@ -360,7 +360,10 @@ async def test_callback_without_valid_state_never_redirects_to_loopback() -> Non
         )
 
     assert resp.status_code == 400
-    assert resp.json() == {"error": "Missing code or state parameter"}
+    assert resp.headers["content-type"].startswith("text/html")
+    assert 'href="/auth/login"' in resp.text
+    assert "location" not in resp.headers
+    assert _REDIRECT not in resp.text
 
 
 async def test_browser_login_is_unchanged_by_native_support() -> None:

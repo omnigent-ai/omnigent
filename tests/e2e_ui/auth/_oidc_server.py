@@ -45,15 +45,22 @@ class OIDCServer:
     :param public_url: The same server via the public-looking loopback alias,
         so the browser and the server share one origin (cookies stick).
     :param idp: The fake IdP the server authenticates against.
+    :param base_path: Optional public prefix handled by the real server middleware.
     """
 
     base_url: str
     public_url: str
     idp: FakeIdP
+    base_path: str = ""
+
+    @property
+    def prefixed_url(self) -> str:
+        """The browser-visible application root, including its public prefix."""
+        return f"{self.public_url}{self.base_path}"
 
 
 def spawn_oidc_server(
-    mock_llm_server_url: str, server_tmp, *, public_client: bool = False
+    mock_llm_server_url: str, server_tmp, *, public_client: bool = False, base_path: str = ""
 ) -> Iterator[OIDCServer]:
     """Spawn an OIDC-mode server wired to a fake IdP; yield a handle.
 
@@ -65,6 +72,7 @@ def spawn_oidc_server(
     :param mock_llm_server_url: Session-scoped mock LLM base (no real creds).
     :param server_tmp: A per-test temp dir (``tmp_path_factory.mktemp(...)``).
     :param public_client: Exercise secretless PKCE, PS256, and explicit endpoints.
+    :param base_path: Public prefix passed to the server's production configuration.
     :yields: An :class:`OIDCServer` handle.
     """
     with fake_idp(
@@ -85,7 +93,7 @@ def spawn_oidc_server(
         public_url = public_loopback_url(base_url)
         # The callback (and thus the session cookie) must be issued for the
         # browser-visible origin, so derive the redirect URI from public_url.
-        redirect_uri = f"{public_url}/auth/callback"
+        redirect_uri = f"{public_url}{base_path}/auth/callback"
         pythonpath = f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
 
         server_env = {
@@ -98,6 +106,7 @@ def spawn_oidc_server(
             "OMNIGENT_AUTH_PROVIDER": "oidc",
             "OMNIGENT_AUTH_ENABLED": "1",
             "OMNIGENT_LOCAL_SINGLE_USER": "",
+            "OMNIGENT_WEB_BASE_PATH": base_path,
             "OMNIGENT_OIDC_ISSUER": idp.issuer,
             "OMNIGENT_OIDC_CLIENT_ID": idp.client_id,
             "OMNIGENT_OIDC_CLIENT_SECRET": idp.client_secret,
@@ -167,7 +176,9 @@ def spawn_oidc_server(
                     f"{base_url} (last_error={last_error}).\n{log_text[-3000:]}"
                 )
 
-            yield OIDCServer(base_url=base_url, public_url=public_url, idp=idp)
+            yield OIDCServer(
+                base_url=base_url, public_url=public_url, idp=idp, base_path=base_path
+            )
         finally:
             _terminate(proc)
             log_handle.close()

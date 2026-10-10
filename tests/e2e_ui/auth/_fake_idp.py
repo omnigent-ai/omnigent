@@ -34,15 +34,15 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 
 import jwt
 import uvicorn
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.server.oidc import derive_code_challenge
 from tests.e2e_ui.conftest import _find_free_port
@@ -66,6 +66,7 @@ class FakeIdP:
     :param email: The email the signed ``id_token`` asserts.
     :param base_url: Reachable HTTP address of the test provider.
     :param endpoint_prefix: Optional path prefix for explicit endpoint testing.
+    :param authorization_errors: Default-empty provider responses consumed before issuing a code.
     """
 
     issuer: str
@@ -74,6 +75,7 @@ class FakeIdP:
     email: str
     base_url: str
     endpoint_prefix: str = ""
+    authorization_errors: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _build_app(
@@ -85,6 +87,7 @@ def _build_app(
     client_secret: str,
     signing_algorithm: str,
     endpoint_prefix: str,
+    authorization_errors: list[tuple[str, str]],
 ) -> FastAPI:
     app = FastAPI()
     codes: dict[str, tuple[str, str]] = {}
@@ -125,11 +128,15 @@ def _build_app(
         state: str,
         code_challenge: str,
         code_challenge_method: str,
-    ) -> HTMLResponse:
+    ) -> Response:
         if request.query_params.get("client_id") != client_id or code_challenge_method != "S256":
             return HTMLResponse("Invalid authorization request", status_code=400)
         if endpoint_prefix and request.query_params.get("p") != "policy":
             return HTMLResponse("Missing provider policy", status_code=400)
+        if authorization_errors:
+            error, description = authorization_errors.pop(0)
+            query = urlencode({"error": error, "error_description": description, "state": state})
+            return RedirectResponse(f"{redirect_uri}?{query}", status_code=302)
         code = secrets.token_urlsafe(32)
         codes[code] = (code_challenge, redirect_uri)
         continue_url = (
@@ -230,6 +237,7 @@ def fake_idp(
     port = _find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     issuer = canonical_issuer or base_url
+    authorization_errors: list[tuple[str, str]] = []
     app = _build_app(
         issuer,
         client_id,
@@ -238,6 +246,7 @@ def fake_idp(
         client_secret=client_secret,
         signing_algorithm=signing_algorithm,
         endpoint_prefix=endpoint_prefix,
+        authorization_errors=authorization_errors,
     )
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
@@ -269,6 +278,7 @@ def fake_idp(
             email=FAKE_IDP_EMAIL,
             base_url=base_url,
             endpoint_prefix=endpoint_prefix,
+            authorization_errors=authorization_errors,
         )
     finally:
         server.should_exit = True

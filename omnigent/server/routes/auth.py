@@ -30,13 +30,14 @@ import secrets
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from html import escape
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import jwt
 from fastapi import APIRouter, Query, Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
@@ -223,59 +224,19 @@ def create_auth_router(
         )
         return response
 
-    @router.get("/login")
-    async def login(request: Request) -> Response:
-        """Redirect to the IdP's authorization endpoint.
-
-        Generates PKCE ``code_verifier`` / ``code_challenge`` and a
-        ``state`` parameter. Stores them in a short-lived signed
-        cookie so the callback can verify the response.
-
-        :param request: The incoming FastAPI request.
-        :returns: 302 redirect to the IdP with PKCE and state
-            params.
-        """
+    def login_response(
+        return_to: str,
+        ticket: str | None = None,
+        invite: str | None = None,
+        reauth: bool = False,
+        *,
+        native: dict[str, str] | None = None,
+        retry: bool = False,
+    ) -> RedirectResponse:
+        """Start a fresh authorization request with a signed retry bound."""
         state = secrets.token_urlsafe(32)
         code_verifier = generate_code_verifier()
         code_challenge = derive_code_challenge(code_verifier)
-
-        # Sanitize at ingest so only a safe same-origin path is ever
-        # signed into the state cookie — prevents an open redirect on
-        # the post-auth 302 in /callback.
-        return_to = _sanitize_return_to(request.query_params.get("return_to"))
-        # A bare "/" default (e.g. an invite link carrying no return_to) would
-        # send the post-auth 302 to the origin root; keep it under the base path
-        # so login stays within a subpath mount.
-        base_path = getattr(request.app.state, "base_path", "")
-        if base_path and return_to == "/":
-            return_to = f"{base_path}/"
-        # Optional CLI login ticket — threaded through the state
-        # cookie so the callback can fulfill it.
-        ticket = request.query_params.get("ticket")
-        # Optional native sign-in — also threaded through the
-        # signed state, so the callback knows where to deliver the code.
-        try:
-            native = _parse_native_sign_in(request.query_params)
-        except ValueError:
-            return JSONResponse(
-                status_code=400, content={"error": "Invalid native sign-in parameters"}
-            )
-        if native is not None and ticket:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "A native sign-in cannot also carry a CLI ticket"},
-            )
-        # Optional OIDC invite token — threaded through the signed state
-        # cookie (not a bare query param) so it can't be tampered with
-        # before the callback redeems it. Only meaningful when invites
-        # are enabled; ignored otherwise.
-        invite = request.query_params.get("invite") if _invites_enabled else None
-        # Forced re-authentication for the device-consent anti-phishing
-        # gate: reauth=1 tells the IdP to require the user to
-        # re-authenticate rather than reusing an existing session
-        # (OIDC Core 3.1.2.1 `prompt=login`, `max_age=0`).
-        # Not applicable to GitHub OAuth, which has no prompt parameter.
-        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
 
         # Store state + code_verifier in a short-lived signed cookie.
         state_payload: dict[str, object] = {
@@ -290,6 +251,8 @@ def create_auth_router(
             state_payload["native"] = native
         if invite:
             state_payload["invite"] = invite
+        if retry:
+            state_payload["oidc_retry"] = True
         if reauth:
             # Record when we demanded fresh auth so /callback can verify the
             # id_token's auth_time proves the IdP actually re-authenticated
@@ -320,7 +283,11 @@ def create_auth_router(
         ]
         auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
-        response = RedirectResponse(url=auth_url, status_code=302)
+        response = RedirectResponse(
+            url=auth_url,
+            status_code=302,
+            headers={**NO_STORE_HEADERS, "Referrer-Policy": "no-referrer"},
+        )
         response.set_cookie(
             key=_state_cookie,
             value=state_jwt,
@@ -332,6 +299,83 @@ def create_auth_router(
         )
         return response
 
+    @router.get("/login")
+    async def login(request: Request) -> Response:
+        """Start OIDC sign-in with PKCE and a short-lived signed state cookie.
+
+        :param request: The incoming FastAPI request with optional sign-in context.
+        :returns: A 302 redirect to the IdP, or 400 JSON for invalid native
+            parameters or a native sign-in combined with a CLI ticket.
+        """
+        # Sanitize before signing so callbacks cannot become open redirects.
+        return_to = _sanitize_return_to(request.query_params.get("return_to"))
+        base_path = getattr(request.app.state, "base_path", "")
+        # Keep a default destination within a deployment's public prefix.
+        if base_path and return_to == "/":
+            return_to = f"{base_path}/"
+        ticket = request.query_params.get("ticket")
+        try:
+            native = _parse_native_sign_in(request.query_params)
+        except ValueError:
+            return JSONResponse(
+                status_code=400, content={"error": "Invalid native sign-in parameters"}
+            )
+        if native is not None and ticket:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "A native sign-in cannot also carry a CLI ticket"},
+            )
+        # Carry invites in signed state, not unverified callback parameters.
+        invite = request.query_params.get("invite") if _invites_enabled else None
+        # OIDC Core 3.1.2.1's prompt=login/max_age=0 demands fresh auth for consent.
+        # GitHub OAuth has no id_token/auth_time to verify that demand.
+        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
+        return login_response(
+            return_to,
+            ticket=ticket,
+            invite=invite,
+            reauth=reauth,
+            native=native,
+        )
+
+    def sign_in_failure(
+        request: Request,
+        *,
+        message: str = "Your sign-in session expired or could not be verified.",
+        login_url: str | None = None,
+        clear_state: bool = False,
+    ) -> HTMLResponse:
+        """Offer browser recovery without restoring unverified sign-in context.
+
+        :param request: Request carrying the deployment's public base path.
+        :param message: Static explanation of the sign-in failure.
+        :param login_url: Same-origin restart URL built from verified context,
+            or ``None`` for a new browser sign-in with app retry guidance.
+        :param clear_state: Discard only an unusable or completed state cookie.
+        :returns: An uncached recovery page that preserves any session cookie.
+        """
+        app_guidance = ""
+        if login_url is None:
+            base_path = getattr(request.app.state, "base_path", "")
+            login_url = f"{base_path}/auth/login"
+            app_guidance = (
+                "<p>If you started from the Omnigent app, return to it and try again.</p>"
+            )
+        response = HTMLResponse(
+            '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            "<title>Sign-in unsuccessful</title></head><body>"
+            f"<h1>Sign-in unsuccessful</h1><p>{escape(message)}</p>{app_guidance}"
+            f'<p><a href="{escape(login_url, quote=True)}">Sign in again</a></p>'
+            "</body></html>",
+            status_code=400,
+            headers={**NO_STORE_HEADERS, "Referrer-Policy": "no-referrer"},
+        )
+        if clear_state:
+            response.delete_cookie(
+                key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
+            )
+        return response
+
     @router.get("/callback")
     async def callback(request: Request) -> Response:
         """Handle the IdP callback after user authentication.
@@ -340,19 +384,24 @@ def create_auth_router(
         authorization code for tokens, extracts the user's email,
         mints a session cookie, and redirects to the app.
 
-        :param request: The incoming FastAPI request containing
-            ``code`` and ``state`` query parameters plus the
-            ``__Host-ap_auth_state`` cookie.
-        :returns: 302 redirect to the app with session cookie set,
-            or 400/403 on validation failure.
+        :param request: The incoming FastAPI request with code/state or provider
+            error parameters and the signed state cookie.
+        :returns: A browser redirect with a session cookie, native app redirect,
+            or CLI success HTML. Provider expiry may redirect once to the IdP;
+            failures return recovery HTML or 400/403 JSON.
         """
         from fastapi.responses import JSONResponse
 
         code = request.query_params.get("code")
         state = request.query_params.get("state")
-        if not code or not state:
-            # An IdP error (e.g. the user declined) arrives without a code.
-            # A native sign-in hears about it at its redirect URI.
+        error = request.query_params.get("error")
+
+        def unverified_failure(reason: str, *, clear_state: bool = False) -> HTMLResponse:
+            """Log a fixed validation category without callback values."""
+            _logger.info("OIDC provider callback could not be verified: %s", reason)
+            return sign_in_failure(request, clear_state=clear_state)
+
+        if not state or (not code and error is None):
             early_native = _native_from_state(_verified_state(request, state))
             if early_native is not None:
                 return _native_failure(
@@ -360,6 +409,8 @@ def create_auth_router(
                     "access_denied",
                     "Sign-in was cancelled or declined at the identity provider.",
                 )
+            if error is not None:
+                return unverified_failure("missing_state")
             return JSONResponse(
                 status_code=400,
                 content={"error": "Missing code or state parameter"},
@@ -368,6 +419,8 @@ def create_auth_router(
         # Verify state from the cookie.
         state_cookie = request.cookies.get(_state_cookie)
         if not state_cookie:
+            if error is not None:
+                return unverified_failure("missing_cookie")
             return JSONResponse(
                 status_code=400,
                 content={"error": "Missing auth state cookie"},
@@ -376,12 +429,17 @@ def create_auth_router(
         try:
             state_payload = jwt.decode(state_cookie, config.cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
+            if error is not None:
+                return unverified_failure("invalid_or_expired_cookie", clear_state=True)
             return JSONResponse(
                 status_code=400,
                 content={"error": "Invalid or expired auth state"},
             )
 
         if state != state_payload.get("state"):
+            if error is not None:
+                # The cookie may belong to another tab's active sign-in.
+                return unverified_failure("state_mismatch")
             return JSONResponse(
                 status_code=400,
                 content={"error": "State mismatch (possible CSRF)"},
@@ -395,6 +453,53 @@ def create_auth_router(
             if native is not None:
                 return _native_failure(native, error, message)
             return JSONResponse(status_code=status_code, content={"error": message})
+
+        if error is not None:
+            if native is not None:
+                return _native_failure(
+                    native,
+                    "access_denied",
+                    "Sign-in was cancelled or declined at the identity provider.",
+                )
+            expired = (
+                error == "temporarily_unavailable"
+                and request.query_params.get("error_description") == "authentication_expired"
+            )
+            if error == "access_denied":
+                _logger.info("OIDC sign-in cancelled at the identity provider")
+            else:
+                _logger.warning(
+                    "OIDC sign-in failed: %s",
+                    "authentication_expired" if expired else "provider_error",
+                )
+            return_to = _sanitize_return_to(state_payload.get("return_to"))
+            ticket = state_payload.get("ticket")
+            invite = state_payload.get("invite") if _invites_enabled else None
+            reauth = isinstance(state_payload.get("reauth_at"), int)
+            if expired and state_payload.get("oidc_retry") is None:
+                return login_response(
+                    return_to,
+                    ticket=ticket if isinstance(ticket, str) else None,
+                    invite=invite if isinstance(invite, str) else None,
+                    reauth=reauth,
+                    retry=True,
+                )
+
+            params = {"return_to": return_to}
+            if isinstance(ticket, str):
+                params["ticket"] = ticket
+            if isinstance(invite, str):
+                params["invite"] = invite
+            if reauth:
+                params["reauth"] = "1"
+            base_path = getattr(request.app.state, "base_path", "")
+            login_url = f"{base_path}/auth/login?{urlencode(params)}"
+            message = (
+                "Your sign-in session expired."
+                if expired
+                else "Sign-in could not be completed at the identity provider."
+            )
+            return sign_in_failure(request, message=message, login_url=login_url, clear_state=True)
 
         code_verifier = state_payload.get("code_verifier", "")
         # Re-sanitize on the way out: /login sanitizes at ingest, but a
@@ -559,11 +664,7 @@ def create_auth_router(
                     _logger.exception("cli-login: refresh grant issuance failed")
             # Return a simple HTML page — the CLI is polling
             # /auth/cli-poll and will pick up the token.
-            import html as _html
-
-            from starlette.responses import HTMLResponse
-
-            safe_email = _html.escape(email)
+            safe_email = escape(email)
             html = (
                 "<html><body style='font-family:system-ui;text-align:center;"
                 "padding:60px'>"
