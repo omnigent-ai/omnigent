@@ -93,6 +93,35 @@ describe("AgentCard icon selection", () => {
     // fires, so the generic bot is the floor.
     expect(chosenIcon(agent({ name: "mystery", harness: "agents_sdk" }))).toBe("bot");
   });
+
+  it("renders a declared emoji icon as the grapheme, over the harness glyph", () => {
+    // A codex-harnessed agent would otherwise get the Codex glyph; a declared
+    // emoji wins, and no brand glyph is rendered.
+    const { container } = render(
+      <AgentCard
+        agent={agent({ name: "x", harness: "codex", icon: "🦊" })}
+        selected={false}
+        onSelect={() => {}}
+      />,
+    );
+    expect(container).toHaveTextContent("🦊");
+    expect(container.querySelector("[data-icon]")).toBeNull();
+  });
+
+  it("renders a declared path icon as an <img> pointing at the icon endpoint", () => {
+    const { container } = render(
+      <AgentCard
+        agent={agent({ id: "ag_9", name: "x", harness: "codex", icon: "brand/logo.svg" })}
+        selected={false}
+        onSelect={() => {}}
+      />,
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img).toHaveAttribute("src", "/v1/agents/ag_9/icon");
+    // The harness glyph must not also render.
+    expect(container.querySelector("[data-icon]")).toBeNull();
+  });
 });
 
 describe("AgentCard compact mode", () => {
