@@ -18,7 +18,10 @@ and steers messages while the agent is busy.
   configuration menu.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. States: catalog loading, delayed catalog,
-  alias vs. full model ID, refused switch (the pill keeps the applied model).
+  alias vs. full model ID, refused switch (the pill keeps the applied model),
+  managed sandbox without an inference catalog (Codex, Devin, and Pi offer a
+  single checked `Harness default` row instead of "Models unavailable"; Claude
+  Code keeps its static list).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
@@ -120,6 +123,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   (real host and Codex CLI; custom, bundled, and hidden defaults on desktop and mobile),
   `tests/e2e_ui/start_session/test_codex_catalog_availability.py::test_codex_prelaunch_label_reflects_catalog_availability`
   (desktop and mobile; populated catalogs without a default, empty catalogs, and probe failures),
+  `tests/e2e_ui/start_session/test_sandbox_codex_without_inference.py::test_sandbox_codex_offers_harness_default_and_starts_without_inference_config`
+  (real server with a managed sandbox and no inference catalog: Codex offers `Harness default` and Start sends a managed launch without a model),
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
