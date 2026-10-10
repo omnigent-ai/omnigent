@@ -966,6 +966,7 @@ def live_server(
             runner_id=prepared["OMNIGENT_REPRO_RUNNER_ID"],
             server_url=base_url,
             mock_llm_url=mock_llm_server_url,
+            env_dir=prepared["OMNIGENT_REPRO_ENV_DIR"],
             workflow_owned=True,
         )
         try:
@@ -1370,7 +1371,8 @@ def _ensure_runner_online(
 
     if _server_state.get("workflow_owned"):
         raise RuntimeError(
-            "Workflow-owned reproduction runner is offline; inspect .omnigent/repro-env logs"
+            "Workflow-owned reproduction runner is offline; inspect the logs under "
+            f"{_server_state.get('env_dir') or '$OMNIGENT_REPRO_ENV_DIR'}"
         )
     binding_token = str(_server_state["binding_token"])
     mock_url = str(_server_state.get("mock_llm_url", ""))

@@ -78,9 +78,9 @@ runner or decide the model backend from ambient credentials.
 Attachment supports HTTP/browser journeys and native session fixtures. Tests
 that directly kill/restart a server or runner or access the fixture database
 require their own environment; run those outside `dev.repro_env exec`. Missing
-process/database state produces an explicit error. The three connection
+process/database state produces an explicit error. The four connection
 variables must be supplied together; use the wrapper rather than setting only
-one of them.
+some of them.
 
 Standalone native mock fixtures save an existing provider config to an
 owner-only `.e2e-backup` file next to its resolved target before replacing it
@@ -89,11 +89,22 @@ If the test process is killed, recover that backup before retrying; subsequent
 runs refuse to overwrite it.
 
 Arbitrary Python/Playwright commands also work with the wrapper. They receive
-`OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`, and
-`OMNIGENT_REPRO_RUNNER_ID`. These URLs are valid only inside that invocation;
-reuse session IDs across invocations, not the temporary URLs. HTTP, SSE and
-terminal WebSockets all use the same product endpoints. Put shared files in the
-worktree, since `/tmp` is private to each sandbox.
+`OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`,
+`OMNIGENT_REPRO_RUNNER_ID`, and `OMNIGENT_REPRO_ENV_DIR`. These URLs are valid
+only inside that invocation; reuse session IDs across invocations, not the
+temporary URLs. HTTP, SSE and terminal WebSockets all use the same product
+endpoints. Put shared files in the worktree, since `/tmp` is private to each
+sandbox.
+
+`OMNIGENT_REPRO_ENV_DIR` is the absolute path of the environment directory the
+wrapper was given with `--output`. Workflows may place it somewhere other than
+the default `.omnigent/repro-env`, so a test that needs the prepared runner's
+state must read it from this variable, never from the default path. Its
+`environment.json` records `config_home` (the runner's `OMNIGENT_CONFIG_HOME`),
+`database`, `runner_id`, `base_url` and `mock_url`; the directory also holds
+`config/`, `claude-config/`, `codex-config/`, `data/` and the process logs.
+`tests.helpers.ui_configuration.prepared_repro_environment()` returns all four
+variables together and rejects a partial set.
 
 Script model responses using the existing helpers in `tests/e2e_ui/conftest.py`
 (`configure_mock_llm`, `set_fallback_mock_llm`, `reset_mock_llm`). Responses may
@@ -108,9 +119,10 @@ approval can be reproduction evidence. A successful canned reply is only a
 connectivity check; the authored test decides whether the reported bug occurred.
 These mocks validate native integration, not live-provider/model behavior.
 
-`python -m dev.repro_env status` prints startup status. Inspect
-`.omnigent/repro-env/` for process logs, product logs under `data/`, provider
-configuration, database and model request statistics. Connection failures must
+`python -m dev.repro_env status` prints startup status. Inspect the environment
+directory (`.omnigent/repro-env/` by default, otherwise the `--output` path) for
+process logs, product logs under `data/`, provider configuration, database and
+model request statistics. Connection failures must
 be reported with their actual diagnostics; do not substitute callbacks or fake
 terminal output and claim a real native turn.
 

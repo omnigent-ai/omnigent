@@ -104,7 +104,8 @@ show the reported symptom. The existing workflow owns shutdown and bundling.
 Independent execution collection and claim verification remain separate work.
 
 When the workflow supplies `execution-context.json`, `dev.repro_env exec`
-automatically saves each command under `.omnigent/repro-env/execution/<attempt-id>`.
+automatically saves each command under `execution/<attempt-id>` inside the
+environment directory (`OMNIGENT_REPRO_ENV_DIR`; `.omnigent/repro-env` by default).
 Pytest loads the evidence collector for supported browser and local HTTP paths;
 keep using the existing drivers with explicit `browser.new_context()` contexts
 (`browser.new_page()` alone bypasses detailed capture). Close contexts before the command exits

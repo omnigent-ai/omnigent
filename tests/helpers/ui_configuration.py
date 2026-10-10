@@ -37,7 +37,12 @@ class ServerState(dict[str, object]):
 
 
 def prepared_repro_environment() -> dict[str, str]:
-    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
+    keys = (
+        "OMNIGENT_REPRO_SERVER_URL",
+        "OMNIGENT_REPRO_MODEL_URL",
+        "OMNIGENT_REPRO_RUNNER_ID",
+        "OMNIGENT_REPRO_ENV_DIR",
+    )
     values = {key: os.environ.get(key, "") for key in keys}
     if any(values.values()) and not all(values.values()):
         missing = ", ".join(key for key, value in values.items() if not value)
