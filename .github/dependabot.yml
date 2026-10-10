@@ -1,102 +1,236 @@
-# Dependabot configuration — security-only.
+# Dependabot configuration: security updates plus grouped version updates.
 #
-# Fix PRs come from the repo-level "Dependabot security updates" toggle
-# (enabled out of band): Dependabot opens a PR whenever a dependency has an
-# open advisory. The `updates` blocks below exist to (a) GROUP those security
-# PRs per ecosystem so a burst of advisories becomes one PR, and (b) declare
-# every manifest directory.
+# Security fix PRs come from the repo-level "Dependabot security updates"
+# toggle (enabled out of band); the `*-security` groups below batch a burst of
+# advisories into one PR per ecosystem. Version updates are ON again, but
+# shaped to avoid the churn that had them switched off before:
+#   - minor + patch bumps land as ONE grouped PR per ecosystem per week;
+#   - majors never arrive for the web workspace (react, react-router, vite
+#     migrations are planned work, not a bot PR) and fall through to their own
+#     PR elsewhere so each gets explicit review;
+#   - a 7-day cooldown matches the repo's existing release-age policy
+#     (pnpm `minimumReleaseAge`, uv `exclude-newer = "P7D"`), so a compromised
+#     or yanked release has a window to surface before it is pinned.
 #
-# Scheduled VERSION updates are DISABLED (`open-pull-requests-limit: 0`): the
-# proactive bump PRs — especially majors (react 19, react-router 8, …) — were
-# pure churn for this repo. Security updates are NOT subject to that limit, so
-# they keep flowing. To re-enable hygiene bumps later, raise the limit and add
-# a `version-updates` group (e.g. `update-types: [minor, patch]`) per ecosystem.
-#
-# No cooldown: security fixes should land promptly. The supply-chain delay a
-# cooldown provided only mattered for version updates, which are now off.
+# Layout rules, learned the hard way:
+#   - Declare each lockfile ONCE, at its root. The pnpm workspace has a single
+#     root pnpm-lock.yaml and the uv workspace a single root uv.lock; listing
+#     members as their own directories produced PRs that changed a package.json
+#     without the lockfile (pre-commit then failed on the mismatch) and
+#     duplicate ungrouped PRs from the undeclared root.
+#   - uv.lock is handled by the `uv` ecosystem, not `pip`, security PRs included.
+#   - Composite actions under .github/actions/* carry their own `uses:` pins,
+#     so github-actions must list that directory as well as the root.
+#   - Review routing comes from .github/CODEOWNERS (the `reviewers` key is
+#     deprecated); labels named here must already exist in the repo.
 version: 2
 
 updates:
-  # ── Python (server + runner; root uv workspace) ──────────────────────────
-  - package-ecosystem: pip
+  # ── Python: server + runner + tooling (uv workspace root; one uv.lock) ───
+  - package-ecosystem: uv
     directory: "/"
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "chore(deps)"
     groups:
-      pip-security:
+      python-security:
         applies-to: security-updates
         patterns: ["*"]
+      # The mlflow release train cross-pins mlflow, mlflow-skinny and
+      # mlflow-tracing to one version (see uv.toml); they must move together.
+      mlflow:
+        applies-to: version-updates
+        patterns: ["mlflow", "mlflow-skinny", "mlflow-tracing"]
+        update-types: ["minor", "patch"]
+      opentelemetry:
+        applies-to: version-updates
+        patterns: ["opentelemetry-*"]
+        update-types: ["minor", "patch"]
+      python-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  # ── web (React frontend) ──────────────────────────────────────────────
+  # ── JavaScript: the pnpm workspace (web, electron, vscode, cloudflare,
+  #    web-extension SDK, CI deps, example extension) ────────────────────
   - package-ecosystem: npm
-    directory: "/web"
+    directory: "/"
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - javascript
+    commit-message:
+      prefix: "chore(deps)"
+    ignore:
+      # Framework majors (react, react-router, vite, electron, ...) are
+      # migrations the team schedules; a bot PR for them is only churn.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       web-security:
         applies-to: security-updates
         patterns: ["*"]
+      npm-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  # ── web Electron shell ────────────────────────────────────────────────
+  # ── Pinned harness CLIs installed by CI: intentional exact pins, never bump.
+  #    Declared so the security toggle does not file ungrouped PRs for them.
   - package-ecosystem: npm
-    directory: "/web/electron"
+    directories:
+      - "/.github/actions/setup-harness-cli/locks/*"
+      - "/.github/actions/e2e-run/claude-billing-notice"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "*"
+
+  # ── GitHub Actions: workflow `uses:` pins AND the composite actions' own pins
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - github_actions
+    commit-message:
+      prefix: "chore(deps)"
     groups:
-      electron-security:
+      actions-security:
         applies-to: security-updates
         patterns: ["*"]
-
-  # ── CI helper deps (.github/ci-deps) ─────────────────────────────────────
-  - package-ecosystem: npm
-    directory: "/.github/ci-deps"
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 0
-    groups:
-      ci-deps-security:
-        applies-to: security-updates
+      # One PR moves every action's SHA pin (and its `# vX.Y.Z` comment);
+      # majors fall through to individual PRs for explicit review.
+      actions-minor-patch:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  # ── Rust sidecar used by the codex-parity test fixture ───────────────────
+  # ── Rust: the omnidev tool and the codex-parity test sidecar ─────────────
   - package-ecosystem: cargo
-    directory: "/tests/codex_parity/sidecar"
+    directories:
+      - "/dev/omnidev"
+      - "/tests/codex_parity/sidecar"
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "chore(deps)"
     groups:
-      sidecar-security:
+      cargo-security:
         applies-to: security-updates
         patterns: ["*"]
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  # ── iOS app (CocoaPods/Bundler Gemfile) ──────────────────────────────────
+  # ── Android app (Gradle, version catalog) ────────────────────────────────
+  - package-ecosystem: gradle
+    directory: "/web/android"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      android-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      android-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ── iOS app tooling (Bundler) ────────────────────────────────────────────
   - package-ecosystem: bundler
     directory: "/web/ios"
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
     groups:
       ios-security:
         applies-to: security-updates
         patterns: ["*"]
+      ios-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  # ── GitHub Actions (workflow `uses:` pins) ───────────────────────────────
-  - package-ecosystem: github-actions
+  # ── Container base images (deploy/*/Dockerfile*) ─────────────────────────
+  - package-ecosystem: docker
+    directories:
+      - "/deploy/docker"
+      - "/deploy/cloudflare"
+      - "/deploy/hf-spaces"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      docker-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ── pre-commit hook revisions ────────────────────────────────────────────
+  - package-ecosystem: pre-commit
     directory: "/"
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
     groups:
-      actions-security:
-        applies-to: security-updates
+      pre-commit-hooks:
         patterns: ["*"]
