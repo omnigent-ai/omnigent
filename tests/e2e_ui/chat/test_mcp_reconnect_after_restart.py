@@ -19,9 +19,15 @@ Journey (all user-observable):
 4. Ask the agent to call the tool again — the tool call must succeed
    (the client should reconnect and retry), but on the broken build
    it fails permanently with the generic runner-dispatch error.
+5. Open that turn's tool trace — the echo result must be on screen,
+   not only persisted.
 
 The mock LLM scripts both turns (tool call, then a per-turn wrap-up
-sentence), so the only nondeterminism is the MCP transport itself.
+sentence), so the only nondeterminism is the MCP transport itself. The
+wrap-up sentence reads the same whether the call succeeded or failed,
+which is why step 5 expands the trace: a recording of this journey ends
+on the actual tool result (the echo on a fixed build, the dispatch error
+on a broken one) rather than on a collapsed "Worked for" row.
 """
 
 from __future__ import annotations
@@ -36,7 +42,8 @@ import uuid
 from typing import Any
 
 import httpx
-from playwright.sync_api import Page, expect
+import pytest
+from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import (
     _create_bundled_session,
@@ -46,6 +53,7 @@ from tests.e2e_ui.conftest import (
 )
 
 _COMPOSER = "Send a message…"
+_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
 # Wrap-up sentences are unique per turn so waiting for them proves the
 # specific turn settled (never a stale bubble from the prior turn).
@@ -168,6 +176,43 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
+def _reveal_tool_output(page: Page, done_text: str, echo_text: str) -> Locator:
+    """Expand a settled turn's trace until its tool's Output panel is on screen.
+
+    The turn is picked by its own wrap-up sentence and the tool row by its
+    argument, so an earlier turn's trace is never the one opened.
+
+    :param page: The Playwright page, on the session.
+    :param done_text: The wrap-up sentence that identifies the turn.
+    :param echo_text: The ``text`` argument of the turn's echo call.
+    :returns: The turn's expanded ``turn-worked-fold`` locator.
+    """
+    bubble = page.locator(_ASSISTANT, has_text=done_text).last
+    fold = bubble.get_by_test_id("turn-worked-fold")
+    worked = fold.get_by_role("button", name=re.compile(r"^Worked"))
+    # The fold mounts open and animates shut; clicking earlier would close it.
+    expect(worked).to_have_attribute("aria-expanded", "false", timeout=30_000)
+    worked.click()
+    expect(worked).to_have_attribute("aria-expanded", "true")
+
+    group = fold.get_by_role("button", name="Called 1 tool", exact=True)
+    expect(group).to_be_visible()
+    group.click()
+    expect(group).to_have_attribute("aria-expanded", "true")
+
+    tool_row = fold.get_by_role(
+        "button", name=re.compile(rf"^echomcp__echo\(.*{re.escape(echo_text)}")
+    )
+    expect(tool_row).to_be_visible()
+    tool_row.click()
+    expect(tool_row).to_have_attribute("aria-expanded", "true")
+    expect(fold.get_by_text("Parameters", exact=True)).to_be_visible()
+    # Scroll the row to the top so its panels sit inside the chat scroller
+    # instead of running under the composer.
+    tool_row.evaluate("row => row.scrollIntoView({ block: 'start' })")
+    return fold
+
+
 def _echo_tool_outputs(base_url: str, session_id: str) -> list[str]:
     """Return the raw outputs of every ``echomcp__echo`` call, in order.
 
@@ -196,8 +241,9 @@ def _echo_tool_outputs(base_url: str, session_id: str) -> list[str]:
     return outputs
 
 
+@pytest.mark.workspace_panel_product_default
 def test_mcp_tool_call_recovers_after_mcp_server_restart(
-    page: Page,
+    request: pytest.FixtureRequest,
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: Any,
@@ -262,6 +308,9 @@ def test_mcp_tool_call_recovers_after_mcp_server_restart(
         )
         session_id = _create_bundled_session(live_server, runner_id, yaml_text)
 
+        # Open the browser only now so a recording starts at the journey,
+        # not at the server-side setup above.
+        page: Page = request.getfixturevalue("page")
         page.goto(f"{live_server}/c/{session_id}")
 
         # ── Turn 1: the MCP tool round-trips while the server is up ──
@@ -283,16 +332,9 @@ def test_mcp_tool_call_recovers_after_mcp_server_restart(
         _send(page, f"Echo the string 'after-restart' for me. {_TURN2_TOKEN}")
         expect(page.get_by_text(_TURN2_DONE)).to_be_visible(timeout=120_000)
 
-        # Best-effort: expand the settled turn's process trace so the tool
-        # result is on screen (the recording then ends showing the actual
-        # tool output — the echo on a fixed build, the dispatch error on a
-        # broken one). Never let expansion flake mask the real assertion.
-        try:
-            page.get_by_role("button", name=re.compile(r"^Worked")).last.click(timeout=5_000)
-            page.get_by_role("button", name=re.compile(r"Called 1 tool")).last.click(timeout=5_000)
-            page.wait_for_timeout(2_000)
-        except Exception:
-            pass
+        # Put the tool result itself on screen before checking it: the
+        # wrap-up sentence alone reads the same on a broken build.
+        fold = _reveal_tool_output(page, _TURN2_DONE, "after-restart")
 
         outputs = _echo_tool_outputs(live_server, session_id)
         assert len(outputs) == 2, (
@@ -304,6 +346,9 @@ def test_mcp_tool_call_recovers_after_mcp_server_restart(
             "classified as a connection error, so the reconnect path never "
             f"ran. Tool output was: {outputs[1]!r}"
         )
+        expect(fold.get_by_text("echo: after-restart")).to_be_in_viewport()
+        # Hold the revealed result so a recording ends on it.
+        page.wait_for_timeout(1_000)
     finally:
         _stop_mcp_server(mcp_proc)
         if session_id is not None:
