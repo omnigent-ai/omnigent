@@ -19,6 +19,7 @@ import {
   UserPlusIcon,
   XIcon,
 } from "lucide-react";
+import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
@@ -357,6 +358,28 @@ export function ChatHeader({
   const isMobile = useIsMobileViewport();
   const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
+  // Desktop grid: both side columns share one minimum width — the wider of the
+  // toggle slot and the action cluster — so the breadcrumb column stays centered
+  // on the pane even when only one side holds controls (see the header class).
+  const leftSlotRef = useRef<HTMLDivElement>(null);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const [sideColumnMinPx, setSideColumnMinPx] = useState(0);
+  useLayoutEffect(() => {
+    const left = leftSlotRef.current;
+    const right = actionsRef.current;
+    if (!left || !right || typeof ResizeObserver === "undefined") return;
+    const measure = () =>
+      setSideColumnMinPx(
+        Math.ceil(
+          Math.max(left.getBoundingClientRect().width, right.getBoundingClientRect().width),
+        ),
+      );
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(left);
+    observer.observe(right);
+    return () => observer.disconnect();
+  }, []);
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
   // ride in the header's single kebab rather than a second trigger of their
@@ -536,6 +559,7 @@ export function ChatHeader({
     ) : null;
   return (
     <header
+      style={{ "--chat-header-side": `${sideColumnMinPx}px` } as CSSProperties}
       className={cn(
         // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
         // the 32px controls. No own background — the app canvas shows
@@ -544,10 +568,11 @@ export function ChatHeader({
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
         "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center gap-1 px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        // Desktop: a 1fr/auto/1fr grid centers the breadcrumb on the pane at any
-        // sidebar width; the fr side columns never shrink below their content, so
-        // the title truncates before colliding with the toggle or action cluster.
-        "md:grid md:grid-cols-[1fr_auto_1fr] md:gap-6",
+        // Desktop: a three-column grid centers the breadcrumb on the pane at any
+        // sidebar width. Both side columns start at the measured --chat-header-side
+        // (so an empty toggle slot still mirrors the action cluster) and share the
+        // leftover equally; the breadcrumb truncates before reaching either side.
+        "md:grid md:grid-cols-[minmax(var(--chat-header-side,0px),1fr)_auto_minmax(var(--chat-header-side,0px),1fr)] md:gap-6",
         settingsMode && "settings-mobile-header",
       )}
     >
@@ -562,6 +587,7 @@ export function ChatHeader({
           just this slot below them (the right action cluster stays up
           in the title-bar strip). Inert outside the shell (index.css). */}
       <div
+        ref={leftSlotRef}
         className={cn(
           "flex shrink-0 items-center gap-1 empty:hidden md:justify-self-start",
           !sidebarOpen && !canvas && "traffic-light-clearance",
@@ -592,10 +618,11 @@ export function ChatHeader({
           landing composer. A resolved title is enough; so is titleLinkTo —
           a child must keep its climb-out while the parent title loads.
           Desktop centers it in the grid's middle column; mobile keeps it
-          flowing after the toggle. min-w-0 lets it truncate rather than
-          push the right-hand action cluster. */}
+          flowing after the toggle. min-w-0 lets it truncate rather than push
+          the right-hand action cluster, and max-w-full keeps the centered (so
+          unstretched) grid item from overflowing its column. */}
       {conversationId && (conversationTitle || titleLinkTo) && (
-        <div className="flex min-w-0 flex-1 items-center md:col-start-2 md:row-start-1 md:justify-self-center">
+        <div className="flex min-w-0 max-w-full flex-1 items-center md:col-start-2 md:row-start-1 md:justify-self-center">
           <ConversationBreadcrumb
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
@@ -613,7 +640,10 @@ export function ChatHeader({
         </div>
       )}
 
-      <div className="ml-auto flex shrink-0 items-center gap-2 max-md:gap-0 max-md:empty:hidden md:col-start-3 md:row-start-1 md:ml-0 md:justify-self-end">
+      <div
+        ref={actionsRef}
+        className="ml-auto flex shrink-0 items-center gap-2 max-md:gap-0 max-md:empty:hidden md:col-start-3 md:row-start-1 md:ml-0 md:justify-self-end"
+      >
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}

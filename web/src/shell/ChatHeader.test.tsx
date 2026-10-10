@@ -235,11 +235,46 @@ describe("ChatHeader — workspace pane alignment", () => {
     const breadcrumb = screen.getByRole("navigation", { name: "Conversation" });
     const slot = breadcrumb.parentElement;
 
-    // A 1fr/auto/1fr grid pins the breadcrumb to the middle column, so its
-    // midpoint tracks the pane's center rather than the sidebar's edge.
-    expect(header).toHaveClass("md:grid", "md:grid-cols-[1fr_auto_1fr]");
-    expect(slot).toHaveClass("md:col-start-2", "md:justify-self-center", "min-w-0");
+    // The grid pins the breadcrumb to the middle column between side columns
+    // that share one minimum width, so its midpoint tracks the pane's center
+    // rather than the sidebar's edge; max-w-full keeps it inside that column.
+    expect(header).toHaveClass(
+      "md:grid",
+      "md:grid-cols-[minmax(var(--chat-header-side,0px),1fr)_auto_minmax(var(--chat-header-side,0px),1fr)]",
+    );
+    expect(slot).toHaveClass("md:col-start-2", "md:justify-self-center", "min-w-0", "max-w-full");
     expect(header).not.toHaveClass("justify-between");
+  });
+
+  it("reserves the wider side cluster's width for both side columns", () => {
+    const measure = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        // Only the action cluster has width here; the toggle slot is empty.
+        const width = this.classList.contains("md:col-start-3") ? 138 : 0;
+        return {
+          width,
+          height: 0,
+          x: 0,
+          y: 0,
+          top: 0,
+          left: 0,
+          right: width,
+          bottom: 0,
+        } as DOMRect;
+      });
+    try {
+      const { container } = renderHeader({
+        sidebarOpen: true,
+        conversationId: "conv-1",
+        conversationTitle: "Centering check",
+        canShare: true,
+      });
+      const header = container.querySelector("header");
+      expect(header?.style.getPropertyValue("--chat-header-side")).toBe("138px");
+    } finally {
+      measure.mockRestore();
+    }
   });
 
   it("keeps the action cluster in the right grid column", () => {
