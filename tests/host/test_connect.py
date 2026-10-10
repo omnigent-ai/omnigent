@@ -81,6 +81,7 @@ from omnigent.host.frames import (
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.process_logging import RedactingLogFormatter
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -1700,6 +1701,296 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     # Keep the diagnostic cause.
     assert "tunnel rejected: bad frame" in error
     assert "code 3" in error
+
+
+_TAIL_SEPARATOR = "\n--- runner log tail ---\n"
+
+_TUNNEL_REJECTION = (
+    "runner tunnel rejected by server (HTTP 403 persisted across 3 attempts); "
+    "run `omnigent login https://example.cloud.databricks.com/omnigent` to re-authenticate"
+)
+
+
+def test_runner_exit_error_leads_with_the_runners_stated_reason(tmp_path: Path) -> None:
+    """The report names the runner's own exit reason before the raw log tail,
+    even when a shutdown traceback sits right above that reason."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "During handling of the above exception, another exception occurred:\n"
+        "\n"
+        "Traceback (most recent call last):\n"
+        '  File "/venv/lib/python3.12/site-packages/starlette/routing.py", line 655, in lifespan\n'
+        "    await receive()\n"
+        '  File "/usr/lib/python3.12/asyncio/queues.py", line 158, in get\n'
+        "    await getter\n"
+        "asyncio.exceptions.CancelledError\n"
+        f"ERROR 09-10 17:15:27.891 runner._entry main | runner exiting: {_TUNNEL_REJECTION}\n"
+        f"error: {_TUNNEL_REJECTION}\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    headline, separator, tail = error.partition(_TAIL_SEPARATOR)
+    assert separator, error
+    first, cause = headline.splitlines()
+    assert first.startswith("runner process exited with code 1 (log on host: ")
+    assert cause == f"cause: {_TUNNEL_REJECTION}"
+    # The raw tail stays attached for anyone who needs the full context.
+    assert "asyncio.exceptions.CancelledError" in tail
+
+
+def test_runner_exit_error_finds_the_reason_above_the_displayed_tail(tmp_path: Path) -> None:
+    """A crash-hook reason logged above the 15-line tail window (the traceback
+    is printed twice below it) still leads the report."""
+    log = tmp_path / "runner-x.log"
+    cause = "[Errno 28] No space left on device: '/tmp/runner-specs-runner_token_ab12-qncoiwzp'"
+    frames = "".join(
+        f'  File "/venv/lib/python3.12/site-packages/pkg{n}.py", line {n}, in step{n}\n'
+        f"    step{n}()\n"
+        for n in range(20)
+    )
+    traceback = f"Traceback (most recent call last):\n{frames}OSError: {cause}\n"
+    log.write_text(
+        "CRITICAL 09-10 17:15:27.891 runner._entry _log_uncaught | "
+        f"runner exiting: uncaught OSError: {cause}\n{traceback}{traceback}",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    headline, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert headline.splitlines()[1] == f"cause: uncaught OSError: {cause}"
+    tail_lines = tail.splitlines()
+    assert len(tail_lines) == 15
+    assert "runner exiting" not in tail
+    assert tail_lines[-1] == f"OSError: {cause}"
+
+
+def test_runner_exit_error_falls_back_to_the_final_traceback_line(tmp_path: Path) -> None:
+    """Without a stated reason (an import error dies before the crash hook is
+    installed), the traceback's final line names the cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 31, in <module>\n'
+        "    from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel\n"
+        "ModuleNotFoundError: No module named 'websockets'\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: ModuleNotFoundError: No module named 'websockets'"
+
+
+def test_runner_exit_error_without_a_recognizable_cause_keeps_the_plain_report(
+    tmp_path: Path,
+) -> None:
+    """Unstructured output is not promoted to a cause; the tail alone carries it."""
+    log = tmp_path / "runner-x.log"
+    log.write_text("boot: starting\nwarming caches\nkilled\n", encoding="utf-8")
+
+    error = _runner_exit_error(137, log)
+
+    lines = error.splitlines()
+    assert lines[0].startswith("runner process exited with code 137 (log on host: ")
+    assert lines[1] == "--- runner log tail ---"
+    assert "cause:" not in error
+
+
+def test_runner_exit_error_redacts_the_stated_reason(tmp_path: Path) -> None:
+    """A credential inside the runner's reason is masked like the tail."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "CRITICAL 09-10 17:15:27.891 runner._entry _log_uncaught | runner exiting: uncaught "
+        "RuntimeError: mint failed for Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert "eyJhbGciOiJIUzI1NiJ9" not in error
+    assert "cause: uncaught RuntimeError: mint failed for" in error
+
+
+def test_runner_exit_error_redacts_the_whole_reason_before_bounding_it(tmp_path: Path) -> None:
+    """A credential straddling the cause's length bound is masked in full: the
+    reason is redacted before it is cut, so no fragment of the value survives in
+    the stated cause or the tail."""
+    log = tmp_path / "runner-x.log"
+    value = ' password="label SYNTHETIC-PASSWORD'
+    reason = "x" * (512 - len(value)) + value + '"'
+    log.write_text(
+        "CRIT  09-10 17:15:27.891 runner._entry                    _log_uncaught      | "
+        f"runner exiting: {reason}\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert "SYNTHETIC-PASSWORD" not in error
+    cause = error.splitlines()[1]
+    assert cause.startswith("cause: xxx")
+    assert len(cause) <= len("cause: ") + 512
+
+
+def test_runner_exit_error_ignores_an_exit_phrase_outside_a_log_record(tmp_path: Path) -> None:
+    """Only the runner logger's own record names the cause; the same phrase printed
+    bare or echoed to stderr is not promoted, so the traceback's last line wins."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "runner exiting: printed by a wrapper\n"
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 31, in <module>\n'
+        "    import websockets\n"
+        "ModuleNotFoundError: No module named 'websockets'\n"
+        "error: runner exiting: echoed to stderr\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: ModuleNotFoundError: No module named 'websockets'"
+
+
+def test_runner_exit_error_promotes_a_bare_traceback_final_line(tmp_path: Path) -> None:
+    """A final traceback line without a message (``KeyboardInterrupt``) still names the cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 2133, in main\n'
+        "    asyncio.run(_run_tunnel_from_env())\n"
+        "KeyboardInterrupt\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: KeyboardInterrupt"
+
+
+def test_runner_exit_error_tail_starts_on_a_whole_line_after_the_byte_bound(
+    tmp_path: Path,
+) -> None:
+    """When the last lines exceed the tail budget in UTF-8 bytes, the cut drops its
+    partial leading line and never splits a multibyte character."""
+    log = tmp_path / "runner-x.log"
+    lines = [f"line {n:02d} " + "é" * 300 for n in range(20)]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    tail_lines = tail.splitlines()
+    assert tail_lines, error
+    assert all(line in lines for line in tail_lines), tail_lines[0][:40]
+    assert len(tail.encode("utf-8")) <= 4096
+
+
+def test_runner_exit_error_keeps_the_suffix_of_a_single_oversized_line(tmp_path: Path) -> None:
+    """A lone line longer than the tail budget has no boundary to drop, so its
+    bounded suffix is shown rather than nothing."""
+    log = tmp_path / "runner-x.log"
+    log.write_text("x" * 5000 + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert "\n" not in tail
+    assert len(tail.encode("utf-8")) == 4096
+
+
+def test_runner_exit_error_reads_the_record_the_runner_logger_actually_writes(
+    tmp_path: Path,
+) -> None:
+    """The record match follows the shared log formatter, not a hand-written sample."""
+    record = logging.LogRecord(
+        "omnigent.runner._entry",
+        logging.CRITICAL,
+        __file__,
+        1,
+        "runner exiting: uncaught OSError: [Errno 28] No space left on device",
+        None,
+        None,
+        func="_log_uncaught",
+    )
+    log = tmp_path / "runner-x.log"
+    log.write_text(RedactingLogFormatter(use_colors=False).format(record) + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    assert error.splitlines()[1] == "cause: uncaught OSError: [Errno 28] No space left on device"
+
+
+def test_runner_exit_error_does_not_promote_a_logged_error_summary(tmp_path: Path) -> None:
+    """A ``SomeError: ...`` line that closes no traceback is output, not the exit cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "ConnectionError: upstream reset; retrying\nConnectionError: upstream reset\nkilled\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(137, log)
+
+    assert "cause:" not in error
+    assert error.splitlines()[1] == "--- runner log tail ---"
+
+
+def test_runner_exit_error_closes_a_traceback_whose_final_line_is_not_recognized(
+    tmp_path: Path,
+) -> None:
+    """An unrecognized closing line (``StopIteration``) still ends the traceback, so a
+    later logged ``SomeError: ...`` summary is not promoted in its place."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 10, in main\n'
+        "    next(iterator)\n"
+        "StopIteration\n"
+        "ConnectionError: upstream reset; retrying\n"
+        "killed\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert "cause:" not in error
+
+
+def test_runner_exit_error_fallback_needs_the_closing_line_in_the_shown_tail(
+    tmp_path: Path,
+) -> None:
+    """A traceback closed above the byte-bounded tail is not named as the cause."""
+    log = tmp_path / "runner-x.log"
+    log.write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/venv/site-packages/omnigent/runner/_entry.py", line 10, in main\n'
+        "    boom()\n"
+        "OSError: boom\n" + "x" * 5000 + "\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert "OSError: boom" not in tail
+    assert "cause:" not in error
+
+
+def test_runner_exit_error_keeps_a_whole_leading_line_when_the_cut_lands_on_a_boundary(
+    tmp_path: Path,
+) -> None:
+    """A cut that starts exactly at a line boundary drops nothing."""
+    log = tmp_path / "runner-x.log"
+    kept = "b" * 2047 + "\n" + "c" * 2048
+    log.write_text("a" * 100 + "\n" + kept + "\n", encoding="utf-8")
+
+    error = _runner_exit_error(1, log)
+
+    _, _, tail = error.partition(_TAIL_SEPARATOR)
+    assert tail == kept
 
 
 async def test_watch_runner_silent_on_intentional_stop(

@@ -76,6 +76,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
   runner_unavailable: "The session's runner isn't connected to the server.",
+  runner_failed_to_start: "The session's runner failed to start on the host.",
   connection_error:
     "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
@@ -126,10 +127,13 @@ interface ParsedErrorMessage {
   message: string;
   terminal: string | null;
   lastOutput: string | null;
+  runnerLog: string | null;
 }
 
 const DIAGNOSTICS_HEADING = /^(?:terminal|lifecycle) diagnostics:\s*$/i;
 const LAST_OUTPUT_HEADING = /^last captured (?:terminal )?output:\s*(.*)$/i;
+// The host appends a dead runner's log tail under this heading.
+const RUNNER_LOG_HEADING = /^--- runner log tail ---$/i;
 const UNAVAILABLE_OUTPUT =
   /^unavailable(?:[.!]|\. The process exited before Omnigent captured a pane snapshot\.)?$/i;
 const EMPTY_RELATED_ERRORS: RelatedRenderError[] = [];
@@ -195,8 +199,23 @@ function trimBlankBoundaryLines(lines: string[]): string | null {
   return start < end ? lines.slice(start, end).join("\n") : null;
 }
 
-function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
-  const lines = rawMessage.replace(/\r\n?/g, "\n").split("\n");
+function parseErrorMessage(rawMessage: string, code: string): ParsedErrorMessage {
+  const allLines = rawMessage.replace(/\r\n?/g, "\n").split("\n");
+  // The host appends the runner log only to runner exit reports, which carry no
+  // terminal sections; elsewhere the marker is just text.
+  const sectionStart = allLines.findIndex(
+    (line) => DIAGNOSTICS_HEADING.test(line.trim()) || LAST_OUTPUT_HEADING.test(line.trim()),
+  );
+  const runnerLogIndex =
+    code === "runner_failed_to_start"
+      ? allLines.findIndex(
+          (line, index) =>
+            (sectionStart < 0 || index < sectionStart) && RUNNER_LOG_HEADING.test(line.trim()),
+        )
+      : -1;
+  const runnerLog =
+    runnerLogIndex >= 0 ? trimBlankBoundaryLines(allLines.slice(runnerLogIndex + 1)) : null;
+  const lines = runnerLogIndex >= 0 ? allLines.slice(0, runnerLogIndex) : allLines;
   const diagnosticsIndex = lines.findIndex((line) => DIAGNOSTICS_HEADING.test(line.trim()));
   const searchStart = diagnosticsIndex >= 0 ? diagnosticsIndex + 1 : 0;
   const lastOutputIndex = lines.findIndex(
@@ -204,7 +223,8 @@ function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
   );
 
   if (diagnosticsIndex < 0 && lastOutputIndex < 0) {
-    return { message: rawMessage.trim(), terminal: null, lastOutput: null };
+    const message = runnerLogIndex >= 0 ? lines.join("\n").trim() : rawMessage.trim();
+    return { message, terminal: null, lastOutput: null, runnerLog };
   }
 
   const messageEnd = diagnosticsIndex >= 0 ? diagnosticsIndex : lastOutputIndex;
@@ -222,7 +242,7 @@ function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
     lastOutput = trimBlankBoundaryLines([headingValue, ...lines.slice(lastOutputIndex + 1)]);
     if (lastOutput && UNAVAILABLE_OUTPUT.test(lastOutput.trim())) lastOutput = null;
   }
-  return { message, terminal, lastOutput };
+  return { message, terminal, lastOutput, runnerLog };
 }
 
 /**
@@ -260,7 +280,7 @@ export function ErrorBanner({
       })),
     [relatedErrors],
   );
-  const parsed = useMemo(() => parseErrorMessage(message), [message]);
+  const parsed = useMemo(() => parseErrorMessage(message, code), [code, message]);
   const messageText = useMemo(() => {
     const parts: string[] = [];
     if (cause) parts.push(cause);
@@ -278,8 +298,11 @@ export function ErrorBanner({
         parsed.lastOutput
           ? { id: "output", label: "Last captured output", content: parsed.lastOutput }
           : null,
+        parsed.runnerLog
+          ? { id: "runner-log", label: "Runner log", content: parsed.runnerLog }
+          : null,
       ].filter((item): item is { id: string; label: string; content: string } => item !== null),
-    [parsed.lastOutput, parsed.terminal],
+    [parsed.lastOutput, parsed.runnerLog, parsed.terminal],
   );
   const [expanded, setExpanded] = useState(false);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);

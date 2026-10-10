@@ -39,6 +39,16 @@ const RATE_LIMIT_ERROR = [
   "Databricks account team to request a higher FMAPI rate limit tier.",
 ].join(" ");
 
+const RUNNER_EXIT_ERROR = [
+  "runner process exited with code 1 (log on host: ~/.omnigent/logs/runner/runner-abc.log)",
+  "cause: uncaught OSError: [Errno 28] No space left on device: '/tmp/runner-specs-runner_token_ab12-x1'",
+  "--- runner log tail ---",
+  "Traceback (most recent call last):",
+  '  File "/usr/lib/python3.12/tempfile.py", line 384, in mkdtemp',
+  "    _os.mkdir(file, 0o700)",
+  "OSError: [Errno 28] No space left on device: '/tmp/runner-specs-runner_token_ab12-x1'",
+].join("\n");
+
 describe("ErrorBanner", () => {
   beforeEach(() => vi.mocked(copyText).mockClear());
 
@@ -225,6 +235,58 @@ describe("ErrorBanner", () => {
       "top-3",
       "right-3",
     );
+  });
+
+  it("keeps a dead runner's stated cause above its folded log tail", () => {
+    render(
+      <ErrorBanner message={RUNNER_EXIT_ERROR} source="execution" code="runner_failed_to_start" />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The session's runner failed to start on the host.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /runner failed to start on the host/i }));
+    const message = screen.getByTestId("error-message-content");
+    expect(message).toHaveTextContent("runner process exited with code 1");
+    expect(message).toHaveTextContent(
+      "cause: uncaught OSError: [Errno 28] No space left on device",
+    );
+    // The traceback belongs in diagnostics, not on top of the cause.
+    expect(message).not.toHaveTextContent("Traceback");
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const runnerLog = screen.getByTestId("error-diagnostics-content");
+    expect(runnerLog).toHaveTextContent("Traceback (most recent call last):");
+    expect(runnerLog).toHaveTextContent("tempfile.py");
+    expect(screen.getByRole("button", { name: "Copy runner log" })).toBeInTheDocument();
+  });
+
+  it("leaves a runner-log marker inside captured terminal output where it is", () => {
+    const message = [
+      "Required terminal exited unexpectedly; the session runtime is no longer available.",
+      "",
+      "Last captured terminal output:",
+      "--- runner log tail ---",
+      "nested error printed by the pane",
+    ].join("\n");
+    render(<ErrorBanner message={message} source="execution" code="required_terminal_exited" />);
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const output = screen.getByTestId("error-diagnostics-content");
+    expect(output).toHaveTextContent("--- runner log tail ---");
+    expect(output).toHaveTextContent("nested error printed by the pane");
+    expect(screen.queryByText("Runner log")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy runner log" })).toBeNull();
+  });
+
+  it("folds a runner log only for a runner exit report", () => {
+    const message = ["The agent runtime hit an error.", "--- runner log tail ---", "noise"].join(
+      "\n",
+    );
+    render(<ErrorBanner message={message} source="execution" code="executor_error" />);
+    fireEvent.click(screen.getByRole("button", { name: /agent runtime hit an error/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(
+      "--- runner log tail ---",
+    );
+    expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
   });
 
   it("preserves classified title, cause, and remediation semantics", () => {
