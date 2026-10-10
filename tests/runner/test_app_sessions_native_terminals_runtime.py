@@ -596,7 +596,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     def _recording_resolve_launch(**kwargs: Any) -> codex_app_mod.NativeCodexLaunch:
         resolve_calls.append(kwargs)
-        return replace(real_resolve_launch(**kwargs), profile=provider_profile)
+        return replace(
+            real_resolve_launch(**kwargs), profile=provider_profile, config_overrides=[]
+        )
 
     monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", _recording_resolve_launch)
 
