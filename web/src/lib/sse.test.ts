@@ -182,6 +182,19 @@ describe("parseEvent — response.output_item.done (message)", () => {
       messageId: "codex:thread_1:turn_1:agentMessage:item_1",
     } satisfies MessageDone);
   });
+
+  it("keeps the server persist stamp as createdAt", () => {
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "it_2",
+        type: "message",
+        response_id: "resp_1",
+        created_at: 1753900000,
+        content: [{ type: "output_text", text: "done" }],
+      },
+    });
+    expect(ev).toMatchObject({ type: "message_done", itemId: "it_2", createdAt: 1753900000 });
+  });
 });
 
 describe("parseEvent — response.output_item.done (reasoning)", () => {

@@ -1345,6 +1345,43 @@ let queryClient: QueryClient | null = null;
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
 
+// Server clock (epoch s) of the transcript activity each conversation has seen:
+// the last snapshot's `updatedAt` and the newest item `createdAt` (hydration,
+// backfill, or a live item event). The periodic snapshot reconcile compares them.
+const snapshotUpdatedAtS = new Map<string, number>();
+const newestItemCreatedAtS = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => {
+  snapshotUpdatedAtS.delete(id);
+  newestItemCreatedAtS.delete(id);
+});
+
+function noteItemCreatedAt(id: string, createdAt: number | undefined): void {
+  if (typeof createdAt !== "number" || createdAt <= 0) return;
+  if (createdAt > (newestItemCreatedAtS.get(id) ?? 0)) newestItemCreatedAtS.set(id, createdAt);
+}
+
+/** Record a processed session snapshot and the items fetched with it. */
+function noteSnapshot(id: string, session: Session, items: ConversationItem[] = []): void {
+  if (session.updatedAt != null) snapshotUpdatedAtS.set(id, session.updatedAt);
+  for (const item of items) noteItemCreatedAt(id, item.created_at);
+}
+
+/**
+ * Whether the server persisted transcript activity after the last snapshot
+ * that no item this tab has seen accounts for: a live stream that stopped
+ * carrying events. A bare metadata edit can trigger one redundant backfill.
+ * Second-granularity stamps leave a blind spot: an item persisted in the same
+ * second as the newest seen item (or the prior snapshot) is not detected until
+ * later activity bumps the clock; closing it fully needs a server-side
+ * monotonic revision.
+ */
+function transcriptAdvancedUnseen(id: string, session: Session): boolean {
+  const updatedAt = session.updatedAt;
+  const lastSnapshot = snapshotUpdatedAtS.get(id);
+  if (updatedAt == null || lastSnapshot === undefined || updatedAt <= lastSnapshot) return false;
+  return updatedAt > (newestItemCreatedAtS.get(id) ?? 0);
+}
+
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
@@ -4342,6 +4379,7 @@ async function bindStream(
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
+    noteSnapshot(id, session, items);
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
@@ -4810,7 +4848,8 @@ function reconnectStatusPatch(
  *
  * A stream pump can keep receiving heartbeats while missing a lifecycle event.
  * Periodically re-read durable status, discarding a snapshot if any semantic
- * stream event arrives during the fetch.
+ * stream event arrives during the fetch. When the snapshot shows transcript
+ * activity the stream never delivered, backfill the items as a reconnect would.
  */
 async function reconcileActiveSessionStatus(
   id: string,
@@ -4868,15 +4907,20 @@ async function reconcileActiveSessionStatus(
   }
   set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  const missedItems = transcriptAdvancedUnseen(id, session);
+  // On a miss, let reconcileOnReconnect record the snapshot on its own success
+  // path so a failed or stale backfill is retried on the next reconcile tick
+  // rather than being masked by an already-advanced snapshot clock.
+  if (!missedItems) noteSnapshot(id, session);
   const ignored = nativePreviewTombstonesByController.get(controller);
-  if (
-    ignored &&
+  const previewInterrupted =
+    ignored !== undefined &&
     get().blocks.some(
       (block) =>
         isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
-    )
-  ) {
-    // Retry a missed final-item backfill on the existing status-reconcile cadence.
+    );
+  if (missedItems || previewInterrupted) {
+    // Backfill items the open stream never carried, on the status-reconcile cadence.
     await reconcileOnReconnect(id, set, get, ignored);
   }
 }
@@ -5084,6 +5128,7 @@ async function rehydrateWindowOnReconnect(
     return;
   }
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  noteSnapshot(id, session, fresh.items);
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
@@ -5307,6 +5352,10 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  // Advance the recovery markers only once the covered backfill is applied. A
+  // failed later page returns above with them unchanged, so the next reconcile
+  // tick retries instead of treating the gap as already processed.
+  noteSnapshot(id, session, items);
 }
 
 // ── Presence idle reporting ─────────────────────────────────────────
@@ -8066,6 +8115,7 @@ async function* tapSessionEvents(
   for await (const event of events) {
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+      if ("createdAt" in event) noteItemCreatedAt(conversationId, event.createdAt);
     }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {

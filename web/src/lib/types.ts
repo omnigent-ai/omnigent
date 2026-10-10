@@ -313,6 +313,11 @@ export interface Session {
   backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;
   /**
+   * Epoch seconds of the last persisted activity (item appends and metadata
+   * edits), stamped from the same clock as item `created_at`. Absent on older servers.
+   */
+  updatedAt?: number;
+  /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string
    * for a top-level session. ``null`` when unset.
