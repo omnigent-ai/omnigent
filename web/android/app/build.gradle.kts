@@ -38,13 +38,6 @@ fun buildProperty(key: String): String? =
 
 val appVersionCode = buildProperty("versionCode")?.toIntOrNull() ?: 9
 val appVersionName = buildProperty("versionName") ?: "0.1.3"
-
-// Side-by-side installs for personal/nightly builds: -PapplicationIdSuffix=.dev
-// gives the APK its own package id (and a launcher label naming the suffix) so
-// it never collides with the store-signed app. Absent/blank keeps the canonical
-// id and label.
-val appIdSuffix = buildProperty("applicationIdSuffix")
-
 // The public first-party Databricks client the desktop and iOS apps use too.
 val databricksOAuthClientId = buildProperty("databricksOAuthClientId") ?: "omnigent"
 val databricksOAuthRedirectUrl =
@@ -69,21 +62,11 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        // Guarded with isNullOrBlank (not just null): a blank
-        // -PapplicationIdSuffix= must keep the canonical id AND label — a
-        // null-only guard would render the label as "Omnigent ()".
-        applicationId =
-            "ai.omnigent.android" + (appIdSuffix.takeUnless { it.isNullOrBlank() } ?: "")
+        applicationId = "ai.omnigent.android"
         minSdk = 28
         targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
-        manifestPlaceholders["appLabel"] =
-            if (!appIdSuffix.isNullOrBlank()) {
-                "Omnigent (${appIdSuffix.trimStart('.')})"
-            } else {
-                "@string/app_name"
-            }
         buildConfigField(
             "String",
             "DATABRICKS_OAUTH_CLIENT_ID",
