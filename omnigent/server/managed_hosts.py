@@ -1627,6 +1627,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "pvc_mounts",
                     "secret_mounts",
                     "pod_ready_timeout_s",
+                    "workspace_prep_timeout_s",
                     "runtime_class",
                     "home_size_limit",
                 },
@@ -1652,6 +1653,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             secret_mounts=secret_mounts,
             pod_ready_timeout_s=_parse_provider_positive_int(
                 raw, "kubernetes", "pod_ready_timeout_s"
+            ),
+            workspace_prep_timeout_s=_parse_provider_positive_int(
+                raw, "kubernetes", "workspace_prep_timeout_s"
             ),
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
             home_size_limit=_parse_kubernetes_home_size_limit(raw),
@@ -3328,6 +3332,7 @@ def _kubernetes_launcher_factory(
     pvc_mounts: list[dict[str, object]] | None,
     secret_mounts: list[dict[str, object]] | None,
     pod_ready_timeout_s: int | None,
+    workspace_prep_timeout_s: int | None,
     runtime_class: str | None,
     home_size_limit: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
@@ -3366,6 +3371,9 @@ def _kubernetes_launcher_factory(
         runner Pod (rotation-friendly credential volumes), or ``None``.
     :param pod_ready_timeout_s: Pod-start wait budget in seconds, or ``None``
         for the launcher's built-in default.
+    :param workspace_prep_timeout_s: Budget in seconds for the in-Pod workspace
+        preparation (the repository clone) once it is running, or ``None`` for
+        the launcher's built-in default.
     :param runtime_class: ``RuntimeClass`` name every runner Pod is scheduled
         under as ``spec.runtimeClassName`` (e.g. ``kata`` for micro-VM
         isolation), or ``None`` for the cluster's default runtime.
@@ -3403,6 +3411,7 @@ def _kubernetes_launcher_factory(
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
             pod_ready_timeout_s=pod_ready_timeout_s,
+            workspace_prep_timeout_s=workspace_prep_timeout_s,
             runtime_class=runtime_class,
             home_size_limit=home_size_limit,
         )

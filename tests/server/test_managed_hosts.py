@@ -776,6 +776,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                     "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
                 },
                 "pod_ready_timeout_s": 300,
+                "workspace_prep_timeout_s": 1200,
                 "home_size_limit": "20Gi",
             },
         }
@@ -802,6 +803,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
         "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
     }
     assert fake.pod_ready_timeout_s == 300
+    assert fake.workspace_prep_timeout_s == 1200
     assert fake.home_size_limit == "20Gi"
 
 
@@ -824,6 +826,7 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.resources is None
     assert fake.pvc_mounts is None
     assert fake.pod_ready_timeout_s is None
+    assert fake.workspace_prep_timeout_s is None
     # Absent, not None: a stock deployment gets a bounded HOME emptyDir.
     assert fake.home_size_limit == KUBERNETES_HOME_SIZE_LIMIT_DEFAULT == "8Gi"
 
@@ -1003,6 +1006,8 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"pod_ready_timeout_s": 0}, "positive integer"),
         ({"pod_ready_timeout_s": "90"}, "positive integer"),
         ({"pod_ready_timeout_s": True}, "positive integer"),
+        ({"workspace_prep_timeout_s": 0}, "positive integer"),
+        ({"workspace_prep_timeout_s": "1800"}, "positive integer"),
     ],
 )
 def test_parse_kubernetes_invalid_block_fails_loud(

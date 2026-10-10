@@ -226,6 +226,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.secret_mounts: list[dict[str, object]] | None = None
         self.tolerations: list[dict[str, object]] | None = None
         self.pod_ready_timeout_s: int | None = None
+        self.workspace_prep_timeout_s: int | None = None
         self.runtime_class: str | None = None
         self.home_size_limit: str | None = None
         self.prepared = False
@@ -605,7 +606,8 @@ def install_fake_kubernetes_launcher(
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
     kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, secret_mounts=…,
-    tolerations=…, pod_ready_timeout_s=…, runtime_class=…, home_size_limit=…)``;
+    tolerations=…, pod_ready_timeout_s=…, workspace_prep_timeout_s=…,
+    runtime_class=…, home_size_limit=…)``;
     the shim records those constructor args on the
     fake and hands it back, so production code runs unmodified against it.
 
@@ -629,6 +631,7 @@ def install_fake_kubernetes_launcher(
         secret_mounts: list[dict[str, object]] | None = None,
         tolerations: list[dict[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
+        workspace_prep_timeout_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = None,
     ) -> FakeSandboxLauncher:
@@ -646,6 +649,7 @@ def install_fake_kubernetes_launcher(
         fake.secret_mounts = secret_mounts
         fake.tolerations = tolerations
         fake.pod_ready_timeout_s = pod_ready_timeout_s
+        fake.workspace_prep_timeout_s = workspace_prep_timeout_s
         fake.runtime_class = runtime_class
         fake.home_size_limit = home_size_limit
         return fake

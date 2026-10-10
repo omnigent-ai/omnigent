@@ -1111,3 +1111,76 @@ def test_incompatible_claimed_profile_preserves_allocation_before_activation(
     harness.custom.patch_namespaced_custom_object.assert_not_called()
     harness.custom.delete_namespaced_custom_object.assert_not_called()
     harness.core.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+
+def test_start_waits_for_in_progress_workspace_preparation(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workspace preparation (the clone) outlasting the pod-ready budget is not a failure."""
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv("OMNIGENT_K8S_WORKSPACE_PREP_TIMEOUT_S", raising=False)
+    clone_seconds = 300.0
+    clock = {"now": 0.0}
+    monkeypatch.setattr(warm.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(warm.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s))
+    activated = {"done": False}
+
+    def execute(handle: Any, pod_name: str, mode: str, payload: Any = None) -> str:
+        if mode == "activate":
+            activated["done"] = True
+            return ""
+        if not activated["done"]:
+            return json.dumps({"stage": "waiting", "generation": None})
+        stage = "prepared" if clock["now"] >= clone_seconds else "preparing"
+        return json.dumps({"stage": stage, "generation": _GENERATION})
+
+    monkeypatch.setattr(harness.launcher, "_exec", MagicMock(side_effect=execute))
+    stages: list[str] = []
+    repo = RepoWorkspace("https://github.com/example/monorepo.git", None, "monorepo")
+
+    result = harness.launcher.start_host(
+        _HANDLE.encode(), **_START_ARGS, repos=[repo], on_stage=stages.append
+    )
+
+    assert result == "/home/omnigent/workspace/monorepo"
+    assert clock["now"] >= clone_seconds > k8s._POD_READY_TIMEOUT_S
+    assert stages == ["starting", "cloning"]
+
+
+@pytest.mark.parametrize(
+    ("stalled_stage", "expected"),
+    [
+        ("waiting", "Timed out waiting for warm Sandbox activation"),
+        ("preparing", "workspace preparation did not finish within 120s"),
+    ],
+)
+def test_stalled_start_reports_the_budget_it_exhausted(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, stalled_stage: str, expected: str
+) -> None:
+    """Activation stays under the pod-ready budget; preparation gets its own, longer one."""
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    harness.launcher._workspace_prep_timeout_s = 120
+    clock = {"now": 0.0}
+    monkeypatch.setattr(warm.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(warm.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s))
+    activated = {"done": False}
+
+    def execute(handle: Any, pod_name: str, mode: str, payload: Any = None) -> str:
+        if mode == "activate":
+            activated["done"] = True
+            return ""
+        if not activated["done"]:
+            return json.dumps({"stage": "waiting", "generation": None})
+        return json.dumps({"stage": "preparing", "generation": _GENERATION})
+
+    if stalled_stage == "waiting":
+        for container in harness.pod.status.container_statuses:
+            container.ready = False
+    monkeypatch.setattr(harness.launcher, "_exec", MagicMock(side_effect=execute))
+    repo = RepoWorkspace("https://github.com/example/monorepo.git", None, "monorepo")
+
+    with pytest.raises(click.ClickException, match=expected):
+        harness.launcher.start_host(_HANDLE.encode(), **_START_ARGS, repos=[repo])
+
+    exhausted = k8s._POD_READY_TIMEOUT_S if stalled_stage == "waiting" else 120
+    assert exhausted <= clock["now"] < exhausted + 2
