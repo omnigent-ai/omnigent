@@ -1010,8 +1010,13 @@ export function CodeViewer({
         </div>
       )}
 
-      {/* GitHub Light/Dark backgrounds match the shiki themes used by highlightCode */}
-      <div ref={codeContainerRef} className="font-mono text-sm bg-white dark:bg-[#0d1117]">
+      {/* GitHub Light/Dark backgrounds match the shiki themes used by highlightCode.
+          Ligatures/contextual alternates are off so each character keeps its own cell;
+          a merged glyph (e.g. a `###` ligature) can hang ink past the selection wash. */}
+      <div
+        ref={codeContainerRef}
+        className="font-mono text-sm bg-white dark:bg-[#0d1117] [font-variant-ligatures:none] [font-feature-settings:'liga'_0,'calt'_0]"
+      >
         {rawLines.map((rawLine, idx) => {
           const lineNum = idx + 1;
           const isMatchLine =

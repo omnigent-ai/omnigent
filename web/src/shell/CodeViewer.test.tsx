@@ -1034,6 +1034,15 @@ describe("CodeViewer .ipynb routing", () => {
   });
 });
 
+describe("source view glyph rendering", () => {
+  it("renders source lines with font ligatures and contextual alternates disabled", () => {
+    renderViewer("### Heading\n\nbody");
+    const lines = screen.getByText("### Heading").closest("[data-line]")?.closest(".font-mono");
+    expect(lines).toHaveClass("[font-variant-ligatures:none]");
+    expect(lines).toHaveClass("[font-feature-settings:'liga'_0,'calt'_0]");
+  });
+});
+
 describe("source line navigation", () => {
   it("centers and highlights the requested Markdown source line", () => {
     const scroll = vi.fn();
