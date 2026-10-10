@@ -1,11 +1,6 @@
-// The gating line of an approval card, e.g. "Claude wants to call **Bash**".
-//
-// Harness bridges wrap the gated tool in `**…**` (routes_hooks.py,
-// _executor_adapter.py) and nothing else in an elicitation message is markup:
-// policy prompts and MCP servers put raw commands and paths in the same field,
-// where a full markdown pass would turn `pkg/__init__.py` into a bold "init" or
-// `*.o *.a` into italics. So only `**bold**` runs are interpreted; everything
-// else stays literal.
+// The gating line of an approval card, e.g. "Claude wants to call **Bash**". Only the
+// bridges' `**bold**` runs are markup: policy prompts and MCP servers put raw commands
+// and paths in the same field, where full markdown would mangle `pkg/__init__.py`.
 
 import { Fragment } from "react";
 
