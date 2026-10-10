@@ -309,8 +309,13 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
 
     def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it; log the exit."""
-        if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
-            del _AUTO_FORWARDER_TASKS[session_id]
+        # A /clear rotation re-keys the entry, so locate it by identity.
+        owner = session_id
+        for key, registered in list(_AUTO_FORWARDER_TASKS.items()):
+            if registered is done_task:
+                del _AUTO_FORWARDER_TASKS[key]
+                owner = key
+                break
         # Obituary: a stopped forwarder takes mirroring, status and the busy
         # signal with it, so no exit path may be silent. ``exception()`` also
         # retrieves the failure (no "Task exception was never retrieved").
@@ -318,27 +323,46 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
             _logger.info(
                 "Transcript forwarder task %s cancelled; session=%s",
                 done_task.get_name(),
-                session_id,
-                extra={"session_id": session_id},
+                owner,
+                extra={"session_id": owner},
             )
         elif (exc := done_task.exception()) is not None:
             _logger.error(
                 "Transcript forwarder task %s died; session mirroring is down "
                 "until the terminal is recreated; session=%s",
                 done_task.get_name(),
-                session_id,
+                owner,
                 exc_info=exc,
-                extra={"session_id": session_id},
+                extra={"session_id": owner},
             )
         else:
             _logger.warning(
                 "Transcript forwarder task %s returned; session mirroring has stopped; session=%s",
                 done_task.get_name(),
-                session_id,
-                extra={"session_id": session_id},
+                owner,
+                extra={"session_id": owner},
             )
 
     task.add_done_callback(_evict)
+
+
+def _rekey_codex_native_session(old_session_id: str, new_session_id: str) -> None:
+    """Move a codex-native session's registry entries onto its ``/clear`` replacement.
+    The replacement owns the terminal while the same app-server and forwarder run on,
+    so teardown keyed by that session (DELETE, idle reaper, terminal exit) must find them."""
+    if old_session_id == new_session_id:
+        return
+    app_server = _AUTO_CODEX_APP_SERVERS.pop(old_session_id, None)
+    if app_server is not None:
+        _AUTO_CODEX_APP_SERVERS[new_session_id] = app_server
+    forwarder_task = _AUTO_FORWARDER_TASKS.pop(old_session_id, None)
+    if forwarder_task is not None:
+        # A forwarder that raced in under the new id would otherwise lose its
+        # reference and leak its app-server; cancelling it closes that server.
+        incumbent = _AUTO_FORWARDER_TASKS.get(new_session_id)
+        if incumbent is not None and incumbent is not forwarder_task:
+            incumbent.cancel()
+        _AUTO_FORWARDER_TASKS[new_session_id] = forwarder_task
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -5875,6 +5899,14 @@ async def _codex_discover_thread_and_forward(
     discovery_started_at = time.monotonic()
     startup_pending_recorded = False
     cancelled = False
+    # A native /clear re-keys the registries; teardown must pop under the current owner.
+    registry_key = session_id
+
+    def _on_forwarder_rotation(old_session_id: str, new_session_id: str) -> None:
+        nonlocal registry_key
+        _rekey_codex_native_session(old_session_id, new_session_id)
+        registry_key = new_session_id
+
     try:
         while True:
             try:
@@ -6139,6 +6171,7 @@ async def _codex_discover_thread_and_forward(
             thread_id=thread_id,
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            on_session_rotated=_on_forwarder_rotation,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -6161,8 +6194,8 @@ async def _codex_discover_thread_and_forward(
             ),
         )
         leftover_app_server = app_server
-        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
-            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(registry_key) is app_server:
+            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(registry_key, None)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
@@ -6216,6 +6249,14 @@ async def _codex_forward_known_thread(
     )
 
     cancelled = False
+    # A native /clear re-keys the registries; teardown must pop under the current owner.
+    registry_key = session_id
+
+    def _on_forwarder_rotation(old_session_id: str, new_session_id: str) -> None:
+        nonlocal registry_key
+        _rekey_codex_native_session(old_session_id, new_session_id)
+        registry_key = new_session_id
+
     try:
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
@@ -6230,6 +6271,7 @@ async def _codex_forward_known_thread(
             thread_id=thread_id,
             client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            on_session_rotated=_on_forwarder_rotation,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -6248,8 +6290,8 @@ async def _codex_forward_known_thread(
             ),
         )
         leftover_app_server = app_server
-        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
-            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        if app_server is None or _AUTO_CODEX_APP_SERVERS.get(registry_key) is app_server:
+            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(registry_key, None)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)

@@ -2064,6 +2064,34 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+# Bounds the best-effort unsubscribe so a stalled app-server cannot block event handling.
+_UNSUBSCRIBE_TIMEOUT_SECONDS = 10.0
+
+
+async def _unsubscribe_retired_thread(
+    client: CodexAppServerClient,
+    *,
+    thread_id: str,
+) -> None:
+    """Drop this connection's subscription to a thread retired by a native ``/clear``.
+    Codex keeps a thread's stdio MCP servers loaded while any connection stays
+    subscribed, so the forwarder's own ``thread/resume`` would pin them (best effort)."""
+    try:
+        await asyncio.wait_for(
+            client.request("thread/unsubscribe", {"threadId": thread_id}),
+            _UNSUBSCRIBE_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - unsubscribe is best-effort cleanup.
+        _logger.warning(
+            "Codex forwarder could not unsubscribe retired thread %s after "
+            "rotation; its MCP servers may linger until the app server stops",
+            thread_id,
+            exc_info=True,
+        )
+
+
 async def supervise_forwarder(
     *,
     base_url: str,
@@ -2075,6 +2103,7 @@ async def supervise_forwarder(
     client: CodexAppServerClient | None = None,
     auth: httpx.Auth | None = None,
     ap_transport: httpx.AsyncBaseTransport | None = None,
+    on_session_rotated: Callable[[str, str], None] | None = None,
 ) -> None:
     """
     Mirror Codex app-server notifications into an Omnigent session.
@@ -2097,6 +2126,9 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
+    :param on_session_rotated: Optional ``(old_session_id, new_session_id)`` callback
+        fired after a native ``/clear`` rotates ownership onto a fresh session, so the
+        runner can move its app-server/forwarder bookkeeping onto that session.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -2165,6 +2197,8 @@ async def supervise_forwarder(
         try:
             async for event in client.iter_events():
                 try:
+                    retiring_session_id = target.session_id
+                    retiring_thread_id = target.thread_id
                     rotated = await _maybe_rotate_session_on_thread_started(
                         ap_client=ap_client,
                         target=target,
@@ -2174,9 +2208,22 @@ async def supervise_forwarder(
                     )
                     if rotated:
                         forwarder_state.note_parent_rotation(target.session_id)
+                        # Hand teardown bookkeeping to the new session before awaiting the
+                        # unsubscribe; a bookkeeping failure must not abort the hand-off.
+                        if on_session_rotated is not None:
+                            try:
+                                on_session_rotated(retiring_session_id, target.session_id)
+                            except Exception:  # noqa: BLE001 - bookkeeping must not abort rotation.
+                                _logger.warning(
+                                    "Codex forwarder rotation callback failed for %s -> %s",
+                                    retiring_session_id,
+                                    target.session_id,
+                                    exc_info=True,
+                                )
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await subscribe_task
+                        await _unsubscribe_retired_thread(client, thread_id=retiring_thread_id)
                         # Fresh thread after a /clear rotation — start its
                         # own active signal so the new subscription parks
                         # until the rotated thread's first turn.
