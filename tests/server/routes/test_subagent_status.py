@@ -725,3 +725,62 @@ async def test_native_child_completes_once_per_confirmed_turn(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+@pytest.mark.parametrize("before", ["running", "waiting"])
+async def test_transcript_lull_does_not_enqueue_completed_push(
+    status_route: _StatusRoute, db_uri: str, monkeypatch: pytest.MonkeyPatch, before: str
+) -> None:
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlMobilePushOutbox, SqlSessionPermission
+    from omnigent.db.enum_codecs import encode_mobile_push_kind
+    from omnigent.server import mobile_push
+    from omnigent.server.mobile_push_store import MobilePushStore
+
+    route = status_route
+    store = MobilePushStore(db_uri)
+    store.register("phone", user_id="owner", platform="android", fcm_token="token")
+    with store._session("seed_transcript_lull_recipient") as transaction:
+        transaction.add(
+            SqlSessionPermission(user_id="owner", conversation_id=route.child_id, level=4)
+        )
+    service = mobile_push.MobilePushService(store, route.store, Mock(), preview=False)
+    monkeypatch.setattr(mobile_push, "_service", service)
+    common._session_status_cache[route.child_id] = before
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "subagent.status", "data": {"idle": True}},
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    assert common._session_status_cache[route.child_id] == "idle"
+    with store._session("verify_transcript_lull_has_no_push") as transaction:
+        assert (
+            list(
+                transaction.scalars(
+                    select(SqlMobilePushOutbox.kind).where(
+                        SqlMobilePushOutbox.session_id == route.child_id
+                    )
+                )
+            )
+            == []
+        )
+    common._session_status_cache[route.child_id] = "running"
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "idle", "turn_completed": True},
+        },
+    )
+    assert response.status_code == 202, response.text
+    await _flush_live_state()
+    with store._session("verify_genuine_completion_push") as transaction:
+        assert list(
+            transaction.scalars(
+                select(SqlMobilePushOutbox.kind).where(
+                    SqlMobilePushOutbox.session_id == route.child_id
+                )
+            )
+        ) == [encode_mobile_push_kind("completed")]

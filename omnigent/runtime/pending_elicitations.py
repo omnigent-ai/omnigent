@@ -61,6 +61,25 @@ _lock = threading.Lock()
 # Optional observer (``subagent_block_notifier``) run synchronously on every
 # tracked event — must be cheap + non-blocking. ``None`` (runner, tests) skips it.
 _observer: Callable[[str, dict[str, Any]], None] | None = None
+_additional_observers: tuple[Callable[[str, dict[str, Any]], None], ...] = ()
+
+
+def add_elicitation_observer(
+    observer: Callable[[str, dict[str, Any]], None],
+) -> Callable[[], None]:
+    """Compose an event-aware observer without replacing the existing consumer."""
+    global _additional_observers
+    with _lock:
+        _additional_observers = (*_additional_observers, observer)
+
+    def remove() -> None:
+        global _additional_observers
+        with _lock:
+            _additional_observers = tuple(
+                item for item in _additional_observers if item is not observer
+            )
+
+    return remove
 
 
 def set_elicitation_observer(
@@ -178,6 +197,8 @@ def _notify_observer(conversation_id: str, event: dict[str, Any]) -> None:
     observer = _observer
     if observer is not None:
         observer(conversation_id, event)
+    for additional_observer in _additional_observers:
+        additional_observer(conversation_id, event)
 
 
 def resolve(conversation_id: str, elicitation_id: str) -> None:
@@ -379,7 +400,8 @@ def reset_for_tests() -> None:
     production callers — there is no legitimate use case for
     wiping the index at runtime.
     """
-    global _observer
+    global _observer, _additional_observers
     with _lock:
         _pending.clear()
+        _additional_observers = ()
     _observer = None

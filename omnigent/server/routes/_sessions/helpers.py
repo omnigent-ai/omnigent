@@ -4871,6 +4871,8 @@ def _publish_status(
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
     failure_context: object = None,
+    *,
+    push_eligible: bool = True,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4933,6 +4935,13 @@ def _publish_status(
     # runner tunnel serve the same sidebar status.
     if persist_live_status:
         session_live_state.persist_live_status(session_id, status)
+    if push_eligible and persist_live_status and scheduled_run_outcome == "auto":
+        from omnigent.server.mobile_push import observe_status
+
+        if status in {"running", "waiting"} or (
+            previous_status in {"running", "waiting"} and status in {"idle", "failed"}
+        ):
+            observe_status(session_id, previous_status, status, error.code if error else None)
     # Event-driven scheduled-run completion. A terminal edge (idle = the turn
     # completed; failed = it errored/disconnected) flips the conversation's
     # still-``running`` scheduled_task_run to succeeded/failed. This is the
@@ -7637,7 +7646,7 @@ async def _dispatch_skill_slash_command_to_runner(
             session_id,
             extra={"session_id": session_id},
         )
-        _publish_status(session_id, "idle")
+        _publish_status(session_id, "idle", push_eligible=False)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",

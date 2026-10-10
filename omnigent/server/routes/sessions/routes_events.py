@@ -1901,6 +1901,7 @@ def register_events_routes(
                     background_task_count=bg_count,
                     background_tasks=bg_tasks,
                     blocked_on=blocked_on,
+                    push_eligible=False,
                 )
                 return {"queued": False}
             assert isinstance(status, str)
