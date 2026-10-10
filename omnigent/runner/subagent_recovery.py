@@ -98,6 +98,7 @@ def build_subagent_recovery(
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            wrapper_label=snapshot.wrapper_label,
         )
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
