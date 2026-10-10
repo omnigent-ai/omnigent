@@ -17,17 +17,102 @@ Security defaults and require remote servers to use `https://`.
 
 The first version provides native setup chrome, recent servers, WKWebView
 loading, foreground local notifications, app badge updates, and notification
-tap routing back into the SPA. OIDC authentication is delegated to the system
-browser and the resulting session is copied into the isolated WKWebView cookie
-store, so providers such as Google that reject embedded user agents work. It
-does not implement APNs, background polling, or localhost proxy/CORS behavior.
+tap routing back into the SPA. OIDC sign-in happens outside the web view (see
+[OIDC sign-in](#oidc-sign-in)), so providers such as Google that reject embedded
+user agents work. It does not implement APNs, background polling, or localhost
+proxy/CORS behavior.
 
 ## Databricks OAuth
 
 Workspace connections use native OAuth, isolated persistent WebKit stores, bounded
 session recovery, and local sign-out. Build-configurable client ID and HTTPS callback
 setup are documented in [Databricks OAuth](docs/databricks-oauth.md). Databricks Apps
-retain inline platform sign-in; generic OIDC is unchanged.
+retain inline platform sign-in. Other servers follow [OIDC sign-in](#oidc-sign-in).
+
+## OIDC sign-in
+
+Omnigent servers that sign in with OIDC (`OMNIGENT_AUTH_PROVIDER=oidc`) open
+their identity provider in Apple's sign-in sheet (`ASWebAuthenticationSession`),
+never inside the web view. The sheet shares Safari's cookies, so an existing IdP
+session, passkeys, and saved passwords work there.
+
+Before loading a server that isn't a Databricks host, the app reads its
+unauthenticated `/.well-known/omnigent.json` manifest. Native sign-in applies
+only when `auth.mode` is `"oidc"`, `auth.native_redirect_uris` lists
+`ai.omnigent.ios:/oauth/callback`, and `auth.session_cookie` is set:
+
+| Server                                                     | Sign-in                                                 |
+| ---------------------------------------------------------- | ------------------------------------------------------- |
+| OIDC that lists the app's redirect                         | Sign-in sheet (below)                                   |
+| OIDC without the app's redirect (older servers)            | Unchanged: ticket sign-in in Safari (deprecated, 0.5.0) |
+| Accounts (username + password)                             | Unchanged: the server's own form, in the web view       |
+| Header mode, custom providers, no auth                     | Unchanged                                               |
+| No `auth` in the manifest (older servers, subpath proxies) | Unchanged                                               |
+| Databricks workspaces and Apps                             | Unchanged: detected by URL, manifest not read           |
+
+- **Connect, server switches, relaunch, deep links, and notification taps**
+  reuse the session cookie if `GET <mount>/v1/me` accepts it, else renew it
+  silently from the stored refresh grant (`POST <mount>/oauth/token`). Only when
+  neither works does the sheet open at `<mount>/auth/login` with a PKCE challenge.
+  The server redirects the sheet to `ai.omnigent.ios:/oauth/callback` with a
+  one-time code, the sheet closes itself, and the app exchanges the code and its
+  verifier at `POST <mount>/auth/native-token`. The callback scheme is not in
+  `Info.plist`: only the sheet receives it.
+- The app installs the session as the server's own cookie (HttpOnly, SameSite=Lax,
+  Secure on https, expiring with the session) in the web view's cookie store,
+  confirms `/v1/me` accepts it, then loads the page. **Signing in…** with
+  **Cancel** shows while renewing or signing in; Cancel, or closing the sheet,
+  returns to the connect screen with the URL kept. If the sheet opened because the
+  saved sign-in had expired or been ended, closing it keeps that reason on the
+  connect screen. A refused sign-in (for example a disallowed email domain) shows
+  the server's reason there; the next launch shows the connect screen with that
+  server prefilled instead of reopening it. A failure after the sheet returns
+  (exchanging its code) just asks to try again. While the next server's manifest is read, the
+  previous server's page is covered.
+- **While connected,** the app renews the cookie before it expires and when it
+  returns to the foreground with the session due. The web app's own navigation to
+  `<mount>/auth/login`, or a redirect to the IdP, is stopped: the app renews and
+  reloads the page you were on. If the page asks again within 15 seconds, or the
+  renewal fails, **Sign in again?** names the cause (expired, ended by the server,
+  sign-in required) and only **Sign In** opens the sheet. An unreachable server
+  shows the connection error instead.
+- **Sign out** (the web app's `<mount>/auth/logout`, **Sign Out** in the native
+  server menu, or **Sign out of <server>** in the sidebar picker) forgets the
+  grant, clears the session cookie, stops reopening that server on launch, and
+  shows "You're signed out of <host>." The grant is revoked at
+  `POST <mount>/oauth/revoke` as a best effort. Safari stays signed in to the
+  IdP, so the next sign-in may finish without a prompt.
+
+The refresh grant is stored per server origin in the Keychain (service
+`ai.omnigent.ios.oidc`, this device only, never synced). Debug builds add a
+floating **Debug** menu on these connections with **Clear Session Cookie** and
+**Clear Refresh Token**.
+
+### Manual verification
+
+Run an OIDC server whose manifest lists the app's redirect (for example
+`deploy/docker` with Keycloak, or Google), then `just run-ios`. Debug builds
+allow `http://` servers.
+
+1. Connect: a system alert asks to use the host to sign in, then the sheet shows
+   the IdP and closes itself after sign-in, signed in. The IdP never appears in
+   the web view.
+2. Select **Cancel** during **Signing in…**, or close the sheet: the connect
+   screen returns with the URL. Retry works.
+3. Sign in with a disallowed account: the connect screen shows the server's
+   reason, and relaunch shows the connect screen with the URL prefilled instead
+   of the sheet.
+4. Relaunch: signed in with no sheet. Revoke the grant first (or **Debug → Clear
+   Refresh Token** and **Clear Session Cookie**), then relaunch: the sheet opens
+   directly.
+5. **Debug → Clear Session Cookie**, then leave and reopen the app (or wait past
+   the cookie's expiry): the session renews silently.
+6. **Debug → Clear Refresh Token**, then **Clear Session Cookie**, then reload:
+   **Sign in again?** says "Sign in to <host> to continue."
+7. Sign out from the web app's settings, the sidebar picker, or the native menu:
+   "You're signed out of <host>.", and relaunch doesn't reconnect.
+8. An accounts-mode server, `http://localhost:6767` (header mode), an older OIDC
+   server (ticket sign-in), and a Databricks workspace behave as before.
 
 ## Managed app configuration
 

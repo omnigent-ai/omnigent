@@ -30,7 +30,9 @@ need ``LEVEL_EDIT`` too, UNLESS the session owner opted into sharing files
 ``LEVEL_READ``. A plain read grant otherwise shares the conversation, not the
 raw filesystem — which routinely holds secrets (``.env`` / key files). The
 share opt-in never widens absolute-path browsing, which stays owner-only.
-``conv_share`` has sharing off; ``conv_open`` has it on.
+The same owner bar decides whether a workspace symlink may lead outside the
+workspace: only the owner's workspace-relative reads reach the runner marked
+``scope=reach``. ``conv_share`` has sharing off; ``conv_open`` has it on.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runtime import _globals, set_runner_client, set_runner_router
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
@@ -69,12 +72,19 @@ class _StubConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
-    def add(self, conversation_id: str, *, share_workspace_files: bool = False) -> None:
+    def add(
+        self,
+        conversation_id: str,
+        *,
+        share_workspace_files: bool = False,
+        parent: str | None = None,
+    ) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
             created_at=0,
             updated_at=0,
-            root_conversation_id=conversation_id,
+            root_conversation_id=parent or conversation_id,
+            parent_conversation_id=parent,
             agent_id="ag_test",
             share_workspace_files=share_workspace_files,
         )
@@ -272,9 +282,13 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     # A second session whose owner opted into sharing workspace files with
     # view-level collaborators — same grant shape, share flag on.
     conv_store.add("conv_open", share_workspace_files=True)
+    # A sub-agent of conv_share: nobody holds a direct grant on it, so every
+    # caller's access is inherited through the parent.
+    conv_store.add("conv_child", parent="conv_share")
     perm_store = _StubPermissionStore()
     perm_store.add_grant("owner@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
+    perm_store.add_grant("manager@example.com", "conv_share", LEVEL_MANAGE)
     perm_store.add_grant("real-owner@example.com", "conv_share", LEVEL_OWNER)
     perm_store.add_grant("owner@example.com", "conv_open", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_open", LEVEL_READ)
@@ -445,6 +459,50 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
     assert runner_client.gets[0].startswith(f"{_FS_BASE}/%2Fetc/passwd")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,url,marked",
+    [
+        ("real-owner@example.com", _FS_RELATIVE, True),
+        ("admin@example.com", _FS_RELATIVE, True),
+        ("owner@example.com", _FS_RELATIVE, False),
+        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_open"), False),
+        ("real-owner@example.com", _FS_ABSOLUTE, False),
+        ("real-owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
+        ("admin@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
+        ("manager@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+        ("owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+    ],
+    ids=[
+        "owner",
+        "admin",
+        "edit-collaborator",
+        "shared-viewer",
+        "owner-absolute",
+        "child-inherited-owner",
+        "child-admin",
+        "child-inherited-manager",
+        "child-inherited-editor",
+        "child-inherited-viewer",
+    ],
+)
+async def test_filesystem_marks_reach_scope_for_the_owner_only(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    url: str,
+    marked: bool,
+) -> None:
+    """Only effective owners receive reach scope for relative reads, including
+    ownership inherited through a parent; an absolute path needs no mark."""
+    resp = await client.get(url, headers={"X-Forwarded-Email": caller})
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+    assert ("scope=reach" in runner_client.gets[0]) is marked
 
 
 @pytest.mark.asyncio

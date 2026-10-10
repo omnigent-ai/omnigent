@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 
@@ -9,11 +10,13 @@ import { SidebarServerPicker } from "./SidebarServerPicker";
 const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
+const signOutOfServer = vi.fn();
 
 vi.mock("@/lib/nativeBridge", () => ({
   getServerPicker: () => getServerPicker(),
   switchServer: (url: string) => switchServer(url),
   openServerSetup: () => openServerSetup(),
+  signOutOfServer: () => signOutOfServer(),
 }));
 
 function renderPicker() {
@@ -38,6 +41,7 @@ beforeEach(() => {
   getServerPicker.mockReset();
   switchServer.mockReset();
   openServerSetup.mockReset();
+  signOutOfServer.mockReset();
 });
 
 afterEach(cleanup);
@@ -245,6 +249,113 @@ describe("SidebarServerPicker", () => {
     expect(screen.getAllByText("Engineering").length).toBeGreaterThan(1);
     // An unnamed one keeps its host.
     expect(screen.getByText("two.example.com")).toBeInTheDocument();
+  });
+
+  it("shows names servers gave themselves, with their hosts", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [
+        "https://omni.example/",
+        "https://staging.example/",
+        "https://plain.example/",
+      ],
+      serverNames: {
+        "https://omni.example": "Acme Engineering",
+        "https://staging.example": "Acme Staging",
+      },
+    });
+    renderPicker();
+    const trigger = await openMenu();
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "Server: Acme Engineering (omni.example). Switch server",
+    );
+    // The current entry and the other named recent both keep their host visible.
+    expect(screen.getAllByText("Acme Engineering").length).toBeGreaterThan(1);
+    expect(screen.getByText("omni.example")).toBeInTheDocument();
+    expect(screen.getByText("Acme Staging")).toBeInTheDocument();
+    expect(screen.getByText("staging.example")).toBeInTheDocument();
+    expect(screen.getByText("plain.example")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Acme Staging"));
+    await waitFor(() => expect(switchServer).toHaveBeenCalledWith("https://staging.example/"));
+  });
+
+  it("doesn't repeat a name that is just the host", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      serverNames: { "https://omni.example": "omni.example" },
+    });
+    renderPicker();
+    const trigger = await openMenu();
+    expect(trigger).toHaveAttribute("aria-label", "Server: omni.example. Switch server");
+  });
+
+  it("names an unnamed managed server from its manifest, with its host", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      managedServers: ["https://omni.example/"],
+      serverNames: { "https://omni.example": "Acme Eng" },
+      recentServers: [],
+    });
+    renderPicker();
+    await openMenu();
+    expect(screen.getByText("Acme Eng")).toBeInTheDocument();
+    expect(screen.getByText("omni.example")).toBeInTheDocument();
+  });
+
+  it("prefers the organization's name over the server's own", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      managedServers: ["https://omni.example/"],
+      managedServerNames: { "https://omni.example/": "Engineering" },
+      serverNames: { "https://omni.example": "Self-chosen" },
+      recentServers: [],
+    });
+    renderPicker();
+    expect(await screen.findByText("Engineering")).toBeInTheDocument();
+    expect(screen.queryByText("Self-chosen")).toBeNull();
+  });
+
+  it("offers Sign out when the shell owns the server's sign-in", async () => {
+    signOutOfServer.mockResolvedValue(true);
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      canSignOut: true,
+    });
+    renderPicker();
+    await openMenu();
+    fireEvent.click(await screen.findByText("Sign out of omni.example"));
+    await waitFor(() => expect(signOutOfServer).toHaveBeenCalledOnce());
+  });
+
+  it("reports a sign-out the shell couldn't complete", async () => {
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "id");
+    signOutOfServer.mockResolvedValue(false);
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      canSignOut: true,
+    });
+    renderPicker();
+    await openMenu();
+    fireEvent.click(await screen.findByText("Sign out of omni.example"));
+    await waitFor(() =>
+      expect(errorToast).toHaveBeenCalledWith("Couldn't sign out of omni.example"),
+    );
+    errorToast.mockRestore();
+  });
+
+  it("hides Sign out when the shell can't sign the server out", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker();
+    await openMenu();
+    expect(await screen.findByText("Connect to new server…")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar-server-sign-out")).toBeNull();
   });
 
   it("doesn't offer the workspace host it moved to as another server", async () => {

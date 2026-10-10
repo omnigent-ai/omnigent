@@ -135,6 +135,7 @@ async def test_degraded_log_records_post_failure_classification(
         if failure == "connect"
         else "ReadTimeout",
         "delivered_ambiguous": failure == "ambiguous",
+        "rejection_reason": None,
     }
     assert "private" not in record.getMessage()
     assert record.exc_info is None

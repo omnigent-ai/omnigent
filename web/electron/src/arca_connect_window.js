@@ -20,6 +20,7 @@
 /** Channels between this window's preload and main. */
 const CONFIRM_CHANNEL = "arca-connect:confirm";
 const CANCEL_CHANNEL = "arca-connect:cancel";
+const { arcaTarget } = require("./arcaIdentity");
 
 /**
  * @param {{
@@ -30,6 +31,8 @@ const CANCEL_CHANNEL = "arca-connect:cancel";
  *   startConnect: (serverUrl: string, onOutput: (text: string) => void) =>
  *     ReturnType<typeof import("./arca").startArcaConnect>,
  *   commandLine: (serverUrl: string) => string,
+ *   startLogin: (serverUrl: string) => ReturnType<typeof import("./arca").startArcaLogin>,
+ *   loginCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
  * }} deps
  * @returns {{ run: (parentWin: unknown, serverUrl: string) => Promise<object> }}
@@ -41,6 +44,8 @@ function createArcaConnectFlow({
   preloadPath,
   startConnect,
   commandLine,
+  startLogin,
+  loginCommandLine,
   log = () => {},
 }) {
   /**
@@ -82,6 +87,12 @@ function createArcaConnectFlow({
     // window), so a repeat click surfaces it and awaits the same outcome
     // rather than erroring with "already in progress".
     if (activeRun) {
+      if (activeRun.target !== arcaTarget(serverUrl)) {
+        return Promise.resolve({
+          ok: false,
+          error: "An Arca connection to another server is in progress. Try again when it finishes.",
+        });
+      }
       try {
         if (!activeRun.win.isDestroyed()) {
           activeRun.win.show();
@@ -116,7 +127,8 @@ function createArcaConnectFlow({
       // Captured now: webContents is unreadable after the window is destroyed,
       // and the closed handler needs the id to unregister the console.
       const consoleId = win.webContents.id;
-      let phase = "asking"; // "asking" → "running" → "done"
+      let phase = "asking";
+      let loginAttempted = false;
       let connect = null;
       let settled = false;
       const settle = (result) => {
@@ -134,10 +146,51 @@ function createArcaConnectFlow({
         }
       };
 
+      const runCommand = (login = false) => {
+        phase = "running";
+        connect = login
+          ? startLogin(serverUrl)
+          : startConnect(serverUrl, (text) => send("arca-connect:output", text));
+        send("arca-connect:started", {
+          login,
+          command: login ? loginCommandLine(serverUrl) : commandLine(serverUrl),
+        });
+        void connect.promise.then((result) => {
+          // Closing the console must not start the next command after a late exit.
+          if (settled) return;
+          if (login && result.ok) {
+            runCommand();
+            return;
+          }
+          if (!login && result.authError && !loginAttempted) {
+            phase = "auth-required";
+            connect = null;
+            send("arca-connect:done", {
+              ok: false,
+              authRequired: true,
+              command: loginCommandLine(serverUrl),
+              error:
+                "This instance needs an Omnigent sign-in. Sign in through your browser, then we'll retry the connection.",
+            });
+            return;
+          }
+          phase = "done";
+          send("arca-connect:done", {
+            ok: result.ok === true,
+            error: result.ok === true ? null : (result.error ?? "Connecting to Arca failed."),
+          });
+          settle({ ...result, shownInConsole: true });
+        });
+      };
+
       consoles.set(consoleId, {
         onConfirm: () => {
+          if (phase === "auth-required") {
+            loginAttempted = true;
+            runCommand(true);
+            return;
+          }
           if (phase !== "asking") return;
-          phase = "running";
           log(`arca connect: user confirmed; running against ${serverUrl}`);
           // Grow to fit the terminal pane the page is about to reveal.
           try {
@@ -145,20 +198,7 @@ function createArcaConnectFlow({
           } catch {
             // Window mid-teardown; the run itself proceeds regardless.
           }
-          connect = startConnect(serverUrl, (text) => send("arca-connect:output", text));
-          send("arca-connect:started", null);
-          void connect.promise.then((result) => {
-            phase = "done";
-            send("arca-connect:done", {
-              ok: result.ok === true,
-              error: result.ok === true ? null : (result.error ?? "Connecting to Arca failed."),
-            });
-            // Resolve now — the SPA proceeds (host auto-select) while the
-            // user reads the output; the window closes on their Close click.
-            // `shownInConsole` tells the picker this outcome was already
-            // displayed here, so it must not be echoed as a second error.
-            settle({ ...result, shownInConsole: true });
-          });
+          runCommand();
         },
         onCancel: () => {
           // Cancel button (or Close after a run) — just close; the close
@@ -198,7 +238,7 @@ function createArcaConnectFlow({
         win.show();
       });
       void win.loadFile(pagePath);
-      activeRun = { win, promise: null };
+      activeRun = { win, promise: null, target: arcaTarget(serverUrl) };
     });
     if (activeRun) activeRun.promise = promise;
     return promise;

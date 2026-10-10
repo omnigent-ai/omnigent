@@ -162,16 +162,19 @@ class SkillSummary(BaseModel):
     is intentionally omitted — it's only loaded server-side when
     the harness invokes the skill, and it can be large.
 
-    :param name: Skill identifier as parsed from the SKILL.md
-        frontmatter, e.g. ``"triage-issues"``. Lowercase
-        kebab-case.
+    :param name: Invocation identifier (the skill's directory name),
+        e.g. ``"triage-issues"``, typed as ``/triage-issues``.
     :param description: One-line summary from the SKILL.md
         frontmatter, e.g. ``"Triage open GitHub issues in the
         repo."``.
+    :param display_name: Human-facing label from the SKILL.md
+        frontmatter ``name``, e.g. ``"Triage Issues"``. ``None`` when
+        it equals ``name`` or the source has no label.
     """
 
     name: str
     description: str
+    display_name: str | None = None
 
 
 class NativeReasoningEffortOption(BaseModel):
@@ -1048,6 +1051,11 @@ class CreateResponseRequest(BaseModel):
     # the message, so the runner can drop the buffered copy and not
     # re-deliver it in a continuation turn. ``None`` for fresh turns.
     injection_id: str | None = None
+    # Server-side identity of the native web input, independent of native transcript matching.
+    input_stable_id: str | None = None
+    pending_id: str | None = None
+    delivery_attempt_id: str | None = None
+    input_enqueued_at_ms: int | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
@@ -2349,6 +2357,11 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param delete_worktree: With ``archived=True``, also remove the
+        session's server-created git worktree directory once the archive
+        teardown runs (after the Undo grace). The branch is kept. Ignored
+        for sessions with no worktree; rejected (400) without
+        ``archived=True``.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2373,6 +2386,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    delete_worktree: bool = False
     project_id: str | None = None
     silent: bool = False
 
@@ -2606,7 +2620,7 @@ class SessionForkRequest(BaseModel):
     workspace: str | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
-    # side-chat tab). The fork otherwise behaves normally (its own runner).
+    # side-chat tab). It may share its parent's runner.
     side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
@@ -2929,7 +2943,7 @@ class GrantPermissionRequest(BaseModel):
 
     :param user_id: The user to grant access to, e.g.
         ``"alice@example.com"`` or ``"__public__"`` for public
-        read access.
+        access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
     """
