@@ -179,6 +179,14 @@ def _assert_auto_mode_decision(sink: dict) -> None:
     assert decision.get("updatedPermissions") == _EXPECTED_AUTO_MODE_PERMISSIONS, decision
 
 
+def _assert_gating_message_bold(card, tool_name: str) -> None:
+    """The hook's ``**<tool>**`` renders as a bold tool name, never as literal asterisks."""
+    line = card.locator("span", has_text="wants to call").first
+    expect(line).to_be_visible()
+    expect(line).not_to_contain_text("**")
+    expect(line.locator("strong", has_text=tool_name)).to_be_visible()
+
+
 @pytest.mark.timeout(240)
 def test_permission_card_offers_approve_and_switch_to_auto(
     page: Page,
@@ -200,6 +208,7 @@ def test_permission_card_offers_approve_and_switch_to_auto(
         card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
         expect(card).to_be_visible(timeout=_CARD_TIMEOUT_MS)
         expect(card).to_contain_text("Write")
+        _assert_gating_message_bold(card, "Write")
 
         # Control: the existing affordances render.
         expect(card.get_by_role("button", name="Approve", exact=True)).to_be_visible()
@@ -217,6 +226,7 @@ def test_permission_card_offers_approve_and_switch_to_auto(
         responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
         expect(responded).to_be_visible(timeout=_CARD_TIMEOUT_MS)
         expect(responded).to_contain_text("Approved · auto mode")
+        _assert_gating_message_bold(responded, "Write")
         _assert_auto_mode_decision(sink)
     finally:
         _drain_pending(base_url, session_id)

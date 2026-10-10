@@ -460,6 +460,34 @@ def test_databricks_request_headers_slice_key(token_dir) -> None:
     assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(recorded)
 
 
+def test_oss_host_routing_opt_in(token_dir, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An OSS host and its spawned runner send the same routing key when enabled."""
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.host.identity import HostIdentity
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    server = "http://localhost:8000"
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    assert databricks_request_headers(server, host_id="host_explicit") == {
+        "X-Databricks-Omnigent-Slice-Key": "host_explicit"
+    }
+    monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_runner")
+    assert databricks_request_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_runner"}
+    assert databricks_request_headers(server, host_id="host_explicit") == {
+        "X-Databricks-Omnigent-Slice-Key": "host_explicit"
+    }
+    monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR)
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda: HostIdentity(host_id="host_saved", name="saved-host"),
+    )
+    assert databricks_request_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_saved"}
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "true")
+    assert databricks_request_headers(server, host_id="host_explicit") == {}
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "0")
+    assert databricks_request_headers(server, host_id="host_explicit") == {}
+
+
 def test_databricks_request_headers_runner_env_default(
     token_dir, monkeypatch: pytest.MonkeyPatch
 ) -> None:

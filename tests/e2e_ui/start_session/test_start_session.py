@@ -48,13 +48,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 import pytest
 from playwright.async_api import Request, Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -77,33 +77,6 @@ _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 # The worktree-list endpoint the branch combobox queries for the picked repo.
 # Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
 _WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright **sync** tests in the same
-    session; once one has run, pytest-asyncio can't start a loop on the main
-    thread. Running the coroutine from a fresh thread via :func:`asyncio.run`
-    sidesteps that. Any exception (including assertion failures) is captured
-    and re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
@@ -314,94 +287,6 @@ def _antigravity_native_agents_body() -> str:
     )
 
 
-def _opencode_native_agents_body() -> str:
-    """Stub body for ``GET /v1/agents``: the native OpenCode agent.
-
-    ``name: "opencode-native-ui"`` + ``harness: "opencode-native"`` is what the
-    frontend maps (via ``nativeCodingAgents``) to the display label
-    **"OpenCode"** and the opencode-native wrapper labels. As with the Pi stub,
-    the wire ``display_name`` is deliberately the raw ``"opencode-native-ui"``
-    to prove the picker derives "OpenCode" itself (the harness→display mapping
-    wins) rather than echoing the server's raw value. Sole agent, so it
-    auto-selects and no explicit pick is needed.
-    """
-    return json.dumps(
-        {
-            "data": [
-                {
-                    "id": "ag_opencode_e2e",
-                    "name": "opencode-native-ui",
-                    "display_name": "opencode-native-ui",
-                    "description": "OpenCode coding agent",
-                    "harness": "opencode-native",
-                    "skills": [],
-                }
-            ]
-        }
-    )
-
-
-def _kimi_native_agents_body() -> str:
-    """Stub body for ``GET /v1/agents``: the native Kimi agent.
-
-    ``name: "kimi-native-ui"`` + ``harness: "kimi-native"`` is what the frontend
-    maps (via ``nativeCodingAgents``) to the display label **"Kimi"** and the
-    kimi-native wrapper labels. The wire ``display_name`` is deliberately the raw
-    ``"kimi-native-ui"`` to prove the picker derives "Kimi" itself
-    (``nativeDisplayNameForAgent`` ignores the wire value) rather than echoing the
-    server. Sole agent, so it auto-selects and no explicit pick is needed.
-    """
-    return json.dumps(
-        {
-            "data": [
-                {
-                    "id": "ag_kimi_native_e2e",
-                    "name": "kimi-native-ui",
-                    "display_name": "kimi-native-ui",
-                    "description": "Moonshot's Kimi Code agent",
-                    "harness": "kimi-native",
-                    "skills": [],
-                }
-            ]
-        }
-    )
-
-
-def _kimi_with_sdk_agents_body() -> str:
-    """Stub body for ``GET /v1/agents``: the native Kimi agent AND the SDK kimi.
-
-    The headless SDK ``kimi`` harness is kept (sub-agents use it) but is hidden
-    from the new-session picker via ``NEW_SESSION_HIDDEN_AGENTS`` so there is one
-    "Kimi" to pick — the native TUI agent (``kimi-native-ui``). Returning both
-    here drives that dedup: the picker must offer only the native row and drop
-    the SDK ``kimi`` row by name.
-    """
-    return json.dumps(
-        {
-            "data": [
-                {
-                    "id": "ag_kimi_native_e2e",
-                    "name": "kimi-native-ui",
-                    "display_name": "kimi-native-ui",
-                    "description": "Moonshot's Kimi Code agent",
-                    "harness": "kimi-native",
-                    "skills": [],
-                },
-                {
-                    # SDK kimi harness — present in the catalog, hidden from the
-                    # picker by NEW_SESSION_HIDDEN_AGENTS (name == "kimi").
-                    "id": "ag_kimi_sdk_e2e",
-                    "name": "kimi",
-                    "display_name": "Kimi",
-                    "description": "Headless Kimi Code (SDK)",
-                    "harness": "kimi",
-                    "skills": [],
-                },
-            ]
-        }
-    )
-
-
 def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host the composer picks."""
     return json.dumps(
@@ -516,6 +401,7 @@ async def _register_common_routes(
     )
     await page.route(_WORKTREES_RE, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/agents", handle_agents)
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
 
@@ -743,6 +629,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -801,7 +688,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             await panel_toggle.click()
             workspace = page.get_by_role("complementary", name="Workspace")
             await expect(workspace).to_be_visible()
-            for tab_name in ("Files", "Changes", "GitHub", "Agents"):
+            for tab_name in ("Files", "Changes", "Pull Requests", "Agents"):
                 await expect(
                     workspace.get_by_role("tab", name=re.compile(tab_name))
                 ).to_be_disabled()
@@ -896,6 +783,7 @@ async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -1078,6 +966,7 @@ async def _drive_no_redirect_after_navigating_away(
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             def note_create_response(response) -> None:
                 if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
@@ -1225,6 +1114,7 @@ async def _drive_landing_clears_after_navigating_away(
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             def note_create_response(response) -> None:
                 if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
@@ -2526,464 +2416,6 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_start_session_pi_native_picker_and_wrapper_labels(
-    seeded_session: tuple[str, str],
-) -> None:
-    """Native Pi: the picker shows "Pi" and create carries terminal-first labels.
-
-    Covers the user-facing Pi native-agent flow this PR adds:
-
-    1. **Picker label/icon** — the agent chip renders the harness-derived
-       display label **"Pi"** (via ``nativeCodingAgents``), NOT the raw agent
-       name ``"pi-native-ui"`` the server sends. (The pre-fix bug surfaced the
-       raw name capitalized as "Pi-native-ui".)
-    2. **Session-creation wrapper labels** — selecting Pi and sending must POST
-       ``/v1/sessions`` with the terminal-first wrapper labels
-       (``omnigent.ui: terminal`` + ``omnigent.wrapper: pi-native-ui``) that
-       make the runner launch the Pi TUI and the web UI render the
-       Chat/Terminal view.
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_pi_native_start(base_url, session_id))
-
-
-async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _register_common_routes(
-                page,
-                created_session_id=session_id,
-                create_bodies=create_bodies,
-                agents_body=_pi_native_agents_body(),
-            )
-
-            # Neutralize agent discovery so the picker shows ONLY the stubbed
-            # built-in Pi. The landing picker merges `/v1/agents` with agents
-            # found by scanning the caller's sessions (`/v1/sessions?visibility=mine`);
-            # on the shared e2e_ui server, sessions other tests left behind
-            # (e.g. a claude-native fork) would otherwise leak in and — ranking
-            # ahead of Pi — auto-select, so the chip would read "Claude Code".
-            # Registered after _register_common_routes so it wins for the
-            # visibility=mine scan; the bare POST /v1/sessions create still falls
-            # through to the capturing handler.
-            async def handle_agent_scan(route: Route) -> None:
-                await route.fulfill(
-                    status=200,
-                    content_type="application/json",
-                    body=json.dumps({"data": []}),
-                )
-
-            await page.route(
-                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
-            )
-
-            # Seed a recent working directory so the working-directory chip
-            # auto-fills and Send can enable without touching the file browser.
-            await page.add_init_script(
-                f"""window.localStorage.setItem(
-                    "omnigent:recent-workspaces",
-                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
-                );"""
-            )
-
-            await page.goto(f"{base_url}/")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-
-            # Pi auto-selects (sole agent). The chip shows the derived label
-            # "Pi" — and crucially NOT "...native...": the regression rendered
-            # the raw agent name "Pi-native-ui" when the harness→display
-            # mapping was missing.
-            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
-            await expect(agent_chip).to_have_attribute("aria-label", re.compile("Pi"))
-            await expect(agent_chip).not_to_have_attribute("aria-label", re.compile("native"))
-
-            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
-            await page.get_by_test_id("new-chat-landing-submit").click()
-
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            assert body["agent_id"] == "ag_pi_e2e", body
-            assert body["host_id"] == _HOST_ID, body
-            assert body["workspace"] == "/work/repo", body
-            # The terminal-first wrapper labels are the contract that drives the
-            # runner-owned Pi TUI and the web UI's Chat/Terminal view.
-            assert body.get("labels") == {
-                "omnigent.ui": "terminal",
-                "omnigent.wrapper": "pi-native-ui",
-                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
-                "omnigent.composer_context.v1.0": (
-                    '{"version":1,"working_directory":{"path":"/work/repo"},'
-                    '"worktree":{"mode":"none"}}'
-                ),
-            }, body
-            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
-        finally:
-            await browser.close()
-
-
-def test_start_session_antigravity_native_picker_and_wrapper_labels(
-    seeded_session: tuple[str, str],
-) -> None:
-    """Native Antigravity: the picker shows "Antigravity" and create carries terminal labels.
-
-    Covers the user-facing Antigravity native-agent flow this PR adds:
-
-    1. **Picker label/icon** — the agent chip renders the harness-derived display
-       label **"Antigravity"** (via ``nativeCodingAgents``), NOT the raw agent name
-       ``"antigravity-native-ui"`` the server sends.
-    2. **Session-creation wrapper labels** — selecting Antigravity and sending must
-       POST ``/v1/sessions`` with the terminal-first wrapper labels
-       (``omnigent.ui: terminal`` + ``omnigent.wrapper: antigravity-native-ui``)
-       that make the runner launch the agy TUI and the web UI render the
-       Chat/Terminal view.
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_antigravity_native_start(base_url, session_id))
-
-
-async def _drive_antigravity_native_start(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _register_common_routes(
-                page,
-                created_session_id=session_id,
-                create_bodies=create_bodies,
-                agents_body=_antigravity_native_agents_body(),
-            )
-
-            # Neutralize agent discovery so the picker shows ONLY the stubbed
-            # built-in Antigravity (sessions other tests left behind on the shared
-            # e2e_ui server would otherwise leak in and, ranking ahead, auto-select).
-            async def handle_agent_scan(route: Route) -> None:
-                await route.fulfill(
-                    status=200,
-                    content_type="application/json",
-                    body=json.dumps({"data": []}),
-                )
-
-            await page.route(
-                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
-            )
-
-            await page.add_init_script(
-                f"""window.localStorage.setItem(
-                    "omnigent:recent-workspaces",
-                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
-                );"""
-            )
-
-            await page.goto(f"{base_url}/")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-
-            # Antigravity auto-selects (sole agent). The chip shows the derived
-            # label "Antigravity" — and NOT "...native...": the raw agent name
-            # would surface "antigravity-native-ui" without the harness→display map.
-            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
-            await expect(agent_chip).to_have_attribute("aria-label", re.compile("Antigravity"))
-            await expect(agent_chip).not_to_have_attribute("aria-label", re.compile("native"))
-
-            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
-            await page.get_by_test_id("new-chat-landing-submit").click()
-
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            assert body["agent_id"] == "ag_antigravity_e2e", body
-            assert body["host_id"] == _HOST_ID, body
-            assert body["workspace"] == "/work/repo", body
-            # The terminal-first wrapper labels drive the runner-owned agy TUI and
-            # the web UI's Chat/Terminal view.
-            assert body.get("labels") == {
-                "omnigent.ui": "terminal",
-                "omnigent.wrapper": "antigravity-native-ui",
-                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
-                "omnigent.composer_context.v1.0": (
-                    '{"version":1,"working_directory":{"path":"/work/repo"},'
-                    '"worktree":{"mode":"none"}}'
-                ),
-            }, body
-            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
-        finally:
-            await browser.close()
-
-
-def test_start_session_opencode_native_picker_and_wrapper_labels(
-    seeded_session: tuple[str, str],
-) -> None:
-    """Native OpenCode: the picker shows "OpenCode" and create carries labels.
-
-    Covers the user-facing OpenCode native-agent flow this PR adds (mirrors
-    the Codex / Pi native rows):
-
-    1. **Picker label/icon** — the agent chip renders the harness-derived
-       display label **"OpenCode"** (via ``nativeCodingAgents``), NOT the raw
-       agent name ``"opencode-native-ui"`` the server sends.
-    2. **Session-creation wrapper labels** — selecting OpenCode and sending
-       must POST ``/v1/sessions`` with the terminal-first wrapper labels
-       (``omnigent.ui: terminal`` + ``omnigent.wrapper: opencode-native-ui``)
-       that make the runner launch the OpenCode TUI and the web UI render the
-       Chat/Terminal view.
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_opencode_native_start(base_url, session_id))
-
-
-async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _register_common_routes(
-                page,
-                created_session_id=session_id,
-                create_bodies=create_bodies,
-                agents_body=_opencode_native_agents_body(),
-            )
-
-            # Neutralize agent discovery so the picker shows ONLY the stubbed
-            # built-in OpenCode. The landing picker merges `/v1/agents` with
-            # agents found by scanning the caller's sessions
-            # (`/v1/sessions?visibility=mine`); on the shared e2e_ui server, sessions
-            # other tests left behind (e.g. a claude-native fork) would
-            # otherwise leak in and — ranking ahead of OpenCode — auto-select,
-            # so the chip would read the wrong label. Registered after
-            # _register_common_routes so it wins for the visibility=mine scan; the
-            # bare POST /v1/sessions create still falls through to the
-            # capturing handler.
-            async def handle_agent_scan(route: Route) -> None:
-                await route.fulfill(
-                    status=200,
-                    content_type="application/json",
-                    body=json.dumps({"data": []}),
-                )
-
-            await page.route(
-                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
-            )
-
-            # Seed a recent working directory so the working-directory chip
-            # auto-fills and Send can enable without touching the file browser.
-            await page.add_init_script(
-                f"""window.localStorage.setItem(
-                    "omnigent:recent-workspaces",
-                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
-                );"""
-            )
-
-            await page.goto(f"{base_url}/")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-
-            # OpenCode auto-selects (sole agent). The chip shows the derived
-            # label "OpenCode" — and crucially NOT "...native...": the raw
-            # agent name "opencode-native-ui" must never surface.
-            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
-            await expect(agent_chip).to_have_attribute("aria-label", re.compile("OpenCode"))
-            await expect(agent_chip).not_to_have_attribute("aria-label", re.compile("native"))
-
-            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
-            await page.get_by_test_id("new-chat-landing-submit").click()
-
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            assert body["agent_id"] == "ag_opencode_e2e", body
-            assert body["host_id"] == _HOST_ID, body
-            assert body["workspace"] == "/work/repo", body
-            # The terminal-first wrapper labels are the contract that drives the
-            # runner-owned OpenCode TUI and the web UI's Chat/Terminal view.
-            assert body.get("labels") == {
-                "omnigent.ui": "terminal",
-                "omnigent.wrapper": "opencode-native-ui",
-                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
-                "omnigent.composer_context.v1.0": (
-                    '{"version":1,"working_directory":{"path":"/work/repo"},'
-                    '"worktree":{"mode":"none"}}'
-                ),
-            }, body
-            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
-        finally:
-            await browser.close()
-
-
-def test_start_session_kimi_native_picker_and_wrapper_labels(
-    seeded_session: tuple[str, str],
-) -> None:
-    """Native Kimi: the picker shows "Kimi" and create carries terminal labels.
-
-    Covers the user-facing Kimi native-agent flow this PR adds (mirrors the
-    Codex / Pi / OpenCode native rows):
-
-    1. **Picker label/icon** — the agent chip renders the harness-derived
-       display label **"Kimi"** (via ``nativeCodingAgents``), NOT the raw agent
-       name ``"kimi-native-ui"`` the server sends.
-    2. **Session-creation wrapper labels** — selecting Kimi and sending must POST
-       ``/v1/sessions`` with the terminal-first wrapper labels
-       (``omnigent.ui: terminal`` + ``omnigent.wrapper: kimi-native-ui``) that
-       make the runner launch the Kimi TUI and the web UI render the
-       Chat/Terminal view.
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_kimi_native_start(base_url, session_id))
-
-
-async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _register_common_routes(
-                page,
-                created_session_id=session_id,
-                create_bodies=create_bodies,
-                agents_body=_kimi_native_agents_body(),
-            )
-
-            # Neutralize agent discovery so the picker shows ONLY the stubbed
-            # built-in Kimi. The landing picker merges `/v1/agents` with agents
-            # found by scanning the caller's sessions (`/v1/sessions?visibility=mine`);
-            # on the shared e2e_ui server, sessions other tests left behind would
-            # otherwise leak in and — ranking ahead of Kimi — auto-select.
-            # Registered after _register_common_routes so it wins the visibility=mine
-            # scan; the bare POST /v1/sessions create still falls through.
-            async def handle_agent_scan(route: Route) -> None:
-                await route.fulfill(
-                    status=200,
-                    content_type="application/json",
-                    body=json.dumps({"data": []}),
-                )
-
-            await page.route(
-                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
-            )
-
-            await page.add_init_script(
-                f"""window.localStorage.setItem(
-                    "omnigent:recent-workspaces",
-                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
-                );"""
-            )
-
-            await page.goto(f"{base_url}/")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-
-            # Kimi auto-selects (sole agent). The chip shows the derived label
-            # "Kimi" — and crucially NOT "...native...": the raw agent name
-            # "kimi-native-ui" must never surface in the picker.
-            agent_chip = page.get_by_test_id("new-chat-landing-agent-select")
-            await expect(agent_chip).to_have_attribute("aria-label", re.compile("Kimi"))
-            await expect(agent_chip).not_to_have_attribute("aria-label", re.compile("native"))
-
-            await page.get_by_test_id("new-chat-landing-input").fill("explore the repo")
-            await page.get_by_test_id("new-chat-landing-submit").click()
-
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            assert body["agent_id"] == "ag_kimi_native_e2e", body
-            assert body["host_id"] == _HOST_ID, body
-            assert body["workspace"] == "/work/repo", body
-            # The terminal-first wrapper labels are the contract that drives the
-            # runner-owned Kimi TUI and the web UI's Chat/Terminal view.
-            assert body.get("labels") == {
-                "omnigent.ui": "terminal",
-                "omnigent.wrapper": "kimi-native-ui",
-                "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
-                "omnigent.composer_context.v1.0": (
-                    '{"version":1,"working_directory":{"path":"/work/repo"},'
-                    '"worktree":{"mode":"none"}}'
-                ),
-            }, body
-            assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
-        finally:
-            await browser.close()
-
-
-def test_start_session_picker_hides_sdk_kimi(
-    seeded_session: tuple[str, str],
-) -> None:
-    """The new-session picker offers only the native Kimi, not the SDK kimi.
-
-    The headless SDK ``kimi`` harness is retained for sub-agents but hidden from
-    the landing picker (``NEW_SESSION_HIDDEN_AGENTS``) so there is exactly one
-    "Kimi" to start — the native TUI agent (``kimi-native-ui``), which opens in
-    the user's workspace. This drives that dedup against the rendered picker: with
-    both rows in the catalog, only ``kimi-native-ui`` is offered and the SDK
-    ``kimi`` row is dropped (the regression surfaced two "Kimi" entries, and
-    picking the SDK one launched headless in a /tmp spec dir).
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_kimi_picker_dedup(base_url, session_id))
-
-
-async def _drive_kimi_picker_dedup(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _register_common_routes(
-                page,
-                created_session_id=session_id,
-                create_bodies=create_bodies,
-                agents_body=_kimi_with_sdk_agents_body(),
-            )
-
-            # Only the built-in catalog feeds the picker for this test.
-            async def handle_agent_scan(route: Route) -> None:
-                await route.fulfill(
-                    status=200,
-                    content_type="application/json",
-                    body=json.dumps({"data": []}),
-                )
-
-            await page.route(
-                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
-            )
-
-            await page.add_init_script(
-                f"""window.localStorage.setItem(
-                    "omnigent:recent-workspaces",
-                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
-                );"""
-            )
-
-            await page.goto(f"{base_url}/")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-
-            # Open the agent picker dropdown.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-
-            # The selected native Kimi is promoted into the main list.
-            await expect(
-                page.get_by_test_id("new-chat-landing-agent-ag_kimi_native_e2e")
-            ).to_be_visible(timeout=30_000)
-            await expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
-            # ...and the SDK kimi row is dropped (hidden by NEW_SESSION_HIDDEN_AGENTS).
-            await expect(
-                page.get_by_test_id("new-chat-landing-agent-ag_kimi_sdk_e2e")
-            ).to_have_count(0)
-            # Two menu items total: the one native Kimi + the "Create custom
-            # agent" action — no second "Kimi" sneaks in via the SDK row.
-            await expect(page.locator("[data-harness-menu-row]")).to_have_count(1)
-        finally:
-            await browser.close()
-
-
 def test_start_session_select_folder(seeded_session: tuple[str, str]) -> None:
     """Browsing into a folder sets the new session's working directory.
 
@@ -3692,6 +3124,7 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
             # Per-agent enrich fetch for whichever agent survives the dedup.
             await page.route(re.compile(r"/v1/sessions/[^/]+/agent$"), handle_enrich)
 

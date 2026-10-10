@@ -19,7 +19,12 @@ from dataclasses import dataclass
 
 import pytest
 
-from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.entities.conversation import (
+    FunctionCallData,
+    FunctionCallOutputData,
+    MessageData,
+    NewConversationItem,
+)
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -423,6 +428,152 @@ def test_peek_returns_items_chronological(session_fixture: _Fixture) -> None:
     assert items[0]["content"] == "find the auth bug"
     assert items[1]["role"] == "assistant"
     assert items[1]["content"] == "looking at handlers.py"
+
+
+def test_peek_projects_tool_call_and_result_items(
+    session_fixture: _Fixture,
+) -> None:
+    """History exposes tool calls and results in their original order."""
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_tool_call",
+                data=FunctionCallData(
+                    agent="researcher",
+                    name="sys_os_shell",
+                    arguments='{"command":"pwd"}',
+                    call_id="call_pwd",
+                ),
+            ),
+            NewConversationItem(
+                type="function_call_output",
+                response_id="resp_tool_call",
+                data=FunctionCallOutputData(
+                    call_id="call_pwd",
+                    output="/workspace/project",
+                ),
+            ),
+        ],
+    )
+
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "tail_items": 2,
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+
+    assert payload["items"] == [
+        {
+            "role": "assistant",
+            "type": "tool_call",
+            "name": "sys_os_shell",
+            "args": '{"command":"pwd"}',
+        },
+        {
+            "role": "tool",
+            "type": "tool_result",
+            "name": None,
+            "content": "/workspace/project",
+        },
+    ]
+
+
+def test_peek_truncates_and_offsets_tool_call_fields(
+    session_fixture: _Fixture,
+) -> None:
+    """Tool-call arguments and results obey the same paging window as text."""
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_tool_window",
+                data=FunctionCallData(
+                    agent="researcher",
+                    name="search",
+                    arguments="abcdefghijklmno",
+                    call_id="call_search",
+                ),
+            ),
+            NewConversationItem(
+                type="function_call_output",
+                response_id="resp_tool_window",
+                data=FunctionCallOutputData(
+                    call_id="call_search",
+                    output="0123456789abcdef",
+                ),
+            ),
+        ],
+    )
+
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "tail_items": 2,
+                    "content_max_chars": 5,
+                    "content_offset_chars": 3,
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+
+    assert payload["items"][0]["args"] == "defgh [truncated]"
+    assert payload["items"][1]["content"] == "34567 [truncated]"
+
+
+def test_peek_joins_text_blocks_and_ignores_non_text_blocks(
+    session_fixture: _Fixture,
+) -> None:
+    """Message projection keeps textual blocks while ignoring images/metadata."""
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_mixed_content",
+                data=MessageData(
+                    role="assistant",
+                    agent="researcher",
+                    content=[
+                        {"type": "output_text", "text": "first"},
+                        {"type": "input_image", "detail": "low"},
+                        {"type": "input_text", "text": "second"},
+                    ],
+                ),
+            )
+        ],
+    )
+
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "tail_items": 1,
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+
+    assert payload["items"] == [
+        {
+            "role": "assistant",
+            "type": "text",
+            "content": "first\nsecond",
+        }
+    ]
 
 
 _HISTORY_CONTENT_SCENARIOS = [
@@ -1062,6 +1213,104 @@ def test_close_then_peek_by_id_still_resolves_tombstoned_row(
     assert payload["title"] == "auth"
 
 
+def test_history_and_close_preserve_colon_rich_titles(
+    session_fixture: _Fixture,
+) -> None:
+    """User titles may contain colons after the agent-name separator."""
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth:phase-1",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+
+    history = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps({"conversation_id": child.id}),
+            session_fixture.ctx,
+        )
+    )
+    closed = json.loads(
+        SysSessionCloseTool().invoke(
+            json.dumps({"conversation_id": child.id}),
+            session_fixture.ctx,
+        )
+    )
+    stored = session_fixture.conv_store.get_conversation(child.id)
+
+    assert history["agent"] == "researcher"
+    assert history["title"] == "auth:phase-1"
+    assert closed["agent"] == "researcher"
+    assert closed["title"] == "auth:phase-1"
+    assert stored is not None
+    assert stored.title == f"researcher:auth:phase-1{_CLOSED_TITLE_INFIX}{child.id}"
+
+
+def test_close_is_idempotent_for_a_tombstoned_child(
+    session_fixture: _Fixture,
+) -> None:
+    """Retrying close returns the same result and does not rewrite identity."""
+    tool = SysSessionCloseTool()
+    first = json.loads(
+        tool.invoke(
+            json.dumps({"conversation_id": session_fixture.child_conv_id}),
+            session_fixture.ctx,
+        )
+    )
+    stored_after_first = session_fixture.conv_store.get_conversation(session_fixture.child_conv_id)
+    second = json.loads(
+        tool.invoke(
+            json.dumps({"conversation_id": session_fixture.child_conv_id}),
+            session_fixture.ctx,
+        )
+    )
+    stored_after_second = session_fixture.conv_store.get_conversation(
+        session_fixture.child_conv_id
+    )
+
+    assert second == first
+    assert stored_after_first is not None
+    assert stored_after_second is not None
+    assert stored_after_second.title == stored_after_first.title
+    assert stored_after_second.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+
+def test_close_same_named_child_does_not_close_another_parent_tree(
+    session_fixture: _Fixture,
+) -> None:
+    """Closing one parent's child leaves an identically named child open elsewhere."""
+    other_parent = session_fixture.conv_store.create_conversation(kind="default")
+    other_child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=other_parent.id,
+    )
+
+    closed = json.loads(
+        SysSessionCloseTool().invoke(
+            json.dumps({"conversation_id": session_fixture.child_conv_id}),
+            session_fixture.ctx,
+        )
+    )
+    other_ctx = ToolContext(
+        task_id="task_other",
+        agent_id="agent_other",
+        conversation_id=other_parent.id,
+    )
+    other_listing = json.loads(SysSessionListTool().invoke("{}", other_ctx))
+    other_stored = session_fixture.conv_store.get_conversation(other_child.id)
+
+    assert closed["closed"] is True
+    assert other_listing["sub_agents"] == [
+        {
+            "agent": "researcher",
+            "title": "auth",
+            "conversation_id": other_child.id,
+        }
+    ]
+    assert other_stored is not None
+    assert other_stored.labels.get(CLOSED_LABEL_KEY) != CLOSED_LABEL_VALUE
+
+
 def test_close_succeeds_regardless_of_session_state(session_fixture: _Fixture) -> None:
     """
     Close tombstones the child conversation regardless of any live
@@ -1116,6 +1365,69 @@ def test_session_list_skips_label_closed_child_with_original_title(
     raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
     payload = json.loads(raw)
     assert payload["sub_agents"] == []
+
+
+def test_session_list_returns_open_children_and_filters_non_resumable_rows(
+    session_fixture: _Fixture,
+) -> None:
+    """Listing includes open named children but hides malformed/closed rows."""
+    session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="legacy-child",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title=f"researcher:old{_CLOSED_TITLE_INFIX}legacy",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    labelled_closed = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:labelled",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    session_fixture.conv_store.set_labels(
+        labelled_closed.id,
+        {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+    )
+
+    payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+
+    assert payload == {
+        "sub_agents": [
+            {
+                "agent": "researcher",
+                "title": "auth",
+                "conversation_id": session_fixture.child_conv_id,
+            }
+        ],
+        "sessions": [],
+    }
+
+
+def test_session_list_is_scoped_to_the_calling_parent(
+    session_fixture: _Fixture,
+) -> None:
+    """A same-named child under another parent never leaks into the list."""
+    other_parent = session_fixture.conv_store.create_conversation(kind="default")
+    other_child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=other_parent.id,
+    )
+
+    own_payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
+    other_ctx = ToolContext(
+        task_id="task_other",
+        agent_id="agent_other",
+        conversation_id=other_parent.id,
+    )
+    other_payload = json.loads(SysSessionListTool().invoke("{}", other_ctx))
+
+    assert [row["conversation_id"] for row in own_payload["sub_agents"]] == [
+        session_fixture.child_conv_id
+    ]
+    assert [row["conversation_id"] for row in other_payload["sub_agents"]] == [other_child.id]
 
 
 def test_session_list_schema_exposes_bounded_pagination() -> None:
@@ -1196,6 +1508,49 @@ def test_peek_invalid_json_returns_error(session_fixture: _Fixture) -> None:
     payload = json.loads(raw)
     assert "error" in payload
     assert "invalid arguments" in payload["error"]
+
+
+@pytest.mark.parametrize("raw_arguments", ["null", "[]", '"conversation"'])
+def test_peek_non_object_arguments_return_structured_errors(
+    session_fixture: _Fixture,
+    raw_arguments: str,
+) -> None:
+    """JSON values other than objects must not escape the tool boundary."""
+    raw = SysSessionGetHistoryTool().invoke(raw_arguments, session_fixture.ctx)
+    payload = json.loads(raw)
+
+    assert "error" in payload
+    assert "arguments must be a JSON object" in payload["error"]
+
+
+@pytest.mark.parametrize("conversation_id", [None, 0, True, ["conv"]])
+def test_peek_non_string_conversation_ids_return_structured_errors(
+    session_fixture: _Fixture,
+    conversation_id: object,
+) -> None:
+    """Provider-side schema bypasses still get an actionable ID error."""
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps({"conversation_id": conversation_id}),
+        session_fixture.ctx,
+    )
+    payload = json.loads(raw)
+
+    assert payload["error"] == (
+        "sys_session_get_history requires a non-empty 'conversation_id' string"
+    )
+
+
+def test_session_list_requires_a_live_caller_conversation(
+    session_fixture: _Fixture,
+) -> None:
+    """A list call outside a workflow fails loudly instead of broadening scope."""
+    ctx_without_session = ToolContext(
+        task_id=session_fixture.ctx.task_id,
+        agent_id=session_fixture.ctx.agent_id,
+    )
+
+    with pytest.raises(RuntimeError, match="spawn tools require a conversation_id"):
+        SysSessionListTool().invoke("{}", ctx_without_session)
 
 
 def test_close_missing_required_field_returns_error(session_fixture: _Fixture) -> None:

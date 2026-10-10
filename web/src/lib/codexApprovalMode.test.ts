@@ -8,15 +8,13 @@ import {
 } from "@/lib/codexApprovalMode";
 
 describe("codexApprovalMode", () => {
-  it("offers the runtime /permissions superset, in Codex's popup order", () => {
-    // Newer builds add "Read Only" after "Full Access"; 0.146 lacks it. Only
-    // the full-bypass sandbox stance stays launch-only (the server 400s it on
-    // a runtime switch), so it's absent here.
+  it("offers only the stances a running session can switch into, in popup order", () => {
+    // Read Only and the full-bypass sandbox stance are launch-only, so the
+    // runtime picker doesn't offer them.
     expect(CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.map((m) => m.value)).toEqual([
       "ask-for-approval",
       "approve-for-me",
       "full-access",
-      "read-only",
     ]);
   });
 
@@ -25,6 +23,9 @@ describe("codexApprovalMode", () => {
       expect(codexApprovalModeLabel("ask-for-approval")).toBe("Ask for approval");
       expect(codexApprovalModeLabel("approve-for-me")).toBe("Approve for me");
       expect(codexApprovalModeLabel("full-access")).toBe("Full Access");
+    });
+
+    it("still labels a read-only session the picker can't switch into", () => {
       expect(codexApprovalModeLabel("read-only")).toBe("Read Only");
     });
 

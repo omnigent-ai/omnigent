@@ -96,12 +96,20 @@ def seeded_markdown(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]
         _cleanup_session_workdir(session_id)
 
 
-@pytest.fixture
-def seeded_python(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
+@pytest.fixture(params=[3, 3_000, 50_000], ids=["short", "past-agent-line-cap", "50k-lines"])
+def seeded_python(
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[str, str, str]]:
     base_url, session_id = seeded_session
-    _seed_file(base_url, session_id, _PY_PATH, _PY_CONTENT)
+    first_padding_line = len(_PY_CONTENT.splitlines()) + 1
+    content = _PY_CONTENT + "".join(
+        f"line_{i} = {i}  # café\n" for i in range(first_padding_line, request.param)
+    )
+    content += "# file_end_marker\n"
+    _seed_file(base_url, session_id, _PY_PATH, content)
     try:
-        yield (base_url, session_id)
+        yield (base_url, session_id, content)
     finally:
         _cleanup_session_workdir(session_id)
 
@@ -136,9 +144,9 @@ def test_markdown_edit_autosaves(page: Page, seeded_markdown: tuple[str, str]) -
     assert sentinel in persisted
 
 
-def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str]) -> None:
-    """Typing in the Monaco code editor auto-saves back to the server."""
-    base_url, session_id = seeded_python
+def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str, str]) -> None:
+    """The full file can be viewed and edited without losing its tail on save."""
+    base_url, session_id, original_content = seeded_python
     page.goto(f"{base_url}/c/{session_id}?file={_PY_PATH}")
 
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
@@ -149,10 +157,16 @@ def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str])
     expect(monaco).to_be_visible(timeout=20_000)
     expect(file_viewer.locator(".view-lines")).to_contain_text("greet", timeout=10_000)
 
+    file_viewer.locator(".view-lines").click()
+    page.keyboard.press("Control+End")
+    expect(file_viewer.locator(".view-lines")).to_contain_text("file_end_marker")
+    expect(
+        file_viewer.get_by_text("This file is too large to load fully", exact=False)
+    ).to_have_count(0)
+
     # Place the cursor at the start of the buffer and type a comment line. A
     # leading edit is unambiguous and easy to assert in the persisted file.
     sentinel = "autosaved_py_sentinel_9c2b"
-    file_viewer.locator(".view-lines").click()
     page.keyboard.press("Control+Home")
     page.keyboard.type(f"# {sentinel}\n")
 
@@ -161,4 +175,7 @@ def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str])
     expect(file_viewer.get_by_text("Saved", exact=True)).to_be_visible(timeout=15_000)
 
     persisted = _wait_for_persisted(base_url, session_id, _PY_PATH, sentinel)
-    assert sentinel in persisted
+    assert persisted == f"# {sentinel}\n{original_content}"
+
+    page.keyboard.press("Control+End")
+    expect(file_viewer.locator(".view-lines")).to_contain_text("file_end_marker")

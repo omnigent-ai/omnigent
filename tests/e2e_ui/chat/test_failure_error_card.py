@@ -47,7 +47,13 @@ def _publish_native_status(
 
 
 def _seed_error_item(
-    session_id: str, *, code: str, message: str, level: str | None = None
+    session_id: str,
+    *,
+    code: str,
+    message: str,
+    level: str | None = None,
+    title: str | None = None,
+    remediation: str | None = None,
 ) -> None:
     """Append a committed ``error`` transcript item to the session's store.
 
@@ -59,6 +65,8 @@ def _seed_error_item(
     :param code: Error classifier, e.g. ``"required_terminal_exited"``.
     :param message: Raw error message stored alongside the code.
     :param level: ``"info"`` seeds a neutral notice instead of a failure.
+    :param title: Optional card headline, e.g. ``"Signed in to Databricks"``.
+    :param remediation: Optional next step shown in the expanded body.
     :raises RuntimeError: If the server under test isn't one we spawned.
     """
     from omnigent.entities import ErrorData, NewConversationItem
@@ -78,7 +86,14 @@ def _seed_error_item(
             NewConversationItem(
                 type="error",
                 response_id="resp_seeded_error",
-                data=ErrorData(source="execution", code=code, message=message, level=level),  # type: ignore[arg-type]
+                data=ErrorData(  # type: ignore[arg-type]
+                    source="execution",
+                    code=code,
+                    message=message,
+                    level=level,
+                    title=title,
+                    remediation=remediation,
+                ),
             ),
         ],
     )
@@ -346,9 +361,7 @@ def test_databricks_rate_limit_is_retryable_live_and_after_reload(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": (
-                            "Please continue from where you left off before the rate limit error."
-                        ),
+                        "text": "Please continue from where you left off.",
                     }
                 ],
             },
@@ -600,4 +613,106 @@ def test_info_level_error_item_renders_as_notice_pill(
     pill = page.locator('[data-testid="error-pill"][data-level="info"]')
     expect(pill).to_be_visible(timeout=15_000)
     expect(pill).to_contain_text("Codex hit an error reloading", timeout=15_000)
+    expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)
+
+
+def test_sign_in_card_opens_the_live_link_and_reports_when_none_is_pending(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    The Databricks sign-in card fetches the link from the host at click time.
+
+    A launcher parked on a sign-in prompt fails the turn with
+    ``databricks_sign_in_pending``. The card never stores the one-time address:
+    its button asks the host what the terminal shows now. With a prompt on
+    screen it opens that address in a new tab; once nothing is pending (here,
+    the real server-to-runner round trip for a session with no terminal) it
+    closes the tab it pre-opened and says so.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="databricks_sign_in_pending",
+        message="Codex is waiting for a sign-in in this session's terminal.",
+        title="Codex can't start until you sign in to Databricks",
+        remediation=(
+            "Open the sign-in link and sign in. Codex continues on its own once the "
+            "sign-in completes; then send your message again."
+        ),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    pill = page.locator('[data-testid="error-pill"][data-level="error"]')
+    expect(pill).to_be_visible(timeout=15_000)
+    expect(pill.get_by_test_id("error-headline")).to_have_text(
+        "Codex can't start until you sign in to Databricks"
+    )
+    open_link = pill.get_by_role("button", name="Open sign-in link")
+    expect(open_link).to_be_visible()
+
+    # While the terminal shows a prompt, the click opens the live address.
+    live_link = f"{base_url}/v1/info"
+    pattern = f"**/v1/sessions/{session_id}/sign-in-link"
+    page.route(
+        pattern,
+        lambda route: route.fulfill(
+            json={"pending": True, "url": live_link, "code": None, "terminal_id": "t1"}
+        ),
+    )
+    with page.context.expect_page() as popup_info:
+        open_link.click()
+    popup = popup_info.value
+    popup.wait_for_url(live_link, timeout=15_000)
+    popup.close()
+    page.unroute(pattern)
+
+    # Nothing pending any more: the real host answer closes the tab and explains.
+    with page.context.expect_page() as popup_info:
+        open_link.click()
+    expect(pill.get_by_test_id("error-sign-in-note")).to_have_text(
+        "No sign-in is pending in the terminal any more. Try sending your message again.",
+        timeout=15_000,
+    )
+    closed_tab = popup_info.value
+    if not closed_tab.is_closed():
+        closed_tab.wait_for_event("close", timeout=15_000)
+    assert closed_tab.is_closed()
+
+
+def test_sign_in_completed_notice_shows_its_line_without_a_click(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    The "Signed in to Databricks" notice shows what to do next without expanding.
+
+    The runner posts this ``level: "info"`` item once the launcher moved past
+    its sign-in prompt and the agent is ready. Notice pills render collapsed,
+    so this one carries its single line of body on its face; the headline
+    alone would not tell the person to resend.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="databricks_sign_in_completed",
+        message="Codex is ready. Send your message again.",
+        level="info",
+        title="Signed in to Databricks",
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    pill = page.locator('[data-testid="error-pill"][data-level="info"]')
+    expect(pill).to_be_visible(timeout=15_000)
+    expect(pill.get_by_test_id("error-headline")).to_have_text("Signed in to Databricks")
+    expect(pill.get_by_test_id("error-notice-body")).to_have_text(
+        "Codex is ready. Send your message again."
+    )
+    expect(pill.get_by_role("button", name="Open sign-in link")).to_have_count(0)
     expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)

@@ -15,10 +15,10 @@ unreachable server still fails out promptly. If any delivery budget drops
 below ``DEFAULT_ASK_TIMEOUT`` again, these fail loudly.
 """
 
-import omnigent.runner.app as runner_app
 import omnigent.runner.pending_approvals as pending_approvals
 import omnigent.runner.tool_dispatch as tool_dispatch
 import omnigent.runtime.harnesses._scaffold as scaffold
+from omnigent.runner import policy_proxy
 from omnigent.spec.types import DEFAULT_ASK_TIMEOUT
 
 # The deciding policy's default ASK budget — one day. Every delivery client
@@ -44,9 +44,9 @@ def test_ask_gate_delivery_timeouts_hold_the_ask_budget() -> None:
 
     # policy-eval + sub-agent wake-notice delivery POSTs (were 30s; the wake
     # POST retried on each timeout -> duplicate cards).
-    assert runner_app._ASK_GATE_DELIVERY_READ_TIMEOUT_S == ONE_DAY
-    assert runner_app._ASK_GATE_DELIVERY_TIMEOUT.read == ONE_DAY
-    assert runner_app._ASK_GATE_DELIVERY_TIMEOUT.connect == 30.0
+    assert policy_proxy._ASK_GATE_DELIVERY_READ_TIMEOUT_S == ONE_DAY
+    assert policy_proxy._ASK_GATE_DELIVERY_TIMEOUT.read == ONE_DAY
+    assert policy_proxy._ASK_GATE_DELIVERY_TIMEOUT.connect == 30.0
 
     # message-send POSTs to a child/target session (were 30s).
     assert tool_dispatch._ASK_GATE_DELIVERY_READ_TIMEOUT_S == ONE_DAY
@@ -66,7 +66,7 @@ def test_no_delivery_budget_undercuts_the_ask_timeout() -> None:
     """
     for budget in (
         pending_approvals._DEFAULT_WAIT_SECONDS,
-        runner_app._ASK_GATE_DELIVERY_TIMEOUT.read,
+        policy_proxy._ASK_GATE_DELIVERY_TIMEOUT.read,
         tool_dispatch._ASK_GATE_DELIVERY_TIMEOUT.read,
         scaffold._POLICY_EVAL_TIMEOUT_S,
     ):
