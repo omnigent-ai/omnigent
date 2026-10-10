@@ -1943,6 +1943,13 @@ async def _teardown_failed_child(
             await _record_subagent_receipt(server_client, child_session_id, entry.work_id)
         return None
 
+    # The server DELETE below can't reach the runner over a downed reverse
+    # tunnel, so reap the child's runner-local forwarder and native server here;
+    # otherwise a failed spawn leaks a task POSTing to the torn-down child.
+    from omnigent.runner.native import orchestration as _orch
+
+    await _orch.reap_native_session(child_session_id)
+
     last_error = ""
     for attempt in range(2):
         try:

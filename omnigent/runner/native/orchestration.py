@@ -289,6 +289,21 @@ async def teardown_all_opencode_native_servers() -> None:
             await teardown_opencode_native_server(session_id)
 
 
+async def reap_native_session(session_id: str) -> None:
+    """Cancel a session's transcript forwarder and close any native server it owns.
+
+    Reaps both the OpenCode server and the Codex app-server so a reaped native
+    session can never orphan either subprocess; each teardown is a no-op when the
+    session has no server of that kind.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+    await _cancel_auto_forwarder_task(session_id)
+    await teardown_opencode_native_server(session_id)
+    await teardown_codex_native_app_server(session_id)
+
+
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.

@@ -1131,6 +1131,26 @@ def unregister_child_session(child_session_id: str) -> None:
     _child_session_parents.pop(child_session_id, None)
 
 
+def list_child_session_ids(parent_session_id: str) -> list[str]:
+    """
+    List every child session a parent owns, across both ownership maps.
+
+    The persistent child→parent map outlives a child's dispatch work, so a
+    completed child whose result was already drained stays discoverable for
+    parent-delete cleanup; active work ids are unioned in for safety.
+
+    :param parent_session_id: Parent session id, e.g. ``"conv_parent123"``.
+    :returns: Child session ids owned by the parent, sorted for determinism.
+    """
+    children = {
+        child_id
+        for child_id, meta in _child_session_parents.items()
+        if meta.parent_id == parent_session_id
+    }
+    children.update(_subagent_work_by_parent.get(parent_session_id, set()))
+    return sorted(children)
+
+
 def _session_status_to_task_status(status: object) -> str | None:
     """
     Map a ``session.status`` value to a child summary ``current_task_status``.
