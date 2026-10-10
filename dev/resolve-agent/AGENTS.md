@@ -127,8 +127,10 @@ handoff narrative or file hash alone is not proof that a command ran.
 
 `fixed` or approval requires the mode's behavior proof and no uncovered required
 regression check. Preserve incomplete work as `partially_fixed` with
-`remaining_work`, or `needs_more_info` when resolution cannot be established.
-Missing footage alone follows the recording exception in the phase procedure.
+`remaining_work`, or `needs_more_info` when resolution cannot be established,
+adding `failure_class: "infrastructure"` when a broken runner or tooling, not
+the bug, stopped the work. Missing footage alone follows the recording exception
+in the phase procedure.
 For open PRs, run the Step 4.3 live Polly/OCR gate before `fixed` or approval.
 Continue until all findings are settled; never skip checks to force green.
 Load `resolve-handoff` and finish with exactly one complete JSON handoff as the final block, including `test_audit`,

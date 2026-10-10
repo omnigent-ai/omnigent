@@ -193,7 +193,9 @@ to the publisher. No new test-selection gate is introduced.
      (the maintainer) to review once CI is green and the review is clean.
 8. Emits a single fenced ```json handoff block: `mode`
    (`reviewed_existing_pr` / `authored_fix`), `outcome` (`fixed` /
-   `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`), the
+   `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`),
+   `failure_class` (`infrastructure` when a broken runner or tooling stopped the
+   run; it requests a retry from workflows that support the signal), the
    plain-English `problem_summary` and `solution_summary` used for the Linear
    update, the per-facet fail→pass proof, the compact PR-facing `review_body` in
    review mode, the PR URL (opened or reviewed, or empty until the workflow-owned

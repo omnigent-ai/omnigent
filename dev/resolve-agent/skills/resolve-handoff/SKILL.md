@@ -31,6 +31,7 @@ the message. Same discipline as repro-agent:
   "bug_url": "https://github.com/omnigent-ai/omnigent/issues/1234",
   "mode": "authored_fix",
   "outcome": "fixed",
+  "failure_class": "",
   "problem_summary": "People see internal catalog IDs in the model picker instead of readable model names.",
   "solution_summary": "The model picker now shows a friendly name for every model.",
   "root_cause": "picker rendered raw catalog IDs because format_label() was never called on the option list",
@@ -125,10 +126,30 @@ readiness; name pending publication/review steps in `remaining_work`.
   `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
   fixed it — name the fixing commit and recommend closing the ticket), or
   `needs_more_info` (couldn't recover a reliable reproduction, evidence is unsafe,
-  required inputs/authorization are missing, or setup/environment blocks verification).
+  required inputs/authorization are missing, or setup/environment blocks verification;
+  when broken runner or tooling infrastructure is the blocker, also set
+  `failure_class`).
   When intended behavior is ambiguous, follow `resolve-investigate`: a supported
   proposal with an unresolved design choice is `partially_fixed`, with the choice
   in `remaining_work`. Do not describe it as a proven fix.
+- `failure_class` — `""` unless broken infrastructure, not the bug or its
+  evidence, stopped the run. Use exactly `"infrastructure"` when the runner,
+  sandbox, OS-environment tools, or workflow-provided environment or credentials
+  failed so that you could not inspect the checkout or run checks — for
+  example every `sys_os_shell` / `sys_os_read` / `sys_os_write` call returns
+  `os_env helper failed`, or the workflow's tracker/GitHub credential is missing,
+  expired, or rejected (401/403) on access it normally has. Keep `outcome` as
+  `needs_more_info` so existing consumers still parse the handoff; the class
+  requests an infrastructure retry. A workflow that supports the signal should
+  retry the attempt on a healthy runner and keep earlier checkpoints instead of
+  posting a verdict to the ticket; one that does not still receives the unchanged
+  outcome with the signal beside it. Name the failing calls
+  and exact error text in `test_audit`, and list the unfinished steps in
+  `remaining_work` so a retry can resume. Never set it for missing report
+  information, unsafe evidence, conflicting bug identities, an unresolved
+  design choice, or access denied by policy: permission the credential was
+  never granted, such as a `denied by policy` 403, needs human authorization
+  and no retry can supply it.
 - `problem_summary` / `solution_summary` — the two user-facing paragraphs shown
   prominently in the Linear update under **What's the problem?** and **How is it
   fixed?** Write plain, natural English for someone who uses the product but has

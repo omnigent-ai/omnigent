@@ -5,18 +5,29 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import os
 import shutil
+import sys
+import time
 import tracemalloc
 from pathlib import Path
 
 import pytest
 
+try:
+    import resource
+except ImportError:  # Windows has no resource module
+    resource = None
+
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
+    _HelperProcessClient,
     _project_root,
     _read_impl,
+    _read_stderr_bounded,
+    _run_helper,
     _shell_impl,
     build_helper_env,
     create_os_environment,
@@ -515,3 +526,113 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+@pytest.mark.parametrize(
+    ("shim_exit", "exit_detail"),
+    [
+        ("exit 0", "exited with code 0"),
+        ("echo 'helper: boom' >&2\nexit 3", "exited with code 3: helper: boom"),
+        ("exec >&- 2>&-\nexec sleep 30", "stopped replying but is still running"),
+        ("exec >&-\nexec sleep 30", "stopped replying but is still running"),
+    ],
+    ids=["silent-exit-0", "stderr-exit-3", "alive-after-closing-pipes", "alive-with-stderr-open"],
+)
+def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    shim_exit: str,
+    exit_detail: str,
+) -> None:
+    """A helper that stops replying leaves a runner-log trail and is cleaned up.
+
+    The client restarts the helper and retries once, and only the retry's
+    error reaches the agent; both attempts must be logged with the exit
+    detail so a broken runner can be diagnosed from the runner log. A helper
+    that stops replying but stays alive, with or without its stderr still
+    open, must not stall the request.
+    """
+    shim = tmp_path / "python-shim"
+    shim.write_text(f"#!/bin/sh\nread -r _request\n{shim_exit}\n", encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shim))
+    client = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_inactive_policy())
+
+    # Capture from the module logger directly so an earlier test that turned
+    # off propagation on the ``omnigent`` logger cannot hide the records.
+    helper_logger = logging.getLogger("omnigent.inner.os_env")
+    monkeypatch.setattr(helper_logger, "propagate", False)
+    helper_logger.addHandler(caplog.handler)
+    started = time.monotonic()
+    try:
+        with caplog.at_level(logging.WARNING, logger=helper_logger.name):
+            result = client.request({"op": "shell", "command": "true", "timeout": 5})
+    finally:
+        client.close()
+        helper_logger.removeHandler(caplog.handler)
+    assert time.monotonic() - started < 10
+
+    assert result == {"error": f"os_env helper failed: OS environment helper {exit_detail}"}
+    records = [record for record in caplog.records if record.name == helper_logger.name]
+    assert len(records) == 2
+    for record in records:
+        pid, backend, active, op, exc, _retry = record.args
+        assert (backend, active, op) == ("none", False, "shell")
+        assert str(exc) == f"OS environment helper {exit_detail}"
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    assert records[0].args[5] and not records[1].args[5]
+
+
+_HIGH_FD = 1100  # above select()'s FD_SETSIZE on Linux
+
+
+@pytest.mark.skipif(
+    resource is None or resource.getrlimit(resource.RLIMIT_NOFILE)[1] <= _HIGH_FD,
+    reason="needs a POSIX descriptor above FD_SETSIZE",
+)
+def test_read_stderr_bounded_reads_descriptors_above_fd_setsize() -> None:
+    """Helper stderr is still collected when the runner has many descriptors open."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, _HIGH_FD + 64), hard))
+    read_fd, write_fd = os.pipe()
+    fd = _HIGH_FD
+    try:
+        while True:
+            try:
+                os.fstat(fd)
+            except OSError:
+                break
+            fd += 1
+        os.dup2(read_fd, fd)
+        os.close(read_fd)
+        os.write(write_fd, b"helper: boom\n")
+        os.close(write_fd)
+        with os.fdopen(fd, "r") as stream:
+            assert _read_stderr_bounded(stream, timeout=0.5, exited=True) == "helper: boom"
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_helper_reports_stdin_closed_before_any_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The helper names an empty stdin on stderr, so a reply-less exit 0 is diagnosable."""
+    config = {
+        "cwd": str(tmp_path),
+        "shell_path": "/bin/sh",
+        "sandbox": _inactive_policy().to_jsonable(),
+    }
+    monkeypatch.chdir(tmp_path)
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert _run_helper(config) == 0
+    assert "stdin closed before any request was received" in capsys.readouterr().err
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"op": "unknown"}\n'))
+    assert _run_helper(config) == 0
+    captured = capsys.readouterr()
+    assert "error" in captured.out
+    assert captured.err == ""

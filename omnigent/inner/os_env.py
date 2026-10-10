@@ -7,17 +7,20 @@ import base64
 import codecs
 import contextlib
 import json
+import logging
 import os
+import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
+from typing import IO, TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
@@ -59,6 +62,8 @@ if TYPE_CHECKING:
 from .sandbox import (
     run_launcher as _run_launcher,
 )
+
+logger = logging.getLogger(__name__)
 
 # Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
 # corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines
@@ -367,6 +372,27 @@ class OSEnvironment(ABC):
         """
 
 
+def _read_stderr_bounded(stream: IO[str], *, timeout: float, exited: bool) -> str:
+    """Collect the helper's stderr without blocking on a write end that is still open."""
+    if IS_WINDOWS:
+        # Selectors cannot watch pipes on Windows; read only once the helper has exited.
+        return stream.read().strip() if exited else ""
+    fd = stream.fileno()
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
+    # DefaultSelector (epoll/kqueue) has no FD_SETSIZE ceiling, unlike select().
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not selector.select(remaining):
+                break
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            chunks.append(data)
+    return b"".join(chunks).decode("utf-8", "replace").strip()
+
+
 class _HelperProcessClient:
     """JSON-line RPC client for the sandboxed OS helper process."""
 
@@ -439,14 +465,15 @@ class _HelperProcessClient:
             return {"error": "OS environment helper is closed"}
 
         self._ensure_started_locked()
-        assert self._proc is not None
-        assert self._proc.stdin is not None
-        assert self._proc.stdout is not None
+        proc = self._proc
+        assert proc is not None
+        assert proc.stdin is not None
+        assert proc.stdout is not None
 
         try:
-            self._proc.stdin.write(json.dumps(payload) + "\n")
-            self._proc.stdin.flush()
-            line = self._proc.stdout.readline()
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._helper_exit_detail_locked())
             result = json.loads(line)
@@ -454,8 +481,20 @@ class _HelperProcessClient:
                 return result
             return {"error": f"Helper returned non-object response: {result!r}"}
         except Exception as exc:  # noqa: BLE001 — helper IO failures are retried or surfaced via error dict
+            retrying = allow_retry and not self._closed
+            # Only the retry's error reaches the agent; the runner log keeps
+            # the first attempt's exit detail.
+            logger.warning(
+                "os_env helper pid %s (backend %s, active %s) failed on op %r: %s%s",
+                proc.pid,
+                self.sandbox.backend_type,
+                self.sandbox.active,
+                payload.get("op"),
+                exc,
+                "; restarting it and retrying once" if retrying else "",
+            )
             self._stop_locked()
-            if allow_retry and not self._closed:
+            if retrying:
                 self._ensure_started_locked()
                 return self._request_locked(payload, allow_retry=False)
             return {"error": f"os_env helper failed: {exc}"}
@@ -657,16 +696,23 @@ class _HelperProcessClient:
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
             return "OS environment helper exited unexpectedly"
+        try:
+            returncode: int | None = self._proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            returncode = None
         stderr = ""
         if self._proc.stderr is not None:
             try:
-                stderr = self._proc.stderr.read().strip()
+                stderr = _read_stderr_bounded(
+                    self._proc.stderr, timeout=0.1, exited=returncode is not None
+                )
             except Exception:  # noqa: BLE001 — stderr read is best-effort for error detail
                 stderr = ""
-        returncode = self._proc.poll()
-        if stderr:
-            return f"OS environment helper exited with code {returncode}: {stderr}"
-        return f"OS environment helper exited with code {returncode}"
+        if returncode is None:
+            detail = "OS environment helper stopped replying but is still running"
+        else:
+            detail = f"OS environment helper exited with code {returncode}"
+        return f"{detail}: {stderr}" if stderr else detail
 
     def _stop_locked(self) -> None:
         proc = self._proc
@@ -1768,6 +1814,7 @@ def _run_helper(config: JsonValue) -> int:
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
 
+    handled = 0
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1784,8 +1831,15 @@ def _run_helper(config: JsonValue) -> int:
             )
         except Exception as exc:  # noqa: BLE001 — helper loop surfaces any error through the JSON response envelope
             response = {"error": f"os_env helper exception: {exc}"}
+        handled += 1
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
+    if not handled:
+        # A reply-less exit 0 is otherwise indistinguishable from a launcher
+        # that never ran the helper.
+        with contextlib.suppress(OSError, ValueError):
+            sys.stderr.write("os_env helper: stdin closed before any request was received\n")
+            sys.stderr.flush()
     return 0
 
 

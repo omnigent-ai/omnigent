@@ -246,6 +246,40 @@ def test_output_outcomes_include_repro_audit_blockers() -> None:
     assert "choice in `remaining_work`" in outcomes
 
 
+def test_infrastructure_blockers_request_a_retry_instead_of_a_verdict() -> None:
+    """A broken runner must be flagged for retry, not delivered as `needs_more_info`."""
+    output = _resolve_procedures().split("## Output —", 1)[1]
+    handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
+    assert handoff["failure_class"] == ""
+
+    fields = " ".join(output.split("Field meanings:", 1)[1].split())
+    failure_class = fields.split("- `failure_class`", 1)[1].split("- `problem_summary`", 1)[0]
+    for requirement in (
+        '`"infrastructure"`',
+        "`os_env helper failed`",
+        "Keep `outcome` as `needs_more_info`",
+        "retry the attempt on a healthy runner",
+        "instead of posting a verdict",
+        "Never set it for missing report information",
+        "credential is missing, expired, or rejected (401/403) on access it normally has",
+        "`denied by policy` 403, needs human authorization",
+    ):
+        assert requirement in failure_class
+
+    instructions = _normalized_resolve_instructions()
+    completion = instructions.split("## Evidence and completion", 1)[1].split(
+        "## Writing and environment", 1
+    )[0]
+    assert '`failure_class: "infrastructure"`' in completion
+    preflight = instructions.split("## Preflight (first turn)", 1)[1].split(
+        "# Establish the cause and intended behavior", 1
+    )[0]
+    assert "the runner is broken, not the report" in preflight
+    assert '`failure_class: "infrastructure"`' in preflight
+    assert '`failure_class: "infrastructure"`' in _shared_impact_assessment()
+    assert '`failure_class: "infrastructure"`' in _shared_repro_audit()
+
+
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:
     instructions = _normalized_resolve_instructions()
     assert "Skip reproduction handoff recovery, fail-before proof" in instructions

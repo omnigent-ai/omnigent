@@ -62,7 +62,8 @@ before Step 1.
      dependency/setup failure, or a broken fixture. A skipped or xfailed test
      is not fail→pass proof.
    - Infrastructure failure means verification is blocked, not that the PR is
-     wrong. Repair setup or report `needs_more_info` with the blocker.
+     wrong. Repair setup or report `needs_more_info` with the blocker, setting
+     `failure_class: "infrastructure"` when the runner or tooling itself is broken.
 
 4. **Repair or reject unreliable evidence.**
 
