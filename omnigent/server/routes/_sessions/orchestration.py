@@ -1692,9 +1692,17 @@ def _accumulate_session_usage(
             model_delta["total_cost_usd"] = cost_delta
         delta["by_model"] = {llm_model: model_delta}
 
-    new_current = conversation_store.increment_session_usage(session_id, delta)
-    # Per-user daily rollup (policy-gated; this is the per-turn delta).
+    try:
+        new_current = conversation_store.increment_session_usage(session_id, delta)
+    except ConversationNotFoundError:
+        # Session row deleted mid-stream: no per-session total left to publish.
+        new_current = None
+    # Daily rollup attributes to the surviving owner (a sub-agent falls back to
+    # its root), so record it even when the session row vanished and the
+    # per-session increment above was dropped.
     _record_daily_cost(conv, cost_delta, conversation_store)
+    if new_current is None:
+        return None
     return _priced_cost_for_display(new_current)
 
 

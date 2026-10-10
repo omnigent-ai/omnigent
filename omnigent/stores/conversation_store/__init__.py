@@ -4,7 +4,7 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -325,10 +325,11 @@ def runner_seen_is_fresh(last_seen: int | None, now: int | None = None) -> bool:
 
 class ConversationNotFoundError(Exception):
     """
-    Raised when a required conversation row is missing.
+    Raised when a store method needed a conversation row that isn't there.
 
-    Store methods use this when absence is not a benign
-    no-op and the route layer must return a typed 404.
+    The meaning is fixed — the write did not happen because the row was
+    gone. Whether that is a typed 404 or a silently dropped best-effort
+    write is a decision each call site makes for itself.
     """
 
 
@@ -1097,6 +1098,47 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def seed_labels_if_absent(
+        self,
+        conversation_id: str,
+        defaults: dict[str, str],
+        updated_at: int | None = None,
+    ) -> dict[str, str]:
+        """
+        Insert declared initial labels for keys with none, then read back.
+
+        Insert-if-absent, NOT upsert: seeding must never overwrite a value
+        another writer already persisted. Deciding "is this key missing?"
+        from a snapshot taken before the write would reset a concurrent
+        policy update to its initial value, so the check belongs in the
+        same statement as the insert.
+
+        :param conversation_id: The conversation to seed,
+            e.g. ``"conv_abc123"``.
+        :param defaults: ``key -> initial value`` for declared labels.
+            Empty performs no write and returns the current label snapshot
+            without an existence check — normally ``{}`` for a conversation
+            that does not exist, though any pre-existing orphan rows are
+            returned unchanged.
+        :param updated_at: Timestamp for inserted rows; ``None`` uses the
+            current wall-clock.
+        :returns: The conversation's full label snapshot after seeding. When
+            *defaults* is empty this is the current stored labels, without an
+            existence check (see above).
+        :raises ConversationNotFoundError: When *defaults* is non-empty and
+            the conversation does not exist. Implementations must check
+            existence in the same transaction as the insert whenever they
+            are about to insert: labels are not foreign-keyed, so a check
+            skipped entirely leaves orphan rows for a conversation that is
+            gone, and reports a write nothing can read back. This narrows
+            the exposure to a race window (an unlocked check followed by a
+            concurrent delete) rather than eliminating it outright — still
+            strictly better than ``set_labels``, which performs no check at
+            all.
+        """
+        ...
+
+    @abstractmethod
     def set_labels(
         self,
         conversation_id: str,
@@ -1116,9 +1158,13 @@ class ConversationStore(ABC):
         validation lives in ``PolicyEngine.apply_label_writes``).
 
         Callers that need "insert only if missing" semantics
-        (initial-value seeding — POLICIES.md §10) should check
-        ``conversation.labels`` first and filter the updates
-        to keys not already present; this method always
+        (initial-value seeding — POLICIES.md §10) must use
+        :meth:`seed_labels_if_absent`, NOT this method. Reading
+        ``conversation.labels`` and filtering the updates to the keys
+        that look missing is a check-then-write race: a value persisted
+        between the read and the write is overwritten by the initial
+        value. The insert-if-absent path leaves that decision to the
+        database, inside the same statement. This method always
         overwrites.
 
         :param conversation_id: The conversation to update,
@@ -1200,16 +1246,52 @@ class ConversationStore(ABC):
         """
         Persist the full session-state snapshot for a conversation.
 
-        Replaces policy-visible state while preserving the internal Plan key
-        in the existing conversation metadata JSON. Called by
-        :meth:`PolicyEngine.apply_state_updates` after applying
-        structured :class:`StateUpdate` operations to the hot
-        cache.
+        Replaces the policy-visible state wholesale — last writer wins,
+        including over keys the caller never read — while preserving the
+        internal Plan key in the existing conversation metadata JSON. Use it
+        to install a state outright (seeding, import, tests).
+
+        A caller applying updates to state it read earlier wants
+        :meth:`mutate_session_state` instead: two writers each holding their
+        own snapshot lose each other's changes here.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
         :param state: The complete session-state dict to persist.
             Serialized as JSON. Empty dict is stored as ``"{}"``.
+        """
+        ...
+
+    @abstractmethod
+    def mutate_session_state(
+        self,
+        conversation_id: str,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """
+        Apply *mutate* to the persisted session state atomically.
+
+        Read-merge-write under a row lock, so two concurrent writers
+        cannot lose each other's updates. Prefer this over
+        :meth:`set_session_state` whenever the new value depends on the
+        old one (counters, appends, checkpoints); a snapshot-then-write
+        pair drops anything persisted in between.
+
+        :param conversation_id: The conversation to update.
+        :param mutate: Callable applied in place to the freshly read
+            state, inside the locked transaction. Must not make store
+            calls of its own, and may run more than once (transaction
+            replay), so it must tolerate replay and avoid external side
+            effects.
+        :returns: The merged state as persisted.
+        :raises ConversationNotFoundError: When the conversation has no
+            row to merge into. Implementations must not treat an absent
+            row as empty state: applying the mutation, issuing an update
+            that matches nothing and returning the result reports a write
+            that did not happen. This is the shared contract for every
+            write on this store that reads before it writes — see also
+            :meth:`increment_session_usage` and
+            :meth:`seed_labels_if_absent`.
         """
         ...
 
@@ -1298,6 +1380,11 @@ class ConversationStore(ABC):
             "by_model": {"claude-sonnet-4-6": {"input_tokens": 1000,
             "total_cost_usd": 0.05}}}``.
         :returns: The updated ``session_usage`` dict after the increment.
+        :raises ConversationNotFoundError: When the conversation has no row
+            to increment — the same row-missing contract as
+            :meth:`mutate_session_state`. Callers on streaming paths, where
+            a session can be deleted mid-turn, should treat this as nothing
+            to record rather than as a failure.
         """
         ...
 

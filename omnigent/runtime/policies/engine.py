@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -27,7 +28,13 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    ConversationStore,
+    DailyCostState,
+)
+
+_logger = logging.getLogger(__name__)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -582,9 +589,38 @@ class PolicyEngine:
             else:
                 session_ops.append(op)
         if session_ops:
-            for op in session_ops:
-                _apply_one(self._session_state, op)
-            self._store.set_session_state(self._conversation_id, self._session_state)
+            # Merge under a row lock instead of overwriting the whole blob:
+            # parallel evaluations on one session each hold their own snapshot,
+            # so a blind write would drop the other's increments / appends.
+            def _merge(state: dict[str, Any]) -> None:
+                for op in session_ops:
+                    _apply_one(state, op)
+
+            # DELETE is the only StateUpdateAction that removes a key (SET,
+            # INCREMENT, and APPEND all leave it present in ``merged``); a
+            # future action that also removes keys must join this set.
+            deleted_keys = {op.key for op in session_ops if op.action == StateUpdateAction.DELETE}
+            try:
+                merged = self._store.mutate_session_state(self._conversation_id, _merge)
+            except ConversationNotFoundError:
+                # Conversation deleted mid-turn: nothing left to persist. Apply
+                # ops to the in-memory view only so guardrails keep counting for
+                # the rest of the turn rather than failing it over a gone session.
+                _logger.debug(
+                    "conversation %s gone mid-turn; session state kept in memory only",
+                    self._conversation_id,
+                )
+                merged = dict(self._session_state)
+                _merge(merged)
+            # ``merged`` wins for its keys; keys this batch deleted stay gone.
+            # Other cache-only keys are preserved (constructor-seeded values;
+            # concurrently deleted keys linger until the next build rereads).
+            preserved = {
+                key: value
+                for key, value in self._session_state.items()
+                if key not in merged and key not in deleted_keys
+            }
+            self._session_state = {**merged, **preserved}
 
     def _record_root_cost_ask_approved(self, op: StateUpdate) -> None:
         """
@@ -598,13 +634,22 @@ class PolicyEngine:
         sub-agent); a top-level session writes through the normal
         per-conversation path (root == self).
 
-        :param op: The ``SET`` op carrying the approved checkpoint value, e.g.
+        :param op: The ``SET`` or ``DELETE`` op on one of the two reserved
+            cost-approval keys, e.g.
             ``StateUpdate(key=..., action=StateUpdateAction.SET, value=0.05)``.
         """
-        root_conv = self._store.get_conversation(self._root_conversation_id)
-        root_state = dict(root_conv.session_state) if root_conv is not None else {}
-        _apply_one(root_state, op)
-        self._store.set_session_state(self._root_conversation_id, root_state)
+        # Atomic merge so sibling approvals don't lose each other. A deleted
+        # root is best-effort: a lost approval re-prompts, it never overspends,
+        # so mirror in memory below and let the turn continue.
+        try:
+            self._store.mutate_session_state(
+                self._root_conversation_id, lambda state: _apply_one(state, op)
+            )
+        except ConversationNotFoundError:
+            _logger.warning(
+                "root conversation %s gone; cost-ask approval kept in memory only",
+                self._root_conversation_id,
+            )
         # Also mirror into this engine's hot in-memory state so a subsequent
         # evaluate() within the same sub-agent turn sees the approval (its
         # session_state was seeded from the root at construction, but a fresh

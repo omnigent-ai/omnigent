@@ -863,6 +863,69 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.75)
 
 
+def test_accumulate_session_usage_deleted_subagent_records_root_daily_cost(stores) -> None:
+    """A sub-agent deleted mid-stream still bills its surviving root owner.
+
+    On the relay path ``increment_session_usage`` can't land once the child's
+    row is gone, but the per-user daily rollup falls back to the root owner, so
+    accumulation must still record the spend instead of silently undercounting.
+    """
+    conversation_store, _agent_store, _permission_store = stores
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    parent_id = _seed_session(stores, owner=ALICE, title="parent session")
+    child = conversation_store.create_conversation(
+        title="sub-agent",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        parent_conversation_id=parent_id,
+    )
+
+    class _DropMetadataAtIncrement:
+        """Store proxy that drops the child's metadata row at the increment
+        seam — after the pre-increment conversation read, before the atomic
+        increment — so the increment raises while the earlier snapshot and the
+        surviving root remain for the daily rollup."""
+
+        def __init__(self, base: SqlAlchemyConversationStore) -> None:
+            self._base = base
+            self._dropped = False
+
+        def increment_session_usage(self, conversation_id: str, delta: dict) -> dict:
+            if not self._dropped and conversation_id == child.id:
+                self._dropped = True
+                from sqlalchemy import delete as sa_delete
+
+                from omnigent.db.db_models import SqlConversationMetadata
+
+                with self._base._session("drop_metadata_row") as session:
+                    session.execute(
+                        sa_delete(SqlConversationMetadata).where(
+                            SqlConversationMetadata.id == conversation_id
+                        )
+                    )
+            return self._base.increment_session_usage(conversation_id, delta)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._base, name)
+
+    from typing import cast
+
+    from omnigent.stores.conversation_store import ConversationStore
+
+    result = sessions_routes._accumulate_session_usage(
+        # ``cost_usd`` is the harness-reported authoritative cost, so the
+        # assertion doesn't depend on the pricing catalog.
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "m1", "cost_usd": 0.002}},
+        child.id,
+        cast(ConversationStore, _DropMetadataAtIncrement(conversation_store)),
+    )
+
+    # No session row left to publish a new total ...
+    assert result is None
+    # ... yet the per-turn cost still reaches Alice via the root fallback.
+    assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.002)
+
+
 def test_projects_changed_event_forwards_to_client(
     app: FastAPI, stores, fast_rescan: None
 ) -> None:

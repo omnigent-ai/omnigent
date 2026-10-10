@@ -47,7 +47,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -1100,37 +1104,48 @@ def _seed_and_load_labels(
     """
     Seed declared initial values and return the current snapshot.
 
-    Race-safe across concurrent workflows: only writes keys
-    that are missing from the persisted state. If two
-    workflows seed simultaneously, the dialect-specific UPSERT
-    guarantees one writer wins per (conversation, key) pair
-    and the other no-ops.
+    Race-safe across concurrent workflows: the store's insert-if-absent
+    primitive lets the database decide which keys are missing, inside
+    the same statement as the insert. If two workflows seed
+    simultaneously, one writer wins per (conversation, key) pair and
+    the other no-ops.
 
     :param conversation_id: The conversation to seed.
     :param label_defs: Per-key declarations from the spec.
         Keys with ``initial is None`` are skipped (those
         labels start unset until a policy writes them).
-    :param conversation_store: Target for both the read and
-        the seed UPSERT.
+    :param conversation_store: Target for the seed insert.
     :param existing: Pre-loaded current label snapshot, passed by callers
-        that already hold the conversation row (saves a re-read).
+        that already hold the conversation row. Only consulted when there
+        is nothing to seed (saves a re-read); when a seed happens, the
+        snapshot is read back in the same transaction as the insert.
         ``None`` loads it here.
     :returns: Full post-seed snapshot of the conversation's
         labels.
     """
-    if existing is None:
-        existing = _load_existing_labels(conversation_id, conversation_store)
-    to_seed = {
-        key: ldef.initial
-        for key, ldef in label_defs.items()
-        if ldef.initial is not None and key not in existing
-    }
-    if to_seed:
-        conversation_store.set_labels(conversation_id, to_seed)
-        # Re-read to pick up the freshly seeded values plus any
-        # writes that landed concurrently from another workflow.
-        existing = _load_existing_labels(conversation_id, conversation_store)
-    return existing
+    declared = {key: ldef.initial for key, ldef in label_defs.items() if ldef.initial is not None}
+    if not declared:
+        if existing is None:
+            existing = _load_existing_labels(conversation_id, conversation_store)
+        return existing
+    # Fast path: when the caller's snapshot already holds every declared key
+    # there is nothing to seed, so skip the write transaction entirely;
+    # insert-if-absent stays the authority for any key that is still missing.
+    if existing is not None and declared.keys() <= existing.keys():
+        return existing
+    # The database decides which keys are missing inside the insert itself,
+    # so a concurrent policy write can never be reset to its initial value;
+    # the returned snapshot is read in the same transaction.
+    try:
+        return conversation_store.seed_labels_if_absent(conversation_id, declared)
+    except ConversationNotFoundError as err:
+        # No metadata row to seed into — created then deleted mid-build, or
+        # never created — so the build cannot proceed; a state conflict
+        # rather than a routine missing-resource read.
+        raise OmnigentError(
+            f"Conversation {conversation_id!r} has no row to seed labels into.",
+            code=ErrorCode.CONFLICT,
+        ) from err
 
 
 def _load_existing_labels(

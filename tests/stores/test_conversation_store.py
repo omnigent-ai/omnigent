@@ -11,7 +11,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
@@ -250,6 +250,37 @@ def test_create_retries_metadata_phase_after_conversation_commit(tmp_path: Path)
         assert session.query(SqlConversation).filter_by(id=conversation_id).count() == 1
     with store._session("test_select_metadata") as session:
         assert session.query(SqlConversationMetadata).filter_by(id=conversation_id).count() == 1
+
+
+def test_mutate_session_state_replays_from_fresh_state_after_serialization_failure(
+    tmp_path: Path,
+) -> None:
+    """A serialization retry re-reads state, so one logical increment commits once.
+
+    The first attempt applies the mutation then fails at commit and rolls back;
+    the replay must re-read the persisted state (still 1) rather than reuse the
+    rolled-back in-memory dict, so the counter lands on 2, not 3.
+    """
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'conversations.db'}",
+    )
+    conv = store.create_conversation(title="omni-2111-replay")
+    store.set_session_state(conv.id, {"n": 1})
+
+    retrying_maker = _RetryOnceMaker(store._session_immediate)
+    store._session_immediate = retrying_maker
+
+    def _bump(state: dict[str, Any]) -> None:
+        state["n"] = state.get("n", 0) + 1
+
+    merged = store.mutate_session_state(conv.id, _bump)
+
+    assert retrying_maker.attempts == 2
+    assert merged["n"] == 2
+    store._session_immediate = retrying_maker._delegate
+    final = store.get_conversation(conv.id)
+    assert final is not None and final.session_state["n"] == 2
 
 
 def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> None:
@@ -7251,6 +7282,155 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+def test_read_modify_write_primitives_report_a_missing_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """No metadata row means no phantom write — for EVERY such primitive.
+
+    Both used to treat the absent row as ``{}``, apply the change, run an
+    UPDATE that matched nothing, and return the mutated dict as if
+    persisted. Fixing one and leaving the other is how the second kept
+    reporting writes that never happened, under a comment describing the
+    bug as fixed. Driven off the shared primitive so a third caller is
+    covered by construction.
+    """
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    missing = "0" * 32
+    writers = {
+        "session state": lambda: conversation_store.mutate_session_state(
+            missing, lambda state: state.__setitem__("counter", 1)
+        ),
+        "session usage": lambda: conversation_store.increment_session_usage(
+            missing, {"total_tokens": 10}
+        ),
+        # Labels are not foreign-keyed, so an unchecked insert here leaves
+        # orphan rows rather than failing — the same phantom write.
+        "labels": lambda: conversation_store.seed_labels_if_absent(missing, {"risk": "seed"}),
+    }
+    for what, write in writers.items():
+        with pytest.raises(ConversationNotFoundError, match=r"no .* row exists"):
+            write()
+        assert conversation_store.get_conversation(missing) is None, what
+    # Nothing was written on the way out, by any of them.
+    with conversation_store._conv_session("check_orphan_labels") as session:
+        from omnigent.db.db_models import SqlConversationLabel
+
+        orphans = session.execute(
+            select(SqlConversationLabel.key).where(SqlConversationLabel.conversation_id == missing)
+        ).all()
+    assert orphans == [], f"orphan label rows left behind: {orphans}"
+
+
+def test_seed_labels_if_absent_empty_defaults_reads_without_writing(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Empty defaults read back the current labels and never raise.
+
+    With nothing to insert the call takes no write lock and skips the
+    existence check: an existing conversation returns its stored labels,
+    and a conversation that is gone returns ``{}`` rather than the
+    ConversationNotFoundError the non-empty seed raises for a missing row.
+    """
+    conv = conversation_store.create_conversation(title="seed-empty")
+    conversation_store.seed_labels_if_absent(conv.id, {"risk": "low"})
+
+    assert conversation_store.seed_labels_if_absent(conv.id, {}) == {"risk": "low"}
+
+    missing = "0" * 32
+    assert conversation_store.get_conversation(missing) is None
+    assert conversation_store.seed_labels_if_absent(missing, {}) == {}
+
+
+def test_two_real_writers_race_on_one_metadata_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two threads, two connections, overlapping read windows — a real race.
+
+    Tests that merge two snapshots sequentially prove the merge but never
+    construct the race, so they stay green with the row lock removed. This
+    one holds each writer inside its own locked transaction (the mutate
+    callback runs there) and only releases when both have arrived, so the
+    writers' read windows overlap unless the store serialises them.
+
+    Without the lock both writers read the same pre-state and the second
+    overwrites the first: ``risk`` ends at 1. With it, the second blocks at
+    the lock — never reaching the barrier, which is why the barrier has a
+    timeout rather than deadlocking — reads 1 and persists 2.
+
+    Locking is dialect-complementary, so this is meaningful on both:
+    ``SELECT … FOR UPDATE`` on PostgreSQL, ``BEGIN IMMEDIATE`` on SQLite.
+    """
+    import contextlib as _contextlib
+    import threading
+
+    conv = conversation_store.create_conversation(title="real-race")
+    # Both threads try to meet here from inside their transactions. When the
+    # store serialises correctly only one can arrive, so the wait must expire
+    # rather than block forever.
+    barrier = threading.Barrier(2, timeout=5.0)
+    errors: list[BaseException] = []
+
+    def _increment() -> None:
+        def _mutate(state: dict) -> None:
+            with _contextlib.suppress(threading.BrokenBarrierError):
+                barrier.wait()
+            state["risk"] = state.get("risk", 0) + 1
+
+        try:
+            conversation_store.mutate_session_state(conv.id, _mutate)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_increment) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads), (
+        "a racing writer never finished — the timed join expired"
+    )
+    assert not errors, errors
+    persisted = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert persisted["risk"] == 2, (
+        f"one writer's increment was lost: {persisted} — the two transactions "
+        f"were not serialised on the metadata row"
+    )
+
+
+def test_mutate_session_state_preserves_the_plan_snapshot(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The reserved Plan key survives the locked merge and stays invisible to it.
+
+    The native Plan snapshot shares the session_state column but is not
+    policy state: the mutate callback must never see it, a forged copy must
+    not persist or surface in the merged result, and the stored snapshot
+    must survive the merge — the same contract ``set_session_state`` pins.
+    """
+    conv = conversation_store.create_conversation()
+    todos = [{"content": "keep", "status": "pending", "activeForm": "keeping"}]
+    conversation_store.set_session_todos(conv.id, todos)
+
+    seen: list[dict[str, Any]] = []
+
+    def _mutate(state: dict[str, Any]) -> None:
+        seen.append(dict(state))
+        state["counter"] = state.get("counter", 0) + 1
+        state["_omnigent_native_plan_snapshot_v1"] = [{"forged": 1}]
+
+    merged = conversation_store.mutate_session_state(conv.id, _mutate)
+
+    assert seen == [{}], "the reserved Plan key leaked into the mutate callback"
+    assert merged == {"counter": 1}, merged
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_state == {"counter": 1}
+    assert fetched.session_todos == todos
 
 
 def _acl_perms(db_uri: str):
