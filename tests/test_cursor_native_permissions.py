@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json as _json
+import logging
 import sqlite3 as _sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -484,6 +486,158 @@ async def test_supervise_transcript_debounces_autoapproved_call(
 
     assert not any("hooks/cursor-permission-request" in u for u, _ in posts), posts
     assert not any(j.get("type") == "external_elicitation_resolved" for _, j in posts), posts
+
+
+def _log_count(caplog: pytest.LogCaptureFixture, level: int, needle: str) -> int:
+    return sum(1 for r in caplog.records if r.levelno == level and needle in r.getMessage())
+
+
+async def _await_log_count(
+    caplog: pytest.LogCaptureFixture, level: int, needle: str, count: int
+) -> None:
+    """Wait until *count* records at *level* containing *needle* exist."""
+    if not await _wait_for(lambda: _log_count(caplog, level, needle) >= count, timeout_s=2.0):
+        pytest.fail(
+            f"expected {count} level-{level} records containing {needle!r}, "
+            f"got {_log_count(caplog, level, needle)}"
+        )
+
+
+def _wrapped_emfile() -> Exception:
+    """EMFILE reaching the poll loop through an explicit cause chain."""
+    outer = RuntimeError("wrapped socket failure")
+    outer.__cause__ = OSError(errno.EMFILE, "Too many open files")
+    return outer
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(lambda: OSError(errno.EMFILE, "Too many open files"), id="emfile"),
+        pytest.param(lambda: OSError(errno.ENFILE, "File table overflow"), id="enfile"),
+        pytest.param(_wrapped_emfile, id="wrapped-emfile"),
+    ],
+)
+async def test_supervise_transcript_fd_exhaustion_warns_once_per_episode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], Exception],
+) -> None:
+    """One WARNING per episode, DEBUG while it holds, one INFO once a pass completes, no ERROR."""
+    caplog.set_level(logging.DEBUG, logger=cnp.__name__)
+    state = {"faulting": True, "clean_passes": 0}
+    store = tmp_path / "store.db"
+
+    def _discover(*_a: object, **_k: object) -> Path:
+        if state["faulting"]:
+            raise fault()
+        store.write_bytes(b"")
+        return store
+
+    monkeypatch.setattr(cnp, "_discover_store", _discover)
+
+    def _read(_s: Path) -> list[CursorPendingToolCall]:
+        state["clean_passes"] += 1
+        return []
+
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", _read)
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(object()))
+
+    task = _start_supervisor(tmp_path, session_id="conv_fd", auto_accept_approvals=False)
+    try:
+        # Episode 1: the first faulting pass warns; further passes only DEBUG.
+        await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 1)
+        await _await_log_count(caplog, logging.DEBUG, "still fd-exhausted", 3)
+        assert _log_count(caplog, logging.WARNING, "degraded by fd exhaustion") == 1
+        # Recovery: the first clean pass logs the episode's end at INFO, exactly once.
+        state["faulting"] = False
+        await _await_log_count(caplog, logging.INFO, "pass completed after fd exhaustion", 1)
+        passes_at_recovery = state["clean_passes"]
+        assert passes_at_recovery >= 1
+        assert await _wait_for(lambda: state["clean_passes"] >= passes_at_recovery + 3)
+        assert _log_count(caplog, logging.INFO, "pass completed after fd exhaustion") == 1
+        # Episode 2: a fresh episode warns again (per-episode state was reset).
+        debug_before = _log_count(caplog, logging.DEBUG, "still fd-exhausted")
+        state["faulting"] = True
+        store.unlink()  # unbind so the next pass re-enters discovery
+        await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 2)
+        await _await_log_count(caplog, logging.DEBUG, "still fd-exhausted", debug_before + 2)
+        assert _log_count(caplog, logging.WARNING, "degraded by fd exhaustion") == 2
+    finally:
+        await _stop(task)
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, [r.getMessage() for r in errors]
+
+
+async def test_supervise_transcript_fd_exhaustion_rewarns_during_long_episode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sustained episode re-warns on the shared cadence and stays at DEBUG in between."""
+    caplog.set_level(logging.DEBUG, logger=cnp.__name__)
+    monkeypatch.setattr(cnp, "_FD_EXHAUSTION_REWARN_S", 0.2)
+
+    def _discover(*_a: object, **_k: object) -> Path:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(cnp, "_discover_store", _discover)
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(object()))
+
+    task = _start_supervisor(tmp_path, session_id="conv_fd_long", auto_accept_approvals=False)
+    try:
+        await _await_log_count(caplog, logging.WARNING, "degraded by fd exhaustion", 2)
+    finally:
+        await _stop(task)
+
+    assert _log_count(caplog, logging.WARNING, "degraded by fd exhaustion") == 2
+    assert _log_count(caplog, logging.DEBUG, "still fd-exhausted") >= 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        pytest.param(lambda: OSError(errno.EACCES, "denied"), id="non-transient-oserror"),
+        pytest.param(lambda: RuntimeError("boom"), id="non-oserror"),
+    ],
+)
+async def test_supervise_transcript_non_transient_failures_still_log_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    make_exc: Callable[[], Exception],
+) -> None:
+    """Only fd exhaustion is demoted: any other poll failure keeps its ERROR."""
+    caplog.set_level(logging.DEBUG, logger=cnp.__name__)
+    expected = make_exc()
+
+    def _discover(*_a: object, **_k: object) -> Path:
+        raise make_exc()
+
+    monkeypatch.setattr(cnp, "_discover_store", _discover)
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(object()))
+
+    task = _start_supervisor(tmp_path, session_id="conv_err", auto_accept_approvals=False)
+    try:
+        await _await_log_count(
+            caplog, logging.ERROR, "cursor transcript elicitation poll failed", 1
+        )
+    finally:
+        await _stop(task)
+
+    error = next(
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+        and "cursor transcript elicitation poll failed" in r.getMessage()
+    )
+    assert error.exc_info is not None
+    assert type(error.exc_info[1]) is type(expected)
+    assert str(error.exc_info[1]) == str(expected)
+    assert not any("degraded by fd exhaustion" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize(
