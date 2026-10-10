@@ -102,7 +102,8 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=5)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
 
 
 def _tails(*paths: Path) -> str:

@@ -702,7 +702,12 @@ async def test_call_tool_persistent_500_raises_after_bounded_retries(
     Failure means either the error is swallowed or the proxy retries without
     bound against a persistently failing server.
     """
-    monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
+    delays: list[float] = []
+
+    async def _record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(proxy_mcp_manager_mod.asyncio, "sleep", _record_sleep)
     attempts = proxy_mcp_manager_mod._TRANSIENT_PROXY_MAX_RETRIES + 1
     transport = _StubTransport(
         [httpx.Response(500, text="Internal Server Error") for _ in range(attempts)]
@@ -717,6 +722,8 @@ async def test_call_tool_persistent_500_raises_after_bounded_retries(
     assert "conv_test" in error_msg
     assert "500" in error_msg
     assert len(transport.calls) == attempts, "The initial post plus the configured retries"
+    backoff = proxy_mcp_manager_mod._TRANSIENT_PROXY_BACKOFF_S
+    assert delays == [backoff, backoff * 2], "Exponential backoff between re-posts"
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import io
 import os
 import shutil
@@ -536,7 +537,7 @@ def test_helper_spawn_retries_transient_fork_failure(
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise BlockingIOError(35, "Resource temporarily unavailable")
+            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
         return real_popen(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked_once)
@@ -565,13 +566,14 @@ def test_helper_spawn_persistent_fork_failure_raises_after_bounded_attempts(
     structured tool error, so the spawn path must re-raise — not swallow —
     once the attempt budget is exhausted, and must not loop forever.
     """
-    monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
+    delays: list[float] = []
+    monkeypatch.setattr(os_env_mod.time, "sleep", delays.append)
     attempts = 0
 
     def _fork_blocked(*_args: object, **_kwargs: object) -> object:
         nonlocal attempts
         attempts += 1
-        raise BlockingIOError(35, "Resource temporarily unavailable")
+        raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
 
     monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked)
 
@@ -586,3 +588,5 @@ def test_helper_spawn_persistent_fork_failure_raises_after_bounded_attempts(
         os_env.close()
 
     assert attempts == os_env_mod._SPAWN_TRANSIENT_ATTEMPTS, "Give up after the bounded attempts"
+    backoff = os_env_mod._SPAWN_TRANSIENT_BACKOFF_S
+    assert delays == [backoff, backoff * 2], "Exponential backoff between spawn attempts"

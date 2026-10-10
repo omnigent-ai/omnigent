@@ -10,6 +10,7 @@ the model as a structured tool error together with that log.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import subprocess
@@ -193,7 +194,7 @@ async def test_shell_helper_transient_fork_failure_recovers(
             return real_popen(args, *popen_args, **popen_kwargs)  # type: ignore[arg-type]
         spawn_attempts += 1
         if spawn_attempts == 1:
-            raise BlockingIOError(35, "Resource temporarily unavailable")
+            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
         return real_popen(args, *popen_args, **popen_kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked_once)
@@ -223,7 +224,7 @@ async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
 ) -> None:
     """Persistent fork ``EAGAIN`` becomes a structured tool error after the bounded attempts.
 
-    Dispatch returns ``{"error": "[Errno 35] ..."}`` instead of raising and logs
+    Dispatch returns ``{"error": "[Errno <EAGAIN>] ..."}`` instead of raising and logs
     ``runner OSEnvironment dispatch failed for sys_os_shell``.
     """
     monkeypatch.setattr(os_env_mod, "_SPAWN_TRANSIENT_BACKOFF_S", 0.0)
@@ -235,7 +236,7 @@ async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
         if not _is_helper_argv(args):
             return real_popen(args, *popen_args, **popen_kwargs)  # type: ignore[arg-type]
         spawn_attempts += 1
-        raise BlockingIOError(35, "Resource temporarily unavailable")
+        raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
 
     monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fork_blocked)
 
@@ -252,7 +253,7 @@ async def test_shell_helper_persistent_fork_failure_surfaces_as_tool_error(
     payload = json.loads(output)
     assert isinstance(payload, dict)
     assert "Resource temporarily unavailable" in payload["error"]
-    assert "Errno 35" in payload["error"]
+    assert f"Errno {errno.EAGAIN}" in payload["error"]
     assert spawn_attempts == os_env_mod._SPAWN_TRANSIENT_ATTEMPTS
     # The runner logged the attributable dispatch failure.
     assert _OS_ENV_ERROR_LOG in caplog.text
