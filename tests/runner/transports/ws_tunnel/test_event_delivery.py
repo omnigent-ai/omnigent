@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from typing import Any
 
 import httpx
+import pytest
 
+from omnigent.errors import ErrorCode
 from omnigent.runner.transports.ws_tunnel.event_delivery import (
     RunnerEventDispatcher,
     TunnelEventClient,
@@ -237,6 +240,38 @@ async def test_synthetic_ack_invokes_http_response_hooks() -> None:
     assert hooks == [202]
 
 
+@pytest.mark.parametrize(
+    ("ack_error", "expected_status"),
+    [
+        # The server's wrong-runner refusal: the session is bound elsewhere.
+        pytest.param(ErrorCode.FORBIDDEN, 403, id="forbidden"),
+        pytest.param(ErrorCode.INVALID_INPUT, 422, id="invalid-input"),
+        pytest.param("invalid session event", 422, id="free-text-rejection"),
+    ],
+)
+async def test_non_retryable_ack_maps_to_synthetic_http_status(
+    ack_error: str, expected_status: int
+) -> None:
+    dispatcher = RunnerEventDispatcher()
+    http_posts: list[object] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        # Round-trip the ack through the wire codec like a real tunnel frame.
+        ack = decode_frame(encode_frame(EventAckFrame(frame.id, 0, ack_error)))
+        assert isinstance(ack, EventAckFrame)
+        dispatcher.acknowledge(ack)
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, http_posts) as client:
+        response = await asyncio.wait_for(client.post(_URL, json=_ITEM), timeout=2)
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": ack_error}
+    assert http_posts == []
+    assert not dispatcher.has_pending
+
+
 async def test_preview_drops_when_negotiated_tunnel_is_down() -> None:
     dispatcher = RunnerEventDispatcher()
     http_posts: list[object] = []
@@ -251,3 +286,63 @@ async def test_preview_drops_when_negotiated_tunnel_is_down() -> None:
         response = await asyncio.wait_for(client.post(_URL, json=preview), timeout=3)
     assert response.status_code == 503
     assert http_posts == []
+
+
+async def test_acknowledged_batch_stamps_last_dispatch_at() -> None:
+    dispatcher = RunnerEventDispatcher()
+    loop = asyncio.get_running_loop()
+    assert dispatcher.last_dispatch_at is None
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, []) as client:
+        before = loop.time()
+        response = await client.post(_URL, json=_ITEM)
+    assert response.status_code == 202
+    dispatched = dispatcher.last_dispatch_at
+    assert dispatched is not None and before <= dispatched <= loop.time()
+
+
+async def test_unacknowledged_batch_does_not_stamp_last_dispatch_at() -> None:
+    dispatcher = RunnerEventDispatcher()
+
+    async def send(_text: str) -> None:
+        # The tunnel drops before any ACK: nothing reached the server.
+        dispatcher.disconnected()
+
+    dispatcher.ready(send)
+    preview = {"type": "external_output_text_delta", "data": {"delta": "hi"}}
+    async with _client(dispatcher, []) as client:
+        response = await asyncio.wait_for(client.post(_URL, json=preview), timeout=3)
+    assert response.status_code == 503
+    assert dispatcher.last_dispatch_at is None
+
+
+async def test_disconnect_during_failed_send_leaves_no_unretrieved_future_error() -> None:
+    dispatcher = RunnerEventDispatcher()
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+
+    async def send(_text: str) -> None:
+        # The tunnel drops mid-send: the pending future fails, then the send itself fails.
+        dispatcher.disconnected()
+        raise OSError("socket closed")
+
+    dispatcher.ready(send)
+    delivery = asyncio.create_task(dispatcher._deliver("session-a", [_ITEM]))
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if delivery.done() or dispatcher._state == "disconnected":
+            break
+    delivery.cancel()
+    await asyncio.gather(delivery, return_exceptions=True)
+    del delivery  # The cancelled task's traceback would otherwise keep the future alive.
+    gc.collect()
+    await asyncio.sleep(0)
+    assert dispatcher._pending == {}
+    assert not reported

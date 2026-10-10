@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import hmac
 import logging
 import os
@@ -141,6 +142,41 @@ _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S
 # Retry only pre-output wedges after confirmed teardown. Replaying a turn
 # with progress can duplicate tool effects; retries never extend the hard cap.
 _WEDGED_TURN_RECOVERY_RETRIES = 1
+
+# Set by the harness subprocess entrypoint. Executors import their SDKs lazily
+# on the first turn, so that graph is only static once a turn has completed.
+_freeze_gc_after_first_turn = False
+
+
+def arm_gc_freeze_after_first_turn() -> None:
+    """Collect and freeze GC-tracked objects once, after this process's first completed turn.
+
+    Only the harness subprocess arms this; an embedding process keeps normal
+    GC. A failed or cancelled turn leaves the freeze armed, so a later turn
+    still freezes the lazily imported SDK.
+    """
+    global _freeze_gc_after_first_turn
+    _freeze_gc_after_first_turn = True
+
+
+def _freeze_gc_if_armed(run_task: asyncio.Task[None], ctx: TurnContext) -> None:
+    """Run the armed freeze once *run_task* has completed without error.
+
+    Called after the turn's terminal event is sent and its state torn down, so
+    the one-time collection (~25 ms) is off the turn's path and frees the
+    turn's cycles instead of pinning them. A harness that observes
+    ``ctx.cancelled`` and returns normally ended a cancelled turn, not a completed one.
+    """
+    global _freeze_gc_after_first_turn
+    if not _freeze_gc_after_first_turn or not run_task.done() or run_task.cancelled():
+        return
+    if ctx.cancelled.is_set():
+        return
+    if run_task.exception() is not None:
+        return
+    _freeze_gc_after_first_turn = False
+    gc.collect()
+    gc.freeze()
 
 
 @dataclass(frozen=True)
@@ -1426,6 +1462,7 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
+            _freeze_gc_if_armed(run_task, ctx)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int

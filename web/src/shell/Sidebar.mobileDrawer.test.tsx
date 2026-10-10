@@ -5,7 +5,7 @@ import { conversation as conv, conversationPage } from "@/test/sidebarMockHelper
 // it (replacing the collapse toggle, which is now desktop-only), and Search /
 // Settings float at the top and bottom of the drawer.
 
-import { cleanup, fireEvent, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -119,31 +119,20 @@ describe("mobile sidebar drawer", () => {
     );
   });
 
-  it("gives both floating chips one shared glass treatment", () => {
-    // These drifted apart once — Settings landed opaque with a heavier shadow
-    // than Search. The look now lives in a single CSS class, so assert both
-    // wear it and neither carries a competing background or shadow utility.
+  it("keeps both floating actions icon-only on mobile", () => {
     renderSidebar();
 
     const search = screen.getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("sidebar-settings-float").closest("a, button")!;
 
-    // Where the chip sits, and which breakpoint it shows at, legitimately
-    // differ; everything about how it looks must not.
-    // `relative` is the Button base's own position, which tailwind-merge drops
-    // from the floating copy in favour of `absolute` — placement, not looks.
     for (const button of [search, settings]) {
-      expect(button).toHaveClass(
-        "sidebar-glass-chip",
-        "max-md:size-11",
-        "max-md:rounded-full",
-        "max-md:text-foreground",
-      );
+      expect(button).toHaveClass("max-md:size-11", "max-md:text-foreground");
+      expect(button).not.toHaveClass("sidebar-glass-chip", "max-md:rounded-full");
     }
   });
 
-  it("gives the session list a gutter so the last row clears the floating chip", () => {
-    // The chip doesn't scroll, so without this it would cover the last row,
+  it("gives the session list a gutter so the last row clears the floating action", () => {
+    // The action doesn't scroll, so without this it would cover the last row,
     // hiding its title and state badge and blocking the tap target.
     renderSidebar();
 
@@ -177,6 +166,7 @@ describe("mobile sidebar drawer keyboard inset", () => {
   afterEach(() => {
     delete (window as unknown as Record<string, unknown>).omnigentNative;
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("pads the drawer bottom by the keyboard inset when the iOS keyboard is open", () => {
@@ -206,6 +196,27 @@ describe("mobile sidebar drawer keyboard inset", () => {
     expect(screen.getByRole("complementary", { name: "Conversations" }).style.paddingBottom).toBe(
       "",
     );
+  });
+
+  it("leaves the list scroll alone when the keyboard opens for focus outside it", () => {
+    // Focused rename rows are re-centered in Sidebar.rowActions.test.tsx.
+    setIOSViewport(844, 844);
+    renderSidebar();
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    composer.focus();
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    act(() => {
+      (window.visualViewport as unknown as { height: number }).height = 508;
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveStyle({
+      paddingBottom: "336px",
+    });
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    composer.remove();
   });
 
   it("applies no bottom padding off the iOS shell even when the viewport shrinks", () => {

@@ -1,12 +1,15 @@
 import {
+  ArrowLeftIcon,
   BotIcon,
   EllipsisVerticalIcon,
   FileIcon,
   FolderPlusIcon,
   GitCompareIcon,
   GitForkIcon,
+  GitPullRequestIcon,
   InfoIcon,
   ListIcon,
+  Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
@@ -14,8 +17,9 @@ import {
   ShareIcon,
   TerminalIcon,
   UserPlusIcon,
+  XIcon,
 } from "lucide-react";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -30,6 +34,7 @@ import {
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
 import { HeaderTitle } from "./HeaderTitle";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
@@ -39,10 +44,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
-import { MOBILE_GLASS_PILL, MOBILE_GLASS_SURFACE } from "./mobileGlass";
+import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { SidebarOpenButton } from "./SidebarOpenButton";
 
 const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
@@ -93,10 +98,16 @@ interface MobileSessionMenuProps {
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
-  /** True while the mobile GitHub drawer is open. */
+  /** True while the mobile Pull Requests drawer is open. */
   githubPanelOpen: boolean;
-  /** Open the mobile GitHub drawer. */
+  /** Open the mobile Pull Requests drawer. */
   onOpenGithub: () => void;
+  /** True while the mobile side-chats drawer is open. */
+  sideChatsPanelOpen: boolean;
+  /** Whether the session's harness supports side chats. */
+  showSideChats: boolean;
+  /** Open the mobile side-chats drawer. */
+  onOpenSideChats: () => void;
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -111,6 +122,8 @@ interface ChatHeaderProps {
   sidebarOpen: boolean;
   /** Open the left sidebar. */
   onOpenSidebar: (peek?: boolean) => void;
+  /** Render the mobile settings-menu return affordance and fade. */
+  settingsMode?: boolean;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
   /**
@@ -161,6 +174,7 @@ interface ChatHeaderProps {
   canShare: boolean;
   /** Whether the active session can be forked. */
   canFork: boolean;
+  forkDisabledReason?: string;
   /** Whether the rendered Share controls should be disabled. */
   shareDisabled?: boolean;
   /** User-facing reason for the disabled Share controls. */
@@ -206,7 +220,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
         aria-label="Session actions"
         title={PENDING_ACTION_TITLE}
         disabled
-        className="text-muted-foreground md:hidden max-md:size-11 max-md:rounded-full"
+        className="text-muted-foreground md:hidden max-md:size-11"
       >
         <EllipsisVerticalIcon className="size-4 max-md:size-5" />
       </Button>
@@ -308,6 +322,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
 export function ChatHeader({
   sidebarOpen,
   onOpenSidebar,
+  settingsMode = false,
   isChildSession,
   subAgentName,
   conversationId,
@@ -321,6 +336,7 @@ export function ChatHeader({
   wrapperLabel,
   canShare,
   canFork,
+  forkDisabledReason,
   shareDisabled = false,
   shareDisabledReason,
   onShare,
@@ -335,42 +351,9 @@ export function ChatHeader({
   pending = false,
   mobileMenu,
 }: ChatHeaderProps) {
-  // Dwell on the toggle for 400ms to peek the sidebar; leaving before then cancels
-  // the pending peek so a quick pass-over never opens it. Peek is a desktop
-  // hover affordance — on mobile the toggle just opens the full-screen overlay,
-  // so a tap's synthetic pointerenter must not trigger it.
   const isMobile = useIsMobileViewport();
+  const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
-  const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const peekRequest = useRef(0);
-  // Once the dwell fires the peek, the card fades in click-through, so the
-  // pointer keeps resting on the toggle — long enough to trip the hover
-  // tooltip's own (longer) delay. The peek is the intended hover reveal, so
-  // suppress the tooltip when the peek fires. Pointer-armed only: keyboard
-  // focus never arms a peek, so the focus tooltip still works.
-  const suppressTooltip = useRef(false);
-  const [tooltipOpen, setTooltipOpen] = useState(false);
-  const cancelPeek = useCallback(() => {
-    peekRequest.current += 1;
-    if (peekTimer.current) {
-      clearTimeout(peekTimer.current);
-      peekTimer.current = null;
-    }
-    suppressTooltip.current = false;
-  }, []);
-  const onPeekSidebar = useCallback(() => {
-    if (isMobile) return;
-    cancelPeek();
-    const request = peekRequest.current;
-    peekTimer.current = setTimeout(() => {
-      peekTimer.current = null;
-      if (peekRequest.current !== request) return;
-      suppressTooltip.current = true;
-      setTooltipOpen(false);
-      onOpenSidebar(true);
-    }, 400);
-  }, [isMobile, onOpenSidebar, cancelPeek]);
-  useEffect(() => cancelPeek, [cancelPeek]);
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
   // ride in the header's single kebab rather than a second trigger of their
@@ -387,6 +370,7 @@ export function ChatHeader({
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
     !mobileMenu.githubPanelOpen &&
+    !mobileMenu.sideChatsPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
       <>
         {showFilesPanel && (
@@ -417,8 +401,8 @@ export function ChatHeader({
             onSelect={mobileMenu.onOpenGithub}
             className="gap-2.5 px-2.5 py-2 text-ui"
           >
-            <GithubMono size={16} className="shrink-0" />
-            GitHub
+            <GitPullRequestIcon className="size-4" />
+            Pull Requests
           </DropdownMenuItem>
         )}
         {/* Agents — always present (the panel lists at least
@@ -444,6 +428,15 @@ export function ChatHeader({
               : mobileMenu.agentCount}
           </span>
         </DropdownMenuItem>
+        {mobileMenu.showSideChats && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenSideChats}
+            className="gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <MessagesSquareIcon className="size-4" />
+            Side chats
+          </DropdownMenuItem>
+        )}
         {/* Shells — the mobile entry into the session's shells
             (desktop has no Shells tab; it opens shells as soft tabs):
             visible when a real shell exists, or when the agent spec
@@ -487,6 +480,7 @@ export function ChatHeader({
         currentProject={projectName}
         canShare={canShare}
         canFork={canFork}
+        forkDisabledReason={forkDisabledReason}
         shareDisabled={shareDisabled}
         shareDisabledReason={shareDisabledReason}
         onShare={onShare}
@@ -547,6 +541,7 @@ export function ChatHeader({
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
         "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        settingsMode && "settings-mobile-header",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -562,50 +557,27 @@ export function ChatHeader({
       <div
         className={cn(
           "flex min-w-0 items-center gap-1 md:gap-6",
-          !sidebarOpen && "traffic-light-clearance",
+          !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
-        {!sidebarOpen && (
-          <Tooltip
-            open={tooltipOpen}
-            onOpenChange={(next) => {
-              if (next && suppressTooltip.current) return;
-              setTooltipOpen(next);
-            }}
+        {!sidebarOpen && (!canvas || canvas.compact || canvas.focused) && (
+          <SidebarOpenButton
+            onOpenSidebar={onOpenSidebar}
+            settingsMode={settingsMode}
+            componentId="chat.header.open_sidebar"
+          />
+        )}
+        {canvas?.compact && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={canvas.closeConversation}
+            aria-label="Back to canvas"
+            className="shrink-0 gap-1 px-1.5 text-ui"
           >
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                // Match the right-panel toggle's 24px icon-xs geometry on
-                // desktop; mobile keeps its larger touch target below.
-                size="icon-xs"
-                aria-label="Open sidebar"
-                componentId="chat.header.open_sidebar"
-                onClick={() => {
-                  cancelPeek();
-                  onOpenSidebar(false);
-                }}
-                // chat-header-sidebar-toggle is hidden on the macOS shell, where
-                // the title-bar cluster carries an always-present toggle (with
-                // the same dwell-to-peek) and this would be a second, offset
-                // copy of it. Kept everywhere else, where it is the ONLY way to
-                // reopen a collapsed sidebar.
-                className={cn(
-                  "chat-header-sidebar-toggle border-none text-muted-foreground hover:text-foreground max-md:size-11",
-                  MOBILE_GLASS_PILL,
-                )}
-                onPointerEnter={onPeekSidebar}
-                onPointerDown={cancelPeek}
-                onPointerLeave={cancelPeek}
-              >
-                <PanelLeftIcon className="size-4 max-md:size-5" />
-              </Button>
-            </TooltipTrigger>
-            {/* Bottom placement keeps the tooltip clear of the macOS
-                Electron shell's traffic lights at the window's top edge. */}
-            <TooltipContent side="bottom">Open sidebar</TooltipContent>
-          </Tooltip>
+            <ArrowLeftIcon className="size-4" />
+            Canvas
+          </Button>
         )}
         {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
             landing composer. A resolved title is enough; so is titleLinkTo —
@@ -632,12 +604,7 @@ export function ChatHeader({
         )}
       </div>
 
-      <div
-        className={cn(
-          "flex items-center gap-2 max-md:gap-0 max-md:empty:hidden",
-          MOBILE_GLASS_PILL,
-        )}
-      >
+      <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -673,10 +640,10 @@ export function ChatHeader({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-44">
-              <DropdownMenuItem onSelect={onFork}>
+              <SessionActionMenuItem disabledReason={forkDisabledReason} onSelect={onFork}>
                 <GitForkIcon className="size-3.5" />
                 Fork
-              </DropdownMenuItem>
+              </SessionActionMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         )}
@@ -698,7 +665,7 @@ export function ChatHeader({
                   size="icon"
                   aria-label="Session actions"
                   data-testid="session-actions-menu"
-                  className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11 max-md:rounded-full"
+                  className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11"
                 >
                   <EllipsisVerticalIcon className="size-4 max-md:size-5" />
                 </Button>
@@ -722,10 +689,14 @@ export function ChatHeader({
                   null otherwise, and renders its own trailing separator. */}
                 {isMobile && <ViewModeMenuItems />}
                 {canFork && (
-                  <DropdownMenuItem onSelect={onFork} data-testid="fallback-fork-conversation">
+                  <SessionActionMenuItem
+                    disabledReason={forkDisabledReason}
+                    onSelect={onFork}
+                    data-testid="fallback-fork-conversation"
+                  >
                     <GitForkIcon className="size-4" />
                     Fork
-                  </DropdownMenuItem>
+                  </SessionActionMenuItem>
                 )}
                 {canShare && (
                   <DropdownMenuItem
@@ -836,6 +807,34 @@ export function ChatHeader({
         {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
             menu the desktop breadcrumb hangs off its title. */}
         {isMobile && conversationMenu}
+        {canvas && !canvas.compact && (
+          <>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={canvas.focused ? "Show canvas beside conversation" : "Focus conversation"}
+              title={canvas.focused ? "Show canvas" : "Focus conversation"}
+              onClick={canvas.toggleFocus}
+              className="shrink-0 text-muted-foreground"
+            >
+              {canvas.focused ? (
+                <PanelLeftIcon className="size-4" />
+              ) : (
+                <Maximize2Icon className="size-4" />
+              )}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Close conversation pane"
+              title="Close conversation pane"
+              onClick={canvas.closeConversation}
+              className="shrink-0 text-muted-foreground"
+            >
+              <XIcon className="size-4" />
+            </Button>
+          </>
+        )}
       </div>
     </header>
   );
