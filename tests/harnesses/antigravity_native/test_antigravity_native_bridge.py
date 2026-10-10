@@ -1572,8 +1572,8 @@ def test_write_mcp_config_tolerates_malformed_user_config(
     with caplog.at_level(logging.WARNING, logger=_mod.__name__):
         path = write_mcp_config(bridge_dir, python_executable="python-test")
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written == build_mcp_config(bridge_dir, python_executable="python-test")
     warnings = [
         record.getMessage()
         for record in caplog.records
@@ -1596,9 +1596,18 @@ def test_write_mcp_config_restricts_isolated_config_to_owner(
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    # A looser file left by an earlier or interrupted write must not keep its mode.
+    config_dir = agy_gemini_dir(bridge_dir) / "config"
+    config_dir.mkdir(parents=True)
+    for stale in ("mcp_config.json", "mcp_config.json.tmp"):
+        (config_dir / stale).write_text("{}", encoding="utf-8")
+        (config_dir / stale).chmod(0o644)
     path = write_mcp_config(bridge_dir, python_executable="python-test")
 
     assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["graft"]["env"] == {
+        "GRAFT_TOKEN": "s"
+    }
 
 
 def test_write_mcp_config_without_user_config_seeds_only_the_relay(
@@ -1617,33 +1626,6 @@ def test_write_mcp_config_without_user_config_seeds_only_the_relay(
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
     assert not [record for record in caplog.records if record.name == _mod.__name__]
-
-
-def test_isolated_agy_launch_prep_keeps_user_mcp_servers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The isolated --gemini_dir config carries the user's ~/.gemini MCP servers plus the relay."""
-    fake_home = tmp_path / "real-home"
-    user_config = fake_home / ".gemini" / "config" / "mcp_config.json"
-    user_config.parent.mkdir(parents=True)
-    user_servers = {
-        "graft": {"command": "/usr/local/bin/graft", "args": ["mcp"]},
-        "graphify": {"command": "/usr/local/bin/graphify", "args": ["mcp"]},
-    }
-    user_config.write_text(json.dumps({"mcpServers": user_servers}), encoding="utf-8")
-    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
-
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    # Both launch paths prepare the isolated dir in this order before starting agy.
-    write_mcp_config(bridge_dir, python_executable="python-test")
-    seed_isolated_agy_home(bridge_dir)
-
-    iso_config = agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
-    servers = json.loads(iso_config.read_text(encoding="utf-8"))["mcpServers"]
-    assert servers["omnigent"]["command"] == "python-test"
-    assert {name: servers.get(name) for name in user_servers} == user_servers
-    assert json.loads(user_config.read_text(encoding="utf-8")) == {"mcpServers": user_servers}
 
 
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:

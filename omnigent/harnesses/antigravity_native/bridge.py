@@ -546,11 +546,15 @@ def write_mcp_config(
         bridge_dir, python_executable=python_executable
     )
     payload["mcpServers"] = servers
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    # Inherited server definitions may carry credentials in their env blocks.
-    tmp.touch(mode=0o600)
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    # Inherited server definitions may carry credentials in their env blocks, so
+    # the file is created owner-only rather than reusing a stale temp file's mode.
+    fd, tmp_name = tempfile.mkstemp(prefix=_MCP_CONFIG_FILE + ".", dir=config_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp_name, path)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
     return path
 
 

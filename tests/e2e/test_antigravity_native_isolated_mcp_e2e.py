@@ -68,6 +68,17 @@ def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> tuple[set[str], s
     log_dir = gemini_dir / "antigravity-cli" / "log"
     servers: set[str] = set()
     mcp_lines: list[str] = []
+
+    def scan_logs() -> None:
+        mcp_lines.clear()
+        for log_path in sorted(log_dir.glob("*.log")) if log_dir.is_dir() else []:
+            for line in log_path.read_text(errors="replace").splitlines():
+                if "mcp" in line.lower():
+                    mcp_lines.append(line)
+                match = _CONNECTING_RE.search(line)
+                if match:
+                    servers.update(name.strip() for name in match.group(1).split(","))
+
     try:
         deadline = time.monotonic() + _AGY_MCP_SCAN_TIMEOUT
         while time.monotonic() < deadline:
@@ -77,16 +88,10 @@ def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> tuple[set[str], s
                 pass  # no new TUI output this second; the log scan below still runs
             except pexpect.EOF:
                 break
-            mcp_lines = []
-            for log_path in sorted(log_dir.glob("*.log")) if log_dir.is_dir() else []:
-                for line in log_path.read_text(errors="replace").splitlines():
-                    if "mcp" in line.lower():
-                        mcp_lines.append(line)
-                    match = _CONNECTING_RE.search(line)
-                    if match:
-                        servers |= {name.strip() for name in match.group(1).split(",")}
+            scan_logs()
             if servers:
                 break
+        scan_logs()  # agy may exit right after logging the answer
     finally:
         # The hanging stand-ins share agy's process group; kill it so none outlive the test.
         with contextlib.suppress(OSError):

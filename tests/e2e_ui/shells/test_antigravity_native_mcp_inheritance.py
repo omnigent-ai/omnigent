@@ -109,6 +109,9 @@ def _mcp_connected(mcp_dir: Path, server: str) -> bool:
 def user_home(antigravity_model: list[str] | None, tmp_path: Path) -> Path:
     """Register the user's own stdio MCP servers with ``agy mcp add`` in the journey HOME."""
     home = Path(os.environ["HOME"])
+    assert not (home / ".gemini" / "config" / "mcp_config.json").exists(), (
+        f"refusing to run `agy mcp add` against a non-fresh HOME {home}"
+    )
     for name in _USER_SERVERS:
         stub = tmp_path / "mcp-stubs" / name
         stub.parent.mkdir(exist_ok=True)
@@ -145,6 +148,7 @@ def _retain_evidence(files: dict[str, str | bytes]) -> None:
 def test_dispatched_agy_worker_keeps_user_mcp_servers(
     browser: Browser, tmp_path: Path, user_home: Path, antigravity_model: list[str] | None
 ) -> None:
+    _TOOL_LISTING.requests.clear()
     user_config = user_home / ".gemini" / "config" / "mcp_config.json"
     user_config_before = user_config.read_bytes()
     evidence: dict[str, str | bytes] = {
