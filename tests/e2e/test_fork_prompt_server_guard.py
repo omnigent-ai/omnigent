@@ -1,9 +1,9 @@
 """Fork/prompt conflicts are rejected before local or server dispatch, without a traceback.
 
 ``omnigent run --fork <id> -p ...`` must print the same one-line usage error for
-a local YAML target and for ``--server <url>``. The server shape runs against a
-real runner-less ``omnigent server``: when the guard was bypassed, the CLI only
-failed later with an unhandled ``RuntimeError`` and the crash reporter.
+a local YAML target and for ``--server <url>``. The server shape runs the real
+CLI against a real runner-less ``omnigent server`` so the whole process is
+observed, not just the Click command.
 """
 
 from __future__ import annotations

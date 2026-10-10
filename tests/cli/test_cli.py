@@ -4916,13 +4916,7 @@ def test_run_server_without_agent_dispatches_direct_server(
 def test_fork_with_prompt_rejected_on_direct_server_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``run --server URL --fork ID -p`` is rejected before dispatch.
-
-    The direct-server (no-AGENT) branch returns early, so the fork guard must
-    run before it: otherwise the invalid combination reaches ``run_chat`` and
-    dies later with an unhandled runner-resolution ``RuntimeError`` instead of
-    the friendly usage error the local-YAML shape produces.
-    """
+    """Reject fork/prompt conflicts before the early-returning direct-server dispatch."""
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     run_chat = Mock()
     monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
@@ -4963,11 +4957,7 @@ def test_fork_with_resume_rejected_on_direct_server_dispatch(
 def test_fork_with_prompt_rejected_before_native_harness_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The native-harness launcher shape is guarded too.
-
-    ``_dispatch_native_terminal_harness`` also returns before the guard's old
-    location, so the hoisted guard must fire before that dispatch as well.
-    """
+    """Reject fork/prompt conflicts before native-harness dispatch."""
     native_dispatch = Mock(return_value=True)
     monkeypatch.setattr("omnigent.cli._dispatch_native_terminal_harness", native_dispatch)
 
