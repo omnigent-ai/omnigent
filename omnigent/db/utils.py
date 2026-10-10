@@ -1029,6 +1029,29 @@ def _is_serialization_failure(exc: DBAPIError) -> bool:
     )
 
 
+# Backends that commit each statement on their own. A callback interrupted
+# there may already be partially applied, so replaying it could double-apply.
+_AUTOCOMMIT_DIALECTS = frozenset({"cloudflare_d1"})
+
+
+def _is_transient_disconnect(exc: DBAPIError, dialect: str) -> bool:
+    """Return whether a statement died because its connection was lost.
+
+    ``connection_invalidated`` is set when the dialect recognized the error as
+    a disconnect (e.g. MySQL 2006 "server has gone away" / 2013 "lost
+    connection during query"), so the dead pooled connection is already
+    discarded and a replay runs on a fresh one. Errors raised outside a
+    statement (``statement is None``, e.g. a failed COMMIT) are excluded: a
+    disconnected commit may have landed, so replaying it could double-apply.
+    Autocommit dialects are excluded for the same reason.
+    """
+    return (
+        exc.connection_invalidated
+        and exc.statement is not None
+        and dialect not in _AUTOCOMMIT_DIALECTS
+    )
+
+
 def run_write_transaction(
     session_maker: NamedManagedSessionMaker,
     operation_name: str,
@@ -1038,12 +1061,20 @@ def run_write_transaction(
     sleep: Callable[[float], None] = time.sleep,
     random_value: Callable[[], float] = random.random,
 ) -> _T:
-    """Replay CRDB serialization failures and MySQL deadlock victims.
+    """Run a named managed transaction, replaying transient failures.
 
-    The callback must contain database work only. Callers must perform cache
-    invalidation and external side effects after this function returns. The
-    supplied maker remains responsible for query naming, commit, rollback,
-    SQLite write isolation, and session cleanup on every attempt.
+    Three kinds of failure are replayed with bounded, jittered backoff:
+    CockroachDB serialization failures (SQLSTATE 40001), MySQL deadlock
+    victims (error 1213), and statement-phase connection losses on
+    transactional dialects (the dialect invalidated the connection, e.g. MySQL
+    "server has gone away", so the replay runs on a fresh one).
+
+    The callback must contain database work only and must not commit on its
+    own: a replay assumes the failed attempt left nothing behind, which holds
+    only while the maker performs the single commit at exit. Callers must
+    perform cache invalidation and external side effects after this function
+    returns. The supplied maker remains responsible for query naming, commit,
+    rollback, SQLite write isolation, and session cleanup on every attempt.
     """
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
@@ -1055,26 +1086,35 @@ def run_write_transaction(
             with session_maker(operation_name) as session:
                 return callback(session)
         except DBAPIError as exc:
-            retryable = (is_cockroachdb(dialect) and _is_serialization_failure(exc)) or (
-                dialect == "mysql" and getattr(exc.orig, "args", ())[:1] == (1213,)
-            )
-            if not retryable:
+            if _is_transient_disconnect(exc, dialect):
+                retry_reason = "connection loss"
+            elif is_cockroachdb(dialect) and _is_serialization_failure(exc):
+                retry_reason = "serialization failure"
+            elif dialect == "mysql" and getattr(exc.orig, "args", ())[:1] == (1213,):
+                retry_reason = "deadlock"
+            else:
                 raise
             if attempt == max_retries:
                 record_transaction_retry(qualified_name, "exhausted")
                 _logger.error(
-                    "Database transaction retries exhausted",
-                    extra={"db_operation": qualified_name, "retry_count": attempt},
+                    "Write transaction retries exhausted",
+                    extra={
+                        "db_operation": qualified_name,
+                        "retry_count": attempt,
+                        "retry_reason": retry_reason,
+                    },
                 )
                 raise
             ceiling = min(0.025 * (2**attempt), 0.1)
             delay = ceiling * random_value()
             record_transaction_retry(qualified_name, "scheduled")
             _logger.warning(
-                "Retrying database transaction after a concurrency conflict",
+                "Retrying write transaction after %s",
+                retry_reason,
                 extra={
                     "db_operation": qualified_name,
                     "retry_count": attempt + 1,
+                    "retry_reason": retry_reason,
                     "retry_delay_seconds": delay,
                 },
             )
