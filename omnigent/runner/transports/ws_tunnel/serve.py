@@ -34,7 +34,7 @@ from websockets.exceptions import (
     WebSocketException,
 )
 
-from omnigent.cli_invocation import cli_invocation
+from omnigent.cli_invocation import cli_invocation, quote_hint_argument
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -520,7 +520,8 @@ async def serve_tunnel(
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
                         "the server likely requires auth — "
-                        f"run `{cli_invocation()} login {display_server_url(server_url)}` or "
+                        f"run `{cli_invocation()} login "
+                        f"{quote_hint_argument(display_server_url(server_url))}` or "
                         f"`{cli_invocation()} setup` to configure credentials"
                     ) from exc
                 retry_reason = (
@@ -536,15 +537,14 @@ async def serve_tunnel(
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
                         if server_url:
-                            # `omnigent login` detects the fronting workspace
-                            # itself — unlike a raw `databricks auth login
-                            # --host`, which would need the workspace host,
-                            # not the server URL (for workspace-hosted
-                            # servers the API mount is the wrong --host).
+                            # `omnigent login` infers the fronting workspace itself,
+                            # unlike `databricks auth login --host`, which needs the
+                            # workspace host.
                             from omnigent.util.server_url import display_server_url
 
                             login_hint = (
-                                f"run `omnigent login {display_server_url(server_url)}` "
+                                f"run `{cli_invocation()} login "
+                                f"{quote_hint_argument(display_server_url(server_url))}` "
                                 "to re-authenticate"
                             )
                         else:
