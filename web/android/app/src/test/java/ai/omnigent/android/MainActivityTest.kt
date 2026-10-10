@@ -27,6 +27,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
+import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowRestrictionsManager
 import java.time.Duration
 import java.util.concurrent.Executor
@@ -241,6 +242,27 @@ class MainActivityTest {
             shadowOf(webView).lastEvaluatedJavascript,
         )
         assertFalse(activity.isFinishing)
+    }
+
+    @Test
+    fun `server menu items above the server entries are never treated as servers`() {
+        val activity = launch()
+        activity.invoke(
+            "showServerSwitcherMenu",
+            arrayOf(View::class.java),
+            activity.switchButton(),
+        )
+        val popup = ShadowPopupMenu.getLatestPopupMenu()
+        val listener = shadowOf(popup).onMenuItemClickListener
+
+        // The debug submenus use ids far above the server entries.
+        val debugRoot = popup.menu.add(3, 20_100, 0, "Debug Authentication")
+
+        assertFalse(listener.onMenuItemClick(debugRoot))
+        assertEquals(
+            "https://example.com",
+            ServerStore(ApplicationProvider.getApplicationContext()).currentServerUrl(),
+        )
     }
 
     @Test

@@ -48,6 +48,15 @@ be able to write resources without a separate Omnigent account.
   expiry while open (silent), an expired or revoked sign-in ("Sign in again?"
   with the reason), and sign-out. Accounts, header, older OIDC servers (ticket
   sign-in), and Databricks hosts keep their previous sign-in.
+- `android-oidc-browser-sign-in`: the Android app signs in to an OIDC server in
+  Auth Tab and never shows the identity provider inside its WebView. States:
+  Connect with no session (Auth Tab), Connect with a still-valid session (no
+  browser), cancel mid sign-in, a refused sign-in (disallowed domain), relaunch
+  (silent, or "Sign in to <host> to continue." when nothing can renew), Android
+  stopping the app while the browser is open, session expiry while open
+  (silent), an expired or revoked sign-in ("Sign in again" with the reason), and
+  sign-out. Accounts, header, older OIDC servers (ticket sign-in), and
+  Databricks hosts keep their previous sign-in.
 
 ## How to get to it (user POV)
 
@@ -70,6 +79,12 @@ the browser, which is how a user switches accounts).
 **iOS:** Connect on the connect screen to an OIDC server; a server picked in the
 native server menu or the sidebar server picker; relaunching the app, deep links,
 and notification taps on a signed-in server; **Sign In** in the "Sign in again?"
+prompt; and sign-out from the app's settings, **Sign Out** in the native server
+menu, and **Sign out of <server>** in the sidebar server picker.
+
+**Android:** Connect on the connect screen to an OIDC server; a server picked in
+the native server menu or the sidebar server picker; relaunching the app and
+notification taps on a signed-in server; **Sign In** on the "Sign in to <host>"
 prompt; and sign-out from the app's settings, **Sign Out** in the native server
 menu, and **Sign out of <server>** in the sidebar server picker.
 
@@ -128,6 +143,13 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `web/ios/OmnigentTests/OidcWebSessionTests.swift`, `OidcCredentialsTests.swift`,
   and `ServerManifestTests.swift`; server flow:
   `tests/server/integration/test_oidc_native_login.py`.
+- **`android-oidc-browser-sign-in` (Android app, own environment):** drive the
+  Android app on an emulator per `web/android/README.md` ("OIDC sign-in", Manual
+  verification) against an OIDC server whose manifest lists the app's redirect.
+  The verification instance is header mode, so it can't show this. Component
+  tests: `OidcSessionControllerTest.kt`, `OidcCredentialsTest.kt`, and
+  `ServerManifestTest.kt` in `web/android/app/src/test/java/ai/omnigent/android/`;
+  server flow: `tests/server/integration/test_oidc_native_login.py`.
 - **Desktop sign-out (Server menu and sidebar picker):** connect the desktop to an
   OIDC server or a Databricks workspace, choose **Server → Sign Out of Server**,
   and confirm every window on it shows "You're signed out of …" and the next
@@ -161,6 +183,11 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   scripted runs.
 - The iOS app also needs the server to list `ai.omnigent.ios:/oauth/callback`
   in its manifest; an OIDC server without it keeps the ticket sign-in in Safari.
+- The Android app also needs the server to list
+  `ai.omnigent.android:/oauth/callback` in its manifest; an OIDC server without
+  it keeps the ticket sign-in in the browser. Browsers without Auth Tab hand the
+  redirect to the app through a Custom Tab intent instead, so check both when a
+  sign-in never returns to the app.
 - The desktop decides OIDC from the server's manifest, so a server reached
   through a subpath proxy (manifest not at the origin root) keeps the in-window
   sign-in. Reproduce with the reporter's exact server URL.
