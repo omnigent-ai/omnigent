@@ -255,7 +255,7 @@ def create_sandbox_inference_router(
                 )
                 result.update(
                     status="unavailable",
-                    error="Could not load AI Gateway models. You can use Harness default.",
+                    error="Could not load AI Gateway models. You can use Default.",
                 )
         return result
 

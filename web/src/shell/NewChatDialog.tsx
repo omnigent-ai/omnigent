@@ -3851,7 +3851,7 @@ export function NewChatLandingScreen() {
                       ? [
                           {
                             key: "__default__",
-                            label: "Harness default",
+                            label: "Default",
                             checked: !routingOn && pickedModel === "",
                             onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
                             testId: "new-chat-landing-agent-model-default",
@@ -4898,7 +4898,7 @@ export function NewChatLandingScreen() {
     pickerEdits.harness === previewHarness &&
     pickerEdits.options.model &&
     !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
-      ? "The selected model is unavailable. Choose another model or Harness default."
+      ? "The selected model is unavailable. Choose another model or Default."
       : pickerLoading || !pickerEdits?.pendingValidation
         ? null
         : pickerEdits && pickerEdits.agentId !== effectiveAgentId

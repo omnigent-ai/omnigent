@@ -1371,7 +1371,10 @@ describe("model picker hotkey", () => {
     // Lands directly on the selected harness's edit submenu (Models / Effort),
     // not just the harness list.
     expect(await screen.findByTestId("new-chat-landing-agent-models")).toBeVisible();
-    const selectedModel = screen.getByRole("menuitemcheckbox", { name: "Harness default" });
+    const selectedModel = within(screen.getByTestId("new-chat-landing-agent-models")).getByRole(
+      "menuitemcheckbox",
+      { name: "Default" },
+    );
     await waitFor(() => expect(selectedModel).toHaveFocus());
     await user.keyboard("{ArrowDown}");
     const nextModel = screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" });
@@ -1390,7 +1393,11 @@ describe("model picker hotkey", () => {
     expect(screen.getByRole("menuitem", { name: "Claude Code" })).toHaveFocus();
     fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
     await waitFor(() =>
-      expect(screen.getByRole("menuitemcheckbox", { name: "Harness default" })).toHaveFocus(),
+      expect(
+        within(screen.getByTestId("new-chat-landing-agent-models")).getByRole("menuitemcheckbox", {
+          name: "Default",
+        }),
+      ).toHaveFocus(),
     );
   });
 });
@@ -5428,7 +5435,7 @@ describe("NewChatLandingScreen", () => {
       target: { value: "run the build" },
     });
     const trigger = selectedPickerModel();
-    expect(trigger.textContent).toContain("Harness default");
+    expect(trigger.textContent).toContain("Default");
     expect(trigger.textContent).not.toContain("Haiku 4.5");
 
     // Saving the fallback sends no override, so the launch uses the provider's default.
@@ -5543,7 +5550,7 @@ describe("NewChatLandingScreen", () => {
     // The Codex model is remembered under codex-native only; Claude Code's
     // picker should reopen on its own Default instead of inheriting the GPT id.
     openAgentModels("a1");
-    expect(selectedPickerModel().textContent).toContain("Harness default");
+    expect(selectedPickerModel().textContent).toContain("Default");
     expect(selectedPickerModel().textContent).not.toContain("GPT-5.6");
     closePrimaryPicker();
 
@@ -8869,7 +8876,7 @@ describe("NewChatLandingScreen smart routing", () => {
   // the server flag off, Smart Routing is never an option.
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
-    ["Claude Code", "a1", false, null, "Harness default"],
+    ["Claude Code", "a1", false, null, "Default"],
     ["Codex", "a2", true, "Smart Routing", "GPT-5.5"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
@@ -8881,7 +8888,11 @@ describe("NewChatLandingScreen smart routing", () => {
       } else {
         expect(screen.getByRole("menuitemcheckbox", { name: routingOption })).toBeTruthy();
       }
-      expect(screen.getByRole("menuitemcheckbox", { name: siblingOption })).toBeTruthy();
+      expect(
+        within(screen.getByTestId("new-chat-landing-agent-models")).getByRole("menuitemcheckbox", {
+          name: siblingOption,
+        }),
+      ).toBeTruthy();
     },
   );
 
@@ -9110,7 +9121,7 @@ describe("NewChatLandingScreen smart routing", () => {
     // Claude Code never had routing picked, so it stays on Default.
     openAgentModels("a1");
     const model = selectedPickerModel();
-    expect(model.textContent).toContain("Harness default");
+    expect(model.textContent).toContain("Default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -9120,14 +9131,18 @@ describe("NewChatLandingScreen smart routing", () => {
     pickPrimaryOption("model", "Smart Routing");
     closePrimaryPicker();
     openAgentModels("a1");
-    // By role, not text: "Default" also labels the Permissions row's value.
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Harness default" }));
+    // Model and effort sections both have a Default choice.
+    fireEvent.click(
+      within(screen.getByTestId("new-chat-landing-agent-models")).getByRole("menuitemcheckbox", {
+        name: "Default",
+      }),
+    );
     closePrimaryPicker();
 
     remountLanding({ smart_routing_enabled: true });
     openAgentModels("a1");
     const model = selectedPickerModel();
-    expect(model.textContent).toContain("Harness default");
+    expect(model.textContent).toContain("Default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -9139,7 +9154,7 @@ describe("NewChatLandingScreen smart routing", () => {
     renderLanding({ smart_routing_enabled: false });
     openAgentModels("a1");
     const model = selectedPickerModel();
-    expect(model.textContent).toContain("Harness default");
+    expect(model.textContent).toContain("Default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -10843,7 +10858,7 @@ describe("managed sandbox gateway preview", () => {
     preview(catalog, new Error("Gateway temporarily unavailable"));
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-    expect(screen.getByRole("alert")).toHaveTextContent("Choose another model or Harness default");
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose another model or Default");
     openAgentModels("a2");
     expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
     expect(screen.getByText("Gateway temporarily unavailable")).toBeVisible();

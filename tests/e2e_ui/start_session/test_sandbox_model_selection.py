@@ -80,12 +80,7 @@ async def _drive_gateway(
                         "provider_label": "AI Gateway",
                         "default_model": None,
                         **(
-                            {
-                                "error": (
-                                    "Could not load AI Gateway models. "
-                                    "You can use Harness default."
-                                )
-                            }
+                            {"error": ("Could not load AI Gateway models. You can use Default.")}
                             if unavailable
                             else {}
                         ),
