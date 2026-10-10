@@ -131,6 +131,16 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
+def _runner_reply_json(resp: httpx.Response) -> Any:
+    """Decode runner JSON, mapping empty or non-JSON replies to HTTP 502."""
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502, detail="runner resource endpoint returned invalid JSON"
+        ) from exc
+
+
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
 # running server loop (not import time) and picks up the configured size. The
@@ -480,12 +490,7 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        try:
-            response_payload = resp.json()
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=502, detail="runner resource endpoint returned invalid JSON"
-            ) from exc
+        response_payload = _runner_reply_json(resp)
         if resp.status_code == 404:
             message = "Resource not found"
             if isinstance(response_payload, dict):
@@ -984,7 +989,7 @@ def register_resources_routes(
         :param body: JSON body to forward.
         :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
-        :raises HTTPException: 502 on transport failure.
+        :raises HTTPException: 502 on transport failure or a non-JSON reply.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -1006,7 +1011,7 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_reply_json(resp)
 
     async def _proxy_delete_to_runner(
         session_id: str,
@@ -1019,7 +1024,7 @@ def register_resources_routes(
         :param path: Runner-relative URL path.
         :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
-        :raises HTTPException: 502 on transport failure.
+        :raises HTTPException: 502 on transport failure or a non-JSON reply.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -1037,7 +1042,7 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_reply_json(resp)
 
     async def _proxy_put_to_runner(
         session_id: str,
@@ -1052,7 +1057,7 @@ def register_resources_routes(
         :param body: JSON body to forward.
         :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
-        :raises HTTPException: 502 on transport failure.
+        :raises HTTPException: 502 on transport failure or a non-JSON reply.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -1074,7 +1079,7 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_reply_json(resp)
 
     async def _proxy_patch_to_runner(
         session_id: str,
@@ -1089,7 +1094,7 @@ def register_resources_routes(
         :param body: JSON body to forward.
         :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
-        :raises HTTPException: 502 on transport failure.
+        :raises HTTPException: 502 on transport failure or a non-JSON reply.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -1111,7 +1116,7 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_reply_json(resp)
 
     # Typed collection routes registered BEFORE /{resource_id} so
     # "environments", "terminals", "files" are not captured as ids.
