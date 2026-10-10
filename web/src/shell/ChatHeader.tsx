@@ -380,13 +380,13 @@ export function ChatHeader({
       const gaps = 2 * (parseFloat(style.columnGap) || 0);
       const leftWidth = left.getBoundingClientRect().width;
       const rightWidth = right.getBoundingClientRect().width;
-      const reserve = Math.max(
-        0,
-        Math.min(Math.max(leftWidth, rightWidth), (inner - gaps - MIN_BREADCRUMB_PX) / 2),
-      );
+      // Space left for both side columns once the breadcrumb keeps its minimum;
+      // a side gets its symmetric share only up to what the other side's content leaves.
+      const budget = Math.max(0, inner - gaps - MIN_BREADCRUMB_PX);
+      const target = Math.min(Math.max(leftWidth, rightWidth), budget / 2);
       const next = {
-        left: Math.ceil(Math.max(leftWidth, reserve)),
-        right: Math.ceil(Math.max(rightWidth, reserve)),
+        left: Math.ceil(Math.max(leftWidth, Math.min(target, budget - rightWidth))),
+        right: Math.ceil(Math.max(rightWidth, Math.min(target, budget - leftWidth))),
       };
       setSideColumns((prev) =>
         prev.left === next.left && prev.right === next.right ? prev : next,
@@ -594,7 +594,6 @@ export function ChatHeader({
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
         "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center gap-1 px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        // Desktop grid uses the measured side-column reservations (sideColumns).
         "md:grid md:grid-cols-[minmax(var(--chat-header-left,0px),1fr)_auto_minmax(var(--chat-header-right,0px),1fr)] md:gap-6",
         settingsMode && "settings-mobile-header",
       )}

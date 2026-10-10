@@ -301,11 +301,17 @@ describe("ChatHeader — workspace pane alignment", () => {
     expect(renderSideColumns(1000)).toEqual(["138px", "138px"]);
   });
 
-  it("shrinks the empty side's reservation before a narrow header overflows", () => {
-    // The populated side keeps its own 138px; the empty side gets what is left
-    // per side once padding, both column gaps and the breadcrumb minimum are out.
-    const emptySide = (300 - 2 * HEADER_PADDING_PX - 2 * COLUMN_GAP_PX - MIN_BREADCRUMB_PX) / 2;
-    expect(renderSideColumns(300)).toEqual([`${emptySide}px`, "138px"]);
+  it("shrinks the empty side's reservation before a narrow header squeezes the breadcrumb", () => {
+    // A 384px header (a 768px viewport with the sidebar at its 50% limit) has
+    // 304px for the three columns: the populated side keeps its 138px and the
+    // empty side gets only the 46px that still leave the breadcrumb its minimum.
+    const columns = 384 - 2 * HEADER_PADDING_PX - 2 * COLUMN_GAP_PX;
+    expect(renderSideColumns(384)).toEqual(["46px", "138px"]);
+    expect(columns - 46 - 138).toBe(MIN_BREADCRUMB_PX);
+  });
+
+  it("falls back to each side's own width when even the breadcrumb minimum does not fit", () => {
+    expect(renderSideColumns(300)).toEqual(["0px", "138px"]);
   });
 });
 

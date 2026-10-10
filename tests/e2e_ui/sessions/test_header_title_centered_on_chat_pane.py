@@ -223,3 +223,61 @@ def test_narrow_chat_pane_keeps_the_title_visible_and_the_controls_inside(
         f"breadcrumb is not centered in the narrow pane: midpoint {_center_x(crumb_box):.0f}px "
         f"vs pane midpoint {_center_x(pane_box):.0f}px (offset {offset:+.0f}px)"
     )
+
+
+_MAC_SHELL_INIT = """
+Object.defineProperty(navigator, 'userAgent', {
+  value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)', configurable: true,
+});
+window.omnigentDesktop = {
+  kind: 'electron',
+  setBadgeCount() {},
+  notify: () => Promise.resolve(false),
+  onNotificationActivated: () => () => {},
+  getServerPicker: () => Promise.resolve(null),
+  switchServer: () => Promise.resolve(),
+  openServerSetup() {},
+};
+"""
+# index.css pads the collapsed header's toggle slot 10.5rem past the traffic
+# lights and the title-bar cluster on the macOS shell.
+_MAC_CLEARANCE_PX = 168
+
+
+@pytest.mark.browser_context_args(viewport=_VIEWPORT, record_video_size=_VIEWPORT)
+def test_collapsed_sidebar_on_the_macos_shell_keeps_the_title_centered_past_the_titlebar(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Exercise the macOS shell CSS in Chromium (no native traffic lights): with the
+    sidebar collapsed, the breadcrumb clears the title-bar clearance and stays centered."""
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, _TITLE)
+
+    page: Page = request.getfixturevalue("page")
+    page.add_init_script(_MAC_SHELL_INIT)
+    _open_titled_session(page, base_url, session_id, _TITLE)
+    expect(page.locator("html")).to_have_attribute("data-electron-mac", "true")
+    _close_workspace_panel(page)
+
+    page.locator('button[aria-label="Close sidebar"]:visible').first.click()
+    expect(page.locator(_CONVERSATIONS)).to_have_attribute("data-collapsed", "true")
+    page.wait_for_timeout(_LAYOUT_SETTLE_MS)
+
+    pane_box = page.get_by_role("main").bounding_box()
+    crumb_box = page.get_by_role("navigation", name="Conversation").bounding_box()
+    actions_box = page.get_by_test_id("header-actions").bounding_box()
+    assert pane_box is not None and crumb_box is not None and actions_box is not None
+    assert pane_box["x"] <= 1, pane_box
+
+    assert crumb_box["x"] >= _MAC_CLEARANCE_PX, (
+        f"breadcrumb starts at {crumb_box['x']:.0f}px, inside the "
+        f"{_MAC_CLEARANCE_PX}px title-bar clearance"
+    )
+    assert crumb_box["x"] + crumb_box["width"] <= actions_box["x"] + 1, (crumb_box, actions_box)
+    offset = _center_x(crumb_box) - _center_x(pane_box)
+    assert abs(offset) <= _BREADCRUMB_TOLERANCE_PX, (
+        f"breadcrumb is not centered with the sidebar collapsed: midpoint "
+        f"{_center_x(crumb_box):.0f}px vs pane midpoint {_center_x(pane_box):.0f}px "
+        f"(offset {offset:+.0f}px)"
+    )
