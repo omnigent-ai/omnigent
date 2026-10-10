@@ -6,6 +6,8 @@ Tests ``resolve_host_owner`` and ``resolve_host_launch`` directly
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import pytest
@@ -16,9 +18,11 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.routes._host_launch import (
+    LAUNCH_TIMEOUT_ENV_VAR,
     host_absent_error,
     resolve_host_launch,
     resolve_host_owner,
+    resolve_launch_timeout_s,
 )
 from omnigent.stores.host_store import now_epoch
 
@@ -291,3 +295,68 @@ class TestHostAbsentError:
         host = _FakeHost(host_id="host_1", status="offline", updated_at=0)
         assert host_absent_error(host, sharded=True).code == ErrorCode.CONFLICT
         assert host_absent_error(host, sharded=False).code == ErrorCode.CONFLICT
+
+
+# ── resolve_launch_timeout_s (operator-tunable launch budget) ─────────
+
+
+@pytest.fixture(autouse=True)
+def _clear_launch_timeout_cache() -> Iterator[None]:
+    """Drop the cached budget so each case reads its own env value."""
+    resolve_launch_timeout_s.cache_clear()
+    yield
+    resolve_launch_timeout_s.cache_clear()
+
+
+class TestResolveLaunchTimeout:
+    def test_defaults_to_thirty_seconds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unset override keeps the historical budget, so existing
+        deployments see no change in launch-failure latency."""
+        monkeypatch.delenv(LAUNCH_TIMEOUT_ENV_VAR, raising=False)
+        assert resolve_launch_timeout_s() == 30.0
+
+    def test_override_widens_the_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A deployment whose launch pulls an image or builds a container
+        sandbox raises the bound instead of failing a healthy session."""
+        monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "300")
+        assert resolve_launch_timeout_s() == 300.0
+
+    def test_override_accepts_fractional_seconds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "2.5")
+        assert resolve_launch_timeout_s() == 2.5
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_blank_is_treated_as_unset(self, monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+        """Compose files that always export the variable shouldn't be read as
+        a configured value."""
+        monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, raw)
+        assert resolve_launch_timeout_s() == 30.0
+
+    def test_override_accepts_the_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "3600")
+        assert resolve_launch_timeout_s() == 3600.0
+
+    @pytest.mark.parametrize(
+        "raw", ["abc", "30s", "0", "-5", "0.05", "nan", "inf", "-inf", "infinity", "3601"]
+    )
+    def test_unusable_value_falls_back_with_a_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        raw: str,
+    ) -> None:
+        """A malformed, sub-second, non-finite or over-ceiling setting must not
+        become a launch budget: ``inf`` would hang a launch the host never
+        answers, and raising would fail every session create. Fall back."""
+        monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, raw)
+        with caplog.at_level(logging.WARNING):
+            assert resolve_launch_timeout_s() == 30.0
+        assert LAUNCH_TIMEOUT_ENV_VAR in caplog.text
+
+    def test_budget_is_cached_for_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolved once, so the warning isn't logged per session create and
+        every launch in a process shares one budget."""
+        monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "120")
+        assert resolve_launch_timeout_s() == 120.0
+        monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "240")
+        assert resolve_launch_timeout_s() == 120.0

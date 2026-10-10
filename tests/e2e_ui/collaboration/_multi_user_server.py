@@ -25,7 +25,6 @@ headerless writes, so a ``local``-owned session can't be created here anyway).
 
 from __future__ import annotations
 
-import json as _json
 import os
 import signal
 import subprocess
@@ -37,6 +36,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _HEALTH_POLL_INTERVAL_S,
     _HEALTH_TIMEOUT_S,
@@ -93,6 +93,7 @@ def spawn_multi_user_server(
     server_tmp,
     *,
     extra_server_env: dict[str, str] | None = None,
+    admin_headers: dict[str, str] | None = None,
 ) -> Iterator[MultiUserServer]:
     """Spawn a multi-user server + one admin-owned session; yield a handle.
 
@@ -105,6 +106,7 @@ def spawn_multi_user_server(
     :param mock_llm_server_url: Session-scoped mock LLM base (no real creds).
     :param server_tmp: A per-test temp dir (``tmp_path_factory.mktemp(...)``).
     :param extra_server_env: Extra env vars for the server process.
+    :param admin_headers: Admin credentials when testing a different identity header.
     :yields: A :class:`MultiUserServer` handle.
     """
     port = _find_free_port()
@@ -126,7 +128,8 @@ def spawn_multi_user_server(
     pythonpath = f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
     # Requests authenticated as the admin identity. A multi-user header-auth
     # server 401s headerless requests, so every REST call here carries it.
-    admin_headers = {"X-Forwarded-Email": ADMIN_EMAIL}
+    if admin_headers is None:
+        admin_headers = {"X-Forwarded-Email": ADMIN_EMAIL}
 
     server_env = {
         **os.environ,
@@ -137,6 +140,7 @@ def spawn_multi_user_server(
         # A header-identified admin so the browser (X-Forwarded-Email) can
         # manage its session (Share button) and see the admin settings group.
         "OMNIGENT_ADMIN_LIST_PATH": str(admins_path),
+        "OMNIGENT_ADMIN_CREDENTIALS_PATH": str(server_tmp / "admin-credentials"),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         "ANTHROPIC_API_KEY": "",
@@ -196,12 +200,8 @@ def spawn_multi_user_server(
         # no turn: the Share modal / button / settings nav only need a
         # top-level session to exist at manage level, which the owner has.
         bundle = _build_hello_world_bundle()
-        create = httpx.post(
-            f"{base_url}/v1/sessions",
-            data={"metadata": _json.dumps({})},
-            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-            headers=admin_headers,
-            timeout=30.0,
+        create = post_session_bundle(
+            httpx.post, f"{base_url}/v1/sessions", bundle, headers=admin_headers, timeout=30.0
         )
         create.raise_for_status()
         session_id = create.json()["session_id"]

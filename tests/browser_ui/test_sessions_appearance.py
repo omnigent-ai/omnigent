@@ -98,10 +98,14 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
         "/v1/sessions",
         {**empty_list, "data": sessions, "first_id": session_ids[0], "last_id": session_ids[-1]},
     )
+    # The sliding header can hover-open agent info while the workspace panel toggles.
+    browser_contract.json("/v1/policy-registry", empty_list)
     for session in sessions:
         session_id = session["id"]
         browser_contract.json(f"/v1/sessions/{session_id}", session)
         browser_contract.json(f"/v1/sessions/{session_id}/items", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/policies", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/owner", {"owner": None})
         browser_contract.json(
             f"/v1/sessions/{session_id}/agent",
             {
@@ -146,10 +150,10 @@ def test_reset_button_has_rendered_top_margin(page: Page, appearance_url: str) -
     _open_appearance(page, appearance_url)
     gap = page.get_by_test_id("reset-appearance-button").evaluate(
         """button => {
-            const wrapper = button.closest('div');
-            const controls = wrapper.previousElementSibling;
-            if (!controls) throw new Error('controls column sibling not found');
-            return wrapper.getBoundingClientRect().top - controls.getBoundingClientRect().bottom;
+            const group = button.closest('[data-testid="settings-group-data"]');
+            const controls = group?.previousElementSibling;
+            if (!group || !controls) throw new Error('appearance groups not found');
+            return group.getBoundingClientRect().top - controls.getBoundingClientRect().bottom;
         }"""
     )
     assert gap >= 24, f"Reset button margin is only {gap:.0f}px; expected at least 24px"

@@ -137,6 +137,12 @@ def resolve_pi_executable(
     return resolved
 
 
+# Pi 0.79.0 added ``--approve``; 0.80.4 added the ``agent_settled`` RPC event
+# that marks a prompt's run as fully finished (after retries and compaction).
+PI_APPROVE_MIN_VERSION = (0, 79, 0)
+PI_AGENT_SETTLED_MIN_VERSION = (0, 80, 4)
+
+
 def pi_version(executable: str) -> tuple[int, int, int] | None:
     """Return the Pi CLI version as ``(major, minor, patch)``, or ``None``.
 
@@ -186,7 +192,7 @@ def pi_supports_approve(executable: str) -> bool:
     ver = pi_version(executable)
     if ver is None:
         return False
-    return ver >= (0, 79, 0)
+    return ver >= PI_APPROVE_MIN_VERSION
 
 
 def build_pi_launch(

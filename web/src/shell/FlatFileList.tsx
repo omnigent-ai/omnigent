@@ -12,6 +12,7 @@ import {
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
+import { useRevealMenu } from "./RevealInFileManager";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -81,6 +82,7 @@ function FileListItem({
   conversationId: string | undefined;
 }) {
   const { handlers, tooltip } = useCursorTooltip(file.path);
+  const reveal = useRevealMenu(isDeleted ? null : file.path);
   const slash = file.path.lastIndexOf("/");
   const dir = slash > 0 ? file.path.slice(0, slash) : "";
   const hasDownload = !isDeleted && Boolean(conversationId);
@@ -88,6 +90,7 @@ function FileListItem({
   return (
     <li>
       <div
+        onContextMenu={reveal.onContextMenu}
         className={cn(
           "group flex w-full min-w-0 items-center gap-2 rounded-md py-0.5 pr-1 pl-2",
           isDeleted ? "opacity-50" : "hover:bg-muted",
@@ -166,6 +169,7 @@ function FileListItem({
             <CopyPathButton path={file.path} revealOnHover />
           </span>
         </span>
+        {reveal.menu}
       </div>
       {tooltip}
     </li>

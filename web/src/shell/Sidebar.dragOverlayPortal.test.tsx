@@ -1,7 +1,8 @@
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // The session-drag preview (dnd-kit DragOverlay) must render in a portal under
 // <body>, never inline inside the sidebar <aside>. The aside always carries a
 // CSS translate (the mobile slide-in), which makes it the containing block for
@@ -9,10 +10,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // coordinates against the aside's box and drifts away from the cursor whenever
 // the aside sits off (0,0), e.g. while it peeks as a floating card.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -26,44 +24,17 @@ vi.mock("@/hooks/useProjectOrder", () => ({
   useSaveProjectOrder: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: vi.fn(() => ({ data: [] })),
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    hasNextPage: false,
-    isFetchingNextPage: false,
-    fetchNextPage: vi.fn(),
-  }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return { ...conversationHooksMock(), useProjects: vi.fn(() => ({ data: [] })) };
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+// Keep Fork actionable: the restriction hook would otherwise wait on a session
+// snapshot this test never serves.
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: () => ({}),
+}));
 vi.mock("./ForkSessionDialog", () => ({
   ForkSessionDialog: ({ open }: { open: boolean }) => (
     <Dialog open={open}>
@@ -84,62 +55,11 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations, useProjects } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
-function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
-  return {
-    id,
-    object: "conversation",
-    title: id,
-    created_at: 0,
-    updated_at: 0,
-    labels: {},
-    permission_level: null,
-    status: "idle",
-    ...partial,
-  };
-}
-
 function mockConversations(conversations: Conversation[]) {
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: conversations,
-              first_id: conversations[0]?.id ?? null,
-              last_id: conversations.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
+  useConvMock.mockImplementation(() => conversationPage(conversations));
 }
 
 /** Activate a real dnd-kit drag on a session row: press, then travel past the

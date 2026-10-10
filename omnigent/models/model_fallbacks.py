@@ -80,7 +80,7 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
             "databricks-claude-opus-4-8",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="AI Gateway Claude serving endpoints, cheapest → most powerful",
+        provenance="Unity Gateway Claude serving endpoints, cheapest → most powerful",
         discovery_gap=(
             "the router picks before a session's live model catalog is reachable, "
             "and a gateway listing ranks models by neither cost nor capability"
@@ -94,7 +94,7 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
             "databricks-gpt-5-5",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="AI Gateway GPT serving endpoints, cheapest → most powerful",
+        provenance="Unity Gateway GPT serving endpoints, cheapest → most powerful",
         discovery_gap=(
             "the router picks before a session's live model catalog is reachable, "
             "and a gateway listing ranks models by neither cost nor capability"

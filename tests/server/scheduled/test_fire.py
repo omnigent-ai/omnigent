@@ -19,16 +19,22 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.db.db_models import current_workspace_id
+from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.bundles import bundle_location
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +56,11 @@ class _FakeAgent:
     bundle_location: str | None = None
     session_id: str | None = None
     name: str = "assistant"
+    created_by: str | None = None
+
+    @property
+    def operator_authored(self) -> bool:
+        return self.session_id is None and self.created_by is None
 
 
 class FakeAgentStore:
@@ -458,6 +469,33 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@pytest.mark.asyncio
+async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """The fire copies another user's agent once and repoints the task, so that
+    user's later changes never reach the runs."""
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    bundle = build_agent_bundle("orion")
+    location = bundle_location(agent_id, bundle)
+    artifacts.put(location, bundle)
+    agents.create_user_agent(agent_id, "orion", location, owner="alice@example.com")
+    task = _task(user_id="bob@example.com", agent_id=agent_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    deps = _deps(store, agent_store=agents, artifact_store=artifacts)
+
+    moved = await fire_mod._own_task_agent(deps, task)
+
+    copy = agents.get(moved.agent_id)
+    assert copy is not None and copy.id != agent_id
+    assert (copy.name, copy.created_by) == ("orion", "bob@example.com")
+    assert store.updates == [{"id": "task_1", "agent_id": copy.id}]
+    assert (await fire_mod._own_task_agent(deps, moved)).agent_id == copy.id
+    assert len(store.updates) == 1, "the owner's own copy is never copied again"
 
 
 @pytest.mark.asyncio
@@ -874,7 +912,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
         return None
 
     async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
-        return None
+        captured["agent_revision"] = kwargs.get("agent_revision")
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
@@ -897,12 +935,15 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
             conversation_store=FakeConversationStore(),
             host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
             host_registry=FakeHostRegistry(online={"host_1"}),
+            agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/rev1")}),
         )
     )
 
     await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
 
     assert captured["user_id"] == RESERVED_USER_LOCAL
+    # The kickoff names the bundle it runs, so the runner sees a later reinstall.
+    assert captured["agent_revision"] == "ag_1/rev1"
 
 
 @pytest.mark.asyncio

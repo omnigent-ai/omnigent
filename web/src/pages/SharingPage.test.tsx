@@ -48,6 +48,9 @@ function state(overrides: Partial<SharingState> = {}): SharingState {
     options: ["on", "read_only", "restricted_read_only", "off"],
     public_sharing_enabled: true,
     public_sharing_editable: true,
+    public_sharing_max_level: "read",
+    public_sharing_max_level_editable: true,
+    public_sharing_max_level_options: ["read", "edit"],
     default_public_sessions: "off",
     default_public_sessions_editable: true,
     default_public_sessions_options: ["off", "sandbox", "all"],
@@ -94,6 +97,56 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SharingPage", () => {
+  it("updates the public ceiling independently of the sharing mode", async () => {
+    setSharingState(state());
+    renderPage();
+    const trigger = await screen.findByRole("combobox", { name: "Maximum public permission" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Edit" }));
+    expect(setModeMutate).toHaveBeenCalledWith(
+      { public_sharing_max_level: "edit" },
+      expect.anything(),
+    );
+  });
+
+  it("disables a deployment-managed public ceiling", async () => {
+    setSharingState(state({ public_sharing_max_level_editable: false }));
+    renderPage();
+    expect(
+      await screen.findByRole("combobox", { name: "Maximum public permission" }),
+    ).toBeDisabled();
+  });
+
+  it("uses titled outlined groups and mobile description tooltips", async () => {
+    setSharingState(state());
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
+
+    expect(screen.getByText(/Control whether users on this server can share sessions/)).toHaveClass(
+      "max-md:hidden",
+    );
+    for (const testId of ["settings-group-sharing-mode", "settings-group-public-sharing"]) {
+      expect(screen.getByTestId(testId).lastElementChild).toHaveClass(
+        "rounded-xl",
+        "border",
+        "border-border",
+        "bg-card",
+      );
+    }
+
+    expect(screen.getByText(/Allow sharing a session with anyone who has the link/)).toHaveClass(
+      "max-md:hidden",
+    );
+    const help = screen.getByRole("button", { name: "About Public access" });
+    expect(help).toHaveClass("md:hidden");
+    fireEvent.click(help);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      /Allow sharing a session with anyone who has the link/,
+    );
+  });
+
   it("shows all four tiers with the current one selected (admin)", async () => {
     setSharingState(state({ sharing_mode: "read_only" }));
 
@@ -290,6 +343,43 @@ describe("SharingPage", () => {
       expect(radios.find((r) => r.value === "off")!.checked).toBe(true);
       fireEvent.click(toggle);
       expect(setModeMutate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("waits for identity before loading settings", () => {
+    const enabledArgs = () =>
+      vi.mocked(sharingHook.useSharing).mock.calls.map((c) => c[0]?.enabled);
+
+    beforeEach(() => vi.mocked(sharingHook.useSharing).mockClear());
+
+    it("does not load while /v1/me is pending, then loads for an admin", async () => {
+      let resolveMe: (id: string) => void = () => {};
+      vi.mocked(identity.resolveIdentity).mockReturnValue(
+        new Promise<string>((r) => {
+          resolveMe = r;
+        }),
+      );
+      setSharingState(state());
+
+      renderPage();
+      expect(enabledArgs()).toEqual(expect.arrayContaining([false]));
+      expect(enabledArgs()).not.toContain(true);
+
+      resolveMe("admin@example.com");
+      await waitFor(() => expect(enabledArgs()).toContain(true));
+    });
+
+    it("never loads for a non-admin", async () => {
+      vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+      setSharingState(undefined);
+
+      renderPage();
+      await waitFor(() =>
+        expect(
+          screen.getByText("You don't have permission to manage session sharing."),
+        ).toBeInTheDocument(),
+      );
+      expect(enabledArgs().every((enabled) => enabled === false)).toBe(true);
     });
   });
 });
