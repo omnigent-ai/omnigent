@@ -1374,6 +1374,9 @@ def create_runner_app(
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    # Forwarded messages between arrival and turn start (or buffering), per session.
+    _message_ingest_inflight: dict[str, int] = {}
+    app.state.message_ingest_inflight = _message_ingest_inflight
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     # Desynced conversations; cleared when a fresh turn binds.
@@ -2987,10 +2990,13 @@ def create_runner_app(
             history = []
         else:
             history = await _load_history_as_input(session_id)
+        # A forwarded message still ingesting starts its own turn over the full history.
+        ingest_inflight = _message_ingest_inflight.get(session_id, 0) > 0
         execution_seen = (
             initially_active
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
             or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+            or ingest_inflight
         )
         recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:
@@ -3091,6 +3097,7 @@ def create_runner_app(
                 ),
                 suppress_recovery_turn=_suppress_recovery,
                 execution_seen=execution_seen,
+                message_ingest_inflight=ingest_inflight,
                 history_len=len(history),
                 last_item_type=history[-1].get("type") if history else None,
             ),
@@ -3766,6 +3773,14 @@ def create_runner_app(
         """
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
+
+    def _end_message_ingest(conv_id: str) -> None:
+        """Release one in-flight message ingest, dropping the entry at zero."""
+        remaining = _message_ingest_inflight.get(conv_id, 1) - 1
+        if remaining > 0:
+            _message_ingest_inflight[conv_id] = remaining
+        else:
+            _message_ingest_inflight.pop(conv_id, None)
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -6325,15 +6340,23 @@ def create_runner_app(
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
 
+            # Counted from arrival so a concurrent session init defers its history resume to it.
+            _message_ingest_inflight[conversation_id] = (
+                _message_ingest_inflight.get(conversation_id, 0) + 1
+            )
             _seq = _ingest_next_seq.get(conversation_id, 0)
             _ingest_next_seq[conversation_id] = _seq + 1
             _cond = _ingest_cond.get(conversation_id)
             if _cond is None:
                 _cond = asyncio.Condition()
                 _ingest_cond[conversation_id] = _cond
-            async with _cond:
-                while _ingest_now_serving.get(conversation_id, 0) != _seq:
-                    await _cond.wait()
+            try:
+                async with _cond:
+                    while _ingest_now_serving.get(conversation_id, 0) != _seq:
+                        await _cond.wait()
+            except BaseException:
+                _end_message_ingest(conversation_id)
+                raise
             try:
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
@@ -6343,7 +6366,8 @@ def create_runner_app(
                         server_client=server_client,
                     )
 
-                if conversation_id in _active_turns:
+                async def _buffer_for_active_turn() -> JSONResponse:
+                    """Queue the message for the live turn, injecting it when the harness can."""
                     _native = _is_native_harness(conversation_id)
                     _awaiting_approval = pending_approvals.has_pending(conversation_id)
                     _can_forward = (
@@ -6406,6 +6430,9 @@ def create_runner_app(
                         },
                     )
 
+                if conversation_id in _active_turns:
+                    return await _buffer_for_active_turn()
+
                 if _session_harness_name(conversation_id) == "claude-native":
                     pending_bridge_dir = None
                     has_queued_messages = bool(_session_message_buffers.get(conversation_id))
@@ -6450,6 +6477,9 @@ def create_runner_app(
                         conversation_id,
                         drop_item_id=persisted_item_id,
                     )
+                    # A turn that started during the load owns the slot and history.
+                    if conversation_id in _active_turns:
+                        return await _buffer_for_active_turn()
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
@@ -6489,6 +6519,7 @@ def create_runner_app(
                     },
                 )
             finally:
+                _end_message_ingest(conversation_id)
                 async with _cond:
                     _ingest_now_serving[conversation_id] = _seq + 1
                     _cond.notify_all()
