@@ -2514,6 +2514,84 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
 
 
 @pytest.mark.asyncio
+async def test_events_interrupt_on_opencode_native_aborts_the_native_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """POST ``/events`` interrupt on an opencode-native session aborts the turn.
+
+    opencode runs the turn inside its own ``serve`` process, so the runner
+    forwards the interrupt to the native ``POST /session/{id}/abort`` instead of
+    falling through to the in-process cancel, which cannot reach that process.
+    """
+    from omnigent.harnesses.opencode_native import app_server as opencode_native_app_server
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+
+    conv_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", tmp_path / "opencode-bridge")
+    bridge_dir = opencode_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    opencode_native_bridge.write_bridge_state(
+        bridge_dir,
+        opencode_native_bridge.OpenCodeNativeBridgeState(
+            session_id=conv_id,
+            server_base_url="http://127.0.0.1:49231",
+            opencode_session_id="ses_opencode",
+            auth_secret="server-password",
+            workspace=str(tmp_path / "ws"),
+        ),
+    )
+
+    abort_calls: list[str] = []
+    closed = {"value": False}
+    captured: dict[str, Any] = {}
+
+    class _FakeOpenCodeClient:
+        async def abort(self, session_id: str) -> bool:
+            abort_calls.append(session_id)
+            return True
+
+        async def aclose(self) -> None:
+            closed["value"] = True
+
+    def _fake_client_for_state(
+        *, base_url: str, auth_secret: str | None, directory: str | None = None
+    ) -> _FakeOpenCodeClient:
+        captured.update(base_url=base_url, auth_secret=auth_secret, directory=directory)
+        return _FakeOpenCodeClient()
+
+    monkeypatch.setattr(opencode_native_app_server, "client_for_state", _fake_client_for_state)
+
+    app, _ = await _build_app_for_spec(_harness_spec("opencode-native"))
+    async with _runner_client(app) as client:
+        # Seeds the spec cache so the /events dispatch detects "opencode-native".
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        int_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, (
+        f"opencode-native interrupt must return 204; got {int_resp.status_code}: {int_resp.text}"
+    )
+    # An empty list means the interrupt fell through to the in-process cancel,
+    # which cannot reach OpenCode's serve process.
+    assert abort_calls == ["ses_opencode"], (
+        f"opencode-native interrupt must abort the native session; got {abort_calls!r}."
+    )
+    assert closed["value"] is True
+    assert captured == {
+        "base_url": "http://127.0.0.1:49231",
+        "auth_secret": "server-password",
+        "directory": str(tmp_path / "ws"),
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["running", "idle", "newer_turn", "missing_turn", "rpc_failure"])
 async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
     monkeypatch: pytest.MonkeyPatch,

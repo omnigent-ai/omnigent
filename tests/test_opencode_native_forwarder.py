@@ -295,8 +295,13 @@ async def test_session_error_generic_posts_failed_without_reauth() -> None:
     assert "reauth_required" not in status
 
 
-async def test_session_error_message_aborted_takes_idle_path() -> None:
-    """A MessageAbortedError is a user interrupt → the normal idle path."""
+async def test_session_error_message_aborted_posts_cancelled_idle() -> None:
+    """A MessageAbortedError is a user interrupt → an idle edge stamped cancelled.
+
+    The server reads ``turn_outcome: cancelled`` on this edge to settle an
+    interrupted sub-agent dispatch as cancelled, instead of reading a bare idle
+    as a normal completion.
+    """
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
     await fwd.handle_event(
@@ -304,6 +309,7 @@ async def test_session_error_message_aborted_takes_idle_path() -> None:
     )
     status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
     assert status["status"] == "idle"
+    assert status["turn_outcome"] == "cancelled"
     assert "reauth_required" not in status
     assert "output" not in status
 
