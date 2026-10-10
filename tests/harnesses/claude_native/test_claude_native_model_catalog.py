@@ -8,9 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.models import model_catalog
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GATEWAY_KIND
 
 
 def _stub_picker(
@@ -289,3 +292,131 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
         },
         {"id": "future", "model": "vendor-future", "displayName": "Future model"},
     ]
+
+
+async def test_catalog_keeps_canonical_rows_for_bare_id_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured gateway whose /v1/models lists bare claude-* ids keeps canonical rows.
+
+    When a gateway provider (e.g. a LiteLLM passthrough) lists bare claude-*
+    ids in /v1/models, the catalog keeps the probe's canonical rows instead
+    of filtering them as non-canonical. Concrete listed ids are surfaced.
+    """
+
+    def _gateway_models_handler(request: httpx.Request) -> httpx.Response:
+        """Serve a mock /v1/models listing bare claude-* ids."""
+        if request.url.path == "/v1/models":
+            # Verify the return_wildcard_routes parameter is sent.
+            assert request.url.query == b"return_wildcard_routes=true"
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "claude-opus-4", "object": "model"},
+                        {"id": "claude-sonnet-4", "object": "model"},
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    # Mock the probe to return canonical rows.
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+                {"id": "sonnet", "model": "claude-sonnet-4", "displayName": "Sonnet 4"},
+            ],
+            default_model="claude-opus-5",
+            empty_picker=False,
+            disabled_models=set(),
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+
+    # Create a gateway provider config with a mock transport.
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={},
+        model=None,
+        listing_provider=model_catalog.ResolvedModelProvider(
+            kind=GATEWAY_KIND,
+            family=ANTHROPIC_FAMILY,
+            base_url="https://gateway.example.com",
+            api_key="test-key",
+            detail="test gateway",
+        ),
+    )
+
+    # Mock the listing fetch with the gateway handler.
+    original_fetch = model_catalog._fetch_openai_compatible_listing
+
+    def _mocked_fetch(
+        provider: model_catalog.ResolvedModelProvider,
+        *,
+        transport: object = None,
+        params: object = None,
+    ) -> model_catalog.ModelListing:
+        return original_fetch(
+            provider,
+            transport=httpx.MockTransport(_gateway_models_handler),
+            params=params,
+        )
+
+    monkeypatch.setattr(model_catalog, "_fetch_openai_compatible_listing", _mocked_fetch)
+
+    catalog = await claude_native.claude_model_catalog(config)
+    assert catalog is not None
+    # Verify canonical rows from the probe are kept.
+    ids = [row.get("id") for row in catalog]
+    models = [row.get("model") for row in catalog]
+    assert "opus" in ids
+    assert "sonnet" in ids
+    assert "claude-opus-4" in models  # Concrete id from gateway listing
+    assert "claude-sonnet-4" in models  # Concrete id from gateway listing
+
+
+async def test_catalog_drops_bare_rows_when_configured_databricks_listing_is_undetermined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured Databricks AI Gateway whose /v1/models fails keeps no bare claude-* rows.
+
+    The gateway routes only its own namespaced ids, so an undetermined listing
+    fails closed there instead of offering aliases that fail at the first turn.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+                {"id": "sonnet", "model": "claude-sonnet-4", "displayName": "Sonnet 4"},
+            ],
+            default_model="claude-opus-5",
+            empty_picker=False,
+            disabled_models=set(),
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    original_fetch = model_catalog._fetch_openai_compatible_listing
+
+    def _not_found_fetch(
+        provider: model_catalog.ResolvedModelProvider, **kwargs: Any
+    ) -> model_catalog.ModelListing:
+        kwargs["transport"] = httpx.MockTransport(lambda _request: httpx.Response(404))
+        return original_fetch(provider, **kwargs)
+
+    monkeypatch.setattr(model_catalog, "_fetch_openai_compatible_listing", _not_found_fetch)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={},
+        model=None,
+        listing_provider=model_catalog.ResolvedModelProvider(
+            kind=GATEWAY_KIND,
+            family=ANTHROPIC_FAMILY,
+            base_url="https://example.cloud.databricks.com/ai-gateway/anthropic",
+            api_key="test-key",
+            detail="databricks gateway",
+        ),
+    )
+
+    catalog = await claude_native.claude_model_catalog(config)
+
+    assert [row for row in catalog or [] if str(row.get("model", "")).startswith("claude-")] == []
