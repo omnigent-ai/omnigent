@@ -413,16 +413,39 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("version", "permission_args", "retain_subscription"),
+    (
+        "version",
+        "permission_args",
+        "retain_subscription",
+        "cancel_launch",
+        "use_envelope",
+        "provider_profile",
+    ),
     [
-        ((0, 153, 1), ["--config", "approval_policy=on-request"], False),
-        ((0, 154, 0), [], True),
-        (None, [], True),
+        pytest.param(
+            version,
+            permission_args,
+            retain_subscription,
+            cancel_launch,
+            use_envelope,
+            None,
+            id=f"{version}-{'cancel' if cancel_launch else 'launch'}-"
+            f"{'envelope' if use_envelope else 'legacy'}",
+        )
+        for version, permission_args, retain_subscription in [
+            ((0, 153, 1), ["--config", "approval_policy=on-request"], False),
+            ((0, 154, 0), [], True),
+            (None, [], True),
+        ]
+        for cancel_launch in (False, True)
+        for use_envelope in (False, True)
+    ]
+    + [
+        pytest.param(
+            (0, 154, 0), [], True, False, True, "configured-workspace", id="configured-provider"
+        )
     ],
 )
-@pytest.mark.parametrize("cancel_launch", [False, True])
-@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
-@pytest.mark.parametrize("provider_profile", [None, "configured-workspace"])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

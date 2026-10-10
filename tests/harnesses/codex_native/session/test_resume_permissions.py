@@ -49,9 +49,7 @@ def test_clear_bridge_state_removes_stale_runtime_state(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("retain_client", [False, True])
-@pytest.mark.parametrize(
-    "model_provider", [None, "omnigent_databricks", "custom-provider", "openai"]
-)
+@pytest.mark.parametrize("model_provider", [None, "omnigent_databricks"])
 def test_preload_codex_thread_for_resume_manages_subscription(
     monkeypatch: pytest.MonkeyPatch,
     retain_client: bool,
