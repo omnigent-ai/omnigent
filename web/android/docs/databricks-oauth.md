@@ -170,8 +170,10 @@ name/value at the final page URL.
 
 On relaunch, a saved grant bootstraps silently. Missing credentials show an
 explicit Sign In action instead of opening the browser without user input. An
-explicit connection may start browser sign-in immediately. Cancellation returns
-to setup with the entered workspace preserved.
+explicit connection may start browser sign-in immediately. Only a Connect or
+server switch made in the running process is explicit: Android restores a killed
+activity with its original intent, so a restored activity counts as a relaunch.
+Cancellation returns to setup with the entered workspace preserved.
 
 ## Session recovery
 

@@ -60,7 +60,7 @@ class ConnectActivity : ComponentActivity() {
         startActivity(
             Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                putExtra(MainActivity.EXTRA_USER_INITIATED_CONNECT, true)
+                putExtra(MainActivity.EXTRA_CONNECT_REQUEST, UserConnectRequests.issue())
             },
         )
         finish()
