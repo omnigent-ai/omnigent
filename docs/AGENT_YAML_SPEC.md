@@ -50,6 +50,7 @@ of the agent YAML.
 | `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
 | `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
+| `tool_groups` | Optional | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`. |
 
 ## Executor
 
@@ -738,6 +739,38 @@ Use `os_env: inherit` to give the terminal the same sandbox as the agent, or
 alias a shared `sandbox:` block so `sys_os_*` and the terminal enforce the same
 policy. Keep `allow_sandbox_override: false` unless you intend to let the
 launcher weaken the sandbox at launch time.
+
+## Tool groups
+
+Several framework-owned tool groups register on every agent without any
+declaration. Each one has a `tool_groups` key so an agent can drop a group it
+cannot use — a headless sub-agent has no embedded browser to drive, and a
+byte-bounded provider counts every advertised tool against its limit.
+
+```yaml
+tool_groups:
+  browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  comments: false         # list_comments / update_comment
+  policies: false         # sys_add_policy / sys_policy_registry
+  agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+```
+
+Every group defaults to `true`, so omitting the block changes nothing. Values
+must be booleans and group names must match exactly; a typo fails the load
+rather than silently leaving the group registered. Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt. The block
+is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+
+`agent_discovery: false` is rejected while `spawn: true` or the
+`scheduled_tasks` group is on: `sys_session_create` and
+`sys_scheduled_task_create` take an `agent_id` the model looks up with
+`sys_agent_list` / `sys_agent_get`.
+
+The session read tools (`sys_session_list` / `sys_session_get_history` /
+`sys_session_get_info`), `sys_session_rename`, and `sys_cancel_task` have no
+key: any agent in a multi-agent session needs the reads, and async work handles
+point at the cancel tool.
 
 ## Complete example
 
