@@ -12,6 +12,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const {
+  APP_ROOT,
   desktopDepsAvailable,
   spawnServer,
   launchDesktop,
@@ -21,6 +22,7 @@ const {
 const PYTHON = process.env.OMNIGENT_PYTHON || "python3";
 const COMPOSITOR = path.join(__dirname, "fixtures", "wayland_stub_compositor.py");
 const RECORD_DIR = path.join(__dirname, "recordings", "desktop-wayland-maximize");
+const OVERLAY_PAGE = path.join(APP_ROOT, "overlay", "update-overlay.html");
 
 const SHELL_READY_TEXT = "What should we build?";
 const WINDOWS_TIMEOUT_MS = 45_000;
@@ -66,7 +68,12 @@ async function waitForRawVideo(recordDir, expectedPages, timeout = 15_000) {
     const stable = total === last;
     if (sizes.length >= expectedPages && total > 0 && stable) return;
     const now = Date.now();
-    if (now >= hardDeadline || (now >= deadline && stable)) return;
+    if (now >= hardDeadline || (now >= deadline && stable)) {
+      if (sizes.length < expectedPages) {
+        console.warn(`waitForRawVideo: giving up with ${sizes.length}/${expectedPages} clips`);
+      }
+      return;
+    }
     last = total;
     await sleep(400);
   }
@@ -199,6 +206,11 @@ test("desktop shell survives maximize on Wayland", async (t) => {
   if (!pywaylandAvailable()) {
     return t.skip("pywayland >= 0.4.19 (stub compositor) not importable");
   }
+  assert.ok(
+    fs.existsSync(OVERLAY_PAGE),
+    `overlay bundle missing at ${OVERLAY_PAGE}. Build it first:\n` +
+      "  pnpm --filter web run build:overlay",
+  );
 
   fs.mkdirSync(RECORD_DIR, { recursive: true });
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-wl-server-"));
@@ -318,9 +330,6 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       (e) => e.event === "invalid_window_geometry",
     );
 
-    evidence.exitAtEnd = exitInfo;
-    fs.writeFileSync(path.join(RECORD_DIR, "evidence.json"), JSON.stringify(evidence, null, 2));
-
     assert.equal(
       evidence.exit,
       null,
@@ -348,6 +357,12 @@ test("desktop shell survives maximize on Wayland", async (t) => {
       `zero-sized window geometry reached the compositor: ${JSON.stringify(evidence.invalidGeometry)}`,
     );
   } finally {
+    evidence.exitAtEnd = exitInfo;
+    try {
+      fs.writeFileSync(path.join(RECORD_DIR, "evidence.json"), JSON.stringify(evidence, null, 2));
+    } catch {
+      // Diagnostics only; the assertions carry the verdict.
+    }
     if (electronApp) await electronApp.close().catch(() => {});
     await stopDisplayCapture().catch(() => {});
     if (compositor) await compositor.stop().catch(() => {});

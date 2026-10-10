@@ -100,7 +100,8 @@ headless stub Wayland compositor that rejects zero-sized
 `xdg_surface.set_window_geometry`, then maximizes and restores the main window
 through the compositor and asserts the process survives. Besides Electron and
 Playwright it needs the overlay bundle and pywayland ≥ 0.4.19 (tested with
-0.4.19) importable by `OMNIGENT_PYTHON`; it skips when any of these is missing.
+0.4.19) importable by `OMNIGENT_PYTHON`. It skips when Electron, Playwright, or
+pywayland is missing and fails fast when the overlay bundle has not been built.
 
 ```bash
 # From the repository root:
