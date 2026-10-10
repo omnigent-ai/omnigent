@@ -14,6 +14,10 @@ The race is exercised via two paths:
 2. The fix: suppress_recovery_turn=True in the session-init envelope causes
    the runner to skip the recovery-turn check, leaving _active_turns empty so
    the forward triggers the turn exactly once.
+
+Also covers the trailing cancellation marker: a cancel persists a role=user
+marker, and neither the session-init heuristic nor the reconnect catch-up scan
+may read it as a pending prompt and re-run the cancelled turn.
 """
 
 from __future__ import annotations
@@ -28,6 +32,10 @@ from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.session_history import (
+    CANCELLATION_MARKER_TEXT,
+    is_pending_user_prompt,
+)
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
 )
@@ -55,6 +63,24 @@ _PENDING_USER_MESSAGE = {
 _ITEMS_PAGE = {
     "object": "list",
     "data": [_PENDING_USER_MESSAGE],
+    "has_more": False,
+}
+# The role=user marker a cancel persists, with the wording an older build wrote:
+# only its first line identifies it.
+_CANCELLATION_MARKER_MESSAGE = {
+    "id": "msg_002",
+    "type": "message",
+    "role": "user",
+    "content": [
+        {
+            "type": "input_text",
+            "text": "[System: interrupted]\nThe user interrupted and abandoned their request.",
+        }
+    ],
+}
+_CANCELLED_ITEMS_PAGE = {
+    "object": "list",
+    "data": [_PENDING_USER_MESSAGE, _CANCELLATION_MARKER_MESSAGE],
     "has_more": False,
 }
 
@@ -95,18 +121,29 @@ class _HistoryServerClient:
 
 
 class _CatchUpServerClient(_HistoryServerClient):
-    """Return no history until the test exposes a missed user item."""
+    """Return no history until the test exposes the missed items in *page*."""
 
-    def __init__(self) -> None:
+    def __init__(self, page: dict[str, Any] = _ITEMS_PAGE) -> None:
         self.expose_item = False
+        self._page = page
 
     async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
         del kwargs
         if url.rstrip("/").endswith(f"/sessions/{SESSION_ID}/items"):
-            page = _ITEMS_PAGE if self.expose_item else {"data": [], "has_more": False}
+            page = self._page if self.expose_item else {"data": [], "has_more": False}
             return self._Resp(page)
         if url.rstrip("/").endswith("/items"):
             return self._Resp({"data": [], "has_more": False})
+        return self._Resp({})
+
+
+class _CancelledHistoryServerClient(_HistoryServerClient):
+    """Return a transcript whose last item is the cancellation marker."""
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if url.rstrip("/").endswith("/items"):
+            return self._Resp(_CANCELLED_ITEMS_PAGE)
         return self._Resp({})
 
 
@@ -337,6 +374,150 @@ async def test_catch_up_turn_hides_browser_tools_without_renderer_evidence() -> 
 
     assert len(harness.posted_bodies) == 1, "catch-up scan did not start one harness turn"
     _assert_browser_tools_hidden(harness.posted_bodies[0])
+
+
+@pytest.mark.asyncio
+async def test_trailing_cancellation_marker_does_not_start_recovery_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A relaunch that loads a cancelled transcript must stay idle.
+
+    ``retry_session`` relaunches a dropped runner without suppressing recovery,
+    so the history heuristic runs. The trailing item is the role=user marker the
+    cancel persisted, not an unanswered prompt; a recovery turn here re-runs the
+    cancelled prompt on every cancel + retry.
+    """
+    app, _pm, harness = _build_sdk_app(_CancelledHistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        # Let a (wrongly) scheduled recovery turn run so it shows up below.
+        await asyncio.sleep(0.1)
+
+        get_resp = await client.get(f"/v1/sessions/{SESSION_ID}")
+        assert get_resp.status_code == 200, get_resp.text
+        assert get_resp.json().get("status") == "idle", (
+            "Session must stay idle when the loaded transcript ends with the "
+            "cancellation marker; a recovery turn was started instead."
+        )
+
+    assert harness.posted_bodies == [], (
+        "A relaunch after a cancel must not re-run the cancelled prompt; the harness "
+        f"was called {len(harness.posted_bodies)} time(s)."
+    )
+    (init_row,) = _init_rows(caplog)
+    assert init_row["recovery_turn"] == "none"
+    assert init_row["history_len"] == 2
+
+
+@pytest.mark.asyncio
+async def test_catch_up_scan_ignores_trailing_cancellation_marker() -> None:
+    """A reconnect that pulls the cancellation marker must not re-run the prompt.
+
+    The marker is persisted by the runner itself, so it is still "new" to the
+    next tunnel reconnect's catch-up scan; the scan must not read that trailing
+    user item as a message missed while the tunnel was down.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    server_client = _CatchUpServerClient(_CANCELLED_ITEMS_PAGE)
+    app, _pm, harness = _build_sdk_app(server_client)
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=True),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        _session_histories_ref[SESSION_ID] = []
+        server_client.expose_item = True
+        try:
+            await app.state.catch_up_scan()
+            await asyncio.sleep(0.1)
+            assert SESSION_ID not in app.state.active_turns, (
+                "catch-up scan started a turn from the trailing cancellation marker"
+            )
+        finally:
+            _session_histories_ref.pop(SESSION_ID, None)
+
+    assert harness.posted_bodies == [], (
+        f"catch-up re-ran the cancelled prompt: harness called {len(harness.posted_bodies)} times"
+    )
+
+
+@pytest.mark.parametrize(
+    ("item", "pending"),
+    [
+        pytest.param(_PENDING_USER_MESSAGE, True, id="user-prompt"),
+        pytest.param(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
+            },
+            False,
+            id="current-marker",
+        ),
+        pytest.param(_CANCELLATION_MARKER_MESSAGE, False, id="older-marker-wording"),
+        pytest.param(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Why did [System: interrupted] appear?"}
+                ],
+            },
+            True,
+            id="sentinel-inside-a-real-prompt",
+        ),
+        pytest.param(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Please explain this log:"},
+                    {"type": "input_text", "text": "[System: interrupted]\nworker 3 exited"},
+                ],
+            },
+            True,
+            id="sentinel-opens-a-later-block",
+        ),
+        # Accepted tradeoff: a one-block prompt in the marker's exact shape is
+        # kept in the transcript but is not re-run automatically.
+        pytest.param(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "[System: interrupted]\nwhat is this?"}
+                ],
+            },
+            False,
+            id="single-block-prompt-in-marker-shape",
+        ),
+        pytest.param(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": CANCELLATION_MARKER_TEXT}],
+            },
+            False,
+            id="assistant-message",
+        ),
+    ],
+)
+def test_pending_user_prompt_excludes_only_the_cancellation_marker(
+    item: dict[str, Any], pending: bool
+) -> None:
+    """Only a user message whose text opens with the marker line is excluded."""
+    assert is_pending_user_prompt(item) is pending
 
 
 @pytest.mark.asyncio

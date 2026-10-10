@@ -152,7 +152,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.runner.resource_routes import register_resource_routes
-from omnigent.runner.session_history import build_session_history
+from omnigent.runner.session_history import build_session_history, is_pending_user_prompt
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
@@ -2997,9 +2997,8 @@ def create_runner_app(
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
-            last_role = last.get("role")
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                is_pending_user_prompt(last)
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
@@ -7551,7 +7550,7 @@ def create_runner_app(
                 if (
                     session_id not in _active_turns
                     and new_items
-                    and new_items[-1].get("role") == "user"
+                    and is_pending_user_prompt(new_items[-1])
                 ):
                     _begin_turn_slot(session_id)
                     _publish_turn_status(session_id, "running")
