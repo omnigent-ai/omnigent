@@ -465,6 +465,13 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
 
+# Quoted argv over this budget launches through a private script (see
+# ``_materialize_launch_script``) so the ``new-session`` command stays
+# small; half tmux's ~16KB cap leaves headroom for its option commands.
+_LAUNCH_COMMAND_BYTES_MAX = 8192
+# Launcher script filename inside the instance's private dir.
+_LAUNCH_SCRIPT_FILENAME = "launch.sh"
+
 
 class _IdleDetector:
     """
@@ -1509,6 +1516,29 @@ class TerminalInstance:
             conversation_link or "",
         )
 
+    def _materialize_launch_script(self, inner_str: str) -> str:
+        """
+        Write the pane command to a script and return a short run command.
+
+        tmux's client->server protocol caps one command at ~16KB, the same
+        cap :meth:`send` chunks literal text for. A launch argv carrying
+        e.g. large agent instructions (``--append-system-prompt``) cannot
+        ride the ``new-session`` invocation inline, so the composed command
+        moves byte-for-byte into a script the pane shell execs — the pane
+        still runs the exact same argv while the command tmux sees stays
+        constant-size. The script lives in the private dir, sharing the
+        instance's 0700 confinement and cleanup lifecycle.
+
+        :param inner_str: The fully shell-quoted pane command.
+        :returns: A short shell command that runs the script.
+        """
+        script_path = self.private_dir / _LAUNCH_SCRIPT_FILENAME
+        script_path.write_text(f"#!/bin/sh\nexec {inner_str}\n", encoding="utf-8")
+        script_path.chmod(0o700)
+        # Run via /bin/sh (not direct exec) so a noexec-mounted temp dir
+        # cannot break the launch.
+        return f"/bin/sh {shlex.quote(str(script_path))}"
+
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
         if self.running:
@@ -1593,6 +1623,8 @@ class TerminalInstance:
         else:
             inner_cmd = [self.command, *self.args]
         inner_str = shlex.join(inner_cmd)
+        if len(inner_str.encode("utf-8")) > _LAUNCH_COMMAND_BYTES_MAX:
+            inner_str = self._materialize_launch_script(inner_str)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 

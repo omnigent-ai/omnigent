@@ -22,6 +22,7 @@ import pytest
 import omnigent.inner.terminal as terminal_mod
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
     _apply_utf8_locale_default,
@@ -2127,7 +2128,10 @@ async def _capture_launch_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    keep_alive_after_exit: bool,
+    keep_alive_after_exit: bool = False,
+    command: str = "bash",
+    args: list[str] | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
 ) -> list[str]:
     """
     Launch a terminal with mocked tmux and return the single setup argv.
@@ -2135,6 +2139,10 @@ async def _capture_launch_argv(
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
+    :param command: Executable to run inside tmux, e.g. ``"claude"``.
+    :param args: Command arguments, e.g. a huge argv value.
+    :param sandbox_policy: Optional sandbox policy; an active one wraps the
+        command in the (mocked) exec launcher, as ``create_terminal_instance`` does.
     :returns: The flattened tmux launch argv.
     """
     captured: list[list[str]] = []
@@ -2160,11 +2168,14 @@ async def _capture_launch_argv(
     )
 
     instance = TerminalInstance(
-        name="bash",
+        name=command,
         session_key="s1",
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
+        command=command,
+        args=args or [],
         keep_alive_after_exit=keep_alive_after_exit,
+        sandbox_policy=sandbox_policy,
     )
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
@@ -3088,6 +3099,207 @@ async def test_send_chunks_long_literal_text_under_tmux_command_cap(
     assert contains_subsequence(enter_call, ["send-keys", "-t", "main", "Enter"])
 
 
+@pytest.mark.asyncio
+async def test_launch_routes_oversized_command_through_launch_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch argv over the tmux per-command cap runs via a launcher script.
+
+    tmux rejects any single client command over its 16KB imsg cap with
+    "command too long". Large agent instructions ride the CLI argv verbatim
+    (``--append-system-prompt``), so inlining the quoted argv into the
+    ``new-session`` invocation made every big-instructions terminal fail to
+    launch. The oversized command must move into a script inside the private
+    dir — byte-for-byte, so the pane still execs the same argv — while the
+    command tmux sees stays small.
+
+    :param tmp_path: Temporary directory used as the instance private dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    big_arg = "x" * 20_000
+    cmd = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        command="claude",
+        args=["--append-system-prompt", big_arg],
+    )
+
+    # The whole client invocation stays under the 16KB cap.
+    packed = sum(len(arg.encode()) + 1 for arg in cmd)
+    assert packed < 16_000, (
+        f"tmux launch argv packs to {packed} bytes; tmux rejects commands "
+        "over its ~16KB cap with 'command too long'"
+    )
+    assert not any(big_arg in arg for arg in cmd)
+
+    # The pane command points at the script, which carries the full argv.
+    script_path = tmp_path / "launch.sh"
+    assert any(str(script_path) in arg for arg in cmd)
+    assert script_path.stat().st_mode & 0o777 == 0o700
+    script_text = script_path.read_text()
+    assert script_text.startswith("#!/bin/sh\nexec ")
+    assert "--append-system-prompt" in script_text
+    # Delivery, not just launch: dropping the oversized value to fit the
+    # cap would silently lose the agent's instructions.
+    assert big_arg in script_text
+
+
+@pytest.mark.asyncio
+async def test_launch_keeps_short_command_inline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch argv comfortably under the cap keeps riding new-session inline.
+
+    The launcher-script route exists only for oversized commands; a normal
+    launch must not change shape (no script file, argv inline), preserving
+    existing behavior for every small-argv terminal.
+
+    :param tmp_path: Temporary directory used as the instance private dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        command="claude",
+        args=["--append-system-prompt", "hi"],
+    )
+
+    assert not (tmp_path / "launch.sh").exists()
+    assert any("--append-system-prompt" in arg for arg in cmd)
+
+
+@pytest.mark.asyncio
+async def test_launch_routes_oversized_sandboxed_command_through_launch_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An oversized argv under an active sandbox keeps the launcher as the pane entrypoint.
+
+    With a sandbox policy the pane command is ``<exec launcher> <args>`` and the
+    launcher applies the sandbox before spawning the CLI. The script route must
+    keep that shape byte-for-byte so the CLI still starts sandboxed and the
+    instructions still arrive.
+
+    :param tmp_path: Temporary directory used as the instance private dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
+    big_arg = "x" * 20_000
+    cmd = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        command="claude",
+        args=["--append-system-prompt", big_arg],
+        sandbox_policy=SandboxPolicy(
+            backend_type="none",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+
+    assert not any(big_arg in arg for arg in cmd)
+    script_text = (tmp_path / "launch.sh").read_text()
+    assert script_text.startswith("#!/bin/sh\nexec /test/launcher --append-system-prompt ")
+    assert big_arg in script_text
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.asyncio
+async def test_launch_real_tmux_survives_oversized_argv(
+    tmp_path: Path, short_tmp_parent: Path
+) -> None:
+    """
+    A real tmux launch succeeds when the pane argv exceeds tmux's command cap.
+
+    Before the launcher-script route, this exact launch raised
+    ``RuntimeError: tmux launch failed (rc=1): command too long`` — the
+    composed ``new-session`` command carrying a >16KB argv exceeded tmux's
+    client->server imsg cap, so terminals for big-instructions agents never
+    started.
+
+    :param tmp_path: Temporary directory used as the instance private dir.
+    :param short_tmp_parent: Short-pathed parent for the AF_UNIX socket.
+    """
+    padding = "x" * 20_000
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command="/bin/sh",
+        # ``:`` ignores its arguments, so the padding rides the argv the
+        # way big instructions do without affecting the pane process.
+        args=["-c", f": {padding}; exec sleep 30"],
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+
+        assert await instance.is_alive() is True
+        probe = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(instance.socket_path),
+                "has-session",
+                "-t",
+                instance.tmux_target,
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+        assert probe.returncode == 0, probe.stderr.decode().strip()
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("start_on_attach", [False, True])
+async def test_launch_delivers_metachar_argv_over_tmux_command_cap_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, start_on_attach: bool
+) -> None:
+    """An oversized argv full of shell metacharacters reaches the pane unchanged.
+
+    The launcher script execs ``shlex.join(argv)`` under ``/bin/sh``, which
+    re-parses the quoted text. Quotes, newlines, ``;|&``, globs, and
+    ``$``/backtick substitutions in a >16KB argv must arrive byte-for-byte and
+    unsplit, whether or not the start-on-attach gate wraps the pane command.
+    """
+    output = tmp_path / "argv.json"
+    script = (
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+    )
+    hostile = "a'b\"c d;e|f&g$h`i(j)k*l?m<n>o\\p#q\n" * 600
+    expected = ["--append-system-prompt", hostile, "--model", "sonnet"]
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-c", script, str(output), *expected],
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=start_on_attach,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        if start_on_attach:
+            await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(10):
+            while await instance.is_alive():
+                await asyncio.sleep(0.05)
+        assert json.loads(output.read_text()) == expected
+    finally:
+        await instance.close()
+
+
 def test_idle_detector_honors_short_threshold_override() -> None:
     """A per-watcher ``idle_threshold_s`` override fires idle sooner.
 
@@ -3546,3 +3758,37 @@ async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) 
     assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
     assert plain["screen"] == joined["screen"]
     assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+async def test_launch_delivers_argv_over_tmux_command_cap_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path
+) -> None:
+    """A pane argv larger than tmux's ~16KB per-command cap still launches intact.
+
+    Large agent instructions ride the CLI argv (``--append-system-prompt``), and
+    tmux rejects one oversized client command with "command too long".
+    """
+    output = tmp_path / "argv.json"
+    script = (
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+    )
+    expected = ["--append-system-prompt", "x" * 20_000]
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-c", script, str(output), *expected],
+        keep_alive_after_exit=True,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        async with asyncio.timeout(10):
+            while await instance.is_alive():
+                await asyncio.sleep(0.05)
+        # Read the delivered argv before ``close()`` removes the private dir.
+        assert json.loads(output.read_text()) == expected
+    finally:
+        await instance.close()
