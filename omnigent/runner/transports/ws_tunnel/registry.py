@@ -64,6 +64,9 @@ _connection_generations = count(1)
 _OUTBOUND_QUEUE_MAX_FRAMES = 1024
 _OUTBOUND_SEND_STALL_S = 10.0
 _OUTBOUND_SEND_POLL_S = 0.05
+# Extra wait past the stall deadline before a caller gives up on an owner loop
+# that stopped without settling the send.
+_OUTBOUND_SEND_BACKSTOP_MARGIN_S = 2.0
 
 
 class WebSocketLike(Protocol):
@@ -928,34 +931,37 @@ class TunnelRegistry:
         except RuntimeError as exc:
             raise ConnectionError(f"runner {session.runner_id!r} tunnel loop is closed") from exc
         wrapped_ack = asyncio.wrap_future(ack)
-        try:
-            # Add a caller-side timeout backstop: if the owner loop stops without
-            # closing (or stops while _enqueue waits for room), ack is never settled
-            # and the caller would await forever. call_soon_threadsafe only raises
-            # for a closed loop, not a stopped one.
-            await asyncio.wait_for(
-                asyncio.shield(wrapped_ack),
-                timeout=_OUTBOUND_SEND_STALL_S + 2.0,
-            )
-        except asyncio.CancelledError:
-            # Cancellation and enqueue use the same registry lock: a cancelled
-            # send never lands, and an already-enqueued send completes rather
-            # than reporting cancellation. Always propagate CancelledError since
-            # callers that cancel and await need to detect termination.
+
+        def _abandon() -> bool:
+            """Stop a pending send from landing; return True if it already landed."""
+            nonlocal cancelled
             with self._lock:
                 if enqueued:
-                    # Frame was accepted; caller's cancellation must not suppress
-                    # the task's termination, so propagate the CancelledError.
-                    task = asyncio.current_task()
-                    if task is not None:
-                        task.uncancel()
-                    raise
+                    return True
                 cancelled = True
             ack.cancel()
-            # Consume wrapped_ack's exception if already set before cancellation,
-            # to avoid "Future exception was never retrieved" noise.
+            # An error settled just before the abandon is never awaited.
             wrapped_ack.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+            return False
+
+        try:
+            # call_soon_threadsafe only raises for a closed loop, so a loop that
+            # stops without closing would leave ack unsettled forever.
+            await asyncio.wait_for(
+                asyncio.shield(wrapped_ack),
+                timeout=_OUTBOUND_SEND_STALL_S + _OUTBOUND_SEND_BACKSTOP_MARGIN_S,
+            )
+        except asyncio.CancelledError:
+            # The registry lock decides whether the frame landed; either way the
+            # caller's cancellation propagates so cancel-then-await teardown ends.
+            _abandon()
             raise
+        except TimeoutError:
+            if _abandon():
+                return
+            raise ConnectionError(
+                f"runner {session.runner_id!r} tunnel loop never answered the send"
+            ) from None
 
     # ── Routing incoming frames ──────────────────────────
 

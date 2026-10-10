@@ -703,6 +703,46 @@ async def test_send_text_cancellation_is_atomic_across_event_loop_threads() -> N
 
 
 @pytest.mark.asyncio
+async def test_send_text_gives_up_on_an_owner_loop_that_never_runs_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running but wedged owner loop fails the send, and the frame never lands later."""
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_STALL_S", 0.05)
+    monkeypatch.setattr(registry_mod, "_OUTBOUND_SEND_BACKSTOP_MARGIN_S", 0.05)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    release = threading.Event()
+    try:
+        reg = TunnelRegistry()
+
+        async def _register() -> registry_mod.RunnerSession:
+            return reg.register("r1", _NoopWS(), _hello())
+
+        session = asyncio.run_coroutine_threadsafe(_register(), loop).result(timeout=5)
+        # Wedge the owner loop so the enqueue callback is queued but never runs.
+        loop.call_soon_threadsafe(release.wait, 5.0)
+        with pytest.raises(ConnectionError, match="never answered"):
+            await asyncio.wait_for(reg.send_text(session, "late-frame"), timeout=3.0)
+        release.set()
+
+        async def _drain() -> list[str | None]:
+            await asyncio.sleep(0.1)
+            items = []
+            while not session.outbound_queue.empty():
+                item = session.outbound_queue.get_nowait()
+                items.append(item.data if item is not None else None)
+            return items
+
+        assert asyncio.run_coroutine_threadsafe(_drain(), loop).result(timeout=5) == []
+    finally:
+        release.set()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
+
+
+@pytest.mark.asyncio
 async def test_send_text_fails_when_owner_loop_is_stopped() -> None:
     """A stopped owner loop fails the send instead of awaiting forever."""
     loop = asyncio.new_event_loop()

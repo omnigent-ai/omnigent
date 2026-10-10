@@ -1446,6 +1446,7 @@ async def test_oversized_snapshot_falls_back_to_bounded_plain_capture(
     assert len(snapshot) <= 256
     assert b"PLAIN-SNAPSHOT" in snapshot
     assert snapshot.startswith(control_bridge._LIVE_MODE_RESET)
+    assert b"\x1b[?2004l" in control_bridge._LIVE_MODE_RESET
     assert len(capture_args) == 2
     assert "-e" in capture_args[0]
     assert "-e" not in capture_args[1]
