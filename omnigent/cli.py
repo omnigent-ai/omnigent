@@ -12805,6 +12805,11 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     split = urlsplit(workspace_host.rstrip("/"))
     host = split.hostname or split.netloc or split.path
     profile = host.split(".")[0]
+    from omnigent.onboarding.databricks_config import databricks_login_port_conflict
+
+    conflict = databricks_login_port_conflict(databricks_bin)
+    if conflict is not None:
+        raise click.ClickException(conflict)
     click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
     result = subprocess.run(
         [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
