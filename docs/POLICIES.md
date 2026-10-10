@@ -69,33 +69,121 @@ After starting, you can also add or remove policies at runtime through the REST 
 
 ### Attachment admission controls
 
-The upload, copy, and fork routes apply additional server settings to `.zip`, `.docx`,
-`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These formats require
-Claude Code or Codex and an updated execution host/runner that supports their
-delivery and restoration. They are stored without extraction; the harness
-reads a local copy outside the working checkout. See
-[attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
+Operators can admit files such as videos for delivery **by local path** to
+`claude-native` (Claude Code) and `codex-native` (Codex). The agent can then use
+installed tools such as `ffprobe` or `ffmpeg`. Uploading a video does not add video
+understanding, previews, transcoding, or tools to the model.
 
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
-| `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per file |
-| `filesystem_attachment_max_files` | `20` | Stored files of these types per session |
-| `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined bytes of these types per session |
-| `filesystem_attachment_denied_extensions` | `[]` | Further restrict the allowlist, e.g. `[".zip", ".db"]` |
+| `filesystem_attachment_allowed_extensions` | `[".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"]` | An explicit list **replaces** the defaults; `[]` disables filesystem admission; the scalar `"*"` allows any extension, including extensionless names |
+| `filesystem_attachment_denied_extensions` | `[]` | Extensions refused by this deployment, including inline files |
+| `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per filesystem file |
+| `filesystem_attachment_max_files` | `20` | Stored filesystem files per session, including unsent uploads |
+| `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined stored filesystem bytes per session |
 
-These are filename-based admission and storage limits, not content inspection.
-Classification uses the stored filename's extension, even when the browser
-reports a different MIME type. It does not identify file formats from their
-bytes, inspect archive entries, or detect renamed binary content. The denylist
-does not restrict files the agent creates or downloads through other tools.
-Images, PDFs, and text/code uploads retain their separate existing limits;
-the web composer also has a fixed 50 MiB ceiling for the formats listed above.
+For video plus selected existing formats:
 
-Request-phase policies receive the filename and content type for these files,
-with an empty `text` value. Their document, archive, and database contents are
-not scanned as text. Ordinary text/code attachments continue to provide decoded
-text to request-phase policies. No attachment delivery-mode field is added to
-the policy payload.
+```yaml
+filesystem_attachment_allowed_extensions: [".mp4", ".mov", ".zip", ".docx"]
+```
+
+For any filesystem type with a denylist and smaller caps:
+
+```yaml
+filesystem_attachment_allowed_extensions: "*"
+filesystem_attachment_denied_extensions: [".exe", ".dll", ".sh"]
+filesystem_attachment_max_bytes: 20971520
+filesystem_attachment_max_files: 10
+filesystem_attachment_max_total_bytes: 104857600
+```
+
+Lists accept extensions with or without a leading dot, normalize case, and
+remove duplicates. Only the scalar `"*"` enables wildcard admission; `["*"]`
+does not. Invalid extension entries are skipped, and an invalid allowlist value
+admits no filesystem files. Omit the setting to retain the built-in set.
+
+The denylist and all applicable caps win over the allowlist. Matching strips
+trailing dots and Unicode whitespace and ignores case; the denylist examines every component of
+compound suffixes (`payload.exe.txt` and `payload.txt.exe` both match `.exe`).
+Names containing Unicode control, bidi embedding/override/isolate, line-separator,
+or paragraph-separator characters are rejected, including percent-encoded forms.
+Other format characters (such as emoji joiners, soft hyphens, and RTL marks) stay
+in display names but are ignored for allowlist and denylist matching. Filesystem delivery
+also rejects `:` (alternate data streams); inline names such as `Screen 10:30.png`
+remain valid. New filenames, as sent, must fit in 255 UTF-8 bytes, so oversized
+padding is rejected before any character processing. Directory components are
+reduced to a basename. Explicitly allowed extensions
+are classified for filesystem delivery before MIME hints, so `clip.mp4` declared
+as `text/plain` or `image/png` remains opaque. Under `"*"`, the same applies to
+every suffix with a known non-inline type or compression (for example `.mp4`,
+`.mov`, `.gz`, `.tex`), including its caps and runtime checks; `/v1/info` lists
+these suffixes. Otherwise, supported declared MIME types retain inline delivery
+(for example, a `text/plain` README or payload.bin, or an `image/png` file named
+photo), with filename fallback for missing/generic MIME and known text/code
+extensions. Wildcard admission preserves these inline types and their limits;
+other names use filesystem delivery. Legacy built-in filesystem formats cannot
+become inline through a MIME hint.
+
+The server checks uploads, copies, forks, message/slash events, and initial
+session items. Filesystem payloads must first be uploaded and then referenced by
+`file_id`; inline bytes cannot bypass admission or quotas. Stored references are
+rebuilt from authoritative metadata, discarding client bytes, filenames, block
+types, and delivery hints. A server-owned `delivery: filesystem` entry in each
+file's `source_metadata` persists through restart, copy, fork, and cold resume.
+Older rows without the entry use the original built-in extension rule. Removing
+an extension prevents new uploads, copies, and forks but keeps existing
+same-session files usable and counted toward quotas. Retained filesystem history
+cannot switch/fork to an SDK harness; unsent files are checked again when sent.
+Forks preserve each source row's delivery classification. Copies are new admission:
+an inline row whose suffix is now explicitly allowed becomes a filesystem row.
+Historic rows that remain inline are checked only against the denylist when
+copied or forked, so newer filename length and character rules do not break them.
+
+Upgrade the server, web client, and execution host/runner together. Both connected
+host and runner must advertise `generalized_filesystem_attachments` for new types;
+legacy built-in formats retain their `filesystem_attachments` compatibility.
+Missing support yields an upgrade error before sending. `/v1/info` publishes the
+effective allowlist, denylist, caps, capable harnesses, and known inline/non-inline
+filename suffixes. The web client uses
+these for early feedback and all three pickers; under `"*"` it omits the picker
+filter. An older server without the policy leaves unknown types to server
+validation, with upload errors preserving the draft. Older web bundles may still
+reject video or apply their former fixed 50 MiB filesystem ceiling.
+The effective policy, including the denylist, is public on unauthenticated
+`/v1/info`; the server remains the enforcement point. Policy is snapshotted at
+server startup and cached by each browser tab. After changing configuration,
+restart the server and reload every open page to receive the new policy.
+Malformed policy responses use the older-server fallback instead of breaking
+the composer. Stale permissive tabs still receive authoritative server errors.
+
+Before rolling back a server, check stored file metadata and retained histories
+for generalized filesystem attachments (including inline suffixes explicitly
+admitted for filesystem delivery). Previous releases ignore the persisted marker:
+they may inline those bytes, omit them from filesystem quotas, and permit SDK
+switches/forks. Restoring the allowlist to the built-in set and restarting stops
+new generalized admission, but does **not** remove or reclassify existing rows.
+Before deploying an older server, remove generalized attachments and their
+references from all retained source/copy/fork histories, or restore a compatible
+database and artifact backup from before their admission. Otherwise retain a
+server version that understands the marker and capability gate. No compatibility
+backport is provided. Rolling back only hosts/runners leaves the new server's
+upgrade gate active; older web bundles retain their older picker restrictions.
+
+These controls inspect names, not file contents. They do not sniff formats, scan
+archive contents, detect renamed binaries, or constrain files agents obtain via
+other tools. Request-phase policies receive filesystem filenames/content types
+with empty `text`; ordinary text/code attachments remain text-scanned. Files are
+stored without extraction, materialized privately without executable permission
+outside the checkout, and downloaded with session access checks, attachment
+disposition, and `nosniff`. See [attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
+
+Uploads and runner downloads still buffer whole files in memory; runner delivery
+also base64-encodes them. Raising caps increases memory use and can encounter
+proxy/transport limits. Session quota serialization covers concurrent operations
+in one server process, not distributed admission across replicas. Choose caps
+appropriate to the deployment and only enable types its tool environment can
+safely process.
 
 ---
 

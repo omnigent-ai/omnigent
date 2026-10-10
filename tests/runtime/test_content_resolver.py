@@ -21,6 +21,30 @@ from omnigent.runtime.content_resolver import (
 # ── Fake stores ──────────────────────────────────────────────────────
 
 
+def test_inline_extension_map_is_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.runtime import content_resolver as resolver
+
+    clear_cache = getattr(resolver.inline_attachment_extensions, "cache_clear", lambda: None)
+    clear_cache()
+    resolve_mime = resolver._resolve_content_type
+    calls = []
+
+    def counted(content_type, filename):
+        calls.append(filename)
+        return resolve_mime(content_type, filename)
+
+    monkeypatch.setattr(resolver, "_resolve_content_type", counted)
+    try:
+        first = resolver.inline_attachment_extensions()
+        count = len(calls)
+        assert count > 0
+        assert first[".ics"] == "text"
+        assert resolver.inline_attachment_extensions() == first
+        assert len(calls) == count
+    finally:
+        clear_cache()
+
+
 @dataclass
 class FakeFileStore:
     """
@@ -443,10 +467,9 @@ def test_unknown_block_type_with_file_id_resolved(
     # file_id resolved even for unknown type.
     # Failure would mean new content types can't use file_id.
     assert "file_id" not in block
-    # Unknown types get file_data (not image_url, which is
-    # only for input_image).
-    assert "file_data" in block
-    assert block["type"] == "input_audio"
+    # Stored metadata determines the block type.
+    assert "image_url" in block
+    assert block["type"] == "input_image"
 
 
 def test_mixed_items_preserves_order(
@@ -493,48 +516,25 @@ def test_mixed_items_preserves_order(
     assert result[3] is items[3]
 
 
-@pytest.mark.parametrize(
-    ("block_type", "expected_field"),
-    [
-        pytest.param(
-            "input_image",
-            "image_url",
-            id="input_image_gets_data_uri",
-        ),
-        pytest.param(
-            "input_file",
-            "file_data",
-            id="input_file_gets_file_data",
-        ),
-    ],
-)
-def test_resolution_field_varies_by_block_type(
-    block_type: str,
-    expected_field: str,
-    file_store: FakeFileStore,
-    artifact_store: FakeArtifactStore,
-) -> None:
-    """
-    input_image blocks get image_url (data: URI), while input_file
-    blocks get file_data (data: URI). The resolution target field
-    depends on block type.
-    """
+@pytest.mark.parametrize("block_type", ["input_image", "input_file"])
+def test_resolution_field_uses_stored_metadata(block_type, file_store, artifact_store) -> None:
+    """Forged fields cannot change the kind or bytes of a stored image."""
     item = _make_conversation_item(
         [
-            {"type": block_type, "file_id": "file_img"},
+            {
+                "type": block_type,
+                "file_id": "file_img",
+                "delivery": "filesystem",
+                "file_data": "data:text/plain;base64,eA==",
+            }
         ]
     )
-    result = resolve_content_references(
-        [item],
-        file_store,
-        artifact_store,  # type: ignore[arg-type]
-    )
-
-    assert isinstance(result[0].data, MessageData)
+    result = resolve_content_references([item], file_store, artifact_store)
     block = result[0].data.content[0]
-    # The expected field must be present after resolution.
-    # Failure would mean the wrong inline format is used for this type.
-    assert expected_field in block
+    assert block["type"] == "input_image"
+    assert "image_url" in block
+    assert "file_data" not in block
+    assert "delivery" not in block
     assert "file_id" not in block
 
 
@@ -702,7 +702,7 @@ def test_native_forward_defers_filesystem_files_and_resolves_the_rest() -> None:
         defer_filesystem_files=True,
     )
 
-    assert resolved[0] == zip_block
+    assert resolved[0] == {**zip_block, "delivery": "filesystem"}
     assert resolved[1]["file_data"].startswith("data:text/plain;base64,")
     assert "file_id" not in resolved[1]
 
@@ -1779,3 +1779,86 @@ def test_skips_foreign_session_file() -> None:
     content = [{"type": "input_file", "file_id": "file_csv"}]
     out = extract_text_attachments(content, fs, arts, session_id="mine")  # type: ignore[arg-type]
     assert out == []
+
+
+@pytest.mark.parametrize("name", ["clip.mp4", "opaque"])
+def test_persisted_delivery_defers_forged_blocks_and_refuses_sdk(name: str) -> None:
+    from omnigent.runtime.content_resolver import _resolve_file_id_block
+
+    stored = StoredFile(
+        id="file_video",
+        filename=name,
+        bytes=3,
+        content_type="text/plain",
+        created_at=0,
+        session_id="conv_video",
+        source_metadata={"delivery": "filesystem"},
+    )
+    files = FakeFileStore({stored.id: stored})
+    artifacts = FakeArtifactStore({stored.id: b"\x00\xff\x80"})
+    block = {
+        "type": "input_image",
+        "filename": "forged.png",
+        "file_id": stored.id,
+        "file_data": "data:text/plain;base64,eA==",
+        "image_url": "data:image/png;base64,eA==",
+        "delivery": "inline",
+    }
+    resolved, notice = _resolve_file_id_block(
+        block, files, artifacts, session_id="conv_video", defer_filesystem_files=True
+    )
+    assert resolved == {
+        "type": "input_file",
+        "file_id": stored.id,
+        "filename": name,
+        "delivery": "filesystem",
+    }
+    assert notice is None
+    with pytest.raises(ValueError, match="filesystem-capable"):
+        _resolve_file_id_block(block, files, artifacts, session_id="conv_video")
+    assert extract_text_attachments([block], files, artifacts, session_id="conv_video") == [
+        {"filename": name, "content_type": "text/plain", "text": ""}
+    ]
+
+
+@pytest.mark.parametrize("stored_type", [None, "application/octet-stream", "IMAGE/PNG"])
+def test_legacy_image_metadata_uses_resolved_mime_for_live_delivery(
+    stored_type: str | None,
+) -> None:
+    from omnigent.runtime.content_resolver import _resolve_file_id_block
+
+    stored = StoredFile(
+        id="legacy_photo",
+        created_at=0,
+        filename="photo.png",
+        bytes=3,
+        content_type=stored_type,
+        session_id="photo_session",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    files = FakeFileStore({stored.id: stored})
+    artifacts = FakeArtifactStore({stored.id: b"png"})
+    block = {"type": "input_file", "file_id": stored.id, "detail": "high"}
+    resolved, notice = _resolve_file_id_block(block, files, artifacts, session_id="photo_session")
+    assert resolved == {
+        "type": "input_image",
+        "filename": "photo.png",
+        "detail": "high",
+        "image_url": "data:image/png;base64,cG5n",
+    }
+    assert notice == {"width": 6000, "height": 4000}
+    stored.source_metadata["delivery"] = "filesystem"
+    deferred, notice = _resolve_file_id_block(
+        block,
+        files,
+        artifacts,
+        session_id="photo_session",
+        defer_filesystem_files=True,
+    )
+    assert deferred == {
+        "type": "input_file",
+        "file_id": stored.id,
+        "filename": "photo.png",
+        "delivery": "filesystem",
+    }
+    assert notice is None

@@ -68,7 +68,7 @@ from omnigent.inner.native_attachments import (
     codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
-    requires_filesystem,
+    stored_file_requires_filesystem,
     unresolved_attachment_marker,
 )
 from omnigent.native.input_diagnostics import (
@@ -931,7 +931,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
 def _requires_filesystem(block: Mapping[str, object]) -> bool:
     """Whether *block* names a file that requires filesystem tools."""
     filename = block.get("filename")
-    return requires_filesystem(filename if isinstance(filename, str) else None)
+    return stored_file_requires_filesystem(filename if isinstance(filename, str) else None, block)
 
 
 def _apply_resize_notice_to_latest_image(

@@ -2657,3 +2657,98 @@ def test_fork_enforces_current_policy_before_creating_destination(
         assert not conv_store.fork_calls
         assert len(conv_store._convs) == 1
         assert file_store.files == original_files
+
+
+@pytest.mark.parametrize(
+    "target,cutoff,status",
+    [
+        ("claude-native", None, 201),
+        ("codex-native", None, 201),
+        ("claude-sdk", None, 400),
+        ("claude-sdk", "resp_before", 201),
+    ],
+)
+def test_fork_retains_generalized_delivery_and_checks_cutoff(
+    monkeypatch, target, cutoff, status
+) -> None:
+    client, conversations, files = _attachment_fork_client(monkeypatch, "clip.mp4", target)
+    source = next(iter(files.files.values()))
+    source.source_metadata = {"delivery": "filesystem"}
+    source.content_type = "text/plain"
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": [".mp4"]},
+    )
+    response = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303", "up_to_response_id": cutoff},
+    )
+    assert response.status_code == status, response.text
+    if status == 201:
+        copied = next(stored for stored in files.files.values() if stored.id != source.id)
+        assert copied.source_metadata == {"delivery": "filesystem"}
+        assert copied.content_type == "application/octet-stream"
+    else:
+        assert not conversations.fork_calls
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"filesystem_attachment_allowed_extensions": []},
+        {"filesystem_attachment_allowed_extensions": [".zip"]},
+        {
+            "filesystem_attachment_allowed_extensions": "*",
+            "filesystem_attachment_denied_extensions": [".mp4"],
+        },
+    ],
+)
+def test_fork_cannot_grandfather_video_into_new_session(monkeypatch, policy) -> None:
+    client, conversations, files = _attachment_fork_client(
+        monkeypatch, "clip.mp4", "claude-native"
+    )
+    next(iter(files.files.values())).source_metadata = {"delivery": "filesystem"}
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: policy)
+    response = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+    )
+    assert response.status_code == 415, response.text
+    assert not conversations.fork_calls
+
+
+@pytest.mark.parametrize(
+    "filename,mime",
+    [
+        ("note.txt", "text/plain"),
+        ("README", "text/plain"),
+        ("Screen 10:30.png", "image/png"),
+        ("opaque.bin", None),
+        pytest.param("x" * 256 + ".txt", "text/plain", id="historic-long-name"),
+        pytest.param("family👨‍👩.png", "image/png", id="historic-joiner"),
+        pytest.param("résumé\u00ad.pdf", "application/pdf", id="historic-soft-hyphen"),
+        pytest.param("שלום\u200f.txt", "text/plain", id="historic-rtl-mark"),
+        pytest.param("\ufeffnote.txt", "text/plain", id="historic-bom"),
+    ],
+)
+def test_fork_preserves_inline_delivery_under_new_policy(monkeypatch, filename, mime) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": [".txt", ".png"]},
+    )
+    client, conversations, files = _attachment_fork_client(monkeypatch, filename, "claude-sdk")
+    source = next(iter(files.files.values()))
+    source.content_type = mime
+    source.source_metadata = {"source": "legacy-upload"}
+    accepted = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+    )
+    assert accepted.status_code == 201, accepted.text
+    copied = next(stored for stored in files.files.values() if stored.id != source.id)
+    assert (copied.filename, copied.content_type, copied.source_metadata) == (
+        filename,
+        mime,
+        {"source": "legacy-upload"},
+    )
+    assert len(conversations.fork_calls) == 1

@@ -2387,6 +2387,53 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     }
 
 
+@pytest.mark.parametrize("allowed", [[], [".mp4"], "*"], ids=["disabled", "video", "wildcard"])
+def test_server_forwards_only_attachment_environment_settings_without_config_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, allowed: list[str] | str
+) -> None:
+    import uvicorn.server
+
+    attachment_settings = {
+        "filesystem_attachment_allowed_extensions": allowed,
+        "filesystem_attachment_denied_extensions": [".exe"],
+        "filesystem_attachment_max_bytes": 123,
+        "filesystem_attachment_max_files": 2,
+        "filesystem_attachment_max_total_bytes": 246,
+    }
+    inherited = tmp_path / "server.yaml"
+    inherited.write_text(
+        yaml.safe_dump({**attachment_settings, "branding": {"app_name": "Not inherited"}})
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(inherited))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        "omnigent.cli._load_global_config",
+        lambda: {"session_title_instructions": "Brief", "branding": {"app_name": "Global"}},
+    )
+    create_app = Mock()
+    monkeypatch.setattr("omnigent.server.app.create_app", create_app)
+    monkeypatch.setattr(uvicorn.server.Server, "run", lambda self: None)
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", Mock())
+    args = ["--host", "127.0.0.1", "--port", "44771", "--no-open"]
+    result = CliRunner().invoke(cli, ["server", *args])
+    assert result.exit_code == 0, result.output
+    assert create_app.call_args.kwargs["server_config"] == {
+        **attachment_settings,
+        "session_title_instructions": "Brief",
+    }
+
+    explicit_settings = {
+        "filesystem_attachment_allowed_extensions": [".zip"],
+        "branding": {"app_name": "Explicit"},
+    }
+    explicit = tmp_path / "explicit.yaml"
+    explicit.write_text(yaml.safe_dump(explicit_settings))
+    result = CliRunner().invoke(cli, ["server", "-c", str(explicit), *args])
+    assert result.exit_code == 0, result.output
+    assert create_app.call_args.kwargs["server_config"] == explicit_settings
+
+
 def test_server_explicit_config_overrides_omnigent_config_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

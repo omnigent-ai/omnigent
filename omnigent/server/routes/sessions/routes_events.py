@@ -209,6 +209,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _query_host_runner_status,
     _remove_session_worktree_best_effort,
+    _request_attachment_policy,
     _require_external_status_forward,
     _require_filesystem_attachment_harness,
     _resolve_harness,
@@ -217,6 +218,7 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
     _stream_live_events,
+    _validate_attachment_content,
     _wait_for_runner_client,
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
@@ -1052,31 +1054,18 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
         if body.type in ("message", _SLASH_COMMAND_TYPE):
-            from omnigent.inner.native_attachments import (
-                inline_filesystem_attachment_name,
-                requires_filesystem,
+            content = await asyncio.to_thread(
+                _validate_attachment_content,
+                body.data.get("content"),
+                session_id=session_id,
+                file_store=file_store,
+                policy=_request_attachment_policy(request),
             )
-
-            content = body.data.get("content")
-            inline_name = inline_filesystem_attachment_name(content)
-            if inline_name is not None:
-                raise OmnigentError(
-                    f"Attachment {inline_name!r} must be uploaded to the session's "
-                    "files and referenced by file_id.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            # Unsent uploads survive a switch or fork without appearing in history.
-            if file_store is not None and isinstance(content, list):
+            if content is not None:
+                body.data["content"] = content
                 for block in content:
-                    file_id = block.get("file_id") if isinstance(block, dict) else None
-                    if not isinstance(file_id, str):
-                        continue
-                    stored = await asyncio.to_thread(file_store.get, file_id)
-                    if stored is None or stored.session_id not in (None, session_id):
-                        continue
-                    if stored.filename is not None and requires_filesystem(stored.filename):
-                        await _require_filesystem_attachment_harness(conv, stored.filename)
-                        break
+                    if block.get("delivery") == "filesystem":
+                        await _require_filesystem_attachment_harness(conv, block["filename"])
         # Fail fast on malformed tools at the boundary. The raw dicts
         # (not the parsed objects) are what the runner stores — the
         # parse call is purely a validator.
@@ -2769,6 +2758,7 @@ def register_events_routes(
             if attachment is not None:
                 await asyncio.to_thread(
                     require_filesystem_attachment_runtime,
+                    filename=attachment,
                     host_id=conv.host_id,
                     runner_id=conv.runner_id,
                     host_registry=getattr(request.app.state, "host_registry", None),

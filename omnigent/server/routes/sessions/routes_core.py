@@ -259,7 +259,10 @@ def _require_attachment_compatible_history(
     from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
 
     filename = _filesystem_attachment_in_history(
-        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
+        session_id,
+        conversation_store,
+        file_store,
+        up_to_response_id=up_to_response_id,
     )
     if filename is not None:
         native = _native_coding_agent_for_agent(target_agent)
@@ -3624,6 +3627,7 @@ def register_core_routes(
         # degrades — so a probe would only trade latency for the same outcome.
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
+        filesystem_sources: list[StoredFile] = []
         if file_store is not None and artifact_store is not None:
             files_after: str | None = None
             while True:
@@ -3641,11 +3645,20 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
-            from omnigent.inner.native_attachments import requires_filesystem
+            from omnigent.inner.native_attachments import stored_file_requires_filesystem
+            from omnigent.server.routes._sessions.helpers import (
+                _attachment_name_allowed,
+                _request_attachment_policy,
+            )
 
-            filesystem_sources = [
-                stored for stored in fork_source_files if requires_filesystem(stored.filename)
-            ]
+            policy = _request_attachment_policy(request)
+            for stored in fork_source_files:
+                filesystem = stored_file_requires_filesystem(
+                    stored.filename, stored.source_metadata
+                )
+                _attachment_name_allowed(stored.filename, policy, historic_inline=not filesystem)
+                if filesystem:
+                    filesystem_sources.append(stored)
             if filesystem_sources:
                 await asyncio.to_thread(
                     _enforce_filesystem_attachment_policy,
@@ -3653,6 +3666,7 @@ def register_core_routes(
                     session_id=None,
                     file_store=file_store,
                     sizes=[stored.bytes for stored in filesystem_sources],
+                    policy=policy,
                 )
 
         # Copied last, after every validation above; the copy row itself is
@@ -3756,11 +3770,19 @@ def register_core_routes(
                         file_store.create,
                         filename=stored_file.filename,
                         bytes=stored_file.bytes,
-                        content_type=stored_file.content_type,
+                        content_type=(
+                            "application/octet-stream"
+                            if stored_file in filesystem_sources
+                            else stored_file.content_type
+                        ),
                         session_id=new_conv.id,
                         file_id=copied_file_id,
                         blob_key=stored_file.blob_key or stored_file.id,
-                        source_metadata=stored_file.source_metadata,
+                        source_metadata=(
+                            {**(stored_file.source_metadata or {}), "delivery": "filesystem"}
+                            if stored_file in filesystem_sources
+                            else stored_file.source_metadata
+                        ),
                     )
                 except Exception:
                     _logger.warning(

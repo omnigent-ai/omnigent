@@ -30,7 +30,10 @@ from pydantic import ValidationError
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -63,6 +66,7 @@ CAP_MCP_TOOLS = "mcp_tools"
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_GENERALIZED_FILESYSTEM_ATTACHMENTS,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,

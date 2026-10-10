@@ -352,8 +352,8 @@ def test_upload_denylist_uses_filename(
 ) -> None:
     """The denylist rejects matching extensions regardless of the declared MIME."""
     monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_denied_extensions",
-        lambda: frozenset({".zip"}),
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_denied_extensions": [".zip"]},
     )
     client, session_id = upload_client
     response = _upload(client, session_id, filename, content_type=content_type)
@@ -377,7 +377,8 @@ def test_upload_quota_counts_only_filesystem_types(
 ) -> None:
     """Only filesystem formats spend the quota across successive uploads."""
     monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_file_limit", lambda: limit
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_files": limit},
     )
     client, session_id = upload_client
     for filename in existing:
@@ -402,8 +403,11 @@ async def test_parallel_uploads_cannot_overspend_the_filesystem_quota(
     from omnigent.server.routes.sessions import routes_resources
 
     monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_file_limit",
-        lambda: 1,
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_max_files": 1,
+            "filesystem_attachment_allowed_extensions": [".mp4"],
+        },
     )
     real_read = routes_resources._read_upload_capped
 
@@ -420,7 +424,7 @@ async def test_parallel_uploads_cannot_overspend_the_filesystem_quota(
             *(
                 http.post(
                     f"/v1/sessions/{session_id}/resources/files",
-                    files={"file": (f"race{i}.zip", b"PK\x03\x04 fake zip", "application/zip")},
+                    files={"file": (f"race{i}.mp4", b"PK\x03\x04 fake zip", "video/mp4")},
                 )
                 for i in range(2)
             )
@@ -428,7 +432,7 @@ async def test_parallel_uploads_cannot_overspend_the_filesystem_quota(
 
     assert sorted(r.status_code for r in responses) == [201, 413]
     stored = SqlAlchemyFileStore(db_uri).list(session_id=session_id, limit=10).data
-    assert [f.filename for f in stored if f.filename.endswith(".zip")] == [
+    assert [f.filename for f in stored if f.filename.endswith(".mp4")] == [
         next(r.json()["name"] for r in responses if r.status_code == 201)
     ]
 
@@ -462,8 +466,8 @@ def test_quota_counts_filesystem_files_past_any_page_boundary(
             )
 
     monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_file_limit",
-        lambda: 1,
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_files": 1},
     )
 
     with pytest.raises(HTTPException) as exc:
@@ -619,10 +623,8 @@ def test_failed_upload_releases_quota_and_can_retry(
 ) -> None:
     """Blob failures leave no metadata, partial bytes, or resource event behind."""
     monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_file_limit", lambda: 1
-    )
-    monkeypatch.setattr(
-        "omnigent.server.server_config.filesystem_attachment_total_bytes_limit", lambda: 4
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_files": 1, "filesystem_attachment_max_total_bytes": 4},
     )
     client, session_id = upload_client
     original_put = LocalArtifactStore.put
@@ -654,3 +656,348 @@ def test_failed_upload_releases_quota_and_can_retry(
     files = SqlAlchemyFileStore(db_uri).list(session_id).data
     assert [stored.id for stored in files] == [retried.json()["id"]]
     assert len(conversations.list_items(session_id, type="resource_event").data) == 1
+
+
+@pytest.mark.parametrize("mime", ["video/mp4", "text/plain", "image/png", ""])
+def test_configured_video_is_stored_opaque_and_byte_faithful(
+    upload_client, monkeypatch: pytest.MonkeyPatch, db_uri: str, mime: str
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": [".MP4"]},
+    )
+    client, session_id = upload_client
+    payload = b"\x00\xff\x80\x01video"
+    response = _upload(client, session_id, "clip.mp4", payload, mime)
+    assert response.status_code == 201, response.text
+    resource = response.json()
+    stored = SqlAlchemyFileStore(db_uri).get(resource["id"])
+    assert stored is not None
+    assert stored.source_metadata == {"delivery": "filesystem"}
+    assert stored.content_type == "application/octet-stream"
+    download = client.get(f"/v1/sessions/{session_id}/resources/files/{stored.id}/content")
+    assert download.content == payload
+    assert download.headers["x-content-type-options"] == "nosniff"
+    assert "attachment;" in download.headers["content-disposition"]
+
+
+@pytest.mark.parametrize("allowed", [[], [".mp4"]])
+def test_filesystem_allowlist_replaces_builtins(upload_client, monkeypatch, allowed) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": allowed},
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, "archive.zip", content_type="text/plain")
+    assert response.status_code == 415, response.text
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "payload.EXE.txt",
+        "payload.txt.exe",
+        "payload.exe. ",
+        "payload.exe:note.txt",
+        "payload.txt:exe",
+        "payload\x01.txt",
+        "payload\x00.txt",
+        "payload.exe .txt",
+    ],
+)
+def test_admission_normalizes_names_before_inline_classification(
+    upload_client, monkeypatch, name
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": "*",
+            "filesystem_attachment_denied_extensions": ["exe"],
+        },
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, name, content_type="text/plain")
+    assert response.status_code == 415, response.text
+
+
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+@pytest.mark.parametrize(
+    "name,mime",
+    [("clip.mp4", "video/mp4"), ("clip.mp4", "text/plain"), ("payload.exe.txt", "text/plain")],
+)
+def test_generalized_inline_bytes_cannot_bypass_admission(
+    upload_client, monkeypatch, event_type, name, mime
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": [".mp4"],
+            "filesystem_attachment_denied_extensions": [".exe"],
+        },
+    )
+    client, session_id = upload_client
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": event_type,
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": name,
+                        "file_data": f"data:{mime};base64,AA==",
+                    }
+                ],
+            },
+        },
+    )
+    assert response.status_code in (400, 415), response.text
+    assert name in response.text
+
+
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+@pytest.mark.parametrize("name", ["clip.mp4", "payload.exe.png"])
+def test_remote_images_cannot_bypass_event_admission(
+    upload_client, monkeypatch, event_type, name
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": [".mp4"],
+            "filesystem_attachment_denied_extensions": [".exe"],
+        },
+    )
+    client, session_id = upload_client
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": event_type,
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "filename": name,
+                        "image_url": f"https://example.com/{name}",
+                    }
+                ],
+            },
+        },
+    )
+    assert response.status_code in (400, 415), response.text
+    assert name in response.text
+
+
+@pytest.mark.parametrize(
+    "name", ["opaque", "clip.MP4. ", "../clip.mp4", "folder\\clip.mp4", ".env"]
+)
+def test_wildcard_admission_normalizes_portable_names(upload_client, monkeypatch, name) -> None:
+    config = {"filesystem_attachment_allowed_extensions": "*"}
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: config,
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, name, b"\x00\xff", "text/plain")
+    assert response.status_code == 201, response.text
+    stored = response.json()
+    assert stored["name"] == name.replace("\\", "/").split("/")[-1].rstrip(" .")
+    if name == ".env":
+        assert stored["metadata"]["source_metadata"] is None
+        config["filesystem_attachment_denied_extensions"] = [".env"]
+        assert _upload(client, session_id, name, content_type="text/plain").status_code == 415
+    else:
+        assert stored["metadata"]["source_metadata"] == (
+            None if name == "opaque" else {"delivery": "filesystem"}
+        )
+
+
+@pytest.mark.parametrize(
+    "cap,first_size,second_size",
+    [
+        ("filesystem_attachment_max_files", 4, 1),
+        ("filesystem_attachment_max_total_bytes", 4, 1),
+        ("filesystem_attachment_max_bytes", 4, 5),
+    ],
+)
+def test_generalized_upload_caps_include_grandfathered_files(
+    upload_client, monkeypatch, cap, first_size, second_size
+) -> None:
+    config = {
+        "filesystem_attachment_allowed_extensions": [".mp4", ".zip"],
+        "filesystem_attachment_max_files": 2,
+        "filesystem_attachment_max_total_bytes": 8,
+        "filesystem_attachment_max_bytes": 4,
+    }
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: config)
+    client, session_id = upload_client
+    assert (
+        _upload(client, session_id, "clip.mp4", b"v" * first_size, "video/mp4").status_code == 201
+    )
+    config["filesystem_attachment_allowed_extensions"] = [".zip"]
+    config[cap] = 1 if cap == "filesystem_attachment_max_files" else 4
+    response = _upload(client, session_id, "next.zip", b"v" * second_size)
+    assert response.status_code == 413, response.text
+
+
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+def test_generalized_stored_reference_is_normalized_at_event_ingress(
+    upload_client, monkeypatch, event_type
+) -> None:
+    from omnigent.server.routes.sessions import routes_events
+
+    config = {"filesystem_attachment_allowed_extensions": [".mp4"]}
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", lambda: config)
+    client, session_id = upload_client
+    uploaded = _upload(client, session_id, "clip.mp4", b"\x00\xff", "video/mp4")
+    assert uploaded.status_code == 201, uploaded.text
+    config["filesystem_attachment_allowed_extensions"] = []
+    captured = []
+
+    async def policy(*args, **kwargs):
+        captured.append(args[3])
+        return {"verdict": "deny", "reason": "stop before runner"}
+
+    monkeypatch.setattr(routes_events, "_evaluate_input_policy", policy)
+    monkeypatch.setattr(routes_events, "_persist_policy_deny_sentinel", AsyncMock())
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": event_type,
+            "data": {
+                "role": "user",
+                "name": "review",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "file_id": uploaded.json()["id"],
+                        "filename": "fake.png",
+                        "delivery": "inline",
+                        "file_data": "data:text/plain;base64,eA==",
+                        "image_url": "data:image/png;base64,eA==",
+                    }
+                ],
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    assert captured
+    content = [block for block in captured[0].data["content"] if "file_id" in block]
+    assert content == [
+        {
+            "type": "input_file",
+            "file_id": uploaded.json()["id"],
+            "filename": "clip.mp4",
+            "delivery": "filesystem",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "name,mime",
+    [("page.html", "text/html"), ("drawing.svg", "image/svg+xml"), ("clip.mp4", "video/mp4")],
+)
+def test_arbitrary_files_download_privately_as_attachments(
+    upload_client, monkeypatch, name, mime
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": [".html", ".svg", ".mp4"]},
+    )
+    client, session_id = upload_client
+    content = b'<script>alert("x")</script>'
+    uploaded = _upload(client, session_id, name, content, mime)
+    assert uploaded.status_code == 201, uploaded.text
+    assert uploaded.json()["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+    file_id = uploaded.json()["id"]
+    download = client.get(f"/v1/sessions/{session_id}/resources/files/{file_id}/content")
+    assert download.content == content
+    assert download.headers["content-disposition"].startswith("attachment;")
+    assert download.headers["x-content-type-options"] == "nosniff"
+    assert "private" in download.headers["cache-control"]
+
+
+def test_wildcard_video_upload_preserves_opaque_bytes_for_every_declared_mime(
+    upload_client,
+    db_uri,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": "*"},
+    )
+    client, session_id = upload_client
+    payload = b"\x00\xffvideo"
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = _upload(client, session_id, "clip.mp4", payload, mime)
+        assert response.status_code == 201, response.text
+        resource = response.json()
+        assert resource["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+        content = client.get(f"/v1/sessions/{session_id}/resources/files/{resource['id']}/content")
+        assert content.content == payload
+        stored = SqlAlchemyFileStore(db_uri).get(resource["id"])
+        assert stored.content_type == "application/octet-stream"
+
+
+@pytest.mark.parametrize("cap", ["max_bytes", "max_files", "max_total_bytes"])
+def test_wildcard_video_mime_cannot_bypass_filesystem_caps(
+    upload_client, monkeypatch, cap
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "filesystem_attachment_allowed_extensions": "*",
+            f"filesystem_attachment_{cap}": 1,
+        },
+    )
+    client, session_id = upload_client
+    assert _upload(client, session_id, "seed.mp4", b"x", "video/mp4").status_code == 201
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = _upload(client, session_id, "clip.mp4", b"xx", mime)
+        assert response.status_code == 413, response.text
+
+
+def test_wildcard_video_mime_cannot_enter_sdk_session(upload_client, db_uri, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": "*"},
+    )
+    client, _ = upload_client
+    sdk = SqlAlchemyConversationStore(db_uri).create_conversation(
+        title="sdk", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = _upload(client, sdk.id, "clip.mp4", b"video", mime)
+        assert response.status_code == 415, response.text
+        assert "Claude Code or Codex" in response.text
+
+
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+def test_wildcard_video_cannot_be_inlined_in_events(
+    upload_client, monkeypatch, event_type
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_allowed_extensions": "*"},
+    )
+    client, session_id = upload_client
+    for mime in ("text/plain", "image/png", "", "application/octet-stream"):
+        response = client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": event_type,
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "clip.mp4",
+                            "file_data": f"data:{mime};base64,eA==",
+                        }
+                    ],
+                },
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert "must be uploaded" in response.text

@@ -1,3 +1,4 @@
+import { attachmentAccept, validateAttachments } from "./attachments";
 // Unit tests for `capabilities.ts` — the `/v1/info` probe's defensive parse
 // and the sandbox-provider option helpers.
 //
@@ -261,4 +262,130 @@ describe("custom agents settings capability", () => {
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },
   );
+});
+
+it.each([[".mp4"], [], "*"])("preserves published attachment policy %j", async (allowed) => {
+  const policy = {
+    allowed_extensions: allowed,
+    denied_extensions: [".exe"],
+    max_bytes: 100,
+    max_files: 2,
+    max_total_bytes: 200,
+    harnesses: ["claude-native"],
+  };
+  expect(
+    (await probe({ filesystem_attachment_policy: policy })).filesystem_attachment_policy,
+  ).toEqual(policy);
+});
+
+const validAttachmentPolicy = {
+  allowed_extensions: [".mp4"],
+  denied_extensions: [".exe"],
+  max_bytes: 100,
+  max_files: 2,
+  max_total_bytes: 200,
+  harnesses: ["claude-native"],
+  inline_extensions: { ".txt": "text" },
+};
+describe("attachment policy parsing", () => {
+  it.each([
+    ["null", null],
+    ["array", []],
+    ["string", "*"],
+    ["missing fields", {}],
+    ["allowed missing", { ...validAttachmentPolicy, allowed_extensions: undefined }],
+    ["allowed object", { ...validAttachmentPolicy, allowed_extensions: {} }],
+    ["allowed mixed", { ...validAttachmentPolicy, allowed_extensions: [1] }],
+    ["allowed empty suffix", { ...validAttachmentPolicy, allowed_extensions: [""] }],
+    ["allowed list wildcard", { ...validAttachmentPolicy, allowed_extensions: ["*"] }],
+    ["bytes zero", { ...validAttachmentPolicy, max_bytes: 0 }],
+    ["denied missing", { ...validAttachmentPolicy, denied_extensions: undefined }],
+    ["denied null", { ...validAttachmentPolicy, denied_extensions: null }],
+    ["denied mixed", { ...validAttachmentPolicy, denied_extensions: [false] }],
+    ["bytes string", { ...validAttachmentPolicy, max_bytes: "100" }],
+    ["bytes infinite", { ...validAttachmentPolicy, max_bytes: Infinity }],
+    ["files negative", { ...validAttachmentPolicy, max_files: -1 }],
+    ["files fractional", { ...validAttachmentPolicy, max_files: 1.5 }],
+    ["total missing", { ...validAttachmentPolicy, max_total_bytes: undefined }],
+    ["harnesses string", { ...validAttachmentPolicy, harnesses: "claude-native" }],
+    ["harnesses mixed", { ...validAttachmentPolicy, harnesses: [1] }],
+    ["inline array", { ...validAttachmentPolicy, inline_extensions: [] }],
+  ])("falls back safely for malformed %s", async (_label, malformed) => {
+    const result = await probe({ filesystem_attachment_policy: malformed });
+    expect(result.filesystem_attachment_policy).toBeUndefined();
+    expect(attachmentAccept(result.filesystem_attachment_policy)).toBeUndefined();
+    const unknown = new File(["video"], "clip.mp4", { type: "video/mp4" });
+    expect(validateAttachments([unknown], result.filesystem_attachment_policy).accepted).toEqual([
+      unknown,
+    ]);
+  });
+  it("requires page reload after server restart to replace cached malformed policy fallback", async () => {
+    const initial = await probe({
+      filesystem_attachment_policy: { ...validAttachmentPolicy, denied_extensions: null },
+    });
+    expect(initial.filesystem_attachment_policy).toBeUndefined();
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({ filesystem_attachment_policy: validAttachmentPolicy }),
+    );
+    const { resolveServerInfo } = await import("./capabilities");
+    expect((await resolveServerInfo()).filesystem_attachment_policy).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.resetModules();
+    const reloaded = await import("./capabilities");
+    expect((await reloaded.resolveServerInfo()).filesystem_attachment_policy).toEqual(
+      validAttachmentPolicy,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("additive attachment policy fields", () => {
+  it.each([
+    { ".future": "video" },
+    { "invalid/suffix": "text" },
+    { txt: "text" },
+    { ".empty": null },
+  ])("keeps core policy and valid inline entries alongside %j", async (unknown) => {
+    const mixed = {
+      ...validAttachmentPolicy,
+      inline_extensions: { ".txt": "text", ".pdf": "pdf", ...unknown },
+    };
+    const result = await probe({ filesystem_attachment_policy: mixed });
+    expect(result.filesystem_attachment_policy).toEqual({
+      ...validAttachmentPolicy,
+      inline_extensions: { ".txt": "text", ".pdf": "pdf" },
+    });
+    expect(attachmentAccept(result.filesystem_attachment_policy)).toContain(".mp4");
+    expect(
+      validateAttachments([new File(["content"], "note.txt")], result.filesystem_attachment_policy)
+        .accepted,
+    ).toHaveLength(1);
+  });
+  it("uses valid non-inline suffix knowledge and drops invalid entries", async () => {
+    const result = await probe({
+      filesystem_attachment_policy: {
+        ...validAttachmentPolicy,
+        allowed_extensions: "*",
+        non_inline_extensions: [".mp4", "bad/path", 1],
+      },
+    });
+    expect(result.filesystem_attachment_policy?.non_inline_extensions).toEqual([".mp4"]);
+    const video = new File(["longer than quota"], "clip.mp4", { type: "text/plain" });
+    expect(
+      validateAttachments([video], { ...result.filesystem_attachment_policy!, max_bytes: 1 })
+        .errors[0],
+    ).toContain("too large");
+  });
+  it("falls back safely for a malformed non-inline suffix container", async () => {
+    expect(
+      (
+        await probe({
+          filesystem_attachment_policy: {
+            ...validAttachmentPolicy,
+            non_inline_extensions: { ".mp4": true },
+          },
+        })
+      ).filesystem_attachment_policy,
+    ).toBeUndefined();
+  });
 });

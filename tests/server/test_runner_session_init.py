@@ -747,3 +747,37 @@ async def test_init_rejection_level_by_status(status: int, level: str) -> None:
     assert rejected["level"] == level
     assert rejected["attributes"]["response_body"] == "nope"
     assert "finished" not in rejected["message"]
+
+
+@pytest.mark.asyncio
+async def test_generalized_history_rechecks_replaced_runner_after_legacy_file(db_uri: str) -> None:
+    initializer, conversation, registry, client = _attachment_initializer(
+        db_uri, "sample.zip", [CAP_FILESYSTEM_ATTACHMENTS]
+    )
+    files = SqlAlchemyFileStore(db_uri)
+    video = files.create(
+        "clip.mp4", bytes=4, session_id=conversation.id, source_metadata={"delivery": "filesystem"}
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.append(
+        conversation.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="c" * 32,
+                data=MessageData(
+                    role="user", content=[{"type": "input_file", "file_id": video.id}]
+                ),
+            )
+        ],
+    )
+    client.release.set()
+    with pytest.raises(OmnigentError, match="Update Omnigent"):
+        await initializer.initialize(conversation, client, timeout=10)
+    assert not client.calls
+    registry.connection = _AdvertisedRunner(
+        [CAP_FILESYSTEM_ATTACHMENTS, "generalized_filesystem_attachments"]
+    )
+    response = await initializer.initialize(conversation, client, timeout=10)
+    assert response.status_code == 201
+    assert len(client.calls) == 1

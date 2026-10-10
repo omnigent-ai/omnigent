@@ -26,7 +26,8 @@ class StoredFile:
         the bytes with ``blob_key or id``.
     :param source_metadata: Optional metadata about the original upload
         before any server-side transform, as an opaque JSON-able dict.
-        ``None`` when there is nothing to record. Today only images that
+        Server-owned ``delivery: filesystem`` fixes delivery across policy changes;
+        rows without it use the legacy filesystem extensions. Images that
         were downscaled at upload populate it, with ``{"width", "height"}``
         giving the pre-downscale pixel size — used to tell the model it is
         viewing a reduced-resolution version. New file types may add their
