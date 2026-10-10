@@ -7862,12 +7862,9 @@ async def _relay_runner_live_elsewhere(
 def _runner_tunnel_waiter(
     runner_client: httpx.AsyncClient,
 ) -> Callable[[float], Awaitable[bool]] | None:
-    """Return a runner client's tunnel-registration waiter, or ``None``.
-
-    In-process test clients carry no tunnel transport; callers fall back to
-    their no-transport behavior. Keeping the private-attribute probe here means
-    one place to update if the transport attribute is ever renamed.
-    """
+    """Return the tunnel-registration waiter, or ``None`` for clients without a
+    tunnel transport (in-process test clients), whose callers fall back to their
+    no-transport behavior."""
     transport = getattr(runner_client, "_transport", None)
     return getattr(transport, "wait_for_runner", None)
 
@@ -8009,37 +8006,38 @@ async def _relay_runner_stream(
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
-            # A still-registered tunnel means only this session's stream dropped
-            # (``session_stream_lost``); otherwise the runner is gone. Resolve it
-            # here so the decision log, failure event, and durable label agree.
-            wait = _runner_tunnel_waiter(runner_client)
-            if wait is not None and await wait(0.0):
-                disconnect_error = ErrorDetail(
-                    code="session_stream_lost",
-                    message="The live session connection was lost.",
-                )
-                failure_origin = "session_stream_lost_mid_turn"
-            else:
-                disconnect_error = ErrorDetail(
-                    code="runner_disconnected",
-                    message="Runner disconnected unexpectedly.",
-                )
-                failure_origin = "runner_disconnected_mid_turn"
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
                 decision = "server_shutdown"
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
-            elif await _runner_disconnect_requires_failure(
-                session_id,
-                conversation_store,
-                origin=failure_origin,
-                error_code=disconnect_error.code,
-            ):
-                decision = "failed_mid_turn"
             else:
-                decision = "idle_no_failure"
+                # Resolve the cause only on the failure path: a still-registered
+                # tunnel (including a runner that re-registered within the grace)
+                # means ``session_stream_lost``, which recovers like a disconnect.
+                wait = _runner_tunnel_waiter(runner_client)
+                if wait is not None and await wait(0.0):
+                    disconnect_error = ErrorDetail(
+                        code="session_stream_lost",
+                        message="The live session connection was lost.",
+                    )
+                    failure_origin = "session_stream_lost_mid_turn"
+                else:
+                    disconnect_error = ErrorDetail(
+                        code="runner_disconnected",
+                        message="Runner disconnected unexpectedly.",
+                    )
+                    failure_origin = "runner_disconnected_mid_turn"
+                if await _runner_disconnect_requires_failure(
+                    session_id,
+                    conversation_store,
+                    origin=failure_origin,
+                    error_code=disconnect_error.code,
+                ):
+                    decision = "failed_mid_turn"
+                else:
+                    decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
             _logger.warning(

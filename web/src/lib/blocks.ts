@@ -528,6 +528,15 @@ const SPECIFIC_ERROR_CODES = new Set([
   "model_change_not_applied",
 ]);
 
+// Disconnect-class failure codes that passive recovery clears once the host is
+// reachable again. Mirrors the server's _DISCONNECT_FAILURE_CODES; a start
+// failure is excluded because it is not recoverable transport loss.
+const DISCONNECT_FAILURE_CODES = new Set(["runner_disconnected", "session_stream_lost"]);
+
+export function isDisconnectFailureCode(code: string | null | undefined): boolean {
+  return code != null && DISCONNECT_FAILURE_CODES.has(code);
+}
+
 /** The server is retrying. */
 export interface RetryBlock {
   type: "retry";
