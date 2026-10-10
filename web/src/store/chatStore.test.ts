@@ -4371,6 +4371,151 @@ describe("chatStore — send while streaming (queueing)", () => {
     });
   });
 
+  // A dispatched tool with no result yet.
+  function inFlightToolGroup(callId: string, output: string | null = null) {
+    return {
+      type: "tool_group" as const,
+      ctx: {
+        agent: "test",
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "resp_a",
+        itemId: `fc_${callId}`,
+      },
+      executions: [
+        {
+          name: "shell",
+          arguments: {},
+          argsSummary: "",
+          callId,
+          agentName: "test",
+          executedBy: "server" as const,
+          output,
+        },
+      ],
+      iteration: 0,
+    };
+  }
+
+  it("ignores a bare idle while the trailing tool call is still unresolved", () => {
+    // A bare PTY idle must not end an unresolved tool call, flip the sidebar
+    // row, or fire the turn-end refetches.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      blocks: [inFlightToolGroup("c1")],
+    });
+    seedConversationsCache([conv("conv_abc", "running")]);
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("running");
+    expect(state.status).toBe("streaming");
+    expect(state.activeResponse).toEqual({
+      responseId: "resp_a",
+      state: "streaming",
+      error: null,
+    });
+    expect(readConversationRows()[0]?.status).toBe("running");
+    expect(invalidateSpy).not.toHaveBeenCalled();
+  });
+
+  it("adopts the bare idle once the trailing tool call has its result", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      blocks: [inFlightToolGroup("c1", "tool output")],
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.activeResponse?.state).toBe("completed");
+  });
+
+  it("adopts an id-bearing idle even while a tool call is unresolved", () => {
+    // A terminal edge naming the turn (status file / Stop hook) is
+    // authoritative — only the bare PTY-quiescence shape is second-guessed.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      blocks: [inFlightToolGroup("c1")],
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+      responseId: "resp_a",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.activeResponse?.state).toBe("completed");
+  });
+
+  it("adopts a parked bare idle carrying a blocked-on reason mid-tool", () => {
+    // A parked edge means the harness is waiting on the user (a dialog),
+    // which the UI must surface — it is not the false-idle shape.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      blocks: [inFlightToolGroup("c1")],
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+      blockedOn: "user_input",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.blockedOn).toBe("user_input");
+  });
+
+  it("adopts a bare idle after a user interrupt even with a dangling tool call", () => {
+    // Stop clicked in another tab: `session.interrupted` cancels the response
+    // here while `sessionStatus` is still running, and the interrupt handler's
+    // bare idle must then end the session although the tool never resolved.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      blocks: [inFlightToolGroup("c1")],
+    });
+    handleSessionEvent({ type: "session_interrupted", requestedAt: 0, responseId: "resp_a" });
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse).toEqual({
+      responseId: "resp_a",
+      state: "cancelled",
+      error: null,
+      completedAt: expect.any(Number),
+    });
+  });
+
   it("finalizes a streaming turn to failed on a bare failed edge", () => {
     useChatStore.setState({
       conversationId: "conv_abc",
