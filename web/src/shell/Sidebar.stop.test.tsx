@@ -90,8 +90,9 @@ describe("sidebar Stop session item", () => {
     openKebab();
     fireEvent.click(screen.getByTestId("stop-conversation"));
 
+    // Killing the shared runner also takes every shell opened on it.
     expect(screen.getByRole("dialog")).toHaveTextContent(
-      "stops its runner, including side chats running on it",
+      "stops its runner, including side chats running on it, and closes any open side shells",
     );
     // The confirm dialog gates the mutation — nothing fires on item click.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
