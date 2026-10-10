@@ -26,8 +26,12 @@
     <string name="oauth_verification_failed">The sign-in callback could not be verified.</string>
     <string name="oauth_session_expired">Your workspace session expired. Connect again to continue.</string>
     <string name="oauth_permission_denied">Databricks denied access to this workspace.</string>
+    <string name="oauth_recovery_exhausted">The workspace session could not be restored. Reconnect to try again.</string>
+    <string name="oauth_signing_out">Signing out of this workspace…</string>
+    <string name="oauth_sign_out_incomplete">Sign-out could not finish. Reconnect to retry cleanup before signing in.</string>
     <string name="menu_reload">Reload</string>
     <string name="menu_connect_new">Connect to New Server</string>
+    <string name="menu_sign_out_workspace">Sign Out of Workspace</string>
     <!-- Shown to IT admins in their EMM console, not to app users. -->
     <string name="restriction_server_urls_title">Omnigent server URLs</string>
     <string name="restriction_server_urls_description">Server URLs to offer users, separated by commas or new lines, most preferred first. They are listed in the app for the user to pick from; the app does not connect to one automatically, and users can still enter a different server.</string>

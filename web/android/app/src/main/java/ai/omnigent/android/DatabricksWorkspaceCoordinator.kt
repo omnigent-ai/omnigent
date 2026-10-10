@@ -12,6 +12,7 @@ internal class DatabricksWorkspaceCoordinator(
     private val tokens: DatabricksTokenManager = DatabricksTokenManager.shared(context),
     private val sessions: DatabricksSessionCreating = DatabricksSessionClient(),
     private val executor: ExecutorService = Executors.newCachedThreadPool(),
+    private val signOuts: DatabricksSignOutManager = DatabricksSignOutManager(context, tokens),
 ) {
     fun prepare(
         context: DatabricksWebContext,
@@ -19,6 +20,7 @@ internal class DatabricksWorkspaceCoordinator(
     ): CompletableFuture<DatabricksWebSession> =
         CompletableFuture.supplyAsync(
             {
+                await(signOuts.finishPending(context, profile))
                 var credential =
                     await(tokens.tokens(context.scope))
                         ?: throw DatabricksSessionException.ReauthenticationRequired()
