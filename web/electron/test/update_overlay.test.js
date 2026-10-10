@@ -240,6 +240,19 @@ describe("update overlay", () => {
     });
   });
 
+  it("keeps the overlay at least 1px tall when the parent resizes with no card", () => {
+    const { controller, onHandlers } = makeOverlay();
+    const parent = new FakeWindow();
+    const overlay = controller.ensureOverlay(parent);
+
+    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 0);
+    parent.emit("resize");
+
+    // Wayland CHECKs (process-wide abort) on a zero-sized toplevel setBounds.
+    assert.equal(overlay.bounds.height, 1);
+    assert.ok(overlay.bounds.width > 0);
+  });
+
   it("opens About before starting a download from Update now", async () => {
     const { calls, controller, handleHandlers } = makeOverlay();
     const parent = new FakeWindow();

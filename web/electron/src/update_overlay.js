@@ -117,12 +117,14 @@ function createUpdateOverlay({
 
   function position(parent, overlay, height) {
     if (!parent || parent.isDestroyed() || overlay.isDestroyed()) return;
+    // Wayland rejects a zero-sized toplevel bounds update — Chromium CHECKs
+    // and the whole app dies — so the "empty" state is a 1px sliver.
     const content = parent.getContentBounds();
     overlay.setBounds({
       x: content.x + content.width - OVERLAY_WIDTH - OVERLAY_INSET,
-      y: content.y + content.height - height - OVERLAY_INSET,
+      y: content.y + content.height - Math.max(1, height) - OVERLAY_INSET,
       width: OVERLAY_WIDTH,
-      height,
+      height: Math.max(1, height),
     });
   }
 
