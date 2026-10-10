@@ -446,6 +446,30 @@ class OmnigentWebViewClientTest {
         assertEquals(true, reportedCrash)
     }
 
+    @Test
+    fun `a native OIDC session takes over its auth routes on the pinned origin`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val client = client(handlesNavigation = { url -> url?.endsWith("/auth/login") == true })
+
+        assertTrue(client.shouldOverrideUrlLoading(webView, request("$PINNED_ORIGIN/auth/login")))
+        assertFalse(client.shouldOverrideUrlLoading(webView, request(PINNED_URL)))
+        assertFalse(webView.stopLoadingCalled)
+
+        client.onPageStarted(webView, "$PINNED_ORIGIN/auth/login", null)
+        assertTrue(webView.stopLoadingCalled)
+    }
+
+    @Test
+    fun `in-page navigations are reported to the shell`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val visited = mutableListOf<String?>()
+        val client = client(onHistoryUpdated = { url -> visited += url })
+
+        client.doUpdateVisitedHistory(webView, "$PINNED_ORIGIN/c/1", false)
+
+        assertEquals(listOf<String?>("$PINNED_ORIGIN/c/1"), visited)
+    }
+
     /** Run posted bounces (see the client's mainHandler) before asserting. */
     private fun idleMainLooper() = shadowOf(Looper.getMainLooper()).idle()
 
@@ -459,6 +483,8 @@ class OmnigentWebViewClientTest {
         workspaceSession: () -> DatabricksWebSession? = { null },
         onWorkspaceSessionInvalid: (Int?) -> Unit = {},
         onWorkspaceSignOut: () -> Unit = {},
+        handlesNavigation: (String?) -> Boolean = { false },
+        onHistoryUpdated: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
@@ -469,6 +495,8 @@ class OmnigentWebViewClientTest {
         workspaceSession = workspaceSession,
         onWorkspaceSessionInvalid = onWorkspaceSessionInvalid,
         onWorkspaceSignOut = onWorkspaceSignOut,
+        handlesNavigation = handlesNavigation,
+        onHistoryUpdated = onHistoryUpdated,
     )
 
     private fun workspaceSession(): DatabricksWebSession {

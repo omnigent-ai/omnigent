@@ -13,11 +13,13 @@ import android.webkit.WebView
 import android.widget.TextView
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
@@ -27,10 +29,95 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowRestrictionsManager
 import java.time.Duration
+import java.util.concurrent.Executor
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class MainActivityTest {
+    @Before
+    fun readManifestsWithoutTheNetwork() {
+        MainActivity.manifestReader = { ServerManifest.BASELINE }
+        MainActivity.oidcWorker = Executor { it.run() }
+    }
+
+    @After
+    fun restoreManifestReader() {
+        MainActivity.manifestReader = { ServerManifest.fetch(it) }
+        MainActivity.oidcWorker = null
+    }
+
+    @Test
+    fun `a server offering native sign-in stays covered until it has a session`() {
+        MainActivity.manifestReader = {
+            ServerManifest(
+                1.0,
+                ServerManifest.Auth(
+                    ServerManifest.Mode.OIDC,
+                    "__Host-ap_session",
+                    listOf(OidcRedirect.REDIRECT_URI),
+                ),
+            )
+        }
+        ServerStore(
+            ApplicationProvider.getApplicationContext(),
+        ).connect("https://native.example.test")
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        // Nothing of the server loads; a prompt blanks the page underneath.
+        assertTrue(shadowOf(activity.webView()).lastLoadedUrl in setOf(null, "about:blank"))
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        // Still renewing, or asking: a relaunch never opens the browser by itself.
+        assertTrue(
+            activity.declared<TextView>("connectionMessage").text.toString() in
+                setOf(
+                    activity.getString(R.string.oidc_signing_in),
+                    "Sign in to native.example.test to continue.",
+                ),
+        )
+    }
+
+    @Test
+    fun `switching to a server offering native sign-in stops the previous page under the cover`() {
+        MainActivity.manifestReader = { url ->
+            if (url.contains("native")) {
+                ServerManifest(
+                    1.0,
+                    ServerManifest.Auth(
+                        ServerManifest.Mode.OIDC,
+                        "__Host-ap_session",
+                        listOf(OidcRedirect.REDIRECT_URI),
+                    ),
+                )
+            } else {
+                ServerManifest.BASELINE
+            }
+        }
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect("https://native.example.test")
+        val activity = launch()
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+
+        activity.invoke(
+            "onSwitchServerRequested",
+            arrayOf(String::class.java),
+            "https://native.example.test",
+        )
+
+        assertEquals("about:blank", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+    }
+
+    @Test
+    fun `a server without native sign-in loads at once, uncovered`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+    }
+
     @Test
     fun `workspace with missing OAuth configuration fails closed before WebView load`() {
         val workspace = "https://dbc-123.cloud.databricks.com/omnigent?o=42"
@@ -350,6 +437,14 @@ class MainActivityTest {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         return Robolectric.buildActivity(MainActivity::class.java).setup().get()
     }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> MainActivity.declared(name: String): T =
+        MainActivity::class
+            .java
+            .getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(this) as T
 
     private fun MainActivity.switchButton(): View =
         MainActivity::class

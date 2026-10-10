@@ -62,7 +62,9 @@ opens public-client OAuth in the system browser, keeps the grant in Keystore-bac
 encrypted storage, exchanges it for a `DBAUTH` web session, and installs that
 session into a persistent AndroidX WebKit profile scoped to the workspace origin,
 optional `o`, and client ID. Databricks Apps keep their existing inline platform
-SSO, while other servers keep the generic ticket/poll OIDC flow.
+SSO. Other OIDC servers sign in natively when their manifest lists the app's
+redirect (see [OIDC sign-in](#oidc-sign-in)), and otherwise keep the ticket/poll
+flow.
 
 The system WebView must support AndroidX WebKit's multi-profile feature; the app
 fails closed rather than putting workspace cookies in the process-wide default
@@ -102,6 +104,49 @@ Host matching is by domain (`*.databricks.com`, `*.azuredatabricks.net`) — no
 probe request. `*.databricksapps.com` is excluded: Apps serve their own app at
 the root and have no workspace mount. All three native shells redirect a bare
 workspace root to `/omnigent`.
+
+## OIDC sign-in
+
+Omnigent servers that sign in with OIDC (`OMNIGENT_AUTH_PROVIDER=oidc`) open
+their identity provider in Auth Tab, never inside the WebView. Before loading a
+server that isn't a Databricks host, the app reads its unauthenticated
+`/.well-known/omnigent.json`. Native sign-in applies only when `auth.mode` is
+`"oidc"`, `auth.native_redirect_uris` lists `ai.omnigent.android:/oauth/callback`,
+and `auth.session_cookie` is set:
+
+| Server                                                     | Sign-in                                                      |
+| ---------------------------------------------------------- | ------------------------------------------------------------ |
+| OIDC that lists the app's redirect                         | Auth Tab (below)                                             |
+| OIDC without the app's redirect (older servers)            | Unchanged: ticket sign-in in the browser (deprecated, 0.3.0) |
+| Accounts, header mode, custom providers, no auth           | Unchanged                                                    |
+| No `auth` in the manifest (older servers, subpath proxies) | Unchanged                                                    |
+| Databricks workspaces and Apps                             | Unchanged: detected by URL, manifest not read                |
+
+- **Connect** reuses the session cookie if `GET <mount>/v1/me` accepts it, else
+  renews it from the stored refresh grant (`POST <mount>/oauth/token`). Only when
+  neither works does it sign in at `<mount>/auth/login` with a PKCE challenge.
+  Auth Tab returns the server's redirect to `ai.omnigent.android:/oauth/callback`
+  with a one-time code, and the app exchanges it with its verifier at
+  `POST <mount>/auth/native-token`. Browsers without Auth Tab open a Custom Tab,
+  whose redirect reaches the app's callback receiver instead.
+- The session is checked with `/v1/me`, installed as the server's own cookie
+  (HttpOnly, SameSite=Lax, Secure on https, expiring with the session), and read
+  back before the page loads. **Signing in…** with **Cancel** covers the page
+  meanwhile, including the previous server's page during a switch.
+- Only an explicit connect (Connect, a server switch, or **Sign In**) opens the
+  browser by itself. A relaunch with nothing to renew shows "Sign in to <host> to
+  continue." with **Sign In**. Closing the browser returns to the connect screen,
+  with the reason when the saved sign-in had expired or been ended. A refused
+  sign-in shows the server's reason, and an unreachable server shows the
+  connection error.
+- **While connected,** the page's own navigation to `<mount>/auth/login`, or a
+  redirect to the identity provider, renews silently and reloads the page you
+  were on. If the page asks again within 15 seconds, or the renewal fails, the
+  app asks to sign in again and names the cause.
+
+The refresh grant is stored per server origin, and the sign-in in progress is
+stored so it survives Android stopping the app while the browser is open. Both
+are encrypted with an Android Keystore key and never leave the device.
 
 ## Managed configuration (org-preset servers)
 

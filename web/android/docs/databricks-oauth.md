@@ -5,7 +5,8 @@ Omnigent. It authenticates, creates the platform web session, and installs that
 session into an isolated persistent WebView profile before loading the page.
 
 Databricks Apps are a different server type and retain inline platform SSO.
-Generic Omnigent servers retain the existing ticket/poll OIDC flow.
+Other Omnigent servers follow [OIDC sign-in](../README.md#oidc-sign-in), which
+reuses Auth Tab and the callback receiver but never reads Databricks credentials.
 
 ## Build configuration
 

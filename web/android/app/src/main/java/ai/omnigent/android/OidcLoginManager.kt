@@ -14,6 +14,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
+ * Legacy ticket sign-in for OIDC servers whose manifest doesn't list this app's native
+ * redirect. Deprecated: removal targeted for Android 0.3.0, once servers ship native sign-in.
+ *
  * Drives the RFC 8252 login flow for the shell: authenticate in the system
  * browser — a real browser, so Google sign-in (which blocks embedded WebViews
  * with `disallowed_useragent`) and passkeys (which need the browser / a password
