@@ -216,7 +216,12 @@ Once the set is genuinely green:
    - Read the finished Markdown once as rendered prose. Split run-on sentences,
      expand unexplained internal shorthand, and remove repeated evidence before
      opening the PR. Compare Test Plan and Demo claims with the diff, test output,
-     and available footage.
+     and available footage. Where the body describes the delivered screen — the
+     order of rows in a picker, which entry is first or checked, a label — use
+     the wording the after-clip's final frame or the driver's assertions on the
+     rendered page established, identical to the clip's caption and
+     `solution_summary`; a description written from the intended design is not
+     checked until it is compared with that frame.
 
    If the target repository provides the template validator, validate the body
    locally before publishing it:
