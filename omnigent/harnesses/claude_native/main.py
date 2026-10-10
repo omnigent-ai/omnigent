@@ -553,8 +553,12 @@ def _gateway_claude_listing(
         if listing_provider.kind == KEY_KIND and listing_provider.family == ANTHROPIC_FAMILY:
             listing = model_catalog._fetch_anthropic_listing(listing_provider, transport=transport)
         else:
+            # LiteLLM hides wildcard routes (``claude-*``) unless asked; other
+            # OpenAI-compatible servers ignore the unknown param.
             listing = model_catalog._fetch_openai_compatible_listing(
-                listing_provider, transport=transport
+                listing_provider,
+                transport=transport,
+                params={"return_wildcard_routes": "true"},
             )
     except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError):
         _logger.debug(
@@ -1571,10 +1575,23 @@ async def claude_model_catalog(
     else:
         # No listing provider, or the listing was undetermined: fall back to the
         # hostname heuristic (which, for a configured gateway provider whose
-        # listing failed, keeps the probe rows — the fail-open path).
-        _non_canonical = listing_provider is None and (
-            (claude_config is not None and not _serves_canonical_anthropic_ids(claude_config))
-            or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+        # listing failed, keeps the probe rows — the fail-open path). Exception:
+        # Databricks AI Gateway whose /v1/models 404s should not offer bare
+        # claude-* ids that fail at the first turn.
+        from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+        is_undetermined_databricks_gateway = (
+            gateway_serves_canonical is None
+            and listing_provider is not None
+            and listing_provider.base_url
+            and is_databricks_ai_gateway_url(listing_provider.base_url)
+        )
+        _non_canonical = is_undetermined_databricks_gateway or (
+            listing_provider is None
+            and (
+                (claude_config is not None and not _serves_canonical_anthropic_ids(claude_config))
+                or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+            )
         )
     if _non_canonical:
         rows = [
