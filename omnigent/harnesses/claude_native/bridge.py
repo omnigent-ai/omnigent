@@ -303,6 +303,10 @@ _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
+# Minimum age of the paste when the submit Enter goes out. A TUI can draw
+# the draft while still treating input as part of the paste; an Enter inside
+# that window folds into the draft as a newline instead of submitting.
+_PASTE_SUBMIT_GAP_S = 2.0
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -4046,9 +4050,10 @@ def inject_user_message(
     while the TUI is still consuming the paste is folded in as a
     newline and the draft sits unsent. This helper first polls
     ``capture-pane`` until the draft is visible in the input box (the
-    paste was committed), sends Enter, then polls that the draft left
-    the box — re-sending Enter while it hasn't — and raises if the
-    message never submits.
+    paste was committed), holds the submit until the paste is at least
+    :data:`_PASTE_SUBMIT_GAP_S` old, sends Enter, then polls that the
+    draft left the box — re-sending Enter while it hasn't — and raises
+    if the message never submits.
 
     A message leading with an *unknown* slash command passes through
     unescaped on the guess that it names a skill. When Claude Code
@@ -4156,8 +4161,9 @@ def _paste_and_submit(
     The delivery core of :func:`inject_user_message` (see its docstring for
     the full hazard notes): clear any leftover draft, bracketed-paste the
     payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
-    visibly commit, submit, and verify the draft left the box — re-sending
-    Enter while it verifiably hasn't.
+    visibly commit and the paste to age past :data:`_PASTE_SUBMIT_GAP_S`,
+    submit, and verify the draft left the box — re-sending Enter while it
+    verifiably hasn't.
 
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
@@ -4211,6 +4217,7 @@ def _paste_and_submit(
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
+    pasted_at = time.monotonic()
     # Wait until the TUI has visibly committed the paste into its input
     # box before submitting. Claude Code coalesces rapid stdin bursts
     # into a paste; an Enter that arrives while it is still consuming
@@ -4245,6 +4252,8 @@ def _paste_and_submit(
         empty_captures=empty_captures,
     )
     time.sleep(_PASTE_SETTLE_S)
+    delivery_diagnostics.set_stage("holding_submit")
+    _hold_submit_until_paste_aged(pasted_at)
     delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
@@ -4285,6 +4294,20 @@ def _paste_and_submit(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _hold_submit_until_paste_aged(pasted_at: float) -> None:
+    """
+    Sleep until the paste is :data:`_PASTE_SUBMIT_GAP_S` old, in cancellable slices.
+
+    :param pasted_at: ``time.monotonic()`` reading taken when ``paste-buffer``
+        returned.
+    :returns: None.
+    :raises ClaudeInjectionCancelled: If the caller cancelled delivery meanwhile.
+    """
+    while (remaining := pasted_at + _PASTE_SUBMIT_GAP_S - time.monotonic()) > 0:
+        _check_injection_cancelled()
+        time.sleep(min(remaining, _CLAUDE_READY_POLL_INTERVAL_S))
 
 
 def _verify_submit_accepted(

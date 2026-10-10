@@ -4937,6 +4937,129 @@ def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
     )
 
 
+def test_inject_user_message_submit_gap_counts_from_the_paste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pre-submit hold is measured from the paste, not from the draft rendering.
+
+    A draft that takes 1.2s to appear still submits once the paste is
+    ``_PASTE_SUBMIT_GAP_S`` old; holding for the full gap again after the
+    draft renders would double the delivery latency.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.02
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    draft_render_delay_s = 1.2
+    gap_s = claude_native_bridge._PASTE_SUBMIT_GAP_S
+    tui: dict[str, Any] = {"pasted_at": None, "submitted": False}
+    enters: list[float] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that renders the pasted draft slowly.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            pasted_at = tui["pasted_at"]
+            rendered = (
+                pasted_at is not None
+                and not tui["submitted"]
+                and time.monotonic() - pasted_at >= draft_render_delay_s
+            )
+            pane = _composer_pane("fix the flaky test" if rendered else "")
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "paste-buffer" in cmd:
+            tui["pasted_at"] = time.monotonic()
+        if cmd[-1] == "Enter":
+            enters.append(time.monotonic() - tui["pasted_at"])
+            tui["submitted"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert len(enters) == 1, f"Expected one submit Enter, got {len(enters)}."
+    # Measured from the draft instead, the Enter would land past gap + 1.2s.
+    assert gap_s <= enters[0] < gap_s + 0.8, (
+        f"Submit Enter landed {enters[0]:.2f}s after the paste; expected within "
+        f"[{gap_s}, {gap_s + 0.8})s."
+    )
+
+
+def test_inject_user_message_cancel_during_submit_hold_sends_no_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A delivery cancelled while the submit is held stops promptly, without an Enter.
+
+    The hold is the longest wait between the paste and the submit; a blind
+    sleep there would both delay the cancellation and let an Enter follow it.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.02
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    cancelled = threading.Event()
+    tui = {"pane": _composer_pane()}
+    enters: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI whose draft renders at once; cancel once it is on screen.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            if "fix the flaky test" in tui["pane"]:
+                cancelled.set()
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    started = time.monotonic()
+    with (
+        claude_native_bridge.cancellable_injection(cancelled),
+        pytest.raises(claude_native_bridge.ClaudeInjectionCancelled),
+    ):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert not enters, "An Enter went out after the delivery was cancelled."
+    assert time.monotonic() - started < claude_native_bridge._PASTE_SUBMIT_GAP_S / 2, (
+        "Cancellation waited out the submit hold instead of interrupting it."
+    )
+
+
 def test_inject_user_message_outlasts_slow_submit_acceptance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4959,6 +5082,7 @@ def test_inject_user_message_outlasts_slow_submit_acceptance(
         raising=False,
     )
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SUBMIT_GAP_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,

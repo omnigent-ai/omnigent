@@ -107,6 +107,7 @@ def test_delivery_diagnostics(
         monkeypatch.setattr(bridge, "_unknown_command_rejection_appeared", lambda *_a, **_k: True)
     monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.03)
     monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PASTE_SUBMIT_GAP_S", 0.0)
     monkeypatch.setattr(bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.06)
     monkeypatch.setattr(bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.02)
@@ -191,6 +192,7 @@ def test_delivery_diagnostics(
         assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == 10
+        assert attrs["stage_holding_submit_ms"] == 0
         assert attrs["elapsed_ms"] == 30
 
     if scenario == "blank_line":
