@@ -35,7 +35,8 @@ from omnigent.server.auth import AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
+from omnigent.server.schemas import AgentList, AgentObject, MCPServerSummary, SkillSummary
+from omnigent.server.seeded_agents import suppressed_agent_names
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 
@@ -259,13 +260,21 @@ def create_builtin_agents_router(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         scope: str | None = Query(default=None, pattern="^user$"),
-    ) -> PaginatedList:
+    ) -> AgentList:
         """List server agents, or with ``scope=user`` the caller's own agents.
 
         Server agents come from ``agent_store.list()``, which never returns
         user agents. ``scope=user`` returns the caller's user agents newest
         first, at most 50 per page and paged with ``after`` only; ``last_id``
         is the last row the server read, which may not be in ``data``.
+
+        Packaged built-ins the deployment suppressed via
+        ``OMNIGENT_SEEDED_AGENTS`` are filtered out. The filter runs after
+        the store page is read, so the cursor stays store-based and
+        ``has_more`` / ``last_id`` remain correct — a filtered page can
+        return fewer than ``limit`` rows, which the paginating client
+        already handles. Suppressing hides a row without deleting it, so a
+        session already bound to one keeps working.
 
         :param request: The incoming FastAPI request (for auth).
         :param limit: Maximum number of agents to return (1-1000; ``scope=user``
@@ -274,16 +283,21 @@ def create_builtin_agents_router(
         :param before: Cursor: return agents before this id (server agents only).
         :param order: Sort order, ``"asc"`` or ``"desc"`` (server agents only).
         :param scope: ``"user"`` to list the caller's own agents.
-        :returns: A :class:`PaginatedList` of agents.
+        :returns: An :class:`AgentList` of agents; for server agents it also names
+            the packaged built-ins the deployment suppressed.
         """
         user_id = _require_user(request, auth_provider)
         if scope != "user":
             page = agent_store.list(limit=limit, after=after, before=before, order=order)
-            return PaginatedList(
-                data=[_to_agent_object(a, agent_cache) for a in page.data],
+            suppressed = suppressed_agent_names()
+            return AgentList(
+                data=[
+                    _to_agent_object(a, agent_cache) for a in page.data if a.name not in suppressed
+                ],
                 first_id=page.first_id,
                 last_id=page.last_id,
                 has_more=page.has_more,
+                suppressed_agent_names=sorted(suppressed),
             )
         require_user_agents()
         if before is not None or order != "desc":
@@ -300,7 +314,7 @@ def create_builtin_agents_router(
         data = await asyncio.to_thread(
             lambda: [_to_agent_object(a, agent_cache) for a in page.data]
         )
-        return PaginatedList(
+        return AgentList(
             data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
         )
 
