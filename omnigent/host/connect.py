@@ -57,7 +57,7 @@ from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
-from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+from omnigent.host.daemon_lifecycle import DaemonLifecycleLock, mark_daemon_registered
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
@@ -4563,6 +4563,7 @@ class HostProcess:
         self._ensure_model_options_prewarm()
         self._ws = ws
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        stamp_write: asyncio.Future[None] | None = None
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
@@ -4590,6 +4591,12 @@ class HostProcess:
                     # request frames run concurrently below; exceptions raised
                     # on those detached tasks are intentionally contained.
                     self._raise_connection_error_from_raw(raw)
+                    if stamp_write is None:
+                        # Off the receive loop: a slow filesystem must not stall
+                        # the keepalive pong the server counts as liveness.
+                        stamp_write = asyncio.ensure_future(
+                            asyncio.to_thread(self._set_daemon_registered, True)
+                        )
                     # Each request frame is handled on its own task so a slow
                     # handler (a model-options CLI exec, a long git walk) can't
                     # head-of-line block the frames behind it — measured
@@ -4603,6 +4610,17 @@ class HostProcess:
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
+            if stamp_write is not None:
+                # Clear only after the in-flight stamp has landed, off the loop;
+                # one shielded coroutine keeps that order even when this task is
+                # cancelled during teardown.
+                async def _settle_stamp() -> None:
+                    with contextlib.suppress(Exception):
+                        await stamp_write
+                    await asyncio.to_thread(self._set_daemon_registered, False)
+
+                with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                    await asyncio.shield(asyncio.ensure_future(_settle_stamp()))
 
     async def _harness_readiness_loop(
         self,
@@ -4671,6 +4689,19 @@ class HostProcess:
             return
         if isinstance(frame, HostConnectionErrorFrame):
             self._raise_connection_error(frame)
+
+    def _set_daemon_registered(self, registered: bool) -> None:
+        """Set or clear this daemon's tunnel-registration stamp.
+
+        The server sends nothing but connection errors before it completes
+        registration, so its first other frame after ``host.hello`` is the
+        acknowledgement; the stamp is cleared when the tunnel drops.
+
+        :param registered: Whether the server has acknowledged this tunnel.
+        """
+        if self._lifecycle_lock is None:
+            return
+        mark_daemon_registered(self._lifecycle_lock.record_path, registered=registered)
 
     def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
         """Handle one inbound frame on its own task, off the receive loop.

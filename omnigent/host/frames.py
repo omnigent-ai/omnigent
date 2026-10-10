@@ -58,6 +58,9 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+# The host wants the server's first keepalive ping right after registration and
+# treats it as the registration acknowledgement for its daemon record:
+CAP_REGISTRATION_ACK = "registration_ack"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -68,6 +71,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_TOOLS,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_REGISTRATION_ACK,
 ]
 
 

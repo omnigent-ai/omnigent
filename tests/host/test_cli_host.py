@@ -923,6 +923,119 @@ def test_host_background_fails_when_daemon_never_registers(
     assert terminated == [4242]
 
 
+def test_host_background_trusts_daemon_registration_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon-stamped registration survives a divergent server status read.
+
+    The daemon registers over its WebSocket tunnel and stamps its registry
+    record; the CLI's secondary ``GET /v1/hosts/{id}`` probe can diverge
+    (stale, cached, or differently-routed read). The stamp is ground truth:
+    the CLI must report success and leave the healthy daemon running instead
+    of declaring a registration timeout and force-terminating it.
+    """
+    from omnigent.host.daemon_lifecycle import mark_daemon_registered
+
+    _patch_background_host_spawn(monkeypatch, tmp_path)
+    # The divergent secondary read: the server answers, but its host row
+    # never reports online.
+    monkeypatch.setattr(
+        "omnigent.cli._daemon_host_status_probe",
+        lambda record, **kwargs: cli_module._HostHttpResult(
+            status_code=200, body={"status": "offline"}
+        ),
+    )
+    # Keep the failure mode fast if the stamp were ignored.
+    monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.2)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None
+    )
+
+    def _claim_and_stamp(target: str, spawned: object, **kwargs: object) -> object:
+        """Persist the fake claim, then stamp it like a registered daemon."""
+        result = _persist_fake_daemon_claim(target, spawned, **kwargs)
+        assert mark_daemon_registered(cli_module._daemon_record_path(target), pid=4242)
+        return result
+
+    monkeypatch.setattr("omnigent.cli._wait_for_daemon_claim", _claim_and_stamp)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: terminated.append(record.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "--background", "--server", "https://example.databricksapps.com"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Started the host daemon" in result.output
+    assert "did not register with the server" not in result.output
+    assert terminated == []
+
+
+def test_daemon_record_rewrite_waits_for_daemon_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI's resolved-URL rewrite reads the record only once it holds the lock.
+
+    The daemon stamps ``registered_at`` while local startup rewrites
+    ``resolved_server_url``; without the writer lock the CLI could read before
+    the stamp and write afterwards, erasing it. Both fields must parse back.
+    """
+    fcntl = pytest.importorskip("fcntl")
+    import threading
+
+    from omnigent.host.daemon_lifecycle import record_update_lock_path
+
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    target = "local"
+    cli_module._write_daemon_record(
+        cli_module._HostDaemonRecord(
+            pid=4242,
+            target=target,
+            mode="local",
+            server_url=None,
+            log_path=None,
+            started_at=int(time.time()),
+        )
+    )
+    record_path = cli_module._daemon_record_path(target)
+    lock_fd = os.open(record_update_lock_path(record_path), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    started = threading.Event()
+    rewritten = threading.Event()
+    worker = threading.Thread(
+        target=lambda: (
+            started.set(),
+            cli_module._update_daemon_resolved_server_url(target, "http://127.0.0.1:6767"),
+            rewritten.set(),
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        assert started.wait(2.0)
+        assert not rewritten.wait(0.3), "CLI rewrite did not wait for the writer lock"
+        # The daemon's stamp lands while the CLI rewrite is held back.
+        data = json.loads(record_path.read_text())
+        data["registered_at"] = 123456789
+        record_path.write_text(json.dumps(data))
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    assert rewritten.wait(5.0)
+    worker.join(5.0)
+
+    again = cli_module._find_daemon_record(target)
+    assert again is not None
+    assert again.registered_at == 123456789
+    assert again.resolved_server_url == "http://127.0.0.1:6767"
+
+
 def test_host_background_does_not_block(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

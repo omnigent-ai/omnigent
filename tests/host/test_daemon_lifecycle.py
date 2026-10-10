@@ -16,8 +16,12 @@ from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
+    mark_daemon_registered,
     normalize_daemon_target,
     record_flock_is_held,
+    record_update_lock_path,
+    update_daemon_record_fields,
+    write_daemon_record,
 )
 from omnigent.host.identity import HostIdentity
 
@@ -210,6 +214,130 @@ def test_record_flock_is_held_states(tmp_path: Path) -> None:
     assert record_flock_is_held(record) is True
     lock.release()
     assert record_flock_is_held(record) is False
+
+
+def test_mark_daemon_registered_stamps_owner_record_in_place(tmp_path: Path) -> None:
+    """The owner's stamp adds ``registered_at`` without swapping the inode."""
+    record = daemon_record_path("local", base_dir=tmp_path)
+    _write_record(record, os.getpid())
+    inode_before = record.stat().st_ino
+
+    assert mark_daemon_registered(record) is True
+
+    payload = json.loads(record.read_text())
+    assert isinstance(payload["registered_at"], int)
+    # Existing fields survive the rewrite.
+    assert payload["pid"] == os.getpid()
+    assert payload["target"] == "local"
+    # In-place rewrite: an inode swap would strand the daemon's flock.
+    assert record.stat().st_ino == inode_before
+
+
+def test_mark_daemon_registered_clears_stamp_on_request(tmp_path: Path) -> None:
+    """``registered=False`` drops the stamp while keeping the record intact."""
+    record = daemon_record_path("local", base_dir=tmp_path)
+    _write_record(record, os.getpid())
+    assert mark_daemon_registered(record) is True
+
+    assert mark_daemon_registered(record, registered=False) is True
+
+    payload = json.loads(record.read_text())
+    assert payload["registered_at"] is None
+    assert payload["pid"] == os.getpid()
+
+
+def test_mark_daemon_registered_waits_for_concurrent_record_writer(tmp_path: Path) -> None:
+    """A stamp blocks while another writer holds the record's sidecar lock."""
+    fcntl = pytest.importorskip("fcntl")
+    import threading
+
+    record = daemon_record_path("local", base_dir=tmp_path)
+    _write_record(record, os.getpid())
+    lock_fd = os.open(record_update_lock_path(record), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    started = threading.Event()
+    stamped = threading.Event()
+    worker = threading.Thread(
+        target=lambda: (started.set(), mark_daemon_registered(record), stamped.set()), daemon=True
+    )
+    try:
+        worker.start()
+        assert started.wait(2.0)
+        assert not stamped.wait(0.3), "stamp did not wait for the writer lock"
+        assert "registered_at" not in json.loads(record.read_text())
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    assert stamped.wait(5.0)
+    worker.join(5.0)
+    assert isinstance(json.loads(record.read_text())["registered_at"], int)
+
+
+def test_write_daemon_record_waits_for_concurrent_writer(tmp_path: Path) -> None:
+    """A whole-record write blocks while a field update holds the writer lock."""
+    fcntl = pytest.importorskip("fcntl")
+    import threading
+
+    record = daemon_record_path("local", base_dir=tmp_path)
+    _write_record(record, os.getpid())
+    lock_fd = os.open(record_update_lock_path(record), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    started = threading.Event()
+    written = threading.Event()
+    replacement = HostDaemonRecord(
+        pid=os.getpid(), target="local", mode="local", server_url=None, log_path=None, started_at=1
+    )
+    worker = threading.Thread(
+        target=lambda: (
+            started.set(),
+            write_daemon_record(replacement, base_dir=tmp_path),
+            written.set(),
+        ),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        assert started.wait(2.0)
+        assert not written.wait(0.3), "record write did not wait for the writer lock"
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    assert written.wait(5.0)
+    worker.join(5.0)
+    assert json.loads(record.read_text())["started_at"] == 1
+
+
+def test_update_daemon_record_fields_can_materialize_missing_record(tmp_path: Path) -> None:
+    """``create`` writes a missing record with the fields applied but never replaces one."""
+    record = daemon_record_path("local", base_dir=tmp_path)
+    template = HostDaemonRecord(
+        pid=4242, target="local", mode="local", server_url=None, log_path=None, started_at=1
+    )
+
+    assert update_daemon_record_fields(record, create=template, resolved_server_url="http://x")
+    payload = json.loads(record.read_text())
+    assert payload["pid"] == 4242
+    assert payload["resolved_server_url"] == "http://x"
+
+    _write_record(record, os.getpid())
+    assert update_daemon_record_fields(record, create=template, resolved_server_url="http://y")
+    payload = json.loads(record.read_text())
+    assert payload["pid"] == os.getpid()
+    assert payload["resolved_server_url"] == "http://y"
+
+
+def test_mark_daemon_registered_refuses_foreign_or_missing_record(tmp_path: Path) -> None:
+    """A record owned by another pid — or absent — is never stamped."""
+    record = daemon_record_path("local", base_dir=tmp_path)
+
+    assert mark_daemon_registered(record) is False
+    # A missing record must not leave a stray writer lock behind either.
+    assert not record_update_lock_path(record).exists()
+
+    _write_record(record, os.getpid() + 1)
+
+    assert mark_daemon_registered(record) is False
+    assert "registered_at" not in json.loads(record.read_text())
 
 
 def test_background_daemon_claims_record_before_connecting(

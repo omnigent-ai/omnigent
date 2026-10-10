@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -32,6 +33,11 @@ from omnigent.host.connect import (
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
+)
+from omnigent.host.daemon_lifecycle import (
+    DaemonLifecycleLock,
+    daemon_record_path,
+    read_daemon_record_text,
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -94,6 +100,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.runner.transports.ws_tunnel.frames import PingFrame, encode_frame
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
@@ -1279,6 +1286,37 @@ class _ConnectionErrorTunnel:
         return encode_host_frame(self.frame)
 
 
+class _AckThenDisconnectTunnel:
+    """Tunnel that delivers the server's first keepalive ping, then drops.
+
+    ``record_after_ack`` captures the daemon record as it stood while the
+    tunnel was still up, after the host had processed the acknowledgement.
+    """
+
+    def __init__(self, record_path: Path | None = None) -> None:
+        self.sent: list[str] = []
+        self.record_after_ack: dict[str, object] | None = None
+        self._record_path = record_path
+        self._acked = False
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def recv(self) -> str:
+        if not self._acked:
+            self._acked = True
+            return encode_frame(PingFrame(ts=1))
+        if self._record_path is not None:
+            # The stamp is written off the receive loop; give it a moment.
+            for _ in range(200):
+                with contextlib.suppress(ValueError):
+                    self.record_after_ack = json.loads(read_daemon_record_text(self._record_path))
+                if (self.record_after_ack or {}).get("registered_at") is not None:
+                    break
+                await asyncio.sleep(0.01)
+        raise ConnectionError("test disconnect")
+
+
 class _RecordingWS:
     """Fake tunnel that records frames the readiness loop sends.
 
@@ -2114,6 +2152,107 @@ async def test_unreported_exit_flushes_after_reconnect(
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}
+
+
+def _owned_daemon_record(tmp_path: Path) -> tuple[Path, object]:
+    """Write a registry record owned by this process; return (path, lock)."""
+    target = "https://server.example.com"
+    record_path = daemon_record_path(target, base_dir=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps({"pid": os.getpid(), "target": target, "mode": "server"}))
+    return record_path, DaemonLifecycleLock.for_target(target, base_dir=tmp_path)
+
+
+async def test_serve_frames_stamps_registration_on_first_server_frame(tmp_path: Path) -> None:
+    """The server's first post-hello frame stamps the daemon's registry record.
+
+    The server sends nothing but connection errors before it completes
+    registration, so its first ordinary frame (the immediate keepalive ping)
+    confirms registration. The CLI's background-spawn readiness gate trusts
+    this stamp when its secondary server status read diverges, so a daemon
+    that registered is never torn down as "never registered". Once the tunnel
+    drops the stamp is cleared again: a daemon mid-reconnect must not read as
+    registered to a later ``host --background`` that reuses it.
+    """
+    record_path, lock = _owned_daemon_record(tmp_path)
+    host = _make_host_process()
+    host._lifecycle_lock = lock
+    tunnel = _AckThenDisconnectTunnel(record_path)
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    await asyncio.gather(*host._frame_tasks, return_exceptions=True)
+
+    assert tunnel.record_after_ack is not None
+    assert isinstance(tunnel.record_after_ack["registered_at"], int)
+    assert json.loads(record_path.read_text())["registered_at"] is None
+
+
+class _AckThenPongWatchTunnel(_AckThenDisconnectTunnel):
+    """Ack tunnel that holds the stamp write back until the pong has been sent."""
+
+    def __init__(self, record_path: Path) -> None:
+        super().__init__(record_path)
+        self.release_stamp = threading.Event()
+        self.stamped_before_pong: bool | None = None
+
+    async def recv(self) -> str:
+        if not self._acked:
+            return await super().recv()
+        for _ in range(400):
+            if len(self.sent) >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert self._record_path is not None
+        payload = json.loads(read_daemon_record_text(self._record_path))
+        self.stamped_before_pong = payload.get("registered_at") is not None
+        self.release_stamp.set()
+        return await super().recv()
+
+
+async def test_serve_frames_dispatches_frames_while_stamp_write_is_slow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow registry write must not hold back the ack ping's pong."""
+    record_path, lock = _owned_daemon_record(tmp_path)
+    host = _make_host_process()
+    host._lifecycle_lock = lock
+    real_set = host._set_daemon_registered
+
+    def slow_set(registered: bool) -> None:
+        if registered:
+            assert tunnel.release_stamp.wait(5.0), "the pong never released the stamp write"
+        real_set(registered)
+
+    monkeypatch.setattr(host, "_set_daemon_registered", slow_set)
+    tunnel = _AckThenPongWatchTunnel(record_path)
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    await asyncio.gather(*host._frame_tasks, return_exceptions=True)
+
+    assert len(tunnel.sent) >= 2, "the ack ping was never answered"
+    assert tunnel.stamped_before_pong is False
+    assert tunnel.record_after_ack is not None
+    assert isinstance(tunnel.record_after_ack["registered_at"], int)
+
+
+async def test_serve_frames_does_not_stamp_before_server_ack(tmp_path: Path) -> None:
+    """A hello that was only sent — never answered — is not a registration.
+
+    The send completing proves nothing about the server's post-hello
+    registration work, so a connection that drops before the server's first
+    frame must leave no stamp for the CLI's readiness gate to trust.
+    """
+    record_path, lock = _owned_daemon_record(tmp_path)
+    host = _make_host_process()
+    host._lifecycle_lock = lock
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert "registered_at" not in json.loads(record_path.read_text())
 
 
 async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
@@ -6684,9 +6823,15 @@ async def test_inbound_frame_resets_silent_connect_streak(
     assert not [record for record in caplog.records if record.levelno == logging.ERROR]
 
 
-async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> None:
-    """A non-retryable server error escapes the live receive loop."""
+async def test_connection_error_frame_fails_loudly_on_live_receive_path(tmp_path: Path) -> None:
+    """A non-retryable server error escapes the live receive loop without a stamp.
+
+    The rejection raises; it must also leave no registration stamp for the
+    CLI's background-spawn gate to trust.
+    """
+    record_path, lock = _owned_daemon_record(tmp_path)
     host = _host()
+    host._lifecycle_lock = lock
     tunnel = _ConnectionErrorTunnel(
         HostConnectionErrorFrame(
             stage="registration",
@@ -6701,6 +6846,7 @@ async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> Non
     assert len(tunnel.sent) == 1
     assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
     assert host._frame_tasks == set()
+    assert "registered_at" not in json.loads(record_path.read_text())
 
 
 async def test_retryable_connection_error_escapes_live_receive_path() -> None:

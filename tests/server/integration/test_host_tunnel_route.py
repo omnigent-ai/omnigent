@@ -17,6 +17,7 @@ from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
+    CAP_REGISTRATION_ACK,
     CAP_SKILL_CONTENT,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
@@ -100,11 +101,14 @@ async def _connect_route(
 def _make_hello(
     name: str = "test-laptop",
     runners: list[str] | None = None,
+    capabilities: list[str] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
     :param name: Human-readable host name.
     :param runners: Live runner IDs, defaults to empty.
+    :param capabilities: Capability tokens the host advertises, defaults to
+        none (an older host).
     :returns: JSON-encoded hello frame string.
     """
     return encode_host_frame(
@@ -113,6 +117,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             runners=runners or [],
+            capabilities=capabilities or [],
         )
     )
 
@@ -141,6 +146,7 @@ async def _send_hello_and_wait(
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
     runners: list[str] | None = None,
+    capabilities: list[str] | None = None,
 ) -> None:
     """Send hello and wait for registration.
 
@@ -149,9 +155,10 @@ async def _send_hello_and_wait(
     :param host_id: Expected host_id in the registry.
     :param name: Host name for the hello frame.
     :param runners: Live runner IDs for the hello frame.
+    :param capabilities: Capability tokens for the hello frame.
     """
     await communicator.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, runners)},
+        {"type": "websocket.receive", "text": _make_hello(name, runners, capabilities)},
     )
     await asyncio.wait_for(
         _wait_registered(registry, host_id),
@@ -297,6 +304,44 @@ async def test_host_tunnel_ping_loop_persists_heartbeat(
     assert host.status == "online", "heartbeat must not change status"
 
     # Clean up the live tunnel so the loop stops.
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_sends_immediate_ping_as_registration_ack(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A host that asks for a registration ack gets its first ping at once.
+
+    Hosts stamp their daemon record with a confirmed registration on the
+    server's first post-hello frame, so the first ping must not wait a full
+    ``PING_INTERVAL_S`` — the CLI's ``--background`` registration grace is of
+    the same order and would expire first.
+    """
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry, capabilities=[CAP_REGISTRATION_ACK])
+
+    sent = await comm.receive_output(timeout=budget(2.0))
+    assert sent["type"] == "websocket.send"
+    assert isinstance(decode_frame(sent["text"]), PingFrame)
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_withholds_immediate_ping_without_capability(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A host that did not advertise the ack keeps the historical frame timing.
+
+    Older hosts, and the fake hosts in this suite, expect the first server
+    frame to be a request rather than a ping, so the ack stays opt-in.
+    """
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    assert await comm.receive_nothing(timeout=0.2)
+
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 

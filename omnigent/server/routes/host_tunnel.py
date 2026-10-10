@@ -31,6 +31,7 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    CAP_REGISTRATION_ACK,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -1063,6 +1064,15 @@ async def _ping_loop(
     :param host_id: Host id for logging.
     :param heartbeat_requested: Event consumed by the heartbeat writer.
     """
+    # The loop starts only after registration, so an opted-in host treats the
+    # immediate first ping as the registration acknowledgement; hosts without
+    # the capability keep the historical first-frame timing.
+    if CAP_REGISTRATION_ACK in conn.hello.capabilities:
+        try:
+            conn.outbound_queue.put_nowait(encode_frame(PingFrame(ts=int(time.time() * 1000))))
+        except Exception:  # noqa: BLE001
+            _logger.warning("Host %s: could not queue the registration ack ping", host_id)
+            return
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
         elapsed = time.time() - conn.last_frame_at
