@@ -288,6 +288,111 @@ async def test_preview_drops_when_negotiated_tunnel_is_down() -> None:
     assert http_posts == []
 
 
+async def test_superseded_disconnect_keeps_live_tunnel_and_pending_ack() -> None:
+    """The shared dispatcher ignores a superseded generation's disconnect.
+
+    Make-before-break opens a replacement while the old socket drains. When the
+    old socket finally closes, its disconnect must not null the live send or
+    fail an ack in flight on the replacement generation.
+    """
+    dispatcher = RunnerEventDispatcher()
+    sent: list[EventBatchFrame] = []
+    release_ack = asyncio.Event()
+    ack_tasks: list[asyncio.Task[None]] = []
+
+    async def old_send(_text: str) -> None:
+        raise AssertionError("the superseded tunnel must not send")
+
+    async def live_send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        sent.append(frame)
+
+        async def _ack_when_released() -> None:
+            await release_ack.wait()
+            dispatcher.acknowledge(EventAckFrame(frame.id, 1))
+
+        ack_tasks.append(asyncio.create_task(_ack_when_released()))
+
+    old_generation = dispatcher.connected(old_send)
+    dispatcher.ready(old_send)
+    # The replacement supersedes the old generation while it is still draining.
+    dispatcher.connected(live_send)
+    dispatcher.ready(live_send)
+
+    submit = asyncio.create_task(dispatcher.submit("session-a", [_ITEM]))
+    for _ in range(50):
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+    assert sent, "the live tunnel never received the batch"
+
+    dispatcher.disconnected(old_generation)
+    assert not submit.done(), "a superseded disconnect wrongly failed the live ack"
+
+    release_ack.set()
+    ack = await asyncio.wait_for(submit, timeout=1)
+    await asyncio.gather(*ack_tasks)
+    assert ack.applied == 1
+    assert len(sent) == 1
+
+
+async def test_current_generation_disconnect_tears_down() -> None:
+    dispatcher = RunnerEventDispatcher()
+
+    async def send(_text: str) -> None:
+        raise AssertionError("disconnected tunnel must not send")
+
+    generation = dispatcher.connected(send)
+    dispatcher.ready(send)
+    dispatcher.disconnected(generation)
+    assert dispatcher._state == "disconnected"
+    assert dispatcher._send is None
+
+
+async def test_superseded_pending_retransmits_on_live_socket_without_timeout() -> None:
+    """A superseded disconnect retransmits that generation's in-flight batch now.
+
+    Make-before-break sends a batch on the old socket, then the replacement goes
+    live. When the old socket finally closes, its unacknowledged batch must be
+    retransmitted on the live socket at once, not after the 30s delivery timeout.
+    """
+    dispatcher = RunnerEventDispatcher()
+    old_sent: list[EventBatchFrame] = []
+    live_sent: list[EventBatchFrame] = []
+    old_received = asyncio.Event()
+
+    async def old_send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        old_sent.append(frame)
+        old_received.set()
+        # The old socket is superseded before it acknowledges, then it closes.
+
+    async def live_send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        live_sent.append(frame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, 1))
+
+    old_generation = dispatcher.connected(old_send)
+    dispatcher.ready(old_send)
+
+    submit = asyncio.create_task(dispatcher.submit("session-a", [_ITEM]))
+    await asyncio.wait_for(old_received.wait(), timeout=1)
+    assert len(old_sent) == 1
+
+    # The replacement supersedes the old generation; then the old socket closes.
+    dispatcher.connected(live_send)
+    dispatcher.ready(live_send)
+    dispatcher.disconnected(old_generation)
+
+    ack = await asyncio.wait_for(submit, timeout=2)
+    assert ack.applied == 1
+    assert len(old_sent) == 1, "the superseded socket must not be reused"
+    assert len(live_sent) >= 1, "the batch was not retransmitted on the live socket"
+
+
 async def test_acknowledged_batch_stamps_last_dispatch_at() -> None:
     dispatcher = RunnerEventDispatcher()
     loop = asyncio.get_running_loop()
@@ -346,3 +451,42 @@ async def test_disconnect_during_failed_send_leaves_no_unretrieved_future_error(
     await asyncio.sleep(0)
     assert dispatcher._pending == {}
     assert not reported
+
+
+async def test_stale_ready_from_superseded_generation_does_not_enable_delivery() -> None:
+    """A superseded generation's late ``event.ready`` leaves the replacement negotiating.
+
+    Make-before-break can deliver the old socket's ready frame after the
+    replacement has already connected. It must not repoint delivery at the
+    closing socket; batches wait for the replacement's own ready frame.
+    """
+    dispatcher = RunnerEventDispatcher()
+    old_sent: list[EventBatchFrame] = []
+    live_sent: list[EventBatchFrame] = []
+
+    async def old_send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        old_sent.append(frame)
+
+    async def live_send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        live_sent.append(frame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, 1))
+
+    old_generation = dispatcher.connected(old_send)
+    live_generation = dispatcher.connected(live_send)
+    dispatcher.ready(old_send, old_generation)
+
+    submit = asyncio.create_task(dispatcher.submit("session-a", [_ITEM]))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not submit.done(), "a superseded generation's ready frame enabled delivery"
+    assert old_sent == [] and live_sent == []
+
+    dispatcher.ready(live_send, live_generation)
+    ack = await asyncio.wait_for(submit, timeout=2)
+    assert ack.applied == 1
+    assert old_sent == [], "the superseded socket must not carry batches"
+    assert len(live_sent) == 1

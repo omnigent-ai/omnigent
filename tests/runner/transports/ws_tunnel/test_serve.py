@@ -2886,18 +2886,13 @@ async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
     outcomes = iter(["error", "error", "stable_drop", "stop"])
     sleeps: list[float] = []
     handshakes: list[tuple[int, bool, float | None]] = []
-    # Provide controlled start/end times for the connected attempt and fall
-    # back to the real clock for all other callers (e.g. the asyncio loop).
-    _real_monotonic = serve_module.time.monotonic
-    controlled = [0.0, 6.0]
-    controlled_idx = [0]
+    # Use connection state so unrelated clock reads do not affect the simulated age.
+    connected_flag = [False]
 
     def _fake_monotonic() -> float:
-        if controlled_idx[0] < len(controlled):
-            val = controlled[controlled_idx[0]]
-            controlled_idx[0] += 1
-            return val
-        return _real_monotonic()
+        # 0 before the stable connection is marked, 6 s after, so its drop lands
+        # past the 5 s stability window regardless of other clock reads.
+        return 6.0 if connected_flag[0] else 0.0
 
     async def _serve_once(
         app: Any,
@@ -2935,6 +2930,7 @@ async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
         if outcome == "stable_drop":
             if on_connected is not None:
                 on_connected()
+            connected_flag[0] = True
             raise ConnectionError("1006 abrupt close")
         raise asyncio.CancelledError
 
@@ -3125,3 +3121,397 @@ async def test_serve_tunnel_keeps_escalating_after_brief_connection(
     # Attempt 3 (brief_drop): connected for 2 s < 5 s; no reset → sleep 2.0
     # Attempt 4 (stop): CancelledError before sleep
     assert sleeps == [0.5, 1.0, 2.0]
+
+
+def test_tunnel_renewal_interval_defaults_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(serve_module._RUNNER_TUNNEL_RENEWAL_INTERVAL_ENV, raising=False)
+    assert (
+        serve_module._tunnel_renewal_interval_s()
+        == serve_module._DEFAULT_TUNNEL_RENEWAL_INTERVAL_S
+    )
+
+
+def test_tunnel_renewal_interval_reads_positive_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(serve_module._RUNNER_TUNNEL_RENEWAL_INTERVAL_ENV, "120")
+    assert serve_module._tunnel_renewal_interval_s() == 120.0
+
+
+def test_tunnel_renewal_interval_non_positive_disables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(serve_module._RUNNER_TUNNEL_RENEWAL_INTERVAL_ENV, "0")
+    assert serve_module._tunnel_renewal_interval_s() is None
+
+
+@pytest.mark.parametrize("raw", ["soon", "nan", "inf", "-inf"])
+def test_tunnel_renewal_interval_unparseable_warns_and_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raw: str,
+) -> None:
+    import logging
+
+    monkeypatch.setenv(serve_module._RUNNER_TUNNEL_RENEWAL_INTERVAL_ENV, raw)
+    caplog.set_level(logging.WARNING, logger="omnigent.runner.transports.ws_tunnel.serve")
+    assert (
+        serve_module._tunnel_renewal_interval_s()
+        == serve_module._DEFAULT_TUNNEL_RENEWAL_INTERVAL_S
+    )
+    assert any(
+        "unparseable" in record.getMessage() and record.levelno == logging.WARNING
+        for record in caplog.records
+    ), "an unparseable interval must log a warning before falling back to the default"
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_shutdown_during_renewal_mint_finishes_graceful_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown racing a ready renewal drains the connection, never cancels it.
+
+    Reproduces the race where credential minting finishes just as a graceful
+    shutdown begins: the ready renewal signal must not hand the still-draining
+    connection to cancellation-based cleanup. The connection must complete its
+    own graceful drain instead.
+    """
+    drained = asyncio.Event()
+    cancelled = asyncio.Event()
+    shutdown_event = asyncio.Event()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        renewal_signal: asyncio.Future[str | None] | None = None,
+        on_graceful_shutdown: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        del app
+        # The renewal mint finished and signalled a cutover while a graceful
+        # shutdown began concurrently.
+        assert renewal_signal is not None
+        renewal_signal.set_result("renewed-token")
+        shutdown_event.set()
+        try:
+            # The connection is mid graceful drain; it must be allowed to finish.
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        if on_graceful_shutdown is not None:
+            on_graceful_shutdown()
+        drained.set()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_shutdown_during_mint",
+            runner_version="0.1.0",
+            shutdown_event=shutdown_event,
+            on_graceful_shutdown=lambda: None,
+        ),
+        timeout=5.0,
+    )
+
+    assert drained.is_set(), "the connection did not finish its graceful drain"
+    assert not cancelled.is_set(), "a shutdown that raced a ready renewal cancelled the drain"
+
+
+@pytest.mark.asyncio
+async def test_await_renewal_skips_cutover_when_shutdown_races_mint() -> None:
+    """A shutdown that begins while the mint is in flight cancels the cutover.
+
+    If shutdown starts after the mint is requested but before it resolves, the
+    watcher must not signal a replacement, so the connection drains gracefully
+    rather than being superseded as it shuts down.
+    """
+    renewal_signal: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+    shutdown_event = asyncio.Event()
+    mint_started = asyncio.Event()
+    release_mint = asyncio.Event()
+
+    async def _prepare() -> str:
+        mint_started.set()
+        await release_mint.wait()
+        return "renewed-token"
+
+    watcher = asyncio.ensure_future(
+        serve_module._await_renewal(
+            0.01, renewal_signal, _prepare, shutdown_event, "runner_shutdown_race"
+        )
+    )
+    try:
+        await asyncio.wait_for(mint_started.wait(), timeout=2)
+        shutdown_event.set()
+        release_mint.set()
+        await asyncio.wait_for(watcher, timeout=2)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+    assert not renewal_signal.done(), "a shutdown during the mint must not signal a cutover"
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_cutover_reuses_minted_token_and_records_each_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A make-before-break cutover reuses the renewal token and accounts cleanly.
+
+    The replacement connection opens with the token the renewal watcher already
+    minted, with no second mint at the loop top. Each generation records exactly
+    one connect and one disconnect: the superseded one when it finishes draining,
+    the replacement when the graceful shutdown closes it.
+    """
+    shutdown_event = asyncio.Event()
+    mint_calls = 0
+    connects = 0
+    disconnects = 0
+    seen_tokens: list[str | None] = []
+
+    def _factory() -> str:
+        nonlocal mint_calls
+        mint_calls += 1
+        return f"minted-{mint_calls}"
+
+    def _count_connected(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal connects
+        connects += 1
+
+    def _count_disconnected(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal disconnects
+        disconnects += 1
+
+    monkeypatch.setattr(serve_module, "touch_connect_marker", lambda: None)
+    monkeypatch.setattr(serve_module, "record_websocket_connected", _count_connected)
+    monkeypatch.setattr(serve_module, "record_websocket_disconnected", _count_disconnected)
+
+    async def _serve_once(
+        app: Any,
+        *,
+        auth_token: str | None = None,
+        on_connected: Any = None,
+        on_prepare_renewal: Any = None,
+        renewal_signal: asyncio.Future[str | None] | None = None,
+        on_graceful_shutdown: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        del app
+        seen_tokens.append(auth_token)
+        if on_connected is not None:
+            on_connected()
+        if len(seen_tokens) == 1:
+            # First generation: mint a renewal token and signal the cutover like
+            # the real watcher, then keep serving (draining) until shutdown.
+            assert on_prepare_renewal is not None
+            assert renewal_signal is not None
+            renewal_signal.set_result(await on_prepare_renewal())
+            await shutdown_event.wait()
+            if on_graceful_shutdown is not None:
+                on_graceful_shutdown()
+            return
+        # Replacement generation: shut it down gracefully, releasing the drain.
+        shutdown_event.set()
+        if on_graceful_shutdown is not None:
+            on_graceful_shutdown()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_cutover_accounting",
+            runner_version="0.1.0",
+            auth_token="initial",
+            auth_token_factory=_factory,
+            shutdown_event=shutdown_event,
+            on_graceful_shutdown=lambda: None,
+        ),
+        timeout=5.0,
+    )
+    await asyncio.sleep(0)
+
+    assert len(seen_tokens) == 2, "the replacement connection never opened"
+    assert seen_tokens[1] == "minted-2", "the replacement did not reuse the minted token"
+    assert mint_calls == 2, "the loop top re-minted instead of reusing the renewal token"
+    assert connects == 2, f"expected one connect per generation, got {connects}"
+    assert disconnects == 2, f"expected one disconnect per generation, got {disconnects}"
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_graceful_shutdown_callback_fires_once_across_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_graceful_shutdown fires once even when a drained generation also drains.
+
+    After a cutover the superseded connection keeps the same callback, so a
+    graceful shutdown reaches the drain on both the draining and the live
+    generation. The callback must still fire at most once per serve_tunnel.
+    """
+    shutdown_event = asyncio.Event()
+    graceful_calls = 0
+    generations = 0
+
+    def _count_graceful() -> None:
+        nonlocal graceful_calls
+        graceful_calls += 1
+
+    monkeypatch.setattr(serve_module, "touch_connect_marker", lambda: None)
+    monkeypatch.setattr(serve_module, "record_websocket_connected", lambda *a, **k: None)
+    monkeypatch.setattr(serve_module, "record_websocket_disconnected", lambda *a, **k: None)
+
+    async def _serve_once(
+        app: Any,
+        *,
+        on_connected: Any = None,
+        on_prepare_renewal: Any = None,
+        renewal_signal: asyncio.Future[str | None] | None = None,
+        on_graceful_shutdown: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        del app
+        nonlocal generations
+        generations += 1
+        if on_connected is not None:
+            on_connected()
+        if generations == 1:
+            # Superseded generation: signal a cutover, then drain on shutdown.
+            assert on_prepare_renewal is not None
+            assert renewal_signal is not None
+            renewal_signal.set_result(await on_prepare_renewal())
+            await shutdown_event.wait()
+            if on_graceful_shutdown is not None:
+                on_graceful_shutdown()
+            return
+        # Replacement generation: trigger the graceful shutdown of both.
+        shutdown_event.set()
+        if on_graceful_shutdown is not None:
+            on_graceful_shutdown()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_graceful_once",
+            runner_version="0.1.0",
+            auth_token="initial",
+            auth_token_factory=lambda: "minted",
+            shutdown_event=shutdown_event,
+            on_graceful_shutdown=_count_graceful,
+        ),
+        timeout=5.0,
+    )
+    await asyncio.sleep(0)
+
+    assert generations == 2, "the replacement connection never opened"
+    assert graceful_calls == 1, (
+        f"on_graceful_shutdown fired {graceful_calls} times; the once-latch did not hold"
+    )
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_failed_replacement_keeps_superseded_connection_serving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected replacement handshake leaves the superseded connection serving.
+
+    The renewal watcher mints a token and signals a cutover, but the replacement
+    fails before it is accepted. The superseded connection must not be cancelled;
+    the loop retries with a fresh mint and a later replacement succeeds. Each
+    accepted generation still records exactly one connect and one disconnect.
+    """
+    shutdown_event = asyncio.Event()
+    old_cancelled = False
+    generations = 0
+    mint_calls = 0
+    connects = 0
+    disconnects = 0
+    seen_tokens: list[str | None] = []
+
+    def _factory() -> str:
+        nonlocal mint_calls
+        mint_calls += 1
+        return f"minted-{mint_calls}"
+
+    def _count_connected(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal connects
+        connects += 1
+
+    def _count_disconnected(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal disconnects
+        disconnects += 1
+
+    monkeypatch.setattr(serve_module, "_INITIAL_RECONNECT_DELAY_S", 0.001)
+    monkeypatch.setattr(serve_module, "touch_connect_marker", lambda: None)
+    monkeypatch.setattr(serve_module, "record_websocket_connected", _count_connected)
+    monkeypatch.setattr(serve_module, "record_websocket_disconnected", _count_disconnected)
+
+    async def _serve_once(
+        app: Any,
+        *,
+        auth_token: str | None = None,
+        on_connected: Any = None,
+        on_prepare_renewal: Any = None,
+        renewal_signal: asyncio.Future[str | None] | None = None,
+        on_graceful_shutdown: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        del app
+        nonlocal generations, old_cancelled
+        generations += 1
+        seen_tokens.append(auth_token)
+        if generations == 1:
+            if on_connected is not None:
+                on_connected()
+            assert on_prepare_renewal is not None
+            assert renewal_signal is not None
+            renewal_signal.set_result(await on_prepare_renewal())
+            try:
+                await shutdown_event.wait()
+            except asyncio.CancelledError:
+                old_cancelled = True
+                raise
+            if on_graceful_shutdown is not None:
+                on_graceful_shutdown()
+            return
+        if generations == 2:
+            # The replacement never reaches the server; the old socket still serves.
+            raise OSError("replacement handshake refused")
+        if on_connected is not None:
+            on_connected()
+        shutdown_event.set()
+        if on_graceful_shutdown is not None:
+            on_graceful_shutdown()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_failed_replacement",
+            runner_version="0.1.0",
+            auth_token="initial",
+            auth_token_factory=_factory,
+            shutdown_event=shutdown_event,
+            on_graceful_shutdown=lambda: None,
+        ),
+        timeout=5.0,
+    )
+    await asyncio.sleep(0)
+
+    assert not old_cancelled, "the superseded connection was cancelled by a failed replacement"
+    assert generations == 3, f"expected a retry after the failed replacement, got {generations}"
+    assert seen_tokens == ["minted-1", "minted-2", "minted-3"], seen_tokens
+    assert mint_calls == 3, "the retry after a failed replacement did not mint a fresh token"
+    assert connects == 2, f"expected one connect per accepted generation, got {connects}"
+    assert disconnects == 2, f"expected one disconnect per accepted generation, got {disconnects}"
