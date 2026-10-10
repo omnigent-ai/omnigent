@@ -673,11 +673,14 @@ async def test_send_text_cancellation_is_atomic_across_event_loop_threads() -> N
 
         # The owner loop has passed the cancellation guard but is paused inside
         # put_nowait. Let cancellation run on this separate caller loop before
-        # releasing the insertion window.
+        # releasing the insertion window. The frame will be committed (inserted)
+        # even though the caller's task was cancelled, so CancelledError should
+        # propagate to the caller.
         timer = threading.Timer(0.1, release_put.set)
         timer.start()
         send.cancel()
-        await send
+        with pytest.raises(asyncio.CancelledError):
+            await send
 
         assert await asyncio.wait_for(asyncio.to_thread(inserted.wait, 2.0), timeout=3.0)
 
