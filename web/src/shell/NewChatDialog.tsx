@@ -3496,6 +3496,12 @@ export function NewChatLandingScreen() {
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
           : null;
+  // The catalog query is disabled for an offline host, so it never fails:
+  // name the host state rather than a stale error or the empty-catalog copy.
+  const pickerModelsEmptyMessage =
+    hostSelected && selectedHost?.status === "offline"
+      ? "Models unavailable while the host is offline."
+      : (pickerModelsError?.message ?? "Models unavailable");
   const modelCatalogLookupEnabled = sandboxSelected
     ? sandboxPreviewEnabled && sandboxInferenceConfigured
     : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
@@ -3821,7 +3827,7 @@ export function NewChatLandingScreen() {
                       )}
                       {!pickerModelsLoading && pickerModelOptions.length === 0 && (
                         <div className="px-2 py-1 text-xs text-muted-foreground">
-                          {pickerModelsError?.message ?? "Models unavailable"}
+                          {pickerModelsEmptyMessage}
                         </div>
                       )}
                     </>

@@ -19,7 +19,6 @@ Centralizing the checks here keeps the two call sites from drifting
 from __future__ import annotations
 
 import functools
-import importlib.util
 import logging
 import os
 from dataclasses import dataclass
@@ -28,7 +27,7 @@ from fastapi import HTTPException
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_OWNER, env_var_is_truthy
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
@@ -38,6 +37,10 @@ from omnigent.stores.permission_store import PermissionStore
 _logger = logging.getLogger(__name__)
 
 LAUNCH_TIMEOUT_ENV_VAR = "OMNIGENT_HOST_LAUNCH_TIMEOUT_S"
+
+# Set on every server replica of a deployment whose router shards host traffic
+# across replicas by host_id. Unset means single-replica (the OSS default).
+HOST_SHARDED_ENV_VAR = "OMNIGENT_HOST_SHARDED"
 
 # How long a launch waits for the host's result frame before the session is
 # failed. A healthy launch only spawns a runner subprocess and answers in
@@ -153,17 +156,15 @@ def resolve_host_owner(
 def _deployment_is_sharded() -> bool:
     """Whether this deployment shards host traffic across replicas by host_id.
 
-    Only the Databricks managed deployment runs multiple replicas behind the
-    host_id-sharding router (Dicer); a single-process / OSS server has exactly
-    one replica, so an absent host is simply offline. The server can't see the
-    sharding layer directly (Dicer strips its routing header), so we detect the
-    managed deployment by the presence of the internal lakebox launcher module —
-    the same signal that gates ``databricks_features`` in ``server_info`` and
-    mirrors the client's own ``isDatabricksWorkspace()`` re-address gate. Cached:
-    ``find_spec`` is side-effect-free but the answer is fixed for the process
-    lifetime.
+    A multi-replica deployment behind a host_id-sharding router declares itself
+    by setting :data:`HOST_SHARDED_ENV_VAR` on every server replica; the server
+    cannot observe the router directly because it strips its routing header
+    before the request arrives. Unset or falsy means single-replica — the
+    single-process / OSS default — where an absent host is simply offline.
+    Cached: the answer is fixed for the process lifetime (tests call
+    ``_deployment_is_sharded.cache_clear()``).
     """
-    return importlib.util.find_spec("omnigent.onboarding.sandboxes.lakebox") is not None
+    return env_var_is_truthy(HOST_SHARDED_ENV_VAR)
 
 
 def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentError:
@@ -188,8 +189,9 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     So ``WRONG_REPLICA`` is emitted only when the deployment is actually sharded.
 
     :param host: The host's persistent record (owner-checked by the caller).
-    :param sharded: Whether this deployment shards by host_id. Defaults to
-        auto-detection (:func:`_deployment_is_sharded`); overridable for tests.
+    :param sharded: Whether this deployment shards by host_id. Defaults to the
+        deployment's declaration (:func:`_deployment_is_sharded`); overridable
+        for tests.
     :returns: The ``OmnigentError`` to raise; the global handler maps its code
         to the HTTP status and the ``{"error": {"code": ...}}`` body the
         client's re-address matches on.

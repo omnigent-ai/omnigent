@@ -366,6 +366,17 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
     // Codex's readiness is still present (the server's full map carries it).
     expect(hosts2?.[0].configured_harnesses?.["codex-native"]).toBe("needs-auth");
   });
+
+  it("surfaces the OmnigentError message when the install's host is offline (409)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "conflict", message: "host is offline" } }, 409),
+    );
+    const { result } = renderHook(() => useInstallHarness(HOST), { wrapper });
+
+    result.current.mutate("codex-native");
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toBe("host is offline");
+  });
 });
 
 describe("useHostModelOptions", () => {
@@ -411,6 +422,24 @@ describe("useHostModelOptions", () => {
       await vi.advanceTimersByTimeAsync(30_000);
       await waitFor(() => expect(result.current.isError).toBe(true));
       expect(result.current.error?.message).toBe("the codex model probe failed — see the host log");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces the OmnigentError message when the host is offline (409)", async () => {
+    // `host_absent_error` serializes as `{error: {code, message}}`, not `{detail}`.
+    fetchMock.mockResolvedValue(
+      mockResponse({ error: { code: "conflict", message: "host is offline" } }, 409),
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+        wrapper,
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.message).toBe("host is offline");
     } finally {
       vi.useRealTimers();
     }
@@ -777,6 +806,17 @@ describe("useStoreCredential", () => {
     result.current.mutate({ harness: "codex-native", kind: "key", secret: "sk" });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.message).toBe("502 Bad Gateway");
+  });
+
+  it("surfaces the OmnigentError message when the host is offline (409)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "conflict", message: "host is offline" } }, 409),
+    );
+    const { result } = renderHook(() => useStoreCredential("host_1"), { wrapper });
+
+    result.current.mutate({ harness: "codex-native", kind: "key", secret: "sk" });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toBe("host is offline");
   });
 
   it("patches the hosts cache and invalidates the detect query on success", async () => {
