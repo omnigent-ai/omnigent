@@ -49,9 +49,12 @@ def _isolated_env(root: Path) -> dict[str, str]:
 
 
 def _run_cli(args: list[str], env: dict[str, str]) -> tuple[int, str]:
-    """Run ``omnigent <args>`` and return ``(exit_code, stdout + stderr)``."""
+    """Run ``python -m omnigent <args>`` and return ``(exit_code, stdout + stderr)``.
+
+    ``-m omnigent`` goes through ``main()``, so the crash handler is installed.
+    """
     proc = subprocess.run(
-        [sys.executable, "-m", "omnigent.cli", *args],
+        [sys.executable, "-m", "omnigent", *args],
         env=env,
         cwd=str(_REPO_ROOT),
         capture_output=True,
@@ -61,10 +64,12 @@ def _run_cli(args: list[str], env: dict[str, str]) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def _assert_guarded(code: int, out: str) -> None:
+def _assert_guarded(code: int, out: str, root: Path) -> None:
     assert code != 0, out
     assert _GUARD_MSG in out, out
     assert _TRACEBACK not in out, out
+    assert "A crash report was saved" not in out, out
+    assert not list((root / "omnigent-data" / "crashes").glob("crash-*.md"))
 
 
 def test_fork_prompt_local_yaml_target_is_guarded(tmp_path: Path) -> None:
@@ -73,7 +78,7 @@ def test_fork_prompt_local_yaml_target_is_guarded(tmp_path: Path) -> None:
         ["run", str(_HELLO_WORLD_YAML), "--fork", _DUMMY_SESSION_ID, "-p", "test"],
         _isolated_env(tmp_path),
     )
-    _assert_guarded(code, out)
+    _assert_guarded(code, out, tmp_path)
 
 
 def test_fork_prompt_server_url_target_is_guarded(tmp_path: Path) -> None:
@@ -83,4 +88,4 @@ def test_fork_prompt_server_url_target_is_guarded(tmp_path: Path) -> None:
         ["run", "--server", server_url, "--fork", _DUMMY_SESSION_ID, "-p", "test"],
         _isolated_env(tmp_path),
     )
-    _assert_guarded(code, out)
+    _assert_guarded(code, out, tmp_path)
