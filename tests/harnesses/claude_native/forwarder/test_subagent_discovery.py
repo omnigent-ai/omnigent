@@ -805,3 +805,71 @@ async def test_fork_subagent_inheriting_its_own_spawn_record_registers(
     assert start_paths == {"a-fork": "/v1/sessions/conv_root/events"}
     assert state.subagents["a-fork"].child_conversation_id == "conv_a-fork"
     assert state.subagents["a-fork"].parent_subagent_id is None
+
+
+async def test_set_aside_subagent_survives_a_forwarder_restart(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawn set aside after its budget stays set aside across a forwarder
+    restart: the durable miss count reloads from disk, so the next poll runs no
+    full transcript re-read."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    (subagents_dir / "agent-orphan.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "general-purpose",
+                "description": "spawn is in no transcript",
+                "toolUseId": "toolu_orphan",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (subagents_dir / "agent-orphan.jsonl").write_text("", encoding="utf-8")
+
+    # A previous forwarder process already spent the resolve budget and persisted
+    # the set-aside count; a restart must read it back verbatim.
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(
+            subagents={},
+            resolve_misses={"orphan": forwarder._SUBAGENT_RESOLVE_MAX_ATTEMPTS},
+        ),
+    )
+    reloaded = forwarder._read_subagent_forward_state(bridge_dir)
+    assert reloaded.resolve_misses == {"orphan": forwarder._SUBAGENT_RESOLVE_MAX_ATTEMPTS}
+
+    def fail_if_scanned(*args: Any, **kwargs: Any) -> dict[str, str | None]:
+        raise AssertionError("restarted forwarder re-read every transcript for a set-aside spawn")
+
+    monkeypatch.setattr(forwarder, "_subagent_parents_by_tool_use", fail_if_scanned)
+    caplog.set_level(logging.DEBUG, logger="omnigent.harnesses.claude_native.forwarder")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=reloaded,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert "orphan" not in state.subagents
+    assert state.resolve_misses == {"orphan": forwarder._SUBAGENT_RESOLVE_MAX_ATTEMPTS}
+    assert not [
+        record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
+    ], "a set-aside spawn must not re-log a WARNING on restart"
