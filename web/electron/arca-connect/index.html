@@ -119,9 +119,11 @@
       body[data-phase="asking"] #status {
         display: none;
       }
+      /* Selectable: a failure here often quotes a command to run elsewhere. */
       #status {
         min-height: 1.4em;
         font-weight: 500;
+        user-select: text;
       }
       #status[data-kind="error"] {
         color: var(--danger);

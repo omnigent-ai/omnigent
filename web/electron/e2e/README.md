@@ -37,6 +37,15 @@ backend — no real provider creds.
   with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
   connect, silent renewal, relaunch, and sign-out, and asserts the app window
   never loads the IdP.
+- `desktop_arca_connect_copy.e2e.js` — native copying (mouse selection, the
+  copy shortcut, right-click → Copy) from the Arca connect console, against
+  `fixtures/arcaFeatureGates.cjs` (stands in for the Databricks-only gates) and
+  `fixtures/fakeArca.sh` (an `arca` that replays a sign-in-required run). Run
+  from `web/electron` after building the SPA:
+  `OMNIGENT_PYTHON=../../.venv/bin/python node --test e2e/desktop_arca_connect_copy.e2e.js`
+  (prefix `OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a` to supply the display yourself).
+- `desktop_display_lifecycle.e2e.js` — checks that a lane which only closes
+  Electron still releases the harness-owned Xvfb (headless Linux).
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.
@@ -53,7 +62,11 @@ pnpm --filter web run build          # build the SPA the server serves
 cd web/electron && pnpm install      # brings in electron + playwright
 ```
 
-On a headless CI box, wrap the run in `xvfb-run` so Electron has a display.
+On a headless Linux box with no `DISPLAY`, `launchDesktop` starts a private
+`Xvfb` (the `Xvfb` executable must be installed) and passes Chromium
+`--no-sandbox` / `--disable-dev-shm-usage`, so a plain `node --test` run of the
+lanes built on it works; wrapping it in `xvfb-run -a` still works too. Lanes
+that launch Electron themselves (the design-prompt harness) still need a display.
 The harness still skips cleanly (not fails) when `electron` or `playwright`
 are absent (e.g. a `--filter web`-only checkout), so those runs stay green.
 
@@ -63,9 +76,9 @@ are absent (e.g. a `--filter web`-only checkout), so those runs stay green.
 cd web/electron
 # after building the SPA (see above):
 node --test e2e/desktop_connect.e2e.js
-# headless CI (needs a virtual display; set OMNIGENT_PW_NO_SANDBOX so Electron's
-# Chromium starts under xvfb / as root / in a container — same flag the Python
-# e2e_ui suite uses):
+# headless CI: with no DISPLAY the harness starts its own Xvfb. To supply the
+# display yourself, set OMNIGENT_PW_NO_SANDBOX so Electron's Chromium starts
+# under xvfb / as root / in a container — same flag the Python e2e_ui suite uses:
 OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_connect.e2e.js
 ```
 
@@ -82,9 +95,11 @@ the temporary directory where it retains recordings when that variable is unset.
 
 Playwright writes one raw
 `page@<hash>.webm` per page context — the main shell window, plus any OAuth
-popup or in-window IdP view, which record separately. Call
-`saveRecording(recordDir, "<name>")` after `electronApp.close()` (as the
-reference test does) to rename **all** of them to stable names: the largest
+popup or in-window IdP view, which record separately. After
+`electronApp.close()`, `await stopDisplayCapture()` (it finalizes the composited
+capture and releases a harness-owned Xvfb; the harness also runs it when the app
+exits) and then call `saveRecording(recordDir, "<name>")` (as the reference
+test does) to rename **all** of them to stable names: the largest
 becomes `<name>.webm` and any others `<name>-2.webm`, `<name>-3.webm`, … It
 returns the list of saved paths. For a popup / IdP bug the subject is the popup
 clip (often the smaller one), so when there is more than one, inspect each and
@@ -134,8 +149,9 @@ instruction to chat. No instruction bar should appear below the browser URL.
 3. Drive the real window to the failing state and assert on it. For a
    `reproduced` facet the assertion FAILS on the running build — the failing
    run's video is the before-fix footage.
-4. Close the app AND call `saveRecording` in the `finally` block (as the
-   reference test does), so the clip is named on the failing path too — a
+4. Close the app, `await stopDisplayCapture()`, AND call `saveRecording` in the
+   `finally` block (as the reference test does), so the clip is named on the
+   failing path too — a
    `reproduced` facet's run throws, and if you name the clip after the
    `try/finally` it never runs on the very path that produces the before-fix
    footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or

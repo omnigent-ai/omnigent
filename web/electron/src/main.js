@@ -345,6 +345,7 @@ function startArcaHostConnect(serverUrl, deps) {
 
 const arcaConnectFlow = createArcaConnectFlow({
   BrowserWindow,
+  Menu,
   ipcMain,
   pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
   preloadPath: path.join(__dirname, "arca_connect_preload.js"),
