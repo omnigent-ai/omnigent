@@ -1,4 +1,4 @@
-"""User agents: ``POST`` / ``GET ?scope=user`` / ``DELETE /v1/agents`` and visibility.
+"""Agent installation, listing, detail, removal, and visibility.
 
 A multi-user server must never let one user overwrite, see, remove, or bind
 another user's agent, nor touch a server agent. These run against a strict
@@ -22,7 +22,7 @@ import pytest_asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from omnigent.db.utils import generate_agent_id, installed_agent_id
+from omnigent.db.utils import builtin_agent_id, generate_agent_id, installed_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
@@ -142,6 +142,90 @@ async def test_reinstall_updates_in_place(client) -> None:
     assert [row["description"] for row in (await _mine(client, ALICE))["data"]] == ["v2"]
 
 
+async def test_agent_detail_returns_current_summary(client) -> None:
+    for description in ("v1", "v2"):
+        installed = (await _install(client, ALICE, "orion", description)).json()
+        detail = await client.get(f"/v1/agents/{installed['id']}", headers=ALICE)
+        assert detail.status_code == 200, detail.text
+        assert detail.json() == installed == (await _mine(client, ALICE))["data"][0]
+        assert detail.json()["description"] == description
+
+    removed = await client.delete(f"/v1/agents/{installed['id']}", headers=ALICE)
+    assert removed.status_code == 200
+    assert (await client.get(f"/v1/agents/{installed['id']}", headers=ALICE)).status_code == 404
+
+
+async def test_agent_detail_requires_owner_and_authentication(client, agent_store) -> None:
+    other = (await _install(client, BOB, "orion")).json()
+    unowned = agent_store.create_user_agent(
+        generate_agent_id(), "legacy", "test:///legacy", owner=None
+    )
+    for agent_id in (other["id"], unowned.id, generate_agent_id()):
+        response = await client.get(f"/v1/agents/{agent_id}", headers=ALICE)
+        assert response.status_code == 404
+        assert response.json() == {"error": f"Agent not found: {agent_id!r}"}
+        assert (await client.get(f"/v1/agents/{agent_id}")).status_code == 401
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+async def test_server_agent_detail_is_shared(client, agent_store, seeded: bool) -> None:
+    agent_id = builtin_agent_id("shared") if seeded else generate_agent_id()
+    agent_store.create(agent_id, "shared", "test:///missing", description="Stored description")
+    for headers in (ALICE, BOB):
+        response = await client.get(f"/v1/agents/{agent_id}", headers=headers)
+        assert response.status_code == 200, response.text
+        assert (
+            response.json() == (await client.get("/v1/agents", headers=headers)).json()["data"][0]
+        )
+        assert response.json()["builtin"] is seeded
+        assert response.json()["description"] == "Stored description"
+        assert response.json()["harness"] is None
+    assert (await client.get(f"/v1/agents/{agent_id}")).status_code == 401
+
+
+async def test_agent_detail_on_authless_server(agent_store, artifact_store, tmp_path) -> None:
+    app = _app(agent_store, artifact_store, tmp_path, auth_provider=None)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        installed = (await _install(c, {}, "orion")).json()
+        response = await c.get(f"/v1/agents/{installed['id']}")
+        assert response.status_code == 200, response.text
+        assert response.json() == installed
+
+
+async def test_agent_detail_redacts_mcp_headers(client, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_DESCRIPTION", "server environment value")
+    files = {
+        "config.yaml": (
+            "spec_version: 1\nname: orion\ndescription: ${AGENT_DESCRIPTION}\n"
+            "executor:\n  config:\n    harness: claude-sdk\n"
+        ),
+        "tools/mcp/docs.yaml": (
+            "name: docs\ntransport: http\nurl: https://docs.example.com/mcp\n"
+            "headers:\n  Authorization: Bearer test-token\n"
+        ),
+    }
+    bundle = io.BytesIO()
+    with tarfile.open(fileobj=bundle, mode="w:gz") as tar:
+        for name, contents in files.items():
+            data = contents.encode()
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            tar.addfile(member, io.BytesIO(data))
+    installed = await client.post(
+        "/v1/agents",
+        headers=ALICE,
+        files={"bundle": ("bundle.tar.gz", bundle.getvalue(), "application/gzip")},
+    )
+    assert installed.status_code == 200, installed.text
+    response = await client.get(f"/v1/agents/{installed.json()['id']}", headers=ALICE)
+    assert response.status_code == 200, response.text
+    assert response.json()["description"] == "${AGENT_DESCRIPTION}"
+    assert response.json()["mcp_servers"][0]["headers"] == {"Authorization": "[REDACTED]"}
+    assert "test-token" not in response.text
+
+
 def _retarred(bundle: bytes, mtime: int) -> bytes:
     """The same files tarred again, as the CLI does on every run: new timestamps,
     owner, and member order."""
@@ -176,6 +260,20 @@ async def test_reinstalling_the_same_files_is_a_no_op(client, retar: bool) -> No
         installed.append((resp.json()["id"], resp.json()["version"]))
     assert installed[1] == installed[0]
     assert installed[0][1] == 1
+
+
+async def test_reinstalling_the_same_files_restores_a_lost_bundle(
+    client, agent_store, artifact_store
+) -> None:
+    """A row can outlive its blob (pruned artifacts, a DB restored without its
+    store); reinstalling the same files puts the blob back."""
+    first = (await _install(client, ALICE, "orion", "same")).json()
+    location = agent_store.get(first["id"]).bundle_location
+    artifact_store.delete(location)
+
+    again = (await _install(client, ALICE, "orion", "same")).json()
+    assert (again["id"], again["version"]) == (first["id"], first["version"])
+    assert artifact_store.exists(location)
 
 
 async def test_same_name_for_another_user_is_a_separate_agent(client, agent_store) -> None:
@@ -354,7 +452,11 @@ async def test_remove_counts_sessions_in_use_up_to_a_cap(
     assert resp.json()["sessions_in_use"] == "2+"
 
 
-async def test_store_without_user_agents_hides_the_routes(client, monkeypatch) -> None:
+async def test_store_without_user_agents_hides_the_routes(
+    client, agent_store, monkeypatch
+) -> None:
+    mine = (await _install(client, ALICE, "orion")).json()
+    shared = agent_store.create(generate_agent_id(), "shared", "test:///shared")
     monkeypatch.setattr(SqlAlchemyAgentStore, "supports_user_agents", property(lambda self: False))
     assert (await _install(client, ALICE, "orion")).status_code == 404
     listing = await client.get("/v1/agents", params={"scope": "user"}, headers=ALICE)
@@ -362,6 +464,8 @@ async def test_store_without_user_agents_hides_the_routes(client, monkeypatch) -
     removal = await client.delete(f"/v1/agents/{generate_agent_id()}", headers=ALICE)
     assert removal.status_code == 404
     assert (await client.get("/v1/agents", headers=ALICE)).status_code == 200
+    assert (await client.get(f"/v1/agents/{mine['id']}", headers=ALICE)).status_code == 404
+    assert (await client.get(f"/v1/agents/{shared.id}", headers=ALICE)).status_code == 200
 
 
 def test_unused_user_agents_bind_only_for_their_owner() -> None:
@@ -552,6 +656,33 @@ async def test_a_run_after_an_mcp_edit_starts_on_the_uploaded_files(
     listed = await c.get(f"/v1/sessions/{later[0]['session_id']}/agent/mcp-servers", headers=ALICE)
     assert listed.status_code == 200, listed.text
     assert listed.json()["data"] == []
+
+
+async def test_a_run_restores_its_agent_bundle_when_the_blob_is_gone(
+    multi_user_client: httpx.AsyncClient, db_uri: str, tmp_path: Path
+) -> None:
+    """A row can outlive its blob (pruned artifacts, a DB restored without its
+    store). The next run of the same files binds that row and puts the blob
+    back, so its session still loads the agent."""
+    from omnigent.server.routes import sessions as session_routes
+    from tests.server.helpers import policy_tool_call_request
+
+    c = multi_user_client
+    bundle = build_agent_bundle("codex")
+    first = await _upload(c, ALICE, bundle)
+    location = SqlAlchemyAgentStore(db_uri).get(first["agent_id"]).bundle_location
+    LocalArtifactStore(str(tmp_path / "artifacts")).delete(location)
+    # As on a fresh server: nothing cached to fall back on.
+    session_routes.get_agent_cache().evict(first["agent_id"])
+
+    rerun = await _upload(c, ALICE, _retarred(bundle, 1))
+    assert rerun["agent_id"] == first["agent_id"]
+    resp = await c.post(
+        f"/v1/sessions/{rerun['session_id']}/policies/evaluate",
+        json=policy_tool_call_request(),
+        headers=ALICE,
+    )
+    assert resp.status_code == 200, resp.text
 
 
 async def test_sub_agent_uploads_keep_a_row_each(multi_user_client: httpx.AsyncClient) -> None:

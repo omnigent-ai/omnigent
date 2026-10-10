@@ -39,13 +39,6 @@ _KNOWN_GAPS = {
         [("send", 20), ("send", 150)],
         harnesses=("claude", "codex"),
     ),
-    **contract.gaps(
-        "R4: Stop with the host unreachable reports success and shows idle, but the turn "
-        "keeps running on the host and finishes once it returns (claude can also lose the "
-        "next message in the busy TUI)",
-        [("stop", 20), ("stop", 150)],
-        harnesses=("claude", "codex"),
-    ),
 }
 #: A refusal slower than this is not "at once" for a user waiting on a button.
 _PROMPT_REFUSAL_S = 35.0

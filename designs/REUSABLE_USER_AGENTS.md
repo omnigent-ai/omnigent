@@ -201,6 +201,8 @@ Invariant enforced in code: server agents (kind 1) never have `created_by` set.
 All routes require the same authentication as `GET /v1/agents`.
 
 **`GET /v1/info`** adds `agent_install: bool`, true when the server's agent store supports user agents.
+It also advertises `agent_detail: true` when `GET /v1/agents/{id}` is available;
+clients treat its absence on older servers as unsupported.
 
 **`POST /v1/agents`** (install or reinstall)
 - Body: multipart, one part `bundle` (`.tar.gz`; the CLI converts directories and YAML).
@@ -221,6 +223,16 @@ All routes require the same authentication as `GET /v1/agents`.
 - Default `GET /v1/agents` (no `scope`) is byte-for-byte unchanged.
 
 On a store without user-agent support, `scope=user`, `POST`, and `DELETE` return 404.
+
+**`GET /v1/agents/{id}`** (single-agent summary)
+- Returns the same redacted agent object as the list routes, using a direct lookup by ID.
+- Allows server agents and the caller's own user agents in the current workspace.
+  Unlike discovery, this also permits reading an owned legacy fork/switch copy by its ID.
+  Session sharing does not grant access through this route.
+- Missing and inaccessible agents return 404. Without authentication configured, the caller
+  owns user agents whose owner is `None`, matching `scope=user`.
+- Stores without user-agent support can still return server agents; user agents return 404.
+- An unreadable bundle falls back to stored metadata, as in the list routes.
 
 **`DELETE /v1/agents/{id}`** (removal)
 - Allowed only for the caller's own user agents; anything else (server agents, other users' agents,

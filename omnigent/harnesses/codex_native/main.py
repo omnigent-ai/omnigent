@@ -102,6 +102,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
+from omnigent.native.native_terminal import request_with_429_retry
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
@@ -1696,11 +1697,13 @@ async def _create_codex_session(
     }
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
-    resp = await client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("codex-native-ui.tar.gz", bundle, "application/gzip")},
-        timeout=120.0,
+    resp = await request_with_429_retry(
+        lambda: client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={"bundle": ("codex-native-ui.tar.gz", bundle, "application/gzip")},
+            timeout=120.0,
+        )
     )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -2601,6 +2604,11 @@ def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject |
     return {"type": "message", "role": role, "content": content}
 
 
+# The Responses API rejects a function_call whose arguments exceed 1,048,576
+# characters, and a rebuilt thread replays every call; leave headroom.
+_MAX_REPLAYED_ARGUMENTS_CHARS = 900_000
+
+
 def _codex_function_call_payload_from_session_item(
     item: _JsonObject,
 ) -> _JsonObject | None:
@@ -2633,12 +2641,28 @@ def _codex_function_call_payload_from_session_item(
             "Cannot synthesize Codex resume rollout: Omnigent function_call "
             f"{item_id!r} has non-string arguments."
         )
-    return {
+    if len(arguments) > _MAX_REPLAYED_ARGUMENTS_CHARS:
+        # An apply_patch mirror carries whole files for added or deleted ones. One
+        # oversized call would fail every request in the thread, so replay a stub.
+        _logger.warning(
+            "Replaying an oversized Codex function_call as a stub: name=%s chars=%d",
+            name,
+            len(arguments),
+        )
+        arguments = json.dumps(
+            {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
+        )
+    payload: _JsonObject = {
         "type": "function_call",
         "name": name,
         "arguments": arguments,
         "call_id": call_id,
     }
+    # The Responses API rejects a replayed namespaced call without it.
+    namespace = item.get("namespace")
+    if isinstance(namespace, str) and namespace:
+        payload["namespace"] = namespace
+    return payload
 
 
 def _codex_function_call_output_payload_from_session_item(

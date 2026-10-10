@@ -48,6 +48,9 @@ function state(overrides: Partial<SharingState> = {}): SharingState {
     options: ["on", "read_only", "restricted_read_only", "off"],
     public_sharing_enabled: true,
     public_sharing_editable: true,
+    public_sharing_max_level: "read",
+    public_sharing_max_level_editable: true,
+    public_sharing_max_level_options: ["read", "edit"],
     default_public_sessions: "off",
     default_public_sessions_editable: true,
     default_public_sessions_options: ["off", "sandbox", "all"],
@@ -94,6 +97,27 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SharingPage", () => {
+  it("updates the public ceiling independently of the sharing mode", async () => {
+    setSharingState(state());
+    renderPage();
+    const trigger = await screen.findByRole("combobox", { name: "Maximum public permission" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Edit" }));
+    expect(setModeMutate).toHaveBeenCalledWith(
+      { public_sharing_max_level: "edit" },
+      expect.anything(),
+    );
+  });
+
+  it("disables a deployment-managed public ceiling", async () => {
+    setSharingState(state({ public_sharing_max_level_editable: false }));
+    renderPage();
+    expect(
+      await screen.findByRole("combobox", { name: "Maximum public permission" }),
+    ).toBeDisabled();
+  });
+
   it("uses titled outlined groups and mobile description tooltips", async () => {
     setSharingState(state());
 

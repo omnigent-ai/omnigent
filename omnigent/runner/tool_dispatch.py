@@ -55,6 +55,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.executor import ToolCallStatus, classify_tool_result
 from omnigent.models.model_override import (
     harness_supports_model_override,
@@ -314,7 +315,7 @@ _SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["func
     "parameters"
 ]["properties"]["title"]["maxLength"]
 
-# Grantee sentinel for an anonymous, public read-only share. Mirrors the
+# Grantee sentinel for public link access. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
 # _session_share_via_rest — the server can't see the agent's sharing
@@ -5135,7 +5136,7 @@ async def _session_share_via_rest(
     Same channel and security posture as the other session REST tools:
     the server enforces that ``server_client``'s identity holds
     manage-level access on the target (the session owner does), and caps
-    public (``__public__``) grants at read.
+    public (``__public__``) grants at the configured ceiling (read by default).
 
     The spec's ``agent_session_sharing:`` policy is enforced HERE, in the
     runner, because the server cannot see it: an ``agent_session_sharing:
@@ -7278,7 +7279,11 @@ async def _execute_os_env_tool(
         return json_dumps_transport_safe({"error": str(exc)})
     finally:
         if os_env is not None and owns_environment:
-            os_env.close()
+            await run_sync_cleanup(
+                os_env.close,
+                component="runner_os_env_tool",
+                session_id=conversation_id,
+            )
 
     return json_dumps_transport_safe(result)
 

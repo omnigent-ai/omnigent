@@ -9,12 +9,14 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
@@ -962,6 +964,20 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: workspace-claude\n"
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
@@ -994,7 +1010,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
                 "snapshot": {
                     "created_at": 10,
                     "updated_at": 11,
-                    "workspace": str(tmp_path),
+                    "workspace": str(workspace),
                     "reasoning_effort": "high",
                     "labels": {},
                 },
@@ -1014,6 +1030,8 @@ async def test_auto_create_claude_terminal_passes_session_effort(
         )
 
     args = captured["spec"].args
+    assert captured["spec"].os_env.cwd == str(workspace)
+    assert captured["spec"].command == "workspace-claude"
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
@@ -1026,6 +1044,47 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     assert str(bridge_dir_for_bridge_id(session_id)) not in messages[0]
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_rejects_missing_recorded_workspace_before_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing recorded workspace stops startup before bridge or terminal setup."""
+    missing_workspace = tmp_path / "removed-workspace"
+    session_id = "f89fd41f6eefee45b2117ac0fcbc73fa"
+    session_init = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": "agent",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(missing_workspace),
+                "labels": {},
+            },
+        }
+    )
+
+    def unexpected_bridge_setup(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("bridge setup must not run for a missing workspace")
+
+    monkeypatch.setattr(claude_native_bridge, "prepare_bridge_dir", unexpected_bridge_setup)
+
+    with pytest.raises(OmnigentError) as failure:
+        await _auto_create_claude_terminal(
+            session_id,
+            object(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+            session_init=session_init,
+        )
+
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
 
 
 @pytest.mark.asyncio
@@ -1971,6 +2030,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
     # Pin the launch config to Claude's native auth so the test does not
     # depend on the runner process's ambient Databricks profile.
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -2129,6 +2189,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
     # Write the previous claude_session_id into the bridge state.json *before*
@@ -3951,6 +4012,91 @@ async def test_delete_cancels_recovery_before_same_session_reinitializes(
 
         cleanup_resp = await client.delete(f"/v1/sessions/{session_id}")
         assert cleanup_resp.status_code == 200, cleanup_resp.text
+
+
+class _RecordingCodexRegistry:
+    """Captures the launched Codex terminal spec."""
+
+    terminal_registry = None
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self.captured = captured
+
+    async def launch_auxiliary_terminal(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: Any,
+        resource_role: str | None = None,
+        parent_os_env: Any = None,
+    ) -> SessionResourceView:
+        """Record the spec and return a terminal resource view."""
+        del terminal_name, session_key, resource_role, parent_os_env
+        self.captured["spec"] = spec
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="codex:main"
+        )
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_launch_reads_project_config_from_session_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex TUI relaunch reads the session workspace's config after the runner cwd is gone."""
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _launch_codex_native_tui,
+    )
+
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+
+    captured: dict[str, Any] = {}
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=None,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    await _launch_codex_native_tui(
+        "conv_codex_cwd_gone",
+        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        app_server=app_server,  # type: ignore[arg-type]
+        launch_config=_CodexNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+        ),
+        bridge_dir=tmp_path / "bridge",
+        thread_id=None,
+        agent_spec=None,
+    )
+
+    spec = captured["spec"]
+    assert spec.command == "workspace-codex"
+    assert spec.args[0] == "--workspace-arg"
+    assert spec.os_env.cwd == str(workspace)
 
 
 @pytest.mark.asyncio

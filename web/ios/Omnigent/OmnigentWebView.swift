@@ -24,6 +24,12 @@ struct OmnigentWebView: UIViewRepresentable {
   var workspaceReady: (() -> Void)?
   var reauthenticateWorkspace: ((URL) -> Void)?
   var signedOut: ((DatabricksWebContext, Task<Void, Error>) -> Void)?
+  /// The clean server URL (no conversation path); its mount locates the OIDC auth routes.
+  var serverURL: URL?
+  /// An OIDC session can't be renewed without the sign-in sheet: the page to return to and why.
+  var requireSignIn: ((URL, String) -> Void)?
+  /// The user signed out of a native-OIDC server: the server and the Connect screen message.
+  var serverSignedOut: ((URL, String) -> Void)?
 
   static func connectionErrorMessage(
     for error: Error, databricksInternalFeaturesEnabled: Bool
@@ -219,11 +225,19 @@ struct OmnigentWebView: UIViewRepresentable {
           currentOrigin: payload.currentOrigin,
           managedServers: cleanList(payload.managedServers),
           recentServers: cleanList(payload.recentServers),
+          canSignOut: payload.canSignOut === true,
         };
         for (const resolve of serverPickerWaiters) {
           try { resolve(info); } catch {}
         }
         serverPickerWaiters.clear();
+      });
+      const signOutWaiters = new Set();
+      defineEmit("__omnigentNativeEmitSignOutResult", (handled) => {
+        for (const resolve of signOutWaiters) {
+          try { resolve(handled === true); } catch {}
+        }
+        signOutWaiters.clear();
       });
       const insetCallbacks = new Set();
       const keyboardViewportCallbacks = new Set();
@@ -372,6 +386,14 @@ struct OmnigentWebView: UIViewRepresentable {
           return Promise.resolve();
         },
         \(managesWorkspace ? "signOut() { window.webkit.messageHandlers.omnigentNative.postMessage({ method: 'signOut' }); }," : "")
+        signOutOfServer() {
+          // Native answers true once it has taken over the sign-out, false when it can't.
+          const pending = new Promise((resolve) => { signOutWaiters.add(resolve); });
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "signOutOfServer",
+          });
+          return pending;
+        },
         openServerSetup() {
           window.webkit.messageHandlers.omnigentNative.postMessage({
             method: "openServerSetup",
@@ -407,7 +429,23 @@ struct OmnigentWebView: UIViewRepresentable {
     private var rootBounces = 0
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
+    /// Legacy ticket sign-in for OIDC servers without native sign-in in their manifest.
+    /// Deprecated: removal targeted for iOS 0.5.0.
     private var oidcLoginManager = OidcLoginManager()
+    private let oidcCredentials = OidcCredentials.shared
+    /// Set once a native-OIDC connect succeeds; the shell then owns the session's lifecycle.
+    private var oidcConnection: OidcConnection?
+    /// The last app page under the mount, reloaded after a renewal the page asked for.
+    private var oidcPageURL: URL?
+    private var oidcRenewalTask: Task<Void, Never>?
+    private var oidcRenewalTimer: Task<Void, Never>?
+    private var oidcRenewalGuard = OidcRenewalGuard()
+    private var oidcReloadRequested = false
+    /// Why a background renewal lost the grant, kept for the next "Sign in again?" prompt.
+    private var oidcRenewalCause: OidcSignInError?
+    /// The "Sign in again?" alert is up; the stalled page must not trigger more renewals.
+    private var oidcSignInRequired = false
+    private var windowWaiter: (id: UUID, continuation: CheckedContinuation<UIWindow, Error>)?
     let websiteDataStore: WKWebsiteDataStore
     private let contextResult: Result<DatabricksWebContext?, Error>
     fileprivate let webStore: DatabricksWebStore?
@@ -445,11 +483,12 @@ struct OmnigentWebView: UIViewRepresentable {
     func attach(_ webView: WKWebView) {
       webView.scrollView.delegate = self
       self.webView = webView
-      if webStore != nil {
-        activationObserver = NotificationCenter.default.addObserver(
-          forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-          Task { @MainActor in self?.checkWorkspaceSessionOnActivation() }
+      activationObserver = NotificationCenter.default.addObserver(
+        forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor in
+          self?.checkWorkspaceSessionOnActivation()
+          self?.checkOidcSessionOnActivation()
         }
       }
       // In-page navigation: the SPA swapped the URL with pushState / replaceState,
@@ -474,6 +513,7 @@ struct OmnigentWebView: UIViewRepresentable {
             }
             self.lastWorkspacePageURL = session.navigationURL(for: url)
           }
+          if let url = webView.url { self.rememberOidcPage(url) }
           self.bounceIfWorkspaceRoot(webView)
         }
       }
@@ -500,6 +540,7 @@ struct OmnigentWebView: UIViewRepresentable {
         model.signOut = nil
         #if DEBUG
           model.injectDebugFault = nil
+          model.injectOidcDebugFault = nil
         #endif
         model.webView = nil
         // SwiftUI dismantles representables while mutating its graph. Publishing here would
@@ -507,10 +548,12 @@ struct OmnigentWebView: UIViewRepresentable {
         DispatchQueue.main.async { [weak model] in
           guard model?.webView == nil else { return }
           model?.isAuthenticating = false
+          model?.hidesPage = false
         }
       }
       urlObservation = nil
       oidcLoginManager.cancel()
+      stopOidcSession()
       webView = nil
     }
 
@@ -595,8 +638,13 @@ struct OmnigentWebView: UIViewRepresentable {
       workspaceBootstrap.cancel()
       oidcLoginManager.cancel()
       oidcLoginManager = OidcLoginManager()
+      stopOidcSession()
       (webView as? AccessoryFreeWebView)?.onWindowAvailable = nil
       webView.stopLoading()
+      // Another server's page must not stay usable while this one's manifest is read.
+      let coversPreviousPage =
+        contextResult.isGenericOidc(url)
+        && webView.url?.omnigentOrigin.map { $0 != url.omnigentOrigin } == true
       pinnedURL = url
       effectiveOrigin = nil
       workspaceSession = nil
@@ -606,9 +654,11 @@ struct OmnigentWebView: UIViewRepresentable {
         model.isAuthenticating = self?.webStore != nil && self?.workspaceSession == nil
         model.serverSwitcherHidden = !model.isAuthenticating
         model.isLoading = true
+        model.hidesPage = coversPreviousPage
         model.bottomBarVisible = false
         model.signOut = self?.webStore == nil ? nil : { self?.requestSignOut() }
         #if DEBUG
+          model.injectOidcDebugFault = nil
           model.injectDebugFault =
             self?.webStore == nil
             ? nil
@@ -626,6 +676,8 @@ struct OmnigentWebView: UIViewRepresentable {
         }
       }
       switch contextResult {
+      case .success(nil) where contextResult.isGenericOidc(url):
+        connectOidcServer(url, in: webView)
       case .success(nil):
         effectiveOrigin = url.omnigentOrigin
         webView.load(URLRequest(url: url))
@@ -743,6 +795,409 @@ struct OmnigentWebView: UIViewRepresentable {
       } catch { showWorkspaceFailure(error) }
     }
 
+    // MARK: Native OIDC sign-in
+
+    /// Reads the manifest, then either signs in natively before loading or loads as before.
+    private func connectOidcServer(_ pageURL: URL, in webView: WKWebView) {
+      let id = navigationID
+      let serverURL =
+        parent.serverURL.flatMap { $0.omnigentOrigin == pageURL.omnigentOrigin ? $0 : nil }
+        ?? pageURL
+      let interactive = parent.connectionIntent == .connect
+      let returnURL =
+        parent.recoveryPageURL.flatMap { OidcWebSession.isPage($0, of: serverURL) ? $0 : nil }
+        ?? pageURL
+      authenticationTask = Task { [weak self, weak webView] in
+        guard let self else { return }
+        defer { if navigationID == id { authenticationTask = nil } }
+        guard let manifest = try? await ServerManifest.fetch(for: serverURL),
+          navigationID == id, let webView, isCurrent(webView)
+        else { return }
+        guard let cookieName = manifest.nativeSignInCookieName else {
+          effectiveOrigin = pageURL.omnigentOrigin
+          webView.load(URLRequest(url: pageURL))
+          return
+        }
+        let connection = OidcConnection(serverURL: serverURL, cookieName: cookieName)
+        do {
+          try await ensureOidcSession(connection, interactive: interactive, in: webView, id: id)
+          try Task.checkCancellation()
+          guard navigationID == id, isCurrent(webView) else { return }
+          oidcConnection = connection
+          oidcPageURL = OidcWebSession.isPage(returnURL, of: serverURL) ? returnURL : serverURL
+          effectiveOrigin = connection.origin
+          let model = parent.model
+          model.isAuthenticating = false
+          model.cancelAuthentication = nil
+          model.currentURL = returnURL
+          model.signOut = { [weak self] in self?.requestOidcSignOut() }
+          #if DEBUG
+            model.injectOidcDebugFault = { [weak self] fault in
+              guard let self else { return "This server view is no longer attached." }
+              return await injectOidcDebugFault(fault)
+            }
+          #endif
+          webView.load(URLRequest(url: returnURL))
+          scheduleOidcRenewal()
+        } catch {
+          guard navigationID == id, self.webView === webView else { return }
+          if !interactive, !OidcWebSession.isNetworkFailure(error), !(error is CancellationError),
+            let requireSignIn = parent.requireSignIn
+          {
+            endOidcProgress()
+            requireSignIn(
+              returnURL,
+              OidcWebSession.reauthenticationMessage(for: error, host: connection.host))
+          } else {
+            if OidcWebSession.stopsAutoOpening(after: error) {
+              parent.settings.suppressAutoOpening(oidcServer: connection.serverURL)
+            }
+            showWorkspaceFailure(error)
+          }
+        }
+      }
+    }
+
+    /// Reuses an accepted session cookie, else renews from the stored grant, else (only when
+    /// `interactive`) signs in through the system sheet. Leaves an accepted cookie installed.
+    private func ensureOidcSession(
+      _ connection: OidcConnection, interactive: Bool, in webView: WKWebView, id: UUID
+    ) async throws {
+      let store = webView.configuration.websiteDataStore.httpCookieStore
+      if let existing = OidcWebSession.liveSessionCookie(
+        in: await OidcWebSession.persistedCookies(in: webView.configuration.websiteDataStore),
+        named: connection.cookieName,
+        serverURL: connection.serverURL, now: Date()),
+        try await oidcCredentials.isAccepted(
+          token: existing.value, cookieName: connection.cookieName,
+          serverURL: connection.serverURL)
+      {
+        return
+      }
+      try Task.checkCancellation()
+      guard navigationID == id else { throw CancellationError() }
+      let model = parent.model
+      model.isAuthenticating = true
+      model.serverSwitcherHidden = false
+      model.cancelAuthentication = { [weak self] in
+        self?.showWorkspaceFailure(CancellationError())
+      }
+      let renewalError: Error
+      do {
+        try await renewOidcCookie(connection, in: store)
+        return
+      } catch {
+        if !interactive || error is CancellationError || OidcWebSession.isNetworkFailure(error) {
+          throw error
+        }
+        renewalError = error
+      }
+      let generation = OidcSignOutGenerations.shared.current(origin: connection.origin)
+      let minted: OidcSessionToken
+      do {
+        let window = try await presentationWindow(for: webView, host: connection.host)
+        minted = try await oidcCredentials.signIn(serverURL: connection.serverURL, anchor: window)
+      } catch is CancellationError where !Task.isCancelled {
+        // Closing the sheet keeps the reason it opened, unless there simply was no sign-in.
+        throw OidcWebSession.cancelledSignInCause(renewalError) ?? CancellationError()
+      }
+      guard OidcSignOutGenerations.shared.isCurrent(generation, origin: connection.origin) else {
+        // Signed out while the sheet was open: drop the grant this sign-in just saved.
+        _ = try? oidcCredentials.signOut(serverURL: connection.serverURL)
+        throw CancellationError()
+      }
+      try await installOidcCookie(minted, for: connection, generation: generation, in: store)
+    }
+
+    private func renewOidcCookie(_ connection: OidcConnection, in store: WKHTTPCookieStore)
+      async throws
+    {
+      let generation = OidcSignOutGenerations.shared.current(origin: connection.origin)
+      let minted = try await oidcCredentials.refresh(serverURL: connection.serverURL)
+      try await installOidcCookie(minted, for: connection, generation: generation, in: store)
+    }
+
+    /// Installs a session the server accepts, unless the user signed out since `generation`.
+    private func installOidcCookie(
+      _ minted: OidcSessionToken, for connection: OidcConnection, generation: Int,
+      in store: WKHTTPCookieStore
+    ) async throws {
+      guard
+        try await oidcCredentials.isAccepted(
+          token: minted.token, cookieName: connection.cookieName, serverURL: connection.serverURL)
+      else { throw OidcSignInError.sessionRejected(host: connection.host) }
+      guard OidcSignOutGenerations.shared.isCurrent(generation, origin: connection.origin) else {
+        throw CancellationError()
+      }
+      guard
+        let cookie = minted.sessionCookie(
+          named: connection.cookieName, serverURL: connection.serverURL)
+      else { throw OidcSignInError.sessionRejected(host: connection.host) }
+      await store.setCookie(cookie)
+      // A sign-out during the write may have cleared cookies before this one landed.
+      guard OidcSignOutGenerations.shared.isCurrent(generation, origin: connection.origin) else {
+        await store.deleteCookie(cookie)
+        throw CancellationError()
+      }
+      // Read it back so the page never loads before WebKit holds the session.
+      let installed = OidcWebSession.liveSessionCookie(
+        in: await store.allCookies(), named: connection.cookieName,
+        serverURL: connection.serverURL, now: Date())
+      guard installed?.value == minted.token else {
+        throw OidcSignInError.sessionRejected(host: connection.host)
+      }
+    }
+
+    /// The window to present the sign-in sheet from, waiting for the web view to join one.
+    private func presentationWindow(for webView: WKWebView, host: String) async throws -> UIWindow {
+      if let window = webView.window { return window }
+      guard let hosted = webView as? AccessoryFreeWebView else {
+        throw OidcSignInError.browserUnavailable(host: host)
+      }
+      // Each wait settles only its own continuation, never a newer connect's.
+      let id = UUID()
+      return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          guard !Task.isCancelled else {
+            continuation.resume(throwing: CancellationError())
+            return
+          }
+          windowWaiter?.continuation.resume(throwing: CancellationError())
+          windowWaiter = (id, continuation)
+          hosted.onWindowAvailable = { [weak self] window in
+            self?.settleWindowWaiter(id, with: .success(window))
+          }
+        }
+      } onCancel: {
+        Task { @MainActor [weak self] in
+          self?.settleWindowWaiter(id, with: .failure(CancellationError()))
+        }
+      }
+    }
+
+    private func settleWindowWaiter(_ id: UUID, with result: Result<UIWindow, Error>) {
+      guard let waiter = windowWaiter, waiter.id == id else { return }
+      windowWaiter = nil
+      waiter.continuation.resume(with: result)
+    }
+
+    /// Clears the connect-time overlays, so "Sign in again?" never sits over a spinner.
+    private func endOidcProgress() {
+      let model = parent.model
+      model.isAuthenticating = false
+      model.cancelAuthentication = nil
+      model.isLoading = false
+      model.hidesPage = false
+      model.cancelServerSwitcherWatchdog()
+    }
+
+    /// Ends this view's native-OIDC lifecycle; the stored grant and cookie are left alone.
+    private func stopOidcSession() {
+      oidcConnection = nil
+      oidcPageURL = nil
+      oidcRenewalTask?.cancel()
+      oidcRenewalTask = nil
+      oidcRenewalTimer?.cancel()
+      oidcRenewalTimer = nil
+      oidcRenewalGuard = OidcRenewalGuard()
+      oidcReloadRequested = false
+      oidcRenewalCause = nil
+      oidcSignInRequired = false
+      windowWaiter?.continuation.resume(throwing: CancellationError())
+      windowWaiter = nil
+    }
+
+    private func rememberOidcPage(_ url: URL) {
+      guard let connection = oidcConnection, OidcWebSession.isPage(url, of: connection.serverURL)
+      else { return }
+      oidcPageURL = url
+    }
+
+    /// Renews before the cookie expires; a missing or expired cookie renews now. A cookie with
+    /// no expiry gets no timer: the page's own sign-in request recovers it.
+    private func scheduleOidcRenewal() {
+      oidcRenewalTimer?.cancel()
+      oidcRenewalTimer = nil
+      guard let connection = oidcConnection, !oidcSignInRequired, oidcRenewalTask == nil,
+        let store = webView?.configuration.websiteDataStore.httpCookieStore
+      else { return }
+      let id = navigationID
+      oidcRenewalTimer = Task { [weak self] in
+        let cookies = await store.allCookies()
+        guard let self, !Task.isCancelled, navigationID == id, oidcConnection == connection
+        else { return }
+        let now = Date()
+        var delay: TimeInterval = 0
+        if let cookie = OidcWebSession.liveSessionCookie(
+          in: cookies, named: connection.cookieName, serverURL: connection.serverURL, now: now)
+        {
+          guard let expiresAt = cookie.expiresDate else { return }
+          delay = OidcWebSession.renewalDelay(expiresAt: expiresAt, now: now)
+        }
+        if delay > 0 {
+          try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+          guard !Task.isCancelled, navigationID == id, oidcConnection == connection else { return }
+        }
+        oidcRenewalTimer = nil
+        renewOidcSession()
+      }
+    }
+
+    private func checkOidcSessionOnActivation() {
+      guard oidcConnection != nil, !oidcSignInRequired, oidcRenewalTask == nil,
+        let view = webView, isCurrent(view)
+      else { return }
+      scheduleOidcRenewal()
+    }
+
+    /// The page asked to sign in again (`/auth/login` or a redirect to the IdP): renew and
+    /// reload it, unless it asked again right after a renewal.
+    private func recoverOidcSession() {
+      guard let connection = oidcConnection, !oidcSignInRequired else { return }
+      guard oidcRenewalGuard.shouldRenew(now: Date(), renewalPending: oidcRenewalTask != nil)
+      else {
+        failOidcSession(OidcSignInError.sessionRejected(host: connection.host))
+        return
+      }
+      oidcReloadRequested = true
+      renewOidcSession()
+    }
+
+    /// Renews from the stored grant. A renewal the page asked for reloads it or fails to the
+    /// alert; a background one keeps the current cookie and retries an unreachable server.
+    private func renewOidcSession() {
+      guard let connection = oidcConnection, !oidcSignInRequired, oidcRenewalTask == nil,
+        let view = webView, isCurrent(view)
+      else { return }
+      oidcRenewalTimer?.cancel()
+      oidcRenewalTimer = nil
+      let id = navigationID
+      let store = view.configuration.websiteDataStore.httpCookieStore
+      oidcRenewalTask = Task { [weak self] in
+        var failure: Error?
+        do {
+          try await self?.renewOidcCookie(connection, in: store)
+        } catch {
+          failure = error
+        }
+        guard let self, !Task.isCancelled, navigationID == id, oidcConnection == connection,
+          !oidcSignInRequired
+        else { return }
+        oidcRenewalTask = nil
+        let reload = oidcReloadRequested
+        oidcReloadRequested = false
+        if let failure {
+          if reload {
+            failOidcSession(failure)
+          } else if OidcWebSession.isNetworkFailure(failure) {
+            retryOidcRenewal()
+          } else if let cause = OidcWebSession.rememberedRenewalCause(failure) {
+            oidcRenewalCause = cause
+          }
+          return
+        }
+        oidcRenewalCause = nil
+        scheduleOidcRenewal()
+        if reload, let webView {
+          webView.load(URLRequest(url: oidcPageURL ?? connection.serverURL))
+        }
+      }
+    }
+
+    private func retryOidcRenewal() {
+      oidcRenewalTimer?.cancel()
+      let id = navigationID
+      let connection = oidcConnection
+      oidcRenewalTimer = Task { [weak self] in
+        try? await Task.sleep(nanoseconds: UInt64(OidcWebSession.retryDelay * 1_000_000_000))
+        guard let self, !Task.isCancelled, navigationID == id, oidcConnection == connection
+        else { return }
+        oidcRenewalTimer = nil
+        renewOidcSession()
+      }
+    }
+
+    /// The session can't continue: an unreachable server returns to setup with the connection
+    /// error; anything else asks "Sign in again?" and never opens the sheet on its own.
+    private func failOidcSession(_ error: Error) {
+      guard let connection = oidcConnection else { return }
+      guard !OidcWebSession.isNetworkFailure(error), !(error is CancellationError),
+        let requireSignIn = parent.requireSignIn
+      else {
+        showWorkspaceFailure(error)
+        return
+      }
+      oidcSignInRequired = true
+      oidcRenewalTimer?.cancel()
+      oidcRenewalTimer = nil
+      webView?.stopLoading()
+      endOidcProgress()
+      let cause = OidcWebSession.reauthenticationCause(for: error, remembered: oidcRenewalCause)
+      oidcRenewalCause = nil
+      requireSignIn(
+        oidcPageURL ?? connection.serverURL,
+        OidcWebSession.reauthenticationMessage(for: cause, host: connection.host))
+    }
+
+    /// Forgets the grant (synchronously), clears the session cookie, then hands the Connect
+    /// screen its message. Revocation finishes in the background.
+    private func requestOidcSignOut() {
+      guard let connection = oidcConnection,
+        let store = webView?.configuration.websiteDataStore.httpCookieStore
+      else { return }
+      OidcSignOutGenerations.shared.signOut(origin: connection.origin)
+      var complete = true
+      do {
+        try oidcCredentials.signOut(serverURL: connection.serverURL)
+      } catch {
+        complete = false
+      }
+      let message = OidcWebSession.signedOutMessage(host: connection.host, complete: complete)
+      let signedOut = parent.serverSignedOut
+      let loadFailed = parent.loadFailed
+      let initialURL = parent.initialURL
+      effectiveOrigin = nil
+      detach()
+      Task { @MainActor in
+        for cookie in OidcWebSession.sessionCookies(
+          in: await store.allCookies(), named: connection.cookieName,
+          serverURL: connection.serverURL, now: Date())
+        {
+          await store.deleteCookie(cookie)
+        }
+        if let signedOut {
+          signedOut(connection.serverURL, message)
+        } else {
+          loadFailed(initialURL, message)
+        }
+      }
+    }
+
+    #if DEBUG
+      private func injectOidcDebugFault(_ fault: OidcDebugFault) async -> String {
+        guard let connection = oidcConnection,
+          let store = webView?.configuration.websiteDataStore.httpCookieStore
+        else { return "This server does not use native OIDC sign-in." }
+        switch fault {
+        case .sessionCookie:
+          for cookie in OidcWebSession.sessionCookies(
+            in: await store.allCookies(), named: connection.cookieName,
+            serverURL: connection.serverURL, now: Date())
+          {
+            await store.deleteCookie(cookie)
+          }
+        case .refreshToken:
+          guard oidcCredentials.hasStoredGrant(serverURL: connection.serverURL) else {
+            return "No saved refresh token for this server. Sign in first."
+          }
+          do {
+            try oidcCredentials.forgetGrantForTesting(serverURL: connection.serverURL)
+          } catch { return error.localizedDescription }
+        }
+        return fault.expectation
+      }
+    #endif
+
     #if DEBUG
       /// Break the live session on request so a tester can watch recovery, refresh, and the sign-in
       /// prompt without waiting for a real expiry. Returns what to expect next. Debug builds only.
@@ -769,6 +1224,7 @@ struct OmnigentWebView: UIViewRepresentable {
         for: error, databricksInternalFeaturesEnabled: databricksInternalFeaturesEnabled)
     }
 
+    /// Also ends a native-OIDC connection or attempt, which shares the same return to setup.
     private func showWorkspaceFailure(_ error: Error) {
       navigationID = UUID()
       effectiveOrigin = nil
@@ -777,6 +1233,7 @@ struct OmnigentWebView: UIViewRepresentable {
       authenticationTask?.cancel()
       authenticationTask = nil
       workspaceBootstrap.cancel()
+      stopOidcSession()
       (webView as? AccessoryFreeWebView)?.onWindowAvailable = nil
       webView?.stopLoading()
       Task { @MainActor [weak self] in
@@ -784,6 +1241,7 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.isAuthenticating = false
         parent.model.cancelAuthentication = nil
         parent.model.isLoading = false
+        parent.model.hidesPage = false
         parent.model.cancelServerSwitcherWatchdog()
         parent.loadFailed(
           parent.initialURL,
@@ -824,6 +1282,14 @@ struct OmnigentWebView: UIViewRepresentable {
         webView?.scrollView.isScrollEnabled = enabled
       case "signOut":
         requestSignOut()
+      case "signOutOfServer":
+        // The same sign-out as the native menu, for workspaces and native-OIDC servers.
+        guard let signOut = parent.model.signOut else {
+          parent.model.emitSignOutResult(false)
+          return
+        }
+        parent.model.emitSignOutResult(true)
+        signOut()
       case "setColorScheme":
         guard let scheme = body["scheme"] as? String,
           let source = ThemeSource(rawValue: scheme)
@@ -904,7 +1370,11 @@ struct OmnigentWebView: UIViewRepresentable {
         webStore == nil
       {
         webView.stopLoading()
-        startLogin(in: webView)
+        if oidcConnection != nil {
+          recoverOidcSession()
+        } else {
+          startLogin(in: webView)
+        }
         return
       }
       parent.model.isLoading = true
@@ -930,6 +1400,8 @@ struct OmnigentWebView: UIViewRepresentable {
         effectiveOrigin = url.omnigentOrigin
         lastWorkspacePageURL = session.navigationURL(for: url)
       }
+      if let url = webView.url { rememberOidcPage(url) }
+      parent.model.hidesPage = false
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       // Workspace roots are caught here too, not only in decidePolicyFor: that
       // callback is skipped for loads the shell starts itself, and the Databricks
@@ -1046,6 +1518,19 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
 
+      // The IdP must never load in the web view: the shell renews or signs out instead.
+      if let connection = oidcConnection, navigationAction.targetFrame?.isMainFrame == true,
+        ["http", "https"].contains(scheme),
+        let route = OidcAuthRoute(url: url, serverURL: connection.serverURL)
+      {
+        decisionHandler(.cancel)
+        switch route {
+        case .login: recoverOidcSession()
+        case .logout: requestOidcSignOut()
+        }
+        return
+      }
+
       if navigationAction.targetFrame?.isMainFrame == true,
         ["http", "https"].contains(scheme),
         url.omnigentOrigin != pinnedOrigin
@@ -1065,6 +1550,9 @@ struct OmnigentWebView: UIViewRepresentable {
 
         if navigationAction.navigationType == .linkActivated {
           openExternal(url)
+        } else if oidcConnection != nil {
+          // A server redirect to the IdP: renew silently rather than sign in in the page.
+          recoverOidcSession()
         } else {
           startLogin(in: webView)
         }
@@ -1177,8 +1665,11 @@ struct OmnigentWebView: UIViewRepresentable {
       promptForExternalURL(url, scheme: scheme)
     }
 
+    /// The legacy ticket flow. Deprecated: removal targeted for iOS 0.5.0.
     private func startLogin(in webView: WKWebView) {
       guard let pinnedOrigin else { return }
+      // The page is left as it is while Safari signs in, so nothing should cover it.
+      parent.model.hidesPage = false
       oidcLoginManager.start(
         origin: pinnedOrigin,
         cookieStore: webView.configuration.websiteDataStore.httpCookieStore
@@ -1233,6 +1724,7 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
       parent.model.isLoading = false
+      parent.model.hidesPage = false
       parent.model.cancelServerSwitcherWatchdog()
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
@@ -1267,6 +1759,16 @@ struct OmnigentWebView: UIViewRepresentable {
       let root = scene?.windows.first { $0.isKeyWindow }?.rootViewController
       return root?.omnigentTopViewController
     }
+  }
+}
+
+extension Result where Success == DatabricksWebContext?, Failure == Error {
+  /// A server that isn't a Databricks host, so its manifest decides how it signs in.
+  fileprivate func isGenericOidc(_ url: URL) -> Bool {
+    if case .success(nil) = self {
+      return ServerAuthentication(origin: url.omnigentOrigin) == .oidc
+    }
+    return false
   }
 }
 
@@ -1432,8 +1934,15 @@ final class ThemeController: ObservableObject {
     self.source = source
     for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
       for window in scene.windows {
-        window.overrideUserInterfaceStyle = source.userInterfaceStyle
+        Self.apply(source, to: window)
       }
     }
+  }
+
+  static func apply(_ source: ThemeSource, to window: UIWindow) {
+    window.overrideUserInterfaceStyle = source.userInterfaceStyle
+    guard window.windowLevel == .normal else { return }
+    window.backgroundColor = DesignTokens.nativeBackground
+    window.rootViewController?.view.backgroundColor = DesignTokens.nativeBackground
   }
 }

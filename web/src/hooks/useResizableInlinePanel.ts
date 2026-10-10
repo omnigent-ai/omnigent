@@ -39,7 +39,12 @@ function defaultWidthPx(): number {
 // Width the panel may not eat into: the sidebar when it's open. Passed down
 // from AppShell so opening the sidebar tightens the ceiling instead of
 // squeezing the chat.
-function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
+function clamp(
+  w: number,
+  minPx = MIN_WIDTH_PX,
+  reservedPx = 0,
+  chatMinPx = CHAT_MIN_WIDTH_PX,
+): number {
   // No viewport ceiling available off the DOM (SSR / node test env) — this runs
   // during render, so guard before reading `window` to avoid a hard throw.
   if (typeof window === "undefined") return Math.max(minPx, w);
@@ -49,10 +54,10 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
     0,
     Math.min(
       window.innerWidth * MAX_WIDTH_RATIO,
-      window.innerWidth - reservedPx - CHAT_MIN_WIDTH_PX - GAP_PX,
+      window.innerWidth - reservedPx - chatMinPx - GAP_PX,
     ),
   );
-  // The chat's 480px floor wins over the panel's own comfort minimum: when the
+  // The chat's width floor wins over the panel's own comfort minimum: when the
   // viewport (with the sidebar open) is too small to grant both, the panel
   // yields below `minPx` rather than let the chat break its minimum. Clamping
   // the floor to the ceiling keeps the range valid so `Math.max` can't push the
@@ -152,12 +157,14 @@ function getServerSnapshot(): number | null {
  * user's width.
  *
  * `persistEnabled` disables manual resizing while the storage key is tentative.
+ * `chatMinWidthPx` lets a nested Canvas conversation use its own width floor.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
   minWidthPx = MIN_WIDTH_PX,
   reservedPx = 0,
   persistEnabled = true,
+  chatMinWidthPx = CHAT_MIN_WIDTH_PX,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   // On a session switch the module store still holds the previous session's
@@ -173,7 +180,8 @@ export function useResizableInlinePanel(
   }
   // Clamped at render time only — the store keeps the user's preferred width, so
   // a temporary squeeze (sidebar opening) is undone when the space returns.
-  const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx, reservedPx);
+  const preferredPanelWidth = Math.max(minWidthPx, effectiveRaw ?? defaultWidthPx());
+  const resolvedWidth = clamp(preferredPanelWidth, minWidthPx, reservedPx, chatMinWidthPx);
   // Drives the drag listeners' lifecycle: they mount only while a drag is
   // live, so there's no idle window-level mousemove handler firing during
   // ordinary page use.
@@ -189,6 +197,8 @@ export function useResizableInlinePanel(
   minWidthRef.current = minWidthPx;
   const reservedRef = useRef(reservedPx);
   reservedRef.current = reservedPx;
+  const chatMinRef = useRef(chatMinWidthPx);
+  chatMinRef.current = chatMinWidthPx;
   const persistEnabledRef = useRef(persistEnabled);
   persistEnabledRef.current = persistEnabled;
 
@@ -227,7 +237,9 @@ export function useResizableInlinePanel(
     function onResize() {
       setStoredWidth((prev) => {
         const base = preferredWidth ?? prev;
-        return base !== null ? clamp(base, minWidthRef.current) : defaultWidthPx();
+        return base !== null
+          ? clamp(base, minWidthRef.current, 0, chatMinRef.current)
+          : defaultWidthPx();
       });
       // Force a re-render even when the stored width is unchanged, so the
       // render-time reserve clamp re-runs against the new viewport.
@@ -259,13 +271,25 @@ export function useResizableInlinePanel(
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         setStoredWidth(
-          (prev) => clamp((prev ?? resolvedWidth) + step, minWidthRef.current, reservedRef.current),
+          (prev) =>
+            clamp(
+              (prev ?? resolvedWidth) + step,
+              minWidthRef.current,
+              reservedRef.current,
+              chatMinRef.current,
+            ),
           true,
         );
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
         setStoredWidth(
-          (prev) => clamp((prev ?? resolvedWidth) - step, minWidthRef.current, reservedRef.current),
+          (prev) =>
+            clamp(
+              (prev ?? resolvedWidth) - step,
+              minWidthRef.current,
+              reservedRef.current,
+              chatMinRef.current,
+            ),
           true,
         );
       }
@@ -285,7 +309,7 @@ export function useResizableInlinePanel(
     function flush() {
       frame = 0;
       if (pending === null || !persistEnabledRef.current) return;
-      setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
+      setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current, chatMinRef.current));
       pending = null;
     }
 
@@ -333,5 +357,10 @@ export function useResizableInlinePanel(
     [onMouseDown, onKeyDown, persistEnabled],
   );
 
-  return { panelWidth: resolvedWidth, handleProps, isDragging };
+  return {
+    panelWidth: resolvedWidth,
+    preferredContentWidth: preferredPanelWidth + chatMinWidthPx + GAP_PX,
+    handleProps,
+    isDragging,
+  };
 }

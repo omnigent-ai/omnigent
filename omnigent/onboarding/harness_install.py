@@ -991,6 +991,9 @@ def _harness_cli_version_string(
         )
     except (OSError, subprocess.SubprocessError):
         return None
+    # Failed launchers can print a runtime version, not the CLI's version.
+    if completed.returncode != 0:
+        return None
     version = _parse_harness_cli_version(
         (completed.stdout or "") + "\n" + (completed.stderr or "")
     )

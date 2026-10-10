@@ -15,6 +15,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
@@ -50,8 +52,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => ({ data: undefined }),
 }));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
@@ -69,6 +71,7 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
     githubState: "ready" as "loading" | "ready" | "unknown",
     prCount: 0,
     prNumber: null as number | null,
+    prNumberPrefix: "#",
     refresh: vi.fn(),
     refreshing: false,
   },
@@ -98,6 +101,7 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       githubState: "ready",
       prCount: 0,
       prNumber: null,
+      prNumberPrefix: "#",
       refreshing: false,
     },
     overrides,
@@ -632,6 +636,8 @@ describe("Composer send shortcut", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
+    [false, "{Alt>}{Enter}{/Alt}"],
+    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     const onSend = vi.fn();
@@ -2487,7 +2493,7 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-loading")).toHaveTextContent("Checking PR…");
+    expect(screen.queryByTestId("composer-pr-loading")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
 
     setComposerGitStatus({ githubState: "unknown" });
@@ -2496,8 +2502,15 @@ describe("Composer shared visible controls", () => {
         <Composer {...composerProps()} />
       </TooltipProvider>,
     );
-    expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
+    expect(screen.queryByTestId("composer-pr-unknown")).toBeNull();
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("marks the PR number with the prefix of the PR's provider", () => {
+    setComposerGitStatus({ prCount: 1, prNumber: 7, prNumberPrefix: "!" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("!7");
+    expect(screen.getByTestId("composer-pr-link")).toHaveAccessibleName("!7");
   });
 
   it("keeps the PR to the right of the confirmed worktree status", () => {
@@ -4269,6 +4282,8 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
       sessionHarness: "codex-native",
       sideChatToOpen: null,
       sideChatDrafts: {},
+      sideChatComposers: {},
+      sideChatSelectionTarget: null,
     });
   });
 
@@ -4290,6 +4305,78 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     expect(sideChatDrafts[sideChatToOpen!.childId]).toBe("restore the row on failure");
     expect(textarea()).toHaveValue("");
     expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+  });
+
+  it.each(["pending:visible", "conv_side"])(
+    "adds selections to visible side chat %s",
+    (childId) => {
+      useChatStore.setState({
+        sideChatSelectionTarget: { childId, parentId: "conv_test" },
+        sideChatComposers: { [childId]: { text: "my question", files: [] } },
+      });
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      render(<Composer {...composerProps()} ref={ref} />);
+
+      act(() => ref.current?.startSideChat("first selection"));
+      act(() => ref.current?.startSideChat("second selection"));
+
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
+        text: "my question",
+        files: [],
+        quotes: ["first selection", "second selection"],
+      });
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
+  it("keeps a selection made during side-chat creation in a new pending tab", async () => {
+    let resolveStart!: () => void;
+    const onStart = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    const queryClient = new QueryClient();
+    const pane = (id: string) => (
+      <QueryClientProvider client={queryClient}>
+        <SideChatPane key={id} childId={id} selectionParentId="conv_test" onStart={onStart} />
+      </QueryClientProvider>
+    );
+    const view = render(pane("pending:starting"));
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "First question" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+
+    // Switching tabs or moving to the mobile drawer must keep the start lock.
+    view.unmount();
+    const remounted = render(pane("pending:starting"));
+    act(() => ref.current?.startSideChat("A second passage"));
+    const newId = useChatStore.getState().sideChatToOpen!.childId;
+    expect(newId).not.toBe("pending:starting");
+    expect(newId).toMatch(/^pending:/);
+    remounted.rerender(pane(newId));
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("A second passage");
+
+    await act(async () => resolveStart());
+
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("First question");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("A second passage");
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(useChatStore.getState().sideChatDrafts[newId]).toBe("A second passage");
+  });
+
+  it("does not add selections to another parent's side chat", () => {
+    useChatStore.setState({ sideChatSelectionTarget: { childId: "conv_side", parentId: "other" } });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.startSideChat("selection"));
+    expect(useChatStore.getState().sideChatToOpen?.childId).toMatch(/^pending:/);
+    expect(useChatStore.getState().sideChatComposers.conv_side).toBeUndefined();
   });
 
   it.each([

@@ -132,6 +132,9 @@ function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } 
 }
 
 function loadNavigationHarness({
+  isPackaged = false,
+  platform,
+  env = {},
   serverUrl = "https://host.example/ml/omnigents",
   savedServerUrl,
   registerFallbacks = true,
@@ -225,9 +228,13 @@ function loadNavigationHarness({
   // The reconnect overlay's behavior is unit-tested in reconnect_overlay.test.js.
   const overlay = { hint: null, shows: [], hides: 0, raises: 0, cancel: null };
   const browserRegistryCalls = { setActive: [], closeAll: [] };
+  let browserRegistryDeps;
+  let browserIpcDeps;
   const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
+  const powerMonitor = new EventEmitter();
+  const connectivity = { online: true };
   const webContents = {
     id: 1,
     send: (channel, data) => calls.progress.push({ channel, data }),
@@ -303,7 +310,7 @@ function loadNavigationHarness({
 
   const electron = {
     app: {
-      isPackaged: false,
+      isPackaged,
       getPath: () => userData,
       setName: () => {},
       setPath: () => {},
@@ -378,6 +385,8 @@ function loadNavigationHarness({
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
+    net: { isOnline: () => connectivity.online },
+    powerMonitor,
     screen: {},
     session: { defaultSession },
     shell: {},
@@ -530,17 +539,24 @@ function loadNavigationHarness({
     "./browserViewRegistry": realBrowserRegistry
       ? require("../src/browserViewRegistry")
       : {
-          createBrowserViewRegistry: () => ({
-            closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
-            setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
-          }),
+          createBrowserViewRegistry: (deps) => {
+            browserRegistryDeps = deps;
+            return {
+              closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
+              setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+            };
+          },
         },
     "./browserViewBounds": realBrowserRegistry
       ? require("../src/browserViewBounds")
       : {
           createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
         },
-    "./browserIpc": { registerBrowserIpc: () => {} },
+    "./browserIpc": {
+      registerBrowserIpc: (deps) => {
+        browserIpcDeps = deps;
+      },
+    },
     "./session-expiry": require("../src/session-expiry"),
     "./popupPolicy": {
       decideWindowOpen: () => ({ kind: "ignore" }),
@@ -570,7 +586,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -586,8 +602,8 @@ function loadNavigationHarness({
     module,
     process: {
       ...process,
-      platform: internalFeatures ? "darwin" : process.platform,
-      env: { ...process.env },
+      platform: platform ?? (internalFeatures ? "darwin" : process.platform),
+      env: { ...process.env, OMNIGENT_SERVER_SELECTOR_V2: "", ...env },
     },
     require: (specifier) => {
       if (specifier === "electron") return electron;
@@ -616,8 +632,12 @@ function loadNavigationHarness({
     overlay,
     bannerCalls,
     browserRegistryCalls,
+    browserRegistryDeps: () => browserRegistryDeps,
+    browserIpcDeps: () => browserIpcDeps,
     permissionPromptCalls,
     electron,
+    powerMonitor,
+    connectivity,
     ipc,
     webRequest,
     webContents,
@@ -633,6 +653,8 @@ function loadNavigationHarness({
     },
     win,
     cleanup: () => {
+      // Network failures retry until they succeed; a closed window would stop them.
+      api.cancelReconnect(win);
       api.disposeAuth();
       api.windows.clear();
       fs.rmSync(userData, { recursive: true, force: true });
@@ -689,6 +711,9 @@ describe("Arca auto-connect wiring", () => {
     await h.ipc.get("omnigent:set-server-url")(setupEvent, picked);
     await tick();
     assert.deepEqual(h.calls.arcaConnects, [picked]);
+    // The onboarding runner follows the window to the workspace host.
+    const take = h.ipc.get("omnigent:take-onboarding-runner");
+    assert.equal(take({ sender: h.webContents, senderFrame: { url: workspace } }), "remote");
 
     // Next launch opens the saved workspace host, and Arca still targets the pick.
     const relaunched = loadNavigationHarness({ ...options, serverUrl: workspace });
@@ -1094,6 +1119,37 @@ describe("Databricks auth mode wiring", () => {
     );
   });
 
+  it("signs in through the browser from an account URL whose workspace rejected its session", async (t) => {
+    const accountPick = "https://spog.cloud.databricks.com/?o=123";
+    let rejected = false;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin, { storedOrigin = origin } = {}) => {
+        if (rejected) return storedOrigin;
+        rejected = true;
+        throw Object.assign(new Error("rejected"), { errorCode: "SESSION_REJECTED" });
+      },
+    });
+    t.after(h.cleanup);
+    const workspaceOrigin = new URL(workspace).origin;
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ server_labels: { [workspaceOrigin]: accountPick } }),
+    );
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace), /rejected/);
+    const connect = () => h.api.loadServerUrl(h.win, accountPick, undefined, { interactive: true });
+    await connect();
+    await connect();
+    assert.deepEqual(
+      h.calls.auth.slice(1).map((call) => [call[2].storedOrigin, call[2].useStoredCredentials]),
+      [
+        [workspaceOrigin, false],
+        [workspaceOrigin, true],
+      ],
+    );
+  });
+
   it("signs a workspace out from the server picker, in every window on it", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
     t.after(h.cleanup);
@@ -1380,7 +1436,7 @@ describe("Databricks auth mode wiring", () => {
   ]) {
     it(`shows "${hint}" over the page while retrying, then "${final}"`, async (t) => {
       const finals = [];
-      // [40]: retrying, then Cancel; []: retries ran out.
+      // [40]: retrying, then Cancel; []: the fast retries ran out.
       for (const retries of [[40], []]) {
         const h = loadNavigationHarness({
           serverUrl: workspace,
@@ -1398,7 +1454,8 @@ describe("Databricks auth mode wiring", () => {
         } else h.emit("did-fail-load", -105, "ERR", `${workspace}/c/1`, true);
         // oxlint-disable-next-line no-await-in-loop
         await wait();
-        if (retries.length) {
+        // Network failures keep retrying past the fast retries; only Cancel stops them.
+        if (retries.length || failure !== serverError) {
           // The page stays underneath the overlay.
           assert.equal(h.overlay.hint, hint);
           assert.deepEqual(h.calls.loadFile, []);
@@ -1409,7 +1466,7 @@ describe("Databricks auth mode wiring", () => {
           assert.equal(h.calls.auth.length, attempts, "Cancel stops the pending reconnect");
         }
         assert.equal(h.overlay.hint, null);
-        const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+        const params = new URL(h.webContents.getURL()).searchParams;
         // The setup page keeps the mounted server URL for the next Connect.
         finals.push([params.get("error"), params.get("url")]);
       }
@@ -2277,6 +2334,135 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
   });
 });
 
+describe("server selector default", () => {
+  const devUrl = "http://localhost:5174/server-selector-v2.html";
+
+  for (const [name, options, settings, v2] of [
+    ["new internal macOS install", { internalFeatures: true }, null, true],
+    [
+      "existing internal macOS install",
+      { internalFeatures: true },
+      { recent_servers: ["https://team.example.com/"] },
+      true,
+    ],
+    ["new public macOS install", {}, null, false],
+    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, false],
+    [
+      "MDM server presets without internal features",
+      { managedServers: ["https://team.example.com/"] },
+      null,
+      false,
+    ],
+    ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
+    ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
+    ["unpackaged internal macOS build", { isPackaged: false, internalFeatures: true }, null, true],
+    ["unpackaged public macOS build", { isPackaged: false }, null, false],
+    ["null selector preference", { internalFeatures: true }, { server_selector_v2: null }, true],
+    [
+      "explicit V2 preference outside the default rollout",
+      { platform: "win32" },
+      { server_selector_v2: true },
+      true,
+    ],
+    [
+      "explicit legacy preference",
+      { internalFeatures: true },
+      { server_selector_v2: false },
+      false,
+    ],
+  ]) {
+    it(`opens the expected selector for ${name}`, async () => {
+      const h = loadNavigationHarness({
+        isPackaged: true,
+        platform: "darwin",
+        env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
+        ...options,
+      });
+      try {
+        if (settings) fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
+        h.api.createWindow();
+        if (v2 && !h.electron.app.isPackaged) {
+          await until(() => h.calls.loadURL.length > 0, "dev selector load");
+          assert.equal(h.calls.loadURL[0][0], devUrl);
+          assert.equal(h.calls.loadFile.length, 0);
+        } else {
+          await until(() => h.calls.loadFile.length > 0, "setup page load");
+          assert.equal(
+            h.calls.loadFile[0][0],
+            v2 ? h.api.SERVER_SELECTOR_V2_PAGE : h.api.SETUP_PAGE,
+          );
+          assert.equal(h.calls.loadURL.length, 0);
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
+  it("falls back to bundled V2 when the internal macOS dev server is unavailable", async () => {
+    const h = loadNavigationHarness({
+      internalFeatures: true,
+      env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
+      loadURL: async () => {
+        throw new Error("Dev server unavailable");
+      },
+    });
+    try {
+      await h.api.loadSetupPage(h.win);
+      assert.equal(h.calls.loadURL[0][0], devUrl);
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("persists switching to legacy and back to V2", async () => {
+    const h = loadNavigationHarness({ isPackaged: true, internalFeatures: true });
+    try {
+      h.api.registerIpc();
+      await h.api.loadSetupPage(h.win, "error=offline&ephemeral=1");
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+      assert.equal(h.calls.loadFile[0][1].search, "error=offline&ephemeral=1");
+      for (const [enabled, page] of [
+        [false, h.api.SETUP_PAGE],
+        [true, h.api.SERVER_SELECTOR_V2_PAGE],
+      ]) {
+        const previousLoads = h.calls.loadFile.length;
+        h.ipc.get("omnigent:set-server-selector-v2")(
+          {
+            sender: h.webContents,
+            senderFrame: { url: h.webContents.getURL() },
+          },
+          enabled,
+        );
+        // oxlint-disable-next-line no-await-in-loop -- Each toggle reloads the sending page.
+        await until(() => h.calls.loadFile.length > previousLoads, "selector switch");
+        assert.equal(h.calls.loadFile.at(-1)[0], page);
+        assert.equal(
+          JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).server_selector_v2,
+          enabled,
+        );
+      }
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("keeps the environment override above a legacy preference", async () => {
+    const h = loadNavigationHarness({
+      isPackaged: true,
+      env: { OMNIGENT_SERVER_SELECTOR_V2: "1" },
+    });
+    try {
+      fs.writeFileSync(h.settingsPath, JSON.stringify({ server_selector_v2: false }));
+      await h.api.loadSetupPage(h.win);
+      assert.equal(h.calls.loadFile[0][0], h.api.SERVER_SELECTOR_V2_PAGE);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("navigation fallback wiring (src/main.js)", () => {
   it("boots a saved Databricks API URL on the UI mount without losing URL state", () => {
     const saved = "https://workspace.cloud.databricks.com/api/2.0/omnigent/?o=123#conversation";
@@ -2867,7 +3053,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     return h;
   }
 
-  it("retries every 5s for a minute, then every 10s for another, counting attempts", (t) => {
+  it("retries every 5s for a minute, every 10s for another, then every minute", (t) => {
     const h = loadNavigationHarness();
     t.after(h.cleanup);
     // Attempts, not elapsed time: timers keep running through sleep.
@@ -2875,6 +3061,8 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
       [...h.api.reconnectDelaysMs()],
       [...Array(12).fill(5_000), ...Array(6).fill(10_000)],
     );
+    // Only network failures use the minute-long retries.
+    assert.equal(h.api.reconnectSlowDelayMs(), 60_000);
   });
 
   const setupEvent = (h) => ({
@@ -2946,7 +3134,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadFile, []);
   });
 
-  it("reopens the mounted page after Connect while offline, once retries ran out", async (t) => {
+  it("reopens the mounted page after a Cancel, then Connect while offline", async (t) => {
     let online = false;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => {
@@ -2967,7 +3155,9 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     h.api.registerIpc();
     failLoad(h);
     await wait(1);
-    // Retries ran out: the setup form keeps the mounted URL for the next Connect.
+    h.overlay.cancel();
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    // The setup form keeps the mounted URL for the next Connect.
     assert.equal(h.overlay.hint, null);
     assert.equal(setupParams(h).url, workspace);
     h.api.setReconnectDelaysMs([20]);
@@ -2981,6 +3171,45 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadURL, [[workspace]]);
     assert.equal(h.overlay.hint, null);
   });
+
+  it("waits while offline without using up retries", async (t) => {
+    const h = browserHarness(t, [20], {
+      ensureSession: async () => {
+        throw Object.assign(new Error("HTTP 503"), { status: 503 });
+      },
+    });
+    h.connectivity.online = false;
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await wait(100);
+    // Several checks passed while offline; none spent the one retry.
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.overlay.hint, "Databricks isn't responding.");
+    h.connectivity.online = true;
+    await until(() => h.calls.auth.length === 2, "the retry once online");
+    // That was the one retry, so the server error now shows the setup page.
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    assert.equal(h.overlay.hint, null);
+  });
+
+  for (const event of ["resume", "unlock-screen"]) {
+    it(`starts the fast retries over on ${event}`, async (t) => {
+      const h = browserHarness(t, [20], {
+        ensureSession: async () => {
+          throw new TypeError("fetch failed");
+        },
+      });
+      h.api.setReconnectSlowDelayMs(60_000);
+      await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+      await until(() => h.calls.auth.length === 2, "the fast retry");
+      // The next retry is a minute away.
+      await wait(60);
+      assert.equal(h.calls.auth.length, 2);
+      h.powerMonitor.emit(event);
+      await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
+      assert.equal(h.overlay.hint, "Check your network connection.");
+      assert.deepEqual(h.calls.loadFile, []);
+    });
+  }
 
   it("returns a failed deep link to its conversation", async (t) => {
     let first = true;
@@ -3046,6 +3275,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
 
   it("goes straight to setup for other windows and non-network errors", async (t) => {
     const embedded = loadNavigationHarness({
+      isPackaged: true,
       serverUrl: workspace,
       databricksMode: "embedded",
       internalFeatures: true,
@@ -3085,6 +3315,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   async function connected(t, delays) {
     const network = createWorkspaceNetwork(origin);
     const h = loadNavigationHarness({
+      isPackaged: true,
       serverUrl: workspace,
       databricksMode: "browser",
       internalFeatures: true,
@@ -3106,13 +3337,11 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       },
       () => {},
     );
-  for (const [trigger, drop, vpnReturns] of [
-    ["the session cookie is removed", (_h, network) => network.removeCookie(), true],
-    ["the workspace redirects to login", loginRedirect, true],
-    ["the session cookie is removed", (_h, network) => network.removeCookie(), false],
+  for (const [trigger, drop] of [
+    ["the session cookie is removed", (_h, network) => network.removeCookie()],
+    ["the workspace redirects to login", loginRedirect],
   ]) {
-    const outcome = vpnReturns ? "reconnects by itself when the VPN returns" : "gives up";
-    it(`${outcome} after ${trigger} off the VPN`, async (t) => {
+    it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
       const { h, network } = await connected(t, [30, 30, 30]);
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       network.verdict = "blocked";
@@ -3124,27 +3353,40 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       assert.deepEqual(h.calls.loadFile, []);
       // Connect, the blocked renewal, then one blocked background retry.
       await until(() => network.sessionCreates === 3, "a blocked retry");
-      if (vpnReturns) {
-        network.verdict = "allow";
-        await until(() => h.calls.loadURL.length === 2, "the reconnect");
-        // Back on the page the user was on; setup never showed.
-        assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
-        assert.equal(h.api.windows.get(h.win).origin, origin);
-        assert.equal(h.overlay.hint, null);
-        assert.deepEqual(h.calls.loadFile, []);
-      } else {
-        await until(() => h.calls.loadFile.length === 1, "the final setup page");
-        assert.deepEqual(shown(h), { error: `${blocked}, then click Connect.`, url: workspace });
-        assert.equal(h.overlay.hint, null);
-      }
+      network.verdict = "allow";
+      await until(() => h.calls.loadURL.length === 2, "the reconnect");
+      // Back on the page the user was on; setup never showed.
+      assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
+      assert.equal(h.overlay.hint, null);
+      assert.deepEqual(h.calls.loadFile, []);
       const settled = network.sessionCreates;
       await wait(100);
       assert.equal(network.sessionCreates, settled);
-      assert.equal(h.calls.loadURL.length, vpnReturns ? 2 : 1);
+      assert.equal(h.calls.loadURL.length, 2);
       assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
       assert.equal(network.browserSignIns, 0);
     });
   }
+
+  it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    h.api.setReconnectSlowDelayMs(20);
+    h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    // Connect, the blocked renewal, the one fast retry, then slower ones past it.
+    await until(() => network.sessionCreates >= 6, "retries past the fast schedule");
+    assert.equal(h.overlay.hint, `${blocked}.`);
+    assert.deepEqual(h.calls.loadFile, []);
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+    assert.equal(h.overlay.hint, null);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(network.browserSignIns, 0);
+  });
 
   it("keeps retrying when Connect is clicked off the VPN, then reconnects", async (t) => {
     const { h, network } = await connected(t, [30, 30, 30]);
@@ -3181,6 +3423,62 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       h.calls.auth.map((call) => call[2].interactive),
       [false, false, true, false, false],
     );
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  // The organization-provided server: an account URL naming the workspace sign-in lands on.
+  const accountPick = "https://spog.cloud.databricks.com/?o=123";
+  async function accountPickHarness(t) {
+    const network = createWorkspaceNetwork(origin, {
+      oauth: {
+        // Tokens are stored per workspace, never under the account origin.
+        getValidStoredToken: async (tokenOrigin) => {
+          if (tokenOrigin === origin) return "token";
+          throw Object.assign(new Error("no stored token"), { errorCode: "NO_STORED_TOKEN" });
+        },
+      },
+    });
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      network,
+    });
+    t.after(h.cleanup);
+    // An earlier Connect to the pick landed on this workspace.
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_labels: { [origin]: accountPick } }));
+    h.api.registerIpc();
+    const connect = () =>
+      h.ipc.get("omnigent:set-server-url")(
+        { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+        accountPick,
+        { requestId: "connect" },
+      );
+    return { h, network, connect };
+  }
+
+  it("connects an account URL to the workspace it reached before, without the browser", async (t) => {
+    const { h, network, connect } = await accountPickHarness(t);
+    assert.equal((await connect()).reconnecting, undefined);
+    assert.equal(network.browserSignIns, 0);
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+    // Relaunch restores the workspace, where the sign-in is stored.
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).server_url, workspace);
+  });
+
+  it("reconnects an account URL's workspace once the VPN is back", async (t) => {
+    const { h, network, connect } = await accountPickHarness(t);
+    h.api.setReconnectDelaysMs([20]);
+    h.api.setReconnectSlowDelayMs(20);
+    network.verdict = "blocked";
+    assert.equal((await connect()).reconnecting, true);
+    assert.equal(h.overlay.hint, `${blocked}.`);
+    await until(() => network.sessionCreates === 2, "a blocked retry");
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 1, "the reconnect");
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.equal(h.overlay.hint, null);
     assert.equal(network.browserSignIns, 0);
   });
 
@@ -3244,6 +3542,65 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
 // detach, so pinWindow must close the window's browser registry when the origin
 // changes — else the native WebContentsView dangles over the setup/welcome page.
 describe("browser-view teardown on server change (src/main.js)", () => {
+  it("offers conditional reconnect guidance only for missing identity on a gated managed target", async (t) => {
+    for (const [serverUrl, internalFeatures, expected] of [
+      ["https://account.databricks.com/omnigent?o=123", true, true],
+      ["https://account.databricks.com/omnigent?o=123", false, false],
+      ["https://public.example", true, false],
+    ]) {
+      const h = loadNavigationHarness({ serverUrl, internalFeatures });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
+      const event = { sender: h.webContents };
+      for (const url of ["http://localhost:5173", "https://127.0.0.1", "http://[::1]"]) {
+        if (expected) {
+          assert.match(hint(event, url), /If this session runs on Arca.*Run on Arca/);
+        } else {
+          assert.equal(hint(event, url), null);
+        }
+      }
+      for (const url of ["https://example.com", "http://10.0.0.1", "file://localhost/x", "bad"]) {
+        assert.equal(hint(event, url), null);
+      }
+    }
+  });
+
+  it("uses captured Arca identity for the sender's workspace and revokes a changed context", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaResult: {
+        ok: true,
+        alreadyRunning: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const registry = h.api.createBrowserRegistryForWindow(h.win);
+    h.api.windows.get(h.win).browserRegistry = registry;
+    const context = h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId);
+    const eligible = h.browserRegistryDeps().isArcaAgentContext;
+    const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
+    assert.equal(eligible(context), false);
+    assert.match(hint({ sender: h.webContents }, "http://localhost"), /Run on Arca/);
+    await h.api.startArcaHostConnect(serverUrl).promise;
+    assert.equal(eligible(context), true);
+    assert.equal(hint({ sender: h.webContents }, "http://localhost"), null);
+    assert.equal(eligible({ ...context, sourceHostId: "b".repeat(32) }), false);
+    h.api.setWindowServerUrl(h.win, serverUrl.replace("123", "456"));
+    assert.deepEqual(h.browserRegistryCalls.closeAll, ["server-changed"]);
+    assert.equal(eligible(context), false);
+    assert.equal(
+      eligible(h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId)),
+      false,
+    );
+  });
+
   it("closes the window's browserRegistry when pinWindow changes origin", () => {
     assert.match(
       liveCode,

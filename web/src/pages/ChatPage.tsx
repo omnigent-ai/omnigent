@@ -1,4 +1,8 @@
+import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useConversationRedirect } from "@/hooks/useConversationRedirect";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
@@ -20,21 +24,13 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  BotIcon,
-  WandSparklesIcon,
-  CornerUpLeftIcon,
-  FileTextIcon,
-  Loader2Icon,
-  MessagesSquareIcon,
-  XIcon,
-} from "lucide-react";
+import { BotIcon, WandSparklesIcon, FileTextIcon, Loader2Icon, XIcon } from "lucide-react";
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
-import { useNavigate, useParams } from "@/lib/routing";
+import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   ChatComposer,
@@ -70,7 +66,7 @@ import {
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
-import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
+import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
@@ -203,6 +199,8 @@ import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
   matchSlashCommandInvocation,
+  skillDisplayNames,
+  skillMenuDescription,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -375,6 +373,8 @@ export function ChatPage() {
   // the session exists. `switchTo` still gets the raw `urlConvId`.
   const sessionConvId = isTempConvId(urlConvId) ? undefined : urlConvId;
   const navigate = useNavigate();
+  const { pathname, search } = useLocation();
+  const rebasePath = useRebasePath();
   const appName = useAppName();
   // Optional first message handed off by the landing composer through the
   // shared chatStore (keyed by conversation id), not router state — router state
@@ -440,32 +440,22 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
-    // A stale temp URL (reload / fresh tab onto `/c/temp:*` whose client-only
-    // conversation is gone) has no forward path: landing is URL-keyed, so the
-    // page would sit on a permanently read-only phantom chat. Redirect to
-    // landing instead of binding a nonexistent session.
+    // A temporary route has no client session after a reload. Return to its
+    // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {
-      navigate("/", { replace: true });
+      const canvas = isCanvasPathname(pathname, rebasePath("/canvas"));
+      navigate(
+        canvas
+          ? canvasLocation(new URLSearchParams(search).get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID)
+          : "/",
+        { replace: true },
+      );
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-  }, [urlConvId, navigate]);
+  }, [urlConvId, navigate, pathname, search, rebasePath]);
 
-  // Server-driven redirect: when the active conversation is superseded
-  // (a `session.superseded` event — e.g. a Claude `/clear` rotated it
-  // away), the store records the follow-to target in
-  // `redirectToConversationId`. Perform the router navigation here (the
-  // store can't), replacing history so Back doesn't return to the
-  // cleared session, then clear the flag so it fires exactly once. Skip
-  // when we're already on the target URL.
-  const redirectToConversationId = useChatStore((s) => s.redirectToConversationId);
-  useEffect(() => {
-    if (!redirectToConversationId) return;
-    if (redirectToConversationId !== urlConvId) {
-      navigate(`/c/${redirectToConversationId}`, { replace: true });
-    }
-    useChatStore.setState({ redirectToConversationId: null });
-  }, [redirectToConversationId, urlConvId, navigate]);
+  useConversationRedirect(urlConvId);
 
   // Pull the first message the landing composer stashed for this conversation,
   // if any. Read-once (consume deletes), so a refresh/back can't replay
@@ -897,11 +887,12 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const { reconnect, dialogOpen, setDialogOpen, localReconnect } = useSessionReconnect({
-    sessionId: urlConvId ?? null,
-    hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
-    isOwner: isOwnerLevel(permissionLevel),
-  });
+  const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
+    useSessionReconnect({
+      sessionId: urlConvId ?? null,
+      hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+      isOwner: isOwnerLevel(permissionLevel),
+    });
 
   const onSend = useCallback(
     (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
@@ -1108,6 +1099,7 @@ export function ChatPage() {
   const mainAgent = (
     <MainAgentSurface
       conversationId={urlConvId ?? null}
+      hostId={activeSession?.hostId ?? activeConv?.host_id ?? null}
       status={status}
       isWorking={isWorking}
       showsWorking={showsWorking}
@@ -1171,6 +1163,7 @@ export function ChatPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         localReconnect={localReconnect}
+        arcaReconnect={arcaReconnect}
         conversationId={urlConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
@@ -1233,132 +1226,6 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
   );
 }
 
-function SelectionPopup({
-  containerRef,
-  onReply,
-  onAskInSideChat,
-}: {
-  containerRef: React.RefObject<HTMLElement | null>;
-  onReply: (text: string) => void;
-  // Present only when the session's harness supports side chat; renders the
-  // "Ask in side chat" action beside Reply.
-  onAskInSideChat?: (text: string) => void;
-}) {
-  const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
-  const selectedTextRef = useRef<string>("");
-
-  const updatePopup = useCallback(() => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    const text = sel.toString().trim();
-    if (!text) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    // Scope to the conversation container — ignore selections in the composer.
-    const container = containerRef.current;
-    if (!container) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-    const anchor = sel.anchorNode;
-    if (!anchor || !container.contains(anchor)) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    const range = sel.getRangeAt(0);
-    const rect = range.getBoundingClientRect();
-    // Position the button just above the selection, horizontally centered.
-    setPopupPos({
-      x: rect.left + rect.width / 2,
-      y: rect.top,
-    });
-    selectedTextRef.current = text;
-  }, [containerRef]);
-
-  useEffect(() => {
-    document.addEventListener("mouseup", updatePopup);
-    document.addEventListener("selectionchange", updatePopup);
-    return () => {
-      document.removeEventListener("mouseup", updatePopup);
-      document.removeEventListener("selectionchange", updatePopup);
-    };
-  }, [updatePopup]);
-
-  if (!popupPos) return null;
-
-  return (
-    <div
-      style={{
-        position: "fixed",
-        // Translate left by 50% to center the button over the midpoint of the
-        // selection, and up by 100% + 6px to sit just above the selection rect.
-        left: popupPos.x,
-        top: popupPos.y,
-        transform: "translate(-50%, calc(-100% - 6px))",
-        zIndex: 50,
-      }}
-    >
-      <Button
-        type="button"
-        variant="secondary"
-        size="sm"
-        // Override shared-variant translucent hover — this button floats over text.
-        className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
-        onMouseDown={(e) => {
-          // Prevent the mousedown from clearing the selection before we read it.
-          e.preventDefault();
-        }}
-        onClick={() => {
-          const text = selectedTextRef.current;
-          if (text) {
-            onReply(text);
-            window.getSelection()?.removeAllRanges();
-            setPopupPos(null);
-            selectedTextRef.current = "";
-          }
-        }}
-      >
-        <CornerUpLeftIcon className="size-3.5" />
-        Reply ↵
-      </Button>
-      {onAskInSideChat ? (
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
-          onMouseDown={(e) => {
-            e.preventDefault();
-          }}
-          onClick={() => {
-            const text = selectedTextRef.current;
-            if (text) {
-              onAskInSideChat(text);
-              window.getSelection()?.removeAllRanges();
-              setPopupPos(null);
-              selectedTextRef.current = "";
-            }
-          }}
-        >
-          <MessagesSquareIcon className="size-3.5" />
-          Ask in side chat
-        </Button>
-      ) : null}
-    </div>
-  );
-}
-
 interface MainAgentSurfaceProps {
   /**
    * Active conversation id, or null when on the landing page. Forwarded
@@ -1366,6 +1233,7 @@ interface MainAgentSurfaceProps {
    * session in terminal-first mode.
    */
   conversationId: string | null;
+  hostId: string | null | undefined;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. Gates the
    *  composer's Stop/Interrupt button — the parent's OWN turn only. */
@@ -1540,6 +1408,7 @@ export function updateWarmTerminalSurfaces(
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
+  hostId,
   status,
   isWorking,
   showsWorking,
@@ -1828,6 +1697,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
           <Transcript
+            hostId={hostId}
             setConversationEl={setConversationEl}
             containerEl={containerEl}
             scroller={scroller}
@@ -2088,7 +1958,7 @@ interface ComposerProps {
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
-  skills: readonly { name: string; description: string }[],
+  skills: readonly SkillSummary[],
   showEffort: boolean,
   showModel: boolean,
   showCompact = true,
@@ -2109,7 +1979,7 @@ export function buildSlashCommandMap(
     m[name] = name === "/model" && supportsModelReset ? `${description} | default` : description;
   }
   for (const skill of skills) {
-    m[`${skillPrefix}${skill.name}`] = skill.description;
+    m[`${skillPrefix}${skill.name}`] = skillMenuDescription(skill);
   }
   return m;
 }
@@ -3198,15 +3068,19 @@ function ComposerImpl(
 
   const skillCommands = useMemo(
     () =>
-      Object.fromEntries(skills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description])),
+      Object.fromEntries(
+        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+      ),
     [skills, skillPrefix],
   );
+  const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
 
   // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
     skills: skillCommands,
+    labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
@@ -3260,13 +3134,22 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     startSideChat(selectedText) {
-      // Open an empty side-chat rail tab right away with the selection quoted in
-      // its composer; the fork is created when the user sends from that tab.
+      // Quote in the visible side chat, or open a pending tab immediately.
+      // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
         return;
       }
-      useChatStore.getState().openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
+      const store = useChatStore.getState();
+      const target = store.sideChatSelectionTarget;
+      if (target?.parentId === sourceId) {
+        store.updateSideChatComposer(target.childId, (current) => ({
+          ...current,
+          quotes: [...(current.quotes ?? []), selectedText],
+        }));
+      } else {
+        store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
+      }
     },
   }));
 
@@ -3684,6 +3567,7 @@ function ComposerImpl(
             state={composerGit.githubState}
             prCount={composerGit.prCount}
             prNumber={composerGit.prNumber}
+            prNumberPrefix={composerGit.prNumberPrefix}
             onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
@@ -3797,6 +3681,7 @@ function ComposerImpl(
                   onSelect={applyMenuSelection}
                   commands={slashCompletion.commands}
                   builtinNames={slashCompletion.builtinNames}
+                  labels={slashCompletion.labels}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />

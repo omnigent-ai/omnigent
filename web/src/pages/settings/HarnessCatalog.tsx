@@ -39,10 +39,12 @@ export function BackButton({
   label,
   to,
   onClick,
+  componentId = "settings.harnesses.back",
 }: {
   label: string;
   to?: string;
   onClick?: () => void;
+  componentId?: string;
 }) {
   return (
     <Button
@@ -53,7 +55,7 @@ export function BackButton({
       onClick={onClick}
     >
       {to !== undefined ? (
-        <Link to={to} componentId="settings.harnesses.back">
+        <Link to={to} componentId={componentId}>
           <ArrowLeftIcon />
           {label}
         </Link>
@@ -605,11 +607,18 @@ function McpRow({
                 {data.tools.map((tool, index) => (
                   // Capped names can collide; these display-only rows have no state.
                   // eslint-disable-next-line react/no-array-index-key
-                  <li key={index}>
-                    <div>
-                      <span className="font-mono">{tool.name}</span>
-                    </div>
-                    {tool.description && <div className="mb-1">{tool.description}</div>}
+                  <li key={`${tool.name}-${index}`}>
+                    {tool.description ? (
+                      <details className="group">
+                        <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
+                          <span className="font-mono">{tool.name}</span>
+                          <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
+                        </summary>
+                        <div className="my-1">{tool.description}</div>
+                      </details>
+                    ) : (
+                      <span className="pl-4 font-mono">{tool.name}</span>
+                    )}
                   </li>
                 ))}
               </ul>
