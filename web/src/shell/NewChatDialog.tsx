@@ -250,11 +250,11 @@ import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/us
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import { useDatabricksInternalFeatures } from "@/hooks/useDatabricksInternalFeatures";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
-  getDesktopFeatures,
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
@@ -491,9 +491,15 @@ function ConnectingText({ className }: { className?: string }) {
 export function ConnectHostInstructions({
   serverUrl,
   label,
+  databricksInternalFeatures = false,
 }: {
   serverUrl: string;
   label?: string;
+  /**
+   * Desktop MDM gate (useDatabricksInternalFeatures): spell commands with
+   * `isaac omni`. `null` while the shell's answer is pending.
+   */
+  databricksInternalFeatures?: boolean | null;
 }) {
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
@@ -502,11 +508,20 @@ export function ConnectHostInstructions({
   // "loading" before the boot probe resolves → treat as OSS (no Databricks
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
+  // Databricks-internal machines refuse a bare `omni` (wrapper guard) and reach
+  // the CLI through the same `isaac omni` launcher the desktop enrolls with.
+  const cli = databricksInternalFeatures ? "isaac omni" : "omni";
   const quotedServerUrl = quoteShellArgument(serverUrl);
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
-      {databricksFeatures ? (
+      {databricksInternalFeatures === null ? (
+        // Hold the commands until the shell answers, so an internal desktop
+        // never shows a bare `omni` that the wrapper guard would refuse.
+        <p className="text-sm text-muted-foreground" data-testid="connect-host-pending">
+          Checking which launcher this desktop uses<span className="animate-pulse">…</span>
+        </p>
+      ) : databricksFeatures ? (
         <Tabs defaultValue="local" componentId="new_chat.host_tabs">
           <TabsList className="w-full">
             <TabsTrigger value="local" className="text-sm">
@@ -518,24 +533,24 @@ export function ConnectHostInstructions({
           </TabsList>
           <TabsContent value="local">
             <CliCommandBlock
-              command={`omni host --server ${quotedServerUrl}`}
+              command={`${cli} host --server ${quotedServerUrl}`}
               testIdPrefix="connect-host"
             />
           </TabsContent>
           <TabsContent value="lakebox" className="flex flex-col gap-1.5">
             <CliCommandBlock
-              command="omni sandbox create --provider lakebox"
+              command={`${cli} sandbox create --provider lakebox`}
               testIdPrefix="connect-lakebox-create"
             />
             <CliCommandBlock
-              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${quotedServerUrl}`}
+              command={`${cli} sandbox connect --provider lakebox --sandbox-id <id> --server ${quotedServerUrl}`}
               testIdPrefix="connect-lakebox-connect"
             />
           </TabsContent>
         </Tabs>
       ) : (
         <CliCommandBlock
-          command={`omni host --server ${quotedServerUrl}`}
+          command={`${cli} host --server ${quotedServerUrl}`}
           testIdPrefix="connect-host"
         />
       )}
@@ -2419,9 +2434,9 @@ export function NewChatLandingScreen() {
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
   const pendingConnectRef = useRef(false);
-  // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
-  // set, the picker offers connecting the user's Arca dev instance as a host.
-  const [arcaEnabled, setArcaEnabled] = useState(false);
+  // Databricks-internal (the desktop shell's MDM flag): the picker offers the
+  // user's Arca dev instance as a host and connect commands spell `isaac omni`.
+  const databricksInternalFeatures = useDatabricksInternalFeatures();
   const [connectingArca, setConnectingArca] = useState(false);
   const [arcaError, setArcaError] = useState<string | null>(null);
   // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
@@ -2707,20 +2722,6 @@ export function NewChatLandingScreen() {
     return () => {
       cancelled = true;
       unsubscribe();
-    };
-  }, []);
-
-  // Desktop feature gates (MDM-managed). Read once per mount — the shell
-  // re-reads macOS preferences on every call, so reopening the composer is
-  // enough to pick up a profile change.
-  useEffect(() => {
-    if (!isElectronShell()) return;
-    let cancelled = false;
-    void getDesktopFeatures().then((features) => {
-      if (!cancelled) setArcaEnabled(features?.databricksInternalFeatures === true);
-    });
-    return () => {
-      cancelled = true;
     };
   }, []);
 
@@ -4907,8 +4908,8 @@ export function NewChatLandingScreen() {
     : null;
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
   // Reconnect remains available to recapture daemon identity after a desktop restart.
-  const arcaHostId = arcaEnabled ? readArcaHostId() : null;
-  const showArcaOption = arcaEnabled;
+  const arcaHostId = databricksInternalFeatures === true ? readArcaHostId() : null;
+  const showArcaOption = databricksInternalFeatures === true;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca
@@ -7065,6 +7066,7 @@ export function NewChatLandingScreen() {
           </DialogHeader>
           <ConnectHostInstructions
             serverUrl={serverUrl}
+            databricksInternalFeatures={databricksInternalFeatures}
             label="Run this on the machine you want to use, then pick it from the host menu:"
           />
         </DialogContent>

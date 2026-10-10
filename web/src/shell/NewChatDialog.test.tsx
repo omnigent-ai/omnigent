@@ -2984,6 +2984,33 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     fireEvent.click(chip);
   }
 
+  it("spells the connect-host command with the isaac omni launcher the desktop uses", async () => {
+    renderLanding({ databricks_features: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-connect-host"));
+    expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
+    // Databricks-internal machines reach the CLI only through `isaac omni`; the
+    // feature probe has already resolved by the time the dialog opens.
+    expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+      /^isaac omni host --server '/,
+    );
+  });
+
+  it("spells the Lakebox commands with isaac omni too", async () => {
+    renderLanding({ databricks_features: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-connect-host"));
+    const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
+    fireEvent.mouseDown(lakeboxTab);
+    fireEvent.click(lakeboxTab);
+    expect(screen.getByTestId("connect-lakebox-create-command")).toHaveTextContent(
+      /^isaac omni sandbox create --provider lakebox$/,
+    );
+    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
+      /^isaac omni sandbox connect --provider lakebox --sandbox-id <id> --server '/,
+    );
+  });
+
   it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
     renderLanding();
     await openHostMenu();
@@ -2997,6 +3024,12 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     // The menu is open (the escape hatch renders), but no Arca entry.
     await screen.findByTestId("new-chat-landing-connect-host");
     expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+    // An old shell that reports no flag falls back to the bare command, not the placeholder.
+    fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+    expect(screen.queryByTestId("connect-host-pending")).toBeNull();
+    expect(screen.getByTestId("connect-host-command").textContent).toBe(
+      `omni host --server '${window.location.origin}'`,
+    );
   });
 
   it("offers reconnect after relaunch while preserving the remembered online host row", async () => {
@@ -5477,14 +5510,15 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
 
     expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
-    expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+    // Exact match: a browser gets the bare `omni` spelling, never the desktop's `isaac omni`.
+    expect(screen.getByTestId("connect-host-command").textContent).toBe(
       `omni host --server '${window.location.origin}/api?profile=dev&glob=*'`,
     );
 
     const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
     fireEvent.mouseDown(lakeboxTab);
     fireEvent.click(lakeboxTab);
-    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
+    expect(screen.getByTestId("connect-lakebox-connect-command").textContent).toBe(
       `omni sandbox connect --provider lakebox --sandbox-id <id> --server '${window.location.origin}/api?profile=dev&glob=*'`,
     );
   });

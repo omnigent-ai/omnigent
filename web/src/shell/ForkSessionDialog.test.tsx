@@ -1,4 +1,5 @@
 import { testAgent } from "@/test/agentFixtures";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
@@ -29,6 +30,7 @@ import {
   hostDirectoryMissing,
   useHostFilesystem,
 } from "@/hooks/useHostFilesystem";
+import { getDesktopFeatures, isElectronShell } from "@/lib/nativeBridge";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -49,6 +51,13 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   checkHostDirectory: vi.fn(),
   hostDirectoryMissing: vi.fn(),
+}));
+// Desktop bridge: default to the browser world (no shell, no MDM flag); the
+// Databricks-internal cases flip these to check the connect-command spelling.
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isElectronShell: vi.fn(() => false),
+  getDesktopFeatures: vi.fn(async () => null),
 }));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
@@ -1110,6 +1119,44 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
       expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
       expect(screen.getByTestId("connect-host-command")).toBeInTheDocument();
+      expect(screen.getByTestId("connect-host-command")).toHaveTextContent(/^omni host --server '/);
+    });
+
+    describe("on a Databricks-internal desktop", () => {
+      beforeEach(() => {
+        vi.mocked(isElectronShell).mockReturnValue(true);
+        vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+      });
+      afterEach(() => {
+        vi.mocked(isElectronShell).mockReturnValue(false);
+        vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+      });
+
+      it("holds the command until the shell answers, then spells it with isaac omni", async () => {
+        setHosts([host({ status: "offline" })]);
+        renderDialog(CODING);
+
+        // While the feature probe is pending there is no bare `omni` to copy.
+        expect(screen.queryByTestId("connect-host-command")).not.toBeInTheDocument();
+        expect(screen.getByTestId("connect-host-pending")).toBeInTheDocument();
+        await waitFor(() =>
+          expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+            /^isaac omni host --server '/,
+          ),
+        );
+        expect(screen.queryByTestId("connect-host-pending")).not.toBeInTheDocument();
+      });
+
+      it("spells the collapsible connect-another-host command with isaac omni too", async () => {
+        renderDialog(CODING);
+
+        fireEvent.click(screen.getByTestId("fork-session-connect-host-toggle"));
+        await waitFor(() =>
+          expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+            /^isaac omni host --server '/,
+          ),
+        );
+      });
     });
 
     it("greys submit when the selected host goes offline on a later refetch", () => {
