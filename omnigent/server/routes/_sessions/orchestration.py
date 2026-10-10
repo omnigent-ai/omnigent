@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -7859,6 +7859,19 @@ async def _relay_runner_live_elsewhere(
     )
 
 
+def _runner_tunnel_waiter(
+    runner_client: httpx.AsyncClient,
+) -> Callable[[float], Awaitable[bool]] | None:
+    """Return a runner client's tunnel-registration waiter, or ``None``.
+
+    In-process test clients carry no tunnel transport; callers fall back to
+    their no-transport behavior. Keeping the private-attribute probe here means
+    one place to update if the transport attribute is ever renamed.
+    """
+    transport = getattr(runner_client, "_transport", None)
+    return getattr(transport, "wait_for_runner", None)
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -7992,11 +8005,26 @@ async def _relay_runner_stream(
                 # reason (an HTTP error), so keep the interval backoff: the
                 # waiter would return at once and spin. A client without a
                 # tunnel transport (in-process tests) also keeps the interval.
-                transport = getattr(runner_client, "_transport", None)
-                wait = getattr(transport, "wait_for_runner", None)
+                wait = _runner_tunnel_waiter(runner_client)
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            # A still-registered tunnel means only this session's stream dropped
+            # (``session_stream_lost``); otherwise the runner is gone. Resolve it
+            # here so the decision log, failure event, and durable label agree.
+            wait = _runner_tunnel_waiter(runner_client)
+            if wait is not None and await wait(0.0):
+                disconnect_error = ErrorDetail(
+                    code="session_stream_lost",
+                    message="The live session connection was lost.",
+                )
+                failure_origin = "session_stream_lost_mid_turn"
+            else:
+                disconnect_error = ErrorDetail(
+                    code="runner_disconnected",
+                    message="Runner disconnected unexpectedly.",
+                )
+                failure_origin = "runner_disconnected_mid_turn"
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
@@ -8004,7 +8032,10 @@ async def _relay_runner_stream(
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
             elif await _runner_disconnect_requires_failure(
-                session_id, conversation_store, origin="runner_disconnected_mid_turn"
+                session_id,
+                conversation_store,
+                origin=failure_origin,
+                error_code=disconnect_error.code,
             ):
                 decision = "failed_mid_turn"
             else:
@@ -8072,23 +8103,7 @@ async def _relay_runner_stream(
                     extra={"session_id": session_id},
                 )
             else:
-                # Turn interrupted: a still-registered tunnel means only this
-                # session's stream dropped (``session_stream_lost``), else the
-                # runner is gone (``runner_disconnected``). Both publish failed.
-                transport = getattr(runner_client, "_transport", None)
-                wait = getattr(transport, "wait_for_runner", None)
-                if wait is not None and await wait(0.0):
-                    disconnect_error = ErrorDetail(
-                        code="session_stream_lost",
-                        message="The live session connection was lost.",
-                    )
-                    failure_origin = "session_stream_lost_mid_turn"
-                else:
-                    disconnect_error = ErrorDetail(
-                        code="runner_disconnected",
-                        message="Runner disconnected unexpectedly.",
-                    )
-                    failure_origin = "runner_disconnected_mid_turn"
+                # Turn interrupted: publish and persist the cause resolved above.
                 turn_id = _session_active_response_cache.get(session_id)
                 _publish_status(
                     session_id,
@@ -8346,11 +8361,9 @@ async def _relay_runner_stream_once(
                             # would deliver a premature, lock-out completion.
                             raw_blocked_on = event.get("blocked_on")
                             raw_response_id = event.get("response_id")
-                            # The runner finishing a turn the server had written
-                            # off as a runner drop proves the drop was transient:
-                            # honor the completion and clear the disconnect cause.
-                            # A genuine task failure keeps its sticky ``failed``
-                            # (the guard only clears a disconnect-class label).
+                            # A turn completing after a presumed runner drop proves
+                            # it was transient: honor it and clear the disconnect
+                            # label. A genuine task failure keeps its sticky ``failed``.
                             if (
                                 status == "idle"
                                 and _session_status_cache.get(session_id) == "failed"
