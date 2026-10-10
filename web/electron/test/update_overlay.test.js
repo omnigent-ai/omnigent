@@ -3,7 +3,12 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { pathToFileURL } = require("node:url");
 
-const { createUpdateOverlay, OVERLAY_INSET, OVERLAY_WIDTH } = require("../src/update_overlay");
+const {
+  createUpdateOverlay,
+  OVERLAY_INSET,
+  OVERLAY_MIN_HEIGHT,
+  OVERLAY_WIDTH,
+} = require("../src/update_overlay");
 
 class FakeWebContents extends EventEmitter {
   constructor() {
@@ -233,24 +238,32 @@ describe("update overlay", () => {
       channel: "omnigent:update-overlay-height",
       payload: 0,
     });
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds.height, OVERLAY_MIN_HEIGHT);
     assert.deepEqual(overlay.ignoreMouse.at(-1), {
       ignore: true,
       options: { forward: true },
     });
   });
 
-  it("keeps the overlay at least 1px tall when the parent resizes with no card", () => {
+  it("does not resize a collapsed overlay while the parent resizes", () => {
     const { controller, onHandlers } = makeOverlay();
     const parent = new FakeWindow();
     const overlay = controller.ensureOverlay(parent);
 
     onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 0);
-    parent.emit("resize");
+    assert.equal(overlay.bounds.height, OVERLAY_MIN_HEIGHT);
 
-    // Wayland CHECKs (process-wide abort) on a zero-sized toplevel setBounds.
-    assert.equal(overlay.bounds.height, 1);
-    assert.ok(overlay.bounds.width > 0);
+    // Chromium's Wayland path CHECKs (process-wide abort) when decoration
+    // insets round a small toplevel's window geometry down to zero, so a
+    // collapsed sliver must not be repositioned during a parent maximize.
+    overlay.bounds = null;
+    parent.emit("resize");
+    assert.equal(overlay.bounds, null);
+
+    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 180);
+    overlay.bounds = null;
+    parent.emit("resize");
+    assert.equal(overlay.bounds.height, 180);
   });
 
   it("opens About before starting a download from Update now", async () => {
@@ -261,7 +274,7 @@ describe("update overlay", () => {
     await handleHandlers.get("omnigent:overlay-update-download")({ sender: overlay.webContents });
 
     assert.deepEqual(calls, [{ openAbout: parent }, "download"]);
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds.height, OVERLAY_MIN_HEIGHT);
     assert.deepEqual(overlay.ignoreMouse.at(-1), {
       ignore: true,
       options: { forward: true },
@@ -294,7 +307,7 @@ describe("update overlay", () => {
     onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 180);
 
     controller.suppress(parent);
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds.height, OVERLAY_MIN_HEIGHT);
 
     controller.unsuppress(parent);
     assert.equal(overlay.bounds.height, 180);
