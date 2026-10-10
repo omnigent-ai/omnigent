@@ -6,6 +6,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -2169,6 +2170,135 @@ async def _capture_launch_argv(
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+async def _failed_launch_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process: _ProcessWithStdout,
+) -> str:
+    """Launch with a failing mocked tmux and return the raised error message."""
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+    ) -> _ProcessWithStdout:
+        """Check both streams are captured, then hand back the failing process."""
+        del cmd, env
+        assert stdout is asyncio.subprocess.PIPE
+        assert stderr is asyncio.subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=fake_create_subprocess_exec,
+            subprocess=terminal_mod.asyncio.subprocess,
+            to_thread=terminal_mod.asyncio.to_thread,
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await instance.launch(cwd=tmp_path)
+    assert instance.running is False
+    return str(excinfo.value)
+
+
+async def test_launch_failure_preserves_stdout_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux launch failure must retain a stdout-only diagnostic."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(
+            returncode=1, stdout=b"new-session refused: server socket unavailable\n"
+        ),
+    )
+    assert "tmux launch failed (rc=1)" in message
+    assert "new-session refused: server socket unavailable" in message
+
+
+async def test_launch_failure_reports_stderr_before_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both streams carry text, stderr leads and stdout is preserved."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(returncode=1, stdout=b"stdout-detail\n", stderr=b"stderr-detail\n"),
+    )
+    assert "stderr-detail" in message
+    assert "stdout-detail" in message
+    assert message.index("stderr-detail") < message.index("stdout-detail")
+
+
+async def test_launch_failure_names_silent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux failing with no output on either stream yields an explicit
+    placeholder reason, never a trailing-colon empty message."""
+    message = await _failed_launch_error(tmp_path, monkeypatch, _ProcessWithStdout(returncode=2))
+    assert "tmux launch failed (rc=2)" in message
+    assert not message.rstrip().endswith(":")
+    assert "<tmux produced no output>" in message
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.skipif(sys.platform == "win32", reason="requires RLIMIT_NPROC")
+async def test_launch_failure_names_silent_exit_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tmux reports fatal errors such as a failed server fork only to its ``-v``
+    log, so the client exits 1 with nothing on either stream."""
+    import resource
+
+    if os.geteuid() == 0:
+        pytest.skip("RLIMIT_NPROC is not enforced for root")
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+
+    def forbid_child_processes() -> None:
+        resource.setrlimit(resource.RLIMIT_NPROC, (1, 1))
+
+    async def spawn(*cmd: str, **kwargs: object) -> asyncio.subprocess.Process:
+        return await real_create_subprocess_exec(*cmd, preexec_fn=forbid_child_processes, **kwargs)
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=terminal_mod.asyncio.subprocess,
+            to_thread=terminal_mod.asyncio.to_thread,
+        ),
+    )
+    instance = TerminalInstance(
+        name="pi",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await instance.launch(cwd=tmp_path)
+    finally:
+        await instance.close()
+
+    message = str(excinfo.value)
+    assert message.startswith("tmux launch failed (rc=1): ")
+    assert not message.rstrip().endswith(":"), message
+    assert instance.running is False
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])
