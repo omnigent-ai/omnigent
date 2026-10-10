@@ -2455,6 +2455,38 @@ def test_cold_start_port_falls_back_when_agy_found_but_no_port(
     assert rpc.resolve_cold_start_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") == 52548
 
 
+def test_cold_start_port_fallback_is_reported_once_per_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With a shared ``ColdStartPortLog`` the fallback is logged at WARNING the first
+    time it is actually taken and at DEBUG afterwards; an attempt that never reaches
+    the fallback (agy not up in the pane yet) does not use up the warning."""
+    states = iter(
+        [
+            rpc.PaneAgyResolution(agy_found=False, port=None),
+            rpc.PaneAgyResolution(agy_found=True, port=None),
+            rpc.PaneAgyResolution(agy_found=True, port=None),
+        ]
+    )
+    monkeypatch.setattr(rpc, "resolve_pane_agy_rpc_port_state", lambda _sock, _tgt: next(states))
+    monkeypatch.setattr(rpc, "_can_attribute_any_agy_port", lambda: False)
+    monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548])
+    socket = Path("/tmp/agy/tmux.sock")
+    log = rpc.ColdStartPortLog()
+    with caplog.at_level("DEBUG", logger=rpc.__name__):
+        assert rpc.resolve_cold_start_agy_rpc_port(socket, "main", log=log) is None
+        assert log.fallback_reported is False
+        assert rpc.resolve_cold_start_agy_rpc_port(socket, "main", log=log) == 52548
+        assert rpc.resolve_cold_start_agy_rpc_port(socket, "main", log=log) == 52548
+    levels = [
+        record.levelname
+        for record in caplog.records
+        if "falling back to the host-wide" in record.getMessage()
+    ]
+    assert levels == ["WARNING", "DEBUG"]
+    assert log.fallback_reported is True
+
+
 def test_cold_start_port_keeps_polling_when_lsof_works_but_our_agy_has_no_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

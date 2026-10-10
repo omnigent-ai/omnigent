@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -424,6 +425,19 @@ def agy_gemini_dir(bridge_dir: Path) -> Path:
         config/state and the Omnigent MCP config.
     """
     return agy_home_dir(bridge_dir) / ".gemini"
+
+
+def agy_conversation_db(bridge_dir: Path, cascade_id: str) -> Path:
+    """Return the conversation db agy writes for *cascade_id* under this session's Gemini dir.
+
+    Its existence proves the cascade was created by this session's own agy; a
+    foreign agy writes into its own ``--gemini_dir``.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param cascade_id: agy cascade/conversation id.
+    :returns: Path of that conversation's sqlite db (may not exist yet).
+    """
+    return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
 
 
 def build_mcp_config(
@@ -992,10 +1006,17 @@ def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
     )
 
 
+# Serializes conversation-id replacement across the writers that can race for one
+# placeholder: a cold-start and the reader's recovery run as threads of one process.
+_STATE_UPDATE_LOCK = threading.Lock()
+
+
 def update_conversation_id(
     bridge_dir: Path,
     conversation_id: str,
     active_turn_id: str | None = None,
+    *,
+    expect_placeholder: bool = False,
 ) -> bool:
     """
     Update the agy conversation id in bridge state.
@@ -1010,31 +1031,49 @@ def update_conversation_id(
     forever, surfaced only as a generic "conversation not ready". The caller
     decides how to react (it stays best-effort; this never raises).
 
+    ``expect_placeholder`` makes the write itself refuse to replace a real id, and
+    the read-check-write runs under one process-wide lock, so two writers racing
+    to replace the same placeholder (a cold-start and the reader's placeholder
+    recovery, threads of one process) cannot clobber each other's binding.
+
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: New agy conversation id, e.g.
         ``"agy_conv_abc123"``.
     :param active_turn_id: Active turn id for the new conversation, e.g.
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
+    :param expect_placeholder: When ``True``, only replace an ``agy_conv_*``
+        placeholder; a real id already in state is kept and ``False`` returned.
     :returns: ``True`` when the new id was written, ``False`` when there was no
-        existing state to update (the id was dropped; a WARNING was logged).
+        existing state to update (the id was dropped; a WARNING was logged) or
+        ``expect_placeholder`` found a real id already bound.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        _logger.warning(
-            "Antigravity bridge: no existing state at %s to update; dropping "
-            "conversation_id=%s (the reader will stay on the placeholder id)",
+    with _STATE_UPDATE_LOCK:
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            _logger.warning(
+                "Antigravity bridge: no existing state at %s to update; dropping "
+                "conversation_id=%s (the reader will stay on the placeholder id)",
+                bridge_dir,
+                conversation_id,
+            )
+            return False
+        if expect_placeholder and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity bridge: state at %s already binds conversation %s; keeping it "
+                "instead of replacing it with %s",
+                bridge_dir,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        write_bridge_state(
             bridge_dir,
-            conversation_id,
+            AntigravityNativeBridgeState(
+                session_id=state.session_id,
+                conversation_id=conversation_id,
+                active_turn_id=active_turn_id,
+            ),
         )
-        return False
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=state.session_id,
-            conversation_id=conversation_id,
-            active_turn_id=active_turn_id,
-        ),
-    )
     return True
 
 

@@ -39,7 +39,11 @@ Discovery mirrors the forwarder's discipline — *poll until ready, never guess*
    ``agy_conv_*`` placeholder until the real id is discovered and persisted. The
    reader polls :func:`read_bridge_state` until ``conversation_id`` is present and
    is NOT a placeholder; that real id is the cascade id (agy uses one UUID for
-   both the conversation and the cascade).
+   both the conversation and the cascade). When the cold-start missed its
+   deadline and the placeholder is all there is, the loop also runs the
+   placeholder-recovery scan (:func:`_recover_placeholder_cascade`) that adopts
+   the TUI-minted cascade a typed turn creates, so discovery cannot deadlock on
+   a placeholder nothing else will ever replace.
 2. **RPC port.** The reader enumerates candidate agy connect-RPC ports
    (:func:`_candidate_agy_rpc_ports`) and binds the one that confirms it hosts the
    cascade id (:func:`_conversation_matches`). It keeps polling until a port
@@ -56,6 +60,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -67,17 +73,22 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
+    agy_conversation_db,
     is_placeholder_conversation_id,
     read_bridge_state,
+    read_tmux_info,
+    update_conversation_id,
     write_bridge_state,
 )
 from omnigent.harnesses.antigravity_native.rpc import (
     AntigravityRpcError,
+    ColdStartPortLog,
     _candidate_agy_rpc_ports,
     _conversation_matches,
     get_all_cascade_trajectories,
     get_available_models,
     get_trajectory_steps,
+    resolve_cold_start_agy_rpc_port,
     stream_agent_state_updates,
 )
 
@@ -131,6 +142,11 @@ _SUBAGENT_QUIESCENT_POLLS_MAX = 480
 # this off the hot path — far slower than the per-turn poll cadence so it does not
 # hammer the loopback RPC.
 _DEFAULT_ROTATION_INTERVAL_S = 3.0
+
+# Seconds between placeholder-recovery scans while discovery is parked on the
+# launcher placeholder. Coarse like the rotation interval: each scan does a
+# pane-scoped port resolve plus a ``GetAllCascadeTrajectories`` fetch.
+_PLACEHOLDER_RECOVERY_INTERVAL_S = 3.0
 
 # Backoff between connect-stream re-entries in :func:`_stream_loop`. In steady
 # state the re-opened stream blocks awaiting frames, so this delay is paid only
@@ -492,6 +508,13 @@ def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) ->
     return isinstance(root, str) and bool(root) and root != cascade_id
 
 
+def _is_root_cascade(cascade_id: str, summary: dict[str, object]) -> bool:
+    """Return whether a trajectory summary is a root cascade rather than a subagent child."""
+    if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
+        return False
+    return not _summary_is_child_trajectory(cascade_id, summary)
+
+
 def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
     """
     Return the id of a newer-active root cascade than the bound one, else ``None``.
@@ -542,12 +565,8 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
     best_id: str | None = None
     best_activity: datetime | None = None
     for cascade_id, summary in summaries.items():
-        if not isinstance(summary, dict):
-            continue
-        if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
-            continue  # never rotate to a non-cascade trajectory
-        if _summary_is_child_trajectory(cascade_id, summary):
-            continue  # a subagent works FOR the bound cascade; it is not a new one
+        if not isinstance(summary, dict) or not _is_root_cascade(cascade_id, summary):
+            continue  # never rotate to a non-cascade trajectory or a subagent child
         if cascade_id == bound_cascade_id:
             continue
         activity = _summary_activity(summary)
@@ -568,6 +587,42 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
     if bound_activity is None or best_activity > bound_activity:
         return best_id
     return None
+
+
+def _typed_root_cascade(summaries: dict[str, object]) -> str | None:
+    """
+    Return the most recently typed-into root cascade id, or ``None``.
+
+    Root filters match rotation; requiring ``lastUserInputTime`` excludes the
+    headless cold-start phantom and bare ``/clear`` mints (never typed into).
+    Only UUID-shaped ids qualify: the id is later used as a file name and a
+    ``--conversation`` argument, so a malformed key from the RPC is never adopted.
+
+    :param summaries: ``trajectorySummaries`` from ``GetAllCascadeTrajectories``.
+    :returns: The typed-into root cascade id, or ``None`` when none exists yet.
+    """
+    best_id: str | None = None
+    best_input: datetime | None = None
+    for cascade_id, summary in summaries.items():
+        if not isinstance(summary, dict) or not _is_cascade_uuid(cascade_id):
+            continue
+        if not _is_root_cascade(cascade_id, summary):
+            continue
+        typed = _parse_activity_timestamp(summary.get("lastUserInputTime"))
+        if typed is None:
+            continue
+        if best_input is None or typed > best_input:
+            best_id, best_input = cascade_id, typed
+    return best_id
+
+
+def _is_cascade_uuid(cascade_id: str) -> bool:
+    """Return whether *cascade_id* parses as a UUID (agy mints UUIDs for cascades)."""
+    try:
+        uuid.UUID(cascade_id)
+    except ValueError:
+        return False
+    return True
 
 
 async def _sleep(seconds: float) -> None:
@@ -793,11 +848,96 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
     return None
 
 
+@dataclass
+class _RecoveryScanLog:
+    """Per-discovery throttling for recovery-scan warnings that would repeat every round."""
+
+    port_log: ColdStartPortLog = field(default_factory=ColdStartPortLog)
+    foreign_misses: dict[str, int] = field(default_factory=dict)
+
+
+def _recover_placeholder_cascade(
+    bridge_dir: Path, *, scan_log: _RecoveryScanLog | None = None
+) -> str | None:
+    """
+    Adopt agy's TUI-minted cascade while bridge state still holds the placeholder.
+
+    Nothing else replaces a stale placeholder: discovery rejects it and the
+    rotation detector starts only after discovery binds. Safety mirrors the
+    cold-start — pane-scoped port (no local pane, no scan), typed-into root
+    cascades only, and the cascade's conversation db must exist under this
+    session's own Gemini dir (a foreign agy writes to its own).
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param scan_log: Throttling state shared by one discovery run: the resolver's
+        restricted-``/proc`` fallback is reported at WARNING once, and a cascade
+        missing from this session's Gemini dir at WARNING on its second miss (the
+        first is usually agy's write lag), DEBUG otherwise. A fresh log when ``None``.
+    :returns: The adopted cascade id (persisted), or ``None`` this round.
+    """
+    log = scan_log if scan_log is not None else _RecoveryScanLog()
+    state = read_bridge_state(bridge_dir)
+    if state is None or not is_placeholder_conversation_id(state.conversation_id):
+        return None
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return None
+    socket_path = Path(info["socket_path"])
+    if not socket_path.exists():
+        # A socket that is not on this host cannot scope the scan (and its pane
+        # cannot have delivered a web turn from here); skip this round.
+        return None
+    port = resolve_cold_start_agy_rpc_port(socket_path, info["tmux_target"], log=log.port_log)
+    if port is None:
+        return None
+    try:
+        body = get_all_cascade_trajectories(port)
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.debug(
+            "agy placeholder recovery: GetAllCascadeTrajectories failed; retrying "
+            "next round: port=%s error=%r",
+            port,
+            exc,
+        )
+        return None
+    summaries = body.get("trajectorySummaries")
+    if not isinstance(summaries, dict):
+        return None
+    cascade_id = _typed_root_cascade(summaries)
+    if cascade_id is None:
+        return None
+    if not agy_conversation_db(bridge_dir, cascade_id).is_file():
+        # agy writes the db shortly after listing the cascade, so the first miss is
+        # usually that lag; a repeat miss means a foreign agy and is reported once.
+        misses = log.foreign_misses.get(cascade_id, 0)
+        _logger.log(
+            logging.WARNING if misses == 1 else logging.DEBUG,
+            "agy placeholder recovery: typed cascade %s on port %s is not (yet) in this "
+            "session's Gemini dir (a foreign agy, or agy has not written it yet); "
+            "refusing to adopt.",
+            cascade_id,
+            port,
+        )
+        log.foreign_misses[cascade_id] = misses + 1
+        return None
+    # The scan above took seconds; a cold-start may have bound a real id meanwhile.
+    if not update_conversation_id(bridge_dir, cascade_id, expect_placeholder=True):
+        return None
+    _logger.info(
+        "agy reader adopted the TUI-minted cascade past a stale placeholder "
+        "(cold-start never bound a real id): bridge_dir=%s cascade=%s",
+        bridge_dir,
+        cascade_id,
+    )
+    return cascade_id
+
+
 async def _discover(
     bridge_dir: Path,
     *,
     poll_interval_s: float,
     stop: StopPredicate,
+    on_adopted: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, int] | None:
     """
     Resolve ``(cascade_id, port)``, polling until ready or asked to stop.
@@ -806,6 +946,11 @@ async def _discover(
     from bridge state (past the launcher placeholder), then the connect-RPC port
     that confirms ownership of that cascade. Discovery work (file read + blocking
     httpx TLS probes) runs in a worker thread so the event loop stays responsive.
+
+    While the placeholder persists, the loop retries the recovery scan
+    (:func:`_recover_placeholder_cascade`) every
+    :data:`_PLACEHOLDER_RECOVERY_INTERVAL_S` and awaits ``on_adopted`` as soon as
+    an adoption is persisted, before the port resolves.
 
     Readiness is checked BEFORE ``stop`` each round, so a discovery that resolves
     immediately consumes none of the caller's poll budget — ``stop`` is a
@@ -816,11 +961,23 @@ async def _discover(
     :param poll_interval_s: Seconds to wait between discovery polls.
     :param stop: Predicate consulted only when a round did NOT resolve; when it
         returns ``True`` the discovery loop gives up (the runner owns restart).
+    :param on_adopted: Awaited once with the cascade id the recovery scan adopted;
+        the caller records it as the session's external id, since no
+        rotation-based first adoption will run for it.
     :returns: ``(cascade_id, port)`` once both resolve, or ``None`` if ``stop``
         fired before discovery completed.
     """
+    scan_log = _RecoveryScanLog()
+    next_recovery_at = 0.0
     while True:
         cascade_id = await asyncio.to_thread(_resolve_cascade_id, bridge_dir)
+        if cascade_id is None and time.monotonic() >= next_recovery_at:
+            next_recovery_at = time.monotonic() + _PLACEHOLDER_RECOVERY_INTERVAL_S
+            cascade_id = await asyncio.to_thread(
+                _recover_placeholder_cascade, bridge_dir, scan_log=scan_log
+            )
+            if cascade_id is not None and on_adopted is not None:
+                await on_adopted(cascade_id)
         if cascade_id is not None:
             port = await asyncio.to_thread(_resolve_rpc_port, cascade_id)
             if port is not None:
@@ -1020,7 +1177,14 @@ async def supervise_reader(
     """
     should_stop: StopPredicate = stop if stop is not None else (lambda: False)
 
-    discovered = await _discover(bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop)
+    async def _record_adopted(adopted_cascade_id: str) -> None:
+        # Placeholder recovery binds the TUI-minted conversation directly, so no
+        # rotation-based first adoption will record it for --resume.
+        await _record_external_session_id(client, session_id, adopted_cascade_id)
+
+    discovered = await _discover(
+        bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop, on_adopted=_record_adopted
+    )
     if discovered is None:
         return None
     cascade_id, port = discovered
