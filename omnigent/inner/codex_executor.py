@@ -471,9 +471,21 @@ def _format_codex_error_params(params: object) -> str:
     if not isinstance(params, dict) or not params:
         return "Codex App Server error (no params)"
     parts: list[str] = []
+    provider_codes: list[object] = []
+
+    def add_message(text: str) -> None:
+        fields = _provider_error_fields(text)
+        if fields is None:
+            parts.append(text)
+            return
+        parts.append(_label_provider_error(*fields))
+        if fields[1]:
+            provider_codes.append(fields[1])
+
     message = params.get("message")
     if isinstance(message, str) and message.strip():
-        parts.append(message.strip())
+        # Top-level messages can also contain provider JSON envelopes.
+        add_message(message.strip())
     # The app server's ``error`` events nest the actual upstream
     # failure under ``params["error"]`` (a dict with its own
     # ``message`` / ``codexErrorInfo`` / ``additionalDetails``
@@ -487,7 +499,7 @@ def _format_codex_error_params(params: object) -> str:
     if isinstance(inner, dict):
         inner_message = inner.get("message")
         if isinstance(inner_message, str) and inner_message.strip():
-            parts.append(_unwrap_provider_error_json(inner_message.strip()))
+            add_message(inner_message.strip())
         inner_info = inner.get("codexErrorInfo")
         if isinstance(inner_info, str) and inner_info.strip() and inner_info != "other":
             parts.append(f"codexErrorInfo={inner_info}")
@@ -495,7 +507,7 @@ def _format_codex_error_params(params: object) -> str:
         if inner_details:
             parts.append(f"details={inner_details!r}")
     code = params.get("code")
-    if code is not None:
+    if code is not None and code not in provider_codes:
         parts.append(f"code={code}")
     data = params.get("data")
     if data is not None and data != "":
@@ -504,40 +516,65 @@ def _format_codex_error_params(params: object) -> str:
         # No standard JSON-RPC fields populated; dump the raw params
         # so the user can still see what codex sent.
         return f"Codex App Server error: raw_params={params!r}"
-    return "; ".join(parts)
+    # The top-level and nested messages can carry the same provider envelope.
+    return "; ".join(dict.fromkeys(parts))
 
 
-def _unwrap_provider_error_json(text: str) -> str:
+def _provider_error_fields(text: str) -> tuple[str, object] | None:
     """
-    Try to JSON-parse *text* and return its ``message`` field.
+    Return the ``(message, code)`` a stringified provider error carries.
 
-    Codex relays provider HTTP errors as a stringified JSON blob
-    (e.g. ``'{"error_code":"BAD_REQUEST","message":"..."}'`` from
-    Databricks gateway). Returning the raw string is technically
-    accurate but visually noisy; extracting the human-readable
-    ``message`` field gives the user the actionable line directly.
+    Codex relays provider HTTP errors as a JSON blob, either flat
+    (``'{"error_code":"BAD_REQUEST","message":"..."}'`` from the
+    Databricks gateway) or a Responses-API envelope
+    (``'{"type":"error","status":400,"error":{"type":
+    "invalid_request_error","message":"..."}}'`` from a ChatGPT
+    account).
 
-    :param text: The candidate string. Expected to be either a JSON
-        object with a ``message`` field, or a plain error string
-        (e.g. ``"connection refused"``).
-    :returns: The extracted ``message`` field if *text* parses as
-        JSON and contains one; otherwise *text* unchanged.
+    :param text: The candidate string.
+    :returns: The stripped message and its code (``None`` when the
+        blob names no code), or ``None`` when *text* is not such a
+        blob.
     """
     import json
 
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        return text
-    if isinstance(parsed, dict):
-        # Provider-style: ``{"error_code": ..., "message": "..."}``.
-        provider_message = parsed.get("message")
-        if isinstance(provider_message, str) and provider_message.strip():
-            error_code = parsed.get("error_code") or parsed.get("code")
-            if error_code:
-                return f"{provider_message.strip()} (error_code={error_code})"
-            return provider_message.strip()
-    return text
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    message = parsed.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip(), parsed.get("error_code") or parsed.get("code")
+    envelope_error = parsed.get("error")
+    if isinstance(envelope_error, dict):
+        message = envelope_error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip(), envelope_error.get("code") or envelope_error.get("type")
+    return None
+
+
+def _label_provider_error(message: str, code: object) -> str:
+    """Format a provider error's *message* with its *code* when it has one."""
+    return f"{message} (error_code={code})" if code else message
+
+
+def _unwrap_provider_error_json(text: str) -> str:
+    """
+    Return the human-readable reason in *text*, or *text* unchanged.
+
+    Returning the raw provider JSON is technically accurate but visually
+    noisy; the extracted ``message`` gives the user the actionable line
+    directly.
+
+    :param text: A provider error JSON blob or a plain error string
+        (e.g. ``"connection refused"``).
+    :returns: The message with its error code when *text* is a provider
+        error blob; otherwise *text* unchanged.
+    """
+    fields = _provider_error_fields(text)
+    return text if fields is None else _label_provider_error(*fields)
 
 
 class _Process(Protocol):
@@ -4089,10 +4126,12 @@ class _CodexAppServerSession:
                     )
                     if failed_turn_id is not None and failed_turn_id != active_turn_id:
                         continue
-                    error_text = str(
-                        params.get("message")
-                        or turn.get("error")
-                        or "Codex App Server turn failed"
+                    error_text = _unwrap_provider_error_json(
+                        str(
+                            params.get("message")
+                            or turn.get("error")
+                            or "Codex App Server turn failed"
+                        )
                     )
                     # Only a connection-level failure is the certificate's doing;
                     # a tool or provider error keeps its own retryable text.

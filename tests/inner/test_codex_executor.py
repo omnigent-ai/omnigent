@@ -2957,6 +2957,131 @@ def test_format_codex_error_params_handles_missing_params() -> None:
     assert "no params" in _format_codex_error_params("not a dict")
 
 
+def test_format_codex_error_params_unwraps_top_level_provider_envelope() -> None:
+    """A provider HTTP error relayed as a stringified JSON envelope in the
+    top-level ``message`` must surface its human-readable reason, not the raw
+    ``{...}`` blob the user cannot act on."""
+    import json
+
+    from omnigent.inner.codex_executor import _format_codex_error_params
+
+    reason = "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."
+    params = {
+        "message": json.dumps({"error": {"message": reason, "type": "invalid_request_error"}}),
+        "code": "invalid_request_error",
+    }
+    result = _format_codex_error_params(params)
+    assert reason in result
+    assert not result.lstrip().startswith("{"), (
+        f"the provider JSON envelope was surfaced verbatim: {result!r}"
+    )
+
+
+def test_unwrap_provider_error_json_extracts_responses_api_envelope() -> None:
+    """Unwrap a Responses-API envelope: the reason under ``error.message`` plus its code."""
+    from omnigent.inner.codex_executor import _unwrap_provider_error_json
+
+    envelope = (
+        '{"type": "error", "status": 400, "error": {"type": '
+        '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
+        'is not supported when using Codex with a ChatGPT account."}}'
+    )
+    result = _unwrap_provider_error_json(envelope)
+    assert result == (
+        "The 'gpt-6-astra' model is not supported when using Codex with "
+        "a ChatGPT account. (error_code=invalid_request_error)"
+    )
+
+    # ``error.code`` wins over ``error.type`` when both are present.
+    assert (
+        _unwrap_provider_error_json(
+            '{"error": {"type": "invalid_request_error", "code": "model_not_found", '
+            '"message": "No model."}}'
+        )
+        == "No model. (error_code=model_not_found)"
+    )
+
+
+def test_unwrap_provider_error_json_leaves_plain_text_unchanged() -> None:
+    """Non-JSON and JSON-without-a-message inputs pass through untouched."""
+    from omnigent.inner.codex_executor import _unwrap_provider_error_json
+
+    assert _unwrap_provider_error_json("connection refused") == "connection refused"
+    # An envelope whose ``error`` carries no message has nothing to extract.
+    assert _unwrap_provider_error_json('{"error": {"type": "x"}}') == ('{"error": {"type": "x"}}')
+
+
+def test_format_codex_error_params_unwraps_responses_api_envelope_message() -> None:
+    """An error frame can carry the provider's stringified envelope as its top-level
+    ``message`` (not under ``params["error"]``); the formatter must unwrap that too."""
+    from omnigent.inner.codex_executor import _format_codex_error_params
+
+    params = {
+        "message": (
+            '{"type": "error", "status": 400, "error": {"type": '
+            '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
+            'is not supported when using Codex with a ChatGPT account."}}'
+        ),
+        "willRetry": False,
+    }
+    result = _format_codex_error_params(params)
+    assert "model is not supported when using Codex with a ChatGPT account" in result
+    assert "error_code=invalid_request_error" in result
+    # The raw envelope must not leak through.
+    assert not result.lstrip().startswith("{")
+    assert '"invalid_request_error"' not in result
+
+    # A top-level ``code`` that repeats the envelope's code is named once.
+    assert _format_codex_error_params({**params, "code": "invalid_request_error"}) == (
+        "The 'gpt-6-astra' model is not supported when using Codex with "
+        "a ChatGPT account. (error_code=invalid_request_error)"
+    )
+    # A flat provider envelope in the top-level message unwraps the same way.
+    flat = {
+        "message": '{"error_code": "BAD_REQUEST", "message": "Bad model."}',
+        "willRetry": False,
+    }
+    assert _format_codex_error_params(flat) == "Bad model. (error_code=BAD_REQUEST)"
+    # A top-level ``code`` the envelope does not name is still reported.
+    assert _format_codex_error_params({**params, "code": "upstream_error"}).endswith(
+        "(error_code=invalid_request_error); code=upstream_error"
+    )
+
+
+def test_format_codex_error_params_reports_a_repeated_reason_once() -> None:
+    """A frame carrying the same provider envelope in its top-level and nested
+    ``message`` fields reports the reason once."""
+    from omnigent.inner.codex_executor import _format_codex_error_params
+
+    envelope = '{"error": {"type": "invalid_request_error", "message": "Model not allowed."}}'
+    result = _format_codex_error_params({"message": envelope, "error": {"message": envelope}})
+    assert result == "Model not allowed. (error_code=invalid_request_error)"
+
+
+def test_run_turn_turn_failed_unwraps_provider_error_envelope() -> None:
+    """A ``turn/failed`` frame carrying the provider's JSON envelope surfaces the reason."""
+
+    async def _t():
+        envelope = (
+            '{"type": "error", "status": 400, "error": {"type": '
+            '"invalid_request_error", "message": "The \'gpt-6-astra\' model '
+            'is not supported when using Codex with a ChatGPT account."}}'
+        )
+        events = await _run_turn_with_events(
+            _session_with_scripted_turn(), [_failed_turn_event(envelope)]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is True
+        assert errors[0].message == (
+            "The 'gpt-6-astra' model is not supported when using Codex with "
+            "a ChatGPT account. (error_code=invalid_request_error)"
+        )
+
+    _run(_t())
+
+
 def test_extract_codex_last_turn_usage_splits_cached_out_of_input() -> None:
     """``tokenUsage.last`` maps onto TurnComplete.usage, splitting cached tokens.
 
