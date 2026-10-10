@@ -81,6 +81,25 @@ def _launch_env(bug_url: str) -> dict[str, str]:
     return env
 
 
+# A shared --server run competes with many other agents to register its host,
+# so give the host-online wait more slack than the client default (which suits a
+# local, just-started server). 120s matches the managed-host online ceiling.
+_SHARED_SERVER_HOST_ONLINE_TIMEOUT_S = "120"
+
+
+def _shared_server_launch_env(env: dict[str, str], *, server: str | None) -> dict[str, str]:
+    """Add shared-``--server`` launch overrides to *env*; mutate and return it.
+
+    Raises the host-online wait (``OMNIGENT_HOST_ONLINE_TIMEOUT_S``, read by
+    ``omnigent run``) for a ``--server`` launch, where host registration can lag
+    under load. Local runs keep the default. Never clobbers a value the caller
+    already exported.
+    """
+    if server is not None:
+        env.setdefault("OMNIGENT_HOST_ONLINE_TIMEOUT_S", _SHARED_SERVER_HOST_ONLINE_TIMEOUT_S)
+    return env
+
+
 def _slug_from_bug_url(bug_url: str) -> str:
     """Derive a branch-safe slug from a bug URL or bare id.
 
@@ -209,7 +228,7 @@ def main() -> None:
     if args.server is not None:
         cmd += ["--server", args.server]
 
-    env = _launch_env(bug_url)
+    env = _shared_server_launch_env(_launch_env(bug_url), server=args.server)
     print(f"→ running: {' '.join(cmd)}")
     print(f"→ cwd:     {worktree}\n")
 

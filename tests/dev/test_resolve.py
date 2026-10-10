@@ -18,6 +18,7 @@ from dev.resolve import (
     build_payload,
     parse_ci_run_url,
     parse_session_ref,
+    shared_server_launch_env,
     ticket_slug,
 )
 
@@ -182,3 +183,23 @@ def test_branch_slug_ticket_only() -> None:
         )
         == "dc59e331"
     )
+
+
+def test_shared_server_launch_env_raises_host_wait_for_shared_server() -> None:
+    """A ``--server`` launch gets the longer host-online wait."""
+    env = shared_server_launch_env({}, server="https://app.example.com")
+    assert env["OMNIGENT_HOST_ONLINE_TIMEOUT_S"] == "120"
+
+
+def test_shared_server_launch_env_leaves_local_run_at_default() -> None:
+    """A local run (no ``--server``) keeps the client default — no override."""
+    env = shared_server_launch_env({}, server=None)
+    assert "OMNIGENT_HOST_ONLINE_TIMEOUT_S" not in env
+
+
+def test_shared_server_launch_env_respects_explicit_override() -> None:
+    """An explicitly exported wait is never clobbered."""
+    env = shared_server_launch_env(
+        {"OMNIGENT_HOST_ONLINE_TIMEOUT_S": "300"}, server="https://app.example.com"
+    )
+    assert env["OMNIGENT_HOST_ONLINE_TIMEOUT_S"] == "300"

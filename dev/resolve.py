@@ -194,6 +194,25 @@ def branch_slug(*, session: str | None, ci_link: str | None, bug_url: str | None
     return "bug"
 
 
+# A shared --server run competes with many other agents to register its host,
+# so give the host-online wait more slack than the client default (which suits a
+# local, just-started server). 120s matches the managed-host online ceiling.
+_SHARED_SERVER_HOST_ONLINE_TIMEOUT_S = "120"
+
+
+def shared_server_launch_env(env: dict[str, str], *, server: str | None) -> dict[str, str]:
+    """Add shared-``--server`` launch overrides to *env*; mutate and return it.
+
+    Raises the host-online wait (``OMNIGENT_HOST_ONLINE_TIMEOUT_S``, read by
+    ``omnigent run``) for a ``--server`` launch, where host registration can lag
+    under load. Local runs keep the default. Never clobbers a value the caller
+    already exported.
+    """
+    if server is not None:
+        env.setdefault("OMNIGENT_HOST_ONLINE_TIMEOUT_S", _SHARED_SERVER_HOST_ONLINE_TIMEOUT_S)
+    return env
+
+
 # --- git / subprocess plumbing ----------------------------------------------
 
 
@@ -439,7 +458,7 @@ def main() -> None:
     if args.server is not None:
         cmd += ["--server", args.server]
 
-    env = os.environ.copy()
+    env = shared_server_launch_env(os.environ.copy(), server=args.server)
     print(f"→ running: {' '.join(cmd)}")
     print(f"→ cwd:     {worktree}\n")
 

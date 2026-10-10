@@ -1416,7 +1416,8 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
     )
 
     async def _no_host_wait(client: object, host_id: str, *, timeout_s: float) -> None:
-        return None
+        captured["host_wait_timeout_s"] = timeout_s
+        return
 
     async def _fake_launch(
         client: object, *, host_id: str, session_id: str, workspace: str, fresh: bool = False
@@ -4671,3 +4672,71 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+def test_daemon_chat_host_online_timeout_defaults_without_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no override, the host-online wait is the built-in default.
+
+    Cleared explicitly so an ambient ``OMNIGENT_HOST_ONLINE_TIMEOUT_S`` on the
+    runner cannot flip this to the override branch.
+    """
+    monkeypatch.delenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", raising=False)
+    assert (
+        chat_module._daemon_chat_host_online_timeout_s()
+        == chat_module._DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+    )
+
+
+def test_daemon_chat_host_online_timeout_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A longer value lets a shared ``--server`` launch wait out slow registration."""
+    monkeypatch.setenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", "120")
+    assert chat_module._daemon_chat_host_online_timeout_s() == 120.0
+
+
+@pytest.mark.parametrize("bad", ["", "soon", "0", "-5", "nan", "inf", "Infinity", "1e309"])
+def test_daemon_chat_host_online_timeout_ignores_unusable_env(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """A non-numeric, non-finite, or non-positive override falls back to the default.
+
+    A 0 or negative wait would fail the launch instantly, a non-number is a typo,
+    and a non-finite value (``inf``/``1e309``) would wait forever — none should
+    silently break ``omnigent run``.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", bad)
+    assert (
+        chat_module._daemon_chat_host_online_timeout_s()
+        == chat_module._DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+    )
+
+
+def test_prepare_chat_session_via_daemon_forwards_host_online_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolved override reaches ``wait_for_host_online`` at launch.
+
+    The resolver tests alone would still pass if the launch flow stopped
+    forwarding the value, so assert the host-online wait actually receives it.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", "120")
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    asyncio.run(
+        _prepare_chat_session_via_daemon(
+            base_url="https://example.databricksapps.com",
+            headers={},
+            auth=None,
+            host_id="host_x",
+            bundle=b"bundle-bytes",
+            resume_conversation_id=None,
+            fork_session_id=None,
+            workspace="/tmp/proj",
+        )
+    )
+
+    assert captured["host_wait_timeout_s"] == 120.0

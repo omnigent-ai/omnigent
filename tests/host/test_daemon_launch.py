@@ -418,3 +418,118 @@ def test_daemon_poll_intervals_open_tight_then_hold_at_the_cadence() -> None:
     # Reaching "ready" on the third probe must cost less than the old flat
     # cadence would have spent getting there.
     assert sum(first_ten[:2]) < 2 * daemon_launch.DAEMON_POLL_INTERVAL_S
+
+
+class _LaunchRefusesThenOk:
+    """MockTransport handler for the runner-launch POST: refuse N times, then 200.
+
+    Models the host-registration window where the launch endpoint briefly
+    cannot find or reach the just-connected host and answers a transient
+    error, then succeeds once the tunnel/registration settles.
+
+    :param failures: Number of initial POSTs answered with the error before a
+        200 carrying ``runner_id``.
+    :param status: Transient HTTP status returned while refusing (409 or 404).
+    :param detail: Error text returned while refusing — under ``error.message``
+        for a 409 (OmnigentError shape) or ``detail`` for a 404 (HTTPException
+        shape), matching the server.
+    """
+
+    def __init__(self, *, failures: int, status: int, detail: str) -> None:
+        self.failures = failures
+        self.status = status
+        self.detail = detail
+        self.posts_seen = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Answer the launch POST, refusing until the failure budget is spent."""
+        assert request.method == "POST"
+        self.posts_seen += 1
+        if self.posts_seen <= self.failures:
+            if self.status == 409:
+                return httpx.Response(self.status, json={"error": {"message": self.detail}})
+            return httpx.Response(self.status, json={"detail": self.detail})
+        return httpx.Response(200, json={"runner_id": "runner_new"})
+
+
+@pytest.fixture
+def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero the launch-retry backoff so the retry loop runs instantly.
+
+    Keeps the retry *count* (the budget length) intact while removing the
+    real multi-second sleeps between attempts.
+    """
+    monkeypatch.setattr(
+        daemon_launch,
+        "_LAUNCH_RETRY_DELAYS_S",
+        (0.0,) * len(daemon_launch._LAUNCH_RETRY_DELAYS_S),
+    )
+
+
+async def _launch(client: httpx.AsyncClient, host_id: str = "host_1") -> str:
+    """Launch a runner on a fresh session (skips the session-GET branch)."""
+    return await daemon_launch.launch_or_reuse_daemon_runner(
+        client, host_id=host_id, session_id="conv_a", workspace="/w", fresh=True
+    )
+
+
+async def test_launch_retries_transient_host_not_found_404(fast_retry: None) -> None:
+    """A pre-registration 404 "host not found" is retried, not fatal.
+
+    When many hosts register against one shared app at once, the launch
+    endpoint can 404 the just-connected host until its registration becomes
+    visible. That window is transient, so the launch must ride it out the
+    same way it rides out a 409 "offline" — otherwise ``omnigent run`` dies
+    before any session exists. The handler 404s twice, then succeeds.
+    """
+    handler = _LaunchRefusesThenOk(failures=2, status=404, detail="host not found")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        runner_id = await _launch(client)
+    assert runner_id == "runner_new"
+    # 3 = 2 transient 404s + the launch that finally succeeded.
+    assert handler.posts_seen == 3
+
+
+async def test_launch_retries_transient_host_offline_409(fast_retry: None) -> None:
+    """A transient 409 "host is offline" is retried across the reconnect window."""
+    handler = _LaunchRefusesThenOk(failures=2, status=409, detail="host 'host_1' is offline")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        runner_id = await _launch(client)
+    assert runner_id == "runner_new"
+    assert handler.posts_seen == 3
+
+
+async def test_launch_does_not_retry_non_transient_404(fast_retry: None) -> None:
+    """A 404 that is not the host (e.g. a missing session) fails fast.
+
+    Only the host-registration race is transient; a missing session is a real
+    error, so retrying it would just delay the failure.
+    """
+    handler = _LaunchRefusesThenOk(failures=99, status=404, detail="session not found")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        with pytest.raises(click.ClickException, match="session not found"):
+            await _launch(client)
+    assert handler.posts_seen == 1
+
+
+async def test_launch_gives_up_on_persistent_host_not_found(fast_retry: None) -> None:
+    """A host that never registers still fails after the bounded budget.
+
+    Retrying the transient 404 must not loop forever: once the delay budget is
+    spent the launch raises, so a genuinely-missing host fails reasonably fast
+    instead of hanging the whole session start.
+    """
+    handler = _LaunchRefusesThenOk(failures=99, status=404, detail="host not found")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        with pytest.raises(click.ClickException, match="host not found"):
+            await _launch(client)
+    # One POST per attempt: the initial try plus one per delay in the budget.
+    assert handler.posts_seen == len(daemon_launch._LAUNCH_RETRY_DELAYS_S) + 1
