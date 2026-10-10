@@ -16,6 +16,15 @@ def test_lane_rules_distinguish_cli_output_from_internal_results() -> None:
     assert "output is only an error message, hint, or status line" in lanes
     assert "`omnigent host` prints the wrong error after login expires" in lanes
     assert "written evidence is enough when no user interface shows the result" in lanes
+    assert (
+        "Judge that by what one user sees in one session, not by the host-level "
+        "symptom the ticket reports" in lanes
+    )
+    assert "Pane and process lifecycle changes are filmable here" in lanes
+    assert "shorten the idle window by exporting `OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S`" in lanes
+    assert "The variable only reaches a runner the recorder starts" in lanes
+    assert "The shortened window is not the whole wait" in lanes
+    assert "do not type into, click, focus, or resize it" in lanes
     assert "an error string, a value, a log line" not in lanes
 
 

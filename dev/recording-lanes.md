@@ -29,8 +29,14 @@ Record the user action and the product's response:
 - **CLI or terminal output:** record the real command and its output, even if the
   output is only an error message, hint, or status line.
 - **Internal/API-only results:** written evidence is enough when no user
-  interface shows the result. Set `recordings: []`, describe what you observed,
-  and explain how you checked it.
+  interface shows the result. Judge that by what one user sees in one session,
+  not by the host-level symptom the ticket reports: a pane or process lifecycle
+  change shows in the session's Terminal view (see `terminal` facets below), so
+  it is not internal even when the production symptom is a day-scale process
+  pile-up. Footage of the ticket's surface from an earlier run proves the
+  surface is filmable; film your own clip on that lane instead. When no surface
+  shows the result, set `recordings: []`, describe what you observed, and
+  explain how you checked it.
 
 For example, if `omnigent host` prints the wrong error after login expires,
 record running that command with an expired login and showing its output. See
@@ -248,6 +254,31 @@ terminal view shown, so **reuse or adapt the closest one**
 tests skip when the harness CLI isn't installed; if the one your bug needs is
 unavailable here, keep `recordings: []` and name the missing CLI in your evidence
 (a real environment limit, not a `not_reproduced`).
+
+**Pane and process lifecycle changes are filmable here.** A pane the idle reaper
+removes, a terminal that appears in or disappears from the Terminal view, or a
+harness process that exits is a value updating on screen, so film it like any
+other terminal journey: shorten the idle window by exporting
+`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` (seconds; `0` disables reaping) on the
+recorder command so the spawned runner inherits it, drive the session with the
+Terminal view shown, and keep filming past that window until the pane is gone
+(`fixed`/`after`) or still listed (`before`). A production window measured in
+hours, or a symptom that takes days to pile up, does not make the per-pane
+behavior unfilmable. Name the shortened window in the clip's caption.
+The variable only reaches a runner the recorder starts: the default fixtures
+and `--ui-base-url` both spawn one, but the workflow-prepared environment
+(`OMNIGENT_REPRO_SERVER_URL`, `dev.repro_env exec`) attaches to a runner that is
+already running, so there the runner itself must be restarted with the variable
+set, or record against fixture-spawned processes instead.
+
+The shortened window is not the whole wait. Recent pane output or viewer input
+counts as busy for two minutes, the reaper scans once a minute, and a newly idle
+pane gets one full window of grace, so even a 5-second window means a few
+minutes between the last output and the pane vanishing. Keep the Terminal view
+open while you wait (an idle viewer does not count as busy) but do not type
+into, click, focus, or resize it — the attach bridge counts every such client
+event as input — wait on the pane's disappearance rather than a fixed sleep, and
+give the before and after clips the same observation period.
 
 ## `cli` facets
 

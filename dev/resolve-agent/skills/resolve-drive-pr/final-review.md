@@ -29,7 +29,9 @@ build the SPA and record via `OMNIGENT_E2E_RECORD_DIR` per
 Link the actual after-clip, not just the repro run and a manual "run it yourself"
 command. Omit the after-clip **only**
 for a genuine, named environmental blocker (recorder tooling missing, fixture
-won't come online after the SPA build, `api`-surface facet with nothing to film) —
+won't come online after the SPA build, or an `api`-surface facet with nothing to
+film; a lifecycle change the Terminal view shows, or a surface the repro bundle
+already filmed, is neither) —
 and when you omit it, **say which blocker, with the evidence**, in both the PR's
 Demo section and the handoff (a `recordings` prose note, or `maintainer_review`).
 A missing upstream before-clip is never that blocker. Never report an after-clip
