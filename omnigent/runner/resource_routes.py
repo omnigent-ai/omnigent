@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import httpx
@@ -57,6 +58,7 @@ from omnigent.runner.native import (
     _is_runner_owned_codex_terminal,
     _log_terminal_lookup_miss,
     _publish_tmux_target_for_bridge,
+    _readvertise_live_claude_tmux_target,
     _resolved_spec_workdir,
     _unwrap_resolved_spec,
 )
@@ -622,6 +624,44 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource_view),
         )
 
+    async def _readvertise_live_claude_pane(
+        conv_id: str, instance: TerminalInstance, terminal_registry: TerminalRegistry
+    ) -> None:
+        """Restore a live Claude pane's missing or stale ``tmux.json`` before a turn.
+
+        The relay binding already knows the bridge dir; the session labels
+        (a server round trip) are the fallback. Best-effort.
+        """
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+        binding = _session_comment_relays.get(conv_id)
+        if binding is not None:
+            bridge_dir = binding.bridge_dir
+        else:
+            try:
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — heal is best-effort
+                _logger.warning(
+                    "could not resolve the claude bridge dir for conv=%s; skipping re-advertise",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+                return
+            bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await asyncio.to_thread(
+            _readvertise_live_claude_tmux_target,
+            bridge_dir,
+            instance,
+            terminal_registry=terminal_registry,
+            session_id=conv_id,
+        )
+
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
         """Re-create a reaped native pane before forwarding a turn (self-heal).
 
@@ -657,7 +697,11 @@ def register_resource_routes(
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
             if await instance.is_alive():
-                return  # pane is registered and alive — nothing to heal
+                if terminal_name == native_terminal_name("claude-native"):
+                    # Alive is not deliverable: the advertisement the inject
+                    # waits on may be missing or stale while the pane is up.
+                    await _readvertise_live_claude_pane(conv_id, instance, terminal_registry)
+                return  # pane is registered and alive — nothing to re-create
             _logger.info(
                 "native pane registered but dead for conv=%s harness=%s; closing stale entry",
                 conv_id,

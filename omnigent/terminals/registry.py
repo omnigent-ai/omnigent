@@ -335,6 +335,37 @@ class TerminalRegistry:
         with self._lock:
             return self._instance_locks.get((conversation_id, terminal_name, session_key))
 
+    def publish_if_registered(
+        self,
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        instance: TerminalInstance,
+        publish: Callable[[], None],
+    ) -> bool:
+        """Run *publish* only while *instance* still occupies its key.
+
+        The check and the call share the registry lock, so a :meth:`launch`
+        that registers a successor or a :meth:`close` that retires *instance*
+        cannot interleave between them: a retired pane never advertises over
+        its replacement. *publish* must stay brief (a small file write); tmux
+        subprocess calls do not belong here.
+
+        :param conversation_id: Owning conversation id.
+        :param terminal_name: Terminal spec name.
+        :param session_key: Session key from launch.
+        :param instance: The instance the caller observed at that key.
+        :param publish: Zero-argument callable that performs the publication.
+        :returns: ``True`` when *publish* ran, ``False`` when the key is now
+            held by another instance or by none.
+        """
+        with self._lock:
+            slot = self._by_conversation.get(conversation_id, {})
+            if slot.get((terminal_name, session_key)) is not instance:
+                return False
+            publish()
+            return True
+
     def get(
         self,
         conversation_id: str,
