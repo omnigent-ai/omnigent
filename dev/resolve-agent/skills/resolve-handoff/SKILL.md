@@ -178,7 +178,9 @@ readiness; name pending publication/review steps in `remaining_work`.
   review mode, record the reviewed PR head. Keep recovered before-clips and
   captions unchanged. Each after-clip's caption lists the actions shown, ending
   with the corrected behavior. A missing before-clip is not a reason to skip
-  the after-clip. Use `[]` only for internal/API-only results with no visible
+  the after-clip. A `.webm` written by the e2e driver that proved the fix is an
+  after-clip; declare it even when you could not view its frames, and say so in
+  its caption. Use `[]` only for internal/API-only results with no visible
   user interaction, or when recording is blocked as described above.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
@@ -187,6 +189,12 @@ readiness; name pending publication/review steps in `remaining_work`.
     and put the written before/after evidence in the PR Demo section.
   - For a recording failure, name the missing tool or the environment problem.
     Text-only CLI output is not a reason to skip recording.
+  - Before writing a reason, list the media this session produced (`.webm` and
+    `.mp4` files under the recording and evidence directories). Never say a
+    journey could not be driven or filmed when a recorded run of that journey
+    exists; declare that clip instead, with a "frames not inspected" or
+    earlier-head disclosure when needed. A missing prepared environment or
+    image tool is a disclosure on a declared clip, not a reason to omit it.
   - Do not substitute a video of test output or a made-up demonstration.
     Missing or rejected footage must not block the fix or PR.
 - `test_audit` — required in both author and review modes for reproduction-driven

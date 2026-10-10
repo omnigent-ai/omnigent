@@ -199,11 +199,21 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the before/after result
   in your evidence and the PR Demo section.
+- The driver that proves the fix is also the recorder. When the selected e2e
+  or any journey driver you ran drives the real surface with recording on, the
+  `.webm` it writes is the after-clip: move it to
+  `recordings/<slug>/after-<facet>.<ext>` and declare it, even when you could
+  not view its frames (say so in the caption). A test's own self-contained
+  server/runner rig is a valid recording environment; a missing prepared repro
+  environment is not a capture blocker once that run exists.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
-  `recording_unavailable_reason`. Do not block the fix or PR because footage is
-  missing or rejected; explain the gap and continue. Only report clips you
-  actually produced.
+  `recording_unavailable_reason`. Check the media the session produced first
+  (*If recording is blocked* in `dev/recording-lanes.md`): the reason must not
+  call a journey undrivable or unfilmable when a recorded run of it exists in
+  the worktree. Do not block the fix or PR because footage is missing or
+  rejected; explain the gap and continue. Only report clips you actually
+  produced.
 
 Build the SPA before starting the recorder. If you are inside a server-spawned
 runner (`OMNIGENT_RUNNER_ID` is set), strip the inherited runner/host variables

@@ -32,8 +32,12 @@ for a genuine, named environmental blocker (recorder tooling missing, fixture
 won't come online after the SPA build, `api`-surface facet with nothing to film) —
 and when you omit it, **say which blocker, with the evidence**, in both the PR's
 Demo section and the handoff (a `recordings` prose note, or `maintainer_review`).
-A missing upstream before-clip is never that blocker. Never report an after-clip
-you didn't actually produce, and never drop it silently.
+A missing upstream before-clip is never that blocker. A blocker is not genuine
+when this session's own driver run already produced footage of the journey:
+check the recording and evidence directories for `.webm`/`.mp4` output before
+accepting an omission, and declare what you find — frames you could not view
+are a disclosure, not a blocker. Never report an after-clip you didn't actually
+produce, and never drop it silently.
 
 **First, submit your final review** per the verdict rule in 2A.5 (review path
 only): **approve** when you were a pure reviewer and the PR is `fixed` (you pushed
