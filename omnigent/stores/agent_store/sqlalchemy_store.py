@@ -14,7 +14,7 @@ from omnigent.db.db_models import (
     SqlConversation,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import encode_agent_kind
+from omnigent.db.enum_codecs import decode_agent_kind, encode_agent_kind
 from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
@@ -24,7 +24,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Agent, PagedList
 from omnigent.errors import StaleCursorError
-from omnigent.stores.agent_store import AgentStore
+from omnigent.stores.agent_store import AgentListMetadata, AgentStore
 
 # ponytail: fixed read cap per "my agents" call. A user with more fork/switch
 # copies than this newer than an original sees that original only on a later
@@ -284,6 +284,34 @@ class SqlAlchemyAgentStore(AgentStore):
                 last_id=entities[-1].id if entities else None,
                 has_more=has_more,
             )
+
+    def get_list_metadata(self, agent_ids: builtins.list[str]) -> dict[str, AgentListMetadata]:
+        """Load batch display/provenance inputs; user ownership stays in the AP DB."""
+        if not agent_ids:
+            return {}
+        with self._session("load_agent_list_metadata") as session:
+            rows = session.execute(
+                select(
+                    SqlAgent.id,
+                    SqlAgent.name,
+                    SqlAgent.bundle_location,
+                    SqlAgent.kind,
+                    SqlAgent.created_by,
+                ).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.id.in_(agent_ids),
+                )
+            ).all()
+            return {
+                row.id: AgentListMetadata(
+                    id=row.id,
+                    name=row.name,
+                    bundle_location=row.bundle_location,
+                    kind=decode_agent_kind(row.kind),
+                    created_by=row.created_by,
+                )
+                for row in rows
+            }
 
     def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:
         """

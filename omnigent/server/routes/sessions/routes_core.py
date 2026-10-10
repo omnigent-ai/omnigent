@@ -143,6 +143,7 @@ from omnigent.server.routes._sessions.helpers import (
     _parse_session_create_metadata,
     _permission_level_from_grants,
     _pin_claude_permission_launch_args,
+    _prepare_child_harnesses,
     _presentation_labels_for_agent,
     _prune_session_read_state,
     _publish_codex_approval_mode,
@@ -174,6 +175,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _cancel_pending_archive_stop,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
+    _dump_session_list_item,
     _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
@@ -1575,9 +1577,9 @@ def register_core_routes(
         unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
         perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
-            perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
+            perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
                 asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+                asyncio.to_thread(agent_store.get_list_metadata, unique_agent_ids),
                 asyncio.to_thread(
                     conversation_store.list_child_conversation_ids_by_parent,
                     conv_ids,
@@ -1589,8 +1591,8 @@ def register_core_routes(
                 else False
             )
         else:
-            agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+            agent_metadata, child_ids_by_parent = await asyncio.gather(
+                asyncio.to_thread(agent_store.get_list_metadata, unique_agent_ids),
                 asyncio.to_thread(
                     conversation_store.list_child_conversation_ids_by_parent,
                     conv_ids,
@@ -1598,6 +1600,10 @@ def register_core_routes(
             )
             perms_by_conv = {}
             user_is_admin = False
+        agent_names_by_id = {agent_id: agent.name for agent_id, agent in agent_metadata.items()}
+        child_harnesses = await asyncio.to_thread(
+            _prepare_child_harnesses, page.data, agent_metadata, agent_cache
+        )
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
@@ -1672,6 +1678,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                child_harnesses=child_harnesses,
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1685,7 +1692,7 @@ def register_core_routes(
         # from list rows. Skipping it here removes the session-connectivity
         # and hosts-table queries from every GET /v1/sessions.
         return PaginatedList(
-            data=[item.model_dump(exclude_none=True) for item in items],
+            data=[_dump_session_list_item(item) for item in items],
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
@@ -1783,13 +1790,17 @@ def register_core_routes(
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
         conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
-            asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+        agent_metadata, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
+            asyncio.to_thread(agent_store.get_list_metadata, unique_agent_ids),
             asyncio.to_thread(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
             ),
             _comments_fingerprints_for(conv_ids),
+        )
+        agent_names_by_id = {agent_id: agent.name for agent_id, agent in agent_metadata.items()}
+        child_harnesses = await asyncio.to_thread(
+            _prepare_child_harnesses, convs, agent_metadata, agent_cache
         )
         pending_counts = pending_elicitations.counts_for(conv_ids)
         items = [
@@ -1803,6 +1814,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                child_harnesses=child_harnesses,
             )
             for conv in convs
         ]
@@ -1823,7 +1835,7 @@ def register_core_routes(
         # search response put in the client cache, making the palette's match
         # preview flicker away on the next stream tick. Omitting the key leaves
         # the cached snippet untouched.
-        return [item.model_dump(exclude={"search_snippet"}) for item in items]
+        return [_dump_session_list_item(item, full=True) for item in items]
 
     @router.websocket("/sessions/updates")
     async def session_updates(websocket: WebSocket) -> None:

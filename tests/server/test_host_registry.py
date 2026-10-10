@@ -10,7 +10,7 @@ import pytest
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import HOST_STATS_FRESH_S, HostRegistry, RunnerExitReports
 
 
 @dataclass
@@ -608,6 +608,103 @@ def test_gateway_inference_returns_a_copy() -> None:
     assert read is not None
     read["codex"] = False
     assert registry.gateway_inference(bare) == {"codex": True}
+
+
+def test_host_stats_are_stamped_on_receipt_and_dropped_on_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pong's snapshot is held in memory with this server's receive time.
+
+    A pong without stats (an older host) clears it. A disconnect drops the
+    readings but keeps the last ``reported_at`` as the host's last-seen, until
+    its next pong.
+    """
+    bare = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    registry = HostRegistry()
+    assert registry.host_stats(bare) is None
+    conn = registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+
+    monkeypatch.setattr("omnigent.server.host_registry.time.time", lambda: 1_790_000_000.5)
+    registry.record_host_stats(conn, {"cpu_percent": 48.0})
+    expected = {"cpu_percent": 48.0, "reported_at": 1_790_000_000.5}
+    assert registry.host_stats(bare) == expected
+    assert registry.host_stats(f"host_{bare}") == expected
+
+    registry.record_host_stats(conn, None)
+    assert registry.host_stats(bare) is None
+
+    registry.record_host_stats(conn, {"cpu_percent": 12.0})
+    registry.deregister(bare)
+    assert registry.host_stats(bare) == {"reported_at": 1_790_000_000.5}
+    assert registry._host_stats == {}
+
+    back = registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+    registry.record_host_stats(back, {"cpu_percent": 3.0})
+    assert registry.host_stats(bare) == {"cpu_percent": 3.0, "reported_at": 1_790_000_000.5}
+    assert len(registry._offline_stats) == 0
+
+
+def test_host_that_never_reported_has_no_last_seen() -> None:
+    """An older host that never sent stats leaves nothing behind when it disconnects."""
+    bare = "1a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    registry = HostRegistry()
+    registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+
+    registry.deregister(bare)
+
+    assert registry.host_stats(bare) is None
+
+
+def test_host_stats_readings_expire_by_server_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readings are served only while fresh by this server's clock, never the viewer's."""
+    bare = "2a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    registry = HostRegistry()
+    conn = registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+    clock = [1_790_000_000.0]
+    monkeypatch.setattr("omnigent.server.host_registry.time.time", lambda: clock[0])
+    registry.record_host_stats(conn, {"cpu_percent": 48.0})
+
+    clock[0] += HOST_STATS_FRESH_S
+    assert registry.host_stats(bare) == {"cpu_percent": 48.0, "reported_at": 1_790_000_000.0}
+    clock[0] += 1
+    assert registry.host_stats(bare) is None
+
+
+def test_offline_last_seen_entries_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ephemeral sandbox host ids can't pile up offline placeholders forever."""
+    monkeypatch.setattr("omnigent.server.host_registry._OFFLINE_STATS_MAX_ENTRIES", 2)
+    registry = HostRegistry()
+    ids = [f"{n}a1b2c3d4e5f60718293a4b5c6d7e8f9"[:32] for n in range(3, 6)]
+    for host_id in ids:
+        conn = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+        registry.record_host_stats(conn, {"cpu_percent": 1.0})
+        registry.deregister(host_id)
+
+    assert len(registry._offline_stats) == 2
+    assert registry.host_stats(ids[0]) is None
+
+
+def test_host_stats_stay_in_their_workspace() -> None:
+    """A host id reused in another workspace never reads the other's stats."""
+    registry = HostRegistry()
+    host_id = "ffeeddccbbaa99887766554433221100"
+    with workspace_scope(111):
+        conn_a = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+    registry.record_host_stats(conn_a, {"cpu_percent": 12.0})
+
+    with workspace_scope(222):
+        assert registry.host_stats(host_id) is None
+    with workspace_scope(111):
+        read = registry.host_stats(host_id)
+    assert read is not None
+    assert read["cpu_percent"] == 12.0
+
+    # The returned snapshot is a copy.
+    read["cpu_percent"] = 99.0
+    assert registry.host_stats(host_id, workspace_id=111) == {
+        "cpu_percent": 12.0,
+        "reported_at": read["reported_at"],
+    }
 
 
 def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:

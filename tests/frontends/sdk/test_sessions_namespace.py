@@ -40,6 +40,7 @@ import pytest
 from omnigent_client._errors import OmnigentError
 from omnigent_client._sessions import (
     Session,
+    SessionListItem,
     SessionsNamespace,
 )
 
@@ -51,6 +52,109 @@ from omnigent.server.schemas import (
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "llm_model": "opus[1m]",
+            "harness_override": "codex",
+            "child_harness": "codex",
+            "cost_control_mode_override": "on",
+        },
+        {
+            "llm_model": None,
+            "harness_override": None,
+            "child_harness": None,
+            "cost_control_mode_override": None,
+        },
+        {},
+    ],
+)
+def test_list_item_model(metadata: dict[str, str | None]) -> None:
+    item = SessionListItem.from_dict(
+        {
+            "id": "conv_model",
+            "agent_id": "ag_model",
+            "status": "idle",
+            "created_at": 100,
+            "updated_at": 200,
+            **metadata,
+        }
+    )
+    assert item.llm_model == metadata.get("llm_model")
+    assert item.harness_override == metadata.get("harness_override")
+    assert item.child_harness == metadata.get("child_harness")
+    assert item.cost_control_mode_override == metadata.get("cost_control_mode_override")
+
+
+@pytest.mark.parametrize(
+    ("metadata", "present", "harness"),
+    [
+        ({}, False, None),
+        ({"child_harness": None}, True, None),
+        ({"child_harness": "codex"}, True, "codex"),
+    ],
+    ids=["absent", "null", "value"],
+)
+def test_list_item_child_harness_presence(metadata, present, harness) -> None:
+    item = SessionListItem.from_dict(
+        {
+            "id": "child",
+            "agent_id": "agent",
+            "status": "idle",
+            "created_at": 1,
+            "updated_at": 1,
+            **metadata,
+        }
+    )
+    assert item.child_harness_present is present
+    assert item.child_harness == harness
+
+
+def test_list_item_preserves_legacy_positional_order() -> None:
+    item = SessionListItem(
+        "conversation",
+        "agent",
+        "running",
+        100,
+        200,
+        "title",
+        {"origin": "legacy"},
+        "runner",
+        "host",
+        "high",
+        "owner",
+        "external",
+        3,
+        True,
+        "parent",
+    )
+    expected = {
+        "id": "conversation",
+        "agent_id": "agent",
+        "status": "running",
+        "created_at": 100,
+        "updated_at": 200,
+        "title": "title",
+        "labels": {"origin": "legacy"},
+        "runner_id": "runner",
+        "host_id": "host",
+        "reasoning_effort": "high",
+        "owner": "owner",
+        "external_session_id": "external",
+        "pending_elicitations_count": 3,
+        "archived": True,
+        "parent_session_id": "parent",
+        "llm_model": None,
+        "harness_override": None,
+        "child_harness": None,
+        "cost_control_mode_override": None,
+        "child_harness_present": False,
+    }
+    for name, value in expected.items():
+        assert getattr(item, name) == value
 
 
 def _make_namespace(

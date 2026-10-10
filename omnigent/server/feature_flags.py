@@ -27,6 +27,7 @@ class Feature(StrEnum):
     HARNESS_SETTINGS_UI = "harness_settings_ui"
     IMPORT_REVIEW = "import_review"
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
+    HOST_STATS = "host_stats"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
         description="Manage reusable custom agents from Settings",
         owner="web",
+        review_by_release="0.18.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.HOST_STATS,
+        description="Host CPU, memory, disk and network stats in the sidebar session tooltip",
+        owner="hosts",
         review_by_release="0.18.0",
     ),
 )

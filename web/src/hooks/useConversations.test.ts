@@ -7,7 +7,7 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
-import { ApiError } from "@/lib/sessionsApi";
+import { ApiError, getSession } from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
@@ -43,7 +43,7 @@ import {
   type Conversation,
   type PinnedConversationsResult,
 } from "./useConversations";
-import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY, nullsToUndefined } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 
@@ -71,6 +71,37 @@ afterEach(() => {
   clearSessionTombstones();
   // Same for the recently-created keep-alive.
   clearRecentlyCreated();
+});
+
+describe("session list child and routing metadata", () => {
+  it.each(["codex", null, undefined] as const)(
+    "preserves a child harness %s on GET and WS rows",
+    async (harness) => {
+      const row = {
+        id: "child_wire",
+        object: "conversation" as const,
+        created_at: 1,
+        updated_at: 1,
+        permission_level: null,
+        cost_control_mode_override: "on" as const,
+        ...(harness === undefined ? {} : { child_harness: harness }),
+      };
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ data: [row], has_more: false, first_id: row.id, last_id: row.id }),
+      );
+      const page = await fetchConversationsPage({
+        searchQuery: "",
+        includeArchived: false,
+        queryClient: new QueryClient(),
+      });
+      expect(page.data[0].cost_control_mode_override).toBe("on");
+      expect("child_harness" in page.data[0]).toBe(harness !== undefined);
+      expect(page.data[0].child_harness).toBe(harness);
+      const streamed = nullsToUndefined(row);
+      expect("child_harness" in streamed).toBe(harness !== undefined);
+      expect(streamed.child_harness).toBe(harness ?? undefined);
+    },
+  );
 });
 
 describe("renameConversation", () => {
@@ -1514,6 +1545,49 @@ describe("useTogglePinnedConversation cache patching", () => {
     expect(row.updated_at).toBe(150);
     expect(row.labels?.[PINNED_LABEL_KEY]).toBe("1721760000000");
   });
+
+  it.each(["codex", null] as const)(
+    "keeps the resolved child %s and routing mode when pinning outside the list window",
+    async (harness) => {
+      const wire = {
+        id: "conv_detail_only",
+        agent_id: "ag_aria",
+        agent_name: "aria",
+        status: "idle",
+        created_at: 100,
+        title: "Detail-only session",
+        harness,
+        sub_agent_name: "worker",
+        parent_session_id: "parent",
+        cost_control_mode_override: "on",
+        labels: {},
+      };
+      fetchMock.mockResolvedValueOnce(mockResponse(wire));
+      const session = await getSession(wire.id);
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(["session", wire.id], session);
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ ...wire, labels: { [PINNED_LABEL_KEY]: "1721760000000" } }),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const rendered = renderHook(() => useTogglePinnedConversation(), { wrapper });
+
+      rendered.result.current.mutate({ id: wire.id, pinned: true });
+      await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+      const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+      expect(pinned?.conversations).toEqual([
+        expect.objectContaining({
+          id: wire.id,
+          agent_id: wire.agent_id,
+          harness_override: harness,
+          child_harness: harness,
+          cost_control_mode_override: "on",
+        }),
+      ]);
+    },
+  );
 
   it("removes the row from the pinned cache on unpin", async () => {
     const { queryClient, rendered } = seed(false);

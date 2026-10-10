@@ -36,6 +36,31 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /**
+   * Latest resource snapshot the host piggybacked on its tunnel keepalive.
+   * `null`/absent means no stats — an older host or server, or no report on
+   * this server replica yet — and the UI shows nothing rather than zeros.
+   */
+  stats?: HostStats | null;
+}
+
+/**
+ * A host's resource snapshot. Each reading is optional (the first keepalive
+ * after a host starts may lack some); `reported_at` is the server's receive
+ * time in epoch seconds, so the snapshot's age never depends on the host clock.
+ * The server sends readings only while fresh by its own clock; a host that
+ * disconnected after reporting keeps just `reported_at`, its last-seen.
+ */
+export interface HostStats {
+  reported_at: number;
+  cpu_percent?: number;
+  memory_total_bytes?: number;
+  memory_used_bytes?: number;
+  disk_total_bytes?: number;
+  disk_free_bytes?: number;
+  /** Throughput since the previous sample, not link capacity. */
+  net_rx_bytes_per_s?: number;
+  net_tx_bytes_per_s?: number;
 }
 
 interface HostsResponse {
@@ -125,10 +150,10 @@ export function useHostModelOptions(
   hostId: string | null,
   harness: string,
   enabled = true,
-  { poll = true }: { poll?: boolean } = {},
+  { poll = true, once = false }: { poll?: boolean; once?: boolean } = {},
 ) {
   const queryClient = useQueryClient();
-  const canRefresh = enabled && hostId !== null && poll;
+  const canRefresh = enabled && hostId !== null && poll && !once;
   const pollerKey = JSON.stringify([hostId, harness]);
   // Only committed selections participate; suspended renders leave retries alone.
   useLayoutEffect(() => {
@@ -152,9 +177,10 @@ export function useHostModelOptions(
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can
     // fetch eagerly without periodic refreshes or background retries.
-    staleTime: 15_000,
+    staleTime: once ? Infinity : 15_000,
+    ...(once && { refetchOnMount: false, retryOnMount: false }),
     refetchInterval: canRefresh ? 15_000 : false,
-    ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
+    ...((!poll || once) && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
     // Retry boot-probe races while any picker uses this catalog. Persistent
     // failures surface after bounded backoff (~22 s).
     retry: (failureCount) =>

@@ -12,8 +12,9 @@ request/response traffic. No per-request reassembly queues needed.
 
 The registry also holds what connected hosts *report* about themselves and
 nothing persists — today the per-family gateway-inference map (see
-:mod:`omnigent.gateway_inference`) and interactive-shell inventory. They are
-delivered on the connect handshake, so a replica that has never seen a host
+:mod:`omnigent.gateway_inference`), interactive-shell inventory and the
+resource snapshot carried on keepalive pongs (see :mod:`omnigent.host.stats`).
+They are delivered over the tunnel, so a replica that has never seen a host
 simply knows nothing about them until the host reconnects and re-reports.
 """
 
@@ -192,6 +193,13 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
 # invalidation — the TTL is purely a memory bound.
 _EXIT_REPORT_TTL_S = 600.0
 _EXIT_REPORT_MAX_ENTRIES = 1024
+
+# Host readings older than this by the server's clock aren't served; a live host
+# reports on every 30 s keepalive, so this only trips when its pongs stop.
+HOST_STATS_FRESH_S = 150.0
+# How long a disconnected host's "last seen" stays answerable, and how many are kept.
+_OFFLINE_STATS_TTL_S = 24 * 3600.0
+_OFFLINE_STATS_MAX_ENTRIES = 1024
 
 
 @dataclass
@@ -498,6 +506,15 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        # Last resource snapshot each host piggybacked on a keepalive pong. Keyed
+        # like ``_hosts`` so a host id reused in another workspace never reads it,
+        # and dropped with the connection so no replica serves a stale reading.
+        self._host_stats: dict[tuple[int, str], dict[str, float]] = {}
+        # A disconnected host's last ``reported_at`` (no readings), so the tooltip
+        # can say "last seen"; bounded so ephemeral sandbox ids can't pile up.
+        self._offline_stats: TTLCache[tuple[int, str], float] = TTLCache(
+            maxsize=_OFFLINE_STATS_MAX_ENTRIES, ttl=_OFFLINE_STATS_TTL_S
+        )
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
@@ -609,6 +626,9 @@ class HostRegistry:
             if current is None or (conn is not None and current is not conn):
                 return False
             removed = self._hosts.pop(key)
+            snapshot = self._host_stats.pop(key, None)
+            if snapshot is not None:
+                self._offline_stats[key] = snapshot["reported_at"]
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
@@ -745,6 +765,54 @@ class HostRegistry:
         with self._lock:
             reported = self._gateway_inference.get(_canonical_host_id(host_id))
         return dict(reported) if reported is not None else None
+
+    def record_host_stats(
+        self,
+        conn: HostConnection,
+        stats: Mapping[str, float] | None,
+    ) -> None:
+        """Store the resource snapshot a host just sent, stamped on receipt.
+
+        ``reported_at`` uses this server's clock, so a snapshot's age never
+        depends on the host's. ``None`` (an older host, or a failed sample)
+        clears the entry so readers show no stats rather than a stale reading.
+
+        :param conn: The connection the pong arrived on.
+        :param stats: Validated snapshot from
+            :func:`omnigent.host.stats.parse_host_stats`, e.g.
+            ``{"cpu_percent": 48.0}``, or ``None``.
+        """
+        key = (conn.workspace_id, conn.host_id)
+        with self._lock:
+            # The host is back, so it no longer needs a "last seen".
+            self._offline_stats.pop(key, None)
+            if stats is None:
+                self._host_stats.pop(key, None)
+            else:
+                self._host_stats[key] = {**stats, "reported_at": time.time()}
+
+    def host_stats(self, host_id: str, workspace_id: int | None = None) -> dict[str, float] | None:
+        """Return what *host_id* last reported to this replica, by this server's clock.
+
+        :param host_id: Host identifier, in any accepted spelling.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: A copy of the snapshot including ``reported_at`` (epoch
+            seconds) while it is at most :data:`HOST_STATS_FRESH_S` old; just
+            ``{"reported_at": ...}`` (its last-seen, no readings) for a host that
+            disconnected after reporting; otherwise ``None``.
+        """
+        key = (
+            current_workspace_id() if workspace_id is None else workspace_id,
+            _canonical_host_id(host_id),
+        )
+        with self._lock:
+            reported = self._host_stats.get(key)
+            last_seen = self._offline_stats.get(key)
+        if reported is not None:
+            fresh = time.time() - reported["reported_at"] <= HOST_STATS_FRESH_S
+            return dict(reported) if fresh else None
+        return {"reported_at": last_seen} if last_seen is not None else None
 
     def interactive_shells(self, host_id: str) -> list[str] | None:
         """Return the ordered shell inventory last reported by *host_id*."""

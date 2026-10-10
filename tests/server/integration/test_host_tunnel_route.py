@@ -41,6 +41,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.server.auth import AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
@@ -1778,4 +1779,40 @@ async def test_malformed_mcp_tools_reply_returns_502(
     assert response.status_code == 502
     assert response.json() == {"detail": "host MCP tools lookup failed"}
     assert not conn.pending_mcp_tools
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_host_tunnel_pings_request_stats_only_with_the_feature(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    """
+    Verify the ``host_stats`` feature reaches the host through the keepalive ping.
+
+    The ping is the server's only periodic message to the host daemon, so it is
+    what keeps a host from sampling at all while the feature is off.
+    """
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    features = frozenset({Feature.HOST_STATS}) if enabled else frozenset()
+    registry = HostRegistry()
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry, HostStore(db_uri), feature_flags=FeatureFlags(features)
+        ),
+        prefix="/v1",
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    sent = await comm.receive_output(timeout=budget(2.0))
+    ping = decode_frame(sent["text"])
+
+    assert isinstance(ping, PingFrame)
+    assert ping.request_host_stats is enabled
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})

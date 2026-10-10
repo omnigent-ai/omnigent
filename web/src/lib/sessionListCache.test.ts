@@ -83,6 +83,35 @@ describe("mergeItemsIntoPages", () => {
     expect(found).toEqual(new Set(["a"]));
   });
 
+  it.each([
+    ["sidebar", ["conversations", "", false]],
+    ["project folder", ["project-sessions", "Alpha"]],
+  ] as const)("merges a newly unresolved child into the %s cache", (_scope, queryKey) => {
+    const client = new QueryClient();
+    const session = conv("a", { parent_session_id: "parent", updated_at: 100 });
+    const before = data([session]);
+    client.setQueryData(queryKey, before);
+    const unchanged = new Map([[session.id, nullsToUndefined({ id: session.id, host_id: null })]]);
+    expect(mergeItemsIntoPages(before, unchanged, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(before);
+    const items = new Map([
+      [session.id, nullsToUndefined({ id: session.id, child_harness: null })],
+    ]);
+
+    client.setQueryData<ConversationsInfiniteData>(queryKey, (cached) => {
+      const merged = mergeItemsIntoPages(cached, items, DEFAULT_FILTERS, NO_ACTIVE);
+      expect(merged.needsRefetch).toBe(false);
+      return merged.data;
+    });
+
+    const after = client.getQueryData<ConversationsInfiniteData>(queryKey)!;
+    const row = after.pages[0].data[0];
+    expect(row).not.toBe(session);
+    expect("child_harness" in row).toBe(true);
+    expect(row.child_harness).toBeUndefined();
+    expect(row.updated_at).toBe(session.updated_at);
+    expect(mergeItemsIntoPages(after, items, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(after);
+  });
+
   it("leaves a cached search_snippet intact when the wire omits the key", () => {
     // search_snippet is search-only: the WS stream excludes it from its dump,
     // so a changed/snapshot frame never carries the key. A key-absent overlay

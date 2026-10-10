@@ -255,6 +255,36 @@ def test_ping_pong_round_trip() -> None:
     assert decoded_o.ts == 1709654400000
 
 
+def test_ping_carries_host_stats_request_round_trip() -> None:
+    decoded = decode_frame(encode_frame(PingFrame(ts=1, request_host_stats=True)))
+    assert decoded == PingFrame(ts=1, request_host_stats=True)
+
+
+def test_ping_without_host_stats_request_keeps_the_original_wire_shape() -> None:
+    # With the host_stats feature off, pings are byte-for-byte what older peers expect.
+    assert json.loads(encode_frame(PingFrame(ts=1))) == {"kind": "ping", "ts": 1}
+    assert decode_frame('{"kind": "ping", "ts": 1, "request_host_stats": "yes"}') == PingFrame(
+        ts=1
+    )
+
+
+def test_pong_carries_host_stats_round_trip() -> None:
+    stats: dict[str, object] = {"cpu_percent": 48.0, "memory_total_bytes": 17179869184}
+    decoded = decode_frame(encode_frame(PongFrame(ts=1, host_stats=stats)))
+    assert decoded == PongFrame(ts=1, host_stats=stats)
+
+
+def test_pong_without_host_stats_keeps_the_original_wire_shape() -> None:
+    # Runner pongs, and peers that predate host stats, must see an unchanged frame.
+    assert json.loads(encode_frame(PongFrame(ts=1))) == {"kind": "pong", "ts": 1}
+
+
+@pytest.mark.parametrize("raw_stats", ['"busy"', "[1, 2]", "null"])
+def test_pong_decodes_non_object_host_stats_as_absent(raw_stats: str) -> None:
+    decoded = decode_frame(f'{{"kind": "pong", "ts": 1, "host_stats": {raw_stats}}}')
+    assert decoded == PongFrame(ts=1, host_stats=None)
+
+
 # ── Decode failure modes ─────────────────────────────────
 
 

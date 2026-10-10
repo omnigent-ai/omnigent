@@ -96,8 +96,6 @@ import {
 import {
   claudeNativeSubagentLabel,
   codexNativeSubagentLabel,
-  isNativeTerminalSession,
-  nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
@@ -213,12 +211,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
-import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
-import {
-  SMART_ROUTING_ARMS,
-  hostBacksHarnessWithGateway,
-  smartRoutingSourceFor,
-} from "@/lib/smartRoutingAvailability";
+import { isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
@@ -230,7 +223,12 @@ import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import { composerContextFromLabels } from "@/lib/composerContextAdapters";
 import {
-  compactModelTriggerLabel,
+  buildComposerSessionDescriptor,
+  isCostRoutingEligible,
+  composerModelChipLabel,
+  effectiveWrapperLabel,
+  effortLevelsForConv,
+  shouldShowComposerEffort,
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
@@ -278,41 +276,7 @@ function smartRoutingEnabled(serverInfo: ServerInfoValue): boolean {
   return serverInfo !== "loading" && serverInfo.smart_routing_enabled;
 }
 
-/**
- * Whether the session's own model can be routed per turn.
- *
- * SDK/bundle agent sessions need only the deployment flag. Native Claude
- * Code / Codex panes ARE routable per turn — the server injects the routed
- * pick via ``/model`` when ``cost_control_mode_override`` is on, the same
- * apparatus the create-time gear arms — but only when a router can answer
- * for their family (the server rejects a routing-on create otherwise): the
- * external AI-Gateway router needs the family's inference gateway-backed on
- * the session's host, and the built-in judge covers the rest. An absent
- * host row reads as backed, mirroring {@link hostBacksHarnessWithGateway}.
- */
-export function isCostRoutingEligible(
-  serverInfo: ServerInfoValue,
-  // Only the fields the guards below read, so a temp/optimistic session can be
-  // evaluated from its seed without fabricating a whole Session. A real Session
-  // is structurally assignable.
-  session: Pick<Session, "agentName" | "parentSessionId" | "harness" | "labels"> | null | undefined,
-  host?: { gateway_inference?: Record<string, boolean> | null } | null,
-): boolean {
-  if (serverInfo === "loading" || !serverInfo.smart_routing_enabled) return false;
-  if (!isCostRoutingSession(session)) return false;
-  if (!isNativeTerminalSession(session)) return true;
-  const native = nativeCodingAgentForSession(session);
-  if (native === undefined || !SMART_ROUTING_ARMS.some((arm) => arm === native.harness)) {
-    return false;
-  }
-  return (
-    smartRoutingSourceFor({
-      externalConfigured: serverInfo.smart_routing_sources.external,
-      ossConfigured: serverInfo.smart_routing_sources.oss,
-      gatewayBacked: hostBacksHarnessWithGateway(host, native.harness),
-    }) !== null
-  );
-}
+export { isCostRoutingEligible } from "@/lib/composerModelLabel";
 
 /**
  * Whether the session may control the routing of the sub-agents it spawns —
@@ -1006,12 +970,12 @@ export function ChatPage() {
   // stable identity across the switch's re-render burst.
   const capabilitySource = useMemo(() => {
     if (activeSession)
-      return {
-        labels: activeSession.labels ?? {},
-        harness: activeSession.harness,
-        inferenceConfigured: activeSession.inferenceConfigured,
-        parentSessionId: activeSession.parentSessionId ?? null,
-      };
+      return buildComposerSessionDescriptor(
+        activeSession.harness,
+        activeSession.labels,
+        activeSession.parentSessionId,
+        activeSession.inferenceConfigured,
+      );
     // Keep the seeded native identity through the temp-to-real ID handoff,
     // until the session snapshot can supply its wrapper label and harness.
     if (
@@ -1022,13 +986,9 @@ export function ChatPage() {
       const seededLabels: Record<string, string | null> = nativeAgent
         ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel }
         : {};
-      return {
-        labels: seededLabels,
-        harness: composerSessionHarness,
-        parentSessionId: null,
-      };
+      return buildComposerSessionDescriptor(composerSessionHarness, seededLabels);
     }
-    return { labels: activeConv?.labels ?? {}, harness: null, parentSessionId: null };
+    return buildComposerSessionDescriptor(null, activeConv?.labels);
   }, [
     activeSession,
     activeConv,
@@ -1055,7 +1015,7 @@ export function ChatPage() {
       ),
     [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
   );
-  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
+  const showEffort = shouldShowComposerEffort(capabilitySource, effortLevels);
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -2022,7 +1982,7 @@ export function buildSlashCommandWithArgsSet(
 // single source of truth lives in @/lib/composerModelLabel (imported above).
 // Re-exported here so ChatPage's existing named exports keep resolving for
 // consumers (e.g. ChatPage.statusLine.test).
-export { formatStatusModelLabel, formatModelEffortStatusLabel };
+export { effortLevelsForConv, formatStatusModelLabel, formatModelEffortStatusLabel };
 
 /**
  * Identity label for the composer status tray: which harness/agent is
@@ -4177,22 +4137,6 @@ export function unboundSessionResumableInApp(params: {
   return params.importSource == null || HOST_PORTABLE_IMPORT_SOURCES.has(params.importSource);
 }
 
-const EFFORT_LEVELS = ["low", "medium", "high"] as const;
-
-/** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
-const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-
-/** Pi thinking ladder (matches PI_EFFORTS in reasoning_effort.py; ``ultra`` aliases to ``max`` on Pi so omitted). */
-const PI_NATIVE_EFFORT_LEVELS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-
 type NativeModelPickerKind =
   "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
 
@@ -4238,75 +4182,6 @@ export function readOnlyReasonForSessionLabels(
     return "Claude Code sub-agents are read-only";
   }
   return null;
-}
-
-/**
- * A custom (label-less) session resolved to the native Codex harness.
- *
- * Custom YAML agents get no `omnigent.wrapper` presentation label, so the
- * resolved harness is the capability evidence. Any wrapper label — including
- * sub-agent variants like `codex-native-ui-subagent`, which cannot honor
- * mid-session overrides — keeps the label authoritative and skips the
- * fallback.
- */
-/**
- * The wrapper label a session behaves as: its own, else the one its harness
- * implies.
- *
- * A session created before its harness was renamed carries no
- * ``omnigent.wrapper`` label — the ACP-era Devin rows are the live example — so
- * every label-driven surface below (model picker, effort ladder, permission mode)
- * would read it as non-native even though the runner resolves it to a native
- * harness and gives it a pane. Deriving from the harness fixes that for any
- * rename, and subsumes the codex-only special case this replaces.
- *
- * A sub-agent child is excluded: it owns no PTY and takes no input, so it must
- * not gain a picker just because its harness is native.
- */
-function effectiveWrapperLabel(
-  conv:
-    | {
-        labels?: Record<string, string | null> | null;
-        harness?: string | null;
-        parentSessionId?: string | null;
-      }
-    | null
-    | undefined,
-): string | undefined {
-  const label = conv?.labels?.["omnigent.wrapper"];
-  if (label != null) return label;
-  if (conv?.parentSessionId != null) return undefined;
-  return nativeCodingAgentForHarness(conv?.harness)?.wrapperLabel;
-}
-
-export function effortLevelsForConv(
-  conv:
-    | {
-        labels?: Record<string, string | null> | null;
-        harness?: string | null;
-        parentSessionId?: string | null;
-      }
-    | null
-    | undefined,
-  codexModelOptions: readonly NativeModelOption[] = [],
-  currentModel: string | null = null,
-): readonly string[] {
-  switch (effectiveWrapperLabel(conv)) {
-    case "claude-code-native-ui":
-      return CLAUDE_NATIVE_EFFORT_LEVELS;
-    case "devin-native-ui":
-      // Devin encodes effort as a model-variant suffix, and the rung set is
-      // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a different
-      // Fusion model), so derive it from the selected model's catalog entry —
-      // its `supportedReasoningEfforts` — rather than a fixed ladder.
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
-    case "codex-native-ui":
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
-    case "pi-native-ui":
-      return PI_NATIVE_EFFORT_LEVELS;
-    default:
-      return EFFORT_LEVELS;
-  }
 }
 
 /**
@@ -4572,14 +4447,15 @@ function SessionHarnessPicker({
     showModels,
     showEffort,
   });
-  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
-  const label = routingOn
-    ? SMART_ROUTING_LABEL
-    : modelLabelLoading
-      ? ""
-      : compactModelTriggerLabel(
-          modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
-        );
+  const { label, effortLabel } = composerModelChipLabel({
+    modelSummary,
+    modelLabelLoading,
+    nativeDisplayName: nativeAgent?.displayName,
+    harnessLabel,
+    showEffort,
+    effort: selectedEffort,
+    routingOn,
+  });
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
