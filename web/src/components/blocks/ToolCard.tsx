@@ -166,6 +166,10 @@ interface ToolCardProps {
   startedAt?: number | null;
   /** Completed runtime in seconds. Undefined when historical data lacks timing. */
   duration?: number;
+  /** Restore a user-expanded card's open state after remount. */
+  defaultOpen?: boolean;
+  /** Reports the user toggling the expandable panel. */
+  onOpenChange?: (open: boolean) => void;
 }
 
 export function ToolCard({
@@ -177,6 +181,8 @@ export function ToolCard({
   state,
   startedAt,
   duration,
+  defaultOpen = false,
+  onOpenChange,
 }: ToolCardProps) {
   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
@@ -200,7 +206,11 @@ export function ToolCard({
   const onBodyClick = openFile && rawPath ? () => openFile(rawPath) : undefined;
 
   return (
-    <Collapsible defaultOpen={false} className="group not-prose w-full">
+    <Collapsible
+      defaultOpen={defaultOpen}
+      onOpenChange={onOpenChange}
+      className="group not-prose w-full"
+    >
       <ToolTriggerRow
         title={title}
         name={name}
