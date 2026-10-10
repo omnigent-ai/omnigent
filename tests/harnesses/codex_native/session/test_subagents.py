@@ -31,6 +31,7 @@ def _collab_item_completed_event(
     parent_thread_id: str = "thread_parent",
     child_thread_id: str = "thread_child",
     item_id: str = "collab_1",
+    agents_states: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Build a Codex ``collabAgentToolCall`` ``item/completed`` notification.
@@ -38,22 +39,52 @@ def _collab_item_completed_event(
     :param parent_thread_id: Codex parent thread id.
     :param child_thread_id: Codex child thread id.
     :param item_id: Codex item id for the collab item.
+    :param agents_states: Optional ``agentsStates`` snapshot keyed by child
+        thread id, e.g. ``{"thread_child": {"status": "running"}}``.
     :returns: App-server event payload.
     """
+    item: dict[str, Any] = {
+        "type": "collabAgentToolCall",
+        "id": item_id,
+        "tool": "spawnAgent",
+        "senderThreadId": parent_thread_id,
+        "receiverThreadIds": [child_thread_id],
+    }
+    if agents_states is not None:
+        item["agentsStates"] = agents_states
     return {
         "method": "item/completed",
         "params": {
             "threadId": parent_thread_id,
             "turnId": "turn_parent",
-            "item": {
-                "type": "collabAgentToolCall",
-                "id": item_id,
-                "tool": "spawnAgent",
-                "senderThreadId": parent_thread_id,
-                "receiverThreadIds": [child_thread_id],
-            },
+            "item": item,
         },
     }
+
+
+def _child_turn_event(
+    method: str,
+    *,
+    child_thread_id: str = "thread_child",
+    turn_id: str = "turn_child",
+) -> dict[str, Any]:
+    """
+    Build a child thread's own ``turn/started``, ``turn/completed`` or
+    ``turn/failed`` notification.
+
+    :param method: ``"turn/started"``, ``"turn/completed"`` or ``"turn/failed"``.
+    :param child_thread_id: Codex child thread id.
+    :param turn_id: Codex turn id on the child thread.
+    :returns: App-server event payload.
+    """
+    turn: dict[str, Any] = {"id": turn_id}
+    if method == "turn/completed":
+        turn.update({"status": "completed", "items": []})
+    elif method == "turn/failed":
+        turn["status"] = "failed"
+    else:
+        turn["status"] = "inProgress"
+    return {"method": method, "params": {"threadId": child_thread_id, "turn": turn}}
 
 
 def _collab_item_started_event(
@@ -149,6 +180,7 @@ def _child_resume_response(
     text: str = "child output",
     agent_nickname: str = "Euclid",
     agent_role: str = "explorer",
+    turn_status: str | None = None,
 ) -> dict[str, Any]:
     """
     Build a Codex ``thread/resume`` response for a child thread.
@@ -160,8 +192,16 @@ def _child_resume_response(
     :param text: Text content of the replayed item.
     :param agent_nickname: Codex-assigned agent nickname.
     :param agent_role: Codex-assigned agent role.
+    :param turn_status: Optional Codex status of the replayed turn, e.g.
+        ``"completed"`` or ``"inProgress"``. Omitted when ``None``.
     :returns: JSON-RPC ``thread/resume`` response.
     """
+    turn: dict[str, Any] = {
+        "id": turn_id,
+        "items": [{"type": "agentMessage", "id": item_id, "text": text}],
+    }
+    if turn_status is not None:
+        turn["status"] = turn_status
     return {
         "result": {
             "thread": {
@@ -175,12 +215,7 @@ def _child_resume_response(
                         }
                     }
                 },
-                "turns": [
-                    {
-                        "id": turn_id,
-                        "items": [{"type": "agentMessage", "id": item_id, "text": text}],
-                    }
-                ],
+                "turns": [turn],
             }
         }
     }
@@ -249,6 +284,25 @@ def _transcript_posts(
         for path, body in posted
         if path == f"/v1/sessions/{session_id}/events"
         and body["type"] == "external_conversation_item"
+    ]
+
+
+def _status_posts(
+    posted: list[tuple[str, dict[str, Any]]],
+    session_id: str,
+) -> list[str]:
+    """
+    Return the ``external_session_status`` statuses posted to one session, in order.
+
+    :param posted: All captured Omnigent posts as ``(path, body)`` tuples.
+    :param session_id: Omnigent session id to filter for.
+    :returns: Status literals, e.g. ``["running", "idle"]``.
+    """
+    return [
+        body["data"]["status"]
+        for path, body in posted
+        if path == f"/v1/sessions/{session_id}/events"
+        and body["type"] == "external_session_status"
     ]
 
 
@@ -854,3 +908,347 @@ def test_forwarder_resolves_child_thread_elicitation_on_child_session(
     assert "/v1/sessions/conv_parent/events" not in posted_paths, (
         f"resolution must not target the parent session; got {posted_paths}"
     )
+
+
+# ── Parent collab snapshots must not revive a settled child ──────────────────
+
+
+def _snapshot_test_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    codex_client: _FakeCodexAppServerClient | None = None,
+) -> tuple[codex_native_forwarder._CodexForwarderState, Path]:
+    """
+    Build forwarder state for a snapshot test and isolate its bridge files.
+
+    Child turn events use the current directory as their bridge dir, so the
+    test runs from a scratch cwd distinct from the parent's bridge dir.
+
+    :param tmp_path: Test scratch directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param codex_client: Optional app-server double enabling child backfill.
+    :returns: ``(forwarder_state, parent_bridge_dir)``.
+    """
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent",
+        codex_client=codex_client,  # type: ignore[arg-type]
+    )
+    return state, bridge_dir
+
+
+def _deliver_parent_events(
+    state: codex_native_forwarder._CodexForwarderState,
+    bridge_dir: Path,
+    events: list[dict[str, Any]],
+    posted: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """
+    Deliver events through ``_handle_event`` as the parent thread's forwarder.
+
+    :param state: Forwarder state shared across the events.
+    :param bridge_dir: Parent bridge directory.
+    :param events: App-server notifications in delivery order.
+    :param posted: List collecting every Omnigent post as ``(path, body)``.
+    :returns: None.
+    """
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        ) as client:
+            for event in events:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
+                    event=event,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+
+    asyncio.run(run())
+
+
+def _running_snapshot_event() -> dict[str, Any]:
+    """Build a parent spawn item whose snapshot still lists the child as running."""
+    return _collab_item_completed_event(agents_states={"thread_child": {"status": "running"}})
+
+
+def _completed_snapshot_event() -> dict[str, Any]:
+    """Build a parent spawn item whose snapshot reports the child as completed."""
+    return _collab_item_completed_event(agents_states={"thread_child": {"status": "completed"}})
+
+
+def _child_error_event(
+    *,
+    child_thread_id: str = "thread_child",
+    turn_id: str = "turn_child",
+) -> dict[str, Any]:
+    """Build a child thread's standalone terminal ``error`` notification."""
+    return {
+        "method": "error",
+        "params": {
+            "threadId": child_thread_id,
+            "turnId": turn_id,
+            "error": {"message": "child crashed"},
+        },
+    }
+
+
+class _SuspendingResumeClient(_PerThreadFakeCodexClient):
+    """Resume client that parks ``thread/resume`` until the test releases it."""
+
+    def __init__(self, thread_responses: dict[str, dict[str, Any]]) -> None:
+        super().__init__(thread_responses)
+        self.resume_started = asyncio.Event()
+        self.release_resume = asyncio.Event()
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "thread/resume":
+            self.resume_started.set()
+            await self.release_resume.wait()
+        return await super().request(method, params)
+
+
+def _child_resume_response_with_turns(statuses: list[str]) -> dict[str, Any]:
+    """
+    Build a child ``thread/resume`` response whose turns carry ``statuses`` in order.
+
+    :param statuses: Non-empty list of Codex turn statuses, oldest first.
+    :returns: JSON-RPC ``thread/resume`` response.
+    """
+    response = _child_resume_response(turn_status=statuses[0])
+    turns = response["result"]["thread"]["turns"]
+    for index, status in enumerate(statuses[1:], start=2):
+        turns.append({"id": f"turn_child_{index}", "status": status, "items": []})
+    return response
+
+
+@pytest.mark.parametrize(
+    ("terminal_event", "settled_status"),
+    [
+        (_child_turn_event("turn/completed"), "idle"),
+        (_child_turn_event("turn/failed"), "failed"),
+        (_child_error_event(), "failed"),
+    ],
+    ids=["turn-completed", "turn-failed", "error-notification"],
+)
+def test_forwarder_collab_snapshot_does_not_revive_settled_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_event: dict[str, Any],
+    settled_status: str,
+) -> None:
+    """
+    A child that finished or failed keeps that status when a later collab snapshot
+    reports it running.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
+
+    _deliver_parent_events(
+        state,
+        bridge_dir,
+        [
+            _subagent_activity_started_event(),
+            _child_turn_event("turn/started"),
+            terminal_event,
+            _running_snapshot_event(),
+        ],
+        posted,
+    )
+
+    assert _status_posts(posted, "conv_child") == ["running", settled_status]
+
+
+def test_forwarder_collab_snapshot_posts_status_for_child_without_own_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A freshly registered child with no lifecycle of its own still takes the snapshot status.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
+
+    _deliver_parent_events(
+        state,
+        bridge_dir,
+        [_subagent_activity_started_event(), _running_snapshot_event()],
+        posted,
+    )
+
+    assert _status_posts(posted, "conv_child") == ["running"]
+
+
+def test_forwarder_collab_snapshot_marks_child_running_after_new_turn_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Once a settled child starts a new turn, a running snapshot is honoured again.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
+
+    _deliver_parent_events(
+        state,
+        bridge_dir,
+        [
+            _subagent_activity_started_event(),
+            _child_turn_event("turn/started"),
+            _child_turn_event("turn/completed"),
+            _child_turn_event("turn/started", turn_id="turn_child_2"),
+            _running_snapshot_event(),
+        ],
+        posted,
+    )
+
+    assert _status_posts(posted, "conv_child") == ["running", "idle", "running", "running"]
+
+
+def test_forwarder_collab_snapshot_does_not_settle_running_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A child mid-turn stays running when a stale snapshot reports it completed.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
+
+    _deliver_parent_events(
+        state,
+        bridge_dir,
+        [
+            _subagent_activity_started_event(),
+            _child_turn_event("turn/started"),
+            _completed_snapshot_event(),
+        ],
+        posted,
+    )
+
+    assert _status_posts(posted, "conv_child") == ["running"]
+
+
+def test_forwarder_replayed_spawn_snapshot_does_not_revive_backfilled_completed_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After a reconnect, a replayed spawn item must not mark a finished child busy.
+
+    A fresh forwarder has not seen the child's live turn lifecycle, but the
+    child's backfilled ``thread/resume`` payload reports its last turn as
+    completed. That terminal state wins over the spawn item's stale snapshot.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={"thread_child": _child_resume_response(turn_status="completed")}
+    )
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
+
+    _deliver_parent_events(state, bridge_dir, [_running_snapshot_event()], posted)
+
+    assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
+    assert _status_posts(posted, "conv_child") == []
+
+
+def test_forwarder_replayed_spawn_snapshot_marks_backfilled_running_child_working(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A replayed spawn snapshot still marks a child busy when its resumed turn is live,
+    and a stale completed snapshot does not settle it.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={"thread_child": _child_resume_response(turn_status="inProgress")}
+    )
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
+
+    _deliver_parent_events(
+        state, bridge_dir, [_running_snapshot_event(), _completed_snapshot_event()], posted
+    )
+
+    assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
+    assert _status_posts(posted, "conv_child") == ["running"]
+
+
+@pytest.mark.parametrize(
+    ("turn_statuses", "expected_posts"),
+    [
+        (["completed", "inProgress"], ["running"]),
+        (["inProgress", "completed"], []),
+    ],
+    ids=["newest-running", "newest-completed"],
+)
+def test_forwarder_backfill_seeds_child_status_from_newest_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    turn_statuses: list[str],
+    expected_posts: list[str],
+) -> None:
+    """
+    Only the newest resumed turn decides whether a replayed running snapshot is honoured.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={"thread_child": _child_resume_response_with_turns(turn_statuses)}
+    )
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
+
+    _deliver_parent_events(state, bridge_dir, [_running_snapshot_event()], posted)
+
+    assert _status_posts(posted, "conv_child") == expected_posts
+
+
+def test_forwarder_backfilled_status_does_not_overwrite_live_child_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A child's live turn edge wins over a stale terminal status in its backfill.
+
+    The child starts a new turn while its ``thread/resume`` is still pending, so
+    the resumed completed turn must not settle a child that is running.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _SuspendingResumeClient(
+        {"thread_child": _child_resume_response(turn_status="completed")}
+    )
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        ) as client:
+
+            def handle(event: dict[str, Any]) -> Any:
+                return codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
+                    event=event,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+
+            spawn = asyncio.create_task(handle(_running_snapshot_event()))
+            await asyncio.wait_for(codex_client.resume_started.wait(), timeout=5)
+            await handle(_child_turn_event("turn/started"))
+            codex_client.release_resume.set()
+            await asyncio.wait_for(spawn, timeout=5)
+
+    asyncio.run(run())
+
+    assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
+    assert _status_posts(posted, "conv_child") == ["running", "running"]
+    assert state.child_turn_status("thread_child") == "running"
