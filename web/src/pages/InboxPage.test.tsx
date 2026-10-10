@@ -267,7 +267,7 @@ describe("InboxPage approval items", () => {
     const row = conversation({ id: "sess_1" });
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
-      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+      pendingElicitations: [rawElicitation("eli_1", "Claude wants to call **Bash**")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
     renderPage();
 
@@ -277,6 +277,10 @@ describe("InboxPage approval items", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
     expect(screen.queryByTestId("approval-card")).not.toBeInTheDocument();
+    // The collapsed row previews the same gating message with its bold tool
+    // name, not the raw `**Bash**` markers.
+    expect(within(toggle).getByText("Bash", { selector: "strong" })).toBeInTheDocument();
+    expect(toggle.textContent).not.toContain("**");
   });
 
   it("submits an approve verdict via approve() and flips the card to responded", async () => {

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { BlockStream } from "@/lib/blockStream";
@@ -1538,5 +1538,59 @@ describe("ApprovalCard — prompt expired", () => {
 
     expect(screen.getByText(/Resolved elsewhere/)).toBeDefined();
     expect(screen.queryByTestId("prompt-expired-hint")).toBeNull();
+  });
+});
+
+describe("ApprovalCard — gating message emphasis", () => {
+  const props = {
+    elicitationId: "elic_emphasis",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"touch /tmp/probe"})',
+    requestedSchema: {},
+  } as const;
+
+  it("shows the bridge's **tool name** bold without the markers, pending and responded", () => {
+    // The hook publishes "<harness> wants to call **<tool>**"; the card must
+    // not print that string verbatim, asterisks included.
+    const message = "Claude wants to call **Bash**";
+    const { rerender } = render(
+      <ApprovalCard {...props} message={message} status="pending" response={null} />,
+    );
+    let card = screen.getByTestId("approval-card");
+    expect(card.textContent).not.toContain("**");
+    expect(within(card).getByText("Bash", { selector: "strong" })).toBeDefined();
+    expect(within(card).getByText(/Claude wants to call/)).toBeDefined();
+
+    rerender(
+      <ApprovalCard
+        {...props}
+        message={message}
+        status="responded"
+        response={{ action: "decline" }}
+      />,
+    );
+    card = screen.getByTestId("approval-card");
+    expect(card.textContent).not.toContain("**");
+    expect(within(card).getByText("Bash", { selector: "strong" })).toBeDefined();
+  });
+
+  it("leaves a policy prompt's raw command text verbatim", () => {
+    // Policy ASK reasons embed unescaped paths and globs: `_` and a single `*`
+    // are text, not markdown.
+    const message = "Agent wants to call sys_os_shell('rm *.o *.a pkg/__init__.py'). Approve?";
+    render(
+      <ApprovalCard
+        {...props}
+        phase="tool_call"
+        policyName="approve_shell_commands"
+        message={message}
+        status="pending"
+        response={null}
+      />,
+    );
+    const card = screen.getByTestId("approval-card");
+    expect(within(card).getByText(message)).toBeDefined();
+    expect(card.querySelector("strong, em")).toBeNull();
   });
 });
