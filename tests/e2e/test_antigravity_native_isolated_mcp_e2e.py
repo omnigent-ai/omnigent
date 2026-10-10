@@ -70,7 +70,7 @@ def _agy_loaded_mcp_servers(gemini_dir: Path, *, cwd: Path) -> set[str]:
             try:
                 child.read_nonblocking(4096, timeout=1)
             except pexpect.TIMEOUT:
-                pass
+                pass  # no new TUI output this second; the log scan below still runs
             except pexpect.EOF:
                 break
             for log_path in sorted(log_dir.glob("*.log")) if log_dir.is_dir() else []:

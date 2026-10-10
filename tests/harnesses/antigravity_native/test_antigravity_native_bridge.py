@@ -1549,23 +1549,38 @@ def test_write_mcp_config_reseed_refreshes_user_servers(
 
 
 @pytest.mark.parametrize(
-    "payload", ["{not json", "[]", '{"mcpServers": []}', '{"mcpServers": "graft"}']
+    "payload",
+    [
+        "{not json",
+        "[]",
+        '{"mcpServers": []}',
+        '{"mcpServers": "graft"}',
+        "[" * 100_000 + "]" * 100_000,
+    ],
+    ids=["not-json", "array", "servers-array", "servers-string", "deeply-nested"],
 )
 def test_write_mcp_config_tolerates_malformed_user_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, payload: str
 ) -> None:
-    """A malformed user config degrades to the relay alone instead of failing the launch."""
+    """A malformed user config degrades to the relay alone, with a warning, instead of failing."""
     fake_home = tmp_path / "real-home"
     _write_user_mcp_config(fake_home, payload)
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    path = write_mcp_config(bridge_dir, python_executable="python-test")
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
 
     servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
     assert set(servers) == {"omnigent"}
     assert servers["omnigent"]["command"] == "python-test"
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _mod.__name__ and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1 and "seeding only the Omnigent relay" in warnings[0]
 
 
 def test_write_mcp_config_without_user_config_seeds_only_the_relay(
@@ -1584,6 +1599,33 @@ def test_write_mcp_config_without_user_config_seeds_only_the_relay(
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
     assert not [record for record in caplog.records if record.name == _mod.__name__]
+
+
+def test_isolated_agy_launch_prep_keeps_user_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The isolated --gemini_dir config carries the user's ~/.gemini MCP servers plus the relay."""
+    fake_home = tmp_path / "real-home"
+    user_config = fake_home / ".gemini" / "config" / "mcp_config.json"
+    user_config.parent.mkdir(parents=True)
+    user_servers = {
+        "graft": {"command": "/usr/local/bin/graft", "args": ["mcp"]},
+        "graphify": {"command": "/usr/local/bin/graphify", "args": ["mcp"]},
+    }
+    user_config.write_text(json.dumps({"mcpServers": user_servers}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Both launch paths prepare the isolated dir in this order before starting agy.
+    write_mcp_config(bridge_dir, python_executable="python-test")
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_config = agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
+    servers = json.loads(iso_config.read_text(encoding="utf-8"))["mcpServers"]
+    assert servers["omnigent"]["command"] == "python-test"
+    assert {name: servers.get(name) for name in user_servers} == user_servers
+    assert json.loads(user_config.read_text(encoding="utf-8")) == {"mcpServers": user_servers}
 
 
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:

@@ -553,13 +553,13 @@ def write_mcp_config(
 
 
 def _load_user_mcp_config(real_home: Path) -> dict[str, object]:
-    """Load the user's real agy MCP config; a missing or malformed file yields ``{}``."""
+    """Load the user's real agy MCP config, dropping a malformed file or ``mcpServers`` map."""
     path = real_home / ".gemini" / _MCP_CONFIG_DIR / _MCP_CONFIG_FILE
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         _logger.warning(
             "Could not read the user's agy MCP config at %s; seeding only the Omnigent relay",
             path,
@@ -571,6 +571,12 @@ def _load_user_mcp_config(real_home: Path) -> dict[str, object]:
             "agy MCP config at %s is not a JSON object; seeding only the Omnigent relay", path
         )
         return {}
+    if "mcpServers" in loaded and not isinstance(loaded["mcpServers"], dict):
+        _logger.warning(
+            "agy MCP config at %s has a non-object mcpServers; seeding only the Omnigent relay",
+            path,
+        )
+        loaded["mcpServers"] = {}
     return loaded
 
 
