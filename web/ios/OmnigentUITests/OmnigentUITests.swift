@@ -46,7 +46,13 @@ final class OmnigentUITests: XCTestCase {
     XCTAssertTrue(download.waitForExistence(timeout: 30))
     sleep(2)
     download.tap()
-    sleep(7)
+    if ProcessInfo.processInfo.environment["OMNIGENT_EXPECT_DOWNLOAD_SHARE_SHEET"] == "1" {
+      XCTAssertTrue(
+        app.sheets.firstMatch.waitForExistence(timeout: 30),
+        "Expected the native share sheet after the download finished."
+      )
+    }
+    sleep(5)
   }
 
   func testLocalServerSnapshot() throws {

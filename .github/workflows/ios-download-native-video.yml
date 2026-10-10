@@ -69,6 +69,7 @@ jobs:
       - name: Record after fix
         env:
           DEVICE_ID: ${{ steps.simulator.outputs.id }}
+          OMNIGENT_EXPECT_DOWNLOAD_SHARE_SHEET: "1"
         run: |
           set -euo pipefail
           cp /tmp/OmnigentWebView.fixed.swift web/ios/Omnigent/OmnigentWebView.swift
