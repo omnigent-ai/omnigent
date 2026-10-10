@@ -4959,6 +4959,7 @@ def test_inject_user_message_outlasts_slow_submit_acceptance(
         raising=False,
     )
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(claude_native_bridge, "_MESSAGE_PASTE_SEPARATION_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,

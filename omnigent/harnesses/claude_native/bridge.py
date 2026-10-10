@@ -302,13 +302,10 @@ _DIALOG_FOOTER_RE = re.compile(
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
-_PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
-# How long to wait for the pasted draft to visibly land in Claude's
-# input box before sending the submit Enter. Claude Code coalesces
-# rapid stdin bursts into a paste, so an Enter sent while the TUI is
-# still consuming the paste gets folded in as a newline instead of
-# submitting — the draft then sits unsent. Polling for the draft makes
-# the handoff deterministic where the old fixed sleep raced it.
+_MESSAGE_PASTE_SEPARATION_S = 2.0
+_PASTE_SETTLE_S = 0.3  # let the TUI commit a paste before the separate submit Enter
+# Wait for the pasted draft before Enter; an Enter inside the paste burst
+# becomes a newline instead of submitting.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
@@ -4005,6 +4002,41 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+def _wait_for_paste_settlement(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+    pasted_at: float,
+    recognized: bool,
+) -> None:
+    """Allow the paste input burst and visible draft to settle before submission."""
+    started = time.monotonic()
+    deadline = started + _PASTE_COMMIT_TIMEOUT_S
+    previous_draft: str | None = None
+    stable_since = started
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
+        row = _composer_row(pane)
+        draft = "".join(row.split()) if row is not None else None
+        if draft != previous_draft:
+            previous_draft = draft
+            stable_since = time.monotonic()
+        matches = _draft_in_input_box(pane, needle)
+        recognized |= matches
+        if (
+            matches
+            and time.monotonic() - stable_since >= _PASTE_SETTLE_S
+            and time.monotonic() - pasted_at >= _MESSAGE_PASTE_SEPARATION_S
+        ):
+            return
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if recognized:
+        raise ClaudeTerminalDialog("Claude draft did not settle before Enter; message not sent.")
+
+
 @delivery_diagnostics.trace_delivery(
     session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
 )
@@ -4208,6 +4240,7 @@ def _paste_and_submit(
             "-t",
             tmux_target,
         )
+        pasted_at = time.monotonic()
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
@@ -4250,6 +4283,15 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    delivery_diagnostics.set_stage("settling_paste")
+    _wait_for_paste_settlement(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        needle=needle,
+        pasted_at=pasted_at,
+        recognized=draft_seen,
+    )
     delivery_diagnostics.set_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
