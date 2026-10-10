@@ -3240,6 +3240,28 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("selects the remembered host when the stored id carries the legacy host_ prefix", async () => {
+    // Older desktop builds saved this machine's id as "host_<hex>", while the
+    // server lists it under the bare hex id. The second online host keeps the
+    // single-host "This machine" label out of the way.
+    const hostId = "6a21c2e26b0a4cc9b4aa311601a4a198";
+    localStorage.setItem("omnigent:last-host-choice", `host_${hostId}`);
+    mockHosts(
+      [
+        host("online", 1),
+        { host_id: hostId, name: "machine-legacy", owner: "me", status: "online" },
+      ],
+      { isFetching: false },
+    );
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        "Host: machine-legacy, Online",
+      ),
+    );
+  });
+
   it.each([false, true])(
     "restores an offline remembered host and requires an explicit switch (managed=%s)",
     async (managedSandboxesEnabled) => {
