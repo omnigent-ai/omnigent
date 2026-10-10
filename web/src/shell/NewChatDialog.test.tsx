@@ -1289,7 +1289,7 @@ function mockClaudeModels(
 }
 
 function renderLanding(
-  infoOverrides: Partial<ServerInfo> = {},
+  infoOverrides: Partial<ServerInfo> | "loading" = {},
   route = "/",
   onRender?: ProfilerOnRenderCallback,
   strictMode = false,
@@ -1297,7 +1297,9 @@ function renderLanding(
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  const info: ServerInfo = {
+  // "loading" renders the composer before the /v1/info probe has resolved.
+  const overrides = infoOverrides === "loading" ? {} : infoOverrides;
+  const resolved: ServerInfo = {
     accounts_enabled: false,
     single_user: false,
     login_url: null,
@@ -1314,13 +1316,14 @@ function renderLanding(
     // gateway-gating cases below were written against (off-gateway family → no
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
-    smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
-    features: { harness_install: infoOverrides.harness_install_enabled === true },
+    smart_routing_sources: { external: overrides.smart_routing_enabled === true, oss: false },
+    features: { harness_install: overrides.harness_install_enabled === true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
-    ...infoOverrides,
+    ...overrides,
   };
+  const info: ServerInfo | "loading" = infoOverrides === "loading" ? "loading" : resolved;
   return render(
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={info}>
@@ -10632,6 +10635,40 @@ describe("managed sandbox inference models", () => {
     expect(body.host_type).toBe("managed");
     expect(body.model_override).toBeUndefined();
     expect(body.inference_configuration_revision).toBeUndefined();
+  });
+
+  it("offers the harness default only once the server capabilities are known", () => {
+    mockHosts([]);
+    const sandboxInfo = {
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+    };
+    // A return visit restores a draft with the Sandbox target and Codex selected
+    // before the /v1/info probe has resolved.
+    const first = renderLanding(sandboxInfo);
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeInTheDocument();
+    selectAgent("a2");
+    first.unmount();
+    localStorage.clear();
+
+    const loading = renderLanding("loading");
+    openAgentModels("a2");
+    const pending = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(pending).getByText("Loading models…")).toBeInTheDocument();
+    expect(within(pending).queryByText("Models unavailable")).toBeNull();
+    expect(within(pending).queryByTestId("new-chat-landing-agent-model-default")).toBeNull();
+    closeMenu();
+    loading.unmount();
+
+    renderLanding(sandboxInfo);
+    openAgentModels("a2");
+    const resolved = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(resolved).queryByText("Loading models…")).toBeNull();
+    expect(within(resolved).getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
   });
 
   it.each(["lakebox", "kubernetes", "agent_sandbox", "modal"])(
