@@ -296,6 +296,19 @@ describe("CreateScheduledTaskDialog validation", () => {
 });
 
 describe("CreateScheduledTaskDialog prefill (seed-on-open + reset)", () => {
+  it("highlights template spans while keeping the Name input value unchanged", () => {
+    const name = "Test Automation {{MMM DD}}";
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName={name} />);
+
+    const input = screen.getByTestId("task-name-input");
+    const overlay = screen.getByTestId("task-name-template-overlay");
+    const highlight = overlay.querySelector("mark[data-template-placeholder]");
+    expect(input).toHaveValue(name);
+    expect(highlight).toHaveTextContent("{{MMM DD}}");
+    expect(highlight?.previousSibling?.textContent).toBe("Test Automation ");
+    expect(overlay).toHaveTextContent(name);
+  });
+
   it("seeds Name + Prompt from initialName/initialPrompt when opened", () => {
     render(
       <CreateScheduledTaskDialog

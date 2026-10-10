@@ -18,10 +18,11 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -354,6 +355,64 @@ def _task(**overrides: Any) -> ScheduledTask:
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_now", [False, True])
+async def test_session_name_uses_worker_start_in_task_timezone(
+    monkeypatch: pytest.MonkeyPatch, run_now: bool
+) -> None:
+    # 2026-10-03 03:30 UTC is still Oct 2 in New York.
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1790998200)
+    task = _task(
+        name="Open PR Rebase - {{YYYY-MM-DD HH:mm}}",
+        prompt="Do not render {{YYYY}} in the prompt",
+        timezone="America/New_York",
+        state="paused" if run_now else "active",
+    )
+    store = FakeScheduledTaskStore(rows={task.id: task})
+    conversations = FakeConversationStore()
+    launch = AsyncMock()
+    deps = _deps(store, conversation_store=conversations)
+    callback = (build_run_now if run_now else build_on_fire)(deps, launch_dispatch=launch)
+    await callback(0, task.id)
+    await _drain()
+    assert conversations.created[0]["title"] == "Open PR Rebase - 2026-10-02 23:30"
+    assert launch.await_args.args[1].prompt == task.prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["invalid", "timezone", "unexpected"])
+async def test_session_name_failure_uses_literal_name(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    caplog.set_level(logging.WARNING, logger=fire_mod.__name__)
+    task = _task(name="Deploy {{env}} {{YYYY}}")
+    if failure == "timezone":
+        task = _task(name="Deploy {{YYYY}}", timezone="unknown/timezone")
+    elif failure == "unexpected":
+        monkeypatch.setattr(fire_mod, "render_session_name", Mock(side_effect=RuntimeError))
+    store = FakeScheduledTaskStore(rows={task.id: task})
+    conversations = FakeConversationStore()
+    launch = AsyncMock()
+    callback = build_on_fire(
+        _deps(store, conversation_store=conversations), launch_dispatch=launch
+    )
+    await callback(0, task.id)
+    await _drain()
+    assert conversations.created[0]["title"] == task.name
+    assert store.runs[0]["status"] == "running"
+    launch.assert_awaited_once()
+    record = next(
+        record for record in caplog.records if "name rendering failed" in record.getMessage()
+    )
+    expected_level, expected_exc_info = {
+        "invalid": (logging.WARNING, False),
+        "timezone": (logging.WARNING, False),
+        "unexpected": (logging.ERROR, True),
+    }[failure]
+    assert record.levelno == expected_level
+    assert (record.exc_info is not None) is expected_exc_info
 
 
 async def _drain() -> None:

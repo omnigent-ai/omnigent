@@ -313,7 +313,7 @@ describe("suggestion prefill", () => {
     fireEvent.click(screen.getByTestId("suggestion-follow-up-monitor"));
     const dialog = screen.getByTestId("manual-dialog-open");
     // The fuller prefill.name/prompt are passed (NOT the short chip label).
-    expect(dialog.getAttribute("data-initial-name")).toBe("Follow-up monitor");
+    expect(dialog.getAttribute("data-initial-name")).toBe("Follow-up monitor - {{ddd, MMM DD}}");
     expect(dialog.getAttribute("data-initial-prompt")).toContain("Review recent email");
   });
 
@@ -333,14 +333,14 @@ describe("suggestion prefill", () => {
     // Open from one chip → seeded.
     fireEvent.click(screen.getByTestId("suggestion-follow-up-monitor"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
-      "Follow-up monitor",
+      "Follow-up monitor - {{ddd, MMM DD}}",
     );
 
     // The stub dialog reports open via the `open` prop; simulate a close by
     // clicking a different chip (reseed) — the new suggestion's values win.
     fireEvent.click(screen.getByTestId("suggestion-pr-sweep"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
-      "PR sweep",
+      "PR sweep - {{YYYY-MM-DD}}",
     );
 
     // Now the plain manual open must be EMPTY — no stale prefill from the chips.
