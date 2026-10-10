@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import click
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.terminal import tmux_reports_target_gone
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -645,8 +646,21 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _session_alive(socket_path: str, tmux_target: str) -> bool:
-    """Return whether the tmux session/pane still exists (the TUI is running)."""
+class CursorPaneGoneError(RuntimeError):
+    """Raised when tmux confirms the advertised Cursor pane is gone (expected teardown)."""
+
+
+def _probe_session(socket_path: str, tmux_target: str) -> bool | None:
+    """Return whether the pane exists, or ``None`` when the probe is inconclusive.
+
+    ``True``/``False`` are returned only for a definitive ``tmux has-session``
+    answer (exit 0, or a nonzero exit whose stderr confirms the session is gone).
+    A probe that could not run, or failed for another operational reason (a
+    permission error, or a loader failure that keeps the tmux client from
+    starting), returns ``None`` so callers keep treating a delivery failure as a
+    genuine error. Classification reuses :func:`tmux_reports_target_gone` so a
+    bare ``No such file or directory`` substring is not mistaken for teardown.
+    """
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
@@ -656,8 +670,17 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode == 0:
+        return True
+    if tmux_reports_target_gone(proc.stderr.strip()):
         return False
-    return proc.returncode == 0
+    return None
+
+
+def _session_alive(socket_path: str, tmux_target: str) -> bool:
+    """Return whether the tmux session/pane still exists (the TUI is running)."""
+    return _probe_session(socket_path, tmux_target) is True
 
 
 def capture_cursor_pane(bridge_dir: Path) -> str | None:
@@ -693,13 +716,24 @@ def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :param keys: tmux key arguments, e.g. ``"y"`` or ``"Escape"``.
+    :raises CursorPaneGoneError: If tmux confirms the advertised pane no longer
+        exists (the TUI exited or its tmux server was torn down).
     :raises RuntimeError: If the tmux target is not advertised or the
-        ``send-keys`` invocation fails.
+        ``send-keys`` invocation fails without tmux confirming the pane is gone.
     """
     info = read_tmux_info(bridge_dir)
     if info is None:
         raise RuntimeError("cursor-native tmux target not advertised")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    try:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+    except RuntimeError as exc:
+        # send-keys fails both when the pane was torn down and on a genuine
+        # delivery failure. Re-probe and report the pane as gone only when the
+        # probe confirms it; a live or inconclusive probe keeps the error.
+        if _probe_session(socket_path, tmux_target) is False:
+            raise CursorPaneGoneError("cursor pane no longer exists (TUI exited)") from exc
+        raise
 
 
 def _submit_needle(content: str) -> str:
