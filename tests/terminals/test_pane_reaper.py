@@ -14,6 +14,7 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
+from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
@@ -295,3 +296,93 @@ async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(
     assert await reaper._is_busy(pane)
     instance._last_client_interaction_at = time.monotonic() - PANE_OUTPUT_BUSY_WINDOW_S - 1.0
     assert not await reaper._is_busy(pane)
+
+
+def _build_real_reaper(monkeypatch, tmp_path: Path) -> NativePaneReaper:
+    """Build the production app and hand back its real native pane reaper.
+
+    Mirrors the rig the ``_is_busy`` tests use: no tmux is available under test,
+    so the activity probes are stubbed before the app is built (they are bound by
+    name at construction time).
+    """
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_a: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_a: None)
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    return reaper
+
+
+async def _forever_forwarder_task() -> None:
+    """A restart-forever stand-in: it only ever exits via cancellation."""
+    await asyncio.Event().wait()
+
+
+class _FakeOpenCodeServer:
+    """Minimal double for an adopted OpenCode server — only ``close`` is used."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_reap_cancels_claude_transcript_forwarder(monkeypatch, tmp_path: Path) -> None:
+    """An idle reap of a claude pane cancels the session's live forwarder.
+
+    Before the fix, ``_reap_native_pane`` only awaited
+    ``teardown_codex_native_app_server``, which early-returns for a non-codex
+    session and so never touched the forwarder — the ~4Hz restart-forever tail
+    kept polling a dead bridge dir until the host was exhausted (#8077).
+    """
+    conv = "conv_reap_claude_8077"
+    reaper = _build_real_reaper(monkeypatch, tmp_path)
+    pane = PaneRef(conv, terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock")
+
+    task = asyncio.create_task(_forever_forwarder_task())
+    native_runtime._AUTO_FORWARDER_TASKS[conv] = task
+    try:
+        await reaper._reap(pane)
+
+        assert task.cancelled()
+        assert conv not in native_runtime._AUTO_FORWARDER_TASKS
+    finally:
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+        if not task.done():
+            task.cancel()
+
+
+async def test_reap_tears_down_idle_opencode_server(monkeypatch, tmp_path: Path) -> None:
+    """An idle reap of an opencode pane closes its server and cancels its forwarder.
+
+    Mirrors the ``DELETE /v1/sessions`` teardown: ``_cancel_auto_forwarder_task``
+    plus ``teardown_opencode_native_server`` must both fire from the reap path.
+    """
+    conv = "conv_reap_opencode_8077"
+    reaper = _build_real_reaper(monkeypatch, tmp_path)
+    pane = PaneRef(
+        conv, terminal_resource_id("opencode", "main"), "opencode", tmp_path / "tmux.sock"
+    )
+
+    task = asyncio.create_task(_forever_forwarder_task())
+    server = _FakeOpenCodeServer()
+    native_runtime._AUTO_FORWARDER_TASKS[conv] = task
+    native_runtime._AUTO_OPENCODE_SERVERS[conv] = server  # type: ignore[assignment]
+    try:
+        await reaper._reap(pane)
+
+        assert server.closed
+        assert conv not in native_runtime._AUTO_OPENCODE_SERVERS
+        assert task.cancelled()
+        assert conv not in native_runtime._AUTO_FORWARDER_TASKS
+    finally:
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+        native_runtime._AUTO_OPENCODE_SERVERS.pop(conv, None)
+        if not task.done():
+            task.cancel()

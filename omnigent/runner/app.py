@@ -7655,6 +7655,15 @@ def create_runner_app(
                 # a ``codex app-server`` for the runner's lifetime even when the
                 # pane close above partially fails (the very leak this guards).
                 await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                # The restart-forever transcript forwarder (claude/qwen/cursor/
+                # opencode) is not a codex app-server, so the teardown above
+                # early-returns for it and never cancels it: on an idle reap it
+                # would keep polling a now-dead bridge dir at ~4Hz, leaking CPU
+                # and file descriptors until the host is exhausted. Mirror the
+                # ``DELETE /v1/sessions`` teardown so an idle reap cancels the
+                # forwarder and reclaims any idle-reaped opencode serve too.
+                await _cancel_auto_forwarder_task(pane.conversation_id)
+                await _native_runtime.teardown_opencode_native_server(pane.conversation_id)
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
                     terminal_name=pane.terminal_name,
