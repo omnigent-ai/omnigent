@@ -210,6 +210,8 @@ interface ChatHeaderProps {
 }
 
 const PENDING_ACTION_TITLE = "Available when the session starts";
+// Breadcrumb width the desktop header keeps before it stops centering the title.
+const MIN_BREADCRUMB_PX = 120;
 
 function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
   if (isMobile) {
@@ -306,13 +308,11 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
  * canvas shows through, and chat content dissolves before it slides
  * under the controls (the conversation viewport's ``chat-scroll-fade``
  * mask, index.css; chat reserves clearance via ``pt-20``,
- * terminal-first via ``pt-14``). On desktop (md+) the bar is a three-column
- * grid: the open-sidebar toggle on the left, the conversation breadcrumb
- * (``[folder] / <title> [/ <sub-agent>]``, with the session-actions kebab and
- * a "Move to…" project picker on the folder tag) centered on the chat pane —
- * so widening the sidebar doesn't drag the title along with the pane's left
- * edge — and the action cluster on the right. Mobile keeps the flex row with
- * the breadcrumb leading. Right slot: desktop action buttons (Agent info ·
+ * terminal-first via ``pt-14``). Desktop (md+) uses symmetric side columns to
+ * center the conversation breadcrumb (``[folder] / <title> [/ <sub-agent>]``,
+ * with the session-actions kebab and a "Move to…" project picker on the folder
+ * tag) on the chat pane; mobile keeps the flex row with the breadcrumb
+ * leading. Right slot: desktop action buttons (Agent info ·
  * Share · right-panel toggle) and, on mobile, a **single** kebab holding both
  * the session actions (pin/share/rename/project/archive/delete) and the
  * workspace-rail entries that open Files · Agents · Shells as full-screen
@@ -358,24 +358,42 @@ export function ChatHeader({
   const isMobile = useIsMobileViewport();
   const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
-  // Desktop grid: both side columns share one minimum width — the wider of the
-  // toggle slot and the action cluster — so the breadcrumb column stays centered
-  // on the pane even when only one side holds controls (see the header class).
+  // Desktop grid: reserve the wider cluster's width on both sides so the breadcrumb
+  // stays centered; a narrow pane shrinks that reservation (keeping MIN_BREADCRUMB_PX
+  // for the breadcrumb) before either side falls back to its own content width.
+  const headerRef = useRef<HTMLElement>(null);
   const leftSlotRef = useRef<HTMLDivElement>(null);
   const actionsRef = useRef<HTMLDivElement>(null);
-  const [sideColumnMinPx, setSideColumnMinPx] = useState(0);
+  const [sideColumns, setSideColumns] = useState({ left: 0, right: 0 });
   useLayoutEffect(() => {
+    const header = headerRef.current;
     const left = leftSlotRef.current;
     const right = actionsRef.current;
-    if (!left || !right || typeof ResizeObserver === "undefined") return;
-    const measure = () =>
-      setSideColumnMinPx(
-        Math.ceil(
-          Math.max(left.getBoundingClientRect().width, right.getBoundingClientRect().width),
-        ),
+    if (!header || !left || !right || typeof ResizeObserver === "undefined") return;
+    const measure = () => {
+      const style = getComputedStyle(header);
+      const inner =
+        header.clientWidth -
+        (parseFloat(style.paddingLeft) || 0) -
+        (parseFloat(style.paddingRight) || 0);
+      const gaps = 2 * (parseFloat(style.columnGap) || 0);
+      const leftWidth = left.getBoundingClientRect().width;
+      const rightWidth = right.getBoundingClientRect().width;
+      const reserve = Math.max(
+        0,
+        Math.min(Math.max(leftWidth, rightWidth), (inner - gaps - MIN_BREADCRUMB_PX) / 2),
       );
+      const next = {
+        left: Math.ceil(Math.max(leftWidth, reserve)),
+        right: Math.ceil(Math.max(rightWidth, reserve)),
+      };
+      setSideColumns((prev) =>
+        prev.left === next.left && prev.right === next.right ? prev : next,
+      );
+    };
     measure();
     const observer = new ResizeObserver(measure);
+    observer.observe(header);
     observer.observe(left);
     observer.observe(right);
     return () => observer.disconnect();
@@ -559,7 +577,13 @@ export function ChatHeader({
     ) : null;
   return (
     <header
-      style={{ "--chat-header-side": `${sideColumnMinPx}px` } as CSSProperties}
+      ref={headerRef}
+      style={
+        {
+          "--chat-header-left": `${sideColumns.left}px`,
+          "--chat-header-right": `${sideColumns.right}px`,
+        } as CSSProperties
+      }
       className={cn(
         // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
         // the 32px controls. No own background — the app canvas shows
@@ -568,10 +592,10 @@ export function ChatHeader({
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
         "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center gap-1 px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        // Desktop: a three-column grid centers the breadcrumb on the pane. Both
-        // side columns start at the measured --chat-header-side, so an empty toggle
-        // slot still mirrors the action cluster; the breadcrumb truncates first.
-        "md:grid md:grid-cols-[minmax(var(--chat-header-side,0px),1fr)_auto_minmax(var(--chat-header-side,0px),1fr)] md:gap-6",
+        // Desktop: a three-column grid centers the breadcrumb on the pane. Each side
+        // column starts at its measured reservation (sideColumns), so an empty toggle
+        // slot mirrors the action cluster; the breadcrumb truncates first.
+        "md:grid md:grid-cols-[minmax(var(--chat-header-left,0px),1fr)_auto_minmax(var(--chat-header-right,0px),1fr)] md:gap-6",
         settingsMode && "settings-mobile-header",
       )}
     >
@@ -613,13 +637,9 @@ export function ChatHeader({
         )}
       </div>
 
-      {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
-          landing composer. A resolved title is enough; so is titleLinkTo —
-          a child must keep its climb-out while the parent title loads.
-          Desktop centers it in the grid's middle column; mobile keeps it
-          flowing after the toggle. min-w-0 lets it truncate rather than push
-          the right-hand action cluster, and max-w-full keeps the centered (so
-          unstretched) grid item from overflowing its column. */}
+      {/* Conversation breadcrumb; empty on the landing composer. titleLinkTo alone
+          suffices so a child keeps its climb-out while the parent title loads;
+          max-w-full keeps the centered (unstretched) grid item inside its column. */}
       {conversationId && (conversationTitle || titleLinkTo) && (
         <div className="flex min-w-0 max-w-full flex-1 items-center md:col-start-2 md:row-start-1 md:justify-self-center">
           <ConversationBreadcrumb
@@ -641,6 +661,7 @@ export function ChatHeader({
 
       <div
         ref={actionsRef}
+        data-testid="header-actions"
         className="ml-auto flex shrink-0 items-center gap-2 max-md:gap-0 max-md:empty:hidden md:col-start-3 md:row-start-1 md:ml-0 md:justify-self-end"
       >
         {/* Other users currently viewing this session (presence).

@@ -225,43 +225,43 @@ describe("ChatHeader — workspace pane alignment", () => {
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
   });
 
-  it("centers the desktop breadcrumb on the pane, independent of the sidebar", () => {
+  it("centers the desktop breadcrumb between symmetric side columns", () => {
     const { container } = renderHeader({
       sidebarOpen: true,
       conversationId: "conv-1",
       conversationTitle: "Centering check",
+      canShare: true,
     });
     const header = container.querySelector("header");
-    const breadcrumb = screen.getByRole("navigation", { name: "Conversation" });
-    const slot = breadcrumb.parentElement;
+    const slot = screen.getByRole("navigation", { name: "Conversation" }).parentElement;
+    const cluster = screen.getByTestId("header-actions");
 
-    // The grid pins the breadcrumb to the middle column between side columns
-    // that share one minimum width, so its midpoint tracks the pane's center
-    // rather than the sidebar's edge; max-w-full keeps it inside that column.
+    // Middle column between side columns that start at the measured reservations;
+    // max-w-full keeps the centered item inside its column.
     expect(header).toHaveClass(
       "md:grid",
-      "md:grid-cols-[minmax(var(--chat-header-side,0px),1fr)_auto_minmax(var(--chat-header-side,0px),1fr)]",
+      "md:grid-cols-[minmax(var(--chat-header-left,0px),1fr)_auto_minmax(var(--chat-header-right,0px),1fr)]",
     );
-    expect(slot).toHaveClass("md:col-start-2", "md:justify-self-center", "min-w-0", "max-w-full");
     expect(header).not.toHaveClass("justify-between");
+    expect(slot).toHaveClass("md:col-start-2", "md:justify-self-center", "min-w-0", "max-w-full");
+    expect(cluster).toHaveClass("md:col-start-3", "md:justify-self-end");
+    expect(cluster).toContainElement(screen.getByRole("button", { name: "Share session" }));
   });
 
-  it("reserves the wider side cluster's width for both side columns", () => {
-    const measure = vi
+  // Renders with an empty toggle slot and a 138px action cluster inside a header
+  // whose content box is `headerWidth` wide; returns the side-column variables.
+  function renderSideColumns(headerWidth: number) {
+    const rect = vi
       .spyOn(HTMLElement.prototype, "getBoundingClientRect")
       .mockImplementation(function (this: HTMLElement) {
-        // Only the action cluster has width here; the toggle slot is empty.
-        const width = this.classList.contains("md:col-start-3") ? 138 : 0;
-        return {
-          width,
-          height: 0,
-          x: 0,
-          y: 0,
-          top: 0,
-          left: 0,
-          right: width,
-          bottom: 0,
-        } as DOMRect;
+        const width = this.dataset.testid === "header-actions" ? 138 : 0;
+        const box = { width, height: 0, x: 0, y: 0, top: 0, left: 0, right: width, bottom: 0 };
+        return { ...box, toJSON: () => box };
+      });
+    const clientWidth = vi
+      .spyOn(Element.prototype, "clientWidth", "get")
+      .mockImplementation(function (this: Element) {
+        return this.tagName === "HEADER" ? headerWidth : 0;
       });
     try {
       const { container } = renderHeader({
@@ -270,25 +270,25 @@ describe("ChatHeader — workspace pane alignment", () => {
         conversationTitle: "Centering check",
         canShare: true,
       });
-      const header = container.querySelector("header");
-      expect(header?.style.getPropertyValue("--chat-header-side")).toBe("138px");
+      const style = container.querySelector("header")!.style;
+      return [
+        style.getPropertyValue("--chat-header-left"),
+        style.getPropertyValue("--chat-header-right"),
+      ];
     } finally {
-      measure.mockRestore();
+      rect.mockRestore();
+      clientWidth.mockRestore();
     }
+  }
+
+  it("reserves the action cluster's width on both sides of a roomy header", () => {
+    expect(renderSideColumns(1000)).toEqual(["138px", "138px"]);
   });
 
-  it("keeps the action cluster in the right grid column", () => {
-    const { container } = renderHeader({
-      sidebarOpen: true,
-      conversationId: "conv-1",
-      conversationTitle: "Centering check",
-      canShare: true,
-    });
-    const share = screen.getByRole("button", { name: "Share session" });
-    const cluster = share.parentElement;
-
-    expect(cluster).toHaveClass("md:col-start-3", "md:justify-self-end");
-    expect(container.querySelector("header")).not.toBeNull();
+  it("shrinks the empty side's reservation before a narrow header overflows", () => {
+    // 300px minus the 120px breadcrumb minimum leaves 90px per side; the
+    // populated side keeps its own 138px.
+    expect(renderSideColumns(300)).toEqual(["90px", "138px"]);
   });
 });
 

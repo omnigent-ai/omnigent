@@ -106,7 +106,29 @@ _LONG_TITLE = (
     "Investigate why the nightly release pipeline keeps timing out while publishing "
     "the desktop installers, then draft a fix and a rollout plan for the team"
 )
-_HEADER_ACTIONS = "header.chat-header > div:last-child"
+_NARROW_VIEWPORT = {"width": 960, "height": 800}
+_NARROW_SIDEBAR_PX = 480  # the sidebar's 50%-of-viewport ceiling at this width
+# The breadcrumb is one centered grid item, so its midpoint lands on the pane's
+# midpoint up to sub-pixel rounding; the title inside it may sit off-center.
+_BREADCRUMB_TOLERANCE_PX = 4
+
+
+def _open_titled_session(page: Page, base_url: str, session_id: str, title: str) -> None:
+    page.goto(f"{base_url}/c/{session_id}")
+    header_title = page.get_by_test_id("header-title")
+    expect(header_title).to_be_visible(timeout=30_000)
+    expect(header_title).to_have_text(title)
+    expect(page.locator(_CONVERSATIONS)).not_to_have_attribute("data-collapsed", "true")
+    expect(page.get_by_role("main")).to_be_visible()
+    page.wait_for_timeout(_LAYOUT_SETTLE_MS)
+
+
+def _close_workspace_panel(page: Page) -> None:
+    """Keep the chat pane at its full width; the panel's default state varies."""
+    collapse = page.get_by_role("button", name="Collapse right panel")
+    if collapse.count() and collapse.first.is_visible():
+        collapse.first.click()
+        page.wait_for_timeout(_LAYOUT_SETTLE_MS)
 
 
 @pytest.mark.browser_context_args(viewport=_VIEWPORT, record_video_size=_VIEWPORT)
@@ -120,25 +142,17 @@ def test_long_header_title_truncates_centered_inside_the_chat_pane(
     _set_title(base_url, session_id, _LONG_TITLE)
 
     page: Page = request.getfixturevalue("page")
-    page.goto(f"{base_url}/c/{session_id}")
-
-    title = page.get_by_test_id("header-title")
-    expect(title).to_be_visible(timeout=30_000)
-    expect(title).to_have_text(_LONG_TITLE)
-    sidebar = page.locator(_CONVERSATIONS)
-    expect(sidebar).not_to_have_attribute("data-collapsed", "true")
-    pane = page.get_by_role("main")
-    expect(pane).to_be_visible()
-    page.wait_for_timeout(_LAYOUT_SETTLE_MS)
-
+    _open_titled_session(page, base_url, session_id, _LONG_TITLE)
     _drag_sidebar_edge_to(page, _SIDEBAR_TARGET_PX)
 
-    sidebar_box = sidebar.bounding_box()
-    pane_box = pane.bounding_box()
+    sidebar_box = page.locator(_CONVERSATIONS).bounding_box()
+    pane_box = page.get_by_role("main").bounding_box()
+    title = page.get_by_test_id("header-title")
     title_box = title.bounding_box()
-    actions_box = page.locator(_HEADER_ACTIONS).bounding_box()
+    crumb_box = page.get_by_role("navigation", name="Conversation").bounding_box()
+    actions_box = page.get_by_test_id("header-actions").bounding_box()
     assert sidebar_box is not None and pane_box is not None
-    assert title_box is not None and actions_box is not None
+    assert title_box is not None and crumb_box is not None and actions_box is not None
     sidebar_right = sidebar_box["x"] + sidebar_box["width"]
     pane_right = pane_box["x"] + pane_box["width"]
     title_right = title_box["x"] + title_box["width"]
@@ -156,9 +170,55 @@ def test_long_header_title_truncates_centered_inside_the_chat_pane(
         f"title runs under the header actions: title ends at {title_right:.0f}px, "
         f"actions start at {actions_box['x']:.0f}px"
     )
-    offset = _center_x(title_box) - _center_x(pane_box)
-    assert abs(offset) <= _CENTER_TOLERANCE_PX, (
-        f"truncated title is not centered on the chat pane: title midpoint "
-        f"{_center_x(title_box):.0f}px vs pane midpoint {_center_x(pane_box):.0f}px "
-        f"(offset {offset:+.0f}px, tolerance {_CENTER_TOLERANCE_PX}px)"
+    offset = _center_x(crumb_box) - _center_x(pane_box)
+    assert abs(offset) <= _BREADCRUMB_TOLERANCE_PX, (
+        f"truncated breadcrumb is not centered on the chat pane: breadcrumb midpoint "
+        f"{_center_x(crumb_box):.0f}px vs pane midpoint {_center_x(pane_box):.0f}px "
+        f"(offset {offset:+.0f}px, tolerance {_BREADCRUMB_TOLERANCE_PX}px)"
+    )
+
+
+@pytest.mark.browser_context_args(viewport=_NARROW_VIEWPORT, record_video_size=_NARROW_VIEWPORT)
+def test_narrow_chat_pane_keeps_the_title_visible_and_the_controls_inside(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """At a 480px pane the title stays readable and centered, and every header
+    control stays inside the pane instead of overflowing past its right edge."""
+    base_url, session_id = seeded_session
+    _set_title(base_url, session_id, _TITLE)
+
+    page: Page = request.getfixturevalue("page")
+    _open_titled_session(page, base_url, session_id, _TITLE)
+    _close_workspace_panel(page)
+    _drag_sidebar_edge_to(page, _NARROW_SIDEBAR_PX)
+
+    pane_box = page.get_by_role("main").bounding_box()
+    title_box = page.get_by_test_id("header-title").bounding_box()
+    crumb_box = page.get_by_role("navigation", name="Conversation").bounding_box()
+    actions = page.get_by_test_id("header-actions")
+    actions_box = actions.bounding_box()
+    assert pane_box is not None and title_box is not None
+    assert crumb_box is not None and actions_box is not None
+    pane_right = pane_box["x"] + pane_box["width"]
+    assert pane_box["width"] <= _NARROW_SIDEBAR_PX + 2, pane_box
+
+    assert title_box["width"] >= 40, (
+        f"title collapsed to {title_box['width']:.0f}px inside a {pane_box['width']:.0f}px pane"
+    )
+    assert crumb_box["x"] >= pane_box["x"] - 1, (crumb_box, pane_box)
+    assert crumb_box["x"] + crumb_box["width"] <= actions_box["x"] + 1, (crumb_box, actions_box)
+    assert actions_box["x"] + actions_box["width"] <= pane_right + 1, (
+        f"header actions overflow the pane: actions end at "
+        f"{actions_box['x'] + actions_box['width']:.0f}px, pane ends at {pane_right:.0f}px"
+    )
+    for control in actions.get_by_role("button").all():
+        box = control.bounding_box()
+        assert box is not None and box["x"] + box["width"] <= pane_right + 1, (
+            f"{control.get_attribute('aria-label')} sits outside the pane: {box}"
+        )
+    offset = _center_x(crumb_box) - _center_x(pane_box)
+    assert abs(offset) <= _BREADCRUMB_TOLERANCE_PX, (
+        f"breadcrumb is not centered in the narrow pane: midpoint {_center_x(crumb_box):.0f}px "
+        f"vs pane midpoint {_center_x(pane_box):.0f}px (offset {offset:+.0f}px)"
     )
