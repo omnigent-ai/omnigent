@@ -79,6 +79,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   connection_error:
     "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
+  output_limit_exceeded: "The model's response hit its maximum output length and was cut off.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
   session_agent_missing:

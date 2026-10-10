@@ -1593,6 +1593,38 @@ def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str)
     assert "/clear" in text
 
 
+# The constant Claude Code writes when a response ends with stop_reason
+# "max_tokens" (read out of @anthropic-ai/claude-code 2.1.268).
+_RAW_OUTPUT_LIMIT_ERROR = (
+    "API Error: Claude's response exceeded the 32000 output token maximum. "
+    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
+    "environment variable."
+)
+# The same record without the "API Error: " prefix, at a raised, comma-formatted
+# limit and with a typographic apostrophe.
+_RAW_OUTPUT_LIMIT_ERROR_VARIANT = (
+    "Claude’s response exceeded the 64,000 output token maximum. To configure "
+    "this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+)
+
+
+@pytest.mark.parametrize("raw_text", [_RAW_OUTPUT_LIMIT_ERROR, _RAW_OUTPUT_LIMIT_ERROR_VARIANT])
+def test_read_transcript_rewrites_output_token_limit(tmp_path: Path, raw_text: str) -> None:
+    """The CLI's flagged output-token-limit error becomes guidance the web user can act on."""
+    text = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert text.startswith("Output limit reached")
+    assert "shorter" in text
+    assert "smaller pieces" in text
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in text
+    assert "output token maximum" not in text
+
+
+def test_read_transcript_leaves_unflagged_output_token_text_untouched(tmp_path: Path) -> None:
+    """A model reply quoting the constant verbatim is unflagged, so it is forwarded as-is."""
+    assert _assistant_transcript_text(tmp_path, _RAW_OUTPUT_LIMIT_ERROR) == _RAW_OUTPUT_LIMIT_ERROR
+
+
 def _assistant_transcript_text(
     tmp_path: Path,
     raw_text: str,
@@ -7970,6 +8002,23 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert login.failure_message is not None
     assert login.failure_message.startswith("Login expired · Please run /login\n\n")
     assert "omni setup" in login.failure_message
+
+
+def test_hook_record_stop_failure_output_limit_details_are_rewritten() -> None:
+    """The output-token-limit constant in ``error_details`` becomes the same guidance."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "max_output_tokens",
+                "error_details": _RAW_OUTPUT_LIMIT_ERROR,
+            }
+        )
+    )
+    assert record.failure_category == "max_output_tokens"
+    assert record.failure_message is not None
+    assert record.failure_message.startswith("Output limit reached")
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in record.failure_message
 
 
 def test_hook_record_stop_failure_last_assistant_message_not_used() -> None:

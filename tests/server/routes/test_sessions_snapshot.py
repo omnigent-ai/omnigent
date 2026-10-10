@@ -610,6 +610,16 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
             'version 2.1.280 or newer is required."}',
             "client_update_required",
         ),
+        (
+            "Output limit reached — the response exceeded the model’s maximum output "
+            "length and was cut off. Ask for a shorter answer, or break the request "
+            "into smaller pieces and continue step by step.",
+            "output_limit_exceeded",
+        ),
+        (
+            "Claude Code ended the turn with an API error (max_output_tokens).",
+            "output_limit_exceeded",
+        ),
     ],
 )
 async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(

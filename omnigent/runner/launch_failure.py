@@ -224,6 +224,15 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# Claude Code's output-token-limit error: the raw constant ("...exceeded the 32000 output
+# token maximum"), the bridge's rewrite ("...exceeded the model's maximum output length"),
+# or the forwarder's category-only fallback "...API error (max_output_tokens)".
+_OUTPUT_LIMIT_ERROR = re.compile(
+    r"response exceeded the [\d,]+ output token maximum"
+    r"|response exceeded the model['’]s maximum output length"
+    r"|\bAPI error \(max_output_tokens\)",
+    re.IGNORECASE,
+)
 # Mid-stream upstream failures the gateway usually recovers from on its own;
 # the runner itself stays healthy, so the turn can be continued by the user.
 _TRANSIENT_UPSTREAM_FRAGMENTS = (
@@ -249,9 +258,10 @@ def classify_native_turn_error(code: str, message: str) -> str:
 
     Recognizes rate limits and transient upstream model-gateway failures so
     the web UI can offer a one-click retry instead of a terminal error, a
-    Claude Code too old for the selected model, and a content-length cap
+    Claude Code too old for the selected model, a content-length cap
     rejection (a request carrying an oversized transcript, refused by the
-    deployment's byte cap before the model sees it). Also corrects
+    deployment's byte cap before the model sees it), and a reply cut off by
+    the model's output-token cap. Also corrects
     ``codex_reauth_required`` when the message reveals that the real
     cause is a budget/usage-limit exhaustion (older runners misclassify the
     gateway's 403 as auth; the server fixes it on deploy).
@@ -269,6 +279,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return "client_update_required"
     if detect_request_size_overflow(message) is not None:
         return "context_length_exceeded"
+    if _OUTPUT_LIMIT_ERROR.search(message):
+        return "output_limit_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:
@@ -327,6 +339,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "runner_unavailable": "The session's runner isn't connected to the server.",
     "connection_error": "The connection to the agent dropped mid-turn.",
     "context_length_exceeded": "The conversation grew past the model's context window.",
+    "output_limit_exceeded": (
+        "The model's response hit its maximum output length and was cut off."
+    ),
     "executor_error": "The agent runtime hit an error while running the turn.",
     "codex_thread_reset": (
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."

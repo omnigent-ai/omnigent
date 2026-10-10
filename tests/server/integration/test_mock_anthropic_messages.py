@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -91,3 +93,62 @@ async def test_nonstream_tool_use_has_decoded_input() -> None:
         assert message["stop_reason"] == "tool_use"
         assert message["content"][0]["name"] == "inspect"
         assert message["content"][0]["input"] == {"path": "synthetic.txt"}
+
+
+@pytest.mark.parametrize("thinking", [None, "Let me plan the long report first."])
+async def test_streamed_stop_reason_override_reaches_message_delta(thinking: str | None) -> None:
+    """A queued ``stop_reason`` ends plain and thinking replies alike."""
+    response_spec: dict[str, object] = {"text": "Here is the start —", "stop_reason": "max_tokens"}
+    if thinking is not None:
+        response_spec["thinking"] = thinking
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=mock_llm_server.app), base_url="http://mock"
+    ) as client:
+        configured = await client.post("/mock/configure", json={"responses": [response_spec]})
+        configured.raise_for_status()
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "synthetic-model",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Write the full report."}],
+                "stream": True,
+            },
+        )
+        assert response.status_code == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        deltas = [event for event in events if event.get("type") == "message_delta"]
+        assert [delta["delta"]["stop_reason"] for delta in deltas] == ["max_tokens"]
+        has_thinking = any(
+            event.get("content_block", {}).get("type") == "thinking" for event in events
+        )
+        assert has_thinking == (thinking is not None)
+
+
+async def test_nonstream_stop_reason_override_reaches_message() -> None:
+    """A queued ``stop_reason`` also ends a JSON (non-streaming) reply."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=mock_llm_server.app), base_url="http://mock"
+    ) as client:
+        configured = await client.post(
+            "/mock/configure",
+            json={"responses": [{"text": "Here is the start —", "stop_reason": "max_tokens"}]},
+        )
+        configured.raise_for_status()
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "synthetic-model",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Write the full report."}],
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        message = response.json()
+        assert message["stop_reason"] == "max_tokens"
+        assert message["content"] == [{"type": "text", "text": "Here is the start —"}]
