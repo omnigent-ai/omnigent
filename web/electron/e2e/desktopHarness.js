@@ -362,8 +362,12 @@ function startDisplayCapture(recordDir, display) {
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
  *   (defaults to a fresh temp dir).
- * @param {Record<string, string>} [opts.env] Extra environment for the app,
- *   e.g. a scratch `HOME` so credential files stay out of the real one.
+ * @param {Record<string, string | undefined>} [opts.env] Extra environment for
+ *   the app, e.g. a scratch `HOME` so credential files stay out of the real
+ *   one. An `undefined` value removes that variable from the child environment
+ *   (e.g. `DISPLAY: undefined` to force the Wayland ozone backend).
+ * @param {string[]} [opts.extraArgs] Extra Electron/Chromium switches, e.g.
+ *   `--ozone-platform=wayland`.
  * @param {string[]} [opts.preload] Modules the main process requires before
  *   `main.js`, e.g. a stand-in system browser that must exist from launch.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
@@ -396,7 +400,14 @@ async function launchDesktop(opts) {
     `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
   );
   const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
-  const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
+  const args = [
+    "-r",
+    profileBootstrap,
+    ...preloads,
+    APP_ROOT,
+    `--user-data-dir=${userDataDir}`,
+    ...(opts.extraArgs ?? []),
+  ];
   // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
   // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
   // as root or in a container — Electron's Chromium refuses to start without
@@ -406,13 +417,23 @@ async function launchDesktop(opts) {
     args.push("--no-sandbox", "--disable-dev-shm-usage");
   }
 
+  // Dev builds read dev-app-update.yml and would try to reach the update
+  // endpoint; a version override keeps the app off the update path.
+  const env = Object.fromEntries(
+    Object.entries({
+      ...process.env,
+      OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0",
+      ...(opts.env ?? {}),
+    }).filter(([, value]) => value !== undefined),
+  );
+
   // Film the composited display (window + embedded WebContentsViews) alongside
   // Playwright's per-page clips: the per-page screencast of the shell window
   // omits any WebContentsView composited over it, so on its own the "desktop
   // recording" would silently drop the very content a journey renders inside
   // an embedded browser view. The display capture becomes the primary clip in
   // saveRecording; the per-page clips remain as context.
-  const displayCapture = startDisplayCapture(opts.recordDir, process.env.DISPLAY);
+  const displayCapture = startDisplayCapture(opts.recordDir, env.DISPLAY);
 
   const stopDisplayCapture = async () => {
     if (displayCapture) await displayCapture.stop();
@@ -423,9 +444,7 @@ async function launchDesktop(opts) {
     electronApp = await electron.launch({
       args,
       recordVideo: { dir: opts.recordDir },
-      // Dev builds read dev-app-update.yml and would try to reach the update
-      // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0", ...opts.env },
+      env,
     });
   } catch (err) {
     await stopDisplayCapture();
