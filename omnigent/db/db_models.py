@@ -505,6 +505,46 @@ class SqlAccountToken(OmnigentBase):
     )
 
 
+class SqlBrowserSessionRevocation(OmnigentBase):
+    """
+    SQLAlchemy model for the ``browser_session_revocations`` table.
+
+    One row per browser session ended by logout. A session cookie JWT
+    carries a ``sid`` that survives sliding renewal; while a row for that
+    ``sid`` exists, neither the cookie nor any renewal of it authenticates.
+    Shared by every replica and durable across restarts.
+
+    No column has a SQL ``DEFAULT``: the application supplies every value.
+    The epoch columns are 64-bit because ``expires_at`` follows the
+    configurable session lifetime and can pass the 32-bit limit (2038).
+
+    :param sid: The ended session's ``sid`` claim.
+    :param user_id: The session's user (``sub``), for audit.
+    :param revoked_at: Unix epoch seconds of the logout.
+    :param expires_at: Unix epoch seconds after which no token of the
+        session can be valid anyway (``auth_time`` + max lifetime); the
+        row may be purged from then on.
+    """
+
+    __tablename__ = "browser_session_revocations"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    sid: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    revoked_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_browser_session_revocations_expires_at", "workspace_id", "expires_at", "sid"),
+    )
+
+
 class SqlConnection(OmnigentBase):
     """
     SQLAlchemy model for the ``connections`` table.
