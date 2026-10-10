@@ -352,3 +352,65 @@ async def test_reject_question_posts_global_endpoint() -> None:
     assert seen["method"] == "POST"
     assert seen["path"] == "/question/que_1/reject"
     await client.aclose()
+
+
+async def test_owned_client_bypasses_proxy_env_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A proxy that cannot route 127.0.0.1 must not black-hole calls to the
+    # loopback opencode serve; the server is reachable without any proxy.
+    import http.server
+    import socket
+    import socketserver
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"models": [{"id": "opencode-go/stub"}]}')
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    stub_port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    # Keep probe bound (never listening) so dead_port refuses connects deterministically.
+    proxy = f"http://127.0.0.1:{dead_port}"
+
+    client = None
+    try:
+        for var in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ):
+            monkeypatch.setenv(var, proxy)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+
+        client = OpenCodeClient(f"http://127.0.0.1:{stub_port}")
+        assert await client.list_models() == [{"id": "opencode-go/stub"}]
+    finally:
+        if client is not None:
+            await client.aclose()
+        probe.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+async def test_owned_client_keeps_proxy_env_for_remote_server() -> None:
+    client = OpenCodeClient("http://opencode.internal.test:4096")
+    try:
+        assert client._client.trust_env is True
+    finally:
+        await client.aclose()

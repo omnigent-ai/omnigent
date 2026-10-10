@@ -37,6 +37,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import httpx
+from omnigent_client._http import is_loopback_url
 from packaging.version import InvalidVersion, Version
 
 from omnigent.harnesses.opencode_native.bridge import (
@@ -523,6 +524,7 @@ class OpenCodeNativeServer:
             base_url=self.base_url,
             headers=self.auth_headers,
             timeout=httpx.Timeout(5.0, connect=2.0),
+            trust_env=not is_loopback_url(self.base_url),
         ) as client:
             for _ in range(attempts):
                 if self.process is not None and self.process.poll() is not None:

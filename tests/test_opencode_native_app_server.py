@@ -410,3 +410,56 @@ def test_list_opencode_cli_model_options(monkeypatch: pytest.MonkeyPatch) -> Non
         "opencode-go/kimi-k2.7-code",
     ]
     assert captured["env"] == {"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"}
+
+
+async def test_wait_until_ready_bypasses_proxy_env_for_loopback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A proxy that cannot route 127.0.0.1 must not black-hole the readiness
+    # probe; the loopback opencode serve is reachable without any proxy.
+    import http.server
+    import socket
+    import socketserver
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"[]")
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    stub_port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    # Keep probe bound (never listening) so dead_port refuses connects deterministically.
+    proxy = f"http://127.0.0.1:{dead_port}"
+
+    try:
+        for var in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ):
+            monkeypatch.setenv(var, proxy)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+
+        server = _server(monkeypatch, tmp_path)
+        server.port = stub_port
+
+        await server._wait_until_ready(attempts=5, delay=0.05)
+    finally:
+        probe.close()
+        httpd.shutdown()
+        httpd.server_close()

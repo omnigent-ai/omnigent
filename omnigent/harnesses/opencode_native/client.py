@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TypeAlias
 
 import httpx
+from omnigent_client._http import is_loopback_url
 
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -157,6 +158,7 @@ class OpenCodeClient:
             base_url=self._base_url,
             headers=default_headers,
             timeout=_DEFAULT_TIMEOUT,
+            trust_env=not is_loopback_url(self._base_url),
         )
         # When a client is injected (tests), still apply our headers so
         # auth/directory routing is exercised.
