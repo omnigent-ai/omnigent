@@ -132,6 +132,7 @@ def register_resource_routes(
     _resp_to_conv: dict[str, str],
     _search_registry_for_root: Callable[[Path], FilesystemRegistry],
     _session_comment_relays: dict[str, _CommentRelayBinding],
+    _session_workspace_value: Callable[[str], Coroutine[Any, Any, str | None]],
     auth_token_factory: Callable[[], str | None] | None,
     filesystem_registry: FilesystemRegistry | None,
     resource_registry: SessionResourceRegistry,
@@ -533,20 +534,29 @@ def register_resource_routes(
                 },
             )
 
+        # New shells open where the session works: the live session workspace
+        # (which workspace_change repoints and each turn's cwd follows) wins over
+        # the static default env root; sessions without one keep that root.
+        session_workspace = await _session_workspace_value(session_id)
+        session_root = (
+            str(Path(session_workspace.strip()).expanduser().resolve())
+            if session_workspace and session_workspace.strip()
+            else resource_registry.compute_default_env_root(session_id, agent_spec)
+        )
+
         if declared_terminal is not None:
             from omnigent.tools.builtins.sys_terminal import (
                 _materialize_terminal_spec_for_launch,
                 _synthesize_parent_os_env,
             )
 
-            default_root = resource_registry.compute_default_env_root(session_id, agent_spec)
-            env_spec = _materialize_terminal_spec_for_launch(declared_terminal, default_root)
-            agent_os_env = _synthesize_parent_os_env(agent_os_env, default_root)
+            env_spec = _materialize_terminal_spec_for_launch(declared_terminal, session_root)
+            agent_os_env = _synthesize_parent_os_env(agent_os_env, session_root)
             cwd_override = cwd_override or spec.get("cwd")
         else:
             spec_cwd = spec.get("cwd")
             if spec_cwd is None or spec_cwd in (".", "./"):
-                spec_cwd = resource_registry.compute_default_env_root(session_id, agent_spec)
+                spec_cwd = session_root
             env_spec = TerminalEnvSpec(
                 os_env=OSEnvSpec(
                     type=spec.get("os_env_type", "caller_process"),

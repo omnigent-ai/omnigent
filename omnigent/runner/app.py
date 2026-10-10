@@ -7207,6 +7207,7 @@ def create_runner_app(
         _resp_to_conv=_resp_to_conv,
         _search_registry_for_root=_search_registry_for_root,
         _session_comment_relays=_session_comment_relays,
+        _session_workspace_value=_session_workspace_value,
         auth_token_factory=auth_token_factory,
         filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
