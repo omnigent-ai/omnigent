@@ -84,6 +84,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsReadTool,
     SysOsShellTool,
     SysOsWriteTool,
+    unknown_shell_argument_error,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
@@ -7191,6 +7192,11 @@ async def _execute_os_env_tool(
         session.
     :returns: Serialized tool result string.
     """
+    if tool_name == SysOsShellTool.name():
+        rejected = unknown_shell_argument_error(args)
+        if rejected is not None:
+            return json_dumps_transport_safe(rejected)
+
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
 
     os_env = None

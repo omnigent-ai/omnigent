@@ -621,10 +621,18 @@ Follow these rules for each clip:
   expired login and capture the error it prints.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the result in `evidence`.
+- Keep the last complete clip until its replacement is finalized. Re-record
+  into a new raw directory and swap the stable path only after the new take
+  checks out; never delete an earlier clip in the re-run command.
+- If a re-record fails or is cut short, attach the best complete clip you have
+  with a caption that states its limits. `recordings: []` is for a facet with
+  no usable clip at all.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
-  `recording_unavailable_reason`. Do not block the verdict because footage is
-  missing or rejected; explain the gap and continue.
+  `recording_unavailable_reason` — the command you ran, the limit you
+  requested, and the error you observed, not an inferred platform ceiling. Do
+  not block the verdict because footage is missing or rejected; explain the
+  gap and continue.
 
 ## Output — the reproduction artifacts
 

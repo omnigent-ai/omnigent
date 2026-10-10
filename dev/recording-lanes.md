@@ -56,6 +56,17 @@ Recording is **best-effort**:
   that cannot start.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
+- A clip that stops short of the full journey is still footage. If a re-record
+  fails, is cut off, or leaves only a truncated file, declare the best complete
+  clip you still have with a caption that states its limits (for example
+  `… → stops before the Subagents panel opens`). Reserve `recordings: []` for a
+  facet with no usable clip at all.
+- Name the blocker you observed — the command you ran, the limit you requested,
+  and the error it returned — not an inferred platform ceiling. `sys_os_shell`
+  takes `timeout` (seconds; default 120). If a run ends at a limit you did not
+  request, verify the `timeout` argument you passed and inspect the returned
+  error before attributing the stop to a platform ceiling; when the argument was
+  wrong, fix the call and rerun.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
   Explain the gap and continue with the available evidence.
 
@@ -169,8 +180,10 @@ same stop point.
 **Move the emitted clip to a stable name.** The video lands under
 `OMNIGENT_E2E_RECORD_DIR` (or the test's own dir) as a random hash name; **move**
 it (do not copy) to a stable `recordings/<slug>/<kind>-<facet>.webm` and delete
-the leftover raw dir, so the same footage isn't collected twice. If that dir has
-**no** `.webm` after the run, the recording genuinely didn't happen (the test
+the leftover raw dir, so the same footage isn't collected twice. If the stable
+path already holds an earlier take, keep it until the new clip is finalized (see
+*Finishing a clip*). If that dir has **no** `.webm` after the run, the recording
+genuinely didn't happen (the test
 errored before opening a page, or the fixture never came online). For a test
 using the `page` fixture, retry with `--video on` and check pytest's `--output`
 directory before declaring the lane unfilmable. A clip there indicates a recorder
@@ -323,6 +336,14 @@ healthy state for a `fixed`/`after` clip; a final frame that shows teardown — 
 pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
 the test body. Fix the stop point and re-record; do not caption around it.
+
+**Keep the last complete clip until its replacement is finalized.** Point the
+re-record at a fresh raw directory (for example `recordings/<slug>/raw-2/`) and
+leave the stable `<kind>-<facet>.<ext>` in place while it runs. Swap the stable
+path only after the new take has finished and its last frame checks out, then
+delete the superseded clip. Never delete the earlier clip as part of the re-run
+command: if the re-run is killed, times out, or produces a truncated file, the
+earlier clip is the footage you attach, with a caption that states its limits.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
