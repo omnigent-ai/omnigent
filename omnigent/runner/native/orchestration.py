@@ -109,6 +109,11 @@ _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
 
+# A Databricks native launcher (dbcert) opens the forwarded ``$BROWSER`` for SSO
+# on every pane (re)launch, so resuming many sessions floods tabs. Native panes
+# drop the inherited opener; the chat sign-in card opens the live link on demand.
+_NATIVE_PANE_BROWSER_ENV_UNSET: tuple[str, ...] = ("BROWSER",)
+
 
 class _EnsureCommentRelay(Protocol):
     """Callable contract for starting a session's native tool relay."""
@@ -4674,6 +4679,7 @@ async def _launch_codex_native_tui(
             command=codex_command,
             args=codex_launch_args,
             env=codex_terminal_env(app_server),
+            env_unset=list(_NATIVE_PANE_BROWSER_ENV_UNSET),
             # Match the local ``omnigent codex`` terminal scrollback.
             scrollback=100_000,
             # Preserve the final frame and exit status until lifecycle cleanup.
@@ -7474,18 +7480,21 @@ def _claude_terminal_env_unset(
     resolve auth against the wrong workspace.
 
     Always drops ``CLAUDECODE`` because Claude Code rejects any child launch
-    carrying that nested-session marker, regardless of its auth mode. When the
-    launch config carries an ``apiKeyHelper``, also drops the raw
-    ``ANTHROPIC_API_KEY``: seeing both opens Claude Code's "Detected a custom
-    API key" menu, whose selected row uses the same ``❯`` glyph the tmux
-    delivery path waits for, so the first web message is typed into the menu.
+    carrying that nested-session marker, regardless of its auth mode.
+
+    Always drops ``BROWSER`` (:data:`_NATIVE_PANE_BROWSER_ENV_UNSET`) so sign-in
+    opens only from the user-driven chat card. When the launch config carries an
+    ``apiKeyHelper``, also drops the raw ``ANTHROPIC_API_KEY``:
+    seeing both opens Claude Code's "Detected a custom API key" menu, whose
+    selected row uses the same ``❯`` glyph the tmux delivery path waits for, so
+    the first web message is typed into the menu.
 
     :param claude_config: The resolved native launch config, or ``None``
         (Claude's own login) — which still strips the nested-session marker.
     :returns: The env var names to unset, e.g.
-        ``["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", "ANTHROPIC_API_KEY"]``.
+        ``["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", "BROWSER", "ANTHROPIC_API_KEY"]``.
     """
-    env_unset = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
+    env_unset = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", *_NATIVE_PANE_BROWSER_ENV_UNSET]
     if claude_config is not None and claude_config.api_key_helper:
         env_unset.append("ANTHROPIC_API_KEY")
     return env_unset

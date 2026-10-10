@@ -220,9 +220,10 @@ def test_claude_terminal_env_unset_without_helper_keeps_key() -> None:
     Claude's own-login path (``None`` config) and a Bedrock-style config have
     no ``apiKeyHelper``, so this helper does not strip ``ANTHROPIC_API_KEY``.
     ``CLAUDECODE`` must still be absent because Claude Code rejects nested
-    launches in every auth mode.
+    launches in every auth mode. ``BROWSER`` is always stripped so a launcher
+    SSO sign-in does not auto-open a browser tab per pane.
     """
-    expected = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
+    expected = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", "BROWSER"]
     own_login_env_unset = _claude_terminal_env_unset(None)
     assert own_login_env_unset == expected
     assert "ANTHROPIC_API_KEY" not in own_login_env_unset
