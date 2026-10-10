@@ -495,8 +495,11 @@ export function ConnectHostInstructions({
 }: {
   serverUrl: string;
   label?: string;
-  /** Desktop MDM gate (useDatabricksInternalFeatures): spell commands with `isaac omni`. */
-  databricksInternalFeatures?: boolean;
+  /**
+   * Desktop MDM gate (useDatabricksInternalFeatures): spell commands with
+   * `isaac omni`. `null` while the shell's answer is pending.
+   */
+  databricksInternalFeatures?: boolean | null;
 }) {
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
@@ -512,7 +515,13 @@ export function ConnectHostInstructions({
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
-      {databricksFeatures ? (
+      {databricksInternalFeatures === null ? (
+        // Hold the commands until the shell answers, so an internal desktop
+        // never shows a bare `omni` that the wrapper guard would refuse.
+        <p className="text-sm text-muted-foreground" data-testid="connect-host-pending">
+          Checking which launcher this desktop uses<span className="animate-pulse">…</span>
+        </p>
+      ) : databricksFeatures ? (
         <Tabs defaultValue="local" componentId="new_chat.host_tabs">
           <TabsList className="w-full">
             <TabsTrigger value="local" className="text-sm">
@@ -4899,8 +4908,8 @@ export function NewChatLandingScreen() {
     : null;
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
   // Reconnect remains available to recapture daemon identity after a desktop restart.
-  const arcaHostId = databricksInternalFeatures ? readArcaHostId() : null;
-  const showArcaOption = databricksInternalFeatures;
+  const arcaHostId = databricksInternalFeatures === true ? readArcaHostId() : null;
+  const showArcaOption = databricksInternalFeatures === true;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca

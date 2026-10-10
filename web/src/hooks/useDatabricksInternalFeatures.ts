@@ -3,10 +3,11 @@ import { getDesktopFeatures, isElectronShell } from "@/lib/nativeBridge";
 
 /**
  * The desktop shell's Databricks-internal MDM flag, already scoped by the shell
- * to windows on a Databricks-managed server. Read once per mount; false in a browser.
+ * to windows on a Databricks-managed server. Read once per mount; `null` while
+ * the shell's answer is pending, `false` outright in a browser.
  */
-export function useDatabricksInternalFeatures(): boolean {
-  const [enabled, setEnabled] = useState(false);
+export function useDatabricksInternalFeatures(): boolean | null {
+  const [enabled, setEnabled] = useState<boolean | null>(() => (isElectronShell() ? null : false));
   useEffect(() => {
     if (!isElectronShell()) return;
     let cancelled = false;

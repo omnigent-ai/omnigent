@@ -2989,9 +2989,8 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     await openHostMenu();
     fireEvent.click(await screen.findByTestId("new-chat-landing-connect-host"));
     expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
-    // Databricks-internal machines reach the CLI only through `isaac omni`; a bare
-    // `omni …` command is refused there by the wrapper guard.
-    // Checked synchronously on purpose: the dialog must show the launcher on its first render.
+    // Databricks-internal machines reach the CLI only through `isaac omni`; the
+    // feature probe has already resolved by the time the dialog opens.
     expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
       /^isaac omni host --server '/,
     );

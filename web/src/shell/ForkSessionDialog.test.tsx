@@ -1132,17 +1132,19 @@ describe("ForkSessionDialog", () => {
         vi.mocked(getDesktopFeatures).mockResolvedValue(null);
       });
 
-      it("spells the connect-host command with the isaac omni launcher", async () => {
+      it("holds the command until the shell answers, then spells it with isaac omni", async () => {
         setHosts([host({ status: "offline" })]);
         renderDialog(CODING);
 
-        // The shell answers the feature probe asynchronously; the command
-        // follows once it lands.
+        // While the feature probe is pending there is no bare `omni` to copy.
+        expect(screen.queryByTestId("connect-host-command")).not.toBeInTheDocument();
+        expect(screen.getByTestId("connect-host-pending")).toBeInTheDocument();
         await waitFor(() =>
           expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
             /^isaac omni host --server '/,
           ),
         );
+        expect(screen.queryByTestId("connect-host-pending")).not.toBeInTheDocument();
       });
     });
 
