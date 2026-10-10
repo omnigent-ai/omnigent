@@ -1,31 +1,8 @@
-// The gating line of an approval card, e.g. "Claude wants to call **Bash**". Only the
-// bridges' `**bold**` runs are markup: policy prompts and MCP servers put raw commands
-// and paths in the same field, where full markdown would mangle `pkg/__init__.py`.
+// Gating line of an approval card. Harness bridges announce the gated tool as
+// "<harness> wants to call|use **<tool>**" (routes_hooks.py, _executor_adapter.py); only that
+// exact shape is formatted. Anything else — policy prompts, MCP messages, raw commands — stays verbatim.
 
-import { Fragment } from "react";
-
-export interface MessageRun {
-  text: string;
-  bold: boolean;
-}
-
-// `**` hugging non-whitespace on both sides, with no `*` inside — the
-// CommonMark strong-emphasis shape the bridges emit. `****`, `** x**` and a
-// lone `**` never match and render verbatim.
-const BOLD_RUN = /\*\*(\S(?:[^*]*?\S)?)\*\*/g;
-
-/** Split `message` into literal and bold runs, in order. */
-export function splitMessageRuns(message: string): MessageRun[] {
-  const runs: MessageRun[] = [];
-  let last = 0;
-  for (const match of message.matchAll(BOLD_RUN)) {
-    if (match.index > last) runs.push({ text: message.slice(last, match.index), bold: false });
-    runs.push({ text: match[1], bold: true });
-    last = match.index + match[0].length;
-  }
-  if (last < message.length) runs.push({ text: message.slice(last), bold: false });
-  return runs;
-}
+const TOOL_NAME_MESSAGE = /^(.+ wants to (?:call|use) )\*\*([^\s*]+)\*\*$/;
 
 export function ElicitationMessage({
   message,
@@ -34,21 +11,12 @@ export function ElicitationMessage({
   message: string;
   className?: string;
 }) {
-  // Keyed by position in the rendered text; runs are never empty, so positions are unique.
-  let offset = 0;
+  const match = TOOL_NAME_MESSAGE.exec(message);
+  if (!match) return <span className={className}>{message}</span>;
   return (
     <span className={className}>
-      {splitMessageRuns(message).map((run) => {
-        const key = offset;
-        offset += run.text.length;
-        return run.bold ? (
-          <strong key={key} className="font-semibold">
-            {run.text}
-          </strong>
-        ) : (
-          <Fragment key={key}>{run.text}</Fragment>
-        );
-      })}
+      {match[1]}
+      <strong className="font-semibold">{match[2]}</strong>
     </span>
   );
 }

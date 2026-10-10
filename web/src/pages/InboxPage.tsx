@@ -341,7 +341,11 @@ export function InboxPage() {
           tile={<KindTile icon={HandIcon} tone="yellow" />}
           kindLabel={item.elicitation.askUserQuestion ? "Question" : "Approval needed"}
           title={title}
-          preview={<ElicitationMessage message={item.elicitation.message} />}
+          preview={
+            item.elicitation.message ? (
+              <ElicitationMessage message={item.elicitation.message} />
+            ) : undefined
+          }
           at={entry.at}
           unread={false}
           expanded={expanded}

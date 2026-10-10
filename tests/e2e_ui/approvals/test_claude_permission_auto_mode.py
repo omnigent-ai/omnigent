@@ -181,9 +181,10 @@ def _assert_auto_mode_decision(sink: dict) -> None:
 
 def _assert_gating_message_bold(card, tool_name: str) -> None:
     """The hook's ``**<tool>**`` renders as a bold tool name, never as literal asterisks."""
-    expect(card).to_contain_text("wants to call")
-    expect(card).not_to_contain_text("**")
-    expect(card.locator("strong", has_text=tool_name).first).to_be_visible()
+    line = card.locator("span", has_text="wants to call").first
+    expect(line).to_be_visible()
+    expect(line).not_to_contain_text("**")
+    expect(line.locator("strong", has_text=tool_name)).to_be_visible()
 
 
 @pytest.mark.timeout(240)

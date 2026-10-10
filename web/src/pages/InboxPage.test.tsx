@@ -283,6 +283,25 @@ describe("InboxPage approval items", () => {
     expect(toggle.textContent).not.toContain("**");
   });
 
+  it("previews a policy prompt's command verbatim in the collapsed row", async () => {
+    // WHY: only the bridges' `**<tool>**` message is formatted; a balanced `**`
+    // inside a command the user is approving must not be read as emphasis.
+    const message = "Agent wants to call sys_os_shell('ls **/vendor/**'). Approve?";
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", message)],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-item");
+    const toggle = within(item).getByRole("button", { name: /My Session/ });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
+    expect(toggle.textContent).toContain(message);
+    expect(toggle.querySelector("strong")).toBeNull();
+  });
+
   it("submits an approve verdict via approve() and flips the card to responded", async () => {
     // WHY: clicking Accept optimistically marks responded then POSTs the
     // verdict through `approve()` to the resolve-target session.
