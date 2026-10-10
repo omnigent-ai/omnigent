@@ -359,6 +359,67 @@ describe("useIdleNotifications offline-runner suppression", () => {
     rerender();
     expect(showMock).not.toHaveBeenCalled();
   });
+
+  it("does not re-notify an unanswered elicitation each time the runner reconnects", () => {
+    // The agent raises a prompt (0 -> 1) on a live-runner session the user
+    // isn't viewing: one legitimate "asks for input" toast.
+    setConversations([{ ...conv("a", "running", 0), runner_online: true }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
+    rerender();
+    expect(showMock).toHaveBeenCalledOnce();
+    expect(showMock.mock.calls[0][0]).toMatchObject({
+      title: "a",
+      body: "Agent is asking for your input.",
+      tag: "omnigent:session:a",
+    });
+
+    // The prompt stays unanswered while the host flaps (laptop closed, server
+    // disconnected): the server zeroes an offline runner's pending count and
+    // restores it on reconnect, so the same prompt swings 0 <-> 1.
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      setConversations([{ ...conv("a", "running", 0), runner_online: false }]);
+      rerender();
+      setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
+      rerender();
+    }
+
+    // The restored count is the same unanswered prompt, not a new one.
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not notify when a session first seen offline comes back with its pending prompt", () => {
+    // A reload while the runner is down: this client only saw the zeroed
+    // count, so the restore on reconnect is a pre-existing prompt (the
+    // fresh-load rule), not a new ask.
+    setConversations([{ ...conv("a", "running", 0), runner_online: false }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
+    rerender();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("still notifies a prompt raised after the runner reconnects", () => {
+    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    // Offline, then back online without the earlier prompt (the runner
+    // restarted), then a genuinely new ask.
+    setConversations([{ ...conv("a", "running", 0), runner_online: false }]);
+    rerender();
+    setConversations([{ ...conv("a", "running", 0), runner_online: true }]);
+    rerender();
+    expect(showMock).not.toHaveBeenCalled();
+
+    setConversations([{ ...conv("a", "running", 1), runner_online: true }]);
+    rerender();
+    expect(showMock).toHaveBeenCalledOnce();
+    expect(showMock.mock.calls[0][0]).toMatchObject({
+      body: "Agent is asking for your input.",
+    });
+  });
 });
 
 describe("useIdleNotifications re-notification dedup (one beep until viewed)", () => {

@@ -288,7 +288,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
     const idle = detectIdleTransitions(prevStatus.current, conversations);
     const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
     prevStatus.current = buildStatusMap(conversations);
-    prevElicitations.current = buildElicitationMap(conversations);
+    // Carry the last live count for offline-runner rows so the server zeroing
+    // and restoring it across a reconnect doesn't read as a new prompt.
+    prevElicitations.current = buildElicitationMap(conversations, prevElicitations.current);
 
     const windowFocused = windowFocusedRef.current;
     const grantedOrNative = isNativeShell() || getNotificationPermission() === "granted";
