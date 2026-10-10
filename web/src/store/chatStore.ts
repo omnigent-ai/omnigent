@@ -2826,8 +2826,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
     setActive((s) => {
       if (s.conversationId !== sessionId) return {};
+      // Leave `pendingUserMessages` alone: wiping a still-optimistic prompt deletes
+      // it with no undo. Server events reconcile it — `input.consumed` promotes it;
+      // a terminal status clears it on non-native sessions.
       const patch: Partial<ChatState> = {
-        pendingUserMessages: [],
         status: "idle",
         sessionStatus: "idle",
         backgroundTaskCount: 0,
