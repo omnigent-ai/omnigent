@@ -177,7 +177,7 @@ def create_sandbox_inference_router(
         user_id = require_user(request, auth_provider)
         response.headers["Cache-Control"] = "private, no-store"
         auth = None
-        profile = None
+        spec = None
         if agent_id is not None:
             # Clients read a missing agent's 404 from ``detail``; keep that shape.
             if await asyncio.to_thread(agent_store.get, agent_id) is None:
@@ -201,7 +201,6 @@ def create_sandbox_inference_router(
             ).spec
             harness = actual_harness(spec, harness)
             auth = spec.executor.auth
-            profile = spec.executor.config.get("profile") or spec.executor.profile
         try:
             snapshot = await inference_service(request).prepare(
                 provider, harness, user_id, agent_auth=auth
@@ -231,7 +230,9 @@ def create_sandbox_inference_router(
         deployment = getattr(request.app.state, "sandbox_config", None)
         target = deployment.for_provider(provider) if deployment is not None else None
         # An agent's own provider takes precedence over the sandbox's ambient gateway.
-        if target is None or not target.managed_launch_supported or auth is not None or profile:
+        if target is None or not target.managed_launch_supported or auth is not None:
+            return result
+        if spec is not None and (spec.executor.config.get("profile") or spec.executor.profile):
             return result
         ambient = await inference_service(request).ambient_catalog(provider, harness, user_id)
         if ambient is not None:
@@ -244,7 +245,7 @@ def create_sandbox_inference_router(
                 )
                 if not all(isinstance(row.get("id"), str) and row["id"] for row in rows):
                     raise ValueError("gateway_model_options rows must carry a model id")
-                # Advisory rows never carry a default marker; Harness default stays a separate row.
+                # Advisory rows never carry a default marker; Default stays a separate row.
                 models = [{**row, "isDefault": False} for row in rows]
                 result.update(models=models, status="ready" if models else "empty")
                 if not models:
