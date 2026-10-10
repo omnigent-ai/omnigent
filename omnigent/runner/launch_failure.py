@@ -108,11 +108,9 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
-# A shell's not-found line names the token it could not resolve, after the
-# phrase (zsh ``command not found: --model``, fish ``Unknown command: claude``)
-# or before it (bash/dash/env/exec, e.g. ``bash: line 1: claude: command not found``).
-# The pane capture wraps long lines into rows, so a phrase may break at any
-# character and a token may continue on the next row.
+# A shell's not-found line names the unresolved token after the phrase (zsh,
+# fish) or before it (bash/dash/env/exec). Pane capture wraps long lines, so
+# a phrase may break at any character and a token may continue on the next row.
 
 
 def _wrappable(phrase: str) -> str:
@@ -127,9 +125,11 @@ def _phrases(*phrases: str) -> str:
 # Tokens start at a non-space run so a long line is scanned once, not per character.
 _TOKEN = r"(?<!\S)(\S+(?:\n\S+)*)"
 _BLAMED_AFTER_PHRASE = re.compile(
-    _phrases("command not found", "no such file or directory", "unknown command")
-    + r":\s*"
-    + _TOKEN
+    _phrases("command not found", "no such file or directory") + r":\s*" + _TOKEN
+)
+# Only fish's own report counts: Claude Code prints ``● Unknown command: /x`` too.
+_BLAMED_BY_FISH = re.compile(
+    r"^fish:\s*" + _wrappable("unknown command") + r":\s*" + _TOKEN, re.MULTILINE
 )
 _BLAMED_BEFORE_PHRASE = re.compile(
     _TOKEN
@@ -154,13 +154,23 @@ def _basename(path: str) -> str:
 
 
 def _not_found_blames(output: str) -> Iterator[tuple[str, str]]:
-    """Yield ``(reporter, blamed token)`` for each shell not-found message in *output*."""
-    for pattern in (_BLAMED_AFTER_PHRASE, _BLAMED_BEFORE_PHRASE, _BLAMED_NOT_RECOGNIZED):
+    """Yield ``(reporter, blamed token)`` for each shell not-found message in *output*.
+
+    A token spanning rows is read both as the first row alone (the line was not
+    wrapped; the next row is unrelated output) and joined (it was wrapped).
+    """
+    for pattern in (
+        _BLAMED_AFTER_PHRASE,
+        _BLAMED_BY_FISH,
+        _BLAMED_BEFORE_PHRASE,
+        _BLAMED_NOT_RECOGNIZED,
+    ):
         for match in pattern.finditer(output):
             line_start = output.rfind("\n", 0, match.start()) + 1
             reporter = _REPORTER.match(output[line_start:].lstrip())
-            token = match.group(1).replace("\n", "").strip(_BLAME_QUOTES)
-            yield (reporter.group(1) if reporter else "", token)
+            raw = match.group(1)
+            for token in dict.fromkeys((raw.split("\n", 1)[0], raw.replace("\n", ""))):
+                yield (reporter.group(1) if reporter else "", token.strip(_BLAME_QUOTES))
         # A zsh-style line names its reporter first; blank the match so the
         # "before" pattern cannot read ``zsh:`` as the blamed token.
         output = pattern.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), output)

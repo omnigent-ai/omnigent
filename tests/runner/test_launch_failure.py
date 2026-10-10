@@ -145,14 +145,20 @@ def test_exit_127_with_output_not_blaming_command_is_not_missing_binary() -> Non
     assert diagnosis is None
 
 
-def test_incidental_not_found_text_from_present_cli_is_not_missing_binary() -> None:
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        (1, "Loading settings…\nclaude: config file not found"),
+        # Claude Code's own slash-command error borrows fish's phrase.
+        (127, "● Unknown command: /claude"),
+    ],
+)
+def test_incidental_not_found_text_from_present_cli_is_not_missing_binary(
+    exit_status: int, output: str
+) -> None:
     # "not found" inside the CLI's own message is not the shell blaming the
     # launched command, whatever the exit code.
-    diagnosis = classify_terminal_failure(
-        command="claude",
-        exit_status=1,
-        output="Loading settings…\nclaude: config file not found",
-    )
+    diagnosis = classify_terminal_failure(command="claude", exit_status=exit_status, output=output)
     assert diagnosis is None
 
 
@@ -160,7 +166,16 @@ def test_incidental_not_found_text_from_present_cli_is_not_missing_binary() -> N
     ("command", "output"),
     [
         ("claude", "zsh: command not found: claude"),
+        # The pane footer follows an unwrapped line without indentation.
+        (
+            "claude",
+            "zsh: command not found: claude\nPane is dead (status 127, Fri Oct 10 00:00:00 2026)",
+        ),
         ("claude", "fish: Unknown command: claude"),
+        (
+            "claude",
+            "fish: Unknown command: claude\nPane is dead (status 127, Fri Oct 10 00:00:00 2026)",
+        ),
         ("claude", "bash: claude: command not found"),
         ("claude", "bash: line 1: claude: command not found"),
         ("claude", "sh: 1: claude: not found"),
@@ -188,6 +203,11 @@ def test_incidental_not_found_text_from_present_cli_is_not_missing_binary() -> N
             "/tmp/abcdefghijabcdefghijabcdefghij/claude",
             "bash: line 1: /tmp/abcdefghijabcdefghijabcdefghij/claude: No such file or direct\n"
             "ory",
+        ),
+        (
+            "claude",
+            "bash: line 1: /tmp/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij/cla\n"
+            "ude: No such file or directory",
         ),
         (
             "claude.exe",
