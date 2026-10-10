@@ -498,6 +498,35 @@ export function removeLocalConversation(tempConvId: string): boolean {
 }
 
 /**
+ * Peek the first message a failed-to-load conversation stranded.
+ *
+ * Reads the `failedSendDraft` without consuming it; the load-error screen
+ * clears it (via `clearFailedSendDraft`) only after the landing composer
+ * accepts the transfer, so a refused restore keeps the stranded copy. Only
+ * the text and attachments come back: the landing composer has no message to
+ * quote, so a stored reply draft is intentionally dropped on restore.
+ *
+ * @param conversationId The failed conversation's id, e.g. `"conv_abc"`.
+ * @returns The stranded text + a copy of its attachments, or `null` when none.
+ */
+export function peekFailedSendDraft(
+  conversationId: string,
+): { text: string; files: File[] } | null {
+  const state = setterForState(conversationId);
+  const draft = state?.failedSendDraft ?? null;
+  if (draft === null || draft.conversationId !== conversationId) return null;
+  // Copy the files: peek must leave the stored draft intact for a refused
+  // restore, so a caller mutating the array can't corrupt it.
+  return { text: draft.text, files: [...draft.files] };
+}
+
+/** Drop a stranded draft (and its retry id) after a confirmed restore. */
+export function clearFailedSendDraft(conversationId: string): void {
+  if (peekFailedSendDraft(conversationId) === null) return;
+  setterFor(conversationId)({ failedSendDraft: null, pendingRetryStableId: null });
+}
+
+/**
  * A user message awaiting its `session.input.consumed` event.
  *
  * Inserted by `send` before the POST is awaited so the bubble renders

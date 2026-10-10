@@ -2109,6 +2109,55 @@ export function resetLandingDraft(): void {
   writeLandingDraft(null);
 }
 
+// A plain landing visit's defaults for restoring stranded text with no existing
+// draft. The mode constants match the screen's initializers; the nullish slots
+// fall through to its last-used seeding, so a restored visit matches a fresh one.
+function defaultLandingDraft(): LandingDraft {
+  return {
+    project: "",
+    message: "",
+    files: [],
+    pickedAgentId: null,
+    selectedHostId: null,
+    sandboxSelected: false,
+    sandboxProvider: null,
+    sandboxRepoSelections: readLastSandboxRepos(),
+    workspace: "",
+    branchName: "",
+    autoSeededBranch: "",
+    permissionMode: CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    approvalMode: CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+    bypassSandbox: false,
+    cursorExecMode: CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+    agySkipMode: AGY_NATIVE_DEFAULT_SKIP_MODE,
+    devinPermissionMode: DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
+    pickedHarness: null,
+    pickedModel: "",
+    pickedEffort: "",
+    costControlMode: null,
+    agentFromConfig: false,
+    workspaceFromConfig: false,
+  };
+}
+
+/**
+ * Restore a first message stranded by a failed session load to the next
+ * landing visit. Only the text and attachments return: an existing draft
+ * keeps its picker selections, and a draft the user has typed into is never
+ * overwritten. Returns whether the message was written, so a refused restore
+ * leaves the stranded source intact.
+ */
+export function restoreLandingDraftMessage(message: string, files: File[]): boolean {
+  if (message.trim() === "" && files.length === 0) return false;
+  if (landingDraft !== null) {
+    if (landingDraft.message.trim() !== "" || landingDraft.files.length > 0) return false;
+    writeLandingDraft({ ...landingDraft, message, files });
+    return true;
+  }
+  writeLandingDraft({ ...defaultLandingDraft(), message, files });
+  return true;
+}
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();

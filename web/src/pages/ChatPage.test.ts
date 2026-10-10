@@ -4,6 +4,7 @@ import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
+import type { PendingInitialPrompt } from "@/store/chatStore";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -26,6 +27,7 @@ import {
   mergePendingBubbles,
   readOnlyReasonForSessionLabels,
   reorderCommittedRequestElicitations,
+  resolveCachedInitialPrompt,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
   shouldShowWorkingIndicator,
@@ -1577,6 +1579,7 @@ describe("shouldSendInitialPrompt", () => {
     sentForConversationId: null,
     conversationId: "conv_abc",
     loadingConversation: false,
+    conversationLoadError: null,
     agentId: "ag_abc123",
   } as const;
 
@@ -1645,6 +1648,15 @@ describe("shouldSendInitialPrompt", () => {
     expect(shouldSendInitialPrompt({ ...ready, loadingConversation: true })).toBe(false);
   });
 
+  it("does not send when the conversation failed to load", () => {
+    // A failed load clears loadingConversation but sets conversationLoadError;
+    // without this gate the first message posts into a session that never came
+    // up, re-opening the duplicate/vanished-prompt path the error screen fixes.
+    expect(
+      shouldSendInitialPrompt({ ...ready, conversationLoadError: new Error("not found") }),
+    ).toBe(false);
+  });
+
   it("waits until an agent is resolved", () => {
     // chatStore.send throws on a null agentId. A failure here means the
     // send would throw before agents finished loading.
@@ -1680,6 +1692,42 @@ describe("shouldSendInitialPrompt", () => {
         conversationId: "conv_B",
       }),
     ).toBe(false);
+  });
+});
+
+describe("resolveCachedInitialPrompt", () => {
+  const prompt: PendingInitialPrompt = { text: "read the README", skill: null, files: [] };
+
+  it("consumes the module entry when no cache matches the id", () => {
+    const consume = vi.fn(() => prompt);
+    expect(resolveCachedInitialPrompt(null, "conv_abc", consume)).toBe(prompt);
+    expect(consume).toHaveBeenCalledTimes(1);
+    expect(consume).toHaveBeenCalledWith("conv_abc");
+  });
+
+  it("returns the cached prompt for a matching id without re-consuming", () => {
+    const consume = vi.fn(() => prompt);
+    const cache = { conversationId: "conv_abc", prompt };
+    expect(resolveCachedInitialPrompt(cache, "conv_abc", consume)).toBe(prompt);
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it("honours a retired null for the matching id so Back cannot re-dispatch", () => {
+    // After a fallback transfer ChatPage caches { prompt: null } for the id; a
+    // matching lookup must keep that null instead of re-consuming the still-live
+    // module entry and resurrecting the already-recovered first message.
+    const consume = vi.fn(() => prompt);
+    const retired = { conversationId: "conv_abc", prompt: null };
+    expect(resolveCachedInitialPrompt(retired, "conv_abc", consume)).toBeNull();
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it("consumes a fresh prompt when the id changes", () => {
+    const consume = vi.fn(() => prompt);
+    const retired = { conversationId: "conv_abc", prompt: null };
+    expect(resolveCachedInitialPrompt(retired, "conv_xyz", consume)).toBe(prompt);
+    expect(consume).toHaveBeenCalledTimes(1);
+    expect(consume).toHaveBeenCalledWith("conv_xyz");
   });
 });
 

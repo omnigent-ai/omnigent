@@ -85,11 +85,13 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  clearFailedSendDraft,
   committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
   isTempConvId,
+  peekFailedSendDraft,
   type PendingInitialPrompt,
   useChatStore,
 } from "@/store/chatStore";
@@ -239,7 +241,11 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
-import { ComposerAgentIcon, NewChatLandingScreen } from "@/shell/NewChatDialog";
+import {
+  ComposerAgentIcon,
+  NewChatLandingScreen,
+  restoreLandingDraftMessage,
+} from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
@@ -472,9 +478,11 @@ export function ChatPage() {
       setInitialPrompt(null);
       return;
     }
-    const cached = consumedInitialPromptRef.current;
-    const prompt =
-      cached?.conversationId === urlConvId ? cached.prompt : consumePendingInitialPrompt(urlConvId);
+    const prompt = resolveCachedInitialPrompt(
+      consumedInitialPromptRef.current,
+      urlConvId,
+      consumePendingInitialPrompt,
+    );
     consumedInitialPromptRef.current = { conversationId: urlConvId, prompt };
     setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
   }, [urlConvId]);
@@ -574,6 +582,7 @@ export function ChatPage() {
         sentForConversationId: initialPromptSentForConvRef.current,
         conversationId: urlConvId,
         loadingConversation,
+        conversationLoadError,
         agentId,
       })
     ) {
@@ -586,7 +595,7 @@ export function ChatPage() {
     initialPromptSentForConvRef.current = urlConvId;
     const { send, sendSlashCommand } = useChatStore.getState();
     dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
-  }, [initialPrompt, urlConvId, loadingConversation, agentId]);
+  }, [initialPrompt, urlConvId, loadingConversation, conversationLoadError, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
   // survives a re-mount of the chat surface. Declared BEFORE the
@@ -1092,7 +1101,29 @@ export function ChatPage() {
     if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
       return <HydratingPlaceholder />;
     if (conversationLoadError) {
-      return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
+      return (
+        <ConversationLoadError
+          conversationId={urlConvId}
+          error={conversationLoadError}
+          // A consumed-but-never-sent first prompt (the auto-send gates never
+          // opened because the session failed to load) — recoverable text the
+          // error screen can hand back to the landing composer.
+          strandedPrompt={
+            initialPrompt !== null &&
+            initialPrompt.conversationId === urlConvId &&
+            initialPromptSentForConvRef.current !== urlConvId
+              ? initialPrompt.prompt
+              : null
+          }
+          // The prompt now lives in the landing composer; retire both views of
+          // the cached source (the per-id ref and the live state) so a
+          // browser-back into this id cannot re-dispatch it.
+          onStrandedPromptRetired={() => {
+            consumedInitialPromptRef.current = { conversationId: urlConvId, prompt: null };
+            setInitialPrompt(null);
+          }}
+        />
+      );
     }
   }
 
@@ -1795,14 +1826,37 @@ function HydratingPlaceholder() {
  * conversation id in the URL — surfaces quickly because the store's
  * items fetch disables retries.
  */
-function ConversationLoadError({
+export function ConversationLoadError({
   conversationId,
   error,
+  strandedPrompt,
+  onStrandedPromptRetired,
 }: {
   conversationId: string;
   error: Error;
+  strandedPrompt: PendingInitialPrompt | null;
+  onStrandedPromptRetired: () => void;
 }) {
   const navigate = useNavigate();
+  // The failed session's composer never rendered, so hand any stranded first
+  // message back to the landing composer; a failed send's draft wins over a
+  // consumed-but-never-dispatched initial prompt.
+  const startNewChat = () => {
+    const failedDraft = peekFailedSendDraft(conversationId);
+    const stranded =
+      failedDraft ??
+      (strandedPrompt !== null
+        ? { text: strandedPrompt.text, files: strandedPrompt.files ?? [] }
+        : null);
+    // Retire every live source once the landing composer accepts the text, so a
+    // browser-back can't auto-send a copy: clear the failed-send draft that fed
+    // it, and retire any cached initial prompt, which re-dispatches otherwise.
+    if (stranded !== null && restoreLandingDraftMessage(stranded.text, stranded.files)) {
+      if (failedDraft !== null) clearFailedSendDraft(conversationId);
+      if (strandedPrompt !== null) onStrandedPromptRetired();
+    }
+    navigate("/");
+  };
   return (
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-md flex-col items-center gap-3 text-center">
@@ -1813,7 +1867,7 @@ function ConversationLoadError({
           : {error.message}
         </p>
         {/* Route to the home composer ("/"), which owns session creation. */}
-        <Button type="button" variant="outline" onClick={() => navigate("/")}>
+        <Button type="button" variant="outline" onClick={startNewChat}>
           Start a new chat
         </Button>
       </div>
@@ -4011,6 +4065,19 @@ export function computeShowsWorking(
 }
 
 /**
+ * Read the carried initial prompt once per conversation id. A matching cache
+ * entry wins (including a retired `null`); otherwise destructively consume the
+ * module entry so a later mount or browser-back cannot re-dispatch it.
+ */
+export function resolveCachedInitialPrompt(
+  cache: { conversationId: string; prompt: PendingInitialPrompt | null } | null,
+  conversationId: string,
+  consume: (conversationId: string) => PendingInitialPrompt | null,
+): PendingInitialPrompt | null {
+  return cache?.conversationId === conversationId ? cache.prompt : consume(conversationId);
+}
+
+/**
  * Decide whether the carried initial prompt should be auto-sent now.
  *
  * The prompt is the optional first message the landing composer hands off via
@@ -4061,6 +4128,7 @@ export function shouldSendInitialPrompt(params: {
   sentForConversationId: string | null;
   conversationId: string | null | undefined;
   loadingConversation: boolean;
+  conversationLoadError: Error | null;
   agentId: string | null;
 }): boolean {
   // Reject a contentless prompt — falsy text (null or "") AND no files —
@@ -4081,6 +4149,10 @@ export function shouldSendInitialPrompt(params: {
   // (or null) id means a later new chat reusing the mounted ChatPage, so
   // it falls through and sends.
   if (params.sentForConversationId === params.conversationId) return false;
+  // A failed load leaves `loadingConversation` false but `conversationLoadError`
+  // set; the error screen recovers the prompt into the landing composer, so
+  // reject it here rather than posting into a session that never came up.
+  if (params.conversationLoadError) return false;
   if (!params.conversationId || params.loadingConversation || !params.agentId) {
     return false;
   }

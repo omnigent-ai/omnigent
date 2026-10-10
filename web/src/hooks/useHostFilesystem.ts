@@ -125,11 +125,13 @@ async function describeListError(res: Response, path: string): Promise<string> {
 /**
  * React Query retry predicate for the directory listing.
  *
- * 4xx responses are deterministic (missing path, bad path, not the owner), so
- * retrying them just delays the error behind the stale placeholder listing the
- * picker keeps on screen while a query is pending. Skip retries for those and
- * let the error surface immediately; retry only transient failures (5xx,
- * network) up to the default cap, matching the untuned default's 3 retries.
+ * Don't retry 4xx (deterministic: missing/bad path, not the owner) or the
+ * settled host-connectivity verdicts 502/504 (dropped connection, host
+ * filesystem failure, or the host consuming the server's whole 5s ``list_dir``
+ * window): a silent retry just repeats a multi-second wait behind a loading
+ * row, so surface those immediately. Skipping retry on a rare gateway blip
+ * reading as 502/504 trades auto-recovery for bounded feedback; re-opening the
+ * folder retries. Other 5xx and network errors retry up to the cap of 3.
  *
  * @param failureCount Number of failures so far (0 on the first failure).
  * @param error The thrown error; a ``FetchError`` carries the HTTP ``status``.
@@ -138,6 +140,9 @@ async function describeListError(res: Response, path: string): Promise<string> {
 export function shouldRetryHostFilesystem(failureCount: number, error: Error): boolean {
   const status = (error as FetchError).status;
   if (status !== undefined && status >= 400 && status < 500) {
+    return false;
+  }
+  if (status === 502 || status === 504) {
     return false;
   }
   return failureCount < MAX_LIST_RETRIES;
