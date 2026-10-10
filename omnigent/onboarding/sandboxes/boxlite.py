@@ -217,6 +217,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         home_dir: str | None = None,
         registry: Mapping[str, object] | None = None,
         disk_size_gb: int | None = None,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -246,6 +248,14 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             ``password_env`` / ``token_env``. The ``*_env`` keys NAME server
             environment variables holding the credentials (12-factor; values
             never live in config). ``None`` uses anonymous pulls.
+        :param cpus: Box vCPU count — the server's ``sandbox.boxlite.cpus``
+            config. ``None`` keeps the built-in default.
+        :param memory_mib: Box RAM in MiB — the server's
+            ``sandbox.boxlite.memory_mib`` config. ``None`` keeps the built-in
+            default. The built-in 4096 is not enough for every workload: a
+            Python test suite OOM-killed its workers inside the guest, which
+            surfaces host-side only as a stalled session, so this needs to be
+            operator-tunable rather than baked in.
         :param disk_size_gb: Box disk size in GB — the server's
             ``sandbox.boxlite.disk_size_gb`` config. ``None`` uses the SDK's
             own default.
@@ -260,6 +270,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         self._home_dir = home_dir
         self._registry = dict(registry) if registry is not None else None
         self._disk_size_gb = disk_size_gb
+        self._cpus = cpus if cpus is not None else _SANDBOX_CPU
+        self._memory_mib = memory_mib if memory_mib is not None else _SANDBOX_MEMORY_MIB
         self._runtime: boxlite_sdk.Boxlite | None = None
 
     async def _aruntime(self) -> boxlite_sdk.Boxlite:
@@ -415,8 +427,8 @@ class BoxliteSandboxLauncher(SandboxLauncher):
             runtime = await self._aruntime()
             options = boxlite.BoxOptions(
                 image=resolved_ref,
-                cpus=_SANDBOX_CPU,
-                memory_mib=_SANDBOX_MEMORY_MIB,
+                cpus=self._cpus,
+                memory_mib=self._memory_mib,
                 disk_size_gb=self._disk_size_gb,
                 env=env,
                 auto_remove=False,

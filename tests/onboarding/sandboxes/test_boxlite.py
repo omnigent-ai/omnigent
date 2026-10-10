@@ -390,6 +390,28 @@ def test_provision_disk_size_gb_reaches_box_options(
     assert create.options.disk_size_gb == 100
 
 
+def test_provision_cpus_and_memory_reach_box_options(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """``cpus`` / ``memory_mib`` passed to the launcher reach ``BoxOptions`` verbatim."""
+    BoxliteSandboxLauncher(cpus=4, memory_mib=8192).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.cpus == 4
+    assert create.options.memory_mib == 8192
+
+
+def test_provision_cpus_and_memory_default_when_unset(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """Unset ``cpus`` / ``memory_mib`` keep the built-in 2 vCPU / 4096 MiB box."""
+    BoxliteSandboxLauncher().provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.cpus == 2
+    assert create.options.memory_mib == 4096
+
+
 def test_provision_image_resolution_order(
     fake_boxlite: _FakeBoxliteState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
