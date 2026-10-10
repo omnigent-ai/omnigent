@@ -211,6 +211,27 @@ describe("message navigation highlight", () => {
 });
 
 describe("UserBubble literal text", () => {
+  it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
+    "keeps indented bullets as siblings after stripping %j",
+    (preamble) => {
+      render(
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_list",
+            content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
+          }}
+          isLastAssistant={false}
+        />,
+      );
+
+      expect(screen.getAllByRole("list")).toHaveLength(1);
+      const items = screen.getAllByRole("listitem");
+      expect(items).toHaveLength(2);
+      expect(items[0].parentElement).toBe(items[1].parentElement);
+    },
+  );
+
   it.each([
     [
       "unfinished placeholder",

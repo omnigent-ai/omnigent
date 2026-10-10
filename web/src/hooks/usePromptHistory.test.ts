@@ -21,13 +21,11 @@ describe("appendPromptHistoryEntry", () => {
   beforeEach(() => localStorage.clear());
   afterEach(() => localStorage.clear());
 
-  it("persists a trimmed entry under the conversation's key", () => {
-    // The leading/trailing whitespace must be stripped before storage so
-    // recall returns the prompt the way it was composed, not with stray
-    // padding — and the return value is what the hook syncs its ref to.
-    const result = appendPromptHistoryEntry("  read the README  ", "conv_a");
-    expect(result).toEqual([{ text: "read the README" }]);
-    expect(storedHistory("conv_a")).toEqual(["read the README"]);
+  it("preserves list indentation while trimming trailing whitespace", () => {
+    const text = "  - first\n  - second";
+    const result = appendPromptHistoryEntry(`${text}  \n`, "conv_a");
+    expect(result).toEqual([{ text }]);
+    expect(storedHistory("conv_a")).toEqual([text]);
   });
 
   it("isolates history per conversation — one chat never sees another's", () => {
@@ -95,13 +93,14 @@ describe("usePromptHistory — per-conversation recall", () => {
   it("recalls an entry written by appendPromptHistoryEntry before the hook mounted", () => {
     // Landing-composer handoff: home page writes under the new session id, then
     // the chat composer mounts bound to that id and hydrates from the same key.
-    appendPromptHistoryEntry("the prompt I just sent", "conv_a");
+    const text = "  - first\n  - second";
+    appendPromptHistoryEntry(text, "conv_a");
     const { result } = renderHook(() => usePromptHistory("conv_a"));
     let recalled: ComposerDraft | null = null;
     act(() => {
       recalled = result.current.recallPrevious("");
     });
-    expect(recalled).toEqual({ text: "the prompt I just sent" });
+    expect(recalled).toEqual({ text });
   });
 
   it("does not recall a prompt that belongs to a different conversation", () => {
