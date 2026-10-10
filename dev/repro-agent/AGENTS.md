@@ -197,9 +197,11 @@ template supplied with the continuation, alongside the normal handoff. Reference
 the current run, snapshot, and accepted plan. Cover every requirement exactly
 once as `exercised`, `substituted`, or `unverified`; describe what actually
 happened, cite evidence, and state limitations. A substitute does not count as
-performing the original action. Identify tested product sessions separately from
-your own repro-agent conversation. Preserve this account before your final
-handoff so the coordinator can collect it automatically.
+performing the original action; a trigger you injected or scripted because the
+reported actions did not produce the failure is `substituted` and cannot support
+`reproduced` or `likely_repro` (Step 2). Identify tested product sessions
+separately from your own repro-agent conversation. Preserve this account before
+your final handoff so the coordinator can collect it automatically.
 
 Registration checks record structure, not whether your interpretation is correct
 or the bug is proven. Your account remains a claim for independent review.
@@ -487,6 +489,19 @@ and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — t
 observed error state is the reproduction. The same journey driver can film it
 in Step 4, even when permanent coverage uses a narrower test.
 
+**Injecting the reported fault is not the same as manufacturing the failing
+state.** Fault injection makes a dependency misbehave the way the report
+describes; the reported user actions still run, and the product reaches the
+symptom on its own. If those actions do *not* produce the failure, and the
+symptom appears only after you post, write, or script the intermediate state you
+*suspect* the product reaches (a status event you believe is lost, a row you
+believe is left behind), you have substituted the trigger, not the environment.
+That only shows the product mirrors the state you fed it; it is a root-cause
+hypothesis, not a reproduction. Keep the injection driver and its result in
+`evidence` as a lead, and verdict the facet on the reported trigger's outcome
+(`not_reproduced`, or `needs_more_info` when the report omits what you need to
+drive the trigger) — never `reproduced` or `likely_repro`.
+
 Judge **each sub-symptom** honestly and independently:
 
 **Global `needs_more_info` rule:** use it only for information absent from the
@@ -498,10 +513,19 @@ retryable rather than becoming a product verdict.
 
 - Failure reproduces on the environment the ticket reports → **`reproduced`**.
   Capture the evidence (snapshot, response, log excerpt).
-- Failure reproduces, but only against a **stand-in** for the reported
-  environment you could not drive (for example the CI egress proxy standing in
-  for a Databricks-network host) → **`likely_repro`**. Name the stand-in in
-  `environment_fidelity` (see below). It still dispatches the fix workflow.
+- Failure reproduces from the reported trigger, but only against a **stand-in**
+  for the reported environment you could not drive (for example the CI egress
+  proxy standing in for a Databricks-network host) → **`likely_repro`**. Name
+  the stand-in in `environment_fidelity` (see below). It still dispatches the
+  fix workflow. A stand-in replaces the *environment* only; a trigger you
+  injected or scripted in place of the reported trigger is not a stand-in and
+  never supports `likely_repro`.
+- The reported trigger does **not** produce the failure, and the symptom appears
+  only once you inject the state you hypothesize the product reaches → the
+  sub-symptom did **not** reproduce. Verdict it **`not_reproduced`**, or
+  **`needs_more_info`** when the report omits concrete details you would need to
+  drive the trigger (name them in `missing_information`). Keep the hypothesis
+  and what the injection showed in `evidence`.
 - The failure depends on **native behaviour this environment cannot exercise**
   (the iOS soft keyboard, WebKit-only rendering, a native-chrome layout) and the
   stand-in you can drive — desktop Chromium at a phone viewport — cannot exhibit
@@ -729,7 +753,11 @@ Field meanings:
   for the reported environment — the verdict is then `likely_repro` — set
   `stand-in: <what you drove> — could not drive <the reported surface>`, e.g.
   `stand-in: CI egress proxy — could not drive the Databricks-network host`, and
-  say the same in `journey` and `evidence`. (When the stand-in *cannot exhibit*
+  say the same in `journey` and `evidence`. This field names the environment
+  only: a trigger you injected or scripted in place of the reported one is not
+  a stand-in, and declaring it here does not make an unreproduced symptom
+  `likely_repro` (Step 2); describe that substitution in `evidence` instead.
+  (When the stand-in *cannot exhibit*
   the reported failure at all — a native-chrome bug on the web SPA — you do not
   get a verdict from it: that is `needs_manual_review`, and you name the
   engine/device profile driven in the facet `evidence` rather than here.)
