@@ -30,7 +30,7 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 
 `max_cost_usd` is a positive per-firing budget. Each fired session gets its own cost-budget policy, which blocks subsequent requests and tool calls once recorded spend reaches the cap. It does not interrupt an in-progress model turn: spend can overshoot before the next check, and denying a native tool call does not terminate the turn. Omit the field to attach no automation-specific cap; other applicable policies still apply.
 
-**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, and `execution_target` controls.
+**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, and `execution_target` controls. When the create tool is called without a `timezone`, the runner fills in the zone the user's client reported for the session (the web app sends its browser zone with each message, and on harnesses that apply per-turn framework instructions those name the zone too), so "every day at 9:00 AM" asked in chat means 9:00 AM where the user is; a session whose client never reported a zone keeps the REST default of `UTC` -- including an automation an agent creates in a delegated child session, which does not inherit the parent session's zone.
 
 ## Schedules are RRULEs, not cron
 

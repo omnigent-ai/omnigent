@@ -1294,6 +1294,11 @@ class SessionEventInput(BaseModel):
         tools are fixed at start time.
     :param created_by: Optional internal attribution actor for runner-
         originated events that are triggered by a prior human turn.
+    :param client_timezone: Optional IANA timezone of the sending client,
+        e.g. ``"America/Los_Angeles"``. The web app reports its local zone
+        with each user message so the agent reads unqualified times, such as
+        an automation's schedule, in the user's wall clock. Forwarded to the
+        runner when valid; never persisted on the item.
     """
 
     type: str
@@ -1304,6 +1309,7 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+    client_timezone: str | None = None
 
     @field_validator("data")
     @classmethod

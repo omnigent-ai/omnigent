@@ -18,6 +18,7 @@ import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge"
 import { setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
+import { localTimezone } from "./timezones";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -1486,6 +1487,9 @@ export function continueFailedTurn(sessionId: string): Promise<void> {
         },
       ],
     },
+    // Re-establish the viewer's zone so a schedule created during the continued
+    // turn still defaults to local time after a runner restart cleared it.
+    client_timezone: localTimezone(),
   })
     .then((result) => {
       if (result.denied) throw new Error("The retry was blocked by a policy");

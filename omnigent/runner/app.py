@@ -102,6 +102,11 @@ from omnigent.runner.background_titles import (
     generate_background_title as run_background_title,
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
+from omnigent.runner.client_timezone import (
+    client_timezone_for,
+    forget_client_timezone,
+    remember_client_timezone,
+)
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 from omnigent.runner.mcp_execution_registry import (
@@ -199,6 +204,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
+    client_timezone_instruction,
     raw_author_instructions,
 )
 from omnigent.server.schemas import (
@@ -3394,6 +3400,7 @@ def create_runner_app(
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
+        forget_client_timezone(session_id)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -4837,6 +4844,15 @@ def create_runner_app(
                 if _active_turns.get(conv) is _own_task and _own_task is not None:
                     _on_proxy_stream_end(conv)
 
+    def _turn_framework_instructions(conv: str) -> list[str]:
+        """Framework instructions for one turn: the user's zone when a client reported one.
+
+        :param conv: Session/conversation id.
+        :returns: Instructions to append after the authored prompt; empty when unknown.
+        """
+        timezone = client_timezone_for(conv)
+        return [client_timezone_instruction(timezone)] if timezone else []
+
     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
         """Reasoning block to forward on a turn, or ``None`` when unset.
 
@@ -4959,15 +4975,20 @@ def create_runner_app(
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
+            _framework_bg = _turn_framework_instructions(conv)
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
-                    cached_spec, _raw_per_request_instructions, []
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=_framework_bg,
                 )
             else:
                 instructions = build_instructions(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    framework_instructions=_framework_bg,
                 )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
@@ -5602,10 +5623,14 @@ def create_runner_app(
                     if _instr_spec_ds is not None:
                         _per_req_instr = cast(str | None, body.get("instructions"))
                         _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
+                        _framework_ds = _turn_framework_instructions(conv_id)
                         _ic_ds = InstructionComposition(
                             authored_present=_authored_ds,
                             composed=build_instructions_nullable(
-                                _instr_spec_ds, _per_req_instr, []
+                                _instr_spec_ds,
+                                _per_req_instr,
+                                [],
+                                framework_instructions=_framework_ds,
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
@@ -5617,7 +5642,10 @@ def create_runner_app(
                             _instr_body = {
                                 **body,
                                 "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                    _instr_spec_ds,
+                                    _per_req_instr,
+                                    [],
+                                    framework_instructions=_framework_ds,
                                 ),
                             }
                         if _authored_ds and harness_name:
@@ -6321,6 +6349,7 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            remember_client_timezone(conversation_id, message_body.get("client_timezone"))
 
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)

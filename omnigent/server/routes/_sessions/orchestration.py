@@ -410,6 +410,7 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.util.timezones import is_valid_timezone
 
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
@@ -6799,6 +6800,18 @@ async def _forward_event_to_runner(
     # raw dict (extra keys ignored) and the value never changes after create.
     if conv.reasoning_effort is not None:
         runner_body["reasoning"] = {"effort": conv.reasoning_effort}
+    # Forward the client's local zone so the agent reads unqualified times in the
+    # user's wall clock; an unresolvable zone is dropped rather than failing the send.
+    if body.client_timezone is not None:
+        if is_valid_timezone(body.client_timezone):
+            runner_body["client_timezone"] = body.client_timezone
+        else:
+            _logger.debug(
+                "Ignoring unknown client_timezone %r for session=%s",
+                body.client_timezone[:64],
+                session_id,
+                extra={"session_id": session_id},
+            )
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
     # _routed_harness is non-None when the child routing path resolved one

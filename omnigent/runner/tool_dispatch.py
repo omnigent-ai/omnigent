@@ -64,6 +64,7 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.runner.client_timezone import client_timezone_for
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
@@ -4666,6 +4667,7 @@ async def _execute_scheduled_task_tool(
     arguments: str,
     *,
     server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
 ) -> str:
     """
     Runner-local handler for the ``sys_scheduled_task_*`` family.
@@ -4674,12 +4676,17 @@ async def _execute_scheduled_task_tool(
     Omnigent server's ``/v1/scheduled-tasks`` REST endpoints over
     ``server_client`` — same posture as :func:`_execute_policy_tool` /
     :func:`_execute_session_query_tool`. Ownership + RRULE validation are
-    enforced server-side.
+    enforced server-side. A create that names no ``timezone`` is evaluated in
+    the zone the session's client reported (see
+    :mod:`omnigent.runner.client_timezone`); the server's UTC default applies
+    only when no client ever reported one.
 
     :param tool_name: One of the ``sys_scheduled_task_*`` names.
     :param arguments: JSON-encoded arguments string from the LLM.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
+    :param conversation_id: Session the tool call belongs to, used to look up
+        the client-reported timezone.
     :returns: Tool output JSON string.
     """
     if server_client is None:
@@ -4694,6 +4701,10 @@ async def _execute_scheduled_task_tool(
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            client_timezone = client_timezone_for(conversation_id)
+            # Fall back to the session's remembered client zone when the agent gave none.
+            if not payload.get("timezone") and client_timezone is not None:
+                payload["timezone"] = client_timezone
             resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
@@ -6797,6 +6808,7 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
