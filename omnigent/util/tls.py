@@ -20,6 +20,7 @@ for our own client connections. Both share the CA-file resolution below.
 from __future__ import annotations
 
 import logging
+import os
 import ssl
 from pathlib import Path
 
@@ -52,16 +53,100 @@ def resolve_ca_file() -> str:
     return certifi.where()
 
 
+def _exists(path: str) -> bool:
+    """Report whether *path* exists (one ``stat``; any error reads as missing)."""
+    try:
+        Path(path).stat()
+    except OSError:
+        return False
+    return True
+
+
+def _has_entries(path: str) -> bool:
+    """Report whether *path* is a directory with at least one entry; errors read as empty."""
+    try:
+        return any(Path(path).iterdir())
+    except OSError:
+        return False
+
+
+def explicit_trust_sources() -> tuple[str | None, str | None]:
+    """Return the configured ``(cafile, capath)`` to honor, at most one of them.
+
+    Only the ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` environment variables count as
+    configuration; OpenSSL's compiled-in defaults are fallbacks and are never
+    mixed into an explicit trust set. An existing file takes precedence over the
+    directory, as in httpx's ``trust_env`` handling. A configured path that no
+    longer exists (a rotated bundle) is logged and dropped instead of raised.
+
+    :returns: ``(cafile, None)``, ``(None, capath)``, or ``(None, None)``.
+    """
+    paths = ssl.get_default_verify_paths()
+    cafile = os.environ.get(paths.openssl_cafile_env) or None
+    capath = os.environ.get(paths.openssl_capath_env) or None
+    if cafile is not None and not _exists(cafile):
+        logger.warning("%s=%s does not exist; ignoring it", paths.openssl_cafile_env, cafile)
+        cafile = None
+    if capath is not None and not _exists(capath):
+        logger.warning("%s=%s does not exist; ignoring it", paths.openssl_capath_env, capath)
+        capath = None
+    if cafile is not None:
+        capath = None
+    return cafile, capath
+
+
+def _no_trust_context() -> ssl.SSLContext:
+    """Build a verifying client context that trusts no roots, so handshakes fail closed."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
 def client_ssl_context() -> ssl.SSLContext:
     """Return a cached verifying client SSL context.
 
-    Built once (lazily) so a reconnect loop doesn't re-read the bundle on every
-    attempt. Keeps the secure defaults of :func:`ssl.create_default_context`
-    (hostname checking enabled, ``verify_mode == CERT_REQUIRED``).
+    Built once so reconnect loops do not re-read the bundle. An existing
+    configured source (:func:`explicit_trust_sources`) is honored exactly, so an
+    empty or malformed one trusts nothing instead of gaining default roots. Only
+    a missing path falls back to the OS bundle or certifi via
+    :func:`resolve_ca_file`: a rotated-away bundle is a broken configuration,
+    not a narrower trust policy. Verification is never disabled.
 
-    :returns: A shared :class:`ssl.SSLContext` trusting the resolved CA bundle.
+    :returns: A shared :class:`ssl.SSLContext`.
     """
     global _client_ssl_context
     if _client_ssl_context is None:
-        _client_ssl_context = ssl.create_default_context(cafile=resolve_ca_file())
+        context = None
+        cafile, capath = explicit_trust_sources()
+        if cafile is not None or capath is not None:
+            try:
+                context = ssl.create_default_context(cafile=cafile, capath=capath)
+            except FileNotFoundError:
+                logger.warning(
+                    "Configured CA source (cafile=%s, capath=%s) vanished while loading; "
+                    "using default roots",
+                    cafile,
+                    capath,
+                )
+            except OSError as exc:  # includes ssl.SSLError for an empty or malformed bundle
+                logger.warning(
+                    "Configured CA source (cafile=%s, capath=%s) could not be loaded (%s); "
+                    "trusting no roots",
+                    cafile,
+                    capath,
+                    exc,
+                )
+                context = _no_trust_context()
+            else:
+                # OpenSSL accepts an empty or non-directory capath without
+                # loading anything, so say so instead of failing silently.
+                if capath is not None and not _has_entries(capath):
+                    logger.warning(
+                        "SSL_CERT_DIR=%s holds no certificates; trusting no roots", capath
+                    )
+        if context is None:
+            context = ssl.create_default_context(cafile=resolve_ca_file())
+        _client_ssl_context = context
     return _client_ssl_context
