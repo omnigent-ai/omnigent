@@ -10586,6 +10586,7 @@ describe("managed sandbox inference models", () => {
 
   it.each([
     ["Codex", "a2"],
+    ["Devin", "a3"],
     ["Pi", "a4"],
   ])(
     "launches %s with the harness default from a sandbox without inference config",
@@ -10593,6 +10594,7 @@ describe("managed sandbox inference models", () => {
       mockHosts([]);
       mockAgents([
         ...DEFAULT_LANDING_AGENTS,
+        testAgent("a3", "devin-native-ui", { display_name: "Devin", harness: "devin-native" }),
         testAgent("a4", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
       ]);
       authenticatedFetchMock.mockResolvedValue({
