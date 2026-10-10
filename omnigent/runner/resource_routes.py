@@ -1590,7 +1590,15 @@ def register_resource_routes(
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
                         # Ending short of Content-Length would hand the client
-                        # a silently incomplete file; abort the transfer instead.
+                        # a silently incomplete file; abort the transfer instead
+                        # so the connection drops and the client sees a failure.
+                        _logger.warning(
+                            "Download of %s aborted: file shrank while streaming "
+                            "(sent %d of %d announced bytes)",
+                            resolved,
+                            size - remaining,
+                            size,
+                        )
                         raise RuntimeError(f"{resolved.name} shrank during download")
                     remaining -= len(chunk)
                     yield chunk
