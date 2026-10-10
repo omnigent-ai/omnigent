@@ -739,6 +739,7 @@ def build_agent_bundle(
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
+    icon: str | None = None,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
@@ -796,6 +797,8 @@ def build_agent_bundle(
         }
     if description is not None:
         config["description"] = description
+    if icon is not None:
+        config["icon"] = icon
     if guardrails is not None:
         config["guardrails"] = guardrails
     if terminals is not None:
@@ -890,6 +893,7 @@ async def create_test_agent(
     terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
     sub_agents: list[dict[str, Any]] | None = None,
+    icon: str | None = None,
 ) -> dict[str, Any]:
     """
     Create an agent via multipart session create and return the agent JSON.
@@ -938,6 +942,7 @@ async def create_test_agent(
         terminals=terminals,
         include_llm=include_llm,
         sub_agents=sub_agents,
+        icon=icon,
     )
     metadata: dict[str, Any] = {}
     headers: dict[str, str] = {}

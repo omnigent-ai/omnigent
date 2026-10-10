@@ -102,6 +102,44 @@ def test_env_passthrough_parses_and_round_trips() -> None:
     }
 
 
+def test_icon_parses_configured_and_absent_rows() -> None:
+    entries = acp_agents(
+        {
+            "acp": {
+                "agents": [
+                    {"name": "Fox", "command": "fox acp", "icon": "🦊"},
+                    {"name": "Goose", "command": "goose acp"},
+                ]
+            }
+        }
+    )
+
+    assert entries[0].icon == "🦊"
+    assert entries[1].icon is None
+
+
+def test_icon_round_trips_only_when_set() -> None:
+    entries = acp_agents(
+        {
+            "acp": {
+                "agents": [
+                    {"name": "Fox", "command": "fox acp", "icon": "🦊"},
+                    {"name": "Goose", "command": "goose acp"},
+                ]
+            }
+        }
+    )
+
+    assert acp_agents_settings(entries) == {
+        "acp": {
+            "agents": [
+                {"name": "Fox", "command": "fox acp", "icon": "🦊"},
+                {"name": "Goose", "command": "goose acp"},
+            ]
+        }
+    }
+
+
 def test_env_passthrough_accepts_a_bare_string() -> None:
     entries = acp_agents(
         {"acp": {"agents": [{"name": "A", "command": "a", "env_passthrough": "XAI_API_KEY"}]}}

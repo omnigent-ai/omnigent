@@ -47,6 +47,8 @@ import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
+import { useSessionAgent } from "@/hooks/useAgents";
+import { AgentIcon, resolveAgentIcon } from "@/lib/agentIcon";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -438,6 +440,13 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
+  // The session's bound agent may declare a custom spec icon (emoji or image
+  // path); it wins over the harness glyph, matching AgentCard's precedence.
+  const { data: boundAgent } = useSessionAgent(rootSessionId);
+  const declaredIcon = resolveAgentIcon(
+    { icon: boundAgent?.icon ?? null, id: boundAgent?.id ?? session?.agentId ?? null },
+    () => null,
+  );
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
@@ -475,13 +484,17 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
                 data-testid="subagent-main-harness-icon"
                 className="flex size-8 shrink-0 items-center justify-center rounded-xl border border-border bg-background"
               >
-                <ComposerAgentIcon
-                  agent={{
-                    name: session?.agentName ?? nativeAgent?.agentName ?? "",
-                    harness: session?.harness ?? nativeAgent?.harness ?? null,
-                  }}
-                  className="size-5"
-                />
+                {declaredIcon.kind === "harness" ? (
+                  <ComposerAgentIcon
+                    agent={{
+                      name: session?.agentName ?? nativeAgent?.agentName ?? "",
+                      harness: session?.harness ?? nativeAgent?.harness ?? null,
+                    }}
+                    className="size-5"
+                  />
+                ) : (
+                  <AgentIcon resolution={declaredIcon} className="size-5" />
+                )}
               </span>
               <span className="min-w-0 truncate text-base font-semibold">{label}</span>
             </div>
