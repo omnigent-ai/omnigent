@@ -26,11 +26,10 @@ rejected up front rather than silently dropped.
 
 One consequence worth knowing before adding a row: the generic ACP spawn env is
 deny-by-default and a row has no ``env_passthrough`` of its own (only a
-user-configured ``acp:<slug>`` agent can declare one), so a row's CLI reaches the
-agent with the base environment only. A vendor that configures or authenticates
-*solely* from an environment variable therefore needs a user-configured agent
-rather than a row here; a vendor that reads stored credentials from disk (Devin,
-Grok's OAuth login) works as a row.
+user-configured ``acp:<slug>`` agent can declare one). The host owner can forward
+specific names with ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``; otherwise a row's CLI
+gets only the base environment and spec-declared names. Vendors that read stored
+credentials from disk (Devin, Grok's OAuth login) need no environment grant.
 
 This module stays import-light (stdlib + :mod:`omnigent.harness_install_spec`)
 so the registry, onboarding, and runner layers can all read it without cycles.
@@ -98,7 +97,10 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
             None,
             login_args=("login", "--device-auth"),
             install_hint="curl -fsSL https://x.ai/cli/install.sh | bash",
-            auth_hint="run `grok login --device-auth` (xAI OAuth) or set XAI_API_KEY",
+            auth_hint=(
+                "run `grok login --device-auth` (xAI OAuth) or forward XAI_API_KEY "
+                "with `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`"
+            ),
         ),
         args=("agent", "stdio"),
         aliases=("grok-build",),

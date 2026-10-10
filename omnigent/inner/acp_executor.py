@@ -211,8 +211,9 @@ class AcpAgentConfig:
         spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
         this executor drives an arbitrary agent, so it cannot infer the family
         the agent authenticates with — an agent that reads a variable must name
-        it here (or in ``os_env.sandbox.env_passthrough``) or it starts
-        unauthenticated. Names only; values come from the host environment.
+        it here, in ``os_env.sandbox.env_passthrough``, or in the host owner's
+        ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``. Names only; values come from the
+        host environment.
     :param permission_mode: Omnigent permission stance, e.g. ``"auto"``
         (default) or ``"bypassPermissions"``. Only the latter changes anything:
         it skips the human approval card for a request no policy had an opinion
@@ -775,8 +776,9 @@ class AcpExecutor(Executor):
     def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the generic ACP subprocess.
 
-        Deny-by-default: base + the names declared by the agent's own config and
-        by the spec's ``os_env.sandbox.env_passthrough``. No prefix family is
+        Deny-by-default: base + names declared by the agent's own config, the
+        spec's ``os_env.sandbox.env_passthrough``, and the host owner's
+        ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``. No prefix family is
         added because the executor cannot know which vendor an arbitrary ACP
         agent belongs to; an agent that authenticates from a variable names it
         instead, which keeps every *other* provider's secret out.
@@ -799,18 +801,14 @@ class AcpExecutor(Executor):
     def _warn_initialize_failed(self, reason: str) -> None:
         """Point a failed handshake at the env allowlist.
 
-        A generic ACP agent gets the base environment plus whatever
-        ``os_env.sandbox.env_passthrough`` declares — nothing else, since the
-        executor cannot know which variable an arbitrary agent authenticates
-        with. An agent that reads e.g. ``GEMINI_API_KEY`` therefore starts
-        unauthenticated and usually dies during ``initialize``. That looks like
-        a protocol fault, so name the likely cause once here rather than let
-        every operator rediscover it.
+        A missing credential can look like a protocol fault when the agent
+        dies during ``initialize``. Point to the explicit forwarding routes.
         """
         logger.warning(
             "acp initialize failed for %r: %s. If this agent authenticates from an "
-            "environment variable, declare it in os_env.sandbox.env_passthrough — "
-            "the spawn environment is filtered to the base set plus that list.",
+            "environment variable, declare it in the agent's env_passthrough, "
+            "os_env.sandbox.env_passthrough, "
+            "or the host owner's OMNIGENT_RUNNER_ENV_PASSTHROUGH.",
             self._config.command,
             reason,
         )

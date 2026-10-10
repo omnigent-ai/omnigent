@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import sys
@@ -2217,6 +2218,60 @@ def test_spawn_env_still_excludes_undeclared_secret() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operator_passthrough_reaches_spawned_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+    from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
+
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    runner_env = _build_runner_env(
+        {
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": ",".join(
+                ["XAI_API_KEY", *sorted(RUNNER_AUTH_SECRET_ENV_VARS)]
+            ),
+            "XAI_API_KEY": "canary-xai",
+            "UNRELATED_API_KEY": "canary-unlisted",
+        },
+        server_url="http://server",
+        runner_id="runner_test",
+        binding_token="canary-binding",
+        initial_auth_token="canary-auth",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    monkeypatch.setattr("os.environ", runner_env)
+    worker_env = _build_harness_spawn_env(None)
+    monkeypatch.setattr("os.environ", worker_env)
+    captured = tmp_path / "agent-env.json"
+    command = shlex.join(
+        [
+            sys.executable,
+            "-c",
+            "import json, os, pathlib, sys; "
+            "observed = {'XAI_API_KEY': os.environ.get('XAI_API_KEY'), "
+            "'unrelated_present': 'UNRELATED_API_KEY' in os.environ, "
+            "'runner_auth_present': any(name in os.environ "
+            f"for name in {sorted(RUNNER_AUTH_SECRET_ENV_VARS)!r})}}; "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps(observed))",
+            str(captured),
+        ]
+    )
+    executor = AcpExecutor(AcpAgentConfig(command=command))
+    try:
+        await executor._start_process()
+        assert executor._proc is not None
+        assert await asyncio.wait_for(executor._proc.wait(), timeout=10) == 0
+        observed = json.loads(captured.read_text())
+        assert observed["XAI_API_KEY"] == "canary-xai"
+        assert not observed["unrelated_present"]
+        assert not observed["runner_auth_present"]
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
 async def test_handshake_timeout_reports_a_non_blank_error(tmp_path: Path) -> None:
     """An agent that never answers ``session/new`` yields a named error.
 
@@ -2404,14 +2459,21 @@ def test_spawn_env_env_unset_strips_declared_names(monkeypatch: pytest.MonkeyPat
             command="agent stdio",
             name="Grok",
             env_passthrough=("XAI_API_KEY", "DEEPSEEK_API_KEY"),
-            env_unset=("XAI_API_KEY",),
+            env_unset=("XAI_API_KEY", "GIT_TOKEN", "GIT_USERNAME"),
         )
     )
     monkeypatch.setenv("XAI_API_KEY", "xai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-secret")
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv("GIT_TOKEN", "canary-git")
+    monkeypatch.setenv("GIT_USERNAME", "git-user")
     env = ex._build_spawn_env()
     assert env.get("DEEPSEEK_API_KEY") == "ds-secret"
     assert "XAI_API_KEY" not in env
+    assert {"GIT_TOKEN", "GIT_USERNAME"}.isdisjoint(env)
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "XAI_API_KEY")
+    assert "XAI_API_KEY" not in ex._build_spawn_env()
 
 
 def test_spawn_env_env_unset_empty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:

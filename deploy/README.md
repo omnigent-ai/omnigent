@@ -392,6 +392,11 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
+Codex, ACP, pi, goose, kimi, qwen and hermes keep `GIT_TOKEN` and
+`GIT_USERNAME` when `IS_SANDBOX=1`, which the managed host image sets.
+Elsewhere, list the pair in `OMNIGENT_RUNNER_ENV_PASSTHROUGH`.
+GitHub CLI tokens such as `GH_TOKEN` always need explicit listing.
+
 See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
 
 ## Auth
