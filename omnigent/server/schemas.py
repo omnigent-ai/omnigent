@@ -1235,7 +1235,7 @@ class ElicitationResult(BaseModel):
         and string lists per the MCP spec.
     :param meta: Optional MCP result metadata. Codex uses
         ``_meta.persist`` to distinguish one-time, session-scoped,
-        and persistent MCP tool approvals.
+        and persistent approvals (MCP tool calls, file changes).
     """
 
     action: Literal["accept", "decline", "cancel"]

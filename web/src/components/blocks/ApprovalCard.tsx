@@ -180,7 +180,10 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
-  /** Codex-native MCP persistence scopes advertised by the request. */
+  /**
+   * Codex-native persistence scopes advertised by the request (MCP tool
+   * calls and file changes). ``session`` renders "Approve for this session".
+   */
   codexPersistModes?: CodexPersistMode[];
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`

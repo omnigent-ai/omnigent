@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -18,6 +18,11 @@ _CODEX_FILE_CHANGE_REQUEST_APPROVAL_METHOD = "item/fileChange/requestApproval"
 _CODEX_PERMISSIONS_REQUEST_APPROVAL_METHOD = "item/permissions/requestApproval"
 _CODEX_EXEC_COMMAND_APPROVAL_METHOD = "execCommandApproval"
 _CODEX_APPLY_PATCH_APPROVAL_METHOD = "applyPatchApproval"
+
+# Codex always accepts a session-scoped file-change approval
+# (``acceptForSession`` / ``approved_for_session``); its own TUI offers
+# "Yes, and don't ask again for these files".
+_CODEX_FILE_CHANGE_PERSIST_MODES: tuple[str, ...] = ("session",)
 
 _CodexParamsBuilder = Callable[[Any, str, dict[str, Any]], ElicitationRequestParams]
 _CodexResponseBuilder = Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]]
@@ -252,20 +257,11 @@ def _codex_mcp_elicitation_response(
     :raises OmnigentError: If the verdict asks for a persistence mode
         the original Codex request did not advertise.
     """
-    response_meta: dict[str, str] | None = None
-    requested_persist = result.meta.get("persist") if result.meta is not None else None
-    if result.action == "accept" and requested_persist is not None:
-        advertised = _codex_mcp_persist_modes(params)
-        if not isinstance(requested_persist, str) or requested_persist not in advertised:
-            raise OmnigentError(
-                "Codex MCP persistence choice was not advertised by the request.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        response_meta = {"persist": requested_persist}
+    requested_persist = _requested_persist_mode(result, _codex_mcp_persist_modes(params))
     return {
         "action": result.action,
         "content": result.content if result.action == "accept" else None,
-        "_meta": response_meta,
+        "_meta": {"persist": requested_persist} if requested_persist is not None else None,
     }
 
 
@@ -277,6 +273,32 @@ def _codex_mcp_persist_modes(params: dict[str, Any]) -> set[str]:
     persist = meta.get("persist")
     values = persist if isinstance(persist, list) else [persist]
     return {value for value in values if isinstance(value, str) and value in {"session", "always"}}
+
+
+def _requested_persist_mode(
+    result: ElicitationResult,
+    advertised: Collection[str],
+) -> str | None:
+    """
+    Return the persistence scope an accepted web verdict asked for.
+
+    :param result: Web-submitted elicitation result.
+    :param advertised: Persistence modes the request offered, e.g.
+        ``{"session", "always"}``.
+    :returns: The requested mode, or ``None`` for one-time accepts and
+        for declines / cancels.
+    :raises OmnigentError: If the verdict asks for a mode the request
+        did not advertise.
+    """
+    requested = result.meta.get("persist") if result.meta is not None else None
+    if result.action != "accept" or requested is None:
+        return None
+    if not isinstance(requested, str) or requested not in advertised:
+        raise OmnigentError(
+            "Codex persistence choice was not advertised by the request.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return requested
 
 
 def _execpolicy_amendment(value: Any) -> list[str] | None:
@@ -434,13 +456,21 @@ def _codex_file_change_approval_response(
     """
     Convert a web verdict into Codex file-change approval output.
 
+    A session-scoped accept (``_meta.persist == "session"``) becomes
+    ``acceptForSession`` so Codex stops prompting for later changes to
+    the same files.
+
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because this
         response shape is unique to file-change approvals.
     :param _params: Original Codex request params, unused because the
         response depends only on the web verdict.
     :returns: Codex ``FileChangeRequestApprovalResponse`` payload.
+    :raises OmnigentError: If the verdict asks for a persistence mode
+        other than ``session``.
     """
+    if _requested_persist_mode(result, _CODEX_FILE_CHANGE_PERSIST_MODES) == "session":
+        return {"decision": "acceptForSession"}
     return {
         "decision": {
             "accept": "accept",
@@ -458,13 +488,20 @@ def _codex_apply_patch_approval_response(
     """
     Convert a web verdict into legacy Codex patch approval output.
 
+    A session-scoped accept becomes ``approved_for_session``, the legacy
+    ``ReviewDecision`` spelling of ``acceptForSession``.
+
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because this
         response shape is unique to legacy patch approvals.
     :param _params: Original Codex request params, unused because the
         response depends only on the web verdict.
     :returns: Codex ``ApplyPatchApprovalResponse`` payload.
+    :raises OmnigentError: If the verdict asks for a persistence mode
+        other than ``session``.
     """
+    if _requested_persist_mode(result, _CODEX_FILE_CHANGE_PERSIST_MODES) == "session":
+        return {"decision": "approved_for_session"}
     return {
         "decision": {
             "accept": "approved",
@@ -722,6 +759,7 @@ def _codex_file_change_approval_params(
         extras["turn_id"] = turn_id
     if isinstance(item_id, str) and item_id:
         extras["item_id"] = item_id
+    extras["codex_persist_modes"] = list(_CODEX_FILE_CHANGE_PERSIST_MODES)
     message = "Codex wants to modify files"
     if grant_root:
         message = f"Codex wants write access under **{grant_root}**"
@@ -818,6 +856,7 @@ def _codex_apply_patch_approval_params(
         extras["call_id"] = call_id
     if isinstance(files, dict) and files:
         extras["files"] = sorted(str(key) for key in files)
+    extras["codex_persist_modes"] = list(_CODEX_FILE_CHANGE_PERSIST_MODES)
     return ElicitationRequestParams(
         mode="form",
         message="Codex wants to apply a patch",

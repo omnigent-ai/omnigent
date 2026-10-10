@@ -32,7 +32,7 @@ export interface RememberScope {
   host?: string;
 }
 
-/** Persistence scopes advertised by Codex for MCP tool approvals. */
+/** Persistence scopes advertised for a Codex approval (MCP tool calls, file changes). */
 export type CodexPersistMode = "session" | "always";
 
 /**

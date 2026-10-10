@@ -705,7 +705,7 @@ export interface ElicitationBlock {
    * Absent/null for all other elicitations.
    */
   rememberScope?: RememberScope | null;
-  /** Codex-native MCP approval persistence modes advertised by the request. */
+  /** Codex-native approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
 }
 

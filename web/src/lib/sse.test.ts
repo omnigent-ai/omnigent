@@ -505,3 +505,44 @@ describe("parseEvent — response.elicitation_resolved", () => {
     } satisfies ElicitationResolved);
   });
 });
+
+describe("parseEvent — response.elicitation_request (Codex persistence choices)", () => {
+  const params = {
+    mode: "form",
+    message: "Codex wants to modify files",
+    requestedSchema: {},
+  };
+
+  it("reads the server-stamped codex_persist_modes on a file-change approval", () => {
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elic_file_change",
+      params: {
+        ...params,
+        phase: "codex_file_change_approval",
+        policy_name: "codex_native_file_change_approval",
+        codex_persist_modes: ["session", "bogus"],
+      },
+    });
+    expect(ev).toMatchObject({ type: "elicitation_request", codexPersistModes: ["session"] });
+  });
+
+  it("falls back to Codex's own _meta.persist advertisement on MCP tool approvals", () => {
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elic_mcp",
+      params: {
+        ...params,
+        phase: "codex_mcp_elicitation",
+        _meta: { codex_approval_kind: "mcp_tool_call", persist: ["session", "always"] },
+      },
+    });
+    expect(ev).toMatchObject({ codexPersistModes: ["session", "always"] });
+  });
+
+  it("advertises nothing when neither source is present", () => {
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elic_plain",
+      params,
+    });
+    expect(ev).toMatchObject({ codexPersistModes: [] });
+  });
+});

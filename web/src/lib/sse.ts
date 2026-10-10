@@ -1055,8 +1055,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       codexMetaRaw && typeof codexMetaRaw === "object" && !Array.isArray(codexMetaRaw)
         ? (codexMetaRaw as Record<string, unknown>)
         : null;
-    const codexPersistRaw =
-      codexMeta?.codex_approval_kind === "mcp_tool_call" ? codexMeta.persist : null;
+    // Codex persistence choices: the server stamps `codex_persist_modes` on
+    // approvals it adapts itself (file changes); MCP tool approvals carry
+    // Codex's own `_meta.persist` advertisement.
+    const codexPersistRaw = Array.isArray(p.codex_persist_modes)
+      ? p.codex_persist_modes
+      : codexMeta?.codex_approval_kind === "mcp_tool_call"
+        ? codexMeta.persist
+        : null;
     const codexPersistCandidates = Array.isArray(codexPersistRaw)
       ? codexPersistRaw
       : [codexPersistRaw];
