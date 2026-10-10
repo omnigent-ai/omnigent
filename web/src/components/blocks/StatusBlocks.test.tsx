@@ -274,6 +274,10 @@ describe("ErrorBanner", () => {
     ["agent_startup_pending", "The agent is still starting in the session terminal."],
     ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
     [
+      "input_too_large",
+      "The message exceeds the agent's input limit. Shorten it or split large pasted content across turns.",
+    ],
+    [
       "transient_upstream_error",
       "The model service hit a temporary error mid-response; retrying usually continues the turn.",
     ],

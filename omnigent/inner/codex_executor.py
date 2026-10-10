@@ -2354,6 +2354,11 @@ def _extract_latest_user_content(
     return ""
 
 
+def _has_prior_history(messages: list[Message]) -> bool:
+    """Whether a fresh thread's first prompt replays earlier turns, not just the latest message."""
+    return sum(1 for msg in messages if msg.get("role") == "user") > 1
+
+
 def _build_initial_prompt(
     messages: list[Message],
 ) -> str | list[CodexParams]:
@@ -2366,8 +2371,7 @@ def _build_initial_prompt(
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
     """
-    user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    if len(messages) <= 1 or len(user_messages) <= 1:
+    if not _has_prior_history(messages):
         return _extract_latest_user_content(messages)
 
     has_attachments = any(
@@ -2736,6 +2740,68 @@ class _PendingToolResult:
     status: ToolCallStatus = ToolCallStatus.SUCCESS
     error: str | None = None
     duration_ms: float = 0.0
+
+
+INPUT_TOO_LARGE_CODE = "input_too_large"
+_INPUT_TOO_LARGE_TITLE = "Message is too large for Codex"
+_INPUT_TOO_LARGE_REMEDIATION = "Shorten the message or split large pasted content across turns."
+_CONVERSATION_TOO_LARGE_TITLE = "Conversation is too large for Codex"
+_CONVERSATION_TOO_LARGE_REMEDIATION = (
+    "Fork the session from a message before the oversized one, or start a new session."
+)
+
+
+class _CodexRequestError(RuntimeError):
+    """A JSON-RPC request the Codex app-server rejected; ``error`` is its payload."""
+
+    def __init__(self, error: object) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _input_too_large_error(
+    error: object, *, replayed_history: bool = False
+) -> ExecutorError | None:
+    """Translate an ``input_too_large`` rejection into a coded turn error.
+
+    Returns ``None`` for any other JSON-RPC error payload. ``replayed_history``
+    marks a fresh thread's first prompt, where the earlier conversation rather
+    than the latest message is what exceeds the limit.
+    """
+    if not isinstance(error, dict):
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual = data.get("actual_chars")
+    limit = data.get("max_chars")
+    counted = isinstance(actual, int) and isinstance(limit, int)
+    if replayed_history:
+        title = _CONVERSATION_TOO_LARGE_TITLE
+        remediation = _CONVERSATION_TOO_LARGE_REMEDIATION
+        message = (
+            f"Replaying this conversation to Codex takes {actual:,} characters; "
+            f"Codex accepts at most {limit:,}."
+            if counted
+            else "Replaying this conversation to Codex exceeds its input limit."
+        )
+    else:
+        title = _INPUT_TOO_LARGE_TITLE
+        remediation = _INPUT_TOO_LARGE_REMEDIATION
+        message = (
+            f"This turn's input is {actual:,} characters; Codex accepts at most {limit:,}."
+            if counted
+            else "This turn's input is too large for Codex."
+        )
+    return ExecutorError(
+        message=message,
+        retryable=False,
+        # Refused before any turn started, so the thread stays idle and reusable.
+        preserve_session=True,
+        code=INPUT_TOO_LARGE_CODE,
+        title=title,
+        remediation=remediation,
+    )
 
 
 class _CodexAppServerSession:
@@ -3690,10 +3756,25 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = reasoning_effort
             turn_params["summary"] = "detailed"
-        start_response = await self._request(
-            "turn/start",
-            turn_params,
-        )
+        try:
+            start_response = await self._request(
+                "turn/start",
+                turn_params,
+            )
+        except _CodexRequestError as exc:
+            # Refused before any turn exists, so name the limit instead of
+            # leaking the app-server's raw JSON-RPC error to the user.
+            replayed_history = is_new_thread and _has_prior_history(prompt_messages)
+            too_large = _input_too_large_error(exc.error, replayed_history=replayed_history)
+            if too_large is None:
+                raise
+            if replayed_history:
+                # The fresh thread never received the replayed history; drop it so
+                # the next turn replays into a new thread instead of sending only
+                # the latest message.
+                self.thread_id = None
+            yield too_large
+            return
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -4255,7 +4336,7 @@ class _CodexAppServerSession:
                 future.exception()
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise _CodexRequestError(error)
         return response
 
     async def _send_response(self, request_id: int, result: CodexParams) -> None:

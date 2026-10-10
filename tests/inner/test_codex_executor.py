@@ -27,10 +27,12 @@ from omnigent.inner.codex_executor import (
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
+    _CodexRequestError,
     _CodexSessionState,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
+    _input_too_large_error,
     _parse_codex_gateway_error,
     _prompt_for_turn,
     _provider_codex_config_overrides,
@@ -178,6 +180,24 @@ class _FakeProcess:
 
     async def wait(self) -> int:
         return self.returncode or 0
+
+
+_INPUT_TOO_LARGE_REJECTION = {
+    "code": -32602,
+    "data": {
+        "input_error_code": "input_too_large",
+        "max_chars": 1_048_576,
+        "actual_chars": 1_449_987,
+    },
+    "message": "Input exceeds the maximum length of 1048576 characters.",
+}
+_TURN_KWARGS: dict[str, Any] = {
+    "tools": [],
+    "system_prompt": "",
+    "model": "gpt-5.4-mini",
+    "cwd": ".",
+    "sandbox": "workspace-write",
+}
 
 
 class TestCodexExecutor(unittest.TestCase):
@@ -456,6 +476,229 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertIsNotNone(message)
         self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS + 1), message)
         self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS), message)
+
+    def test_request_error_keeps_the_app_server_payload(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._proc = _FakeProcess()
+            error = {
+                "code": -32602,
+                "data": {"input_error_code": "input_too_large"},
+                "message": "Input exceeds the maximum length of 1048576 characters.",
+            }
+
+            async def _reject(payload):
+                session._pending_requests[payload["id"]].set_result(
+                    {"id": payload["id"], "error": error}
+                )
+
+            session._send_message = _reject
+            with self.assertRaises(_CodexRequestError) as raised:
+                await session._request("turn/start", {"threadId": "thread-1", "input": []})
+            self.assertIsInstance(raised.exception, RuntimeError)
+            self.assertEqual(raised.exception.error, error)
+            self.assertEqual(str(raised.exception), str(error))
+
+        _run(_t())
+
+    def test_oversized_turn_input_fails_with_a_clear_reason(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    _CodexRequestError(_INPUT_TOO_LARGE_REJECTION),
+                ]
+            )
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "Summarize this log"}],
+                    **_TURN_KWARGS,
+                )
+            ]
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertEqual(methods, ["thread/start", "turn/start"])
+            self.assertEqual(len(events), 1)
+            error = events[0]
+            self.assertIsInstance(error, ExecutorError)
+            self.assertEqual(error.code, "input_too_large")
+            self.assertEqual(error.title, "Message is too large for Codex")
+            self.assertIn("1,449,987", error.message)
+            self.assertIn("1,048,576", error.message)
+            self.assertIn("Shorten the message", error.remediation)
+            self.assertFalse(error.retryable)
+            self.assertTrue(error.preserve_session)
+            surfaced = f"{error.title} {error.message} {error.remediation}"
+            for fragment in ("-32602", "input_error_code", "Codex executor error"):
+                self.assertNotIn(fragment, surfaced)
+            self.assertIsNone(session.active_turn_id)
+            # No earlier history was lost, so the empty thread is kept for the retry.
+            self.assertEqual(session.thread_id, "thread-1")
+
+        _run(_t())
+
+    def test_rejected_history_replay_discards_the_fresh_thread(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    _CodexRequestError(_INPUT_TOO_LARGE_REJECTION),
+                    {"result": {"thread": {"id": "thread-2"}}},
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            history = [
+                {"role": "user", "content": "What does the log say?"},
+                {"role": "assistant", "content": "It reports heartbeat latency."},
+                {"role": "user", "content": "x" * 32},
+            ]
+            events = [event async for event in session.run_turn(messages=history, **_TURN_KWARGS)]
+            error = events[0]
+            self.assertIsInstance(error, ExecutorError)
+            self.assertTrue(error.preserve_session)
+            self.assertIsNone(session.thread_id)
+            # The replayed conversation, not the latest message, is what exceeded the limit.
+            self.assertEqual(error.title, "Conversation is too large for Codex")
+            self.assertIn("Replaying this conversation to Codex takes 1,449,987", error.message)
+            self.assertIn("Fork the session", error.remediation)
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-2"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            follow_up = [*history, {"role": "user", "content": "Summarize the first error."}]
+            _ = [event async for event in session.run_turn(messages=follow_up, **_TURN_KWARGS)]
+            await inject_task
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertEqual(methods, ["thread/start", "turn/start", "thread/start", "turn/start"])
+            replay = session._request.await_args_list[3].args[1]["input"][0]["text"]
+            self.assertIn("Conversation so far:", replay)
+            self.assertIn("It reports heartbeat latency.", replay)
+            self.assertEqual(session.thread_id, "thread-2")
+
+        _run(_t())
+
+    def test_rejected_oversized_input_keeps_an_established_thread(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(
+                side_effect=[
+                    _CodexRequestError(_INPUT_TOO_LARGE_REJECTION),
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            history = [
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": "earlier answer"},
+                {"role": "user", "content": "x" * 32},
+            ]
+            events = [event async for event in session.run_turn(messages=history, **_TURN_KWARGS)]
+            self.assertTrue(events[0].preserve_session)
+            self.assertEqual(events[0].title, "Message is too large for Codex")
+            self.assertEqual(session.thread_id, "thread-1")
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-2"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            follow_up = [*history, {"role": "user", "content": "shorter"}]
+            _ = [event async for event in session.run_turn(messages=follow_up, **_TURN_KWARGS)]
+            await inject_task
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertEqual(methods, ["turn/start", "turn/start"])
+            self.assertEqual(
+                session._request.await_args_list[1].args[1]["input"],
+                [{"type": "text", "text": "shorter"}],
+            )
+
+        _run(_t())
+
+    def test_other_turn_start_rejections_still_propagate(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    _CodexRequestError({"code": -32600, "message": "Invalid request"}),
+                ]
+            )
+            with self.assertRaisesRegex(RuntimeError, "Invalid request"):
+                _ = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[],
+                        system_prompt="",
+                        model="gpt-5.4-mini",
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
+
+        _run(_t())
+
+    def test_input_too_large_error_without_counts_or_for_other_rejections(self):
+        error = _input_too_large_error(
+            {
+                "code": -32602,
+                "data": {"input_error_code": "input_too_large"},
+                "message": "Input exceeds the maximum length.",
+            }
+        )
+        self.assertIsNotNone(error)
+        self.assertEqual(error.code, "input_too_large")
+        self.assertIn("too large", error.message)
+        replay = _input_too_large_error(
+            {"code": -32602, "data": {"input_error_code": "input_too_large"}},
+            replayed_history=True,
+        )
+        self.assertEqual(
+            replay.message, "Replaying this conversation to Codex exceeds its input limit."
+        )
+        self.assertIsNone(_input_too_large_error({"code": -32600, "message": "Invalid request"}))
+        self.assertIsNone(_input_too_large_error("Invalid request"))
 
     def test_run_turn_delegates_to_app_server_session(self):
         async def _t():
