@@ -2984,6 +2984,33 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     fireEvent.click(chip);
   }
 
+  it("spells the connect-host command with the isaac omni launcher the desktop uses", async () => {
+    renderLanding({ databricks_features: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-connect-host"));
+    expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
+    // Databricks-internal machines reach the CLI only through `isaac omni`; a bare
+    // `omni …` command is refused there by the wrapper guard.
+    expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+      /^isaac omni host --server '/,
+    );
+  });
+
+  it("spells the Lakebox commands with isaac omni too", async () => {
+    renderLanding({ databricks_features: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-connect-host"));
+    const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
+    fireEvent.mouseDown(lakeboxTab);
+    fireEvent.click(lakeboxTab);
+    expect(screen.getByTestId("connect-lakebox-create-command")).toHaveTextContent(
+      /^isaac omni sandbox create --provider lakebox$/,
+    );
+    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
+      /^isaac omni sandbox connect --provider lakebox --sandbox-id <id> --server '/,
+    );
+  });
+
   it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
     renderLanding();
     await openHostMenu();

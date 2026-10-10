@@ -72,6 +72,7 @@ import {
   nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
+import { useDatabricksInternalFeatures } from "@/hooks/useDatabricksInternalFeatures";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
@@ -805,6 +806,7 @@ function SupportedForkSessionForm({
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
   const serverUrl = getCliServerUrl();
+  const databricksInternalFeatures = useDatabricksInternalFeatures();
 
   // Gates the sandbox rows in the host picker: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -1333,6 +1335,7 @@ function SupportedForkSessionForm({
               // online.
               <ConnectHostInstructions
                 serverUrl={serverUrl}
+                databricksInternalFeatures={databricksInternalFeatures}
                 label={
                   allHosts.length === 0
                     ? "No hosts connected yet. Connect one from your terminal:"
@@ -1426,7 +1429,12 @@ function SupportedForkSessionForm({
                       ? "Connect a host from your terminal"
                       : "Connect another host from your terminal"}
                   </button>
-                  {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
+                  {showConnect && (
+                    <ConnectHostInstructions
+                      serverUrl={serverUrl}
+                      databricksInternalFeatures={databricksInternalFeatures}
+                    />
+                  )}
                 </>
               </>
             )}
