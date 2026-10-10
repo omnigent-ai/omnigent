@@ -6993,11 +6993,13 @@ def session(ctx: click.Context) -> None:
 def session_export(session_id: str, output: str | None, server: str | None) -> None:
     """Export a session transcript to a portable JSONL file.
 
-    Each line of the output is a JSON object.  The first line carries
-    the session metadata (``"record_type": "session_meta"``); every
-    subsequent line is one conversation item
-    (``"record_type": "item"``).  The file preserves full turn order
-    and is independent of ``omnigent import``, which reads native harness history.
+    Writes an ``omnigent.transcript/1`` file (see ``docs/session-export.md``):
+    the first line is a header naming the schema and the session; every
+    following line is one entry — ``message``, ``reasoning``, ``tool_call``,
+    ``tool_result``, ``error``, ``compaction`` or ``note`` — in turn order.
+    Content the provider withheld (encrypted reasoning, provider-hosted tool
+    results) is marked ``sealed`` rather than silently dropped. Independent of
+    ``omnigent import``, which reads native harness history.
 
     \b
     Examples:
@@ -7008,6 +7010,7 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     import httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.export import iter_transcript_lines
 
     cfg = _load_effective_config()
     resolved_server = _resolve_attach_server_url(server, cfg.get("server"))
@@ -7039,12 +7042,10 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         session_data = resp.json()
 
         n_items = 0
-        with out_path.open("w", encoding="utf-8") as fh:
-            # First line: session metadata.
-            meta_record = {"record_type": "session_meta", **session_data}
-            fh.write(json.dumps(meta_record) + "\n")
 
-            # Remaining lines: items in ascending order, paginated.
+        def _items() -> Iterator[dict[str, Any]]:
+            """Page through the session's items in ascending order."""
+            nonlocal n_items
             after: str | None = None
             while True:
                 params: dict[str, str | int] = {"limit": 500, "order": "asc"}
@@ -7054,12 +7055,14 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 items_resp.raise_for_status()
                 page = items_resp.json()
                 for item in page["data"]:
-                    item_record = {"record_type": "item", **item}
-                    fh.write(json.dumps(item_record) + "\n")
                     n_items += 1
+                    yield item
                 if not page.get("has_more"):
                     break
                 after = page.get("last_id")
+
+        with out_path.open("w", encoding="utf-8") as fh:
+            fh.writelines(iter_transcript_lines(session_data, _items()))
 
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
@@ -7130,6 +7133,96 @@ def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
     return {"type": item_type, "data": raw}
 
 
+def _read_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, object]]]:
+    """
+    Read a session export into ``(session meta, initial_items)``.
+
+    Accepts an ``omnigent.transcript/1`` file (header line carries
+    ``schema``) and, for files written before the schema existed, the older
+    ``record_type: session_meta`` / ``item`` JSONL. The meta dict uses the
+    ``GET /v1/sessions/{id}`` key names either way so the caller binds the
+    agent and restores settings the same way.
+
+    :param src_path: The export file.
+    :returns: The session meta and the ``SessionEventInput``-shaped items.
+    :raises click.ClickException: If the file is not an export this version
+        can read, or an item does not validate.
+    """
+    from omnigent.entities.conversation import parse_item_data
+    from omnigent.export import TranscriptSchemaError, item_from_entry, read_transcript
+
+    with src_path.open("r", encoding="utf-8") as fh:
+        first = next((line for line in fh if line.strip()), "")
+    try:
+        first_record: object = json.loads(first) if first.strip() else None
+    except ValueError as exc:
+        raise click.ClickException(f"{src_path}:1: not valid JSON ({exc}).") from exc
+    if isinstance(first_record, dict) and "record_type" in first_record:
+        return _read_legacy_session_export(src_path)
+
+    try:
+        with src_path.open("r", encoding="utf-8") as fh:
+            transcript = read_transcript(fh)
+    except TranscriptSchemaError as exc:
+        raise click.ClickException(f"{src_path}: {exc}") from exc
+
+    initial_items: list[dict[str, object]] = []
+    for entry in transcript.entries:
+        payload = item_from_entry(entry)
+        try:
+            parse_item_data(str(payload["type"]), payload["data"])
+        except (TypeError, ValueError) as exc:
+            raise click.ClickException(
+                f"{src_path}: entry {entry.seq} is an invalid {payload['type']!r} item: {exc}"
+            ) from exc
+        initial_items.append(payload)
+
+    header = transcript.header
+    meta: _JsonObject = {
+        "id": header.session,
+        "title": header.title,
+        "agent_id": header.agent_id,
+        "harness": header.harness,
+        "workspace": header.workspace,
+        **header.settings,
+    }
+    return meta, initial_items
+
+
+def _read_legacy_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, object]]]:
+    """Read the pre-schema ``session_meta`` / ``item`` JSONL export."""
+    meta: _JsonObject | None = None
+    items: list[_JsonObject] = []
+    with src_path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record_value: object = json.loads(line)
+            except ValueError as exc:
+                raise click.ClickException(
+                    f"{src_path}:{line_no}: not valid JSON ({exc})."
+                ) from exc
+            if not isinstance(record_value, dict) or not all(
+                isinstance(key, str) for key in record_value
+            ):
+                raise click.ClickException(f"{src_path}:{line_no}: expected a JSON object.")
+            record = cast(_JsonObject, record_value)
+            kind = record.get("record_type")
+            if kind == "session_meta":
+                meta = record
+            elif kind == "item":
+                items.append(record)
+            # Unknown record_type lines are ignored for forward compatibility.
+
+    if meta is None:
+        raise click.ClickException(
+            f"{src_path}: no 'session_meta' line found — is this a session export?"
+        )
+    return meta, [_import_item_payload(item) for item in items]
+
+
 @session.command("import")
 @click.option(
     "--input",
@@ -7155,8 +7248,9 @@ def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
 def session_import(input_path: str, title: str | None, server: str | None) -> None:
     """Import a session transcript from a portable JSONL file.
 
-    The inverse of ``omnigent session export``: reads the ``session_meta`` +
-    ``item`` lines and recreates the conversation on the target server as a new
+    The inverse of ``omnigent session export``: reads an
+    ``omnigent.transcript/1`` file (or the older ``session_meta`` / ``item``
+    JSONL) and recreates the conversation on the target server as a new
     session (a fresh conversation id each time). Distinct from ``omnigent
     import``, which reads native harness history rather than an export file.
 
@@ -7192,39 +7286,9 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     if not src_path.is_file():
         raise click.ClickException(f"Import file not found: {input_path}")
 
-    meta: _JsonObject | None = None
-    items: list[_JsonObject] = []
-    with src_path.open("r", encoding="utf-8") as fh:
-        for line_no, line in enumerate(fh, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record_value: object = json.loads(line)
-            except ValueError as exc:
-                raise click.ClickException(
-                    f"{input_path}:{line_no}: not valid JSON ({exc})."
-                ) from exc
-            if not isinstance(record_value, dict) or not all(
-                isinstance(key, str) for key in record_value
-            ):
-                raise click.ClickException(f"{input_path}:{line_no}: expected a JSON object.")
-            record = cast(_JsonObject, record_value)
-            kind = record.get("record_type")
-            if kind == "session_meta":
-                meta = record
-            elif kind == "item":
-                items.append(record)
-            # Unknown record_type lines are ignored for forward compatibility.
-
-    if meta is None:
-        raise click.ClickException(
-            f"{input_path}: no 'session_meta' line found — is this a session export?"
-        )
-    if not items:
-        raise click.ClickException(f"{input_path}: no 'item' lines to import.")
-
-    initial_items = [_import_item_payload(item) for item in items]
+    meta, initial_items = _read_session_export(src_path)
+    if not initial_items:
+        raise click.ClickException(f"{input_path}: no items to import.")
 
     # Agent binding: reuse the exported agent_id when it exists on the target
     # server; otherwise fall back to the built-in native agent for the export's

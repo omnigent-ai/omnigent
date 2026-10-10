@@ -298,3 +298,102 @@ def test_session_import_missing_meta_errors(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "session_meta" in result.output
+
+
+def _write_transcript(
+    path: Path, *, header: dict[str, Any], entries: list[dict[str, Any]]
+) -> None:
+    """Write an ``omnigent.transcript/1`` file: header line + one line per entry."""
+    lines = [{"schema": "omnigent.transcript/1", **header}, *entries]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+
+@respx.mock
+def test_session_import_reads_transcript_schema(tmp_path: Path) -> None:
+    """A schema-headed transcript is rebuilt into typed items and settings reapplied."""
+    src = tmp_path / "t.jsonl"
+    _write_transcript(
+        src,
+        header={
+            "session": "conv_old",
+            "title": "orig",
+            "agent_id": "ag_abc",
+            "harness": "claude-native",
+            "workspace": "/work/churn",
+            "settings": {"reasoning_effort": "high"},
+        },
+        entries=[
+            {"turn": 1, "seq": 1, "role": "user", "kind": "message", "text": "hello"},
+            {
+                "turn": 1,
+                "seq": 2,
+                "role": "assistant",
+                "kind": "tool_call",
+                "origin_type": "function_call",
+                "agent": "claude-native-ui",
+                "tool": "shell",
+                "tool_input": {"command": ["ls"]},
+                "call_id": "call_1",
+            },
+            {
+                "turn": 1,
+                "seq": 3,
+                "role": "tool",
+                "kind": "tool_result",
+                "call_id": "call_1",
+                "tool_output": "lib.py",
+            },
+            {
+                "turn": 1,
+                "seq": 4,
+                "role": "assistant",
+                "kind": "message",
+                "text": "done",
+                "agent": "claude-native-ui",
+            },
+        ],
+    )
+
+    route = respx.post(f"{_BASE}/v1/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "conv_new", "agent_id": "ag_abc"})
+    )
+
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code == 0, result.output
+    assert "conv_new" in result.output
+    body = json.loads(route.calls.last.request.content)
+    assert body["agent_id"] == "ag_abc"
+    assert body["title"] == "orig"
+    assert body["workspace"] == "/work/churn"
+    assert body["reasoning_effort"] == "high"
+    assert [item["type"] for item in body["initial_items"]] == [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    # Text-only user entry is rebuilt into an input_text block.
+    assert body["initial_items"][0]["data"]["content"] == [{"type": "input_text", "text": "hello"}]
+    call = body["initial_items"][1]["data"]
+    assert call["name"] == "shell"
+    assert json.loads(call["arguments"]) == {"command": ["ls"]}
+    assert call["agent"] == "claude-native-ui"
+    assert body["initial_items"][3]["data"]["agent"] == "claude-native-ui"
+
+
+def test_session_import_refuses_unknown_schema(tmp_path: Path) -> None:
+    """A newer schema version is refused rather than misread."""
+    src = tmp_path / "future.jsonl"
+    src.write_text(
+        json.dumps({"schema": "omnigent.transcript/99", "session": "x"}) + "\n", encoding="utf-8"
+    )
+
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code != 0
+    assert "unsupported transcript schema" in result.output

@@ -13555,6 +13555,53 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/export": {
+      "get": {
+        "description": "Stream the session as a portable, versioned transcript.\n\nBuilds the same `omnigent.transcript/1` file as `omnigent session export` (see `docs/session-export.md`) server-side, paging the\nitems so a long session never has to fit in memory at once.\n\n**Returns:** An `application/x-ndjson` download named `<session_id>.jsonl`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ; 404 if no session exists.",
+        "operationId": "export_session_transcript_v1_sessions__session_id__export_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The session as an `omnigent.transcript/1` file: one JSON object per line, header first, then one entry per item."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Session Transcript",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/items": {
       "get": {
         "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A `PaginatedList` of conversation items.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
