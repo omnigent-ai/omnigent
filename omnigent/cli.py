@@ -12772,6 +12772,59 @@ def _login_and_mint_workspace_auth_info(
     return auth_info
 
 
+# ``databricks auth login`` prints nothing while it waits (up to an hour) for the
+# browser to reach its loopback callback. Explain that callback once the wait
+# looks stuck, and stop waiting well before the CLI would.
+_BROWSER_LOGIN_CALLBACK_PORT = 8020
+_BROWSER_LOGIN_HINT_DELAY_S = 30.0
+_BROWSER_LOGIN_TIMEOUT_S = 600.0
+# Set by the sandbox bootstrap for the in-sandbox login whose callback port it forwards itself.
+_BROWSER_LOGIN_CALLBACK_FORWARDED_ENV = "OMNIGENT_LOGIN_CALLBACK_FORWARDED"
+
+
+def _browser_login_callback_guidance() -> str:
+    """How the browser reaches the login callback when it is not on this machine."""
+    port = _BROWSER_LOGIN_CALLBACK_PORT
+    return (
+        f"To finish the login, the browser must reach http://localhost:{port} on this "
+        "machine, or whichever localhost port the browser's address bar shows after you "
+        f"sign in (the CLI picks another port when {port} is busy). If the browser runs on "
+        "a different machine than this terminal (for example an SSH or Arca session), "
+        "forward that port from the browser's machine first: "
+        f"`ssh -L {port}:localhost:{port} -N <this-host>` (if the address bar shows a "
+        f"different port, use it in both places instead of {port}), then reload the "
+        "browser tab."
+    )
+
+
+def _in_ssh_session() -> bool:
+    return any(os.environ.get(name) for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"))
+
+
+def _wait_for_browser_login(
+    proc: subprocess.Popen[bytes], *, guidance: str, guidance_shown: bool
+) -> int:
+    """Wait for ``databricks auth login`` and return its exit code, printing a notice (plus
+    *guidance*, unless empty or already *guidance_shown*) once the wait looks stuck; after
+    ``_BROWSER_LOGIN_TIMEOUT_S`` the CLI is terminated and ``click.ClickException`` raised."""
+    minutes = int(_BROWSER_LOGIN_TIMEOUT_S // 60)
+    try:
+        return proc.wait(timeout=_BROWSER_LOGIN_HINT_DELAY_S)
+    except subprocess.TimeoutExpired:
+        pass
+    notice = f"Still waiting for the browser login to finish (giving up after {minutes} minutes)."
+    click.echo(notice if guidance_shown or not guidance else f"{notice} {guidance}")
+    try:
+        return proc.wait(timeout=_BROWSER_LOGIN_TIMEOUT_S - _BROWSER_LOGIN_HINT_DELAY_S)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        timed_out = (
+            f"Timed out after {minutes} minutes waiting for the browser to finish the "
+            "Databricks login."
+        )
+        raise click.ClickException(f"{timed_out} {guidance}" if guidance else timed_out) from None
+
+
 def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None) -> None:
     """Run ``databricks auth login --host <workspace>`` (browser flow).
 
@@ -12783,13 +12836,21 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
         grant to that workspace (else the grant is account-scoped and
         the workspace rejects it).
     :raises click.ClickException: When the Databricks CLI binary is
-        missing or the login exits non-zero.
+        missing, the login exits non-zero, or the browser never calls
+        back within :data:`_BROWSER_LOGIN_TIMEOUT_S`.
 
     The login writes to a ``.databrickscfg`` profile named after the
     workspace's first DNS label (e.g. ``acme`` for
     ``acme.cloud.databricks.com``), keeping distinct workspaces off the
     shared ``DEFAULT`` profile. The OAuth grant itself stays host-keyed,
     so :func:`_databricks_workspace_token` still resolves it by host.
+
+    The CLI completes only when the browser reaches ``localhost:8020`` on
+    this machine; in an SSH session that is said up front, and any login
+    still running after :data:`_BROWSER_LOGIN_HINT_DELAY_S` gets the same
+    guidance instead of silence. The sandbox bootstrap forwards that port
+    itself and sets :data:`_BROWSER_LOGIN_CALLBACK_FORWARDED_ENV` so the
+    login it drives only prints the notice.
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
@@ -12806,14 +12867,25 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     host = split.hostname or split.netloc or split.path
     profile = host.split(".")[0]
     click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
-    result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
-        check=False,
-    )
-    if result.returncode != 0:
+    forwarded = bool(os.environ.get(_BROWSER_LOGIN_CALLBACK_FORWARDED_ENV))
+    guidance = "" if forwarded else _browser_login_callback_guidance()
+    in_ssh_session = bool(guidance) and _in_ssh_session()
+    if in_ssh_session:
+        click.echo(f"This terminal is an SSH session. {guidance}")
+    with subprocess.Popen(
+        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile]
+    ) as proc:
+        try:
+            returncode = _wait_for_browser_login(
+                proc, guidance=guidance, guidance_shown=in_ssh_session
+            )
+        except BaseException:
+            proc.kill()
+            raise
+    if returncode != 0:
         raise click.ClickException(
             f"`databricks auth login --host {login_host} --profile {profile}` failed "
-            f"(exit {result.returncode}). If the workspace is unreachable from "
+            f"(exit {returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )
 

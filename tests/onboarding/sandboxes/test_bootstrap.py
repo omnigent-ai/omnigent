@@ -334,10 +334,11 @@ def test_login_runs_in_sandbox_and_forwards_callback_port(
 
     # The login runs INSIDE the sandbox with a forced PTY — and it is
     # `omnigent login <server>` (which infers the fronting workspace
-    # itself), NOT a raw `databricks auth login` with profile flags.
+    # itself), NOT a raw `databricks auth login` with profile flags. The
+    # env marker tells it the callback port is forwarded from out here.
     assert launcher.stream_calls == [
         _StreamCall(
-            command="omnigent login https://app.example.com",
+            command="OMNIGENT_LOGIN_CALLBACK_FORWARDED=1 omnigent login https://app.example.com",
             pty=True,
         )
     ]
@@ -370,7 +371,7 @@ def test_login_runs_in_sandbox_and_forwards_callback_port(
     ]
     # The seed lands before the login spawn (the login reads the cfg).
     assert launcher.log.index(f"run:{launcher.run_commands[0]}") < launcher.log.index(
-        "stream:omnigent login https://app.example.com"
+        "stream:OMNIGENT_LOGIN_CALLBACK_FORWARDED=1 omnigent login https://app.example.com"
     )
 
 
