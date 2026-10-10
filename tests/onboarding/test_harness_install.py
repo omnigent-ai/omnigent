@@ -1346,7 +1346,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
-        (OPENAI_FAMILY, "0.137.0", None),
+        (OPENAI_FAMILY, "0.129.0", None),
         (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
@@ -1425,28 +1425,38 @@ def test_harness_cli_installed_checks_minimum_for_other_versioned_specs(
     assert hi.harness_cli_installed(key) is False
 
 
-def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
+@pytest.mark.parametrize(
+    ("version", "installed"),
+    [
+        ("0.128.9", False),
+        ("0.129.0", True),
+        ("0.130.0", True),
+        ("0.133.0", True),
+        ("0.139.0", True),
+    ],
+    ids=["below-floor", "policy-hook-floor", "below-bypass-flag-gate", "mid-window", "ci-pinned"],
+)
+def test_the_codex_floor_is_the_policy_hook_capability_floor(
     monkeypatch: pytest.MonkeyPatch,
+    version: str,
+    installed: bool,
 ) -> None:
-    """0.139.0 must read as installed, not ``version-too-low``.
+    """Codex reads as installed exactly from the policy-hook capability floor up.
 
-    A too-low codex makes ``harness_is_configured`` false, and the host then
-    refuses EVERY codex launch — plain sessions included — with a misleading
-    "run omni setup". Smart Routing's spawn hook wants 0.145.0, but that is
-    enforced where the hook is registered, so an older CLI loses only the
-    spawn gate.
+    The floor also feeds the host readiness map and launch gate, so a floor
+    above the capability requirement flags a working codex "outdated".
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
             return subprocess.CompletedProcess(
-                args=argv, returncode=0, stdout="codex-cli 0.139.0\n", stderr=""
+                args=argv, returncode=0, stdout=f"codex-cli {version}\n", stderr=""
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
-    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
+    assert hi.harness_cli_installed(OPENAI_FAMILY) is installed
 
 
 def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
