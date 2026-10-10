@@ -11674,6 +11674,159 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
   });
 });
 
+describe("chatStore — orphaned compaction spinner recovery", () => {
+  // A dropped terminal compaction event strands the "Compacting…" spinner
+  // (compaction_loading). The turn lifecycle is the recovery signal: the
+  // spinner must not outlive its turn.
+  const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
+  const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
+
+  function manualScheduler(): FrameScheduler {
+    return { schedule: () => {}, cancel: () => {} };
+  }
+
+  const compactionLoading = (responseId: string): AnyBlock => ({
+    type: "compaction_loading",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId: `cl_${responseId}` },
+  });
+
+  const typesOf = () => useChatStore.getState().blocks.map((b) => b.type);
+
+  it("clears a spinner stranded by a dropped terminal when the next turn starts", async () => {
+    // The compaction ran in a now-finished turn and its terminal event was
+    // lost, so the spinner sits on the idle session. The user sends another
+    // message; a turn cannot begin while compacting, so the leftover clears.
+    useChatStore.setState({
+      conversationId: "conv_orphan_start",
+      blocks: [compactionLoading("resp_old")],
+      activeResponse: null,
+      status: "idle",
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents(
+      "conv_orphan_start",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manualScheduler(),
+    );
+
+    sink.push(sse("response.created", { id: "resp_new", status: "in_progress", output: [] }));
+    sink.close();
+    await tick();
+    await tick();
+
+    expect(typesOf()).toEqual(["response_start"]);
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "resp_new",
+      state: "streaming",
+      error: null,
+    });
+
+    controller.abort();
+  });
+
+  it("clears the spinner when the turn it ran in settles", async () => {
+    // The compaction announces during the turn, its terminal event is dropped,
+    // and the turn completes. An idle session that just finished a turn cannot
+    // still be compacting, so the spinner from that turn must clear.
+    useChatStore.setState({
+      conversationId: "conv_orphan_end",
+      blocks: [],
+      activeResponse: null,
+      status: "idle",
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents(
+      "conv_orphan_end",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manualScheduler(),
+    );
+
+    sink.push(sse("response.created", { id: "resp_turn", status: "in_progress", output: [] }));
+    sink.push(sse("response.compaction.in_progress", {}));
+    await tick();
+    // The spinner is live while the turn runs.
+    expect(typesOf()).toContain("compaction_loading");
+
+    sink.push(sse("response.completed", { id: "resp_turn", status: "completed", output: [] }));
+    sink.close();
+    await tick();
+    await tick();
+
+    expect(typesOf()).not.toContain("compaction_loading");
+    expect(useChatStore.getState().status).toBe("idle");
+    expect(useChatStore.getState().activeResponse?.state).toBe("completed");
+
+    controller.abort();
+  });
+
+  it("does not clear a turn's own in-flight compaction spinner", async () => {
+    // Guard: the spinner belongs to the live turn, so starting that turn must
+    // not remove it. Only an earlier turn's leftover is orphaned.
+    useChatStore.setState({
+      conversationId: "conv_live_compaction",
+      blocks: [],
+      activeResponse: null,
+      status: "idle",
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents(
+      "conv_live_compaction",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manualScheduler(),
+    );
+
+    sink.push(sse("response.created", { id: "resp_live", status: "in_progress", output: [] }));
+    sink.push(sse("response.compaction.in_progress", {}));
+    await tick();
+
+    expect(typesOf()).toContain("compaction_loading");
+
+    controller.abort();
+  });
+
+  it("does not clear another turn's compaction spinner when a turn settles", async () => {
+    // Guard: settling one turn clears only that turn's leftover spinner, never
+    // a spinner scoped to a different (e.g. sub-agent) response.
+    useChatStore.setState({
+      conversationId: "conv_other_turn",
+      blocks: [compactionLoading("resp_live")],
+      activeResponse: { responseId: "resp_other", state: "streaming", error: null },
+      status: "streaming",
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents(
+      "conv_other_turn",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manualScheduler(),
+    );
+
+    sink.push(sse("response.completed", { id: "resp_other", status: "completed", output: [] }));
+    sink.close();
+    await tick();
+    await tick();
+
+    expect(typesOf()).toContain("compaction_loading");
+
+    controller.abort();
+  });
+});
+
 describe("chatStore — pumpStreamEvents end reasons", () => {
   const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
   const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];

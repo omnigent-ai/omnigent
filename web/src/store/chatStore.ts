@@ -6235,6 +6235,18 @@ export async function pumpStreamEvents(
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
         });
+        // A dropped terminal compaction event can strand a "Compacting…"
+        // spinner. A new turn can only begin once compaction has ended, so a
+        // loading block left from an earlier turn is orphaned — clear it.
+        set((s) => ({
+          blocks: s.blocks.some(
+            (b) => b.type === "compaction_loading" && b.ctx.responseId !== block.responseId,
+          )
+            ? s.blocks.filter(
+                (b) => b.type !== "compaction_loading" || b.ctx.responseId === block.responseId,
+              )
+            : s.blocks,
+        }));
         continue;
       }
 
@@ -6409,10 +6421,14 @@ export async function pumpStreamEvents(
         // had their preview replaced when their `text_done` committed, so
         // this is usually a no-op.
         get().blocks.forEach((candidate) => ignoreLivePreview(candidate, ignoredMessages));
+        // A dropped terminal compaction event can strand a "Compacting…"
+        // spinner on the turn it ran in; that turn has now settled, so clear it.
+        const strandedSpinner = (b: AnyBlock) =>
+          endedId !== "" && b.type === "compaction_loading" && b.ctx.responseId === endedId;
         set((s) => ({
           status: "idle",
-          blocks: s.blocks.some(isLiveProvisionalBlock)
-            ? s.blocks.filter((b) => !isLiveProvisionalBlock(b))
+          blocks: s.blocks.some((b) => isLiveProvisionalBlock(b) || strandedSpinner(b))
+            ? s.blocks.filter((b) => !isLiveProvisionalBlock(b) && !strandedSpinner(b))
             : s.blocks,
         }));
         const convId = get().conversationId;
