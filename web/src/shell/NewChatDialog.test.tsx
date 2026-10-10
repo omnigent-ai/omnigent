@@ -10564,26 +10564,6 @@ describe("managed sandbox inference models", () => {
     });
   }
 
-  it("offers Codex a model choice on a sandbox without inference config, like Claude Code", () => {
-    mockHosts([]);
-    renderLanding({
-      managed_sandboxes_enabled: true,
-      sandbox_provider: "agent_sandbox",
-      sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
-    });
-    expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeInTheDocument();
-
-    openAgentModels("a1");
-    const claudeModels = screen.getByTestId("new-chat-landing-agent-models");
-    expect(within(claudeModels).queryAllByRole("menuitemcheckbox").length).toBeGreaterThan(0);
-    closeMenu();
-
-    openAgentModels("a2");
-    const codexModels = screen.getByTestId("new-chat-landing-agent-models");
-    expect(within(codexModels).queryByText("Models unavailable")).toBeNull();
-    expect(within(codexModels).queryAllByRole("menuitemcheckbox").length).toBeGreaterThan(0);
-  });
-
   it.each([
     ["Codex", "a2"],
     ["Devin", "a3"],

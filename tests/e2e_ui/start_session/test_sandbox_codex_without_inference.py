@@ -15,12 +15,12 @@ import httpx
 import pytest
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop
 from tests._helpers.live_server import isolated_local_server
 from tests.e2e_ui.start_session.helpers import select_landing_agent
 from tests.e2e_ui.start_session.test_start_session import (
     _close_entry_models,
     _open_entry_models,
-    _run_in_fresh_loop,
     _wait_until,
 )
 
@@ -60,24 +60,16 @@ def builtin_agent_ids(base_url: str) -> dict[str, str]:
     return {agent["name"]: agent["id"] for agent in agents}
 
 
-def test_sandbox_codex_picker_offers_models_without_inference_config(
+def test_sandbox_codex_offers_harness_default_and_starts_without_inference_config(
     sandbox_server: str, tmp_path: Path
 ) -> None:
-    """Codex on the Sandbox target lists selectable models, as Claude Code does."""
+    """Codex lists a selectable default like Claude Code, and Start sends a bare managed launch."""
     agents = builtin_agent_ids(sandbox_server)
-    _run_in_fresh_loop(
-        _drive_pickers(
+    run_in_fresh_loop(
+        _drive_journey(
             sandbox_server, agents["codex-native-ui"], agents["claude-native-ui"], tmp_path
         )
     )
-
-
-def test_sandbox_codex_starts_without_inference_config(
-    sandbox_server: str, tmp_path: Path
-) -> None:
-    """Start sends a bare managed Codex launch (no model) from the Sandbox target."""
-    agents = builtin_agent_ids(sandbox_server)
-    _run_in_fresh_loop(_drive_start(sandbox_server, agents["codex-native-ui"], tmp_path))
 
 
 async def _open_composer(page: Any, base_url: str) -> None:
@@ -93,52 +85,18 @@ async def _dismiss_entry_models(page: Any) -> None:
     await expect(page.locator("[data-radix-popper-content-wrapper]")).to_have_count(0)
 
 
-async def _drive_pickers(base_url: str, codex_id: str, claude_id: str, evidence_dir: Path) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        context = await browser.new_context(viewport=_VIEWPORT)
-        page = await context.new_page()
-        try:
-            await _open_composer(page, base_url)
-            picker = page.get_by_test_id("new-chat-landing-agent-select")
-            models = page.get_by_test_id("new-chat-landing-agent-models")
-
-            await _open_entry_models(page, codex_id)
-            await expect(models).to_be_visible()
-            await expect(models).not_to_contain_text("Loading models")
-            await page.wait_for_timeout(2_000)
-            codex_rows = await models.get_by_role("menuitemcheckbox").count()
-            codex_menu = " ".join((await models.inner_text()).split())
-            codex_trigger = " ".join((await picker.inner_text()).split())
-            codex_trigger_label = await picker.get_attribute("aria-label")
-            await page.screenshot(path=evidence_dir / "codex-sandbox-models.png")
-            await _dismiss_entry_models(page)
-
-            await _open_entry_models(page, claude_id)
-            await expect(models).to_be_visible()
-            await expect(models).not_to_contain_text("Loading models")
-            await page.wait_for_timeout(2_000)
-            claude_rows = await models.get_by_role("menuitemcheckbox").count()
-            claude_menu = " ".join((await models.inner_text()).split())
-            await page.screenshot(path=evidence_dir / "claude-sandbox-models.png")
-            await _dismiss_entry_models(page)
-
-            print(
-                f"codex: rows={codex_rows} menu={codex_menu!r} trigger={codex_trigger!r} "
-                f"aria-label={codex_trigger_label!r}; "
-                f"claude: rows={claude_rows} menu={claude_menu!r}"
-            )
-            assert claude_rows > 0, "Claude Code offers no models on the Sandbox target"
-            assert codex_rows > 0 and "Models unavailable" not in codex_menu, (
-                f"Codex offers no model choice on the Sandbox target: menu={codex_menu!r}, "
-                f"trigger={codex_trigger!r}, rows={codex_rows}"
-            )
-        finally:
-            await context.close()
-            await browser.close()
+async def _settled_model_menu(page: Any, agent_id: str) -> Any:
+    """Open *agent_id*'s model list and wait until it shows rows or the unavailable note."""
+    await _open_entry_models(page, agent_id)
+    models = page.get_by_test_id("new-chat-landing-agent-models")
+    await expect(models).to_be_visible()
+    await expect(models).not_to_contain_text("Loading models")
+    rows = models.get_by_role("menuitemcheckbox")
+    await expect(rows.first.or_(models.get_by_text("Models unavailable"))).to_be_visible()
+    return models
 
 
-async def _drive_start(base_url: str, codex_id: str, evidence_dir: Path) -> None:
+async def _drive_journey(base_url: str, codex_id: str, claude_id: str, evidence_dir: Path) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         context = await browser.new_context(viewport=_VIEWPORT)
@@ -155,6 +113,26 @@ async def _drive_start(base_url: str, codex_id: str, evidence_dir: Path) -> None
 
             await page.route(_SESSIONS_RE, handle_sessions)
             await _open_composer(page, base_url)
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+
+            models = await _settled_model_menu(page, codex_id)
+            codex_rows = await models.get_by_role("menuitemcheckbox").count()
+            codex_menu = " ".join((await models.inner_text()).split())
+            codex_trigger = " ".join((await picker.inner_text()).split())
+            await page.screenshot(path=evidence_dir / "codex-sandbox-models.png")
+            await _dismiss_entry_models(page)
+
+            models = await _settled_model_menu(page, claude_id)
+            claude_rows = await models.get_by_role("menuitemcheckbox").count()
+            await page.screenshot(path=evidence_dir / "claude-sandbox-models.png")
+            await _dismiss_entry_models(page)
+
+            assert claude_rows > 0, "Claude Code offers no models on the Sandbox target"
+            assert codex_rows > 0 and "Models unavailable" not in codex_menu, (
+                f"Codex offers no model choice on the Sandbox target: menu={codex_menu!r}, "
+                f"trigger={codex_trigger!r}, rows={codex_rows}"
+            )
+
             await select_landing_agent(page, codex_id)
             await page.get_by_test_id("new-chat-landing-repo-chip").click()
             await page.get_by_test_id("new-chat-landing-repo-input").fill(_REPO_URL)
@@ -162,9 +140,8 @@ async def _drive_start(base_url: str, codex_id: str, evidence_dir: Path) -> None
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("Reply with READY.")
             submit = page.get_by_test_id("new-chat-landing-submit")
-            await page.wait_for_timeout(1_000)
-            await page.screenshot(path=evidence_dir / "codex-sandbox-start.png")
             await expect(submit).to_be_enabled()
+            await page.screenshot(path=evidence_dir / "codex-sandbox-start.png")
             await submit.click()
             await _wait_until(lambda: len(creates) == 1)
             body = creates[0]
