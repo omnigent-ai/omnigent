@@ -1461,19 +1461,156 @@ def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path)
     assert server["command"] == sys.executable
 
 
-def test_write_mcp_config_targets_isolated_agy_gemini_dir(tmp_path: Path) -> None:
-    """write_mcp_config writes into the isolated agy Gemini dir, not ~/.gemini."""
+def test_write_mcp_config_targets_isolated_agy_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without a user config, the relay alone lands in the isolated agy Gemini dir, silently."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
+    assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+    # The bridge token the shared relay requires is written into the bridge dir.
+    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+    assert not [record for record in caplog.records if record.name == _mod.__name__]
+
+
+def _write_user_mcp_config(fake_home: Path, payload: str) -> Path:
+    real_config = fake_home / ".gemini" / "config" / "mcp_config.json"
+    real_config.parent.mkdir(parents=True, exist_ok=True)
+    real_config.write_text(payload, encoding="utf-8")
+    return real_config
+
+
+def test_write_mcp_config_inherits_user_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User ~/.gemini MCP servers are seeded beside the relay; the real file is untouched."""
+    fake_home = tmp_path / "real-home"
+    graft = {"command": "/usr/local/bin/graft", "args": ["mcp"], "env": {"GRAFT_INDEX": ".graft"}}
+    user_payload = json.dumps(
+        {"mcpServers": {"graft": graft, "graphify": {"command": "/usr/local/bin/graphify"}}}
+    )
+    real_config = _write_user_mcp_config(fake_home, user_payload)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     path = write_mcp_config(bridge_dir, python_executable="python-test")
 
-    # The config lands under the isolated --gemini_dir config path, so the user's
-    # real ~/.gemini is untouched.
-    assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
-    # The bridge token the shared relay requires is written into the bridge dir.
-    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    assert set(servers) == {"graft", "graphify", "omnigent"}
+    assert servers["graft"] == graft
+    assert servers["omnigent"]["command"] == "python-test"
+    assert real_config.read_text(encoding="utf-8") == user_payload
+
+
+def test_write_mcp_config_relay_wins_user_name_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user server named ``omnigent`` never displaces the session relay."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(
+        fake_home, json.dumps({"mcpServers": {"omnigent": {"command": "/usr/local/bin/other"}}})
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    relay = build_mcp_config(bridge_dir, python_executable="python-test")["mcpServers"]
+    assert servers == relay
+
+
+def test_write_mcp_config_reseed_refreshes_user_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relaunch picks up the user's current servers instead of a stale snapshot."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(fake_home, json.dumps({"mcpServers": {"graft": {"command": "graft"}}}))
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    write_mcp_config(bridge_dir, python_executable="python-test")
+    _write_user_mcp_config(
+        fake_home, json.dumps({"mcpServers": {"graphify": {"command": "graphify"}}})
+    )
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    assert set(servers) == {"graphify", "omnigent"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{not json",
+        "[]",
+        '{"mcpServers": []}',
+        '{"mcpServers": "graft"}',
+        "[" * 100_000 + "]" * 100_000,
+    ],
+    ids=["not-json", "array", "servers-array", "servers-string", "deeply-nested"],
+)
+def test_write_mcp_config_tolerates_malformed_user_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, payload: str
+) -> None:
+    """A malformed user config degrades to the relay alone, with a warning, instead of failing."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(fake_home, payload)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written == build_mcp_config(bridge_dir, python_executable="python-test")
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _mod.__name__ and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1 and "seeding only the Omnigent relay" in warnings[0]
+
+
+@pytest.mark.posix_only
+def test_write_mcp_config_restricts_isolated_config_to_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inherited server env blocks can hold tokens, so only the owner may read the file."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(
+        fake_home,
+        json.dumps({"mcpServers": {"graft": {"command": "graft", "env": {"GRAFT_TOKEN": "s"}}}}),
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A looser file left by an earlier or interrupted write must not keep its mode.
+    config_dir = agy_gemini_dir(bridge_dir) / "config"
+    config_dir.mkdir(parents=True)
+    for stale in ("mcp_config.json", "mcp_config.json.tmp"):
+        (config_dir / stale).write_text("{}", encoding="utf-8")
+        (config_dir / stale).chmod(0o644)
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["graft"]["env"] == {
+        "GRAFT_TOKEN": "s"
+    }
 
 
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
