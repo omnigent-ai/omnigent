@@ -657,10 +657,11 @@ async def test_call_tool_network_error_raises() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_transient_500_retries_and_succeeds(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("status", sorted(proxy_mcp_manager_mod._TRANSIENT_PROXY_STATUSES))
+async def test_call_tool_transient_status_retries_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
-    """A transient 500 from the proxy is retried and the call succeeds.
+    """A retryable status from the proxy is retried and the call succeeds.
 
     The retry must re-post under the same operation id (so the server
     reattaches work already started instead of replaying it) with a fresh
@@ -677,13 +678,13 @@ async def test_call_tool_transient_500_retries_and_succeeds(
             "result": {"content": [{"type": "text", "text": "recovered"}], "isError": False},
         }
     )
-    transport = _StubTransport([httpx.Response(500, text="Internal Server Error"), rpc_ok])
+    transport = _StubTransport([httpx.Response(status, text="transient proxy failure"), rpc_ok])
     manager = _make_manager(transport)
 
     output = await manager.call_tool(_make_spec("github"), "github__search", {"query": "x"})
 
     assert output == "recovered"
-    assert len(transport.calls) == 2, "Exactly one retry must follow the transient 500"
+    assert len(transport.calls) == 2, f"Exactly one retry must follow the transient {status}"
     first, second = transport.calls
     assert (
         first.body["params"][MCP_OPERATION_ID_PARAM]
@@ -719,23 +720,25 @@ async def test_call_tool_persistent_500_raises_after_bounded_retries(
 
 
 @pytest.mark.asyncio
-async def test_call_tool_client_error_does_not_retry(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("status", [404, 429])
+async def test_call_tool_non_retryable_status_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
-    """A non-transient status (404) fails immediately, without any retry.
+    """A non-retryable status fails immediately, without any retry.
 
-    Failure means deterministic request errors burn retries and delay the
-    tool result for no benefit.
+    A 404 is a deterministic request error, and a 429 means the proxy is rate
+    limiting; re-posting either within the sub-second budget only delays the
+    tool result or adds load.
     """
     monkeypatch.setattr(proxy_mcp_manager_mod, "_TRANSIENT_PROXY_BACKOFF_S", 0.0)
-    transport = _StubTransport([httpx.Response(404, text="not found")])
+    transport = _StubTransport([httpx.Response(status, text="not retried")])
     manager = _make_manager(transport)
 
     with pytest.raises(RuntimeError) as exc_info:
         await manager.call_tool(_make_spec("github"), "github__search", {})
 
-    assert "404" in str(exc_info.value)
-    assert len(transport.calls) == 1, "Client errors must not be retried"
+    assert str(status) in str(exc_info.value)
+    assert len(transport.calls) == 1, f"HTTP {status} must not be retried"
 
 
 @pytest.mark.asyncio

@@ -50,9 +50,9 @@ _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
 
 # Bounded retry for brief HTTP failures from the MCP proxy (LB blip, momentary
-# overload); a lost connection takes the reconnect path instead. ``Retry-After``
-# is ignored on purpose: the budget targets sub-second blips, not rate limiting.
-_TRANSIENT_PROXY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# overload); a lost connection takes the reconnect path instead, and 429 is left
+# out because a rate-limited proxy must not be re-posted within this budget.
+_TRANSIENT_PROXY_STATUSES = frozenset({500, 502, 503, 504})
 _TRANSIENT_PROXY_MAX_RETRIES = 2
 _TRANSIENT_PROXY_BACKOFF_S = 0.5
 
@@ -322,12 +322,13 @@ class ProxyMcpManager:
         **Transient proxy failures**: a status in
         :data:`_TRANSIENT_PROXY_STATUSES` is re-posted a bounded number of
         times with the same operation id and a fresh JSON-RPC id, so the
-        runner's execution registry reattaches work it already started instead
-        of running it again. The server side of a re-post repeats only policy
-        evaluation and idempotent label writes, and its one self-executed tool,
-        ``sys_advise_models``, is read-only. An approved call whose approval
-        the server already consumed still fails with ``Elicitation not found
-        or already resolved`` on re-post, as it did before this retry.
+        runner's execution registry attaches the re-post to work it already
+        started instead of running it again. Server-side work before the
+        forward is not deduplicated: a re-post repeats policy evaluation and
+        label writes, an ASK-gated call whose approval request was already
+        published can show a second approval card, and one whose approval was
+        already consumed still fails with ``Elicitation not found or already
+        resolved``, as before this retry.
 
         :param spec: Ignored — accepted for interface parity with
             :class:`RunnerMcpManager`.  ``None`` is acceptable for callers

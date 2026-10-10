@@ -1,40 +1,11 @@
-"""Runner ``sys_os_shell`` dispatch under upstream/host faults.
+"""Runner ``sys_os_shell`` dispatch under transient and persistent faults.
 
-An agent runs a shell command while a dependency misbehaves, in one of two
-ways that production logs record as tool-dispatch failures:
-
-* The Omnigent server's MCP proxy (``POST /v1/sessions/{id}/mcp``) answers
-  HTTP 500 while forwarding the ``tools/call``. Such server-side errors are
-  routinely transient (a restart, a load-balancer blip, momentary overload).
-* The runner-local OSEnvironment path cannot fork the sandbox helper:
-  ``subprocess.Popen`` raises ``BlockingIOError`` (``EAGAIN``) because the
-  host is briefly out of process capacity.
-
-Correct dispatch behavior has two halves, and this module asserts both:
-
-* **Transient faults must be absorbed.** A single 500 or one fork ``EAGAIN``
-  must not permanently fail the tool call; the runner retries (replay-safe:
-  the MCP proxy retry re-posts under the same retained operation id, and a
-  failed spawn has no side effects) and the command succeeds.
-* **Persistent faults must surface.** When the fault does not clear within
-  the bounded retries, the failure must come back to the LLM as a structured
-  tool-result error — never be swallowed, never raise out of dispatch — and
-  the runner must emit its attributable ERROR log
-  (``tool sys_os_shell failed`` / ``runner OSEnvironment dispatch failed for
-  sys_os_shell`` at ``omnigent.runner.tool_dispatch``).
-
-Each fault is injected at the exact frame the production tracebacks name
-(the proxy's HTTP response; ``os_env`` helper ``Popen``), and every test
-drives the real dispatch entrypoint
-:func:`omnigent.runner.tool_dispatch.execute_tool` end-to-end through the
-real ``ProxyMcpManager`` / ``CallerProcessOSEnvironment``.
-
-This is a backend (``api``-surface) behavior: the trigger is not a user
-action and the observable is the tool-result string plus the ERROR log line.
-
-Run with::
-
-    .venv/bin/python -m pytest tests/runner/test_tool_dispatch_fault_recovery.py -v
+Each case drives :func:`omnigent.runner.tool_dispatch.execute_tool` through
+the real ``ProxyMcpManager`` or ``CallerProcessOSEnvironment`` with the fault
+injected at the frame the production tracebacks name: an HTTP 500 from the
+server MCP proxy, or a fork ``EAGAIN`` from the helper ``Popen``. One fault
+must be absorbed without a dispatch ERROR log; a persistent one must reach
+the model as a structured tool error together with that log.
 """
 
 from __future__ import annotations

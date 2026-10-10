@@ -200,31 +200,31 @@ def faulted_stack(
             stdout=server_out,
             stderr=subprocess.STDOUT,
         )
-    with runner_stdout.open("w") as runner_out:
-        runner = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                f"from {_FAULTS_MODULE} import install_runner_fault; install_runner_fault(); "
-                "from omnigent.runner._entry import main; main()",
-            ],
-            env={
-                **common_env,
-                "OMNIGENT_RUNNER_ID": runner_id,
-                "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                "RUNNER_SERVER_URL": base_url,
-                # A fresh config home keeps ambient harness credentials out of turn setup.
-                "OMNIGENT_CONFIG_HOME": str(stack_tmp / "config-home"),
-                "OMNIGENT_PROCESS_LOG_FILE": str(runner_log),
-            },
-            stdout=runner_out,
-            stderr=subprocess.STDOUT,
-        )
-
-    procs = (server, runner)
+    procs: tuple[subprocess.Popen[bytes], ...] = (server,)
     logs = (server_log, runner_stdout, runner_log)
     try:
+        with runner_stdout.open("w") as runner_out:
+            runner = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from {_FAULTS_MODULE} import install_runner_fault; install_runner_fault(); "
+                    "from omnigent.runner._entry import main; main()",
+                ],
+                env={
+                    **common_env,
+                    "OMNIGENT_RUNNER_ID": runner_id,
+                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+                    "RUNNER_SERVER_URL": base_url,
+                    # A fresh config home keeps ambient harness credentials out of turn setup.
+                    "OMNIGENT_CONFIG_HOME": str(stack_tmp / "config-home"),
+                    "OMNIGENT_PROCESS_LOG_FILE": str(runner_log),
+                },
+                stdout=runner_out,
+                stderr=subprocess.STDOUT,
+            )
+        procs = (server, runner)
         _wait_until_online(base_url, runner_id, procs, logs)
         yield _FaultedStack(base_url, runner_id, server_log, runner_stdout, runner_log, fault_log)
     finally:
@@ -334,11 +334,10 @@ def _assert_command_ran(
     )
     if observed is None:
         return
-    log_lines = [
-        line
-        for line in stack.runner_log.read_text(errors="replace").splitlines()
-        if signature in line
-    ]
+    runner_log_text = (
+        stack.runner_log.read_text(errors="replace") if stack.runner_log.exists() else ""
+    )
+    log_lines = [line for line in runner_log_text.splitlines() if signature in line]
     pytest.fail(
         f"sys_os_shell did not run {token!r} after one transient fault; the tool "
         f"Output panel shows:\n{observed}\nrunner log signature lines "
