@@ -46,6 +46,10 @@ Design notes:
   was pushed to (the fork for a fork PR) — see :func:`_resolve_pr_via_commit`.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
+- A token without the Checks permission (a fine-grained PAT) can read a PR but
+  not its check runs: GitHub refuses just ``statusCheckRollup`` and ``gh`` fails
+  the whole call, so PR reads retry without that field and report
+  ``checks_supported: false`` rather than pretending there is no PR.
 """
 
 from __future__ import annotations
@@ -85,6 +89,10 @@ _pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
 )
+# Reading check runs needs the Checks permission, which a fine-grained personal
+# access token cannot hold; GitHub refuses just this field and ``gh`` fails the
+# whole call, so :func:`_gh_pr_view` retries without it.
+_PR_CHECKS_FIELD = "statusCheckRollup"
 
 
 def _gh_timeout_seconds() -> float:
@@ -525,6 +533,46 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     return None
 
 
+def _checks_refused(fields: str, stderr: str) -> bool:
+    """Whether a failed ``gh pr view`` was refused only its ``statusCheckRollup`` field.
+
+    GitHub reports a field it refuses as a GraphQL error at that field's path
+    (``Resource not accessible by personal access token (…statusCheckRollup)``),
+    so the PR itself resolved; a missing PR or a sign-in failure never names it.
+    """
+    return _PR_CHECKS_FIELD in fields.split(",") and _PR_CHECKS_FIELD in stderr
+
+
+def _gh_pr_view(
+    args: list[str], fields: str, *, cwd: str, token: str | None = None
+) -> dict[str, Any] | None:
+    """Return ``gh pr view <args> --json <fields>`` as a dict, or ``None``.
+
+    When GitHub refuses ``statusCheckRollup``, retry once without it; the result
+    then lacks that key. Any other failure, or no PR, is ``None``.
+    """
+    rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
+    if rc != 0 and _checks_refused(fields, err):
+        without_checks = ",".join(f for f in fields.split(",") if f != _PR_CHECKS_FIELD)
+        rc, out, _ = _gh(["pr", "view", *args, "--json", without_checks], cwd=cwd, token=token)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """``checks`` and ``checks_supported`` for a ``gh pr view`` object; the field is
+    absent only after :func:`_gh_pr_view` dropped it."""
+    return {
+        "checks": _summarize_checks(data.get(_PR_CHECKS_FIELD)),
+        "checks_supported": _PR_CHECKS_FIELD in data,
+    }
+
+
 def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[str, Any] | None:
     """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
 
@@ -544,14 +592,9 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
 
     :param token: Optional GH_TOKEN to run the calls as the selected account.
     """
-    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root, token=token)
-    if rc == 0:
-        try:
-            data = json.loads(out)
-        except ValueError:
-            data = None
-        if isinstance(data, dict):
-            return data
+    data = _gh_pr_view([], fields, cwd=root, token=token)
+    if data is not None:
+        return data
 
     resolved = _resolve_pr_via_commit(root, token=token)
     if resolved is None:
@@ -563,16 +606,7 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     # itself doesn't need it (the explicit ``-R`` below carries the base).
     if not _resolved_base_nwo(root):
         _gh(["repo", "set-default", base_repo], cwd=root, token=token)
-    rc, out, _ = _gh(
-        ["pr", "view", str(number), "-R", base_repo, "--json", fields], cwd=root, token=token
-    )
-    if rc != 0:
-        return None
-    try:
-        data = json.loads(out)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
+    return _gh_pr_view([str(number), "-R", base_repo], fields, cwd=root, token=token)
 
 
 def _workspace_github_info(root: str) -> dict[str, Any]:
@@ -641,7 +675,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             "author": author.get("login") if isinstance(author, dict) else None,
             "base_ref": data.get("baseRefName"),
             "head_ref": data.get("headRefName"),
-            "checks": _summarize_checks(data.get("statusCheckRollup")),
+            **_checks_fields(data),
             # PR description + conversation comments feed the Summary tab; an
             # empty body is null so the UI shows its "no description" state.
             "body": body if isinstance(body, str) and body.strip() else None,
@@ -700,18 +734,12 @@ def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any
         _, accounts = _list_accounts(root)
         if reference.host not in {account.get("host") for account in accounts}:
             return None
-    rc, out, _ = _gh(
-        ["pr", "view", str(reference.number), "-R", _repo_argument(reference), "--json", fields],
+    return _gh_pr_view(
+        [str(reference.number), "-R", _repo_argument(reference)],
+        fields,
         cwd=root,
         token=_pr_token(root, reference),
     )
-    if rc != 0:
-        return None
-    try:
-        result = json.loads(out)
-    except ValueError:
-        return None
-    return result if isinstance(result, dict) else None
 
 
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
@@ -750,7 +778,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "head_ref": data.get("headRefName"),
         "head_sha": data.get("headRefOid"),
         "base_sha": data.get("baseRefOid"),
-        "checks": _summarize_checks(data.get("statusCheckRollup")),
+        **_checks_fields(data),
         "body": data.get("body") or None,
         "comments": _shape_comments(data.get("comments")),
     }

@@ -625,15 +625,20 @@ function PullRequestCommentCard({
   );
 }
 
-/** The Summary tab body: CI checks, the PR description, then its comments. */
+/** The Summary tab body: CI checks, the PR description, then its comments. When
+ *  the token can't read check runs, the Checks area says so instead of counts. */
 function PullRequestSummaryTab({
   checks,
+  checksSupported,
+  checksUnavailableHint,
   body,
   comments,
   commentsPartial,
   providerLabel,
 }: {
   checks: PullRequestChecks;
+  checksSupported: boolean;
+  checksUnavailableHint?: string;
   body: string | null | undefined;
   comments: PullRequestComment[];
   commentsPartial?: boolean;
@@ -646,15 +651,21 @@ function PullRequestSummaryTab({
     <div className="space-y-4 p-3 pb-16">
       {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
           pill to see the job names in that bucket. */}
-      {(checks.total > 0 || checks.partial) && (
+      {(checks.total > 0 || checks.partial || !checksSupported) && (
         <section className="space-y-1.5">
           <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
             Checks
           </h3>
-          {checks.partial && (
+          {!checksSupported ? (
             <p role="status" className="text-ui text-muted-foreground">
-              Some checks are unavailable. Counts include only the checks loaded.
+              {checksUnavailableHint ?? "Checks can’t be read with the signed-in account."}
             </p>
+          ) : (
+            checks.partial && (
+              <p role="status" className="text-ui text-muted-foreground">
+                Some checks are unavailable. Counts include only the checks loaded.
+              </p>
+            )
           )}
           <div className="flex flex-wrap items-center gap-1.5">
             <CheckPill
@@ -1532,6 +1543,8 @@ function PullRequestPanelDetails({
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
           <PullRequestSummaryTab
             checks={checks}
+            checksSupported={pr.checks_supported !== false}
+            checksUnavailableHint={copy.checksUnavailableHint}
             body={pr.body}
             comments={comments}
             commentsPartial={pr.comments_partial}
