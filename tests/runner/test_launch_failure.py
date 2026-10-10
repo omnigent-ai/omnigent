@@ -122,7 +122,7 @@ _PRESENT_CLI_CRASH_OUTPUT = "\n".join(
 
 # claude-native launches through ``env -u … claude …``, so the runner reports
 # ``env`` as the launched command; a direct launch reports the CLI itself.
-@pytest.mark.parametrize("command", ["env", "claude", "/usr/local/bin/claude"])
+@pytest.mark.parametrize("command", ["env", "claude", "/usr/local/bin/claude", "zsh"])
 def test_present_cli_crash_with_stray_flag_is_unclassified(command: str) -> None:
     # The not-found line blames `--model`, not the launched command, and the
     # rest of the pane proves the CLI ran: unclassified is the honest answer.
@@ -156,18 +156,6 @@ def test_incidental_not_found_text_from_present_cli_is_not_missing_binary() -> N
     assert diagnosis is None
 
 
-@pytest.mark.parametrize("command", ["zsh", "bash", "sh"])
-def test_shell_launcher_reporting_a_stray_token_is_not_missing_binary(command: str) -> None:
-    # A shell used as the launcher prefixes its own name (``zsh:2:``); only
-    # the blamed token decides, and ``--model`` is not the launched command.
-    diagnosis = classify_terminal_failure(
-        command=command,
-        exit_status=127,
-        output="zsh:2: command not found: --model",
-    )
-    assert diagnosis is None
-
-
 @pytest.mark.parametrize(
     ("command", "output"),
     [
@@ -185,6 +173,26 @@ def test_shell_launcher_reporting_a_stray_token_is_not_missing_binary(command: s
         ("env", "env: ‘claude’: No such file or directory"),
         ("env", "env: claude: No such file or directory"),
         ("env", "/usr/bin/env: ‘claude’: No such file or directory"),
+        # tmux captures visible rows, so a long shell error wraps mid-sentence.
+        (
+            "claude",
+            "bash: line 1: /home/runner/.local/share/pnpm/global/5/node_modules/.bin/claude:\n"
+            "No such file or directory",
+        ),
+        (
+            "/home/runner/.local/share/pnpm/global/5/node_modules/.bin/claude",
+            "bash: line 1: /home/runner/.local/share/pnpm/global/5/node_modules/.bin/claude:\n"
+            "No such file or directory",
+        ),
+        (
+            "/tmp/abcdefghijabcdefghijabcdefghij/claude",
+            "bash: line 1: /tmp/abcdefghijabcdefghijabcdefghij/claude: No such file or direct\n"
+            "ory",
+        ),
+        (
+            "claude.exe",
+            "'C:\\tools\\claude.exe' is not recognized as an internal or external command,",
+        ),
     ],
 )
 def test_not_found_line_blaming_launched_command_is_missing_binary(

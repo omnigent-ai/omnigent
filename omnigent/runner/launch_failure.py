@@ -16,7 +16,7 @@ covers them all. A new harness quirk becomes one entry in
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
@@ -111,14 +111,37 @@ _MISSING_MARKERS = (
 # A shell's not-found line names the token it could not resolve, after the
 # phrase (zsh ``command not found: --model``, fish ``Unknown command: claude``)
 # or before it (bash/dash/env/exec, e.g. ``bash: line 1: claude: command not found``).
+# The pane capture wraps long lines into rows, so a phrase may break at any
+# character and a token may continue on the next row.
+
+
+def _wrappable(phrase: str) -> str:
+    """Regex for *phrase* that tolerates a pane row break anywhere inside it."""
+    return r"\n?".join(r"\s+" if ch == " " else re.escape(ch) for ch in phrase)
+
+
+def _phrases(*phrases: str) -> str:
+    return "(?:" + "|".join(_wrappable(p) for p in phrases) + ")"
+
+
+# Tokens start at a non-space run so a long line is scanned once, not per character.
+_TOKEN = r"(?<!\S)(\S+(?:\n\S+)*)"
 _BLAMED_AFTER_PHRASE = re.compile(
-    r"(?:command not found|no such file or directory|unknown command):\s*(\S+)"
+    _phrases("command not found", "no such file or directory", "unknown command")
+    + r":\s*"
+    + _TOKEN
 )
 _BLAMED_BEFORE_PHRASE = re.compile(
-    r"(\S+):\s*(?:command not found|no such file or directory|not found\b"
-    r"|executable file not found)"
+    _TOKEN
+    + r":\s*"
+    + _phrases(
+        "command not found", "no such file or directory", "not found", "executable file not found"
+    )
+    + r"\b"
 )
-_BLAMED_NOT_RECOGNIZED = re.compile(r"(\S+) is not recognized as an internal or external command")
+_BLAMED_NOT_RECOGNIZED = re.compile(
+    _TOKEN + r"\s+" + _wrappable("is not recognized as an internal or external command")
+)
 _REPORTER = re.compile(r"^-?([a-z0-9_./+-]+?)(?::\d+)?:")
 _BLAME_QUOTES = "'\"`‘’,;"
 # Launchers whose own not-found line blames the program they failed to exec.
@@ -126,17 +149,21 @@ _BLAME_QUOTES = "'\"`‘’,;"
 _EXEC_WRAPPERS = frozenset({"env"})
 
 
-def _not_found_blame(line: str) -> tuple[str, str] | None:
-    """Return ``(reporter, blamed token)`` for a shell not-found *line*, else ``None``."""
-    match = (
-        _BLAMED_AFTER_PHRASE.search(line)
-        or _BLAMED_BEFORE_PHRASE.search(line)
-        or _BLAMED_NOT_RECOGNIZED.search(line)
-    )
-    if match is None:
-        return None
-    reporter = _REPORTER.match(line.lstrip())
-    return (reporter.group(1) if reporter else "", match.group(1).strip(_BLAME_QUOTES))
+def _basename(path: str) -> str:
+    return re.split(r"[\\/]", path)[-1]
+
+
+def _not_found_blames(output: str) -> Iterator[tuple[str, str]]:
+    """Yield ``(reporter, blamed token)`` for each shell not-found message in *output*."""
+    for pattern in (_BLAMED_AFTER_PHRASE, _BLAMED_BEFORE_PHRASE, _BLAMED_NOT_RECOGNIZED):
+        for match in pattern.finditer(output):
+            line_start = output.rfind("\n", 0, match.start()) + 1
+            reporter = _REPORTER.match(output[line_start:].lstrip())
+            token = match.group(1).replace("\n", "").strip(_BLAME_QUOTES)
+            yield (reporter.group(1) if reporter else "", token)
+        # A zsh-style line names its reporter first; blank the match so the
+        # "before" pattern cannot read ``zsh:`` as the blamed token.
+        output = pattern.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), output)
 
 
 def _missing_binary(s: _Signal) -> bool:
@@ -149,14 +176,10 @@ def _missing_binary(s: _Signal) -> bool:
     if not s.command:
         # Nothing to cross-check against; keep the historical broad rule.
         return s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS)
-    for line in s.output.splitlines():
-        blame = _not_found_blame(line)
-        if blame is None:
-            continue
-        reporter, token = blame
-        if token == s.command or token.rsplit("/", 1)[-1] == s.command:
+    for reporter, token in _not_found_blames(s.output):
+        if token == s.command or _basename(token) == s.command:
             return True
-        if reporter.rsplit("/", 1)[-1] == s.command and s.command in _EXEC_WRAPPERS:
+        if _basename(reporter) == s.command and s.command in _EXEC_WRAPPERS:
             return True
     return s.exit_code == 127 and not s.output.strip()
 
@@ -250,7 +273,7 @@ def classify_terminal_failure(
         (the caller falls back to the generic message).
     """
     signal = _Signal(
-        command=(command or "").rsplit("/", 1)[-1].lower(),
+        command=_basename(command or "").lower(),
         exit_code=exit_status,
         output=(output or "").lower(),
     )

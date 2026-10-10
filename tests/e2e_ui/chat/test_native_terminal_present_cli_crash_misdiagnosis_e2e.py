@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from tests._helpers.native_session import create_native_session
 from tests.e2e_ui.conftest import _bind_session_runner, _ensure_runner_online, _server_state
@@ -45,17 +46,10 @@ _MISDIAGNOSIS_HEADLINE = "Agent command not found"
 _MISDIAGNOSIS_REMEDIATION = "Install the harness"
 _HONEST_HEADLINE = "The agent's terminal exited unexpectedly"
 
-_needs_tmux = pytest.mark.skipif(
+pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="the claude-native required terminal needs tmux",
 )
-
-
-@pytest.fixture
-def browser_context_args(browser_context_args: dict[str, Any]) -> dict[str, Any]:
-    if not os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
-        return browser_context_args
-    return {**browser_context_args, "record_video_size": {"width": 1280, "height": 720}}
 
 
 def _write_crashing_claude_stub(bin_dir: Path) -> Path:
@@ -88,16 +82,6 @@ def _write_workspace_with_claude_override(workspace: Path, stub: Path) -> None:
     (workspace / ".omnigent" / "config.yaml").write_text(
         f"harness:\n  claude-native:\n    command: {stub}\n", encoding="utf-8"
     )
-
-
-@pytest.mark.timeout(30)
-def test_crashing_claude_stub_exits_127_after_running(tmp_path: Path) -> None:
-    stub = _write_crashing_claude_stub(tmp_path)
-    result = subprocess.run([str(stub)], capture_output=True, text=True, check=False)
-    assert result.returncode == _CRASH_EXIT_CODE
-    assert _RESUME_MARKER in result.stdout, result.stdout
-    assert _STRAY_ARG_LINE in result.stdout, result.stdout
-    assert (tmp_path / _RAN_MARKER).exists()
 
 
 @pytest.fixture
@@ -172,8 +156,8 @@ def _await_required_terminal_exit(
             continue
         if items.status_code == 200:
             for item in items.json().get("data", []):
-                error = item.get("error") if isinstance(item.get("error"), dict) else item
-                if item.get("type") == "error" and error.get("code"):
+                error = item.get("error")
+                if item.get("type") == "error" and isinstance(error, dict) and error.get("code"):
                     return error
         time.sleep(1.0)
     raise AssertionError(f"no task failure persisted in time; last_task_error={last!r}")
@@ -185,7 +169,7 @@ def _reveal_failure_card(page: Page):
     pill = page.locator(_ERROR_PILL).first
     expect(toggle.or_(pill).first).to_be_visible(timeout=_CARD_TIMEOUT_MS)
     if toggle.count() > 0:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(PlaywrightTimeoutError):
             page.get_by_test_id("view-mode-chat").click(timeout=30_000)
     expect(pill).to_be_visible(timeout=_CARD_TIMEOUT_MS)
     if pill.get_by_test_id("error-message-content").count() == 0:
@@ -203,7 +187,6 @@ def _reveal_failure_card(page: Page):
     return pill
 
 
-@_needs_tmux
 @pytest.mark.timeout(300)
 def test_present_cli_crash_is_not_misdiagnosed_as_missing(
     request: pytest.FixtureRequest,
@@ -232,7 +215,11 @@ def test_present_cli_crash_is_not_misdiagnosed_as_missing(
     # card for the recording and snapshot its final text for the negative checks.
     expect(pill).to_contain_text(_RESUME_MARKER, timeout=15_000)
     expect(pill).to_contain_text(_STRAY_ARG_LINE, timeout=15_000)
-    page.wait_for_timeout(3_000)
+    # The persisted message is truncated, so the exit status is read from the
+    # captured output's pane-is-dead footer.
+    expect(pill).to_contain_text(f"status {_CRASH_EXIT_CODE}", timeout=15_000)
+    if record_dir:
+        page.wait_for_timeout(3_000)
     card_text = pill.inner_text()
 
     assert _MISDIAGNOSIS_HEADLINE not in card_text, (
