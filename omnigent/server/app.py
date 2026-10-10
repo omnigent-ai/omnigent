@@ -55,6 +55,7 @@ from omnigent.errors import (
     OmnigentError,
     is_cancelled_rpc_error,
     is_permission_denied_rpc_error,
+    is_resource_exhausted_rpc_error,
 )
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
@@ -528,6 +529,10 @@ def _session_id_from_request(request: Request) -> str | None:
     """
     match = _SESSION_PATH_RE.search(request.url.path)
     return match.group(1) if match else None
+
+
+# Retry-After hint (seconds) for the upstream RESOURCE_EXHAUSTED 503.
+_UPSTREAM_RESOURCE_EXHAUSTED_RETRY_AFTER_S = 1
 
 
 def _error_audit_extra(
@@ -2469,7 +2474,9 @@ def create_app(
         :param request: The incoming request; its path supplies the session id
             threaded into the error log.
         :param exc: The unhandled exception.
-        :returns: A 500 JSON response with ``internal_error`` code.
+        :returns: A 500 JSON response with ``internal_error`` code, or a coded
+            response for a recognized upstream condition (a cancelled, denied,
+            or resource-exhausted backing call).
         """
         if is_cancelled_rpc_error(exc):
             # A peer-cancelled backing call (upstream teardown/restart) is an
@@ -2522,6 +2529,41 @@ def create_app(
                 ),
             )
             return await _handle_omnigent_error(request, denied)
+        if is_resource_exhausted_rpc_error(exc):
+            # A saturated upstream request budget frees as in-flight calls finish:
+            # a retryable condition, not a fault. Booked as transient upstream at
+            # WARNING and answered as a coded 503 with a Retry-After hint.
+            exhausted = OmnigentError(
+                "A backing service is at its concurrent request limit; retry shortly.",
+                code=ErrorCode.UPSTREAM_RESOURCE_EXHAUSTED,
+            )
+            _logger.warning(
+                "Upstream call refused at a backing service's request limit: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="exhausted",
+                    code=str(exhausted.code),
+                    http_status=str(exhausted.http_status),
+                    error_category=exhausted.category.value,
+                    error_impact=exhausted.impact.value,
+                    error_phase=exhausted.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            # Answered directly: _handle_omnigent_error books every 5xx as ERROR and
+            # carries no headers, and the catch-all runs outside the request
+            # middleware, so Retry-After and the correlation id are set here.
+            headers = {"Retry-After": str(_UPSTREAM_RESOURCE_EXHAUSTED_RETRY_AFTER_S)}
+            request_id = getattr(request.state, "audit_request_id", None)
+            if isinstance(request_id, str):
+                headers["X-Request-Id"] = request_id
+            return JSONResponse(
+                status_code=exhausted.http_status,
+                headers=headers,
+                content={"error": {"code": exhausted.code, "message": exhausted.message}},
+            )
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real
