@@ -13180,3 +13180,211 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
     failed = [e for e in published if e.get("type") == "response.failed"]
     assert failed, "response.failed was not published"
     assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+
+
+async def _run_depth_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    parent_id: str,
+    attach_bodies: list[dict[str, Any]],
+    parent_policy_payload: dict[str, Any] | None,
+) -> str:
+    """Dispatch one ``sys_session_send`` against a mock server recording policy POSTs.
+
+    Shared by the depth-inheritance cases below: the only difference between them
+    is what the parent carries (a session attachment, a bundle declaration, or
+    nothing), so the mock, the dispatch call, and the cleanup are identical.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param parent_id: Parent conversation id, e.g. ``"conv_parent_depth"``.
+    :param attach_bodies: Filled with each child policy ``POST`` body.
+    :param parent_policy_payload: What ``GET /v1/sessions/{parent}/policies``
+        answers, or ``None`` to answer 404 (no attachment readable).
+    :returns: The dispatch tool's output string.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    child_id = f"{parent_id}_child"
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == f"/v1/sessions/{parent_id}/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.method == "GET" and path == f"/v1/sessions/{parent_id}/policies":
+            if parent_policy_payload is None:
+                return httpx.Response(404, json={"error": "no policies"})
+            return httpx.Response(200, json=parent_policy_payload)
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(201, json={"id": child_id})
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/policies":
+            attach_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "pol_depth"})
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            return await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "worker", "title": "delegate", "args": {"input": "do it"}}
+                ),
+                server_client=server_client,
+                conversation_id=parent_id,
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            subagent_work.unregister_subagent_work(child_id)
+            subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_inherits_a_decremented_depth_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child inherits the parent's depth allowance, one level lower.
+
+    This is the enforcement behind the depth bound (#5169): the parent's own
+    ``spawn_depth_bounds`` policy decides whether *this* dispatch happens, and the
+    child gets ``max_depth - 1`` so the next generation is bounded too. If the
+    attachment is missing or not decremented, a self-similar chain of delegating
+    sub-agents never runs out of depth and an unattended session can grow a tree
+    without anything noticing.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.policies.builtins.orchestration import SPAWN_DEPTH_HANDLER, SPAWN_DEPTH_PARAM
+
+    attach_bodies: list[dict[str, Any]] = []
+    output = await _run_depth_dispatch(
+        monkeypatch,
+        parent_id="conv_parent_depth",
+        attach_bodies=attach_bodies,
+        parent_policy_payload={
+            "object": "list",
+            "data": [
+                {
+                    "name": "__spawn_depth_bounds",
+                    "handler": SPAWN_DEPTH_HANDLER,
+                    "factory_params": {SPAWN_DEPTH_PARAM: 2},
+                }
+            ],
+        },
+    )
+
+    assert json.loads(output)["status"] == "launching"
+    assert len(attach_bodies) == 1, "the child must inherit exactly one depth allowance"
+    assert attach_bodies[0]["handler"] == SPAWN_DEPTH_HANDLER
+    assert attach_bodies[0]["factory_params"] == {SPAWN_DEPTH_PARAM: 1}
+    assert attach_bodies[0]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_seeds_depth_from_the_parent_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bundle declaration on the root seeds the chain without any attachment.
+
+    The root session states the bound once, in its agent spec. With no
+    attachment to read, the spec still has to produce the child's allowance —
+    otherwise the bound only ever propagates from a session that was itself
+    spawned, and a bound declared at the top would do nothing.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.policies.builtins.orchestration import (
+        SPAWN_DEPTH_HANDLER,
+        SPAWN_DEPTH_PARAM,
+    )
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.types import FunctionPolicySpec, FunctionRef, Phase, PhaseSelector
+
+    attach_bodies: list[dict[str, Any]] = []
+    spec = SimpleNamespace(
+        sub_agents=[SimpleNamespace(name="worker")],
+        guardrails=SimpleNamespace(
+            policies=[
+                FunctionPolicySpec(
+                    name="depth",
+                    on=[PhaseSelector(Phase.TOOL_CALL)],
+                    function=FunctionRef(SPAWN_DEPTH_HANDLER, {SPAWN_DEPTH_PARAM: 3}),
+                )
+            ]
+        ),
+    )
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_parent_spec/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.method == "GET" and path == "/v1/sessions/conv_parent_spec/policies":
+            return httpx.Response(200, json={"object": "list", "data": []})
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_child_spec"})
+        if request.method == "POST" and path == "/v1/sessions/conv_child_spec/policies":
+            attach_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "pol_depth"})
+        if request.method == "POST" and path == "/v1/sessions/conv_child_spec/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "worker", "title": "delegate", "args": {"input": "do it"}}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_spec",
+                agent_spec=spec,
+                session_inbox=session_inbox,
+            )
+        finally:
+            subagent_work.unregister_subagent_work("conv_child_spec")
+            subagent_work._session_inboxes_ref.pop("conv_parent_spec", None)
+
+    assert json.loads(output)["status"] == "launching"
+    assert len(attach_bodies) == 1
+    assert attach_bodies[0]["factory_params"] == {SPAWN_DEPTH_PARAM: 2}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_attaches_nothing_without_a_depth_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatches from a session with no depth bound stay unbounded.
+
+    Every existing bundle is in this case, so a regression here would attach a
+    depth allowance to sessions that never asked for one — changing behaviour for
+    orchestrators that delegate deeper than the default by design.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    attach_bodies: list[dict[str, Any]] = []
+    output = await _run_depth_dispatch(
+        monkeypatch,
+        parent_id="conv_parent_unbounded",
+        attach_bodies=attach_bodies,
+        parent_policy_payload={"object": "list", "data": []},
+    )
+
+    assert json.loads(output)["status"] == "launching"
+    assert attach_bodies == []
