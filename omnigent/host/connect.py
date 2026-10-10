@@ -1157,6 +1157,8 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._started_at = time.time()
+        self._restart_approval_recovery_task: asyncio.Task[None] | None = None
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
         # files). Each entry remembers the repository root it was built for.
@@ -4226,6 +4228,10 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._suspend_task
                 self._suspend_task = None
+            if self._restart_approval_recovery_task is not None:
+                self._restart_approval_recovery_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._restart_approval_recovery_task
             if self._lifecycle_task is not None:
                 self._lifecycle_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4562,6 +4568,10 @@ class HostProcess:
         # the server is offline. Successful or in-flight work is retained.
         self._ensure_model_options_prewarm()
         self._ws = ws
+        if self._restart_approval_recovery_task is None:
+            self._restart_approval_recovery_task = asyncio.create_task(
+                self._recover_restart_approvals(), name="host-restart-approvals"
+            )
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
         try:
             # Reports raised while disconnected must wait until registration;
@@ -4603,6 +4613,28 @@ class HostProcess:
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
+
+    async def _recover_restart_approvals(self) -> None:
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+        from omnigent.host.restart_approvals import retire_restart_approvals
+
+        # Managed-host launch tokens do not authorize user session-list access.
+        if os.environ.get(HOST_TOKEN_ENV_VAR):
+            return
+        try:
+            headers = await self._run_host_subprocess_in_thread(self._build_connect_headers)
+            headers["x-omnigent-background-session-titles"] = "off"
+            async with httpx.AsyncClient(
+                base_url=self._server_url, headers=headers, timeout=45.0
+            ) as client:
+                await retire_restart_approvals(
+                    client,
+                    host_id=self._identity.host_id,
+                    started_at=self._started_at,
+                    runner_is_live=lambda runner_id: runner_id in self._alive_runner_ids(),
+                )
+        except (httpx.HTTPError, ValueError):
+            _logger.exception("Host restart approval recovery failed")
 
     async def _harness_readiness_loop(
         self,
