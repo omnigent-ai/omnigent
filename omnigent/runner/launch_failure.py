@@ -16,7 +16,7 @@ covers them all. A new harness quirk becomes one entry in
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
@@ -108,6 +108,92 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
+# A shell's not-found line names the unresolved token after the phrase (zsh,
+# fish) or before it (bash/dash/env/exec). Pane capture wraps long lines, so
+# a phrase may break at any character and a token may continue on the next row.
+
+
+def _wrappable(phrase: str) -> str:
+    """Regex for *phrase* that tolerates a pane row break anywhere inside it."""
+    return r"\n?".join(r"\s+" if ch == " " else re.escape(ch) for ch in phrase)
+
+
+def _phrases(*phrases: str) -> str:
+    return "(?:" + "|".join(_wrappable(p) for p in phrases) + ")"
+
+
+# Tokens start at a non-space run so a long line is scanned once, not per character.
+_TOKEN = r"(?<!\S)(\S+(?:\n\S+)*)"
+_BLAMED_AFTER_PHRASE = re.compile(
+    _phrases("command not found", "no such file or directory") + r":\s*" + _TOKEN
+)
+# Only fish's own report counts: Claude Code prints ``● Unknown command: /x`` too.
+_BLAMED_BY_FISH = re.compile(
+    r"^fish:\s*" + _wrappable("unknown command") + r":\s*" + _TOKEN, re.MULTILINE
+)
+_BLAMED_BEFORE_PHRASE = re.compile(
+    _TOKEN
+    + r":\s*"
+    + _phrases(
+        "command not found", "no such file or directory", "not found", "executable file not found"
+    )
+    + r"\b"
+)
+_BLAMED_NOT_RECOGNIZED = re.compile(
+    _TOKEN + r"\s+" + _wrappable("is not recognized as an internal or external command")
+)
+_REPORTER = re.compile(r"^-?([a-z0-9_./+-]+?)(?::\d+)?:")
+_BLAME_QUOTES = "'\"`‘’,;"
+# Launchers whose own not-found line blames the program they failed to exec.
+# claude-native runs ``env -u … claude …``, so an ``env:`` error means the CLI.
+_EXEC_WRAPPERS = frozenset({"env"})
+
+
+def _basename(path: str) -> str:
+    return re.split(r"[\\/]", path)[-1]
+
+
+def _not_found_blames(output: str) -> Iterator[tuple[str, str]]:
+    """Yield ``(reporter, blamed token)`` for each shell not-found message in *output*.
+
+    A token spanning rows is read both as the first row alone (the line was not
+    wrapped; the next row is unrelated output) and joined (it was wrapped).
+    """
+    for pattern in (
+        _BLAMED_AFTER_PHRASE,
+        _BLAMED_BY_FISH,
+        _BLAMED_BEFORE_PHRASE,
+        _BLAMED_NOT_RECOGNIZED,
+    ):
+        for match in pattern.finditer(output):
+            line_start = output.rfind("\n", 0, match.start()) + 1
+            reporter = _REPORTER.match(output[line_start:].lstrip())
+            raw = match.group(1)
+            for token in dict.fromkeys((raw.split("\n", 1)[0], raw.replace("\n", ""))):
+                yield (reporter.group(1) if reporter else "", token.strip(_BLAME_QUOTES))
+        # A zsh-style line names its reporter first; blank the match so the
+        # "before" pattern cannot read ``zsh:`` as the blamed token.
+        output = pattern.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), output)
+
+
+def _missing_binary(s: _Signal) -> bool:
+    """Missing install: a not-found line blames the launched command, or a silent 127.
+
+    Exit 127 alone is ambiguous: a present CLI that crashes and leaves a stray
+    token for the shell exits 127 too. With a known command, only a not-found
+    line about that command (or from its exec wrapper) proves a missing install.
+    """
+    if not s.command:
+        # Nothing to cross-check against; keep the historical broad rule.
+        return s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS)
+    for reporter, token in _not_found_blames(s.output):
+        if token == s.command or _basename(token) == s.command:
+            return True
+        if _basename(reporter) == s.command and s.command in _EXEC_WRAPPERS:
+            return True
+    return s.exit_code == 127 and not s.output.strip()
+
+
 # --- CLI rejected its arguments -----------------------------------------------
 # Usage errors from the agent CLI or a wrapper around it, e.g. a flag added by a
 # host-side launcher that this CLI version (or Omnigent's env) does not allow.
@@ -119,7 +205,6 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: claude",
     "usage: codex",
 )
-
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -138,7 +223,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "missing_binary",
-        lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
+        _missing_binary,
         FailureDiagnosis(
             title="Agent command not found",
             cause=(
@@ -198,7 +283,7 @@ def classify_terminal_failure(
         (the caller falls back to the generic message).
     """
     signal = _Signal(
-        command=(command or "").rsplit("/", 1)[-1].lower(),
+        command=_basename(command or "").lower(),
         exit_code=exit_status,
         output=(output or "").lower(),
     )

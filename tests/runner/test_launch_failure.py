@@ -106,6 +106,138 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
+# Pane output proving the CLI was present and running: it self-updated and
+# printed a resume hint, then a stray flag hit the shell as command-not-found
+# (exit 127). A mid-session crash of a present CLI, not a missing install.
+_PRESENT_CLI_CRASH_OUTPUT = "\n".join(
+    (
+        "● Unknown command: /restart",
+        "  Press Ctrl-C again to exit    ✔ Update installed · Restart to update",
+        "Resume this session with:",
+        "claude --resume be28caff-2e85-47de-8f17-9346d116106b",
+        "^Czsh:2: command not found: --model",
+    )
+)
+
+
+# claude-native launches through ``env -u … claude …``, so the runner reports
+# ``env`` as the launched command; a direct launch reports the CLI itself.
+@pytest.mark.parametrize("command", ["env", "claude", "/usr/local/bin/claude", "zsh"])
+def test_present_cli_crash_with_stray_flag_is_unclassified(command: str) -> None:
+    # The not-found line blames `--model`, not the launched command, and the
+    # rest of the pane proves the CLI ran: unclassified is the honest answer.
+    diagnosis = classify_terminal_failure(
+        command=command,
+        exit_status=127,
+        output=_PRESENT_CLI_CRASH_OUTPUT,
+    )
+    assert diagnosis is None
+
+
+def test_exit_127_with_output_not_blaming_command_is_not_missing_binary() -> None:
+    # A present CLI that produced output and then exited 127 for its own
+    # reasons is not a missing install.
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=127,
+        output="Welcome to Claude Code!\nSession crashed unexpectedly",
+    )
+    assert diagnosis is None
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        (1, "Loading settings…\nclaude: config file not found"),
+        # Claude Code's own slash-command error borrows fish's phrase.
+        (127, "● Unknown command: /claude"),
+    ],
+)
+def test_incidental_not_found_text_from_present_cli_is_not_missing_binary(
+    exit_status: int, output: str
+) -> None:
+    # "not found" inside the CLI's own message is not the shell blaming the
+    # launched command, whatever the exit code.
+    diagnosis = classify_terminal_failure(command="claude", exit_status=exit_status, output=output)
+    assert diagnosis is None
+
+
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        ("claude", "zsh: command not found: claude"),
+        # The pane footer follows an unwrapped line without indentation.
+        (
+            "claude",
+            "zsh: command not found: claude\nPane is dead (status 127, Fri Oct 10 00:00:00 2026)",
+        ),
+        ("claude", "fish: Unknown command: claude"),
+        (
+            "claude",
+            "fish: Unknown command: claude\nPane is dead (status 127, Fri Oct 10 00:00:00 2026)",
+        ),
+        ("claude", "bash: claude: command not found"),
+        ("claude", "bash: line 1: claude: command not found"),
+        ("claude", "sh: 1: claude: not found"),
+        ("/usr/local/bin/claude", "bash: /usr/local/bin/claude: No such file or directory"),
+        ("claude", "zsh: no such file or directory: /opt/claude/bin/claude"),
+        ("claude", "'claude' is not recognized as an internal or external command,"),
+        ("claude", 'exec: "claude": executable file not found in $PATH'),
+        # env blames the CLI it could not exec (GNU quotes the name, BSD does not),
+        # and prefixes the line with however it was invoked.
+        ("env", "env: ‘claude’: No such file or directory"),
+        ("env", "env: claude: No such file or directory"),
+        ("env", "/usr/bin/env: ‘claude’: No such file or directory"),
+        # tmux captures visible rows, so a long shell error wraps mid-sentence.
+        (
+            "claude",
+            "bash: line 1: /home/runner/.local/share/pnpm/global/5/node_modules/.bin/claude:\n"
+            "No such file or directory",
+        ),
+        (
+            "/home/runner/.local/share/pnpm/global/5/node_modules/.bin/claude",
+            "bash: line 1: /home/runner/.local/share/pnpm/global/5/node_modules/.bin/claude:\n"
+            "No such file or directory",
+        ),
+        (
+            "/tmp/abcdefghijabcdefghijabcdefghij/claude",
+            "bash: line 1: /tmp/abcdefghijabcdefghijabcdefghij/claude: No such file or direct\n"
+            "ory",
+        ),
+        (
+            "claude",
+            "bash: line 1: /tmp/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij/cla\n"
+            "ude: No such file or directory",
+        ),
+        (
+            "claude.exe",
+            "'C:\\tools\\claude.exe' is not recognized as an internal or external command,",
+        ),
+    ],
+)
+def test_not_found_line_blaming_launched_command_is_missing_binary(
+    command: str, output: str
+) -> None:
+    diagnosis = classify_terminal_failure(command=command, exit_status=127, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent command not found"
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        (None, "bash: qwen: command not found"),
+        (127, _PRESENT_CLI_CRASH_OUTPUT),
+    ],
+)
+def test_unknown_command_keeps_legacy_broad_match(exit_status: int | None, output: str) -> None:
+    # With no command to cross-check, the historical exit-code / marker rule
+    # still applies rather than guessing which token the shell meant.
+    diagnosis = classify_terminal_failure(command=None, exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent command not found"
+
+
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
     # Ordering guard: the root case also reads like a permission problem, so it
     # must be matched before any broader rule.
