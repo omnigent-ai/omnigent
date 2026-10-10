@@ -279,6 +279,33 @@ tape and note that rendering was skipped.
   message), with only a short trailing `Sleep` after it lands — never a bare
   `Sleep`/short total duration as the stop condition. The clip must show the
   outcome, not the moment before it.
+- **Every captioned step needs its own `Wait`, not a `Sleep`.** A caption that
+  says a command listed, printed, or showed something claims that output rendered
+  on screen. Follow each such command with `Wait /<pattern>/` on the output the
+  caption names (the listed session id, the error line) before the next `Type`.
+  A `Sleep` only passes time: the tape renders and the caption gets written even
+  when the command showed something else entirely. If a captioned `Wait` times
+  out, that step did not happen as described — fix the setup, or drop the step
+  from both the tape and the caption; never caption the intended output.
+- **Pre-answer first-run prompts before filming a harness CLI.** Under a fresh
+  `HOME`/`CLAUDE_CONFIG_DIR`, `claude agents`, `claude --bg …` and `claude attach`
+  open Claude Code's "Accessing workspace … Do you trust this folder?" dialog
+  instead of the command's output; it stays on screen while later `Type` steps go
+  to it, and nothing the caption describes ever renders. Seed the gates for the
+  tape's working directory first — `ensure_claude_workspace_trusted(Path(cwd))` in
+  `omnigent/harnesses/claude_native/bridge.py` writes `hasCompletedOnboarding` and
+  `projects["<abs cwd>"].hasTrustDialogAccepted` into
+  `$CLAUDE_CONFIG_DIR/.claude.json` (or `~/.claude.json`), the same pre-accept the
+  runner performs for native sessions — or answer the dialog on-tape as a visible
+  step. Export `CLAUDE_CONFIG_DIR` to the recording's own config directory before
+  calling the helper and keep it set for the tape, so the seeded trust never lands
+  in your real `~/.claude.json`. The prepared repro environment seeds this only
+  for its own server and runner processes (in `.omnigent/repro-env/claude-config`);
+  `python -m dev.repro_env exec` does not replace your shell's `CLAUDE_CONFIG_DIR`
+  with that directory, so a tape run that way still needs the export and the
+  helper call. `claude agents` then opens an interactive view that stays open:
+  `Wait` for the listed session, leave the view (Claude Code asks for Ctrl-C
+  twice), and `Wait` for the shell prompt before typing the next command.
 - **A clip of the reproduction TEST running is NOT the journey.** If the tape
   won't render (server boot times out, `ttyd` missing, VHS unavailable), do
   **not** substitute a recording of `pytest … FAILS` / an `AssertionError`. That
@@ -323,6 +350,14 @@ healthy state for a `fixed`/`after` clip; a final frame that shows teardown — 
 pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
 the test body. Fix the stop point and re-record; do not caption around it.
+
+Check every step the caption names, not only the last one. Each is a claim about
+the clip, so back it with evidence from that run: a driver assertion or tape
+`Wait` that fired on the described output, a saved screenshot, or a frame you
+sampled at that moment (`ffmpeg -ss <seconds> -i <clip> -frames:v 1 step.png`).
+A command the tape typed and slept past has no evidence of its output: caption
+only that the command was run, or the state its frame shows (an unanswered
+folder-trust dialog), never the listing or message you intended it to show.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

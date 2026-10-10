@@ -616,6 +616,14 @@ Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
+- Caption each step from its own evidence. A caption that says a command listed
+  or printed something claims that output rendered, so back every such step with
+  a driver assertion or a VHS `Wait /pattern/` on that output, or a frame sampled
+  at that moment — a `Sleep` after the command verifies nothing. Pre-accept a
+  harness CLI's first-run prompt (Claude Code's folder-trust dialog under a fresh
+  `CLAUDE_CONFIG_DIR`) before filming, per the `cli` lane in
+  `dev/recording-lanes.md`; if the clip shows the prompt instead of the output,
+  caption the prompt or re-record — never the intended listing.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -760,7 +768,10 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
+  own steps), distinct from the bug-level `journey` field. Every step it names
+  must be backed by that clip's evidence (Step 4): a command the tape slept past
+  is "run `claude agents`", not "`claude agents` lists the session".
+  `capture_mode` is one
   of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
   recording. Empty list when nothing valid was recorded.
