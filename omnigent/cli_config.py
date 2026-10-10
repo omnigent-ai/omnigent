@@ -1354,6 +1354,51 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     )
 
 
+def _databricks_workspace_drift_notice(config: dict[str, Any]) -> str | None:  # type: ignore[explicit-any]
+    """Warn when ucode's current workspace differs from every configured
+    Databricks profile. Sessions route through the configured profile, not
+    ucode's current_workspace, so return ``None`` when they agree."""
+    from omnigent.onboarding.databricks_config import (
+        get_workspace_url_for_profile,
+        normalize_workspace_url,
+    )
+    from omnigent.onboarding.provider_config import DATABRICKS_KIND, load_providers
+    from omnigent.onboarding.ucode_state import read_current_ucode_state
+
+    ucode_state = read_current_ucode_state()
+    if ucode_state is None or not ucode_state.workspace_url:
+        return None
+    # Hostnames are case-insensitive: a mixed-case ~/.databrickscfg host must
+    # not read as drift from ucode's lowercase copy of the same workspace.
+    ucode_url = normalize_workspace_url(ucode_state.workspace_url).lower()
+
+    configured: list[tuple[str, bool, str]] = []
+    for entry in load_providers(config).values():
+        if entry.kind != DATABRICKS_KIND or not entry.profile:
+            continue
+        host = get_workspace_url_for_profile(entry.profile)
+        if host:
+            configured.append(
+                (entry.profile, entry.default, normalize_workspace_url(host).lower())
+            )
+    if not configured:
+        return None
+    if any(url == ucode_url for _profile, _default, url in configured):
+        return None
+
+    # With several drifted profiles, name the default one: sessions route through it.
+    profile, _default, omni_url = next((item for item in configured if item[1]), configured[0])
+
+    def _bare(url: str) -> str:
+        return url.split("://", 1)[-1]
+
+    return (
+        f"⚠ Databricks: ucode now points at {_bare(ucode_url)}, but Omnigent still "
+        f"uses the '{profile}' profile ({_bare(omni_url)}). "
+        "Reconfigure Databricks to follow ucode."
+    )
+
+
 def _harness_credential_rows(config: dict[str, Any], family: str) -> list[_HarnessMenuRow]:  # type: ignore[explicit-any]
     """Build the level-2 rows: each credential serving *family*, then ``+ Add``.
 
@@ -4215,6 +4260,9 @@ def _run_configure_harnesses_interactive() -> None:
         selectable.append(True)
         row_target.append(_QUIT)
         descriptions.append("")
+        # Drift warning renders in the frame-level status slot so it clears
+        # once ucode and the configured Databricks profile agree again.
+        drift_notice = _databricks_workspace_drift_notice(config)
         idx = select(
             "Configure harnesses",
             options,
@@ -4222,6 +4270,8 @@ def _run_configure_harnesses_interactive() -> None:
             selectable=selectable,
             clear_on_exit=True,
             compact=True,
+            status=drift_notice,
+            status_style="bold yellow",
         )
         if idx < 0:  # Esc / q — exit
             return
