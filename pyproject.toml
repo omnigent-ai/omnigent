@@ -38,7 +38,8 @@ dependencies = [
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
     "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
-    "mcp>=1.0,<2",
+    # >=1.20: mcp.client.auth.oauth2 (used for MCP OAuth) first ships there.
+    "mcp>=1.20,<2",
     "starlette>=1.0.1,<2",
     "uvicorn[standard]>=0.30,<1",
     # websockets >=15 asyncio client hangs on macOS before emitting any handshake

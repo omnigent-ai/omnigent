@@ -1928,6 +1928,127 @@ def test_parse_inline_mcp_headers_and_env_expanded(
     assert stdio_srv.env == {"MY_KEY": "val-456"}
 
 
+def test_parse_inline_mcp_auth_oauth_sets_oauth_flag(tmp_path: Path) -> None:
+    """Inline ``type: mcp`` entries support ``auth: {type: oauth}``, same
+    as the directory-config path."""
+    config = {
+        "spec_version": 1,
+        "name": "inline-oauth",
+        "tools": {
+            "svc": {
+                "type": "mcp",
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "oauth"},
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    http_srv = next(s for s in spec.mcp_servers if s.name == "svc")
+    assert http_srv.oauth is True
+    assert http_srv.databricks_profile is None
+
+
+def _write_inline_oauth_server(tmp_path: Path, entry: dict[str, object]) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "inline-oauth",
+        "tools": {"svc": {"type": "mcp", "auth": {"type": "oauth"}, **entry}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+
+@pytest.mark.parametrize(
+    "url", ["http://mcp.example.com/mcp", "http://192.168.1.10/mcp", "ftp://mcp.example.com"]
+)
+def test_parse_inline_mcp_oauth_rejects_cleartext_urls(tmp_path: Path, url: str) -> None:
+    """OAuth tokens must not travel over plain http to a non-loopback host."""
+    _write_inline_oauth_server(tmp_path, {"url": url})
+    with pytest.raises(OmnigentError, match=r"Inline MCP server 'svc' auth type 'oauth'.*https"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000/mcp",
+        "http://127.0.0.1:8000/mcp",
+        "http://127.9.9.9/mcp",
+        "http://[::1]/mcp",
+    ],
+)
+def test_parse_inline_mcp_oauth_allows_loopback_http(tmp_path: Path, url: str) -> None:
+    _write_inline_oauth_server(tmp_path, {"url": url})
+    assert parse(tmp_path).mcp_servers[0].oauth is True
+
+
+def test_parse_inline_mcp_oauth_rejects_authorization_header(tmp_path: Path) -> None:
+    """The OAuth token would replace the header, so both together are an error."""
+    _write_inline_oauth_server(
+        tmp_path,
+        {"url": "https://mcp.example.com/mcp", "headers": {"authorization": "Bearer x"}},
+    )
+    with pytest.raises(OmnigentError, match=r"both auth type 'oauth' and an 'Authorization'"):
+        parse(tmp_path)
+
+
+def test_parse_inline_mcp_oauth_keeps_other_headers(tmp_path: Path) -> None:
+    _write_inline_oauth_server(
+        tmp_path, {"url": "https://mcp.example.com/mcp", "headers": {"X-Tenant": "acme"}}
+    )
+    assert parse(tmp_path).mcp_servers[0].headers == {"X-Tenant": "acme"}
+
+
+def test_parse_inline_mcp_oauth_requires_a_url(tmp_path: Path) -> None:
+    _write_inline_oauth_server(tmp_path, {"command": "npx", "args": ["some-server"]})
+    with pytest.raises(OmnigentError, match=r"auth type 'oauth' requires an http\(s\) 'url'"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("auth", "expected"),
+    [
+        ({"type": "OAuth"}, r"got 'OAuth' \(did you mean 'oauth'\?\)"),
+        ({"type": "oauht"}, r"got 'oauht'$"),
+        ({"type": "api_key"}, r"got 'api_key'$"),
+        ({"profile": "prod"}, r"got None$"),
+    ],
+)
+def test_parse_inline_mcp_rejects_unknown_auth_type(
+    tmp_path: Path, auth: dict[str, str], expected: str
+) -> None:
+    """A mistyped auth type must not connect silently without credentials."""
+    config = {
+        "spec_version": 1,
+        "name": "inline-auth",
+        "tools": {"svc": {"type": "mcp", "url": "https://mcp.example.com/mcp", "auth": auth}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(
+        OmnigentError,
+        match=r"Inline MCP server 'svc' auth type must be 'databricks' or 'oauth', " + expected,
+    ):
+        parse(tmp_path)
+
+
+def test_parse_inline_mcp_rejects_non_mapping_auth(tmp_path: Path) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "inline-auth",
+        "tools": {"svc": {"type": "mcp", "url": "https://mcp.example.com/mcp", "auth": "oauth"}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"Inline MCP server 'svc' 'auth' must be a mapping"):
+        parse(tmp_path)
+
+
+def test_parse_inline_mcp_oauth_unexpanded_url_is_checked_later(tmp_path: Path) -> None:
+    """Scaffolding/validation parses keep ``${VAR}``; the scheme is checked at connect."""
+    _write_inline_oauth_server(tmp_path, {"url": "${MCP_URL}"})
+    assert parse(tmp_path, expand_env=False).mcp_servers[0].url == "${MCP_URL}"
+
+
 def test_parse_inline_mcp_url_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Inline ``type: mcp`` entries expand ``${VAR}`` in ``url``, same
     as the directory-config path."""
@@ -2726,6 +2847,152 @@ def test_mcp_env_expansion_mixed_set_and_unset_raises(
     (mcp_dir / "mixed.yaml").write_text(yaml.dump(mcp_config))
     with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
         parse(agent_dir)
+
+
+# ── MCP auth block (directory configs) ─────────────────
+
+
+def test_mcp_directory_config_auth_oauth_sets_oauth_flag(agent_dir: Path) -> None:
+    """A directory MCP config's ``auth: {type: oauth}`` block sets
+    ``MCPServerConfig.oauth = True`` — this is the field that makes
+    :func:`omnigent.tools.mcp_oauth.build_oauth_client_provider` kick in
+    instead of a static header."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "oauth-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "oauth"},
+    }
+    (mcp_dir / "oauth.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].oauth is True
+    assert spec.mcp_servers[0].databricks_profile is None
+
+
+def test_mcp_directory_config_auth_oauth_rejects_cleartext_url(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "oauth-server",
+        "transport": "http",
+        "url": "http://mcp.example.com/mcp",
+        "auth": {"type": "oauth"},
+    }
+    (mcp_dir / "oauth.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(
+        OmnigentError, match=r"auth type 'oauth': the url uses plain http.*oauth\.yaml"
+    ):
+        parse(agent_dir)
+
+
+def test_mcp_directory_config_auth_oauth_rejects_authorization_header(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "oauth-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "headers": {"Authorization": "Bearer static"},
+        "auth": {"type": "oauth"},
+    }
+    (mcp_dir / "oauth.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"both auth type 'oauth' and an 'Authorization'"):
+        parse(agent_dir)
+
+
+def test_mcp_directory_config_auth_databricks_sets_profile(agent_dir: Path) -> None:
+    """A directory MCP config's ``auth: {type: databricks, profile: ...}``
+    sets ``databricks_profile`` — previously only the inline ``tools:``
+    block supported this; directory configs silently ignored it."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "databricks-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "databricks", "profile": "my-profile"},
+    }
+    (mcp_dir / "databricks.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].databricks_profile == "my-profile"
+    assert spec.mcp_servers[0].oauth is False
+
+
+def test_mcp_directory_config_auth_databricks_missing_profile_raises(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "bad-databricks",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {"type": "databricks"},
+    }
+    (mcp_dir / "bad.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"auth type 'databricks' requires a 'profile'"):
+        parse(agent_dir)
+
+
+@pytest.mark.parametrize(
+    ("auth", "expected"),
+    [
+        ({"type": "OAuth"}, r"got 'OAuth' \(did you mean 'oauth'\?\)"),
+        (
+            {"type": "Databricks", "profile": "p"},
+            r"got 'Databricks' \(did you mean 'databricks'\?\)",
+        ),
+        ({"type": "bearer"}, r"got 'bearer'"),
+    ],
+)
+def test_mcp_directory_config_rejects_unknown_auth_type(
+    agent_dir: Path, auth: dict[str, str], expected: str
+) -> None:
+    """A mistyped auth type must not connect silently without credentials."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "typo-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": auth,
+    }
+    (mcp_dir / "typo.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(
+        OmnigentError,
+        match=r"MCP server 'typo-server' auth type must be 'databricks' or 'oauth', "
+        + expected
+        + r".*typo\.yaml",
+    ):
+        parse(agent_dir)
+
+
+def test_mcp_directory_config_rejects_non_mapping_auth(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "typo-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": "oauth",
+    }
+    (mcp_dir / "typo.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"'typo-server' 'auth' must be a mapping.*typo\.yaml"):
+        parse(agent_dir)
+
+
+def test_mcp_directory_config_no_auth_block_defaults(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "plain-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+    }
+    (mcp_dir / "plain.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].oauth is False
+    assert spec.mcp_servers[0].databricks_profile is None
 
 
 # ── MCP required field validation ─────────────────────
